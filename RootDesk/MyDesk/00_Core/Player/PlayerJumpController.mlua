@@ -1,0 +1,257 @@
+@Component
+script PlayerJumpController extends Component
+
+    @Sync
+    property integer CurrentIndex = 4
+
+    @Sync
+    property boolean IsMoving = false
+
+    property any keyHandler = nil
+
+    method table GetTilePositions()
+                -- 발판의 X, Y 좌표 목록을 반환합니다.
+                local tilePositions = {
+                    Vector2(-3.15, -0.66), -- 1번 발판
+                    Vector2(-2.25, -0.66), -- 2번 발판
+                    Vector2(-1.35, -0.66), -- 3번 발판
+                    Vector2(-0.45, -0.66), -- 4번 발판 (중앙)
+                    Vector2( 0.45, -0.66), -- 5번 발판
+                    Vector2( 1.35, -0.66), -- 6번 발판
+                    Vector2( 2.25, -0.66)  -- 7번 발판
+                }
+                return tilePositions
+    end
+
+    method void OnBeginPlay()
+                -- 초기화 및 이벤트 연결을 처리합니다.
+                log("PlayerJumpController OnBeginPlay started")
+                if self:IsServer() then
+                    log("PlayerJumpController OnBeginPlay on Server")
+                    -- 시작 시 4번째 발판의 중심 위치로 플레이어를 배치합니다.
+                    _TimerService:SetTimerOnce(function()
+                        if not isvalid(self.Entity) then return end
+                        local transform = self.Entity.TransformComponent
+                        local rigidbody = self.Entity.RigidbodyComponent
+                        local controller = self.Entity.PlayerControllerComponent
+                        if transform and rigidbody and controller then
+                            local tilePositions = self:GetTilePositions()
+                            local startPos = tilePositions[self.CurrentIndex]
+                            local spawnPos = Vector2(startPos.x, startPos.y + 0.1) -- 0.1만큼 살짝 띄움
+                            rigidbody:SetWorldPosition(spawnPos)
+                            rigidbody:PositionReset()
+                            controller.FixedLookAt = controller.LookDirectionX
+                            log("PlayerJumpController: Server set initial position to: " .. tostring(spawnPos) .. ", FixedLookAt: " .. tostring(controller.FixedLookAt))
+                        end
+                    end, 0.1)
+                end
+        
+                if self:IsClient() then
+                    log("PlayerJumpController OnBeginPlay on Client")
+                    -- 1. 캐릭터의 기본 좌우 이동(Move) 입력을 차단합니다.
+                    local controller = self.Entity.PlayerControllerComponent
+                    if controller then
+                        controller:AddCondition("Move", function()
+                            return false
+                        end)
+                    end
+                    -- 키보드 입력을 감지하기 위해 InputService의 이벤트를 연결합니다.
+                    self.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+                end
+    end
+
+    method void OnEndPlay()
+                -- 이벤트 핸들러를 연결 해제합니다.
+                log("PlayerJumpController OnEndPlay")
+                if self:IsClient() then
+                    if self.keyHandler then
+                        _InputService:DisconnectEvent(KeyDownEvent, self.keyHandler)
+                        self.keyHandler = nil
+                    end
+                end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnKeyDown(KeyDownEvent event)
+                -- 로컬 플레이어가 아닐 경우 입력을 받지 않도록 확인합니다.
+                log("PlayerJumpController OnKeyDown: KeyCode = " .. tostring(event.key))
+                if self.Entity ~= _UserService.LocalPlayer then 
+                    log("PlayerJumpController OnKeyDown: Ignored (not LocalPlayer)")
+                    return
+                end
+        
+                -- 이미 이동 중이면 입력을 받지 않습니다.
+                if self.IsMoving then
+                    log("PlayerJumpController OnKeyDown: Ignored (already moving)")
+                    return
+                end
+        
+                local key = event.key
+                if key == KeyboardKey.A or key == KeyboardKey.LeftArrow then
+                    log("PlayerJumpController OnKeyDown: Request Jump Left")
+                    self:RequestJumpLeft()
+                elseif key == KeyboardKey.D or key == KeyboardKey.RightArrow then
+                    log("PlayerJumpController OnKeyDown: Request Jump Right")
+                    self:RequestJumpRight()
+                elseif key == KeyboardKey.W or key == KeyboardKey.UpArrow then
+                    log("PlayerJumpController OnKeyDown: Request Toggle Direction")
+                    self:RequestToggleDirection()
+                end
+    end
+
+    @ExecSpace("Server")
+    method void RequestJumpLeft()
+                -- 왼쪽 발판으로 점프
+                log("PlayerJumpController RequestJumpLeft on Server. CurrentIndex = " .. tostring(self.CurrentIndex))
+                if self.IsMoving then
+                    log("PlayerJumpController RequestJumpLeft: Ignored (already moving)")
+                    return
+                end
+        
+                if self.CurrentIndex <= 1 then 
+                    log("PlayerJumpController RequestJumpLeft: Boundary reached (index <= 1)")
+                    return
+                end
+        
+                self.IsMoving = true
+                local rigidbody = self.Entity.RigidbodyComponent
+                if isvalid(rigidbody) then
+                    rigidbody.Enable = false -- 서버에서 물리엔진 비활성화 (클라이언트로 동기화됨)
+                end
+        
+                self.CurrentIndex = self.CurrentIndex - 1
+                local tilePositions = self:GetTilePositions()
+                local targetPos = tilePositions[self.CurrentIndex]
+                log("PlayerJumpController RequestJumpLeft: Target index = " .. tostring(self.CurrentIndex) .. ", TargetPos = " .. tostring(targetPos))
+        
+                -- 클라이언트로 트윈 실행 명령을 전송합니다.
+                self:PlayJumpTweenClient(targetPos.x, targetPos.y, self.Entity.PlayerComponent.UserId)
+    end
+
+    @ExecSpace("Server")
+    method void RequestJumpRight()
+                -- 오른쪽 발판으로 점프
+                log("PlayerJumpController RequestJumpRight on Server. CurrentIndex = " .. tostring(self.CurrentIndex))
+                if self.IsMoving then
+                    log("PlayerJumpController RequestJumpRight: Ignored (already moving)")
+                    return
+                end
+        
+                if self.CurrentIndex >= 7 then 
+                    log("PlayerJumpController RequestJumpRight: Boundary reached (index >= 7)")
+                    return
+                end
+        
+                self.IsMoving = true
+                local rigidbody = self.Entity.RigidbodyComponent
+                if isvalid(rigidbody) then
+                    rigidbody.Enable = false -- 서버에서 물리엔진 비활성화 (클라이언트로 동기화됨)
+                end
+        
+                self.CurrentIndex = self.CurrentIndex + 1
+                local tilePositions = self:GetTilePositions()
+                local targetPos = tilePositions[self.CurrentIndex]
+                log("PlayerJumpController RequestJumpRight: Target index = " .. tostring(self.CurrentIndex) .. ", TargetPos = " .. tostring(targetPos))
+        
+                -- 클라이언트로 트윈 실행 명령을 전송합니다.
+                self:PlayJumpTweenClient(targetPos.x, targetPos.y, self.Entity.PlayerComponent.UserId)
+    end
+
+    @ExecSpace("Server")
+    method void RequestToggleDirection()
+                -- 캐릭터의 고정 시선 방향을 토글하고 제자리 홉 점프를 유도합니다.
+                log("PlayerJumpController RequestToggleDirection on Server")
+                if self.IsMoving then
+                    log("PlayerJumpController RequestToggleDirection: Ignored (already moving)")
+                    return
+                end
+        
+                local controller = self.Entity.PlayerControllerComponent
+                local rigidbody = self.Entity.RigidbodyComponent
+        
+                if controller and rigidbody then
+                    self.IsMoving = true
+                    -- 1. 서버에서 물리 비활성화 (동기화됨)
+                    rigidbody.Enable = false
+        
+                    -- 2. 방향 뒤집기 및 고정
+                    local newDir = controller.LookDirectionX * -1.0
+                    controller.LookDirectionX = newDir
+                    controller.FixedLookAt = newDir
+                    log("PlayerJumpController: LookDirectionX and FixedLookAt set to " .. tostring(newDir))
+        
+                    -- 3. 현재 딛고 있는 발판 Y 좌표 확인
+                    local tilePositions = self:GetTilePositions()
+                    local currentPos = tilePositions[self.CurrentIndex]
+        
+                    -- 4. 클라이언트에서 제자리 홉 점프 실행
+                    self:PlayDirectionJumpTweenClient(currentPos.x, currentPos.y, self.Entity.PlayerComponent.UserId)
+                end
+    end
+
+    @ExecSpace("Server")
+    method void RequestEndJump()
+                -- 점프 완료 후 서버에서 물리 엔진 활성화 및 물리 리셋
+                log("PlayerJumpController RequestEndJump on Server")
+                local rigidbody = self.Entity.RigidbodyComponent
+                if isvalid(rigidbody) then
+                    rigidbody.Enable = true
+                    rigidbody:PositionReset()
+                end
+                self.IsMoving = false
+    end
+
+    @ExecSpace("Client")
+    method void PlayJumpTweenClient(number targetX, number targetY)
+                -- 클라이언트에서 직접 단일 트윈을 실행하여 두 번 꺾이는 느낌 없이 한 번에 부드럽게 이동시킵니다.
+                log("PlayerJumpController PlayJumpTweenClient: Target (" .. targetX .. ", " .. targetY .. ")")
+                local rigidbody = self.Entity.RigidbodyComponent
+                local transform = self.Entity.TransformComponent
+        
+                if not isvalid(rigidbody) or not isvalid(transform) then 
+                    log("PlayerJumpController PlayJumpTweenClient: Invalid rigidbody or transform")
+                    return
+                end
+        
+                local targetPos = Vector2(targetX, targetY + 0.1) -- 0.1만큼 살짝 띄움
+        
+                -- 단일 이동 트윈 실행 (QuadEaseOut으로 시작하여 꺾임 없이 한 번에 부드럽게 이동)
+                local moveTween = _TweenLogic:MoveTo(self.Entity, targetPos, 0.25, EaseType.QuadEaseOut)
+        
+                moveTween:SetOnEndCallback(function()
+                    if not isvalid(self.Entity) then return end
+                    log("PlayerJumpController PlayJumpTweenClient: Move tween complete, landing")
+                    -- 서버에 물리 복구를 요청합니다.
+                    self:RequestEndJump()
+                end)
+    end
+
+    @ExecSpace("Client")
+    method void PlayDirectionJumpTweenClient(number targetX, number targetY)
+                -- 캐릭터가 제자리에서 조용히 살짝 홉(점프)하도록 연출합니다.
+                log("PlayerJumpController PlayDirectionJumpTweenClient")
+                local rigidbody = self.Entity.RigidbodyComponent
+                local transform = self.Entity.TransformComponent
+        
+                if not isvalid(rigidbody) or not isvalid(transform) then return end
+        
+                local currentX = transform.Position.x
+                local targetPos = Vector2(currentX, targetY + 0.1)
+                local peakY = transform.Position.y + 0.5 -- 0.5만큼 위로 홉 점프
+                local midPos = Vector2(currentX, peakY)
+        
+                -- 1단계: 최고점까지 상승
+                local upwardTween = _TweenLogic:MoveTo(self.Entity, midPos, 0.15, EaseType.QuadEaseOut)
+        
+                upwardTween:SetOnEndCallback(function()
+                    if not isvalid(self.Entity) then return end
+                    -- 2단계: 다시 원래 높이로 하강
+                    local downwardTween = _TweenLogic:MoveTo(self.Entity, targetPos, 0.15, EaseType.QuadEaseIn)
+                    downwardTween:SetOnEndCallback(function()
+                        if not isvalid(self.Entity) then return end
+                        self:RequestEndJump()
+                    end)
+                end)
+    end
+
+end
