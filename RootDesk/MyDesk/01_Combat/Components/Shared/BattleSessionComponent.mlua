@@ -1,0 +1,1629 @@
+@Component
+script BattleSessionComponent extends Component
+
+	@Sync property string BattlePhase = "Setup"
+	@Sync property integer TurnNumber = 0
+	@Sync property string QueuedActionType = ""
+	@Sync property integer QueuedActionDirection = 0
+	@Sync property boolean IsActionProcessing = false
+	@Sync property string QueuedTileIds = ""
+	@Sync property integer QueuedTileCount = 0
+	@Sync property string ExecutingTileIds = ""
+	@Sync property integer ExecutingTileIndex = 0
+	@Sync property integer TileQueueCapacity = 2
+	@Sync property string BattleResult = ""
+
+	property integer CellCount = 6
+	property number CellStartX = -2.8
+	property number CellSpacing = 1.12
+	property number UnitY = 0.12
+	property integer PlayerStartCell = 1
+	property integer EnemyStartCell = 4
+	property number BasicAttackDamage = 3
+	property string BasicSlashMotionKey = "basic_slash"
+	property string BasicSlashActionName = "swingO1"
+	property number BasicSlashMotionPlayRate = 1
+	property number BasicSlashMotionDuration = 0.45
+	property number BasicSlashImpactDelay = 0.18
+	property number HeavySlashDamage = 6
+	property string HeavySlashMotionKey = "heavy_slash"
+	property string HeavySlashActionName = "swingO2"
+	property number HeavySlashMotionPlayRate = 0.85
+	property number HeavySlashMotionDuration = 0.70
+	property number HeavySlashImpactDelay = 0.38
+	property string PushMotionKey = "push"
+	property string PushActionName = "swingO1"
+	property number PushMotionPlayRate = 0.9
+	property number PushMotionDuration = 0.40
+	property number PushImpactDelay = 0.18
+	property number MoveActionDuration = 0.12
+	property number TurnActionDuration = 0.12
+	property number BasicAttackActionDuration = 0.45
+	property number HeavySlashActionDuration = 0.70
+	property number PushActionDuration = 0.40
+	property number EnemyThinkDuration = 0.25
+	property number EnemyMoveActionDuration = 0.12
+	property number EnemyAttackActionDuration = 0.30
+	property string EnemyEntityName = "BattleDummyEnemy"
+	property Entity PlayerEntity = nil
+	property Entity EnemyEntity = nil
+	property integer ActionTimerId = 0
+	property integer ImpactTimerId = 0
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleMoveKeyDown(KeyDownEvent event)
+		-- Converts one movement/turn/attack key press into a server-authoritative request.
+		if event.key == KeyboardKey.Space then
+			log("[BattleInput] turn requested")
+			self:RequestTurn()
+			return
+		end
+
+		if event.key == KeyboardKey.F then
+			log("[BattleInput] basic attack requested")
+			self:RequestBasicAttack()
+			return
+		end
+
+		local direction = 0
+		if event.key == KeyboardKey.LeftArrow or event.key == KeyboardKey.A then
+			direction = -1
+		elseif event.key == KeyboardKey.RightArrow or event.key == KeyboardKey.D then
+			direction = 1
+		end
+
+		if direction ~= 0 then
+			log("[BattleInput] move requested direction=" .. direction)
+			self:RequestMove(direction)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Self")
+	handler HandleUnitTurnedEvent(UnitTurnedEvent event)
+		-- Confirms that subscribers can observe a completed direction change.
+		log("[BattleEvent] UnitTurnedEvent received unit=" .. event.UnitId .. " from=" .. event.PreviousFacing .. " to=" .. event.CurrentFacing)
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Self")
+	handler HandleUnitMovedEvent(UnitMovedEvent event)
+		-- Confirms that subscribers can observe a completed logical move.
+		log("[BattleEvent] UnitMovedEvent received unit=" .. event.UnitId .. " from=" .. event.FromCell .. " to=" .. event.ToCell)
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Self")
+	handler HandleBasicAttackResolvedEvent(BasicAttackResolvedEvent event)
+		-- Confirms that subscribers receive both hit and miss attack resolutions.
+		log("[BattleEvent] BasicAttackResolvedEvent attack=" .. event.AttackId .. " source=" .. event.SourceUnitId .. " target=" .. event.TargetUnitId .. " cell=" .. event.TargetCell .. " hit=" .. tostring(event.Hit) .. " reason=" .. event.Reason .. " damage=" .. event.DamageAmount .. " hp=" .. event.TargetHpBefore .. "->" .. event.TargetHpAfter)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Initializes the map-scoped battle session and registers entities already in the map.
+		log("[BattleSession] begin map=" .. self.Entity.Name .. " cells=" .. self.CellCount)
+		self:RegisterEnemy()
+
+		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
+		if users ~= nil then
+			for _, player in ipairs(users) do
+				self:RegisterPlayer(player)
+			end
+		end
+
+		self:TryStartBattle()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Prevents a pending action callback from surviving this map-scoped battle session.
+		if self.ActionTimerId > 0 then
+			_TimerService:ClearTimer(self.ActionTimerId)
+			self.ActionTimerId = 0
+		end
+		if self.ImpactTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactTimerId)
+			self.ImpactTimerId = 0
+		end
+
+		self.QueuedActionType = ""
+		self.QueuedActionDirection = 0
+		self.IsActionProcessing = false
+		self.QueuedTileIds = ""
+		self.QueuedTileCount = 0
+		self.ExecutingTileIds = ""
+		self.ExecutingTileIndex = 0
+		self.BattleResult = ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		-- Polls only during Setup so a player spawned after the map component can be registered.
+		if self.BattlePhase ~= "Setup" then
+			return
+		end
+
+		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
+		if users ~= nil then
+			for _, player in ipairs(users) do
+				self:RegisterPlayer(player)
+				break
+			end
+		end
+
+		self:TryStartBattle()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnMapEnter(Entity enteredEntity)
+		-- Registers a player that enters this battle map after the session has initialized.
+		if enteredEntity == nil or enteredEntity.PlayerComponent == nil then
+			return
+		end
+
+		self:RegisterPlayer(enteredEntity)
+		self:TryStartBattle()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RegisterEnemy()
+		-- Finds the placed dummy enemy and initializes its logical unit state.
+		local enemy = self.Entity:GetChildByName(self.EnemyEntityName, false)
+		if enemy == nil then
+			log_error("[BattleSession] enemy missing name=" .. self.EnemyEntityName)
+			return
+		end
+
+		self.EnemyEntity = enemy
+		self:ConfigureUnit(enemy, "enemy_01", "Enemy", self.EnemyStartCell, "Left", 100)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RegisterPlayer(Entity player)
+		-- Initializes one player as the controllable logical battle unit.
+		if player == nil or player.PlayerComponent == nil then
+			return
+		end
+
+		if self.PlayerEntity ~= nil and self.PlayerEntity == player then
+			return
+		end
+
+		self.PlayerEntity = player
+		if player.PlayerControllerComponent ~= nil then
+			player.PlayerControllerComponent.Enable = false
+		end
+
+		if player.MovementComponent ~= nil then
+			player.MovementComponent:Stop()
+		end
+
+		self:ConfigureUnit(player, "player_01", "Player", self.PlayerStartCell, "Right", 100)
+	end
+
+	@ExecSpace("ServerOnly")
+	method any EnsureUnitComponent(Entity targetEntity)
+		-- Returns the target's BattleUnitComponent, attaching it at runtime when necessary.
+		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			unit = targetEntity:AddComponent("BattleUnitComponent")
+		end
+
+		if unit == nil then
+			log_error("[BattleSession] failed to attach BattleUnitComponent entity=" .. targetEntity.Name)
+		end
+		return unit
+	end
+
+	@ExecSpace("ServerOnly")
+	method any EnsurePresentationComponent(Entity targetEntity)
+		-- Attaches optional visual behavior to runtime-created players while preserving placed enemy settings.
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			presentation = targetEntity:AddComponent("BattleUnitPresentationComponent")
+		end
+
+		if presentation == nil then
+			log_error("[BattleSession] failed to attach BattleUnitPresentationComponent entity=" .. targetEntity.Name)
+		end
+		return presentation
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConfigureUnit(Entity targetEntity, string unitId, string team, integer cellIndex, string facing, number maxHp)
+		-- Writes the initial logical state and places the entity at its cell position.
+		if self:IsValidCell(cellIndex) == false then
+			log_error("[BattleSession] invalid initial cell=" .. cellIndex .. " unit=" .. unitId)
+			return
+		end
+
+		local unit = self:EnsureUnitComponent(targetEntity)
+		if unit == nil then
+			return
+		end
+		self:EnsurePresentationComponent(targetEntity)
+
+		unit.UnitId = unitId
+		unit.Team = team
+		unit.CellIndex = cellIndex
+		unit.Facing = facing
+		unit.MaxHp = maxHp
+		unit.CurrentHp = maxHp
+		unit.IsDead = false
+		self:ApplyFacing(targetEntity, facing)
+
+		local position = self:GetCellPosition(cellIndex)
+		self:PlaceEntity(targetEntity, position)
+		if team == "Player" and targetEntity.PlayerComponent ~= nil then
+			self:LockBoardCamera(self:GetBoardCenterX(), targetEntity.PlayerComponent.UserId)
+		end
+		log("[BattleSession] unit registered id=" .. unitId .. " team=" .. team .. " cell=" .. cellIndex .. " x=" .. position.x)
+	end
+
+	@ExecSpace("Server")
+	method void RequestTurn()
+		-- Validates the requesting client before forwarding the turn request.
+		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil then
+			log_warning("[BattleTurn] rejected reason=PLAYER_MISSING")
+			return
+		end
+
+		if self.PlayerEntity.PlayerComponent.UserId ~= senderUserId then
+			log_warning("[BattleTurn] rejected reason=INVALID_SENDER")
+			return
+		end
+
+		local result = self:TryQueuePlayerAction("TURN", 0)
+		if result.Success == false then
+			log_warning("[BattleQueue] rejected action=TURN reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryQueuePlayerAction(string actionType, integer direction)
+		-- Accepts at most one player action and keeps the slot occupied until presentation time ends.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
+
+		if self.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+
+		if self.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+
+		if self.QueuedActionType ~= "" then
+			result.Reason = "QUEUE_FULL"
+			return result
+		end
+
+		if self.QueuedTileCount > 0 then
+			result.Reason = "TILE_QUEUE_OCCUPIED"
+			return result
+		end
+
+		if actionType ~= "MOVE" and actionType ~= "TURN" and actionType ~= "BASIC_ATTACK" and actionType ~= "HEAVY_SLASH" then
+			result.Reason = "INVALID_ACTION"
+			return result
+		end
+
+		if actionType == "MOVE" and direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+
+		self.QueuedActionType = actionType
+		self.QueuedActionDirection = direction
+		result.Success = true
+		result.Reason = "QUEUED"
+		log("[BattleQueue] queued action=" .. actionType .. " direction=" .. direction)
+		self:ExecuteQueuedAction()
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ExecuteQueuedAction()
+		-- Dispatches the queued action through the existing authoritative action functions.
+		local actionType = self.QueuedActionType
+		local direction = self.QueuedActionDirection
+		if actionType == "" then
+			return
+		end
+
+		self.IsActionProcessing = true
+		log("[BattleQueue] started action=" .. actionType .. " direction=" .. direction)
+
+		local actionResult = nil
+		if actionType == "MOVE" then
+			actionResult = self:TryMove("player_01", direction)
+		elseif actionType == "TURN" then
+			actionResult = self:TryTurn("player_01")
+		elseif actionType == "BASIC_ATTACK" then
+			actionResult = self:TryBasicAttack("player_01")
+		elseif actionType == "HEAVY_SLASH" then
+			actionResult = self:TryHeavySlash("player_01")
+		end
+
+		if actionResult == nil or actionResult.Success == false then
+			local reason = "EXECUTION_FAILED"
+			if actionResult ~= nil then
+				reason = actionResult.Reason
+			end
+			self:CompleteQueuedAction(actionType, false, reason)
+			return
+		end
+
+		local duration = self:GetActionDuration(actionType)
+		local complete = function()
+			self:CompleteQueuedAction(actionType, true, actionResult.Reason)
+		end
+		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetActionDuration(string actionType)
+		if actionType == "MOVE" then
+			return math.max(0.05, self.MoveActionDuration)
+		elseif actionType == "TURN" then
+			return math.max(0.05, self.TurnActionDuration)
+		elseif actionType == "BASIC_ATTACK" then
+			return math.max(0.1, self.BasicAttackActionDuration)
+		elseif actionType == "HEAVY_SLASH" then
+			return math.max(0.1, self.HeavySlashActionDuration)
+		elseif actionType == "PUSH" then
+			return math.max(0.1, self.PushActionDuration)
+		end
+
+		return 0.05
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompleteQueuedAction(string actionType, boolean success, string reason)
+		-- A valid player action hands control to the enemy; invalid actions release input immediately.
+		self.ActionTimerId = 0
+		self.QueuedActionType = ""
+		self.QueuedActionDirection = 0
+		log("[BattleQueue] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
+		if self.BattleResult ~= "" then
+			self.IsActionProcessing = false
+			return
+		end
+
+		if success == true then
+			self:BeginEnemyTurn()
+			return
+		end
+
+		self.IsActionProcessing = false
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginEnemyTurn()
+		-- Keeps player input locked while the single enemy intent is selected and executed.
+		self.BattlePhase = "EnemyTurn"
+		self.QueuedActionType = "ENEMY_THINK"
+		self.QueuedActionDirection = 0
+		self.IsActionProcessing = true
+		log("[BattleTurnFlow] phase=EnemyTurn turn=" .. self.TurnNumber)
+
+		local execute = function()
+			self:ExecuteEnemyIntent()
+		end
+		self.ActionTimerId = _TimerService:SetTimerOnce(execute, math.max(0.05, self.EnemyThinkDuration))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildEnemyIntent()
+		-- Chooses only between moving toward the player and attacking an adjacent player.
+		local intent = {
+			ActionType = "WAIT",
+			Direction = 0,
+			Reason = "UNIT_MISSING"
+		}
+
+		if isvalid(self.PlayerEntity) == false or isvalid(self.EnemyEntity) == false then
+			return intent
+		end
+
+		local player = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		local enemy = self.EnemyEntity:GetComponent("script.BattleUnitComponent")
+		if player == nil or enemy == nil or player.IsDead == true or enemy.IsDead == true then
+			intent.Reason = "UNIT_UNAVAILABLE"
+			return intent
+		end
+
+		local cellDelta = player.CellIndex - enemy.CellIndex
+		if cellDelta < 0 then
+			enemy.Facing = "Left"
+		elseif cellDelta > 0 then
+			enemy.Facing = "Right"
+		end
+		self:ApplyFacing(self.EnemyEntity, enemy.Facing)
+
+		if math.abs(cellDelta) == 1 then
+			intent.ActionType = "BASIC_ATTACK"
+			intent.Reason = "PLAYER_ADJACENT"
+			return intent
+		end
+
+		if cellDelta < 0 then
+			intent.ActionType = "MOVE"
+			intent.Direction = -1
+			intent.Reason = "APPROACH_PLAYER"
+		elseif cellDelta > 0 then
+			intent.ActionType = "MOVE"
+			intent.Direction = 1
+			intent.Reason = "APPROACH_PLAYER"
+		else
+			intent.Reason = "SAME_CELL"
+		end
+		return intent
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ExecuteEnemyIntent()
+		-- Reuses the same authoritative move and attack paths as the player.
+		self.ActionTimerId = 0
+		local intent = self:BuildEnemyIntent()
+		self.QueuedActionType = "ENEMY_" .. intent.ActionType
+		self.QueuedActionDirection = intent.Direction
+		log("[BattleEnemy] intent action=" .. intent.ActionType .. " direction=" .. intent.Direction .. " reason=" .. intent.Reason)
+
+		local actionResult = nil
+		if intent.ActionType == "MOVE" then
+			actionResult = self:TryMove("enemy_01", intent.Direction)
+		elseif intent.ActionType == "BASIC_ATTACK" then
+			actionResult = self:TryBasicAttack("enemy_01")
+		else
+			actionResult = { Success = true, Reason = intent.Reason }
+		end
+
+		local success = actionResult ~= nil and actionResult.Success == true
+		local reason = "EXECUTION_FAILED"
+		if actionResult ~= nil then
+			reason = actionResult.Reason
+		end
+
+		local duration = self:GetEnemyActionDuration(intent.ActionType)
+		local complete = function()
+			self:CompleteEnemyTurn(intent.ActionType, success, reason)
+		end
+		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetEnemyActionDuration(string actionType)
+		if actionType == "MOVE" then
+			return math.max(0.05, self.EnemyMoveActionDuration)
+		elseif actionType == "BASIC_ATTACK" then
+			return math.max(0.1, self.EnemyAttackActionDuration)
+		end
+		return 0.05
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompleteEnemyTurn(string actionType, boolean success, string reason)
+		-- Ends one full round and reopens the next player turn.
+		self.ActionTimerId = 0
+		self.QueuedActionType = ""
+		self.QueuedActionDirection = 0
+		self.IsActionProcessing = false
+		if self.BattleResult ~= "" then
+			log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason .. " result=" .. self.BattleResult)
+			return
+		end
+
+		self.TurnNumber = self.TurnNumber + 1
+		self.BattlePhase = "PlayerTurn"
+		log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
+		log("[BattleTurnFlow] phase=PlayerTurn turn=" .. self.TurnNumber)
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsTeamTurn(string team)
+		if team == "Player" then
+			return self.BattlePhase == "PlayerTurn"
+		elseif team == "Enemy" then
+			return self.BattlePhase == "EnemyTurn"
+		end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryTurn(string unitId)
+		-- Reverses a living unit's logical and visual facing without moving cells.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			PreviousFacing = "",
+			CurrentFacing = ""
+		}
+
+		local unitEntity = self:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+
+		if self:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+
+		if unit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+
+		result.PreviousFacing = unit.Facing
+		if unit.Facing == "Right" then
+			unit.Facing = "Left"
+		else
+			unit.Facing = "Right"
+		end
+		result.CurrentFacing = unit.Facing
+		self:ApplyFacing(unitEntity, unit.Facing)
+
+		local turnedEvent = UnitTurnedEvent()
+		turnedEvent.UnitId = unit.UnitId
+		turnedEvent.PreviousFacing = result.PreviousFacing
+		turnedEvent.CurrentFacing = result.CurrentFacing
+		self.Entity:SendEvent(turnedEvent)
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[BattleTurn] success unit=" .. unit.UnitId .. " from=" .. result.PreviousFacing .. " to=" .. result.CurrentFacing .. " cell=" .. unit.CellIndex)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyFacing(Entity targetEntity, string facing)
+		-- Uses the native player look direction so the three-layer avatar renderer turns correctly.
+		if targetEntity.PlayerControllerComponent == nil then
+			return
+		end
+
+		if facing == "Right" then
+			targetEntity.PlayerControllerComponent.LookDirectionX = 1
+		else
+			targetEntity.PlayerControllerComponent.LookDirectionX = -1
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestBasicAttack()
+		-- Validates the requesting client before resolving a basic front-cell attack.
+		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil then
+			log_warning("[BattleAttack] rejected reason=PLAYER_MISSING")
+			return
+		end
+
+		if self.PlayerEntity.PlayerComponent.UserId ~= senderUserId then
+			log_warning("[BattleAttack] rejected reason=INVALID_SENDER")
+			return
+		end
+
+		local result = self:TryQueuePlayerAction("BASIC_ATTACK", 0)
+		if result.Success == false then
+			log_warning("[BattleQueue] rejected action=BASIC_ATTACK reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestQueueTile(string tileId)
+		-- Validates the requesting player before registering one supported tile in the queue slot.
+		if self:IsValidPlayerRequest(senderUserId) == false then
+			log_warning("[BattleTileQueue] register rejected tile=" .. tileId .. " reason=INVALID_SENDER")
+			return
+		end
+
+		local result = self:TryQueueTile(tileId)
+		if result.Success == false then
+			log_warning("[BattleTileQueue] register rejected tile=" .. tileId .. " reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestExecuteQueuedTile()
+		-- Validates the requesting player before executing the registered tile.
+		if self:IsValidPlayerRequest(senderUserId) == false then
+			log_warning("[BattleTileQueue] execute rejected reason=INVALID_SENDER")
+			return
+		end
+
+		local result = self:TryExecuteQueuedTile()
+		if result.Success == false then
+			log_warning("[BattleTileQueue] execute rejected reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestClearQueuedTile()
+		-- Validates the requesting player before clearing the registered tile.
+		if self:IsValidPlayerRequest(senderUserId) == false then
+			log_warning("[BattleTileQueue] clear rejected reason=INVALID_SENDER")
+			return
+		end
+
+		local result = self:TryClearQueuedTile()
+		if result.Success == false then
+			log_warning("[BattleTileQueue] clear rejected reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsValidPlayerRequest(string requestingUserId)
+		-- Confirms that a client request belongs to the registered solo player.
+		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil then
+			return false
+		end
+
+		return self.PlayerEntity.PlayerComponent.UserId == requestingUserId
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryQueueTile(string tileId)
+		-- Appends one supported tile up to the configurable queue capacity.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			QueueIndex = -1,
+			QueueCount = self.QueuedTileCount
+		}
+
+		if self.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+
+		if self.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+
+		local capacity = math.max(1, self.TileQueueCapacity)
+		if self.QueuedTileCount >= capacity then
+			result.Reason = "QUEUE_FULL"
+			return result
+		end
+
+		if tileId ~= "basic_slash" and tileId ~= "heavy_slash" and tileId ~= "push" then
+			result.Reason = "INVALID_TILE"
+			return result
+		end
+
+		self.QueuedTileIds = self:AppendTileId(self.QueuedTileIds, tileId)
+		self.QueuedTileCount = self:GetTileIdCount(self.QueuedTileIds)
+		result.Success = true
+		result.Reason = "QUEUED"
+		result.QueueIndex = self.QueuedTileCount
+		result.QueueCount = self.QueuedTileCount
+		log("[BattleTileQueue] registered tile=" .. tileId .. " index=" .. result.QueueIndex .. " count=" .. result.QueueCount .. "/" .. capacity .. " turn=" .. self.TurnNumber)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryExecuteQueuedTile()
+		-- Freezes the registered queue and starts an arbitrary-length sequential execution pass.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
+
+		if self.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+
+		if self.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+
+		if self.QueuedTileCount <= 0 or self.QueuedTileIds == "" then
+			result.Reason = "QUEUE_EMPTY"
+			return result
+		end
+
+		self.ExecutingTileIds = self.QueuedTileIds
+		self.ExecutingTileIndex = 1
+		self.QueuedTileIds = ""
+		self.QueuedTileCount = 0
+		self.IsActionProcessing = true
+
+		result.Success = true
+		result.Reason = "EXECUTING"
+		log("[BattleTileQueue] execution started count=" .. self:GetTileIdCount(self.ExecutingTileIds) .. " capacity=" .. self.TileQueueCapacity .. " turn=" .. self.TurnNumber)
+		self:ExecuteNextQueuedTile()
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ExecuteNextQueuedTile()
+		-- Resolves exactly one tile, then advances only after its action duration has completed.
+		local tileCount = self:GetTileIdCount(self.ExecutingTileIds)
+		if self.ExecutingTileIndex <= 0 or self.ExecutingTileIndex > tileCount then
+			self:CompleteTileQueueExecution(true, "QUEUE_COMPLETE")
+			return
+		end
+
+		local tileId = self:GetTileIdAt(self.ExecutingTileIds, self.ExecutingTileIndex)
+		local actionType = self:GetTileActionType(tileId)
+		if actionType == "" then
+			self:CompleteTileQueueExecution(false, "INVALID_TILE")
+			return
+		end
+
+		self.QueuedActionType = actionType
+		self.QueuedActionDirection = 0
+		log("[BattleTileQueue] tile started index=" .. self.ExecutingTileIndex .. "/" .. tileCount .. " tile=" .. tileId .. " action=" .. actionType)
+
+		local actionResult = nil
+		if actionType == "BASIC_ATTACK" then
+			actionResult = self:TryBasicAttack("player_01")
+		elseif actionType == "HEAVY_SLASH" then
+			actionResult = self:TryHeavySlash("player_01")
+		elseif actionType == "PUSH" then
+			actionResult = self:TryPush("player_01")
+		end
+
+		if actionResult == nil or actionResult.Success == false then
+			local reason = "EXECUTION_FAILED"
+			if actionResult ~= nil then
+				reason = actionResult.Reason
+			end
+			self:CompleteTileQueueExecution(false, reason)
+			return
+		end
+
+		local completedIndex = self.ExecutingTileIndex
+		local duration = self:GetActionDuration(actionType)
+		local complete = function()
+			self.ActionTimerId = 0
+			log("[BattleTileQueue] tile completed index=" .. completedIndex .. "/" .. tileCount .. " tile=" .. tileId .. " reason=" .. actionResult.Reason)
+			if self.BattleResult ~= "" then
+				self:CompleteTileQueueExecution(true, "BATTLE_ENDED")
+				return
+			end
+			self.ExecutingTileIndex = completedIndex + 1
+			self:ExecuteNextQueuedTile()
+		end
+		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompleteTileQueueExecution(boolean success, string reason)
+		-- Clears execution state once, then hands control to the enemy only after the full queue succeeds.
+		local executedCount = self:GetTileIdCount(self.ExecutingTileIds)
+		self.ActionTimerId = 0
+		self.QueuedActionType = ""
+		self.QueuedActionDirection = 0
+		self.ExecutingTileIds = ""
+		self.ExecutingTileIndex = 0
+		log("[BattleTileQueue] execution completed success=" .. tostring(success) .. " reason=" .. reason .. " count=" .. executedCount)
+
+		if self.BattleResult ~= "" then
+			self.IsActionProcessing = false
+			return
+		end
+		if success then
+			self:BeginEnemyTurn()
+			return
+		end
+		self.IsActionProcessing = false
+	end
+
+	method string AppendTileId(string serializedQueue, string tileId)
+		if serializedQueue == "" then
+			return tileId
+		end
+		return serializedQueue .. "|" .. tileId
+	end
+
+	method integer GetTileIdCount(string serializedQueue)
+		if serializedQueue == "" then
+			return 0
+		end
+		local count = 0
+		for _ in string.gmatch(serializedQueue, "([^|]+)") do
+			count = count + 1
+		end
+		return count
+	end
+
+	method string GetTileIdAt(string serializedQueue, integer targetIndex)
+		if targetIndex <= 0 then
+			return ""
+		end
+		local index = 0
+		for tileId in string.gmatch(serializedQueue, "([^|]+)") do
+			index = index + 1
+			if index == targetIndex then
+				return tileId
+			end
+		end
+		return ""
+	end
+
+	method string GetTileActionType(string tileId)
+		if tileId == "basic_slash" then
+			return "BASIC_ATTACK"
+		elseif tileId == "heavy_slash" then
+			return "HEAVY_SLASH"
+		elseif tileId == "push" then
+			return "PUSH"
+		end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryClearQueuedTile()
+		-- Clears every registered tile only while the player still owns an idle input phase.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
+
+		if self.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+
+		if self.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+
+		if self.QueuedTileCount <= 0 or self.QueuedTileIds == "" then
+			result.Reason = "QUEUE_EMPTY"
+			return result
+		end
+
+		local clearedCount = self.QueuedTileCount
+		self.QueuedTileIds = ""
+		self.QueuedTileCount = 0
+		result.Success = true
+		result.Reason = "CLEARED"
+		log("[BattleTileQueue] cleared count=" .. clearedCount .. " turn=" .. self.TurnNumber)
+		return result
+	end
+
+	@ExecSpace("Server")
+	method void RequestResetBattle()
+		-- Accepts Reset only from the registered solo player after the battle has ended.
+		if self:IsValidPlayerRequest(senderUserId) == false then
+			log_warning("[BattleReset] rejected reason=INVALID_SENDER")
+			return
+		end
+
+		local result = self:ResetBattle()
+		if result.Success == false then
+			log_warning("[BattleReset] rejected reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResetBattle()
+		-- Restores the existing two units and all turn/queue state without rebuilding the map.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
+
+		if self.BattleResult == "" then
+			result.Reason = "BATTLE_NOT_ENDED"
+			return result
+		end
+		if isvalid(self.PlayerEntity) == false or isvalid(self.EnemyEntity) == false then
+			result.Reason = "UNIT_MISSING"
+			return result
+		end
+
+		if self.ActionTimerId > 0 then
+			_TimerService:ClearTimer(self.ActionTimerId)
+			self.ActionTimerId = 0
+		end
+		if self.ImpactTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactTimerId)
+			self.ImpactTimerId = 0
+		end
+
+		self.BattlePhase = "Setup"
+		self.BattleResult = ""
+		self.TurnNumber = 1
+		self.QueuedActionType = ""
+		self.QueuedActionDirection = 0
+		self.QueuedTileIds = ""
+		self.QueuedTileCount = 0
+		self.ExecutingTileIds = ""
+		self.ExecutingTileIndex = 0
+		self.IsActionProcessing = false
+
+		self:ConfigureUnit(self.PlayerEntity, "player_01", "Player", self.PlayerStartCell, "Right", 100)
+		self:ConfigureUnit(self.EnemyEntity, "enemy_01", "Enemy", self.EnemyStartCell, "Left", 100)
+		self.BattlePhase = "PlayerTurn"
+
+		result.Success = true
+		result.Reason = "RESET"
+		log("[BattleReset] completed turn=" .. self.TurnNumber .. " playerCell=" .. self.PlayerStartCell .. " enemyCell=" .. self.EnemyStartCell)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryPush(string sourceUnitId)
+		-- Starts the push presentation, then resolves board displacement at the configured impact frame.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			SourceUnitId = sourceUnitId
+		}
+
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		if self:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if sourceUnit.IsDead == true then
+			result.Reason = "SOURCE_DEAD"
+			return result
+		end
+
+		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourcePresentation ~= nil and sourceEntity.PlayerControllerComponent ~= nil then
+			sourcePresentation:PlayCombatMotion(
+				sourceUnitId,
+				self.PushMotionKey,
+				self.PushActionName,
+				self.PushMotionPlayRate,
+				self.PushMotionDuration
+			)
+		end
+
+		local safeImpactDelay = math.max(0, self.PushImpactDelay)
+		if safeImpactDelay <= 0 then
+			return self:ResolvePushImpact(sourceUnitId)
+		end
+		if self.ImpactTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactTimerId)
+			self.ImpactTimerId = 0
+		end
+
+		local scheduledAt = _UtilLogic.ElapsedSeconds
+		local resolveImpact = function()
+			self.ImpactTimerId = 0
+			local elapsed = _UtilLogic.ElapsedSeconds - scheduledAt
+			log("[BattleImpact] triggered effect=PUSH elapsed=" .. tostring(elapsed))
+			local impactResult = self:ResolvePushImpact(sourceUnitId)
+			if impactResult.Success == false then
+				log_warning("[BattlePush] failed source=" .. sourceUnitId .. " reason=" .. impactResult.Reason)
+			end
+		end
+		self.ImpactTimerId = _TimerService:SetTimerOnce(resolveImpact, safeImpactDelay)
+
+		result.Success = true
+		result.Reason = "IMPACT_PENDING"
+		log("[BattleImpact] scheduled effect=PUSH delay=" .. tostring(safeImpactDelay))
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolvePushImpact(string sourceUnitId)
+		-- Re-resolves the front target and moves it one logical cell away from the source.
+		local result = {
+			Success = false,
+			Hit = false,
+			Reason = "UNKNOWN",
+			SourceUnitId = sourceUnitId,
+			TargetUnitId = "",
+			TargetCell = -1,
+			FromCell = -1,
+			ToCell = -1
+		}
+
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		if self:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if sourceUnit.IsDead == true then
+			result.Reason = "SOURCE_DEAD"
+			return result
+		end
+
+		local direction = -1
+		if sourceUnit.Facing == "Right" then
+			direction = 1
+		end
+		result.TargetCell = sourceUnit.CellIndex + direction
+		local targetEntity = self:ResolveFrontTarget(sourceUnitId)
+		if isvalid(targetEntity) == false then
+			result.Success = true
+			result.Reason = self:IsValidCell(result.TargetCell) and "MISS_EMPTY" or "MISS_OUT_OF_BOUNDS"
+			log("[BattlePush] resolved source=" .. sourceUnitId .. " target= cell=" .. result.TargetCell .. " reason=" .. result.Reason)
+			return result
+		end
+
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		result.Hit = true
+		result.TargetUnitId = targetUnit.UnitId
+		result.FromCell = targetUnit.CellIndex
+		result.ToCell = targetUnit.CellIndex + direction
+		if self:IsValidCell(result.ToCell) == false then
+			result.Success = true
+			result.Reason = "PUSH_BLOCKED_OUT_OF_BOUNDS"
+			log("[BattlePush] resolved source=" .. sourceUnitId .. " target=" .. result.TargetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+			return result
+		end
+		if self:IsCellOccupied(result.ToCell, targetUnit.UnitId) then
+			result.Success = true
+			result.Reason = "PUSH_BLOCKED_OCCUPIED"
+			log("[BattlePush] resolved source=" .. sourceUnitId .. " target=" .. result.TargetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+			return result
+		end
+
+		targetUnit.CellIndex = result.ToCell
+		self:PlaceEntity(targetEntity, self:GetCellPosition(result.ToCell))
+		local movedEvent = UnitMovedEvent()
+		movedEvent.UnitId = targetUnit.UnitId
+		movedEvent.FromCell = result.FromCell
+		movedEvent.ToCell = result.ToCell
+		self.Entity:SendEvent(movedEvent)
+
+		result.Success = true
+		result.Reason = "PUSHED"
+		log("[BattlePush] resolved source=" .. sourceUnitId .. " target=" .. result.TargetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryBasicAttack(string sourceUnitId)
+		-- Supplies the basic slash profile to the shared front-cell attack resolver.
+		return self:TryFrontAttack(
+			sourceUnitId,
+			"basic_slash",
+			self.BasicAttackDamage,
+			self.BasicSlashMotionKey,
+			self.BasicSlashActionName,
+			self.BasicSlashMotionPlayRate,
+			self.BasicSlashMotionDuration,
+			self.BasicSlashImpactDelay
+		)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryHeavySlash(string sourceUnitId)
+		-- Supplies the slower, stronger slash profile without duplicating target or damage rules.
+		return self:TryFrontAttack(
+			sourceUnitId,
+			"heavy_slash",
+			self.HeavySlashDamage,
+			self.HeavySlashMotionKey,
+			self.HeavySlashActionName,
+			self.HeavySlashMotionPlayRate,
+			self.HeavySlashMotionDuration,
+			self.HeavySlashImpactDelay
+		)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryFrontAttack(string sourceUnitId, string attackId, number damageAmount, string motionKey, string actionName, number motionPlayRate, number motionDuration, number impactDelay)
+		-- Starts presentation immediately, then resolves the logical front-cell hit at the attack's impact frame.
+		local result = {
+			Success = false,
+			Hit = false,
+			Reason = "UNKNOWN",
+			SourceUnitId = sourceUnitId,
+			AttackId = attackId,
+			TargetUnitId = "",
+			TargetCell = -1,
+			DamageAmount = 0,
+			TargetHpBefore = -1,
+			TargetHpAfter = -1
+		}
+
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+
+		if self:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+
+		if sourceUnit.IsDead == true then
+			result.Reason = "SOURCE_DEAD"
+			return result
+		end
+
+		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourcePresentation ~= nil and sourceEntity.PlayerControllerComponent ~= nil then
+			sourcePresentation:PlayCombatMotion(
+				sourceUnitId,
+				motionKey,
+				actionName,
+				motionPlayRate,
+				motionDuration
+			)
+		end
+
+		local safeImpactDelay = math.max(0, impactDelay)
+		if safeImpactDelay <= 0 then
+			return self:ResolveFrontAttackImpact(sourceUnitId, attackId, damageAmount)
+		end
+
+		if self.ImpactTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactTimerId)
+			self.ImpactTimerId = 0
+		end
+
+		local scheduledAt = _UtilLogic.ElapsedSeconds
+		local resolveImpact = function()
+			self.ImpactTimerId = 0
+			local elapsed = _UtilLogic.ElapsedSeconds - scheduledAt
+			log("[BattleImpact] triggered attack=" .. attackId .. " elapsed=" .. tostring(elapsed))
+			local impactResult = self:ResolveFrontAttackImpact(sourceUnitId, attackId, damageAmount)
+			if impactResult.Success == false then
+				log_warning("[BattleImpact] failed attack=" .. attackId .. " reason=" .. impactResult.Reason)
+			end
+		end
+		self.ImpactTimerId = _TimerService:SetTimerOnce(resolveImpact, safeImpactDelay)
+
+		result.Success = true
+		result.Reason = "IMPACT_PENDING"
+		log("[BattleImpact] scheduled attack=" .. attackId .. " delay=" .. tostring(safeImpactDelay))
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveFrontAttackImpact(string sourceUnitId, string attackId, number damageAmount)
+		-- Re-reads the source cell and facing at impact time, so damage remains board-state based.
+		local result = {
+			Success = false,
+			Hit = false,
+			Reason = "UNKNOWN",
+			SourceUnitId = sourceUnitId,
+			AttackId = attackId,
+			TargetUnitId = "",
+			TargetCell = -1,
+			DamageAmount = 0,
+			TargetHpBefore = -1,
+			TargetHpAfter = -1
+		}
+
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		if self:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if sourceUnit.IsDead == true then
+			result.Reason = "SOURCE_DEAD"
+			return result
+		end
+
+		local facingDirection = -1
+		if sourceUnit.Facing == "Right" then
+			facingDirection = 1
+		end
+		result.TargetCell = sourceUnit.CellIndex + facingDirection
+
+		local targetEntity = nil
+		if self:IsValidCell(result.TargetCell) then
+			targetEntity = self:ResolveFrontTarget(sourceUnitId)
+		else
+			result.Reason = "MISS_OUT_OF_BOUNDS"
+		end
+
+		if isvalid(targetEntity) then
+			local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+			local damageResult = self:ApplyDamage(sourceUnitId, targetUnit.UnitId, damageAmount)
+			if damageResult.Success == false then
+				result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
+				log_error("[BattleAttack] damage failed source=" .. sourceUnitId .. " target=" .. targetUnit.UnitId .. " reason=" .. damageResult.Reason)
+				return result
+			end
+
+			result.Hit = true
+			result.Reason = "HIT"
+			result.TargetUnitId = targetUnit.UnitId
+			result.DamageAmount = damageResult.AppliedAmount
+			result.TargetHpBefore = damageResult.HpBefore
+			result.TargetHpAfter = damageResult.HpAfter
+		elseif result.Reason == "UNKNOWN" then
+			result.Reason = "MISS_EMPTY"
+		end
+
+		local attackEvent = BasicAttackResolvedEvent()
+		attackEvent.SourceUnitId = result.SourceUnitId
+		attackEvent.AttackId = result.AttackId
+		attackEvent.TargetUnitId = result.TargetUnitId
+		attackEvent.TargetCell = result.TargetCell
+		attackEvent.Hit = result.Hit
+		attackEvent.Reason = result.Reason
+		attackEvent.DamageAmount = result.DamageAmount
+		attackEvent.TargetHpBefore = result.TargetHpBefore
+		attackEvent.TargetHpAfter = result.TargetHpAfter
+		self.Entity:SendEvent(attackEvent)
+
+		result.Success = true
+		log("[BattleAttack] resolved attack=" .. result.AttackId .. " source=" .. result.SourceUnitId .. " facing=" .. sourceUnit.Facing .. " target=" .. result.TargetUnitId .. " cell=" .. result.TargetCell .. " hit=" .. tostring(result.Hit) .. " reason=" .. result.Reason .. " damage=" .. result.DamageAmount .. " hp=" .. result.TargetHpBefore .. "->" .. result.TargetHpAfter)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyDamage(string sourceUnitId, string targetUnitId, number amount)
+		-- Owns the single HP mutation path and forwards the first zero-HP transition to death handling.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			AppliedAmount = 0,
+			HpBefore = -1,
+			HpAfter = -1
+		}
+
+		if amount <= 0 then
+			result.Reason = "INVALID_AMOUNT"
+			return result
+		end
+
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		local targetEntity = self:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		if isvalid(targetEntity) == false then
+			result.Reason = "TARGET_NOT_FOUND"
+			return result
+		end
+
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if sourceUnit.Team == targetUnit.Team then
+			result.Reason = "SAME_TEAM"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+
+		result.HpBefore = targetUnit.CurrentHp
+		result.HpAfter = math.max(0, result.HpBefore - amount)
+		result.AppliedAmount = result.HpBefore - result.HpAfter
+		targetUnit.CurrentHp = result.HpAfter
+		if result.HpAfter <= 0 and targetUnit.IsDead == false then
+			self:HandleUnitDied(targetUnitId, "DAMAGE")
+		end
+
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil and targetEntity.SpriteRendererComponent ~= nil then
+			presentation:PlayHitFlash(targetUnitId)
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[BattleDamage] applied source=" .. sourceUnitId .. " target=" .. targetUnitId .. " amount=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void HandleUnitDied(string unitId, string cause)
+		-- Marks one unit dead exactly once and freezes the battle in a synchronized result phase.
+		local unitEntity = self:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			log_error("[BattleDeath] failed unit=" .. unitId .. " reason=UNIT_NOT_FOUND")
+			return
+		end
+
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			log_error("[BattleDeath] failed unit=" .. unitId .. " reason=COMPONENT_MISSING")
+			return
+		end
+		if unit.IsDead == true then
+			log_warning("[BattleDeath] duplicate ignored unit=" .. unitId)
+			return
+		end
+
+		unit.CurrentHp = math.max(0, unit.CurrentHp)
+		unit.IsDead = true
+		if self.ImpactTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactTimerId)
+			self.ImpactTimerId = 0
+		end
+		self.QueuedActionType = ""
+		self.QueuedActionDirection = 0
+		self.QueuedTileIds = ""
+		self.QueuedTileCount = 0
+		self.ExecutingTileIds = ""
+		self.ExecutingTileIndex = 0
+		self.IsActionProcessing = false
+		self.BattlePhase = "BattleEnded"
+		if unit.Team == "Enemy" then
+			self.BattleResult = "Victory"
+		else
+			self.BattleResult = "Defeat"
+		end
+
+		log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=" .. self.BattleResult)
+		log("[BattleResult] result=" .. self.BattleResult .. " turn=" .. self.TurnNumber)
+	end
+
+	@ExecSpace("ServerOnly")
+	method Entity ResolveFrontTarget(string sourceUnitId)
+		-- Returns a living opposing unit occupying the source unit's front cell.
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			return nil
+		end
+
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			return nil
+		end
+
+		local facingDirection = -1
+		if sourceUnit.Facing == "Right" then
+			facingDirection = 1
+		end
+		local targetCell = sourceUnit.CellIndex + facingDirection
+
+		local candidates = { self.PlayerEntity, self.EnemyEntity }
+		for _, candidate in ipairs(candidates) do
+			if isvalid(candidate) and candidate ~= sourceEntity then
+				local unit = candidate:GetComponent("script.BattleUnitComponent")
+				if unit ~= nil and unit.Team ~= sourceUnit.Team and unit.IsDead == false and unit.CellIndex == targetCell then
+					return candidate
+				end
+			end
+		end
+		return nil
+	end
+
+	@ExecSpace("Server")
+	method void RequestMove(integer direction)
+		-- Validates the requesting client before forwarding the move to battle state.
+		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil then
+			log_warning("[BattleMove] rejected reason=PLAYER_MISSING")
+			return
+		end
+
+		if self.PlayerEntity.PlayerComponent.UserId ~= senderUserId then
+			log_warning("[BattleMove] rejected reason=INVALID_SENDER")
+			return
+		end
+
+		local result = self:TryQueuePlayerAction("MOVE", direction)
+		if result.Success == false then
+			log_warning("[BattleQueue] rejected action=MOVE direction=" .. direction .. " reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryMove(string unitId, integer direction)
+		-- Moves one logical cell after checking phase, range, life, and occupancy.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			FromCell = -1,
+			ToCell = -1
+		}
+
+		if direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+
+		local unitEntity = self:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+
+		if self:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+
+		result.FromCell = unit.CellIndex
+		result.ToCell = unit.CellIndex + direction
+		if unit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+
+		if self:IsValidCell(result.ToCell) == false then
+			result.Reason = "OUT_OF_BOUNDS"
+			return result
+		end
+
+		if self:IsCellOccupied(result.ToCell, unitId) then
+			result.Reason = "CELL_OCCUPIED"
+			return result
+		end
+
+		unit.CellIndex = result.ToCell
+		local position = self:GetCellPosition(result.ToCell)
+		self:PlaceEntity(unitEntity, position)
+
+		local movedEvent = UnitMovedEvent()
+		movedEvent.UnitId = unit.UnitId
+		movedEvent.FromCell = result.FromCell
+		movedEvent.ToCell = result.ToCell
+		self.Entity:SendEvent(movedEvent)
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[BattleMove] success unit=" .. unit.UnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " x=" .. position.x)
+		return result
+	end
+
+	method Entity FindUnitEntity(string unitId)
+		-- Finds one of the currently registered battle entities by logical unit id.
+		local candidates = { self.PlayerEntity, self.EnemyEntity }
+		for _, candidate in ipairs(candidates) do
+			if isvalid(candidate) then
+				local unit = candidate:GetComponent("script.BattleUnitComponent")
+				if unit ~= nil and unit.UnitId == unitId then
+					return candidate
+				end
+			end
+		end
+		return nil
+	end
+
+	method boolean IsCellOccupied(integer cellIndex, string ignoredUnitId)
+		-- Returns whether a living unit other than the requester occupies a cell.
+		local candidates = { self.PlayerEntity, self.EnemyEntity }
+		for _, candidate in ipairs(candidates) do
+			if isvalid(candidate) then
+				local unit = candidate:GetComponent("script.BattleUnitComponent")
+				if unit ~= nil and unit.UnitId ~= ignoredUnitId and unit.IsDead == false and unit.CellIndex == cellIndex then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	method number GetBoardCenterX()
+		-- Calculates the visual center of the current logical battle board.
+		return self.CellStartX + self.CellSpacing * (self.CellCount - 1) * 0.5
+	end
+
+	@ExecSpace("Client")
+	method void LockBoardCamera(number boardCenterX)
+		-- Switches away from the moving player to a fixed board-center camera target.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CameraComponent == nil then
+			log_error("[BattleCamera] local player camera missing")
+			return
+		end
+
+		local anchor = self.Entity:GetChildByName("BattleCameraAnchor", false)
+		if isvalid(anchor) == false or anchor.CameraComponent == nil or anchor.TransformComponent == nil then
+			log_error("[BattleCamera] BattleCameraAnchor missing")
+			return
+		end
+
+		local playerCamera = player.CameraComponent
+		local boardCamera = anchor.CameraComponent
+		local anchorX = anchor.TransformComponent.WorldPosition.x
+		boardCamera.CameraOffset = Vector2(boardCenterX - anchorX, playerCamera.CameraOffset.y)
+		boardCamera.ScreenOffset = playerCamera.ScreenOffset
+		boardCamera.ZoomRatio = playerCamera.ZoomRatio
+		boardCamera.ConfineCameraArea = false
+		boardCamera.Damping = Vector2(0, 0)
+		boardCamera.DeadZone = Vector2(0, 0)
+		boardCamera.SoftZone = Vector2(0, 0)
+
+		_CameraService.TransitionBlendTime = 0
+		_CameraService:SwitchCameraTo(boardCamera)
+		log("[BattleCamera] fixed anchor active centerX=" .. boardCenterX .. " anchorX=" .. anchorX .. " offsetX=" .. boardCamera.CameraOffset.x)
+	end
+
+	method boolean IsValidCell(integer cellIndex)
+		-- Returns whether the logical cell index is inside the six-cell board.
+		return cellIndex >= 0 and cellIndex < self.CellCount
+	end
+
+	method Vector2 GetCellPosition(integer cellIndex)
+		-- Converts a zero-based logical cell index into the current map's world position.
+		local x = self.CellStartX + self.CellSpacing * cellIndex
+		return Vector2(x, self.UnitY)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlaceEntity(Entity targetEntity, Vector2 position)
+		-- Places Body-based players through MovementComponent and static units through TransformComponent.
+		if targetEntity.MovementComponent ~= nil then
+			targetEntity.MovementComponent:SetPosition(position)
+			return
+		end
+
+		if targetEntity.TransformComponent == nil then
+			log_error("[BattleSession] TransformComponent missing entity=" .. targetEntity.Name)
+			return
+		end
+
+		local current = targetEntity.TransformComponent.Position
+		targetEntity.TransformComponent.Position = Vector3(position.x, position.y, current.z)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryStartBattle()
+		-- Enters the first player turn after both required units have registered.
+		if isvalid(self.PlayerEntity) == false or isvalid(self.EnemyEntity) == false then
+			return
+		end
+
+		if self.BattlePhase == "PlayerTurn" then
+			return
+		end
+
+		self.BattlePhase = "PlayerTurn"
+		self.TurnNumber = 1
+		log("[BattleSession] ready phase=" .. self.BattlePhase .. " turn=" .. self.TurnNumber .. " playerCell=" .. self.PlayerStartCell .. " enemyCell=" .. self.EnemyStartCell)
+	end
+
+end
