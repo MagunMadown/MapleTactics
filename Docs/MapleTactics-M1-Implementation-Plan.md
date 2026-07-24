@@ -205,7 +205,7 @@ Lua `pairs` 순서는 규칙에 사용하지 않는다.
 - [ ] EnemyDefinitions/EnemyPatternSteps 로더.
 - [ ] TargetType: FRONT_CELL, FIRST_ENEMY_FORWARD, RANGE_OFFSETS 구현.
 - [ ] ConditionType: ALWAYS, DISTANCE_EQ, HP_RATIO_LE, CELL_FREE 구현.
-- [ ] Enemy Action: MOVE_TOWARD, TURN_TO_PLAYER, TELEGRAPH, EXECUTE_TILE, RETREAT 구현.
+- [ ] Enemy Action: MOVE_TOWARD, TURN_TO_PLAYER, TELEGRAPH, EXECUTE_TILE, RETREAT, MOVE_FIXED_FACING 구현.
 - [ ] ContentValidator의 중복 ID, 참조 무결성, 범위, enum 검사 구현.
 - [ ] CSV만 추가해 타일 2종과 적 2종을 추가하는 제작 테스트.
 
@@ -219,16 +219,21 @@ Lua `pairs` 순서는 규칙에 사용하지 않는다.
 목표: 스테이지 정의만으로 적 배치와 보상 진입을 구성한다.
 
 - [ ] StageDefinitions/StageEnemySpawns 로더.
-- [ ] CellIndex, Facing, SpawnOrder로 유닛 스폰.
+- [ ] CellIndex, Facing, WaveIndex, SpawnOrder로 유닛 스폰.
 - [ ] Stage별 허용 적, 난이도 배수, 보상 풀 연결.
+- [ ] EnemySpawnPools 로더.
+- [ ] StageEnemyWaves 로더 및 TriggerType(ON_WAVE_CLEARED) 처리.
+- [ ] 웨이브 시작 시 결정적 빈 칸 선택 로직 (RunSeed+StageIndex+WaveIndex, 플레이어 좌우 칸 모두 후보).
 - [ ] 보스 Phase 조건과 PatternId 교체.
 - [ ] Pattern만으로 표현할 수 없는 요구가 실제로 발생한 경우에만 BT Spike 수행.
 - [ ] 스테이지 완료 -> 증강 선택 -> 다음 스테이지 전환.
+- [ ] 양방향(플레이어 좌/우 동시 교전) 시나리오 회귀 테스트.
 
 완료 기준:
 
 - StageId만 바꿔 다른 적 조합과 패턴을 로드한다.
 - 동일 Seed/StageId에서 동일한 배치와 보상 후보가 나온다.
+- 웨이브가 진행돼도 좌우 배치와 등장 순서가 동일 Seed에서 동일하게 재현된다.
 
 ### Phase 4 — 직업 4종과 증강
 
@@ -292,7 +297,7 @@ Lua `pairs` 순서는 규칙에 사용하지 않는다.
 
 ### EnemyActionTypes
 
-`WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `TELEGRAPH_TILE`, `EXECUTE_TILE`
+`WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`
 
 ### AugmentTriggers
 
@@ -305,7 +310,7 @@ Lua `pairs` 순서는 규칙에 사용하지 않는다.
 1. 필요한 EnemyId가 존재하는지 확인한다.
 2. 새 행동이 아니라 기존 ActionType 조합으로 가능한지 확인한다.
 3. `StageDefinitions`에 한 행을 추가한다.
-4. `StageEnemySpawns`에 CellIndex와 SpawnOrder를 추가한다.
+4. `StageEnemySpawns`(Wave 0 고정 배치) 또는 `StageEnemyWaves`+`EnemySpawnPools`(후속 웨이브)에 CellIndex/WaveIndex/SpawnOrder를 추가한다.
 5. `StageAugmentPools`에 후보군을 연결한다.
 6. ContentValidator를 실행한다.
 7. 고정 Seed로 플레이해 Intent와 승패를 확인한다.

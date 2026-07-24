@@ -28,6 +28,7 @@ Milestone: M1 playable vertical slice
 - 큐 실행 중 각 타일은 현재 보드에서 타깃을 다시 계산한다.
 - 적의 다음 행동은 플레이어에게 미리 표시된다.
 - 전투 월드 위치와 논리 CellIndex를 분리한다.
+- 적은 플레이어 좌우 어느 빈 칸에도 배치될 수 있어, 방향 전환은 전투 내내 반복적으로 필요한 핵심 조작이다.
 
 ## 4. M1 콘텐츠 범위
 
@@ -40,7 +41,7 @@ Milestone: M1 playable vertical slice
 | 공격 타일 | 8 이상 |
 | 증강 | 12 이상 |
 | 원시 EffectType | 6 |
-| 원시 EnemyActionType | 6 |
+| 원시 EnemyActionType | 7 |
 
 구조 검증은 직업 1종, 적 2종, 보스 1종, 타일 4종, 증강 3종으로 먼저 수행한다. 구조가 통과한 뒤 값으로 목표 수량까지 확장한다.
 
@@ -62,7 +63,12 @@ M1 직업 슬롯:
 - 일반 적은 `EnemyPatternSteps`의 순차 패턴으로 행동한다.
 - 보스는 HP 조건에 따라 PatternId를 바꾼다.
 - BT는 PatternStep으로 표현하기 어려운 요구가 확인된 후에만 도입한다.
-- 스테이지는 EnemyId, CellIndex, Facing, SpawnOrder, AugmentPoolId를 데이터로 정의한다.
+- 적은 `TURN_TO_PLAYER` 포함 여부로 성격이 갈린다 — 포함하면 플레이어 위치를 따라 방향을 바꾸는 추적형, 빼면 `DefaultFacing`을 계속 유지하는 고정 방향형이다.
+- 이동도 같은 원리다 — `MOVE_TOWARD`/`MOVE_AWAY`는 플레이어 상대 위치에 반응하고, `MOVE_FIXED_FACING`은 플레이어 위치와 무관하게 현재 Facing 방향으로만 이동한다.
+- 스테이지는 초기 배치(Wave 0)를 EnemyId, CellIndex, Facing, WaveIndex로 정의한다.
+- 초기 배치 외 후속 웨이브는 `EnemySpawnPools`에서 가중치로 뽑아 좌우 빈 칸에 채우며, 직전 웨이브 전멸 시 다음 웨이브가 시작된다.
+- 웨이브 등장 칸 선택은 RunSeed+StageIndex+WaveIndex 기반 결정적 규칙을 따른다.
+- 스테이지는 AugmentPoolId를 데이터로 정의한다.
 
 ## 7. 증강 원칙
 
@@ -123,3 +129,5 @@ M1 직업 슬롯:
 | 2026-07-17 | 수정 | 일반 적 BT+FSM+Pattern 중첩을 Pattern Runner로 단순화 | 상태 권한 중복과 제작 난이도 감소 | AI 구조 |
 | 2026-07-17 | 추가 | Phase 0 기술 검증 게이트 | 실제 MSW 경계를 본 구현 전에 증명 | 전체 일정 |
 | 2026-07-18 | 수정 | 큰 시스템 단위 로드맵을 화면 중심 마이크로 수직 슬라이스로 세분화 | Maker 화면을 보며 기능 하나씩 이해·검증하고, 실제 두 번째 사례가 생긴 뒤 인터페이스를 추출하기 위함 | Phase 1은 배치→이동→전환→공격→사망→적 행동→턴→타일 큐 순으로 진행. Registry·Dataset·증강은 후속 Phase로 이동 |
+| 2026-07-24 | 수정 | 스테이지 적 배치를 고정 단일 로스터에서 양방향 배치 + 다중 웨이브(`EnemySpawnPools`/`StageEnemyWaves`) 구조로 확장 | 참고작(쇼군 쇼다운)처럼 좌우에서 적이 계속 보충되며 이어지는 전투를 지원 | Data-Dictionary(StageEnemySpawns 수정, EnemySpawnPools·StageEnemyWaves 신설), GDD §3/§6, Implementation-Plan Phase 3 |
+| 2026-07-24 | 추가 | EnemyActionType에 `MOVE_FIXED_FACING` 추가 | 플레이어 위치와 무관하게 한 방향으로만 움직이는 몬스터와, 플레이어를 따라 도는 몬스터를 데이터만으로 구분 표현하기 위함 | Data-Dictionary §7, GDD §4 콘텐츠 수량, Implementation-Plan Phase 2/3 |

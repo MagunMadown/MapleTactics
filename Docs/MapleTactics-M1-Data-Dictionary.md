@@ -10,7 +10,7 @@
 - 빈 셀은 `nil` 또는 `""` 양쪽을 누락으로 처리한다.
 - ID는 ASCII `lower_snake_case`를 기본으로 한다.
 - ID 열은 대소문자를 구분하며 공백을 허용하지 않는다.
-- 순서가 필요한 표는 `Seq`, `StepIndex`, `SpawnOrder` 중 하나를 반드시 가진다.
+- 순서가 필요한 표는 `Seq`, `StepIndex`, `SpawnOrder`, `WaveIndex` 중 하나를 반드시 가진다.
 - 참조 ID는 로드 직후 전체 테이블을 대상으로 무결성 검사한다.
 - `pairs` 순서를 사용하지 않는다. 배열로 수집한 뒤 명시적 키로 정렬한다.
 - 불리언은 `true`/`false` 소문자만 허용한다.
@@ -108,7 +108,9 @@
 | NextStepOnSuccess | integer | - | 비어 있으면 다음 StepIndex |
 | NextStepOnFailure | integer | - | 비어 있으면 다음 StepIndex |
 
-허용 ActionType M1: `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `TELEGRAPH_TILE`, `EXECUTE_TILE`.
+허용 ActionType M1: `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`.
+
+`MOVE_FIXED_FACING`은 플레이어 위치를 참조하지 않고 유닛의 현재 `Facing` 방향으로 1칸 이동한다. 패턴에 `TURN_TO_PLAYER`가 없으면 `DefaultFacing`이 끝까지 유지되어 한 방향 고정형 몬스터가 되고, 있으면 플레이어 위치를 따라 도는 추적형이 된다.
 
 허용 ConditionType M1: `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE`.
 
@@ -135,16 +137,44 @@
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
 | StageId | string | O | StageDefinitions 참조 |
-| SpawnOrder | integer | O | 결정적 생성/행동 동률 순서 |
+| WaveIndex | integer | O | 몇 번째 웨이브 소속인지. `0`은 전투 시작과 동시 고정 배치 |
+| SpawnOrder | integer | O | 같은 Wave 안 결정적 생성/행동 동률 순서 |
 | EnemyId | string | O | EnemyDefinitions 참조 |
 | CellIndex | integer | O | 스테이지 보드 범위 안 |
 | Facing | integer | O | `-1` 또는 `1` |
 | PatternOverrideId | string | - | 특정 배치만 패턴 교체 |
 | HpMultiplier | number | O | 0보다 큼 |
 
-같은 StageId에서 CellIndex 중복 점유를 허용하지 않는다.
+같은 StageId·WaveIndex에서 CellIndex 중복 점유를 허용하지 않는다. `WaveIndex=0` 행은 플레이어 좌/우 양쪽 CellIndex에 모두 배치될 수 있다 — 기존 데이터는 전부 `WaveIndex=0`으로 채우면 하위호환된다.
 
-## 10. AugmentDefinitions
+## 10. EnemySpawnPools
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| PoolId | string | O | 스폰 후보 풀 ID |
+| EnemyId | string | O | EnemyDefinitions 참조 |
+| Weight | integer | O | 1 이상 |
+| MinWaveIndex | integer | O | 최소 등장 웨이브 |
+| MaxWaveIndex | integer | O | 최대 등장 웨이브 |
+
+기본 키: `(PoolId, EnemyId)`는 유일해야 한다. `StageAugmentPools`와 동일한 가중치 후보 풀 구조를 재사용한다.
+
+## 11. StageEnemyWaves
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| StageId | string | O | StageDefinitions 참조 |
+| WaveIndex | integer | O | `1`부터 시작하는 후속 웨이브 순서 |
+| TriggerType | enum | O | 웨이브 시작 조건 |
+| EnemyPoolId | string | O | EnemySpawnPools 참조 |
+| SpawnCount | integer | O | 이번 웨이브에 등장할 적 수 |
+| MaxConcurrent | integer | O | 보드에 동시 존재 가능한 최대 적 수 |
+
+허용 TriggerType M1: `ON_WAVE_CLEARED` (직전 WaveIndex의 모든 적이 죽으면 시작).
+
+웨이브가 시작되면 그 시점의 빈 칸을 CellIndex 오름차순으로 모은 뒤 `RunSeed + StageIndex + WaveIndex` 기반 결정적 RNG로 `SpawnCount`개를 뽑는다. 플레이어가 서 있는 칸과 이미 점유된 칸은 후보에서 제외하며, 플레이어 좌/우 양쪽 칸이 모두 후보에 포함된다. `MaxConcurrent`를 넘는 스폰 요청은 빈 칸이 다시 생길 때까지 대기한다.
+
+## 12. AugmentDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -158,7 +188,7 @@
 | JobTagFilter | string | - | 비어 있으면 모든 직업 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-## 11. AugmentEffects
+## 13. AugmentEffects
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -176,7 +206,7 @@
 
 허용 TriggerType M1: `TURN_START`, `COMMAND_ACCEPTED`, `TILE_QUEUED`, `BEFORE_TILE_EXECUTE`, `AFTER_DAMAGE`, `UNIT_MOVED`, `ENEMY_DIED`, `STAGE_CLEARED`.
 
-## 12. StageAugmentPools
+## 14. StageAugmentPools
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -187,7 +217,7 @@
 | MaxStageIndex | integer | O | 최대 등장 스테이지 |
 | RequiredJobTag | string | - | 직업 태그 조건 |
 
-## 13. AugmentConflicts
+## 15. AugmentConflicts
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -197,7 +227,7 @@
 
 충돌은 방향과 무관하게 취급한다. Validator는 A->B만 있어도 B->A를 런타임 인덱스에 함께 등록한다.
 
-## 14. Validator 오류 코드
+## 16. Validator 오류 코드
 
 | 코드 | 의미 | 전투 시작 차단 |
 |---|---|:---:|
@@ -211,6 +241,8 @@
 | DATA_DUPLICATE_ORDER | 같은 부모 안 순서 키 중복 | O |
 | DATA_CELL_OCCUPIED | 스테이지 시작 셀 중복 | O |
 | DATA_DISABLED_REFERENCE | 활성 콘텐츠가 비활성 콘텐츠 참조 | O |
+| DATA_SPAWN_POOL_EMPTY | EnemySpawnPools의 PoolId에 활성 EnemyId가 하나도 없음 | O |
+| DATA_SPAWN_COUNT_EXCEEDS_BOARD | StageEnemyWaves의 SpawnCount가 BoardSize보다 큼 | O |
 | DATA_UNUSED_ROW | 어디에서도 참조되지 않는 활성 행 | X, 경고 |
 
 로그 예시:
@@ -219,7 +251,7 @@
 [DATA_MISSING_REFERENCE] Dataset=TileEffects Row=7 Column=TileId Value=unknown_tile
 ```
 
-## 15. 새 데이터 추가 완료 기준
+## 17. 새 데이터 추가 완료 기준
 
 - Maker에서 wrapper와 CSV가 한 쌍으로 인식된다.
 - Runtime name이 로더에 등록된 이름과 일치한다.
