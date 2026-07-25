@@ -24,6 +24,11 @@ script BattleSessionComponent extends Component
 	@Sync property integer StageNumber = 1
 	@Sync property string StageId = "stage01"
 	@Sync property integer RunSeed = 1000
+	@Sync property integer EntryRequestId = 0
+	@Sync property string EntryMode = ""
+	@Sync property string SelectedCharacterId = ""
+	@Sync property string SelectedJobId = ""
+	@Sync property string SelectedLoadoutId = ""
 	@Sync property integer StageTurnNumber = 0
 	@Sync property integer CurrentWave = 0
 	@Sync property integer TotalWaves = 3
@@ -77,6 +82,7 @@ script BattleSessionComponent extends Component
 	property string CurrentEnemyPatternId = ""
 	property string CurrentEnemyMovementPolicy = ""
 	property number WaveTransitionDelay = 0.60
+	property boolean AutoStartPrototypeBattle = true
 	property string LeftEnemyEntityName = "BattleEnemyLeft"
 	property string RightEnemyEntityName = "BattleEnemyRight"
 	property Entity PlayerEntity = nil
@@ -141,8 +147,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
-		-- Initializes the map-scoped battle session and starts Stage 1 by spawning Wave 1.
-		log("[BattleSession] begin map=" .. self.Entity.Name .. " cells=" .. self.CellCount)
+		-- Initializes the map-scoped session. Prototype maps may still opt into automatic Stage 1 start.
+		log("[BattleSession] begin map=" .. self.Entity.Name .. " cells=" .. self.CellCount .. " autoStart=" .. tostring(self.AutoStartPrototypeBattle))
 		local boardState = self:EnsureBoardStateComponent()
 		if boardState == nil then
 			log_error("[BattleSession] BoardStateComponent unavailable")
@@ -150,6 +156,10 @@ script BattleSessionComponent extends Component
 		end
 		boardState:ResetRegistry("SESSION_BEGIN")
 
+		if self.AutoStartPrototypeBattle == false then
+			log("[BattleSession] waiting for BattleGateway entry")
+			return
+		end
 		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
 		if users ~= nil then
 			for _, player in ipairs(users) do
@@ -223,6 +233,18 @@ script BattleSessionComponent extends Component
 			return
 		end
 
+		local entryState = enteredEntity:GetComponent("script.BattleEntryStateComponent")
+		if entryState ~= nil and entryState.EntryState == "PREPARED" then
+			local entryResult = _BattleGatewayLogic:ConsumePreparedBattle(enteredEntity, self)
+			if entryResult.Success == true then
+				return
+			end
+			log_warning("[BattleSession] prepared entry fallback request=" .. entryState.RequestId .. " reason=" .. entryResult.Reason)
+		end
+		if self.AutoStartPrototypeBattle == false then
+			log("[BattleSession] player waiting for prepared entry player=" .. enteredEntity.Name)
+			return
+		end
 		self:RegisterPlayer(enteredEntity)
 		self:TryStartBattle()
 	end
@@ -230,8 +252,15 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void StartStage(integer stageNumber)
 		-- Loads the stage wave table and starts Wave 1 through the same runtime spawn path.
+		local normalizedStageNumber = math.max(1, stageNumber)
+		self:StartStageById(string.format("stage%02d", normalizedStageNumber), normalizedStageNumber)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void StartStageById(string stageId, integer stageNumber)
+		-- Starts one exact StageId so external lobby and selection systems do not depend on numeric formatting.
 		self.StageNumber = math.max(1, stageNumber)
-		self.StageId = string.format("stage%02d", self.StageNumber)
+		self.StageId = stageId
 		local configuredWaves = _StageWaveRepositoryLogic:GetTotalWaveCount(self.StageId)
 		if configuredWaves > 0 then
 			self.TotalWaves = configuredWaves
@@ -1616,8 +1645,88 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table InitializeFromEntry(Entity playerEntity, string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode, integer requestId)
+		-- Public map-session initializer used only through BattleGatewayLogic.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			RequestId = requestId,
+			StageId = stageId
+		}
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			result.Reason = "INVALID_PLAYER"
+			return result
+		end
+		if stageId == nil or stageId == "" then
+			result.Reason = "INVALID_STAGE_ID"
+			return result
+		end
+		local configuredWaves = _StageWaveRepositoryLogic:GetTotalWaveCount(stageId)
+		if configuredWaves <= 0 then
+			result.Reason = "STAGE_DEFINITION_NOT_FOUND"
+			return result
+		end
+		if entryMode ~= "NEW_RUN" and entryMode ~= "CONTINUE_RUN" then
+			result.Reason = "INVALID_ENTRY_MODE"
+			return result
+		end
+
+		local runState = nil
+		if entryMode == "NEW_RUN" then
+			runState = _RunManagerLogic:StartNewRun(playerEntity, runSeed)
+		else
+			runState = _RunManagerLogic:EnsureRunState(playerEntity, runSeed)
+		end
+		if runState == nil then
+			result.Reason = "RUN_STATE_UNAVAILABLE"
+			return result
+		end
+
+		local stageNumberText = string.match(stageId, "%d+")
+		local stageNumber = tonumber(stageNumberText) or runState.CurrentStageNumber
+		self.StageId = stageId
+		self.StageNumber = math.max(1, stageNumber)
+		self.TotalWaves = configuredWaves
+		self.RunSeed = runState.RunSeed
+		self.EntryRequestId = requestId
+		self.EntryMode = entryMode
+		self.SelectedCharacterId = characterId or ""
+		self.SelectedJobId = jobId or ""
+		self.SelectedLoadoutId = loadoutId or ""
+		self:RegisterPlayer(playerEntity)
+
+		local rebuildResult = self:RebuildBattleState("BATTLE_ENTRY")
+		result.Success = rebuildResult.Success
+		result.Reason = rebuildResult.Reason
+		log("[BattleSession] entry initialized request=" .. requestId .. " stage=" .. self.StageId .. " character=" .. self.SelectedCharacterId .. " job=" .. self.SelectedJobId .. " loadout=" .. self.SelectedLoadoutId .. " seed=" .. self.RunSeed .. " mode=" .. self.EntryMode .. " success=" .. tostring(result.Success))
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetBattleSnapshot()
+		-- Stable read model for server-side lobby, waiting, result, and flow controllers.
+		return {
+			Success = true,
+			Reason = "OK",
+			EntryRequestId = self.EntryRequestId,
+			EntryMode = self.EntryMode,
+			StageId = self.StageId,
+			StageNumber = self.StageNumber,
+			RunSeed = self.RunSeed,
+			CharacterId = self.SelectedCharacterId,
+			JobId = self.SelectedJobId,
+			LoadoutId = self.SelectedLoadoutId,
+			BattlePhase = self.BattlePhase,
+			BattleResult = self.BattleResult,
+			TurnNumber = self.TurnNumber,
+			CurrentWave = self.CurrentWave,
+			TotalWaves = self.TotalWaves
+		}
+	end
+
+	@ExecSpace("ServerOnly")
 	method table RebuildBattleState(string reason)
-		-- Clears transient battle state, then rebuilds Stage 1 through the normal spawn path.
+		-- Clears transient battle state, then rebuilds the selected Stage through the normal spawn path.
 		local result = {
 			Success = false,
 			Reason = "UNKNOWN"
@@ -1659,7 +1768,7 @@ script BattleSessionComponent extends Component
 		self:CleanupRegisteredEnemies(reason)
 		self.PlayerEntity = playerEntity
 		self:ConfigureUnit(playerEntity, "player_01", "Player", self.PlayerStartCell, "Right", 100, 1)
-		self:StartStage(1)
+		self:StartStageById(self.StageId, self.StageNumber)
 
 		result.Success = true
 		result.Reason = reason
