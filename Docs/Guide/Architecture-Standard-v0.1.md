@@ -235,6 +235,26 @@ Runtime Entity와 Timer를 보관하지 않는다.
 - Executor는 다른 Executor를 직접 호출하지 않는다.
 - 복수 Effect 순서는 `SkillExecutionComponent`가 조정한다.
 
+### 6.8 BattleGatewayLogic — 구현됨
+
+메인 UI, 대기 화면, 캐릭터 선택, 맵 이동 시스템이 사용하는 전투 진입 Facade다.
+플레이어별 Pending 정보는 `BattleEntryStateComponent`가 소유하고 Gateway Logic은
+상태를 직접 보관하지 않는다.
+
+외부 호출 규격은
+[`Battle-Integration-API.md`](./Battle-Integration-API.md)를 따른다.
+
+### 6.9 BattleEntryStateComponent — 구현됨
+
+- StageId, CharacterId, JobId, LoadoutId, RunSeed Snapshot
+- `NEW_RUN` 또는 `CONTINUE_RUN`
+- `IDLE → PREPARED → STARTED` 입장 상태
+- 플레이어별 증가하는 RequestId
+- 실패 및 취소 Reason
+
+MSW 컴포넌트는 외부에서 생성자를 호출하지 않는다. Gateway가 플레이어에 컴포넌트를
+찾거나 추가하고, `Prepare(...)`와 `BattleSession.InitializeFromEntry(...)`를 사용한다.
+
 ---
 
 ## 7. 메서드 명명과 공통 결과
@@ -711,6 +731,8 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 | 현재 구현 | 규격상 위치 | 처리 |
 |---|---|---|
 | `BattleSessionComponent` | Session + Turn + Wave + Skill 임시 통합 | 단계적 분리 |
+| `BattleGatewayLogic` | 외부 시스템 전투 진입 Facade | 유지 |
+| `BattleEntryStateComponent` | 플레이어별 Pending 전투 입장 | 유지 |
 | `BattleUnitComponent` | Unit Runtime State | 유지 |
 | `BoardStateComponent` | Board Registry | 유지 |
 | `BattleUnitPresentationComponent` | Presentation | 유지 |
@@ -737,4 +759,3 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 
 규격 문서와 코드가 다르면 코드를 임의로 따라가지 않는다. 구현 오류인지 규격 변경인지
 먼저 결정하고, 승인된 규격 변경만 문서 버전을 올려 반영한다.
-

@@ -730,3 +730,28 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 - Maker 실제 승리 검증: `BattleResult=Victory`, `LastBattleResult=Victory`, 완료 스테이지 `1`, 다음 스테이지 `2`, `runRecorded=true`
 - Build Console: 중단 Error/Warning `0`; 최종 runtime Error/Warning `0`
 - 다음 확장: Stage 2 전환 또는 Run Seed 생성 정책과 DataStorage 영구 저장
+
+### 2026-07-25 — 메인 UI·대기·캐릭터 선택용 Battle Gateway
+
+- 상태: ✅ Tested
+- 새 파일:
+  - `01_Combat/Resolvers/BattleGatewayLogic.mlua`
+  - `01_Combat/Components/Shared/BattleEntryStateComponent.mlua`
+  - `Docs/Guide/Battle-Integration-API.md`
+- 외부 진입 Facade:
+  - Client 동일 맵 즉시 시작: `RequestBeginBattle(...)`
+  - Client 준비/이동 분리: `RequestPrepareBattleEntry(...)` → `RequestStartPreparedBattle()`
+  - Server 준비/시작: `PrepareBattleEntry`, `StartPreparedBattle`, `BeginBattle`
+  - 취소와 조회: `CancelBattleEntry`, `GetBattleEntrySnapshot`
+- 플레이어별 Entry Snapshot: StageId, CharacterId, JobId, LoadoutId, RunSeed, EntryMode, RequestId
+- 상태 흐름: `IDLE → PREPARED → STARTED`; 취소 시 `CANCELLED`
+- Session 공개 초기화: Gateway 전용 `InitializeFromEntry(...)`, Server 조회용 `GetBattleSnapshot()`
+- Stage 시작: 숫자 전용 `StartStage` 외에 정확한 ID를 받는 `StartStageById` 추가
+- Prototype 호환: `AutoStartPrototypeBattle=true`는 기존 Play 즉시 시작 유지, 실제 UI 연동 맵은 `false` 권장
+- Maker Server 검증: `BeginBattle`로 `character_test_01 / warrior / starter_loadout / seed 4321` 전달 후 `STARTED`, `PlayerTurn`, Wave `1/3`
+- Maker Client RPC 검증:
+  - 분리 호출 `RequestPrepareBattleEntry → RequestStartPreparedBattle` 성공
+  - 단일 Facade 호출 `RequestBeginBattle` 성공
+  - 최종 Snapshot `character_facade_01 / mage / facade_loadout / seed 6001`, `STARTED`, `PlayerTurn`, Wave `1/3`
+- Build Console: 중단 Error/Warning `0`; 최종 runtime Error/Warning `0`
+- 아직 하지 않음: StageId→Map/Instance 이동, Character/Job/Loadout 실제 전투 데이터 적용, 전투 종료 후 보상·로비 이동

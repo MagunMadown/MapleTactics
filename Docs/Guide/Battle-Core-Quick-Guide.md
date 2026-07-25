@@ -2,6 +2,8 @@
 
 공동 개발 시 상태 소유권, 스키마와 확장 절차는
 [`Architecture-Standard-v0.1.md`](./Architecture-Standard-v0.1.md)를 우선 기준으로 사용한다.
+메인 UI·대기·캐릭터 선택 시스템의 전투 호출은
+[`Battle-Integration-API.md`](./Battle-Integration-API.md)를 따른다.
 
 ## 1. 현재 구현 범위
 
@@ -43,7 +45,8 @@ RootDesk/MyDesk/
 │   │       ├── BattleUnitPresentationComponent.mlua
 │   │       └── BattleTileColor.mlua
 │   ├── Resolvers/
-│   │   └── EffectRouterLogic.mlua
+│   │   ├── EffectRouterLogic.mlua
+│   │   └── BattleGatewayLogic.mlua
 │   └── Events/
 │       ├── BasicAttackResolvedEvent.mlua
 │       ├── UnitMovedEvent.mlua
@@ -64,6 +67,9 @@ RootDesk/MyDesk/
 ui/
 └── BattleQueueHUD.ui
 ```
+
+플레이어별 Pending 전투 요청은
+`01_Combat/Components/Shared/BattleEntryStateComponent.mlua`에 저장한다.
 
 `01_Combat/Components/Shared`에는 플레이어와 적이 공통으로 사용하거나 전투 맵 전체에서 사용하는 컴포넌트를 둔다. 플레이어 전용 또는 적 전용 동작이 생기면 각각 `Player`, `Enemy` 하위 폴더를 추가한다.
 
