@@ -119,6 +119,7 @@
 - 일반 적 `EnemyPatternRunnerComponent`
 - Intent 생성과 Client 전송, Intent HUD
 - StageDefinition/Spawn/Rule/Victory 조립
+- StageEnemyWaves의 전멸 기본 진행과 턴/시간 제한 강제 증원, 겹친 웨이브 수명 추적
 - 보스는 Pattern + HP Phase부터 구현하고 BT는 실제 분기 요구가 확인된 경우에만 도입
 
 통과 조건:
@@ -126,6 +127,7 @@
 - Intent 표시와 실제 Range/Action 일치
 - 일반 적 2종과 보스 1종이 Definition/Pattern으로 동작
 - 스테이지 전용 Manager나 EnemyId별 분기 없음
+- `TURN_LIMIT`에서 지정 턴 전에는 증원이 없고 턴 경계에서 정확히 한 번 생성되며, 마지막 웨이브 출현 후 전체 적 전멸 전에는 Victory가 발생하지 않음
 
 ### Gate 4 - 증강 3택 수직 슬라이스
 

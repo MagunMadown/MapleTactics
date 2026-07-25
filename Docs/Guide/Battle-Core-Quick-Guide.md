@@ -1,18 +1,23 @@
 # 기본 전투 코어 간단 가이드
 
+공동 개발 시 상태 소유권, 스키마와 확장 절차는
+[`Architecture-Standard-v0.1.md`](./Architecture-Standard-v0.1.md)를 우선 기준으로 사용한다.
+
 ## 1. 현재 구현 범위
 
-현재 전투 코어는 6칸 전투 보드에서 플레이어와 더미 적의 초기 상태를 만들고 화면 위치를 논리 셀과 맞추는 단계다.
+현재 전투 코어는 6칸 전투 보드에서 플레이어와 좌우의 초반 적 두 명을 배치하고 화면 위치를 논리 셀과 맞추는 단계다.
 
-- 플레이어: 셀 `1`, 오른쪽 방향, HP 100
-- 적: 셀 `4`, 왼쪽 방향, HP 100
-- 전투 시작 상태: `PlayerTurn`, 1턴; 플레이어 행동 뒤 `EnemyTurn`을 거쳐 다음 턴으로 복귀
+- 플레이어: 셀 `2`, 오른쪽 방향, HP 100
+- 왼쪽 적: 셀 `0`, 오른쪽 방향, HP 6
+- 오른쪽 적: 셀 `5`, 왼쪽 방향, HP 6
+- 전투 시작 상태: `PlayerTurn`, 1턴; 플레이어 행동 뒤 생존 적이 `SpawnOrder` 순으로 한 번씩 행동하고 다음 턴으로 복귀
 - 셀 번호: `0`부터 `5`까지 사용
 - 좌·우 한 칸 이동과 `UnitMovedEvent` 구현
 - 이동 없는 방향 전환과 `UnitTurnedEvent` 구현
 - 바라보는 앞 셀의 공용 공격 Hit/Miss 판정과 공격 ID가 포함된 `BasicAttackResolvedEvent` 구현
 - 기본 베기 피해 3, 강한 베기 피해 6을 같은 `ApplyDamage` 경로로 적용
 - 앞 셀의 대상을 한 칸 밀고 이후 타일이 변경된 보드에서 다시 타깃을 찾는 `push` 타일
+- `DAMAGE`와 `PUSH`를 기존 판정 함수로 전달하는 최소 `EffectRouterLogic`
 - 적 모델의 머리 위에 동기화된 `HP 현재 / 최대` 월드 텍스트 표시
 - 설정 가능한 색상과 지속시간을 사용하는 피격 플래시
 - 공격마다 고정 ActionName·속도·지속시간을 사용하는 설정형 아바타 모션
@@ -21,19 +26,24 @@
 - 기본 용량 2인 가변 타일 큐에 `basic_slash`·`heavy_slash`·`push`를 순서대로 등록·실행·전체 비우기 하는 하단 중앙 `BattleQueueHUD`
 - HP 0 사망 판정, `VICTORY`/`DEFEAT` 결과 고정, 현재 전투를 초기화하는 `다시 시작` 버튼
 - 적이 멀면 한 칸 접근하고 인접하면 기본 공격하는 최소 Intent
-- 적 Intent UI, 적 전용 모션, HP Bar, 별도 무기 이펙트는 아직 구현하지 않음
+- 플레이어 턴 시작 전에 적 행동을 `PreparedIntent`로 고정하고 HUD에 `접근` 또는 `기본 베기`로 표시
+- 한 적이 죽어도 다른 적이 살아 있으면 전투를 계속하고, 모든 적이 죽었을 때만 `VICTORY`
+- 적 전용 모션, HP Bar, 별도 무기 이펙트와 Intent 아이콘은 아직 구현하지 않음
 
 ## 2. 파일 구조
 
 ```text
 RootDesk/MyDesk/
 ├── 01_Combat/
-│   └── Components/
-│       └── Shared/
-│           ├── BattleSessionComponent.mlua
-│           ├── BattleUnitComponent.mlua
-│           ├── BattleUnitPresentationComponent.mlua
-│           └── BattleTileColor.mlua
+│   ├── Components/
+│   │   └── Shared/
+│   │       ├── BattleSessionComponent.mlua
+│   │       ├── BoardStateComponent.mlua
+│   │       ├── BattleUnitComponent.mlua
+│   │       ├── BattleUnitPresentationComponent.mlua
+│   │       └── BattleTileColor.mlua
+│   ├── Resolvers/
+│   │   └── EffectRouterLogic.mlua
 │   └── Events/
 │       ├── BasicAttackResolvedEvent.mlua
 │       ├── UnitMovedEvent.mlua
@@ -41,6 +51,10 @@ RootDesk/MyDesk/
 ├── 05_UI/
 │   └── HUD/
 │       └── BattleQueueHudComponent.mlua
+├── 04_Roguelike/
+│   └── RunManager/
+│       ├── PlayerRunStateComponent.mlua
+│       └── RunManagerLogic.mlua
 └── Models/
     ├── Characters/
     │   └── BattleDummyEnemy.model
@@ -68,10 +82,32 @@ ui/
 - `TileQueueCapacity`까지 타일을 순서대로 등록하고 전체 큐가 끝날 때까지 적 턴 전환을 보류
 - `QueuedTileIds`, `ExecutingTileIds`, `ExecutingTileIndex`로 등록 큐와 실행 큐를 분리
 - 두 공격이 공유하는 `TryFrontAttack → ResolveFrontAttackImpact` 모션·타깃·피해·이벤트 경로
-- 플레이어 행동 완료 후 적 Intent 실행과 다음 Turn 개방
+- `Prepare → Hold → Execute → Complete`로 적 Intent를 준비·유지·실행하고 다음 Turn 개방
+- 밀치기 등으로 보드가 바뀌어도 준비한 ActionType/TileId는 유지하고 실행 시 현재 셀에서 명중 판정
 - HP 0 최초 전환의 사망·승패 확정과 현재 Entity를 재사용하는 전투 Reset
 
 전투는 Play 시작 시 자동으로 초기화되므로 현재 단계에서는 별도로 메서드를 호출할 필요가 없다.
+
+새 Run은 `BattleSessionComponent.StartNewRun(seed)`로 시작한다. 이 메서드는 `RunManagerLogic`을 통해 플레이어의 `PlayerRunStateComponent`를 초기화한 뒤 같은 Seed로 Stage 1/Wave 1을 다시 구성한다. 전투 맵의 `RunSeed`는 계산에 쓰는 복사본이며 원본 소유자는 플레이어의 Run 상태다.
+
+### PlayerRunStateComponent와 RunManagerLogic
+
+`PlayerRunStateComponent`는 플레이어별 Run 상태의 원본이다. `RunSeed`, `RunSequence`, `RunState`, `CurrentStageNumber`, `CompletedStageCount`, `LastBattleResult`를 보관한다.
+
+`RunManagerLogic`은 이 컴포넌트를 찾고 호출하는 무상태 조정자다. 전역 Logic 안에 특정 사용자의 진행 값을 저장하지 않으므로 이후 map02에서도 같은 플레이어 컴포넌트를 읽어 Run을 이어갈 수 있다. Stage 1 승리 시 현재 구현은 `CompletedStageCount=1`, `CurrentStageNumber=2`, `LastBattleResult=Victory`를 기록한다.
+
+### BoardStateComponent
+
+전투 맵 수명 동안 모든 참가자를 `UnitId`로 등록하고, 셀 점유와 생존 적 목록을 제공하는 서버 전용 Registry다. `BattleSessionComponent`가 Play 시작 시 맵 루트에 한 번 추가하고 유닛 설정 직후 자동 등록한다.
+
+- `RegisterUnit(entity)`: 설정이 끝난 `BattleUnitComponent` 등록 또는 갱신
+- `UnregisterUnit(unitId)`: 런타임 Despawn 전에 등록 해제
+- `FindByUnitId(unitId)`: 사망 여부와 관계없이 Entity 조회
+- `FindAtCell(cellIndex, ignoredUnitId)`: 해당 셀의 살아 있는 유닛 조회
+- `CollectLivingEnemies()`: 살아 있는 적을 안정된 순서로 수집
+- `CollectRegisteredUnits()`: 모든 유닛을 `SpawnOrder`, 동률이면 `UnitId` 순으로 정렬
+
+새 적을 추가할 때는 고유 `UnitId`와 `SpawnOrder`를 먼저 지정한 다음 `RegisterUnit`을 호출한다. 셀 충돌이나 공격 대상을 찾을 때 별도의 Entity 배열을 만들지 말고 이 Registry를 사용한다.
 
 ### BattleUnitComponent
 
@@ -81,6 +117,7 @@ ui/
 |---|---|
 | `UnitId` | 전투 내부 유닛 식별자 |
 | `Team` | `Player` 또는 `Enemy` |
+| `SpawnOrder` | 여러 유닛의 결정적 처리 순서 |
 | `CellIndex` | 현재 논리 셀 번호 |
 | `Facing` | `Left` 또는 `Right` |
 | `MaxHp` | 최대 HP |
@@ -105,6 +142,15 @@ ui/
 
 현재 `basic_slash`의 설정은 `BattleSessionComponent.BasicSlashMotionKey`, `BasicSlashActionName`, `BasicSlashMotionPlayRate`, `BasicSlashMotionDuration`, `BasicSlashImpactDelay`에서 교체할 수 있다. `BasicSlashActionName`은 `swingO1`로 고정되어 같은 타일을 반복해도 같은 모션을 재생한다. 예를 들어 다른 스킬의 ActionName을 `swingO2`로 지정하면 피해 로직과 분리된 다른 모션을 사용할 수 있다.
 
+### EffectRouterLogic
+
+서버에서 원시 EffectType을 기존 전투 상태 변경 함수로 전달하는 작은 무상태 Router다.
+
+- `DAMAGE` → `BattleSessionComponent.ApplyDamage`
+- `PUSH` → `BattleSessionComponent.ResolvePushImpact`
+
+Router는 HP나 CellIndex를 직접 변경하지 않는다. `[BattleEffectRouter] dispatch/resolved` 로그로 실제 분기와 결과를 확인하며, 아직 `DAMAGE`와 `PUSH` 외 EffectType은 거절한다.
+
 `ImpactDelay`는 모션 시작 후 실제 셀 판정과 피해가 발생할 때까지의 시간이다. 기본 베기는 `0.18`, 강한 베기는 `0.38`이며 반드시 해당 공격의 `MotionDuration`과 `ActionDuration`보다 짧게 둔다. 이 값만 조정하면 애니메이션에서 무기가 닿는 프레임과 피해 시점을 맞출 수 있다.
 
 커스텀 액션 이름은 실제 아바타가 지원하는 Action ID여야 한다. 활의 `shoot1`처럼 장비가 필요한 자세는 모션뿐 아니라 해당 무기도 장착해야 자연스럽게 표시된다.
@@ -115,7 +161,7 @@ ui/
 
 ### BattleQueueHudComponent
 
-`BattleQueueHUD.ui`에 연결된 클라이언트 UI 컴포넌트다. `BattleSessionComponent`의 동기화 속성을 읽어 `TURN`, 등록 타일, Phase와 처리 상태를 표시하고, 버튼 클릭을 서버 요청으로 전달한다. 전투 판정은 계속 `BattleSessionComponent`가 담당하므로 UI 이미지·색상·배치를 교체해도 피해 규칙은 바뀌지 않는다.
+`BattleQueueHUD.ui`에 연결된 클라이언트 UI 컴포넌트다. `BattleSessionComponent`의 동기화 속성을 읽어 `TURN`, 등록 타일, Phase, 처리 상태와 준비된 적 행동을 표시하고, 버튼 클릭을 서버 요청으로 전달한다. 전투 판정은 계속 `BattleSessionComponent`가 담당하므로 UI 이미지·색상·배치를 교체해도 피해 규칙은 바뀌지 않는다.
 
 - `기본 공격 타일`: 남은 슬롯에 `basic_slash` 추가
 - `강한 베기 타일`: 남은 슬롯에 `heavy_slash` 추가
@@ -125,7 +171,9 @@ ui/
 
 버튼 활성 상태도 동기화된다. 플레이어 턴에는 큐가 가득 차기 전까지 타일을 계속 추가할 수 있고, 한 개 이상 등록되면 실행·전체 비우기 버튼을 사용할 수 있다. 기본 `TileQueueCapacity=2`이며 이 값을 3 이상으로 바꿔도 큐 저장·검증·순차 실행과 HUD의 `현재/용량` 표시는 그대로 확장된다.
 
-적 HP가 0이 되면 적 Sprite와 HP 텍스트가 숨겨지고 중앙에 `VICTORY`와 `다시 시작` 버튼이 나타난다. 플레이어 HP가 0이면 `DEFEAT`가 표시된다. Reset 후 결과 패널은 다시 숨겨지고 양쪽 HP 100, 시작 셀, 시작 방향, Turn 1로 복원된다.
+적 HP가 0이 되면 해당 적 Sprite와 HP 텍스트만 숨겨진다. 다른 적이 살아 있으면 전투를 계속하고, 모든 적의 HP가 0이 된 뒤 중앙에 `VICTORY`와 `다시 시작` 버튼이 나타난다. 플레이어 HP가 0이면 `DEFEAT`가 표시된다. Reset 후 결과 패널은 다시 숨겨지고 플레이어 HP 100, 두 적 HP 6, 시작 셀과 방향, Turn 1로 복원된다.
+
+초반 적 체력은 `BattleSessionComponent.EarlyStageEnemyMaxHp`에서 조정한다. 현재 값 `6`은 기본 베기(피해 3) 두 번 또는 강한 베기(피해 6) 한 번에 처치되는 기준이다. 이후 스테이지별 수치표를 도입할 때 이 설정을 Dataset 값으로 교체한다.
 
 ## 4. 셀과 화면 좌표
 
@@ -184,11 +232,17 @@ WorldY = 0.12
 
 화면 하단의 `BattleQueueHUD`는 `빈 큐 (0/2)`, `[밀치기] → [기본 베기] (2/2)`처럼 전체 순서를 표시한다. 실행 중인 타일에는 `▶`가 붙고 상태 문구에는 현재 실행 인덱스가 표시된다. 등록된 타일이 있을 때 키보드 즉시 행동은 `TILE_QUEUE_OCCUPIED`로 거절된다.
 
-현재 적 Intent는 두 종류뿐이다. 플레이어와 거리가 두 칸 이상이면 플레이어 방향으로 한 칸 이동하고, 바로 옆 셀이면 같은 `TryBasicAttack → ApplyDamage` 경로로 플레이어를 공격한다. 별도 BT나 범용 AI 프레임워크는 아직 만들지 않았다.
+적 이동 방식은 `BattleSessionComponent.EnemyMovementPolicy`에서 선택한다. 기본값 `TRACK_PLAYER`는 플레이어가 현재 Facing 반대편에 있으면 `TURN_TO_PLAYER`를 한 행동으로 준비하고, 이미 플레이어를 바라보면 `MOVE_TOWARD` 또는 앞 칸 `EXECUTE_TILE/basic_slash`를 준비한다. `FIXED_FACING`은 플레이어 위치로 회전하지 않고 현재 Facing을 `MOVE_FIXED_FACING`의 방향으로 사용한다.
+
+준비 결과는 플레이어 턴 동안 `PreparedEnemy*` 동기화 속성에 보관되고 HUD에는 `적 예고: 플레이어 방향 전환`, `추적 접근`, `고정 방향 전진`, `기본 베기`, `대기` 중 하나로 보인다. 고정 방향 이동이 경계 또는 다른 생존 유닛의 점유에 막히면 자동 반전하지 않고 현재 Cell과 Facing을 유지한 채 `WAIT_OUT_OF_BOUNDS` 또는 `WAIT_CELL_OCCUPIED`로 행동을 완료한다.
+
+플레이어 행동으로 적이 밀려나도 이미 준비한 행동 종류는 다시 고르지 않는다. 준비한 것이 기본 베기라면 이동 대신 현재 위치와 준비 당시 Facing을 사용해 앞 셀을 공격하며, 닿지 않으면 `MISS_EMPTY`로 턴을 소비한다. 행동을 완료한 뒤 다음 플레이어 턴이 열릴 때만 새 Intent를 준비한다. 별도 BT나 범용 AI 프레임워크는 아직 만들지 않았다.
 
 대표 재타깃 순서는 `push|basic_slash`다. 플레이어 Cell 1, 적 Cell 2에서 실행하면 밀치기가 적을 Cell 3으로 옮긴다. 두 번째 기본 베기는 큐 등록 당시의 적을 기억하지 않고 현재 앞 셀인 Cell 2를 다시 검사하므로 `MISS_EMPTY`가 된다.
 
-HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행되고 `BattlePhase=BattleEnded`, `BattleResult=Victory/Defeat`로 고정된다. 이 상태에서는 다음 적 행동이나 Turn 증가가 발생하지 않는다. `다시 시작`은 새 Entity를 Spawn하지 않고 기존 플레이어와 적의 전투 상태를 초기화한다.
+HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행된다. 플레이어가 사망하면 즉시 `Defeat`이며, 웨이브의 마지막 적이 사망하면 `WaveTransition`으로 들어간다. 마지막 웨이브까지 끝났을 때만 `BattlePhase=BattleEnded`, `WaveState=StageCleared`, `BattleResult=Victory`가 된다.
+
+`map01`에는 적을 고정 배치하지 않는다. `BattleSessionComponent`가 시작할 때 `BattleDummyEnemy.model`의 ID인 `battledummyenemy`로 Wave 1을 생성하고, 웨이브 완료 시 기존 적을 Registry에서 해제·파괴한 뒤 다음 웨이브를 생성한다. 현재 Stage 1은 `TotalWaves=3`, 웨이브당 좌우 적 2명, 각 HP 6이다. `다시 시작`도 같은 런타임 생성 경로로 Stage 1 / Wave 1을 다시 만든다.
 
 ## 6. 다음 기능을 추가할 때
 
@@ -204,9 +258,10 @@ HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행되고 `B
 → 공격 모션·ImpactDelay·타격 시점 재판정·Event까지 완료
 → 다음 인덱스를 같은 방식으로 실행
 → 마지막 타일까지 완료된 뒤 EnemyTurn 시작
-→ BuildEnemyIntent가 MOVE 또는 BASIC_ATTACK 선택
-→ 적 행동 완료 후 TurnNumber 증가
-→ PlayerTurn 복귀와 입력 잠금 해제
+→ 이미 PREPARED 상태인 적 Intent를 Hold
+→ 저장된 TURN_TO_PLAYER / MOVE_TOWARD / MOVE_FIXED_FACING / EXECUTE_TILE을 그대로 실행
+→ Complete 후 TurnNumber 증가
+→ PlayerTurn 복귀, 다음 Intent 준비와 입력 잠금 해제
 ```
 
 다른 스크립트가 `CellIndex`, HP, 턴을 직접 변경하지 않도록 한다. 전투 상태 변경은 항상 `BattleSessionComponent` 또는 이후에 추출될 전용 Resolver를 통해 수행한다.
@@ -264,20 +319,22 @@ HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행되고 `B
 한 턴의 전체 순서는 다음 로그로 확인한다.
 
 ```text
-[BattleQueue] completed action=BASIC_ATTACK success=true reason=HIT
-[BattleTurnFlow] phase=EnemyTurn turn=3
-[BattleEnemy] intent action=BASIC_ATTACK direction=0 reason=PLAYER_ADJACENT
-[BattleDamage] applied source=enemy_01 target=player_01 amount=3 hp=100->97
-[BattleEnemy] completed action=BASIC_ATTACK success=true reason=HIT
-[BattleTurnFlow] phase=PlayerTurn turn=4
+[BattleEnemyIntent] prepare enemy=enemy_01 pattern=prototype_basic step=1 action=EXECUTE_TILE tile=basic_slash turn=2
+[BattleEnemyIntent] hold enemy=enemy_01 pattern=prototype_basic step=1 action=EXECUTE_TILE tile=basic_slash turn=2
+[BattleTurnFlow] phase=EnemyTurn turn=2
+[BattleEnemyIntent] execute enemy=enemy_01 pattern=prototype_basic step=1 action=EXECUTE_TILE tile=basic_slash preparedTurn=2 currentTurn=2
+[BattleEnemyIntent] complete enemy=enemy_01 pattern=prototype_basic step=1 action=EXECUTE_TILE tile=basic_slash success=true
+[BattleTurnFlow] phase=PlayerTurn turn=3
 ```
 
-사망과 Reset은 다음 로그로 확인한다.
+웨이브 전환과 Reset은 다음 로그로 확인한다.
 
 ```text
-[BattleDeath] unit=enemy_01 cause=DAMAGE result=Victory
-[BattleResult] result=Victory turn=2
-[BattleReset] completed turn=1 playerCell=1 enemyCell=4
+[BattleWave] spawned stage=1 wave=1/3 enemies=2 hp=6
+[BattleWave] cleared stage=1 wave=1/3 nextWave=2
+[BattleWave] spawned stage=1 wave=2/3 enemies=2 hp=6
+[BattleResult] result=Victory stage=1 wave=3/3 turn=1
+[BattleReset] completed stage=1 wave=1/3 playerCell=2 enemyHp=6
 ```
 
 ## 7. 파일 작업 주의사항
@@ -290,3 +347,89 @@ HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행되고 `B
 ## 8. 개인별 로그라이크 확장
 
 개인별 로그라이크의 맵·런 수명과 컴포넌트 책임은 [`Solo-Roguelike-Architecture.md`](Solo-Roguelike-Architecture.md)를 따른다.
+
+## 9. 스테이지 웨이브와 강제 증원 설정
+
+웨이브 진행값과 적 전투 수치는 `03_Data`의 세 CSV에서 수정한다.
+
+- `StageEnemyWaves.csv`: 웨이브 순서, 생성 조건, 수량, 동시 생존 제한, 지연값
+- `EnemySpawnPools.csv`: Pool ID에 적 정의 ID와 실제 적 Model ID를 연결
+- `EnemyDefinitions.csv`: 적 HP, 기본 공격력, 패턴, 이동 정책을 정의
+
+새 적을 추가할 때는 먼저 `EnemyDefinitions.csv`에 전투 수치를 등록한 뒤,
+`EnemySpawnPools.csv`에서 `EnemyDefinitionId`와 `EnemyModelId`를 연결한다.
+
+`EnemyDefinitions.csv`의 주요 열은 다음과 같다.
+
+| 열 | 의미 |
+|---|---|
+| `EnemyDefinitionId` | 코드와 스폰 풀이 참조하는 적 정의 키 |
+| `DisplayName` | 제작자가 표에서 구분하기 위한 이름 |
+| `MaxHp` | 생성 시 적용할 최대·현재 HP |
+| `BasicAttackDamage` | 해당 적 유닛의 기본 공격 피해 |
+| `PatternId` | 적 Intent를 만드는 패턴 키 |
+| `MovementPolicy` | `TRACK_PLAYER` 또는 `FIXED_FACING` |
+
+```csv
+EnemyDefinitionId,DisplayName,MaxHp,BasicAttackDamage,PatternId,MovementPolicy
+early_mushroom,초급 주황버섯,6,3,prototype_basic,TRACK_PLAYER
+```
+
+각 스폰된 `BattleUnitComponent`가 이 값을 복사해 보관한다. 따라서 강제 증원으로
+서로 다른 웨이브가 겹치더라도 적마다 HP·공격력·패턴·이동 정책을 독립적으로 사용할 수 있다.
+`EnemySpawnPools.Weight`는 양의 정수 가중치로 실제 선택에 사용한다. 후보를
+`EnemyDefinitionId|EnemyModelId`로 정렬한 뒤 `RunSeed`, `WaveIndex`, 스폰 슬롯 번호로
+결정적 가중치 롤을 만든다. 같은 Seed와 같은 데이터는 항상 같은 구성을 만들기 때문에
+테스트와 리플레이가 재현되며, Seed를 바꾸면 같은 Wave에서도 다른 구성을 만들 수 있다.
+
+```csv
+PoolId,EnemyDefinitionId,EnemyModelId,Weight,MinWaveIndex,MaxWaveIndex
+stage01_basic,early_mushroom,battledummyenemy,1,1,3
+stage01_basic,guard_mushroom,battledummyenemy,1,1,3
+```
+
+현재 1:1 설정에서 기본 `RunSeed=1000`의 Wave 1은 `early → guard`,
+`RunSeed=1001`의 Wave 1은 `guard → early` 순으로 생성된다. 서버에서 새 런을
+시작할 때는 `BattleSessionComponent.StartNewRun(runSeed)`를 호출한다. 이 메서드는
+진행 중인 타이머와 적 Registry를 먼저 정리하고 Stage 1 / Wave 1을 정상 생성 경로로
+다시 만든다. 결과 화면의 `다시 시작`은 현재 Seed를 유지하는 `ResetBattle()`을 사용한다.
+
+`StageEnemyWaves.csv`의 주요 열은 다음과 같다.
+
+| 열 | 의미 |
+|---|---|
+| `StageId` | `stage01`처럼 스테이지를 구분하는 키 |
+| `WaveIndex` | 1부터 시작하는 웨이브 순서 |
+| `SpawnTriggerMode` | `CLEAR_ONLY`, `TURN_LIMIT`, `TIME_LIMIT`, `TURN_OR_TIME` |
+| `EnemyPoolId` | `EnemySpawnPools.csv`에서 찾을 적 풀 |
+| `SpawnCount` | 해당 웨이브에서 생성할 적 수 |
+| `MaxConcurrent` | 이전 웨이브 생존자를 포함한 최대 동시 생존 적 수 |
+| `ClearSpawnDelaySeconds` | 전멸 후 다음 웨이브가 등장하기까지의 지연 |
+| `ForceAfterTurns` | 현재 웨이브 생성 후 강제 증원까지 허용할 턴 수 |
+| `ForceAfterSeconds` | 시간 기준 강제 증원까지 허용할 초 |
+
+기본 규칙은 적 전멸 후 다음 웨이브 생성이다. 제한에 먼저 도달하면 즉시 행동 중간에 생성하지 않고 `ForceSpawnPending`으로 대기한 뒤, 안전한 턴 경계에서 다음 웨이브를 생성한다. 이전 웨이브의 살아 있는 적은 유지되므로 웨이브가 겹칠 수 있다.
+
+설정 예시는 다음과 같다.
+
+```csv
+StageId,WaveIndex,SpawnTriggerMode,EnemyPoolId,SpawnCount,MaxConcurrent,SpawnSidePolicy,ClearSpawnDelaySeconds,ForceAfterTurns,ForceAfterSeconds
+stage01,1,TURN_LIMIT,stage01_basic,2,5,BALANCED,0.6,4,0
+stage01,3,CLEAR_ONLY,stage01_basic,2,5,BALANCED,0.6,0,0
+```
+
+설정 변경 후 Maker에서 Refresh하고 Play한다. Console에서 아래 순서로 확인할 수 있다.
+
+```text
+[StageWaveData] stage loaded stage=stage01 totalWaves=3
+[EnemyData] loaded id=early_mushroom hp=6 attack=3 pattern=prototype_basic movement=TRACK_PLAYER
+[StageWaveData] wave loaded stage=stage01 wave=1 enemy=early_mushroom hp=6 attack=3 mode=TURN_LIMIT
+[EnemyPool] selected pool=stage01_basic wave=1 slot=2 seed=1000 roll=2/2 definition=guard_mushroom weight=1
+[EnemyData] applied unit=enemy_w1_right definition=guard_mushroom hp=9.0 attack=2.0 pattern=prototype_basic movement=FIXED_FACING roll=2/2
+[BattleWave] spawned stage=1 wave=1/3 seed=1000 enemies=2 livingTotal=2 composition=early_mushroom,guard_mushroom
+[BattleWave] force pending reason=TURN_LIMIT wave=1 nextWave=2
+[BattleWave] spawned stage=1 wave=2/3 enemies=2 livingTotal=4
+[BattleWave] force spawned reason=TURN_LIMIT wave=2
+```
+
+최종 승리는 마지막 웨이브가 이미 생성되었고, 이전 웨이브 생존자를 포함한 모든 적이 사망했을 때만 발생한다.

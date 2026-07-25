@@ -32,8 +32,8 @@
 - 현재 맵: MapleTile(0), `RigidbodyComponent`
 - 권장 최종 맵: SideViewRectTile(2), `SideviewbodyComponent`
 - 권장 화면: PC 가로 12.8 x 7.2 world units
-- 기본 전투 보드: 화면 중앙에 7개 논리 셀
-- 권장 초기 배치: Player Cell 1, Enemy Cell 5
+- 기본 전투 보드: 화면 중앙에 6개 논리 셀
+- 현재 초기 배치: Player Cell 1, Enemy Cell 4
 - 월드 좌표는 CellIndex에서 계산하고, 판정은 Transform 좌표가 아닌 CellIndex로 한다.
 
 맵 타입 변경은 사용자가 Maker Hierarchy에서 수행한다. 전환 후 `refresh`하고 실제 `TileMapMode`를 다시 확인하기 전에는 이동 Body/API를 확정하지 않는다.
@@ -237,7 +237,7 @@
 
 ### Slice 10 - 두 번째 사례가 생긴 부분만 인터페이스화
 
-- ⬜ 상태: Not started
+- 🟡 상태: Implemented (core paths tested) — Maker refresh/build 통과, `DAMAGE`/`PUSH` 실제 분기 확인. 경계 밀치기 회귀 검증은 남음
 - 화면 결과: 기존 플레이 결과는 변하지 않지만 새 타일 하나를 작은 설정값으로 추가할 수 있다.
 - 리팩터링 대상:
   - `DAMAGE`, `PUSH`가 생겼으므로 Effect Router 추출
@@ -251,17 +251,107 @@
   - 기존 Slice 0~9 회귀 테스트 통과
   - 새 타일 하나가 기존 전투 Manager 수정 없이 추가됨
 
+### Slice 10.5 - 적 Intent 준비·유지·실행 분리
+
+- ✅ 상태: Tested — Maker refresh/build 및 `접근 준비 → 기본 베기 준비 → 밀치기 → 준비한 베기 Miss → 다음 Intent 준비` 런타임 검증 완료
+- 화면 결과: 플레이어 턴 동안 적의 다음 행동이 HUD에 미리 보이고, 밀치기·이동·방향 전환 후에도 적이 행동 종류를 다시 고르지 않고 예고한 행동을 실행한다.
+- 목적:
+  - 현재 `BuildEnemyIntent → 즉시 실행` 구조를 `Prepare → Hold → Execute`로 분리
+  - 쇼군 쇼다운처럼 위치 조작으로 이미 준비된 공격의 명중 셀을 바꿀 수 있게 함
+  - 최종 `EnemyPatternSteps` 표를 붙일 때 전투 코어를 다시 뜯지 않는 런타임 계약 확정
+- 최소 상태:
+  - `EMPTY`: 준비된 Intent 없음
+  - `PREPARED`: ActionType/TileId/PatternId/StepIndex가 고정되어 HUD 표시 가능
+  - `EXECUTING`: 저장된 Intent 실행 중이며 새 Intent 생성 금지
+- 최소 인터페이스:
+  - `PrepareEnemyIntent(enemyId)`
+  - `GetPreparedEnemyIntent(enemyId)`
+  - `ExecutePreparedEnemyIntent(enemyId)`
+  - `CompletePreparedEnemyIntent(enemyId, success, reason)`
+- 실행 규칙:
+  - Intent 준비 시 `ActionType`, `TileId`, `PatternId`, `StepIndex`, `PreparedTurn`만 고정한다.
+  - `TargetId`와 목표 Cell은 고정하지 않는다. 공격 실행 시 현재 CellIndex/Facing과 Tile Target 규칙으로 다시 판정한다.
+  - 밀치기 후에도 `BuildEnemyIntent`를 다시 호출하지 않는다. 준비된 공격이 현재 위치에서 닿지 않으면 `MISS_EMPTY` 또는 `OUT_OF_RANGE`로 끝난다.
+  - 준비된 Intent가 없는 적만 다음 Pattern Step을 선택한다.
+  - 적 행동 완료 후에만 StepIndex를 전진하고 다음 플레이어 턴용 Intent를 준비한다.
+- 표 전환 계약:
+  - 프로토타입에서는 한 개의 하드코딩 Pattern으로 위 상태 전이를 먼저 검증한다.
+  - Phase 2에서 `EnemyDefinitions.PatternId`와 `EnemyPatternSteps` 행을 로드해 같은 `PreparedIntent` Snapshot을 생성한다.
+  - 콘텐츠별 `EnemyId` 분기는 `BattleSessionComponent`에 추가하지 않는다.
+- 협업 경계:
+  - 전투 코어 개발자: Intent 상태 전이와 실행 순서만 소유
+  - 콘텐츠 개발자: `EnemyDefinitions`/`EnemyPatternSteps`의 행과 기존 ActionType 조합만 수정
+  - UI 개발자: 읽기 전용 Prepared Intent DTO/Event만 소비하고 AI 판정을 복제하지 않음
+- 아직 하지 않음:
+  - 실제 UserDataSet/CSV 로더, 다중 적 Intent 순서, Telegraph 아이콘 리소스
+- 완료 기준:
+  - 적이 `EXECUTE_TILE/basic_slash`를 준비한 뒤 밀려나도 `MOVE_TOWARD`로 재계산하지 않음
+  - 준비된 공격이 현재 위치에서 빗나가고 같은 로그의 PatternId/StepIndex가 유지됨
+  - HUD 표시 ActionType/TileId와 실제 실행 값이 일치
+  - `Prepare → Hold → Execute → Complete` positive log 순서가 한 번씩만 출력
+
+### Slice 11 - 단일 적의 추적 이동과 고정 방향 이동 분리
+
+- ✅ 상태: Tested — 추적 방향 전환, 고정 방향 이동, 경계·점유 WAIT를 Maker 런타임에서 검증 완료
+- 화면 결과: 같은 적이 설정에 따라 플레이어를 향해 접근하거나, 생성 시 정해진 방향을 유지한 채 이동한다.
+- 최소 구현:
+  - 기존 `BuildEnemyIntent`의 무조건적인 플레이어 방향 회전을 제거
+  - `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_FIXED_FACING` 세 행동 의미 분리
+  - `MOVE_FIXED_FACING`이 경계/점유에 막히면 위치와 Facing을 유지하고 WAIT 처리
+- 아직 하지 않음:
+  - Dataset, 적 두 명, 런타임 Spawn, 웨이브
+- 완료 기준:
+  - 고정 방향 적 뒤로 플레이어가 이동해도 적 Facing이 바뀌지 않음
+  - 추적 행동은 플레이어 반대편 이동 후 다음 행동에서 방향을 갱신
+  - 이동 실패 때 자동 반전하지 않는 positive log
+
+### Slice 12 - 다중 유닛 Board Registry
+
+- ✅ 상태: Tested — Registry 조회·안정 정렬·사망 제외와 기존 이동/공격/밀치기/Reset 회귀 검증 완료
+- 화면 결과: 화면은 기존 한 적 그대로지만 내부 조회가 `EnemyEntity` 단일 참조 대신 UnitId/CellIndex Registry를 사용한다.
+- 최소 구현:
+  - `BoardStateComponent`에 Register/Unregister/FindByUnitId/FindAtCell/CollectLivingEnemies 추가
+  - CellIndex와 SpawnOrder 기준 안정 정렬
+  - 기존 이동·공격·밀치기·사망·Reset 경로를 Registry 조회로 교체
+- 아직 하지 않음:
+  - 두 번째 적 배치, 웨이브, 범용 이벤트 버스
+- 완료 기준:
+  - 기존 Slice 2~9의 대표 회귀 로그가 동일
+  - 사망 유닛이 점유 조회와 생존 적 목록에서 제외
+  - Lua `pairs` 순서에 의존하지 않음
+
+### Slice 13 - 좌우 적 두 명 고정 배치
+
+- ✅ 상태: Tested — 좌우 배치, SpawnOrder 행동 순서, 개별 사망 지속, 전체 사망 승리와 Reset 검증 완료
+- 화면 결과: 6칸 보드에서 플레이어 양쪽에 적이 보이고 방향 전환으로 공격 대상을 바꾼다.
+- 검증 배치:
+  - Player Cell 2
+  - Left Enemy Cell 0, 초기 Facing Right
+  - Right Enemy Cell 5, 초기 Facing Left
+- 최소 구현:
+  - 같은 적 `.model` 인스턴스 2개 사용
+  - SpawnOrder에 따른 결정적 적 행동 순서
+  - 한 적 사망 후 다른 적이 살아 있으면 전투 계속
+  - 모든 적 사망 후에만 Victory
+- 아직 하지 않음:
+  - 런타임 Spawn, SpawnPool, 다중 웨이브, 적별 Intent 완성 UI
+- 완료 기준:
+  - 좌우 Front Cell 공격, 밀치기, 점유 차단이 각각 올바른 UnitId를 대상으로 함
+  - 생존 적 두 명의 행동 순서가 매 실행 동일
+  - 첫 적 사망 시 Victory가 발생하지 않고 두 번째 적 사망 시 한 번만 발생
+
 ## 5. 이후 Phase로 넘길 것
 
 Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 
 1. 타일 쿨다운과 FreePlay
-2. 일반 적 Pattern 데이터
+2. 일반 적 Pattern과 InitialFacingPolicy 데이터
 3. UserDataSet/CSV 이전과 Validator
-4. 스테이지 시작/승리/다음 스테이지
-5. 증강 3택
-6. 직업과 콘텐츠 수량 확장
-7. 연출, 저장, 재접속
+4. 런타임 적 Spawn과 Registry 수명
+5. BALANCED/ANY 웨이브와 스테이지 진행
+6. 증강 3택
+7. 직업과 콘텐츠 수량 확장
+8. 연출, 저장, 재접속
 
 ## 6. 사용자와 함께 확인할 화면 체크포인트
 
@@ -427,3 +517,216 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 - 경계 검증: Player Cell 4, Enemy Cell 5에서 밀치기 → 목적지 Cell 6 차단, Enemy Cell 5 유지
 - Build/Runtime/UI lint 검증: error `0`, warning `0`
 - 다음 작업: 두 번째 Effect 사례를 기준으로 `DAMAGE`·`PUSH`의 작은 Effect Router 추출 여부 검토
+
+### 2026-07-25 — DAMAGE/PUSH 최소 Effect Router
+
+- 상태: 🟡 Implemented (core paths tested)
+- 새 파일: `01_Combat/Resolvers/EffectRouterLogic.mlua`
+- `DAMAGE`: Router가 기존 `BattleSessionComponent.ApplyDamage` 단일 HP 변경 경로로 전달
+- `PUSH`: Router가 기존 `BattleSessionComponent.ResolvePushImpact` 셀 이동 경로로 전달
+- 기존 피해, 사망, 피격 플래시, 밀치기 점유/경계, `UnitMovedEvent` 규칙은 변경하지 않음
+- Positive log: `[BattleEffectRouter] dispatch/resolved effect=DAMAGE|PUSH`
+- 로컬 정적 검사: `git diff --check` 통과
+- Maker 연결/작업공간 갱신: `map01` 편집 모드 감지, `refresh` 성공
+- Build Console: 중단 오류 및 Warning `0`; 기존 동적 컴포넌트 접근 관련 Info 진단만 확인
+- Runtime `DAMAGE`: `dispatch effect=DAMAGE` → HP `100→97` → `resolved success=true reason=OK`
+- Runtime `PUSH`: Enemy Cell `2→3`, `UnitMovedEvent` 수신 → `resolved success=true reason=PUSHED`
+- 테스트 스크립트에서 존재하지 않는 `RequestPush`를 한 차례 호출해 `LEA-2011`이 발생했으나, 테스트 호출명을 수정하고 로그를 비운 뒤 Router 공개 진입점으로 재검증함
+- 남은 재검증: `push|basic_slash` 재타깃과 경계 밀치기 `PUSH_BLOCKED_OUT_OF_BOUNDS`
+
+### 2026-07-25 — 적 Prepared Intent와 HUD 예고
+
+- 상태: ✅ Tested
+- 적 Intent 상태: `EMPTY → PREPARED → EXECUTING → EMPTY`
+- 준비 Snapshot: `EnemyId`, `PatternId`, `StepIndex`, `ActionType`, `TileId`, `Direction`, `PreparedTurn`, `Reason`
+- 실행 흐름: `PrepareEnemyIntent → BeginEnemyTurn(Hold) → ExecutePreparedEnemyIntent → CompletePreparedEnemyIntent`
+- HUD: 기존 상태 문구에 `적 예고: 접근` 또는 `적 예고: 기본 베기`를 표시하며, AI 조건을 UI에 복제하지 않고 동기화 Snapshot만 읽음
+- 최초 상태 검증: Player Cell 1, Enemy Cell 4에서 Turn 1 `MOVE_TOWARD`, HUD `적 예고: 접근`
+- 접근 검증: Player `1→2` 이동 후 준비된 Turn 1 `MOVE_TOWARD`가 Enemy `4→3`으로 실행되고 Turn 2 `EXECUTE_TILE/basic_slash` 준비
+- 유지 검증: Turn 2에 `push`로 Enemy `3→4` 이동 후에도 `prototype_basic / step 1 / EXECUTE_TILE / basic_slash / preparedTurn 2` 유지
+- 실행 결과: 적이 이동으로 재계획하지 않고 Cell 4에서 Left 방향의 Cell 3을 공격하여 `MISS_EMPTY`; Player는 Cell 2에서 피해 없음
+- 완료 후 재계산: 위 공격 완료와 Turn 3 진입 뒤에만 새 `MOVE_TOWARD` Intent 준비
+- Positive log 순서: `[BattleEnemyIntent] prepare → hold → execute → complete → clear`
+- Maker 검증: workspace refresh 성공, Build Console Error/Warning `0`, runtime Error/Warning `0`
+
+### 2026-07-25 — 추적 이동과 고정 방향 이동 분리
+
+- 상태: ✅ Tested
+- 설정값: `BattleSessionComponent.EnemyMovementPolicy`
+  - `TRACK_PLAYER`: 현재 Facing과 플레이어 방향이 다르면 `TURN_TO_PLAYER`, 같으면 `MOVE_TOWARD` 또는 앞 칸 `basic_slash`
+  - `FIXED_FACING`: 플레이어 위치로 회전하지 않고 현재 Facing을 `MOVE_FIXED_FACING.Direction`으로 고정
+- HUD 예고: `플레이어 방향 전환`, `추적 접근`, `고정 방향 전진`, `기본 베기`, `대기`
+- 추적 검증: Enemy Cell 1/Left, Player Cell 4에서 `TURN_TO_PLAYER direction=1` 실행 → Enemy Right 유지 → 다음 Turn `MOVE_TOWARD direction=1` 준비
+- 고정 방향 검증: 같은 배치에서 `FIXED_FACING`은 Player가 오른쪽에 있어도 Enemy Left를 유지하고 Cell `1→0` 이동
+- 경계 검증: Enemy Cell 0/Left에서 이동 시 Cell과 Facing을 유지하고 `WAIT_OUT_OF_BOUNDS`로 정상 완료
+- 점유 검증: `MOVE_FIXED_FACING` 준비 뒤 목적지 Cell을 Player가 점유하면 Enemy 위치·Facing을 유지하고 `WAIT_CELL_OCCUPIED`로 정상 완료
+- Prepared Intent 유지: 방향과 행동은 준비 시점 Snapshot을 사용하며 실행 시 플레이어 위치로 다시 계산하지 않음
+- Maker 검증: workspace refresh 성공, Build Console Error/Warning `0`, runtime Error/Warning `0`
+
+### 2026-07-25 — 다중 유닛 Board Registry
+
+- 상태: ✅ Tested
+- 새 파일: `01_Combat/Components/Shared/BoardStateComponent.mlua`
+- Registry API: `RegisterUnit`, `UnregisterUnit`, `FindByUnitId`, `FindAtCell`, `CollectLivingEnemies`, `CollectRegisteredUnits`
+- 내부 저장은 `UnitId → Entity` Dictionary를 사용하고, 순서가 필요한 조회 결과는 `SpawnOrder → UnitId` 순으로 정렬
+- 점유와 생존 적 조회에서 `IsDead=true` 유닛을 제외하며, `FindByUnitId`는 전투 Reset이 기존 Entity를 재사용할 수 있도록 사망 유닛도 반환
+- `BattleSessionComponent`의 이동·전방 타깃·공격·밀치기·사망 판정·Reset·전투 시작 조회를 Registry 경로로 전환
+- 현재 화면과 배치는 기존 Player 1명/Enemy 1명을 유지하며, 두 번째 적 배치와 런타임 Spawn은 Slice 13 이후로 분리
+- Registry 검증: 등록 수 `2`, 안정 순서 `player_01:1,enemy_01:2`, UnitId/Cell 점유 조회 모두 성공
+- 사망 제외 검증: Enemy를 임시 사망 상태로 전환했을 때 Cell 점유 없음, 생존 적 수 `0`
+- 회귀 검증: Player `1→2→3`, 공격 HP `100→90`, 밀치기 Enemy `4→5`, Reset 후 Player `1`/Enemy `4`/등록 수 `2`
+- Maker 검증: workspace refresh 성공, Build Console 중단 Error/Warning `0`(기존 동적 컴포넌트 접근 Info 진단만 존재), runtime Error `0`
+
+### 2026-07-25 — 좌우 적 두 명과 초반 HP 조정
+
+- 상태: ✅ Tested
+- 배치: Left Enemy Cell `0`/Right, Player Cell `2`/Right, Right Enemy Cell `5`/Left
+- 같은 `BattleDummyEnemy.model`을 `BattleEnemyLeft`, `BattleEnemyRight` 두 인스턴스로 배치
+- UnitId와 순서: `enemy_left_01`/SpawnOrder `2`, `enemy_right_01`/SpawnOrder `3`
+- 초반 적 HP: `EarlyStageEnemyMaxHp=6`
+  - 기본 베기 피해 `3`: 2회 처치
+  - 강한 베기 피해 `6`: 1회 처치
+- 적 턴: 생존 적을 SpawnOrder 순으로 하나씩 실행하고, 모든 생존 적 행동이 끝난 뒤에만 다음 PlayerTurn 개방
+- 행동 순서 검증: Left `0→1` 실행 후 Right `5→4`, 이후 Turn `1→2`
+- 첫 적 사망 검증: Left HP `6→0`, `result=CONTINUE`, 생존 적 `1`, Victory 없음
+- 전체 사망 검증: Right HP `6→0`, 생존 적 `0`일 때만 `result=Victory`
+- Reset 검증: Player Cell `2`, Left `0`/HP `6`, Right `5`/HP `6`, 생존 적 `2`
+- 화면 검증: 고정 카메라 안에서 플레이어 양쪽 적과 `HP 6 / 6` 텍스트가 정상 표시
+- 아직 분리 유지: 런타임 Spawn/웨이브, 적별 전체 Intent 큐 UI, Dataset 기반 HP 밸런스
+
+### 2026-07-25 — Stage 1 유한 웨이브와 런타임 Spawn
+
+- 상태: ✅ Tested
+- 진행 구조: `Stage 1 → Wave 1 → Wave 2 → Wave 3 → Stage Clear`
+- 시작 방식: `map01`의 고정 적 두 Entity를 제거하고, 게임 시작부터 `BattleSessionComponent.StartStage(1)`이 Wave 1을 생성
+- 생성 원본: `BattleDummyEnemy.model`, `EnemyModelId=battledummyenemy`
+- 현재 설정: `TotalWaves=3`, 웨이브당 좌우 적 2명, 각 `EarlyStageEnemyMaxHp=6`, 웨이브 전환 `0.60초`
+- UnitId: `enemy_w{wave}_left`, `enemy_w{wave}_right`; Entity 이름도 Wave 번호를 포함해 런타임 추적 가능
+- 스폰 위치: 기본 Cell 0/5를 우선 사용하고, 생존 플레이어가 점유 중이면 해당 가장자리에서 안쪽 빈 셀을 탐색
+- 전환 처리: 마지막 적 사망 시 행동·Impact 타이머와 큐를 정리하고 `WaveTransition/Cleared`; 기존 적을 Registry에서 해제·파괴한 뒤 다음 웨이브 생성
+- 완료 처리: Wave 1·2 종료는 Victory가 아니며, Wave 3 종료에서만 `BattleEnded/StageCleared/Victory`
+- Reset: 런타임 적을 정리하고 플레이어를 초기 Cell 2로 복원한 뒤 동일한 Stage 1 / Wave 1 생성 경로 재사용
+- HUD: 넓은 상태 문구에 `STAGE 1 · WAVE 1/3` 표시, 전환 중 `웨이브 완료 · 다음 웨이브 준비` 표시
+- Maker 검증:
+  - 최초 등록 `player_01 + enemy_w1_left + enemy_w1_right`, 적 HP `6 / 6`
+  - Wave 1 전멸 → `WaveTransition` → Wave 2 적 2명 생성
+  - Wave 2 전멸 → Wave 3 적 2명 생성
+  - Wave 3 전멸 → `BattleResult=Victory`, Wave 4 미생성
+  - Reset → Wave 1, 생존 적 2명, `BattleResult=""`
+- Build Console: 중단 Error/Warning `0`; 기존 동적 컴포넌트 접근 Info 진단만 존재
+- 다음 확장: 웨이브별 적 수·모델·HP·스폰 Cell을 Dataset 행으로 이동하고 Stage 2 데이터를 추가
+
+### 2026-07-25 — Dataset 기반 웨이브와 턴·시간 강제 증원
+
+- 상태: ✅ Tested
+- 새 데이터:
+  - `03_Data/StageEnemyWaves.userdataset` + `StageEnemyWaves.csv`
+  - `03_Data/EnemySpawnPools.userdataset` + `EnemySpawnPools.csv`
+- 새 로더: `03_Data/Repositories/StageWaveRepositoryLogic.mlua`
+- 기본 진행: 모든 생존 적 전멸 → `ClearSpawnDelaySeconds` 후 다음 웨이브
+- 선택 가능한 생성 모드:
+  - `CLEAR_ONLY`: 전멸할 때만 다음 웨이브
+  - `TURN_LIMIT`: 지정 턴을 넘기면 강제 증원 예약
+  - `TIME_LIMIT`: 지정 시간이 지나면 강제 증원 예약
+  - `TURN_OR_TIME`: 두 제한 중 먼저 도달한 조건으로 예약
+- 안전한 생성 시점: 시간 제한 콜백은 `ForceSpawnPending`만 설정하고, 실제 생성은 턴 경계에서 수행
+- 겹침 규칙: 강제 증원에서는 이전 웨이브 생존자를 제거하지 않고 다음 웨이브를 빈 Cell에 추가
+- 안전 제한: `MaxConcurrent`와 빈 Cell 수를 모두 확인하며, 공간이 부족하면 `CAPACITY_WAIT` 상태로 다음 턴 경계까지 대기
+- Stage 1 설정:
+  - Wave 1·2: `TURN_LIMIT`, 4턴, 적 2명, 최대 동시 생존 5명
+  - Wave 3: `CLEAR_ONLY`, 적 2명
+  - 공통 전멸 전환 지연: `0.60초`
+- HUD: `증원까지 N턴`, `시간제 증원`, `증원 대기`, `전멸 시 증원`, `마지막 웨이브` 상태 표시
+- Maker 검증:
+  - Dataset에서 `stage01`, 총 3웨이브 및 웨이브별 설정 정상 로드
+  - Wave 1 전멸 → 0.60초 후 Wave 2 생성, 생존 적 2명
+  - Wave 1 적 2명 생존 상태에서 4턴 기준 도달 → Wave 2가 겹쳐 생성되고 생존 적 4명
+  - 시간 제한 0.20초 표적 검증 → 행동 중 Wave 유지, `ForceSpawnPending=true`, `TIME_LIMIT`
+  - 겹친 Wave 1·2 적 4명 전멸 → Wave 3 생성
+  - Wave 3 전멸 → `Victory`, `BattleEnded`, 생존 적 0
+- Build Console: 중단 Error/Warning `0`; runtime Error/Warning `0`
+- 다음 데이터화: 여러 적 정의와 Spawn Pool 가중치 선택, EnemyPatternSteps 실제 Dataset 연결
+
+### 2026-07-25 — Enemy 정의 테이블과 유닛별 전투 수치
+
+- 상태: ✅ Tested
+- 새 데이터:
+  - `03_Data/EnemyDefinitions.userdataset` + `EnemyDefinitions.csv`
+  - 초기 정의 `early_mushroom`: HP `6`, 기본 공격력 `3`, 패턴 `prototype_basic`, 이동 정책 `TRACK_PLAYER`
+- 연결 변경:
+  - `EnemySpawnPools.csv`가 `EnemyDefinitionId`와 `EnemyModelId`를 함께 보관
+  - `StageWaveRepositoryLogic`이 Wave → Pool → Enemy Definition 순서로 검증·변환
+  - `BattleSessionComponent`의 적 HP 하드코딩을 제거하고 현재 Wave 정의에서 수치를 적용
+  - 스폰된 각 `BattleUnitComponent`가 `EnemyDefinitionId`, `BasicAttackDamage`, `EnemyPatternId`, `EnemyMovementPolicy`를 독립 보관
+  - 기본 공격은 세션 공용 피해가 아니라 공격 유닛의 `BasicAttackDamage`를 우선 사용
+- 겹침 안전성: 강제 증원으로 서로 다른 웨이브가 동시에 존재해도 각 적의 수치·패턴·이동 정책이 유지됨
+- 현재 제한: 실행별 난수 Run Seed는 아직 없으며 같은 데이터는 같은 적 구성을 재현
+- Maker 검증:
+  - Wave 1·2·3에서 `early_mushroom`, HP `6`, 공격력 `3`, 패턴·이동 정책 정상 재적용
+  - 적 기본 공격 1회로 플레이어 HP `100 → 97`
+  - Wave 1 전멸 → Wave 2, Wave 2 전멸 → Wave 3 정상 전환
+  - Wave 3 전멸 → `Victory`, `BattleEnded`, `StageCleared`, 생존 적 `0`
+- Build Console: 중단 Error/Warning `0`; 최종 runtime Error/Warning `0`
+
+### 2026-07-25 — 슬롯별 결정적 가중치 스폰과 혼합 적
+
+- 상태: ✅ Tested
+- 두 번째 적 정의:
+  - `guard_mushroom`: HP `9`, 기본 공격력 `2`, 패턴 `prototype_basic`, 이동 정책 `FIXED_FACING`
+  - 현재 시각 모델은 `early_mushroom`과 동일한 `battledummyenemy`를 재사용
+- Pool 설정: `early_mushroom`과 `guard_mushroom`을 `stage01_basic`에 Weight `1:1`로 등록
+- 선택 규칙:
+  - Wave 전체에서 한 번 고르지 않고 각 SpawnIndex마다 독립 선택
+  - 후보를 `EnemyDefinitionId|EnemyModelId`로 결정 정렬
+  - WaveIndex·SpawnIndex 기반의 `1..전체 Weight` 결정적 롤 사용
+  - 같은 데이터에서는 같은 결과가 나와 테스트와 리플레이를 재현 가능
+- 런타임 변경:
+  - `GetEnemySpawnDefinition()`이 Pool 행과 Enemy Definition을 합친 슬롯별 정의 반환
+  - Wave는 모든 슬롯 정의를 먼저 검증한 뒤에만 Spawn을 시작하여 부분 생성 방지
+  - `SpawnWaveEnemy()`가 세션 공용 수치 대신 전달받은 슬롯 정의로 Model·HP·공격력·패턴·이동 정책 적용
+- Maker 검증:
+  - Wave 1: `early_mushroom → guard_mushroom`, HP `6/9`, 공격력 `3/2`
+  - Wave 2: `guard_mushroom → early_mushroom`으로 롤 순서 전환
+  - `guard_mushroom` Intent가 `MOVE_FIXED_FACING`, 방향 `-1`로 준비
+  - 수비형 적 기본 공격으로 플레이어 HP `100 → 98`
+  - 혼합 구성으로 Wave 1→2→3 전환 후 `Victory`, `BattleEnded`, `StageCleared`, 생존 적 `0`
+- Build Console: 중단 Error/Warning `0`; 최종 runtime Error/Warning `0`
+- 다음 확장: Run Seed를 선택식에 추가해 런마다 구성이 달라지되 같은 Seed는 재현되도록 연결
+
+### 2026-07-25 — Run Seed 기반 웨이브 구성 재현
+
+- 상태: ✅ Tested
+- 동기화 상태: `BattleSessionComponent.RunSeed`, 기본값 `1000`
+- 새 런 API: `StartNewRun(runSeed)`
+  - 진행 중인 행동·Impact·Wave·강제 증원 타이머 정리
+  - 기존 적 Registry 해제와 Entity 제거
+  - 플레이어 초기화 후 Stage 1 / Wave 1 정상 생성 경로 재사용
+- 결과 화면의 `ResetBattle()`은 현재 Run Seed를 유지
+- 선택 입력: `RunSeed`, `WaveIndex`, `SpawnIndex`, 후보의 전체 Weight
+- 결정 규칙: 후보를 `EnemyDefinitionId|EnemyModelId`로 정렬하고
+  `(RunSeed mod ΣWeight) + ((WaveIndex - 1) × 31) + SpawnIndex`로 롤 계산
+- Maker 재현 검증:
+  - Seed `1000` 첫 실행: `early_mushroom → guard_mushroom`
+  - Seed `1000` 재실행: `early_mushroom → guard_mushroom`
+  - Seed `1001`: `guard_mushroom → early_mushroom`
+  - 세 실행 모두 새 런 완료 후 `PlayerTurn`, Wave `1/3`, 생존 적 `2`
+- Runtime Error/Warning: `0`
+- 다음 확장: 런 전체를 소유하는 RunManager와 Seed 생성·저장 정책 연결
+
+### 2026-07-25 — 개인별 Run 상태 소유권 분리
+
+- 상태: ✅ Tested
+- 새 파일:
+  - `04_Roguelike/RunManager/PlayerRunStateComponent.mlua`
+  - `04_Roguelike/RunManager/RunManagerLogic.mlua`
+- 소유권: 변경 가능한 Run 값은 전역 Logic이 아니라 각 플레이어의 `PlayerRunStateComponent`가 보관
+- 조정자: `RunManagerLogic`은 상태를 직접 보관하지 않고 플레이어 컴포넌트 생성·조회, 새 Run 시작, 전투 결과 전달만 담당
+- 현재 Run 상태: Seed, Run 순번, 상태, 현재 스테이지, 완료 스테이지 수, 마지막 전투 결과
+- 전투 연결:
+  - 플레이어 등록 시 기존 Run을 재사용하거나 최초 Run을 초기화
+  - `BattleSessionComponent.StartNewRun(seed)`가 Run 상태 초기화와 전투 재구성을 함께 수행
+  - 최종 승패 확정 시 `RecordBattleResult`로 해당 플레이어의 Run 상태 갱신
+- Maker 새 Run 검증: Seed `2001`, Run 순번 `2`, Stage 1/Wave 1, 생존 적 `2`, Run 상태 `Active`
+- Maker 실제 승리 검증: `BattleResult=Victory`, `LastBattleResult=Victory`, 완료 스테이지 `1`, 다음 스테이지 `2`, `runRecorded=true`
+- Build Console: 중단 Error/Warning `0`; 최종 runtime Error/Warning `0`
+- 다음 확장: Stage 2 전환 또는 Run Seed 생성 정책과 DataStorage 영구 저장

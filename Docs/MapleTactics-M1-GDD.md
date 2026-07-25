@@ -1,6 +1,7 @@
 # MapleTactics M1 GDD
 
-Stage: Planning complete, implementation not started  
+Stage: Phase 1 prototype in progress, bidirectional combat expansion planned
+
 Milestone: M1 playable vertical slice
 
 ## 1. 게임 한 줄 설명
@@ -27,6 +28,8 @@ Milestone: M1 playable vertical slice
 - 큐는 최대 3칸을 기본값으로 하며 직업/증강이 변경할 수 있다.
 - 큐 실행 중 각 타일은 현재 보드에서 타깃을 다시 계산한다.
 - 적의 다음 행동은 플레이어에게 미리 표시된다.
+- 적 Intent는 플레이어 턴 전에 준비되어 ActionType/TileId가 고정되며, 플레이어가 위치를 바꿔도 실행 직전에 다른 행동으로 재선택하지 않는다.
+- 준비된 공격은 TargetId를 저장하지 않고 실행 시점의 현재 CellIndex/Facing과 타일 Target 규칙으로 명중 셀을 계산한다.
 - 전투 월드 위치와 논리 CellIndex를 분리한다.
 - 적은 플레이어 좌우 어느 빈 칸에도 배치될 수 있어, 방향 전환은 전투 내내 반복적으로 필요한 핵심 조작이다.
 
@@ -61,12 +64,20 @@ M1 직업 슬롯:
 ## 6. 적과 스테이지 원칙
 
 - 일반 적은 `EnemyPatternSteps`의 순차 패턴으로 행동한다.
+- `EnemyPatternRunnerComponent`는 표의 다음 Step을 `PreparedIntent` 런타임 Snapshot으로 만들고 `Prepare → Hold → Execute → Complete` 상태를 관리한다.
+- 밀치기나 이동은 준비된 ActionType/TileId를 바꾸지 않는다. 위치가 달라져 사거리가 맞지 않으면 예고 공격이 빗나간다.
 - 보스는 HP 조건에 따라 PatternId를 바꾼다.
 - BT는 PatternStep으로 표현하기 어려운 요구가 확인된 후에만 도입한다.
-- 적은 `TURN_TO_PLAYER` 포함 여부로 성격이 갈린다 — 포함하면 플레이어 위치를 따라 방향을 바꾸는 추적형, 빼면 `DefaultFacing`을 계속 유지하는 고정 방향형이다.
-- 이동도 같은 원리다 — `MOVE_TOWARD`/`MOVE_AWAY`는 플레이어 상대 위치에 반응하고, `MOVE_FIXED_FACING`은 플레이어 위치와 무관하게 현재 Facing 방향으로만 이동한다.
-- 스테이지는 초기 배치(Wave 0)를 EnemyId, CellIndex, Facing, WaveIndex로 정의한다.
-- 초기 배치 외 후속 웨이브는 `EnemySpawnPools`에서 가중치로 뽑아 좌우 빈 칸에 채우며, 직전 웨이브 전멸 시 다음 웨이브가 시작된다.
+- 적의 초기 `Facing`은 생성 순간 한 번 결정한다. 기본 정책은 `FACE_PLAYER`이며, 특수 적이나 연출은 `FIXED_LEFT`/`FIXED_RIGHT` 또는 스테이지 배치의 `FacingOverride`를 사용한다.
+- `TURN_TO_PLAYER`는 제자리 회전, `MOVE_TOWARD`/`MOVE_AWAY`는 플레이어 상대 방향으로 회전 후 이동, `MOVE_FIXED_FACING`은 현재 `Facing`을 바꾸지 않고 그 방향으로 이동한다.
+- 고정 방향 이동이 보드 끝이나 점유 셀에 막히면 해당 행동은 `WAIT`로 끝나며 자동 반전하지 않는다.
+- 추적형/고정형은 몬스터 종류를 상속으로 나누지 않고 `EnemyPatternSteps`에 어떤 Action을 조합했는지로 구분한다.
+- 스테이지의 첫 배치는 Wave 1이며 맵에 적을 고정하지 않고 `StageEnemySpawns`의 EnemyId, CellIndex, FacingOverride, SpawnOrder를 읽어 런타임 생성한다.
+- 후속 웨이브는 `EnemySpawnPools`에서 가중치로 뽑아 좌우 빈 칸에 채운다. 기본 진행은 현재까지 생성된 적 전멸 후 다음 웨이브 시작이다.
+- 스테이지 데이터는 `CLEAR_ONLY`, `TURN_LIMIT`, `TIME_LIMIT`, `TURN_OR_TIME` 중 하나를 선택할 수 있다. 제한 모드는 적이 남아 있어도 지정 턴 또는 시간이 지나면 다음 웨이브를 강제 증원한다.
+- 턴 제한은 웨이브 생성 뒤 완료된 턴 수로 계산한다. 시간 제한이 행동 도중 충족되면 현재 행동을 끊지 않고 다음 안전한 턴 경계에서 증원한다.
+- 강제 증원으로 여러 웨이브가 겹치면 남은 적과 새 적이 같은 적 턴에 참여한다. 마지막 웨이브 출현 후 전체 생존 적이 0명이 되어야 스테이지가 완료된다.
+- 후속 웨이브의 기본 배치 정책은 `BALANCED`다. 양쪽에 빈 칸이 있고 2명 이상 생성하면 좌우에 최소 1명씩 먼저 배치하고, 남은 적은 전체 빈 칸에서 뽑는다. `ANY`는 방향 강제 없이 전체 빈 칸에서 뽑는다.
 - 웨이브 등장 칸 선택은 RunSeed+StageIndex+WaveIndex 기반 결정적 규칙을 따른다.
 - 스테이지는 AugmentPoolId를 데이터로 정의한다.
 
@@ -83,6 +94,10 @@ M1 직업 슬롯:
 | 시스템 | MSW 구현 |
 |---|---|
 | 전투 세션 | 맵 엔티티 `BattleSessionComponent` |
+| 보드 점유와 다중 유닛 | 맵 엔티티 `BoardStateComponent` |
+| 개별 적 패턴 상태 | 적 엔티티 `EnemyPatternRunnerComponent` |
+| 적 Intent 읽기 모델 | 서버 `PreparedIntent` Snapshot + Client용 읽기 전용 DTO/Event |
+| 스테이지/웨이브 진행 | 맵 엔티티 `StageFlowComponent` |
 | 전투 격리 | 플레이어당 Instance Room/Instance Map |
 | 플레이어 런 상태 | 플레이어 엔티티 `PlayerRunStateComponent` |
 | 정적 데이터 | UserDataSet + CSV |
@@ -92,6 +107,14 @@ M1 직업 슬롯:
 | 전투 이벤트 | `@Event extends EventType` |
 | 무상태 규칙 | `@Logic` Resolver/Router |
 | 권장 맵 타입 | SideViewRectTile(2) |
+
+협업 시 소유권은 다음과 같이 분리한다.
+
+- 콘텐츠 개발자는 기존 `EnemyActionType`을 조합해 `EnemyDefinitions.csv`와 `EnemyPatternSteps.csv` 행을 추가·수정한다.
+- 전투 코어 개발자는 Loader/Validator, Pattern Runner, Resolver/Router를 소유하며 EnemyId별 분기를 만들지 않는다.
+- UI 개발자는 Prepared Intent DTO/Event만 읽고 서버의 조건·타깃 판정을 UI 코드에 복제하지 않는다.
+- 기존 ActionType만 사용하는 새 적은 `.mlua` 수정 없이 표 행 추가로 완성하는 것을 기본 완료 기준으로 한다.
+- 새 원시 ActionType이 정말 필요할 때만 Router, Validator 허용 목록, 데이터 사전, 회귀 테스트를 한 변경 단위로 확장한다.
 
 ## 9. 로드맵
 
@@ -131,3 +154,6 @@ M1 직업 슬롯:
 | 2026-07-18 | 수정 | 큰 시스템 단위 로드맵을 화면 중심 마이크로 수직 슬라이스로 세분화 | Maker 화면을 보며 기능 하나씩 이해·검증하고, 실제 두 번째 사례가 생긴 뒤 인터페이스를 추출하기 위함 | Phase 1은 배치→이동→전환→공격→사망→적 행동→턴→타일 큐 순으로 진행. Registry·Dataset·증강은 후속 Phase로 이동 |
 | 2026-07-24 | 수정 | 스테이지 적 배치를 고정 단일 로스터에서 양방향 배치 + 다중 웨이브(`EnemySpawnPools`/`StageEnemyWaves`) 구조로 확장 | 참고작(쇼군 쇼다운)처럼 좌우에서 적이 계속 보충되며 이어지는 전투를 지원 | Data-Dictionary(StageEnemySpawns 수정, EnemySpawnPools·StageEnemyWaves 신설), GDD §3/§6, Implementation-Plan Phase 3 |
 | 2026-07-24 | 추가 | EnemyActionType에 `MOVE_FIXED_FACING` 추가 | 플레이어 위치와 무관하게 한 방향으로만 움직이는 몬스터와, 플레이어를 따라 도는 몬스터를 데이터만으로 구분 표현하기 위함 | Data-Dictionary §7, GDD §4 콘텐츠 수량, Implementation-Plan Phase 2/3 |
+| 2026-07-25 | 수정 | 초기 방향 결정과 전투 중 방향 행동을 분리하고, 웨이브 배치에 `BALANCED`/`ANY` 정책을 추가 | 생성 위치에 따라 고정 방향 적이 보드 바깥을 향하는 문제를 막고 객체별 책임을 명확히 하기 위함 | EnemyDefinitions, StageEnemySpawns, StageEnemyWaves, 적 Action 의미, Phase 1~3 구현 순서 |
+| 2026-07-25 | 추가 | 적 Intent를 `Prepare → Hold → Execute → Complete` 상태로 분리하고 `EnemyPatternSteps` 표에서 생성되는 PreparedIntent 계약과 개발자별 소유권을 명시 | 밀치기 직후 적이 행동을 재선택해 위치 조작이 무의미해지는 문제를 막고, 여러 개발자가 전투 코어 충돌 없이 표 행으로 적을 확장하기 위함 | Phase 1 Slice 10.5, GDD §3/§6/§8, Data-Dictionary §7.1/§7.2, Implementation-Plan 전투 코어 완료 기준 |
+| 2026-07-25 | 추가 | 웨이브 전멸 기본 진행에 턴/시간 제한 강제 증원 예외와 겹친 웨이브의 최종 승리 조건 추가 | 턴을 오래 소비할수록 적 증원이 누적되는 압박을 만들고, 스테이지 제작자가 표에서 증원 속도를 조절하기 위함 | GDD §6, Data-Dictionary StageEnemyWaves, Implementation-Plan Phase 3 |
