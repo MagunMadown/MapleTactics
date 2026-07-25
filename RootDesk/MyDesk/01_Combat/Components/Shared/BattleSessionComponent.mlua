@@ -12,13 +12,40 @@ script BattleSessionComponent extends Component
 	@Sync property integer ExecutingTileIndex = 0
 	@Sync property integer TileQueueCapacity = 2
 	@Sync property string BattleResult = ""
+	@Sync property string PreparedEnemyIntentState = "EMPTY"
+	@Sync property string PreparedEnemyId = ""
+	@Sync property string PreparedEnemyPatternId = ""
+	@Sync property integer PreparedEnemyStepIndex = 0
+	@Sync property string PreparedEnemyActionType = ""
+	@Sync property string PreparedEnemyTileId = ""
+	@Sync property integer PreparedEnemyDirection = 0
+	@Sync property integer PreparedEnemyTurn = 0
+	@Sync property string PreparedEnemyReason = ""
+	@Sync property integer StageNumber = 1
+	@Sync property string StageId = "stage01"
+	@Sync property integer RunSeed = 1000
+	@Sync property integer StageTurnNumber = 0
+	@Sync property integer CurrentWave = 0
+	@Sync property integer TotalWaves = 3
+	@Sync property string WaveState = "Setup"
+	@Sync property integer WaveSpawnStageTurn = 0
+	@Sync property string CurrentWaveSpawnMode = "CLEAR_ONLY"
+	@Sync property integer ForceAfterTurns = 0
+	@Sync property number ForceAfterSeconds = 0
+	@Sync property boolean ForceSpawnPending = false
+	@Sync property string ForceSpawnPendingReason = ""
+	@Sync property integer CurrentWaveSpawnCount = 2
+	@Sync property integer MaxConcurrentEnemies = 5
+	@Sync property number CurrentClearSpawnDelay = 0.60
 
 	property integer CellCount = 6
 	property number CellStartX = -2.8
 	property number CellSpacing = 1.12
 	property number UnitY = 0.12
-	property integer PlayerStartCell = 1
-	property integer EnemyStartCell = 4
+	property integer PlayerStartCell = 2
+	property integer LeftEnemyStartCell = 0
+	property integer RightEnemyStartCell = 5
+	property number CurrentEnemyMaxHp = 1
 	property number BasicAttackDamage = 3
 	property string BasicSlashMotionKey = "basic_slash"
 	property string BasicSlashActionName = "swingO1"
@@ -44,11 +71,23 @@ script BattleSessionComponent extends Component
 	property number EnemyThinkDuration = 0.25
 	property number EnemyMoveActionDuration = 0.12
 	property number EnemyAttackActionDuration = 0.30
-	property string EnemyEntityName = "BattleDummyEnemy"
+	property string EnemyModelId = "battledummyenemy"
+	property string CurrentEnemyDefinitionId = ""
+	property number CurrentEnemyBasicAttackDamage = 0
+	property string CurrentEnemyPatternId = ""
+	property string CurrentEnemyMovementPolicy = ""
+	property number WaveTransitionDelay = 0.60
+	property string LeftEnemyEntityName = "BattleEnemyLeft"
+	property string RightEnemyEntityName = "BattleEnemyRight"
 	property Entity PlayerEntity = nil
 	property Entity EnemyEntity = nil
+	property any BoardState = nil
 	property integer ActionTimerId = 0
 	property integer ImpactTimerId = 0
+	property integer WaveTimerId = 0
+	property integer ForceSpawnTimerId = 0
+	property integer PendingWaveNumber = 0
+	property integer LastEnemySpawnOrder = 0
 
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
@@ -102,9 +141,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
-		-- Initializes the map-scoped battle session and registers entities already in the map.
+		-- Initializes the map-scoped battle session and starts Stage 1 by spawning Wave 1.
 		log("[BattleSession] begin map=" .. self.Entity.Name .. " cells=" .. self.CellCount)
-		self:RegisterEnemy()
+		local boardState = self:EnsureBoardStateComponent()
+		if boardState == nil then
+			log_error("[BattleSession] BoardStateComponent unavailable")
+			return
+		end
+		boardState:ResetRegistry("SESSION_BEGIN")
 
 		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
 		if users ~= nil then
@@ -113,7 +157,7 @@ script BattleSessionComponent extends Component
 			end
 		end
 
-		self:TryStartBattle()
+		self:StartStage(1)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -127,6 +171,14 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ImpactTimerId)
 			self.ImpactTimerId = 0
 		end
+		if self.WaveTimerId > 0 then
+			_TimerService:ClearTimer(self.WaveTimerId)
+			self.WaveTimerId = 0
+		end
+		if self.ForceSpawnTimerId > 0 then
+			_TimerService:ClearTimer(self.ForceSpawnTimerId)
+			self.ForceSpawnTimerId = 0
+		end
 
 		self.QueuedActionType = ""
 		self.QueuedActionDirection = 0
@@ -136,6 +188,14 @@ script BattleSessionComponent extends Component
 		self.ExecutingTileIds = ""
 		self.ExecutingTileIndex = 0
 		self.BattleResult = ""
+		self.WaveState = "Setup"
+		self.ForceSpawnPending = false
+		self.ForceSpawnPendingReason = ""
+		self.PendingWaveNumber = 0
+		self:ClearPreparedEnemyIntent("END_PLAY")
+		if self.BoardState ~= nil then
+			self.BoardState:ResetRegistry("SESSION_END")
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -168,16 +228,307 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method void RegisterEnemy()
-		-- Finds the placed dummy enemy and initializes its logical unit state.
-		local enemy = self.Entity:GetChildByName(self.EnemyEntityName, false)
-		if enemy == nil then
-			log_error("[BattleSession] enemy missing name=" .. self.EnemyEntityName)
+	method void StartStage(integer stageNumber)
+		-- Loads the stage wave table and starts Wave 1 through the same runtime spawn path.
+		self.StageNumber = math.max(1, stageNumber)
+		self.StageId = string.format("stage%02d", self.StageNumber)
+		local configuredWaves = _StageWaveRepositoryLogic:GetTotalWaveCount(self.StageId)
+		if configuredWaves > 0 then
+			self.TotalWaves = configuredWaves
+		end
+		self.StageTurnNumber = 0
+		self.CurrentWave = 0
+		self.BattleResult = ""
+		self.WaveState = "Setup"
+		self:ClearForcedSpawnSchedule("STAGE_START")
+		log("[BattleWave] stage started stage=" .. self.StageNumber .. " seed=" .. self.RunSeed .. " totalWaves=" .. self.TotalWaves)
+		self:SpawnWave(1)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnWave(integer waveNumber)
+		-- Creates one data-defined wave while preserving living enemies from an earlier forced-overlap wave.
+		if waveNumber < 1 or waveNumber > self.TotalWaves then
+			log_error("[BattleWave] spawn rejected wave=" .. waveNumber .. " total=" .. self.TotalWaves)
 			return
 		end
 
-		self.EnemyEntity = enemy
-		self:ConfigureUnit(enemy, "enemy_01", "Enemy", self.EnemyStartCell, "Left", 100)
+		local definition = _StageWaveRepositoryLogic:GetWaveDefinition(self.StageId, waveNumber, self.RunSeed)
+		if definition.Success == false then
+			self.WaveState = "DataError"
+			log_error("[BattleWave] definition rejected stage=" .. self.StageId .. " wave=" .. waveNumber .. " reason=" .. definition.Reason)
+			return
+		end
+		if self:CanSpawnWave(definition.SpawnCount, definition.MaxConcurrent) == false then
+			self.ForceSpawnPending = true
+			self.ForceSpawnPendingReason = "CAPACITY_WAIT"
+			self.PendingWaveNumber = waveNumber
+			self.WaveState = "SpawnPending"
+			log_warning("[BattleWave] pending stage=" .. self.StageId .. " wave=" .. waveNumber .. " reason=CAPACITY_WAIT count=" .. definition.SpawnCount .. " maxConcurrent=" .. definition.MaxConcurrent)
+			return
+		end
+		local spawnDefinitions = {}
+		local compositionIds = {}
+		for spawnIndex = 1, definition.SpawnCount do
+			local spawnDefinition = _StageWaveRepositoryLogic:GetEnemySpawnDefinition(definition.EnemyPoolId, waveNumber, spawnIndex, self.RunSeed)
+			if spawnDefinition.Success == false then
+				self.WaveState = "DataError"
+				log_error("[BattleWave] enemy definition rejected stage=" .. self.StageId .. " wave=" .. waveNumber .. " slot=" .. spawnIndex .. " reason=" .. spawnDefinition.Reason)
+				return
+			end
+			table.insert(spawnDefinitions, spawnDefinition)
+			table.insert(compositionIds, spawnDefinition.EnemyDefinitionId)
+		end
+
+		self:ClearForcedSpawnSchedule("WAVE_SPAWN")
+		self:CleanupDefeatedEnemies("BEFORE_WAVE_" .. waveNumber)
+		self.CurrentWave = waveNumber
+		self.WaveState = "Spawning"
+		if waveNumber == 1 then
+			self.BattlePhase = "Setup"
+			self.TurnNumber = 0
+		end
+		self.QueuedActionType = ""
+		self.QueuedActionDirection = 0
+		self.QueuedTileIds = ""
+		self.QueuedTileCount = 0
+		self.ExecutingTileIds = ""
+		self.ExecutingTileIndex = 0
+		self.IsActionProcessing = false
+		self.LastEnemySpawnOrder = 0
+		self:ClearPreparedEnemyIntent("WAVE_SPAWN")
+		local firstSpawnDefinition = spawnDefinitions[1]
+		self.EnemyModelId = firstSpawnDefinition.EnemyModelId
+		self.CurrentEnemyDefinitionId = firstSpawnDefinition.EnemyDefinitionId
+		self.CurrentEnemyMaxHp = firstSpawnDefinition.MaxHp
+		self.CurrentEnemyBasicAttackDamage = firstSpawnDefinition.BasicAttackDamage
+		self.CurrentEnemyPatternId = firstSpawnDefinition.PatternId
+		self.CurrentEnemyMovementPolicy = firstSpawnDefinition.MovementPolicy
+		self.CurrentWaveSpawnMode = definition.SpawnTriggerMode
+		self.ForceAfterTurns = definition.ForceAfterTurns
+		self.ForceAfterSeconds = definition.ForceAfterSeconds
+		self.CurrentWaveSpawnCount = definition.SpawnCount
+		self.MaxConcurrentEnemies = definition.MaxConcurrent
+		self.CurrentClearSpawnDelay = definition.ClearSpawnDelaySeconds
+		self.WaveSpawnStageTurn = math.max(1, self.StageTurnNumber)
+
+		local spawnedCount = 0
+		for spawnIndex = 1, definition.SpawnCount do
+			local preferredCell = self.LeftEnemyStartCell
+			local searchDirection = 1
+			local facing = "Right"
+			local side = "left"
+			if spawnIndex % 2 == 0 then
+				preferredCell = self.RightEnemyStartCell
+				searchDirection = -1
+				facing = "Left"
+				side = "right"
+			end
+			if spawnIndex > 2 then
+				side = side .. "_" .. spawnIndex
+			end
+			local startCell = self:FindAvailableSpawnCell(preferredCell, searchDirection)
+			local enemy = self:SpawnWaveEnemy(side, startCell, facing, waveNumber * 100 + spawnIndex, spawnDefinitions[spawnIndex])
+			if isvalid(enemy) then
+				spawnedCount = spawnedCount + 1
+				if isvalid(self.EnemyEntity) == false then
+					self.EnemyEntity = enemy
+				end
+			end
+		end
+
+		if spawnedCount == 0 then
+			self.WaveState = "SpawnFailed"
+			log_error("[BattleWave] spawn failed stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave)
+			return
+		end
+
+		self.WaveState = "Active"
+		self:ScheduleForcedSpawnTimer()
+		local livingTotal = #self.BoardState:CollectLivingEnemies()
+		log("[BattleWave] spawned stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " seed=" .. self.RunSeed .. " enemies=" .. spawnedCount .. " livingTotal=" .. livingTotal .. " composition=" .. table.concat(compositionIds, ",") .. " mode=" .. self.CurrentWaveSpawnMode .. " forceTurns=" .. self.ForceAfterTurns .. " forceSeconds=" .. self.ForceAfterSeconds)
+		if waveNumber == 1 then
+			self:TryStartBattle()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean CanSpawnWave(integer spawnCount, integer maxConcurrent)
+		-- Enforces the configured live-enemy cap and requires enough currently empty board cells.
+		if self.BoardState == nil then
+			return false
+		end
+		local livingEnemies = self.BoardState:CollectLivingEnemies()
+		if #livingEnemies + spawnCount > maxConcurrent then
+			return false
+		end
+		local emptyCells = 0
+		for cellIndex = 0, self.CellCount - 1 do
+			if self.BoardState:FindAtCell(cellIndex, "") == nil then
+				emptyCells = emptyCells + 1
+			end
+		end
+		return emptyCells >= spawnCount
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleForcedSpawnTimer()
+		-- A real-time limit only marks the next wave pending; spawning waits for a stable turn boundary.
+		if self.CurrentWave >= self.TotalWaves then
+			return
+		end
+		if self.CurrentWaveSpawnMode ~= "TIME_LIMIT" and self.CurrentWaveSpawnMode ~= "TURN_OR_TIME" then
+			return
+		end
+		if self.ForceAfterSeconds <= 0 then
+			return
+		end
+
+		local scheduledWave = self.CurrentWave
+		local markPending = function()
+			self.ForceSpawnTimerId = 0
+			if self.BattleResult ~= "" or self.CurrentWave ~= scheduledWave then
+				return
+			end
+			self.ForceSpawnPending = true
+			self.ForceSpawnPendingReason = "TIME_LIMIT"
+			self.PendingWaveNumber = scheduledWave + 1
+			log("[BattleWave] force pending reason=TIME_LIMIT wave=" .. scheduledWave .. " nextWave=" .. self.PendingWaveNumber)
+		end
+		self.ForceSpawnTimerId = _TimerService:SetTimerOnce(markPending, self.ForceAfterSeconds)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearForcedSpawnSchedule(string reason)
+		if self.ForceSpawnTimerId > 0 then
+			_TimerService:ClearTimer(self.ForceSpawnTimerId)
+			self.ForceSpawnTimerId = 0
+		end
+		if self.ForceSpawnPending == true then
+			log("[BattleWave] force pending cleared reason=" .. reason .. " pendingWave=" .. self.PendingWaveNumber)
+		end
+		self.ForceSpawnPending = false
+		self.ForceSpawnPendingReason = ""
+		self.PendingWaveNumber = 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void EvaluateForcedSpawnAtTurnBoundary()
+		-- Evaluates turn pressure and consumes one pending forced wave only after the full enemy round.
+		if self.BattleResult ~= "" or self.CurrentWave >= self.TotalWaves then
+			return
+		end
+		if self.CurrentWaveSpawnMode == "TURN_LIMIT" or self.CurrentWaveSpawnMode == "TURN_OR_TIME" then
+			local elapsedTurns = self.StageTurnNumber - self.WaveSpawnStageTurn
+			if self.ForceAfterTurns > 0 and elapsedTurns >= self.ForceAfterTurns then
+				self.ForceSpawnPending = true
+				self.ForceSpawnPendingReason = "TURN_LIMIT"
+				self.PendingWaveNumber = self.CurrentWave + 1
+				log("[BattleWave] force pending reason=TURN_LIMIT wave=" .. self.CurrentWave .. " elapsedTurns=" .. elapsedTurns .. " nextWave=" .. self.PendingWaveNumber)
+			end
+		end
+		if self.ForceSpawnPending == false then
+			return
+		end
+
+		local pendingWave = self.PendingWaveNumber
+		local pendingReason = self.ForceSpawnPendingReason
+		self:SpawnWave(pendingWave)
+		if self.CurrentWave == pendingWave then
+			log("[BattleWave] force spawned reason=" .. pendingReason .. " wave=" .. pendingWave .. " stageTurn=" .. self.StageTurnNumber)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method Entity SpawnWaveEnemy(string side, integer startCell, string facing, integer spawnOrder, table spawnDefinition)
+		-- Spawns one enemy with a wave-unique name and UnitId, then registers its logical state.
+		if self:IsValidCell(startCell) == false then
+			log_error("[BattleWave] enemy spawn rejected side=" .. side .. " reason=NO_EMPTY_CELL")
+			return nil
+		end
+
+		local unitId = "enemy_w" .. self.CurrentWave .. "_" .. side
+		local entityName = "BattleEnemy_W" .. self.CurrentWave .. "_" .. side
+		local position = self:GetCellPosition(startCell)
+		local enemy = _SpawnService:SpawnByModelId(
+			spawnDefinition.EnemyModelId,
+			entityName,
+			Vector3(position.x, position.y, 0),
+			self.Entity
+		)
+		if isvalid(enemy) == false then
+			log_error("[BattleWave] SpawnByModelId failed model=" .. spawnDefinition.EnemyModelId .. " unit=" .. unitId)
+			return nil
+		end
+
+		self:ConfigureUnit(enemy, unitId, "Enemy", startCell, facing, spawnDefinition.MaxHp, spawnOrder)
+		local enemyUnit = enemy:GetComponent("script.BattleUnitComponent")
+		if enemyUnit ~= nil then
+			enemyUnit.EnemyDefinitionId = spawnDefinition.EnemyDefinitionId
+			enemyUnit.BasicAttackDamage = spawnDefinition.BasicAttackDamage
+			enemyUnit.EnemyPatternId = spawnDefinition.PatternId
+			enemyUnit.EnemyMovementPolicy = spawnDefinition.MovementPolicy
+			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
+		end
+		return enemy
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer FindAvailableSpawnCell(integer preferredCell, integer searchDirection)
+		-- Finds an empty cell from the requested board edge so a surviving player is never overlapped.
+		local direction = searchDirection
+		if direction ~= -1 then
+			direction = 1
+		end
+		for offset = 0, self.CellCount - 1 do
+			local cell = preferredCell + (offset * direction)
+			if self:IsValidCell(cell) and self.BoardState:FindAtCell(cell, "") == nil then
+				return cell
+			end
+		end
+		return -1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CleanupRegisteredEnemies(string reason)
+		-- Unregisters and destroys only runtime enemy entities while preserving the stage player.
+		if self.BoardState == nil then
+			return
+		end
+
+		local registeredUnits = self.BoardState:CollectRegisteredUnits()
+		for _, unitEntity in ipairs(registeredUnits) do
+			local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil and unit.Team == "Enemy" then
+				self.BoardState:UnregisterUnit(unit.UnitId)
+				if isvalid(unitEntity) then
+					_EntityService:Destroy(unitEntity)
+				end
+			end
+		end
+		self.EnemyEntity = nil
+		log("[BattleWave] enemies cleaned reason=" .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CleanupDefeatedEnemies(string reason)
+		-- Removes dead enemies only so forced waves can overlap with survivors from earlier waves.
+		if self.BoardState == nil then
+			return
+		end
+		local removedCount = 0
+		local registeredUnits = self.BoardState:CollectRegisteredUnits()
+		for _, unitEntity in ipairs(registeredUnits) do
+			local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil and unit.Team == "Enemy" and unit.IsDead == true then
+				self.BoardState:UnregisterUnit(unit.UnitId)
+				if isvalid(unitEntity) then
+					_EntityService:Destroy(unitEntity)
+				end
+				removedCount = removedCount + 1
+			end
+		end
+		log("[BattleWave] defeated enemies cleaned reason=" .. reason .. " count=" .. removedCount)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -191,7 +542,13 @@ script BattleSessionComponent extends Component
 			return
 		end
 
+		local previousRunSeed = self.RunSeed
 		self.PlayerEntity = player
+		local runState = _RunManagerLogic:EnsureRunState(player, self.RunSeed)
+		if runState ~= nil then
+			self.RunSeed = runState.RunSeed
+			log("[BattleRun] context synced sequence=" .. runState.RunSequence .. " seed=" .. self.RunSeed .. " state=" .. runState.RunState)
+		end
 		if player.PlayerControllerComponent ~= nil then
 			player.PlayerControllerComponent.Enable = false
 		end
@@ -200,7 +557,26 @@ script BattleSessionComponent extends Component
 			player.MovementComponent:Stop()
 		end
 
-		self:ConfigureUnit(player, "player_01", "Player", self.PlayerStartCell, "Right", 100)
+		self:ConfigureUnit(player, "player_01", "Player", self.PlayerStartCell, "Right", 100, 1)
+		if self.CurrentWave > 0 and previousRunSeed ~= self.RunSeed then
+			log("[BattleRun] rebuilding for restored seed previous=" .. previousRunSeed .. " current=" .. self.RunSeed)
+			self:RebuildBattleState("RUN_CONTEXT_SYNC")
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method any EnsureBoardStateComponent()
+		-- Returns the map-scoped BoardStateComponent, attaching it once when this prototype map lacks it.
+		local boardState = self.Entity:GetComponent("script.BoardStateComponent")
+		if boardState == nil then
+			boardState = self.Entity:AddComponent("BoardStateComponent")
+		end
+		if boardState == nil then
+			log_error("[BattleSession] failed to attach BoardStateComponent entity=" .. self.Entity.Name)
+			return nil
+		end
+		self.BoardState = boardState
+		return boardState
 	end
 
 	@ExecSpace("ServerOnly")
@@ -232,7 +608,7 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method void ConfigureUnit(Entity targetEntity, string unitId, string team, integer cellIndex, string facing, number maxHp)
+	method void ConfigureUnit(Entity targetEntity, string unitId, string team, integer cellIndex, string facing, number maxHp, integer spawnOrder)
 		-- Writes the initial logical state and places the entity at its cell position.
 		if self:IsValidCell(cellIndex) == false then
 			log_error("[BattleSession] invalid initial cell=" .. cellIndex .. " unit=" .. unitId)
@@ -247,6 +623,7 @@ script BattleSessionComponent extends Component
 
 		unit.UnitId = unitId
 		unit.Team = team
+		unit.SpawnOrder = spawnOrder
 		unit.CellIndex = cellIndex
 		unit.Facing = facing
 		unit.MaxHp = maxHp
@@ -259,7 +636,16 @@ script BattleSessionComponent extends Component
 		if team == "Player" and targetEntity.PlayerComponent ~= nil then
 			self:LockBoardCamera(self:GetBoardCenterX(), targetEntity.PlayerComponent.UserId)
 		end
-		log("[BattleSession] unit registered id=" .. unitId .. " team=" .. team .. " cell=" .. cellIndex .. " x=" .. position.x)
+		if self.BoardState == nil then
+			log_error("[BattleSession] registry missing during configure unit=" .. unitId)
+			return
+		end
+		local registerResult = self.BoardState:RegisterUnit(targetEntity)
+		if registerResult.Success == false then
+			log_error("[BattleSession] registry rejected unit=" .. unitId .. " reason=" .. registerResult.Reason)
+			return
+		end
+		log("[BattleSession] unit registered id=" .. unitId .. " team=" .. team .. " cell=" .. cellIndex .. " spawnOrder=" .. spawnOrder .. " x=" .. position.x)
 	end
 
 	@ExecSpace("Server")
@@ -406,81 +792,241 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void BeginEnemyTurn()
-		-- Keeps player input locked while the single enemy intent is selected and executed.
+		-- Executes the intent that stayed visible and immutable throughout the player turn.
+		if self.PreparedEnemyIntentState ~= "PREPARED" then
+			log_warning("[BattleEnemyIntent] missing before enemy turn; preparing fallback turn=" .. self.TurnNumber)
+			self.LastEnemySpawnOrder = 0
+			self:PrepareNextEnemyIntent()
+		end
+
 		self.BattlePhase = "EnemyTurn"
-		self.QueuedActionType = "ENEMY_THINK"
-		self.QueuedActionDirection = 0
+		self.QueuedActionType = "ENEMY_" .. self.PreparedEnemyActionType
+		self.QueuedActionDirection = self.PreparedEnemyDirection
 		self.IsActionProcessing = true
+		log("[BattleEnemyIntent] hold enemy=" .. self.PreparedEnemyId .. " pattern=" .. self.PreparedEnemyPatternId .. " step=" .. self.PreparedEnemyStepIndex .. " action=" .. self.PreparedEnemyActionType .. " tile=" .. self.PreparedEnemyTileId .. " turn=" .. self.PreparedEnemyTurn)
 		log("[BattleTurnFlow] phase=EnemyTurn turn=" .. self.TurnNumber)
 
 		local execute = function()
-			self:ExecuteEnemyIntent()
+			self:ExecutePreparedEnemyIntent()
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(execute, math.max(0.05, self.EnemyThinkDuration))
 	end
 
 	@ExecSpace("ServerOnly")
-	method table BuildEnemyIntent()
-		-- Chooses only between moving toward the player and attacking an adjacent player.
+	method table BuildEnemyIntent(string enemyUnitId)
+		-- Builds one prototype PatternStep while keeping tracking and fixed-facing movement semantics separate.
 		local intent = {
 			ActionType = "WAIT",
+			TileId = "",
 			Direction = 0,
-			Reason = "UNIT_MISSING"
+			Reason = "UNIT_MISSING",
+			PatternId = "",
+			StepIndex = 1
 		}
 
-		if isvalid(self.PlayerEntity) == false or isvalid(self.EnemyEntity) == false then
+		local playerEntity = self:FindUnitEntity("player_01")
+		local enemyEntity = self:FindUnitEntity(enemyUnitId)
+		if isvalid(playerEntity) == false or isvalid(enemyEntity) == false then
 			return intent
 		end
 
-		local player = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
-		local enemy = self.EnemyEntity:GetComponent("script.BattleUnitComponent")
+		local player = playerEntity:GetComponent("script.BattleUnitComponent")
+		local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
 		if player == nil or enemy == nil or player.IsDead == true or enemy.IsDead == true then
 			intent.Reason = "UNIT_UNAVAILABLE"
 			return intent
 		end
+		intent.PatternId = enemy.EnemyPatternId
+		local movementPolicy = enemy.EnemyMovementPolicy
 
 		local cellDelta = player.CellIndex - enemy.CellIndex
-		if cellDelta < 0 then
-			enemy.Facing = "Left"
-		elseif cellDelta > 0 then
-			enemy.Facing = "Right"
-		end
-		self:ApplyFacing(self.EnemyEntity, enemy.Facing)
-
-		if math.abs(cellDelta) == 1 then
-			intent.ActionType = "BASIC_ATTACK"
-			intent.Reason = "PLAYER_ADJACENT"
+		if cellDelta == 0 then
+			intent.Reason = "SAME_CELL"
 			return intent
 		end
 
+		local playerDirection = 1
 		if cellDelta < 0 then
-			intent.ActionType = "MOVE"
-			intent.Direction = -1
-			intent.Reason = "APPROACH_PLAYER"
-		elseif cellDelta > 0 then
-			intent.ActionType = "MOVE"
-			intent.Direction = 1
-			intent.Reason = "APPROACH_PLAYER"
-		else
-			intent.Reason = "SAME_CELL"
+			playerDirection = -1
 		end
+
+		if movementPolicy == "FIXED_FACING" then
+			local fixedDirection = self:GetFacingDirection(enemy.Facing)
+			local frontCell = enemy.CellIndex + fixedDirection
+			if math.abs(cellDelta) == 1 and player.CellIndex == frontCell then
+				intent.ActionType = "EXECUTE_TILE"
+				intent.TileId = "basic_slash"
+				intent.Reason = "PLAYER_ADJACENT_IN_FRONT"
+			else
+				intent.ActionType = "MOVE_FIXED_FACING"
+				intent.Direction = fixedDirection
+				intent.Reason = "ADVANCE_FIXED_FACING"
+			end
+			return intent
+		end
+
+		if movementPolicy ~= "TRACK_PLAYER" then
+			intent.Reason = "INVALID_MOVEMENT_POLICY"
+			log_warning("[BattleEnemyIntent] invalid movement policy=" .. movementPolicy .. " enemy=" .. enemyUnitId)
+			return intent
+		end
+
+		if self:GetFacingDirection(enemy.Facing) ~= playerDirection then
+			intent.ActionType = "TURN_TO_PLAYER"
+			intent.Direction = playerDirection
+			intent.Reason = "PLAYER_SIDE_CHANGED"
+			return intent
+		end
+
+		if math.abs(cellDelta) == 1 then
+			intent.ActionType = "EXECUTE_TILE"
+			intent.TileId = "basic_slash"
+			intent.Reason = "PLAYER_ADJACENT_IN_FRONT"
+			return intent
+		end
+
+		intent.ActionType = "MOVE_TOWARD"
+		intent.Direction = playerDirection
+		intent.Reason = "APPROACH_PLAYER"
 		return intent
 	end
 
 	@ExecSpace("ServerOnly")
-	method void ExecuteEnemyIntent()
-		-- Reuses the same authoritative move and attack paths as the player.
+	method table PrepareEnemyIntent()
+		-- Starts a new enemy round by selecting the first living enemy in stable SpawnOrder.
+		self.LastEnemySpawnOrder = 0
+		return self:PrepareNextEnemyIntent()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table PrepareNextEnemyIntent()
+		-- Selects the next living enemy whose SpawnOrder follows the last completed enemy.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
+
+		if self.BattleResult ~= "" then
+			result.Reason = "BATTLE_ENDED"
+			return result
+		end
+		if self.PreparedEnemyIntentState ~= "EMPTY" then
+			result.Reason = "INTENT_ALREADY_PREPARED"
+			return result
+		end
+
+		if self.BoardState == nil then
+			result.Reason = "REGISTRY_MISSING"
+			return result
+		end
+		local livingEnemies = self.BoardState:CollectLivingEnemies()
+		local selectedUnitId = ""
+		for _, enemyEntity in ipairs(livingEnemies) do
+			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+			if enemyUnit ~= nil and enemyUnit.SpawnOrder > self.LastEnemySpawnOrder then
+				selectedUnitId = enemyUnit.UnitId
+				break
+			end
+		end
+		if selectedUnitId == "" then
+			result.Reason = "NO_NEXT_LIVING_ENEMY"
+			return result
+		end
+
+		return self:PrepareEnemyIntentForUnit(selectedUnitId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table PrepareEnemyIntentForUnit(string enemyUnitId)
+		-- Converts one enemy's prototype PatternStep into the synchronized read-only runtime snapshot.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
+		if self.BattleResult ~= "" then
+			result.Reason = "BATTLE_ENDED"
+			return result
+		end
+		if self.PreparedEnemyIntentState ~= "EMPTY" then
+			result.Reason = "INTENT_ALREADY_PREPARED"
+			return result
+		end
+
+		local intent = self:BuildEnemyIntent(enemyUnitId)
+		self.PreparedEnemyIntentState = "PREPARED"
+		self.PreparedEnemyId = enemyUnitId
+		self.PreparedEnemyPatternId = intent.PatternId
+		self.PreparedEnemyStepIndex = intent.StepIndex
+		self.PreparedEnemyActionType = intent.ActionType
+		self.PreparedEnemyTileId = intent.TileId
+		self.PreparedEnemyDirection = intent.Direction
+		self.PreparedEnemyTurn = self.TurnNumber
+		self.PreparedEnemyReason = intent.Reason
+
+		result.Success = true
+		result.Reason = "PREPARED"
+		local preparedMovementPolicy = ""
+		local preparedEnemyEntity = self:FindUnitEntity(self.PreparedEnemyId)
+		if isvalid(preparedEnemyEntity) then
+			local preparedEnemyUnit = preparedEnemyEntity:GetComponent("script.BattleUnitComponent")
+			if preparedEnemyUnit ~= nil then
+				preparedMovementPolicy = preparedEnemyUnit.EnemyMovementPolicy
+			end
+		end
+		log("[BattleEnemyIntent] prepare enemy=" .. self.PreparedEnemyId .. " pattern=" .. self.PreparedEnemyPatternId .. " step=" .. self.PreparedEnemyStepIndex .. " action=" .. self.PreparedEnemyActionType .. " tile=" .. self.PreparedEnemyTileId .. " direction=" .. self.PreparedEnemyDirection .. " turn=" .. self.PreparedEnemyTurn .. " policy=" .. preparedMovementPolicy .. " reason=" .. self.PreparedEnemyReason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetPreparedEnemyIntent()
+		-- Returns a copy so callers cannot mutate the synchronized snapshot fields.
+		return {
+			State = self.PreparedEnemyIntentState,
+			EnemyId = self.PreparedEnemyId,
+			PatternId = self.PreparedEnemyPatternId,
+			StepIndex = self.PreparedEnemyStepIndex,
+			ActionType = self.PreparedEnemyActionType,
+			TileId = self.PreparedEnemyTileId,
+			Direction = self.PreparedEnemyDirection,
+			PreparedTurn = self.PreparedEnemyTurn,
+			Reason = self.PreparedEnemyReason
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ExecutePreparedEnemyIntent()
+		-- Reuses the authoritative action paths without rebuilding the prepared PatternStep.
 		self.ActionTimerId = 0
-		local intent = self:BuildEnemyIntent()
+		if self.PreparedEnemyIntentState ~= "PREPARED" then
+			log_error("[BattleEnemyIntent] execute rejected state=" .. self.PreparedEnemyIntentState)
+			self:CompleteEnemyTurn("WAIT", false, "INTENT_NOT_PREPARED")
+			return
+		end
+
+		local intent = self:GetPreparedEnemyIntent()
+		self.PreparedEnemyIntentState = "EXECUTING"
 		self.QueuedActionType = "ENEMY_" .. intent.ActionType
 		self.QueuedActionDirection = intent.Direction
-		log("[BattleEnemy] intent action=" .. intent.ActionType .. " direction=" .. intent.Direction .. " reason=" .. intent.Reason)
+		log("[BattleEnemyIntent] execute enemy=" .. intent.EnemyId .. " pattern=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " action=" .. intent.ActionType .. " tile=" .. intent.TileId .. " preparedTurn=" .. intent.PreparedTurn .. " currentTurn=" .. self.TurnNumber)
 
 		local actionResult = nil
-		if intent.ActionType == "MOVE" then
-			actionResult = self:TryMove("enemy_01", intent.Direction)
-		elseif intent.ActionType == "BASIC_ATTACK" then
-			actionResult = self:TryBasicAttack("enemy_01")
+		if intent.ActionType == "MOVE_TOWARD" then
+			actionResult = self:TryMove(intent.EnemyId, intent.Direction)
+		elseif intent.ActionType == "MOVE_FIXED_FACING" then
+			actionResult = self:TryMove(intent.EnemyId, intent.Direction)
+			if actionResult.Success == false and (actionResult.Reason == "OUT_OF_BOUNDS" or actionResult.Reason == "CELL_OCCUPIED") then
+				log("[BattleEnemyIntent] fixed move blocked; wait enemy=" .. intent.EnemyId .. " direction=" .. intent.Direction .. " reason=" .. actionResult.Reason)
+				actionResult = {
+					Success = true,
+					Reason = "WAIT_" .. actionResult.Reason
+				}
+				self.QueuedActionType = "ENEMY_WAIT"
+				self.QueuedActionDirection = 0
+			end
+		elseif intent.ActionType == "TURN_TO_PLAYER" then
+			actionResult = self:TryFaceDirection(intent.EnemyId, intent.Direction)
+		elseif intent.ActionType == "EXECUTE_TILE" and intent.TileId == "basic_slash" then
+			actionResult = self:TryBasicAttack(intent.EnemyId)
 		else
 			actionResult = { Success = true, Reason = intent.Reason }
 		end
@@ -493,24 +1039,67 @@ script BattleSessionComponent extends Component
 
 		local duration = self:GetEnemyActionDuration(intent.ActionType)
 		local complete = function()
-			self:CompleteEnemyTurn(intent.ActionType, success, reason)
+			self:CompletePreparedEnemyIntent(intent.EnemyId, intent.PatternId, intent.StepIndex, intent.ActionType, intent.TileId, success, reason)
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
 	end
 
 	@ExecSpace("ServerOnly")
 	method number GetEnemyActionDuration(string actionType)
-		if actionType == "MOVE" then
+		-- Returns the presentation lock duration for each prepared enemy action meaning.
+		if actionType == "MOVE_TOWARD" or actionType == "MOVE_FIXED_FACING" then
 			return math.max(0.05, self.EnemyMoveActionDuration)
-		elseif actionType == "BASIC_ATTACK" then
+		elseif actionType == "TURN_TO_PLAYER" then
+			return math.max(0.05, self.TurnActionDuration)
+		elseif actionType == "EXECUTE_TILE" then
 			return math.max(0.1, self.EnemyAttackActionDuration)
 		end
 		return 0.05
 	end
 
 	@ExecSpace("ServerOnly")
+	method void CompletePreparedEnemyIntent(string enemyId, string patternId, integer stepIndex, string actionType, string tileId, boolean success, string reason)
+		-- Completes one enemy snapshot, then advances to the next living enemy before ending the round.
+		log("[BattleEnemyIntent] complete enemy=" .. enemyId .. " pattern=" .. patternId .. " step=" .. stepIndex .. " action=" .. actionType .. " tile=" .. tileId .. " success=" .. tostring(success) .. " reason=" .. reason)
+		local completedEnemy = self:FindUnitEntity(enemyId)
+		if isvalid(completedEnemy) then
+			local completedUnit = completedEnemy:GetComponent("script.BattleUnitComponent")
+			if completedUnit ~= nil then
+				self.LastEnemySpawnOrder = completedUnit.SpawnOrder
+			end
+		end
+		self:ClearPreparedEnemyIntent("COMPLETED")
+		if self.BattleResult == "" then
+			local nextResult = self:PrepareNextEnemyIntent()
+			if nextResult.Success == true then
+				log("[BattleEnemyIntent] advance next=" .. self.PreparedEnemyId .. " afterSpawnOrder=" .. self.LastEnemySpawnOrder)
+				self:BeginEnemyTurn()
+				return
+			end
+		end
+		self:CompleteEnemyTurn(actionType, success, reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearPreparedEnemyIntent(string reason)
+		-- Clears the runtime snapshot without selecting the next PatternStep.
+		if self.PreparedEnemyIntentState ~= "EMPTY" then
+			log("[BattleEnemyIntent] clear enemy=" .. self.PreparedEnemyId .. " state=" .. self.PreparedEnemyIntentState .. " reason=" .. reason)
+		end
+		self.PreparedEnemyIntentState = "EMPTY"
+		self.PreparedEnemyId = ""
+		self.PreparedEnemyPatternId = ""
+		self.PreparedEnemyStepIndex = 0
+		self.PreparedEnemyActionType = ""
+		self.PreparedEnemyTileId = ""
+		self.PreparedEnemyDirection = 0
+		self.PreparedEnemyTurn = 0
+		self.PreparedEnemyReason = ""
+	end
+
+	@ExecSpace("ServerOnly")
 	method void CompleteEnemyTurn(string actionType, boolean success, string reason)
-		-- Ends one full round and reopens the next player turn.
+		-- Ends the full ordered enemy round and reopens the next player turn.
 		self.ActionTimerId = 0
 		self.QueuedActionType = ""
 		self.QueuedActionDirection = 0
@@ -521,9 +1110,13 @@ script BattleSessionComponent extends Component
 		end
 
 		self.TurnNumber = self.TurnNumber + 1
+		self.StageTurnNumber = self.TurnNumber
 		self.BattlePhase = "PlayerTurn"
+		self.LastEnemySpawnOrder = 0
+		self:EvaluateForcedSpawnAtTurnBoundary()
 		log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
-		log("[BattleTurnFlow] phase=PlayerTurn turn=" .. self.TurnNumber)
+		log("[BattleTurnFlow] phase=PlayerTurn turn=" .. self.TurnNumber .. " stageTurn=" .. self.StageTurnNumber .. " wave=" .. self.CurrentWave)
+		self:PrepareEnemyIntent()
 	end
 
 	@ExecSpace("ServerOnly")
@@ -587,6 +1180,77 @@ script BattleSessionComponent extends Component
 		result.Reason = "OK"
 		log("[BattleTurn] success unit=" .. unit.UnitId .. " from=" .. result.PreviousFacing .. " to=" .. result.CurrentFacing .. " cell=" .. unit.CellIndex)
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryFaceDirection(string unitId, integer direction)
+		-- Sets one living unit to an explicit prepared direction without deriving it again from the current target position.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			PreviousFacing = "",
+			CurrentFacing = ""
+		}
+
+		if direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+
+		local unitEntity = self:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if self:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if unit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+
+		result.PreviousFacing = unit.Facing
+		result.CurrentFacing = "Right"
+		if direction < 0 then
+			result.CurrentFacing = "Left"
+		end
+
+		if result.PreviousFacing == result.CurrentFacing then
+			result.Success = true
+			result.Reason = "ALREADY_FACING"
+			log("[BattleTurn] kept unit=" .. unit.UnitId .. " facing=" .. result.CurrentFacing .. " cell=" .. unit.CellIndex)
+			return result
+		end
+
+		unit.Facing = result.CurrentFacing
+		self:ApplyFacing(unitEntity, unit.Facing)
+
+		local turnedEvent = UnitTurnedEvent()
+		turnedEvent.UnitId = unit.UnitId
+		turnedEvent.PreviousFacing = result.PreviousFacing
+		turnedEvent.CurrentFacing = result.CurrentFacing
+		self.Entity:SendEvent(turnedEvent)
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[BattleTurn] success unit=" .. unit.UnitId .. " from=" .. result.PreviousFacing .. " to=" .. result.CurrentFacing .. " cell=" .. unit.CellIndex .. " source=PREPARED_DIRECTION")
+		return result
+	end
+
+	method integer GetFacingDirection(string facing)
+		-- Converts the logical facing string into a stable one-cell direction.
+		if facing == "Right" then
+			return 1
+		end
+		return -1
 	end
 
 	@ExecSpace("ServerOnly")
@@ -917,7 +1581,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table ResetBattle()
-		-- Restores the existing two units and all turn/queue state without rebuilding the map.
+		-- Restarts a completed battle while preserving the current run seed.
 		local result = {
 			Success = false,
 			Reason = "UNKNOWN"
@@ -927,10 +1591,37 @@ script BattleSessionComponent extends Component
 			result.Reason = "BATTLE_NOT_ENDED"
 			return result
 		end
-		if isvalid(self.PlayerEntity) == false or isvalid(self.EnemyEntity) == false then
-			result.Reason = "UNIT_MISSING"
-			return result
+		return self:RebuildBattleState("RESET")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table StartNewRun(integer runSeed)
+		-- Asks the player-owned run state to begin, then rebuilds this map-scoped battle.
+		if isvalid(self.PlayerEntity) == false then
+			return {
+				Success = false,
+				Reason = "PLAYER_MISSING"
+			}
 		end
+		local runState = _RunManagerLogic:StartNewRun(self.PlayerEntity, runSeed)
+		if runState == nil then
+			return {
+				Success = false,
+				Reason = "RUN_STATE_UNAVAILABLE"
+			}
+		end
+		self.RunSeed = runState.RunSeed
+		log("[BattleRun] new run requested sequence=" .. runState.RunSequence .. " seed=" .. self.RunSeed)
+		return self:RebuildBattleState("NEW_RUN")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RebuildBattleState(string reason)
+		-- Clears transient battle state, then rebuilds Stage 1 through the normal spawn path.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
 
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
@@ -940,10 +1631,16 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ImpactTimerId)
 			self.ImpactTimerId = 0
 		end
+		if self.WaveTimerId > 0 then
+			_TimerService:ClearTimer(self.WaveTimerId)
+			self.WaveTimerId = 0
+		end
+		self:ClearForcedSpawnSchedule(reason)
 
 		self.BattlePhase = "Setup"
 		self.BattleResult = ""
-		self.TurnNumber = 1
+		self.TurnNumber = 0
+		self.StageTurnNumber = 0
 		self.QueuedActionType = ""
 		self.QueuedActionDirection = 0
 		self.QueuedTileIds = ""
@@ -951,14 +1648,22 @@ script BattleSessionComponent extends Component
 		self.ExecutingTileIds = ""
 		self.ExecutingTileIndex = 0
 		self.IsActionProcessing = false
+		self.LastEnemySpawnOrder = 0
+		self:ClearPreparedEnemyIntent(reason)
 
-		self:ConfigureUnit(self.PlayerEntity, "player_01", "Player", self.PlayerStartCell, "Right", 100)
-		self:ConfigureUnit(self.EnemyEntity, "enemy_01", "Enemy", self.EnemyStartCell, "Left", 100)
-		self.BattlePhase = "PlayerTurn"
+		local playerEntity = self:FindUnitEntity("player_01")
+		if isvalid(playerEntity) == false then
+			result.Reason = "PLAYER_MISSING"
+			return result
+		end
+		self:CleanupRegisteredEnemies(reason)
+		self.PlayerEntity = playerEntity
+		self:ConfigureUnit(playerEntity, "player_01", "Player", self.PlayerStartCell, "Right", 100, 1)
+		self:StartStage(1)
 
 		result.Success = true
-		result.Reason = "RESET"
-		log("[BattleReset] completed turn=" .. self.TurnNumber .. " playerCell=" .. self.PlayerStartCell .. " enemyCell=" .. self.EnemyStartCell)
+		result.Reason = reason
+		log("[BattleReset] completed reason=" .. reason .. " seed=" .. self.RunSeed .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " playerCell=" .. self.PlayerStartCell .. " enemyHp=" .. self.CurrentEnemyMaxHp)
 		return result
 	end
 
@@ -1004,7 +1709,7 @@ script BattleSessionComponent extends Component
 
 		local safeImpactDelay = math.max(0, self.PushImpactDelay)
 		if safeImpactDelay <= 0 then
-			return self:ResolvePushImpact(sourceUnitId)
+			return _EffectRouterLogic:ExecuteEffect(self, "PUSH", sourceUnitId, "", 0)
 		end
 		if self.ImpactTimerId > 0 then
 			_TimerService:ClearTimer(self.ImpactTimerId)
@@ -1016,7 +1721,7 @@ script BattleSessionComponent extends Component
 			self.ImpactTimerId = 0
 			local elapsed = _UtilLogic.ElapsedSeconds - scheduledAt
 			log("[BattleImpact] triggered effect=PUSH elapsed=" .. tostring(elapsed))
-			local impactResult = self:ResolvePushImpact(sourceUnitId)
+			local impactResult = _EffectRouterLogic:ExecuteEffect(self, "PUSH", sourceUnitId, "", 0)
 			if impactResult.Success == false then
 				log_warning("[BattlePush] failed source=" .. sourceUnitId .. " reason=" .. impactResult.Reason)
 			end
@@ -1110,10 +1815,18 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table TryBasicAttack(string sourceUnitId)
 		-- Supplies the basic slash profile to the shared front-cell attack resolver.
+		local damageAmount = self.BasicAttackDamage
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) then
+			local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+			if sourceUnit ~= nil then
+				damageAmount = sourceUnit.BasicAttackDamage
+			end
+		end
 		return self:TryFrontAttack(
 			sourceUnitId,
 			"basic_slash",
-			self.BasicAttackDamage,
+			damageAmount,
 			self.BasicSlashMotionKey,
 			self.BasicSlashActionName,
 			self.BasicSlashMotionPlayRate,
@@ -1265,7 +1978,7 @@ script BattleSessionComponent extends Component
 
 		if isvalid(targetEntity) then
 			local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
-			local damageResult = self:ApplyDamage(sourceUnitId, targetUnit.UnitId, damageAmount)
+			local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnit.UnitId, damageAmount)
 			if damageResult.Success == false then
 				result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
 				log_error("[BattleAttack] damage failed source=" .. sourceUnitId .. " target=" .. targetUnit.UnitId .. " reason=" .. damageResult.Reason)
@@ -1362,7 +2075,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void HandleUnitDied(string unitId, string cause)
-		-- Marks one unit dead exactly once and freezes the battle in a synchronized result phase.
+		-- Marks one unit dead exactly once, advances finite waves, and clears the stage after the final wave.
 		local unitEntity = self:FindUnitEntity(unitId)
 		if isvalid(unitEntity) == false then
 			log_error("[BattleDeath] failed unit=" .. unitId .. " reason=UNIT_NOT_FOUND")
@@ -1381,9 +2094,21 @@ script BattleSessionComponent extends Component
 
 		unit.CurrentHp = math.max(0, unit.CurrentHp)
 		unit.IsDead = true
+		if unit.Team == "Enemy" and self.BoardState ~= nil then
+			local livingEnemies = self.BoardState:CollectLivingEnemies()
+			if #livingEnemies > 0 then
+				log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=CONTINUE livingEnemies=" .. #livingEnemies)
+				return
+			end
+		end
+		self:ClearForcedSpawnSchedule("ALL_ENEMIES_DEFEATED")
 		if self.ImpactTimerId > 0 then
 			_TimerService:ClearTimer(self.ImpactTimerId)
 			self.ImpactTimerId = 0
+		end
+		if self.ActionTimerId > 0 then
+			_TimerService:ClearTimer(self.ActionTimerId)
+			self.ActionTimerId = 0
 		end
 		self.QueuedActionType = ""
 		self.QueuedActionDirection = 0
@@ -1392,15 +2117,47 @@ script BattleSessionComponent extends Component
 		self.ExecutingTileIds = ""
 		self.ExecutingTileIndex = 0
 		self.IsActionProcessing = false
-		self.BattlePhase = "BattleEnded"
 		if unit.Team == "Enemy" then
+			if self.CurrentWave < self.TotalWaves then
+				self.BattlePhase = "WaveTransition"
+				self.WaveState = "Cleared"
+				self:ClearPreparedEnemyIntent("WAVE_CLEARED")
+				local clearedWave = self.CurrentWave
+				local nextWave = clearedWave + 1
+				local advanceWave = function()
+					self.WaveTimerId = 0
+					if self.BattleResult ~= "" or self.CurrentWave ~= clearedWave then
+						return
+					end
+					self.TurnNumber = self.TurnNumber + 1
+					self.StageTurnNumber = self.TurnNumber
+					self:SpawnWave(nextWave)
+					if self.CurrentWave == nextWave then
+						self.BattlePhase = "PlayerTurn"
+						self.WaveState = "Active"
+						self:PrepareEnemyIntent()
+					end
+				end
+				self.WaveTimerId = _TimerService:SetTimerOnce(advanceWave, math.max(0, self.CurrentClearSpawnDelay))
+				log("[BattleWave] cleared stage=" .. self.StageNumber .. " wave=" .. clearedWave .. "/" .. self.TotalWaves .. " nextWave=" .. nextWave)
+				return
+			end
+
+			self.BattlePhase = "BattleEnded"
+			self.WaveState = "StageCleared"
 			self.BattleResult = "Victory"
 		else
+			self.BattlePhase = "BattleEnded"
+			self.WaveState = "Failed"
 			self.BattleResult = "Defeat"
 		end
 
-		log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=" .. self.BattleResult)
-		log("[BattleResult] result=" .. self.BattleResult .. " turn=" .. self.TurnNumber)
+		local runResultRecorded = false
+		if isvalid(self.PlayerEntity) then
+			runResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageNumber, self.BattleResult)
+		end
+		log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=" .. self.BattleResult .. " wave=" .. self.CurrentWave)
+		log("[BattleResult] result=" .. self.BattleResult .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " runRecorded=" .. tostring(runResultRecorded))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1422,13 +2179,14 @@ script BattleSessionComponent extends Component
 		end
 		local targetCell = sourceUnit.CellIndex + facingDirection
 
-		local candidates = { self.PlayerEntity, self.EnemyEntity }
-		for _, candidate in ipairs(candidates) do
-			if isvalid(candidate) and candidate ~= sourceEntity then
-				local unit = candidate:GetComponent("script.BattleUnitComponent")
-				if unit ~= nil and unit.Team ~= sourceUnit.Team and unit.IsDead == false and unit.CellIndex == targetCell then
-					return candidate
-				end
+		if self.BoardState == nil then
+			return nil
+		end
+		local candidate = self.BoardState:FindAtCell(targetCell, sourceUnitId)
+		if isvalid(candidate) then
+			local unit = candidate:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil and unit.Team ~= sourceUnit.Team then
+				return candidate
 			end
 		end
 		return nil
@@ -1519,31 +2277,19 @@ script BattleSessionComponent extends Component
 	end
 
 	method Entity FindUnitEntity(string unitId)
-		-- Finds one of the currently registered battle entities by logical unit id.
-		local candidates = { self.PlayerEntity, self.EnemyEntity }
-		for _, candidate in ipairs(candidates) do
-			if isvalid(candidate) then
-				local unit = candidate:GetComponent("script.BattleUnitComponent")
-				if unit ~= nil and unit.UnitId == unitId then
-					return candidate
-				end
-			end
+		-- Delegates logical unit lookup to the map-scoped BoardState registry.
+		if self.BoardState == nil then
+			return nil
 		end
-		return nil
+		return self.BoardState:FindByUnitId(unitId)
 	end
 
 	method boolean IsCellOccupied(integer cellIndex, string ignoredUnitId)
-		-- Returns whether a living unit other than the requester occupies a cell.
-		local candidates = { self.PlayerEntity, self.EnemyEntity }
-		for _, candidate in ipairs(candidates) do
-			if isvalid(candidate) then
-				local unit = candidate:GetComponent("script.BattleUnitComponent")
-				if unit ~= nil and unit.UnitId ~= ignoredUnitId and unit.IsDead == false and unit.CellIndex == cellIndex then
-					return true
-				end
-			end
+		-- Delegates living-cell occupancy to the map-scoped BoardState registry.
+		if self.BoardState == nil then
+			return false
 		end
-		return false
+		return isvalid(self.BoardState:FindAtCell(cellIndex, ignoredUnitId))
 	end
 
 	method number GetBoardCenterX()
@@ -1612,18 +2358,29 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void TryStartBattle()
-		-- Enters the first player turn after both required units have registered.
-		if isvalid(self.PlayerEntity) == false or isvalid(self.EnemyEntity) == false then
+		-- Enters the first player turn after a player and at least one wave enemy have registered.
+		local playerEntity = self:FindUnitEntity("player_01")
+		if isvalid(playerEntity) == false or self.BoardState == nil then
 			return
 		end
+		local livingEnemies = self.BoardState:CollectLivingEnemies()
+		if #livingEnemies == 0 then
+			return
+		end
+		self.PlayerEntity = playerEntity
+		self.EnemyEntity = livingEnemies[1]
 
 		if self.BattlePhase == "PlayerTurn" then
 			return
 		end
 
 		self.BattlePhase = "PlayerTurn"
+		self.WaveState = "Active"
 		self.TurnNumber = 1
-		log("[BattleSession] ready phase=" .. self.BattlePhase .. " turn=" .. self.TurnNumber .. " playerCell=" .. self.PlayerStartCell .. " enemyCell=" .. self.EnemyStartCell)
+		self.StageTurnNumber = 1
+		self.WaveSpawnStageTurn = 1
+		log("[BattleSession] ready phase=" .. self.BattlePhase .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " playerCell=" .. self.PlayerStartCell .. " livingEnemies=" .. #livingEnemies .. " enemyHp=" .. self.CurrentEnemyMaxHp)
+		self:PrepareEnemyIntent()
 	end
 
 end
