@@ -267,8 +267,19 @@ ENTRY_NOT_PREPARED
 CURRENT_MAP_UNAVAILABLE
 BATTLE_SESSION_NOT_FOUND
 STAGE_DEFINITION_NOT_FOUND
+CONTENT_VALIDATION_FAILED
 RUN_STATE_UNAVAILABLE
 ```
+
+Stage 시작 전 `StageDefinitionRepositoryLogic`과 `ContentValidatorLogic`이
+Stage Definition, 보드 범위, 큐 용량, Wave 참조를 검증한다.
+
+- Stage가 없으면 `STAGE_DEFINITION_NOT_FOUND`
+- Stage 행은 있으나 값 또는 참조가 잘못되면 `CONTENT_VALIDATION_FAILED`
+- 세부 원인은 Server 결과의 `DetailReason`과 `[ContentValidation]` 로그에서 확인
+
+Stage 제작 규칙은
+[`Stage-Authoring-Guide.md`](./Stage-Authoring-Guide.md)를 따른다.
 
 ## 10. Prototype 자동 시작
 

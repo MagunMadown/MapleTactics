@@ -13,6 +13,12 @@
 이 문서는 여러 개발자가 같은 규칙으로 콘텐츠와 기능을 추가하기 위한 기준이다.
 구현되어 있는 기능과 앞으로 도입할 규격을 구분하기 위해 다음 표기를 사용한다.
 
+사람 개발자와 AI의 실제 작업 순서, 파일 소유권, 병렬 개발 Gate와 검증·인수인계 규칙은
+[`Development-Workflow-Guide.md`](./Development-Workflow-Guide.md)를 필수 동반
+문서로 사용한다.
+현재 구현에서 부족한 항목과 우선순위, 각 Gate의 해제 조건은 해당 문서의
+`2.1 현재 부족한 항목`을 단일 기준으로 사용한다.
+
 - **필수**: 신규 코드와 데이터가 반드시 지켜야 한다.
 - **권장**: 특별한 이유가 없다면 따른다.
 - **계획됨**: 스키마와 책임만 먼저 정했으며 런타임 구현은 아직 없다.
@@ -95,8 +101,8 @@ UI / Motion / Effect Presentation
 | 상태 | 단일 소유자 | 변경 진입점 | 수명 |
 |---|---|---|---|
 | Run Seed, 현재 Stage, 완료 Stage | `PlayerRunStateComponent` | `RunManagerLogic` | 플레이어 Run |
-| BattlePhase, 승패 | `BattleSessionComponent` | Session 공개 API | 전투 맵 |
-| Turn, 행동 큐, 입력 잠금 | `BattleTurnComponent` | Turn 공개 API | 전투 맵 |
+| BattlePhase, Turn, 행동 큐, 입력 잠금 | `BattleTurnComponent` | Turn 공개 API | 전투 맵 |
+| 승패, Stage 연결, 전체 실행 조정 | `BattleSessionComponent` | Session 공개 API | 전투 맵 |
 | Wave, 증원 예약, Spawn Timer | `BattleWaveComponent` | Wave 공개 API | 전투 맵 |
 | Unit HP, Cell, Facing, IsDead | `BattleUnitComponent` | `Apply...` 계열 전투 API | 유닛 |
 | 보드 등록과 Cell 점유 | `BoardStateComponent` | Registry API | 전투 맵 |
@@ -104,9 +110,14 @@ UI / Motion / Effect Presentation
 | 준비된 적 Intent | `EnemyIntentComponent` 또는 Turn Controller | Intent API | 전투 맵/적 |
 | UI 표시 캐시 | UI Controller | `Refresh...` | 클라이언트 UI |
 
-현재 `BattleTurnComponent`, `BattleWaveComponent`, `SkillRuntimeStateComponent`,
-`EnemyIntentComponent`는 **계획됨** 상태다. 마이그레이션 전까지는 동일 상태가
-`BattleSessionComponent`에 존재한다.
+현재 `SkillRuntimeStateComponent`, `BattleTurnComponent`, `BattleWaveComponent`는
+**구현됨** 상태다. `EnemyIntentComponent`는 **계획됨** 상태이며 마이그레이션
+전까지 해당 맵 상태는 `BattleSessionComponent`에 존재한다.
+
+`BattleSessionComponent`의 기존 Turn/Queue와 Wave `@Sync` 필드는 단계적
+마이그레이션을 위한 호환 Snapshot이다. 직접 변경하지 않고
+`PublishTurnStateSnapshot()` 또는 `PublishWaveStateSnapshot()`으로만 갱신한다.
+신규 UI와 기능은 각 상태 소유 컴포넌트를 직접 읽거나 공개 메서드를 호출한다.
 
 ### 4.1 상태 변경 금지 규칙
 
@@ -186,22 +197,33 @@ MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은
 
 스킬별 피해, 적 패턴 분기, Wave 데이터 해석을 직접 구현하지 않는다.
 
-### 6.2 BattleTurnComponent — 계획됨
+### 6.2 BattleTurnComponent — 구현됨
 
 - 현재 Turn과 Phase
-- 플레이어 행동 큐
+- 즉시 행동 슬롯과 가변 Skill 큐
+- 등록 큐와 실행 큐의 분리
 - 실행 중 입력 잠금
 - 행동 완료 후 적 Turn 전환
-- Turn 경계 Event
-- Cooldown 감소 요청
+- Wave 전환과 전투 종료 Phase 반영
 
-### 6.3 BattleWaveComponent — 계획됨
+상태 변경은 `ResetTurnState`, `OpenPlayerTurn`, `TryReserveImmediateAction`,
+`TryAppendSkill`, `TryFreezeSkillQueue`, `BeginEnemyTurn`, `CompleteEnemyTurn`,
+`SetPhase`를 통해서만 수행한다. Session은 타깃·피해·모션·적 Intent 실행을 조정하고
+행동 경계에서 Turn API를 호출한다. 자세한 사용법은
+[`Battle-Turn-Guide.md`](./Battle-Turn-Guide.md)를 따른다.
+
+### 6.3 BattleWaveComponent — 구현됨
 
 - Stage Wave 진행
 - 전멸 후 다음 Wave
 - Turn/시간 제한 강제 증원 예약
 - Spawn 수와 동시 생존 수 검증
 - Spawn/Cleanup Timer 소유
+
+Wave 번호, 상태, 현재 Spawn 규칙, 강제 증원 예약과 Wave/시간 Timer를 소유한다.
+Session은 실제 Enemy Definition 조회와 Spawn, 보드 수용량 판정, 승패 확정을 담당한다.
+맵에는 `BattleWaveState` 자식 Entity로 배치한다. 사용 규격은
+[`Battle-Wave-Guide.md`](./Battle-Wave-Guide.md)를 따른다.
 
 ### 6.4 BattleUnitComponent — 구현됨
 
@@ -217,7 +239,20 @@ MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은
 - 생존 적 조회
 - 결정적인 `SpawnOrder → UnitId` 정렬
 
-### 6.6 Repository Logic
+### 6.6 SkillRuntimeStateComponent — 구현됨
+
+- 전투 참가자별 `SkillId → RemainingTurns` 상태 소유
+- 스킬 사용 가능 여부의 서버 판정
+- 실행이 시작된 스킬의 Cooldown 기록
+- 다음 소유자 Turn 시작 시 Cooldown 감소
+- UI가 읽는 `CooldownSnapshot`과 `CooldownRevision` 동기화
+
+현재 플레이어 Cooldown은 적 행동 전체가 끝나 다음 `PlayerTurn`이 열리기 직전에 1
+감소한다. `CooldownTurns=1`은 사용한 턴의 같은 큐에서 재사용할 수 없고 다음 플레이어
+턴에 다시 사용할 수 있다. `CooldownTurns=2`는 다음 플레이어 턴에도 1이 남고 그 다음
+플레이어 턴에 준비된다.
+
+### 6.7 Repository Logic
 
 - Dataset 행 조회
 - 필수 필드 검증
@@ -227,7 +262,7 @@ MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은
 
 Runtime Entity와 Timer를 보관하지 않는다.
 
-### 6.7 Resolver와 Executor
+### 6.8 Resolver와 Executor
 
 - Resolver는 대상과 결과를 계산한다.
 - Executor는 하나의 원자적인 Effect를 적용한다.
@@ -235,7 +270,7 @@ Runtime Entity와 Timer를 보관하지 않는다.
 - Executor는 다른 Executor를 직접 호출하지 않는다.
 - 복수 Effect 순서는 `SkillExecutionComponent`가 조정한다.
 
-### 6.8 BattleGatewayLogic — 구현됨
+### 6.9 BattleGatewayLogic — 구현됨
 
 메인 UI, 대기 화면, 캐릭터 선택, 맵 이동 시스템이 사용하는 전투 진입 Facade다.
 플레이어별 Pending 정보는 `BattleEntryStateComponent`가 소유하고 Gateway Logic은
@@ -244,7 +279,7 @@ Runtime Entity와 Timer를 보관하지 않는다.
 외부 호출 규격은
 [`Battle-Integration-API.md`](./Battle-Integration-API.md)를 따른다.
 
-### 6.9 BattleEntryStateComponent — 구현됨
+### 6.10 BattleEntryStateComponent — 구현됨
 
 - StageId, CharacterId, JobId, LoadoutId, RunSeed Snapshot
 - `NEW_RUN` 또는 `CONTINUE_RUN`
@@ -357,7 +392,7 @@ UI 표시 문구는 Reason ID와 분리한다. 서버 Reason을 그대로 사용
 
 ## 10. Stage 콘텐츠 규격
 
-### 10.1 StageDefinitions — 계획됨
+### 10.1 StageDefinitions — 런타임 골격 구현됨
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---:|---|
@@ -375,6 +410,12 @@ UI 표시 문구는 Reason ID와 분리한다. 서버 Reason을 그대로 사용
 | `StageRuleId` | string |  | 특수 규칙 Handler ID |
 
 Map Entity에는 가능하면 `StageId`만 설정하고 세부 값은 Repository에서 읽는다.
+
+`StageDefinitionRepositoryLogic`과 `ContentValidatorLogic`이 구현되어
+`BattleSessionComponent` 진입 전에 Definition과 Wave 참조를 검증한다. 현재 `stage01`은
+기존 전투 보존을 위한 호환 Definition을 제공하며, Maker의 `StageDefinitions`
+UserDataSet 행이 존재하면 Dataset을 우선한다. 제작 절차와 호환 제거 조건은
+[`Stage-Authoring-Guide.md`](./Stage-Authoring-Guide.md)를 따른다.
 
 ### 10.2 기존 Stage Dataset — 구현됨
 
@@ -409,14 +450,15 @@ Repository가 우선순위를 정한다.
 ```text
 SkillDefinition
 → Target 검증
+→ Cooldown 사용 가능 검증
 → Modifier 적용
+→ Cooldown 기록
 → SkillEffectStep 1 실행
 → SkillEffectStep 2 실행
 → ...
-→ Cooldown 기록
 ```
 
-### 11.2 SkillDefinitions — 계획됨
+### 11.2 SkillDefinitions — 런타임 골격 구현됨
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---:|---|
@@ -432,11 +474,12 @@ SkillDefinition
 | `MotionProfileId` | string |  | 표현 설정 ID |
 | `EffectSetId` | string | O | Effect Step 묶음 |
 | `RequiredJobTag` | string |  | 제한이 없으면 빈 문자열 |
+| `ActionDuration` | number | O | 큐의 다음 행동까지 기다리는 시간 |
 
 v0.1 최초 구현 TargetingType은 현재 전방 Cell 판정을 표현할 수 있는
 `FRONT_CELL`부터 시작한다. 다른 TargetingType은 실제 기능 Slice에서 추가한다.
 
-### 11.3 SkillEffectSteps — 계획됨
+### 11.3 SkillEffectSteps — 런타임 골격 구현됨
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---:|---|
@@ -453,6 +496,12 @@ v0.1 최초 구현 TargetingType은 현재 전방 Cell 판정을 표현할 수 �
 같은 `EffectSetId` 안에서는 `StepIndex` 오름차순으로 실행한다. 중복 StepIndex는
 Validation 실패다.
 
+`SkillDefinitionRepositoryLogic`과 `ContentValidatorLogic`이 Definition과 Effect Step을
+조회·변환·검증한다. 현재 기본 베기, 강한 베기, 밀치기는 공통 실행 경로로 이전되었고,
+복수 Effect Step도 `StepIndex` 순서로 실행한다. Cooldown은 유닛의
+`SkillRuntimeStateComponent`가 기록하고 Turn 경계에서 감소시킨다.
+세부 제작 절차는 [`Skill-Authoring-Guide.md`](./Skill-Authoring-Guide.md)를 따른다.
+
 ### 11.4 EffectType
 
 | EffectType | 상태 | 의미 |
@@ -467,7 +516,7 @@ Validation 실패다.
 새 EffectType을 추가할 때는 기존 스킬 클래스를 상속하지 않는다. 공통 Executor 계약을
 따르는 Handler를 하나 추가하고 Router에 등록한다.
 
-### 11.5 Effect 실행 Context
+### 11.5 Effect 실행 Context — 구현됨
 
 Executor는 다음 의미를 가진 Context를 받는다.
 
@@ -483,6 +532,8 @@ Executor는 다음 의미를 가진 Context를 받는다.
 ```
 
 Context는 요청 동안만 사용하는 값이다. Executor가 Context를 전역 상태로 보관하지 않는다.
+실제 Executor 계약과 확장 절차는
+[`Effect-Executor-Guide.md`](./Effect-Executor-Guide.md)를 따른다.
 
 ### 11.6 상속과 조합
 
@@ -707,13 +758,13 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 현재 Stage 1을 유지하면서 다음 순서로 진행한다.
 
 1. 이 규격을 공동 기준으로 승인
-2. `StageDefinitions`와 Content Validator 추가
-3. `SkillDefinitions`, `SkillEffectSteps`와 Repository 추가
-4. 기본 베기·강한 베기·밀치기를 데이터 기반 Skill 실행으로 이전
-5. Effect Context와 Executor 계약 정리
-6. `SkillRuntimeStateComponent`와 Cooldown 골격 추가
-7. Turn·큐 책임을 `BattleTurnComponent`로 이동
-8. Wave·Spawn Timer 책임을 `BattleWaveComponent`로 이동
+2. `StageDefinitions` Repository와 Content Validator 추가 — 런타임 골격 구현, Dataset 전환 검증 중
+3. `SkillDefinitions`, `SkillEffectSteps`와 Repository 추가 — 런타임 골격 구현, Dataset 전환 검증 중
+4. 기본 베기·강한 베기·밀치기를 데이터 기반 Skill 실행으로 이전 — 단일 Effect 경로 구현
+5. Effect Context와 Executor 계약 정리 — DAMAGE/PUSH 및 다중 Step 실행 구현
+6. `SkillRuntimeStateComponent`와 Cooldown 골격 추가 — 구현됨
+7. Turn·큐 책임을 `BattleTurnComponent`로 이동 — 구현됨
+8. Wave·Spawn Timer 책임을 `BattleWaveComponent`로 이동 — 구현됨
 9. `EnemyPatternSteps`와 Intent Resolver 연결
 10. 직업·아이템·증강 Modifier 스키마와 빈 파이프라인 추가
 11. Stage 1 전체 회귀 검증
@@ -730,14 +781,21 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 
 | 현재 구현 | 규격상 위치 | 처리 |
 |---|---|---|
-| `BattleSessionComponent` | Session + Turn + Wave + Skill 임시 통합 | 단계적 분리 |
+| `BattleSessionComponent` | 전투 흐름 조정 + Turn/Wave 호환 Snapshot | Turn·Wave·SkillRuntime 상태를 전용 컴포넌트에 위임하고 호환 API만 유지 |
 | `BattleGatewayLogic` | 외부 시스템 전투 진입 Facade | 유지 |
 | `BattleEntryStateComponent` | 플레이어별 Pending 전투 입장 | 유지 |
 | `BattleUnitComponent` | Unit Runtime State | 유지 |
 | `BoardStateComponent` | Board Registry | 유지 |
 | `BattleUnitPresentationComponent` | Presentation | 유지 |
-| `EffectRouterLogic` | Effect Router | Executor 등록형으로 확장 |
+| `SkillRuntimeStateComponent` | 유닛별 Cooldown Runtime State | 구현됨 |
+| `EffectRouterLogic` | Effect Router | DAMAGE/PUSH Executor 연결 구현 |
+| `SkillExecutionLogic` | Effect Context 생성·Step 순차 실행 | 구현됨 |
+| `DamageEffectExecutorLogic` | DAMAGE 원자 효과 | 구현됨 |
+| `PushEffectExecutorLogic` | PUSH 원자 효과 | 구현됨 |
 | `StageWaveRepositoryLogic` | Stage/Enemy Repository | 책임별 Repository로 확장 |
+| `StageDefinitionRepositoryLogic` | Stage Definition Repository | 구현됨, Stage 1 Dataset 전환 후 호환값 제거 |
+| `ContentValidatorLogic` | 전투 시작 전 콘텐츠 참조 검증 | 구현됨 |
+| `SkillDefinitionRepositoryLogic` | Skill·Effect Step Repository | 구현됨, Dataset 전환 후 호환값 제거 |
 | `StageEnemyWaves` | Stage Wave Definition | 유지 |
 | `EnemySpawnPools` | Spawn Pool Definition | 유지 |
 | `EnemyDefinitions` | Enemy Definition | 유지 |

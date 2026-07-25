@@ -107,32 +107,36 @@ Instance Room 안에서는 각 플레이어의 전투 맵과 `BattleSessionCompo
 
 ## 4. 맵별 Stage 설정
 
-같은 `BattleSessionComponent`를 여러 맵에 재사용하되 맵 인스턴스마다 다음 값을 다르게 설정한다.
+같은 `BattleSessionComponent`를 여러 전투 맵에 재사용하되 Stage별 전투 값은 맵
+컴포넌트 속성에 복사하지 않고 `StageDefinitions`와 연결 Dataset에서 읽는다.
 
 ```text
 StageId
-CellCount
-CellStartX
-CellSpacing
-UnitY
-PlayerStartCell
-EnemyStartCell
-TurnLimit
+→ StageDefinitionRepositoryLogic
+→ ContentValidatorLogic
+→ CellCount / CellStartX / CellSpacing / UnitY / PlayerStartCell
+→ WaveTableId
+→ StageEnemyWaves / EnemySpawnPools / EnemyDefinitions
 ```
 
-초기에는 맵 컴포넌트 속성으로 설정한다. 스테이지가 3개 이상이 되어 반복 데이터가 생기면 `StageDefinition` 또는 Dataset으로 이동한다.
+맵은 지형, 카메라, `BattleSessionComponent`와
+`BattleBoardState`·`BattleTurnState`·`BattleWaveState` Entity를 제공한다. Stage 수치,
+적 구성, 강제 증원 규칙은 Dataset이 제공한다. 일반 Stage를 추가하기 위해 Session에
+Stage별 분기를 넣지 않는다.
 
 map02 예시:
 
-```text
-StageId         = "stage02"
-CellCount       = 8
-PlayerStartCell = 0
-EnemyStartCell  = 6
-TurnLimit       = 10
+```csv
+SchemaVersion,StageId,DisplayName,CellCount,CellStartX,CellSpacing,UnitY,PlayerStartCell,QueueCapacity,WaveTableId,NextStageId,StageRuleId
+1,stage02,Stage 2,8,-3.92,1.12,0.12,0,3,stage02,,default
 ```
 
-현재 `BattleSessionComponent`에는 일부 값만 존재하며 `StageId`, `TurnLimit`, 복수 적 목록은 아직 없다. 실제 map02를 만들 때 필요한 값부터 추가한다.
+현재 `StageId`, 복수 적, 유한 Wave와 Turn/시간 제한 증원은 구현되어 있다. 부족한 부분은
+`StageDefinitions.userdataset/.csv` 실제 페어와 StageId를 실제 Map/Instance로 연결하는
+Map Flow다. 이 두 항목이 준비되기 전에는 Stage 2 대량 병렬 제작을 시작하지 않는다.
+
+세부 제작 절차는
+[`Stage-Authoring-Guide.md`](./Stage-Authoring-Guide.md)를 따른다.
 
 ## 5. 상태 변경 흐름
 

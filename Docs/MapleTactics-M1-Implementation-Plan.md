@@ -10,7 +10,7 @@
 | 항목 | 결정 |
 |---|---|
 | 전투 권위 | 서버 |
-| 전투 상태 수명 | 전투 맵 엔티티의 `BattleSessionComponent` |
+| 전투 상태 수명 | 전투 맵 엔티티의 상태별 `@Component` (`BattleTurnComponent` 등) |
 | 전투 격리 | 플레이어당 Instance Room/Instance Map 하나 |
 | 플레이어별 런 상태 | 플레이어 엔티티의 `PlayerRunStateComponent` |
 | 전투 보드 | 월드 좌표와 분리된 1차원 논리 셀 |
@@ -229,12 +229,13 @@ StageFlowComponent
 
 목표: 이동, 회전, 큐 등록, 큐 실행, 적 행동, 승패가 이어진다.
 
-- [ ] `BattleSessionComponent` phase machine 구현.
+- [x] `BattleTurnComponent` Phase/Turn/Queue 상태 소유와 `BattleSessionComponent` 실행 조정 분리.
+- [x] `BattleWaveComponent` Wave/강제 증원/Timer 상태 소유와 Session Spawn 조정 분리.
 - [ ] `BoardStateComponent`와 점유 조회 구현.
 - [ ] 단일 `EnemyEntity` 참조를 UnitId 기반 다중 유닛 Registry로 교체.
 - [ ] 플레이어 좌우에 적 1명씩 둔 고정 배치 회귀 시나리오.
 - [ ] MOVE, TURN Command 검증/적용.
-- [ ] `AttackQueueComponent` 최대 슬롯과 등록 순서 구현.
+- [x] `BattleTurnComponent` 가변 최대 슬롯과 등록·실행 큐 순서 구현.
 - [ ] QUEUE_TILE의 FreePlay 턴 소비 예외 구현.
 - [ ] EXECUTE_QUEUE의 타일별 타깃 재계산 구현.
 - [ ] DAMAGE, PUSH, TURN, MOVE 원시 Effect 구현.

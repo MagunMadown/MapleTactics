@@ -2,16 +2,20 @@
 
 공동 개발 시 상태 소유권, 스키마와 확장 절차는
 [`Architecture-Standard-v0.1.md`](./Architecture-Standard-v0.1.md)를 우선 기준으로 사용한다.
+사람 개발자와 AI의 작업 분담, 수정 허용 범위와 검증 절차는
+[`Development-Workflow-Guide.md`](./Development-Workflow-Guide.md)를 따른다.
 메인 UI·대기·캐릭터 선택 시스템의 전투 호출은
 [`Battle-Integration-API.md`](./Battle-Integration-API.md)를 따른다.
+스킬 Definition과 Effect Step 제작은
+[`Skill-Authoring-Guide.md`](./Skill-Authoring-Guide.md)를 따른다.
 
 ## 1. 현재 구현 범위
 
 현재 전투 코어는 6칸 전투 보드에서 플레이어와 좌우의 초반 적 두 명을 배치하고 화면 위치를 논리 셀과 맞추는 단계다.
 
 - 플레이어: 셀 `2`, 오른쪽 방향, HP 100
-- 왼쪽 적: 셀 `0`, 오른쪽 방향, HP 6
-- 오른쪽 적: 셀 `5`, 왼쪽 방향, HP 6
+- 왼쪽 적: 셀 `0`, 오른쪽 방향, 현재 `early_mushroom` HP 6
+- 오른쪽 적: 셀 `5`, 왼쪽 방향, 현재 `guard_mushroom` HP 9
 - 전투 시작 상태: `PlayerTurn`, 1턴; 플레이어 행동 뒤 생존 적이 `SpawnOrder` 순으로 한 번씩 행동하고 다음 턴으로 복귀
 - 셀 번호: `0`부터 `5`까지 사용
 - 좌·우 한 칸 이동과 `UnitMovedEvent` 구현
@@ -25,6 +29,8 @@
 - 공격마다 고정 ActionName·속도·지속시간을 사용하는 설정형 아바타 모션
 - 기본 베기 `0.18`초, 강한 베기 `0.38`초의 공격별 타격 지연과 타격 시점 셀 재판정
 - 이동·방향 전환·기본 공격이 공통으로 통과하는 서버 기준 행동 큐와 처리 중 입력 잠금
+- Turn·Phase·행동 슬롯·Skill 큐를 맵 수명의 `BattleTurnComponent`가 단일 소유
+- Wave 진행·강제 증원 예약·Wave Timer를 `BattleWaveComponent`가 단일 소유
 - 기본 용량 2인 가변 타일 큐에 `basic_slash`·`heavy_slash`·`push`를 순서대로 등록·실행·전체 비우기 하는 하단 중앙 `BattleQueueHUD`
 - HP 0 사망 판정, `VICTORY`/`DEFEAT` 결과 고정, 현재 전투를 초기화하는 `다시 시작` 버튼
 - 적이 멀면 한 칸 접근하고 인접하면 기본 공격하는 최소 Intent
@@ -40,6 +46,8 @@ RootDesk/MyDesk/
 │   ├── Components/
 │   │   └── Shared/
 │   │       ├── BattleSessionComponent.mlua
+│   │       ├── BattleTurnComponent.mlua
+│   │       ├── BattleWaveComponent.mlua
 │   │       ├── BoardStateComponent.mlua
 │   │       ├── BattleUnitComponent.mlua
 │   │       ├── BattleUnitPresentationComponent.mlua
@@ -82,7 +90,7 @@ ui/
 - 6개 셀의 좌표 계산
 - 플레이어와 적 등록
 - 유닛 초기 위치 배치
-- 현재 전투 단계와 턴 보관
+- `BattleTurnComponent` 연결과 행동 실행 조정
 - 플레이어의 기본 자유 이동 잠금
 - 플레이어 행동 접수·실행·완료와 중복 입력 거절
 - `TileQueueCapacity`까지 타일을 순서대로 등록하고 전체 큐가 끝날 때까지 적 턴 전환을 보류
@@ -93,6 +101,20 @@ ui/
 - HP 0 최초 전환의 사망·승패 확정과 현재 Entity를 재사용하는 전투 Reset
 
 전투는 Play 시작 시 자동으로 초기화되므로 현재 단계에서는 별도로 메서드를 호출할 필요가 없다.
+
+### BattleTurnComponent
+
+전투 Phase, Turn, 즉시 행동 슬롯, Skill 등록·실행 큐와 입력 잠금을 소유한다.
+Session의 같은 이름 필드는 기존 외부 코드용 호환 Snapshot이므로 직접 대입하지 않는다.
+신규 UI는 Turn 컴포넌트를 읽고, 명령은 계속 Session의 `Request...` API로 보낸다.
+상세 규격은 [`Battle-Turn-Guide.md`](./Battle-Turn-Guide.md)를 따른다.
+
+### BattleWaveComponent
+
+현재 Wave, 전체 Wave 수, Spawn Trigger, 증원 예약과 Wave 관련 Timer를 소유한다.
+Session은 Wave 컴포넌트의 요청을 받아 실제 적 생성과 승패를 처리한다. 신규 HUD는
+`BattleWaveState` Entity의 동기화 상태를 읽는다. 상세 규격은
+[`Battle-Wave-Guide.md`](./Battle-Wave-Guide.md)를 따른다.
 
 새 Run은 `BattleSessionComponent.StartNewRun(seed)`로 시작한다. 이 메서드는 `RunManagerLogic`을 통해 플레이어의 `PlayerRunStateComponent`를 초기화한 뒤 같은 Seed로 Stage 1/Wave 1을 다시 구성한다. 전투 맵의 `RunSeed`는 계산에 쓰는 복사본이며 원본 소유자는 플레이어의 Run 상태다.
 
@@ -177,9 +199,14 @@ Router는 HP나 CellIndex를 직접 변경하지 않는다. `[BattleEffectRouter
 
 버튼 활성 상태도 동기화된다. 플레이어 턴에는 큐가 가득 차기 전까지 타일을 계속 추가할 수 있고, 한 개 이상 등록되면 실행·전체 비우기 버튼을 사용할 수 있다. 기본 `TileQueueCapacity=2`이며 이 값을 3 이상으로 바꿔도 큐 저장·검증·순차 실행과 HUD의 `현재/용량` 표시는 그대로 확장된다.
 
-적 HP가 0이 되면 해당 적 Sprite와 HP 텍스트만 숨겨진다. 다른 적이 살아 있으면 전투를 계속하고, 모든 적의 HP가 0이 된 뒤 중앙에 `VICTORY`와 `다시 시작` 버튼이 나타난다. 플레이어 HP가 0이면 `DEFEAT`가 표시된다. Reset 후 결과 패널은 다시 숨겨지고 플레이어 HP 100, 두 적 HP 6, 시작 셀과 방향, Turn 1로 복원된다.
+적 HP가 0이 되면 해당 적 Sprite와 HP 텍스트만 숨겨진다. 다른 적이 살아 있으면 전투를
+계속한다. 현재 Wave의 모든 적이 사망하면 마지막 Wave가 아닌 경우 `WaveTransition`을
+거쳐 다음 Wave를 생성하고, 마지막 Wave를 완료했을 때만 중앙에 `VICTORY`와
+`다시 시작` 버튼이 나타난다. 플레이어 HP가 0이면 즉시 `DEFEAT`가 표시된다. Reset 후
+결과 패널은 다시 숨겨지고 플레이어 HP 100, 시작 셀과 방향, Turn 1로 복원되며 Wave 1의
+적은 현재 적 정의에 따라 다시 생성된다.
 
-초반 적 체력은 `BattleSessionComponent.EarlyStageEnemyMaxHp`에서 조정한다. 현재 값 `6`은 기본 베기(피해 3) 두 번 또는 강한 베기(피해 6) 한 번에 처치되는 기준이다. 이후 스테이지별 수치표를 도입할 때 이 설정을 Dataset 값으로 교체한다.
+초반 적 체력은 `RootDesk/MyDesk/03_Data/EnemyDefinitions.csv`의 `MaxHp`에서 적 정의별로 조정한다. 현재 `early_mushroom`은 HP 6, `guard_mushroom`은 HP 9이며, Stage의 Wave·Pool 설정이 사용할 적 정의를 선택한다. `BattleSessionComponent.EarlyStageEnemyMaxHp`는 신규 밸런스 설정 경로로 사용하지 않는다.
 
 ## 4. 셀과 화면 좌표
 
@@ -248,7 +275,7 @@ WorldY = 0.12
 
 HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행된다. 플레이어가 사망하면 즉시 `Defeat`이며, 웨이브의 마지막 적이 사망하면 `WaveTransition`으로 들어간다. 마지막 웨이브까지 끝났을 때만 `BattlePhase=BattleEnded`, `WaveState=StageCleared`, `BattleResult=Victory`가 된다.
 
-`map01`에는 적을 고정 배치하지 않는다. `BattleSessionComponent`가 시작할 때 `BattleDummyEnemy.model`의 ID인 `battledummyenemy`로 Wave 1을 생성하고, 웨이브 완료 시 기존 적을 Registry에서 해제·파괴한 뒤 다음 웨이브를 생성한다. 현재 Stage 1은 `TotalWaves=3`, 웨이브당 좌우 적 2명, 각 HP 6이다. `다시 시작`도 같은 런타임 생성 경로로 Stage 1 / Wave 1을 다시 만든다.
+`map01`에는 적을 고정 배치하지 않는다. `BattleSessionComponent`가 시작할 때 `BattleDummyEnemy.model`의 ID인 `battledummyenemy`로 Wave 1을 생성하고, 웨이브 완료 시 기존 적을 Registry에서 해제·파괴한 뒤 다음 웨이브를 생성한다. 현재 Stage 1은 `TotalWaves=3`, 웨이브당 좌우 적 2명이며 HP는 `EnemyDefinitions.csv`의 적 정의를 따른다. 현재 `early_mushroom`은 HP 6, `guard_mushroom`은 HP 9다. `다시 시작`도 같은 런타임 생성 경로로 Stage 1 / Wave 1을 다시 만든다.
 
 ## 6. 다음 기능을 추가할 때
 
@@ -267,8 +294,15 @@ HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행된다. �
 → 이미 PREPARED 상태인 적 Intent를 Hold
 → 저장된 TURN_TO_PLAYER / MOVE_TOWARD / MOVE_FIXED_FACING / EXECUTE_TILE을 그대로 실행
 → Complete 후 TurnNumber 증가
+→ 플레이어 SkillRuntimeState의 Cooldown 1 감소
 → PlayerTurn 복귀, 다음 Intent 준비와 입력 잠금 해제
 ```
+
+스킬 Cooldown은 각 전투 참가자의 `SkillRuntimeStateComponent`가 소유한다. 큐 등록과
+실행 직전에 서버가 각각 검사하며, Cooldown이 있는 같은 스킬은 한 큐에 중복 등록할 수
+없다. HUD는 `CD 강한 베기 1`처럼 동기화된 남은 턴을 표시하고 해당 버튼을
+비활성화한다. 상세 규칙은
+[`Cooldown-Runtime-Guide.md`](./Cooldown-Runtime-Guide.md)를 따른다.
 
 다른 스크립트가 `CellIndex`, HP, 턴을 직접 변경하지 않도록 한다. 전투 상태 변경은 항상 `BattleSessionComponent` 또는 이후에 추출될 전용 Resolver를 통해 수행한다.
 
