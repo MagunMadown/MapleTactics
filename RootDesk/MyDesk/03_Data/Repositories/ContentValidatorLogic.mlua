@@ -1,0 +1,176 @@
+@Logic
+script ContentValidatorLogic
+
+	property integer SupportedStageSchemaVersion = 1
+	property integer SupportedSkillSchemaVersion = 1
+
+	@ExecSpace("ServerOnly")
+	method table ValidateStageById(string stageId)
+		local definition = _StageDefinitionRepositoryLogic:GetStageDefinition(stageId)
+		if definition.Success == false then
+			return {
+				Success = false,
+				Reason = definition.Reason,
+				StageId = stageId,
+				Data = definition
+			}
+		end
+		return self:ValidateStageDefinition(definition)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateStageDefinition(table definition)
+		local result = {
+			Success = false,
+			Reason = "CONTENT_VALIDATION_FAILED",
+			StageId = definition.StageId or "",
+			TotalWaves = 0,
+			Data = definition
+		}
+		if definition.SchemaVersion ~= self.SupportedStageSchemaVersion then
+			return self:RejectStage(result, "UNSUPPORTED_STAGE_SCHEMA")
+		end
+		if definition.StageId == nil or definition.StageId == "" then
+			return self:RejectStage(result, "INVALID_STAGE_ID")
+		end
+		if definition.DisplayName == nil or definition.DisplayName == "" then
+			return self:RejectStage(result, "STAGE_DISPLAY_NAME_MISSING")
+		end
+		if definition.CellCount == nil or definition.CellCount <= 0 then
+			return self:RejectStage(result, "INVALID_CELL_COUNT")
+		end
+		if definition.CellSpacing == nil or definition.CellSpacing <= 0 then
+			return self:RejectStage(result, "INVALID_CELL_SPACING")
+		end
+		if definition.PlayerStartCell == nil
+			or definition.PlayerStartCell < 0
+			or definition.PlayerStartCell >= definition.CellCount then
+			return self:RejectStage(result, "INVALID_PLAYER_START_CELL")
+		end
+		if definition.QueueCapacity == nil or definition.QueueCapacity <= 0 then
+			return self:RejectStage(result, "INVALID_QUEUE_CAPACITY")
+		end
+		if definition.WaveTableId == nil or definition.WaveTableId == "" then
+			return self:RejectStage(result, "WAVE_TABLE_ID_MISSING")
+		end
+		if definition.NextStageId ~= nil
+			and definition.NextStageId ~= ""
+			and definition.NextStageId == definition.StageId then
+			return self:RejectStage(result, "NEXT_STAGE_SELF_REFERENCE")
+		end
+
+		local totalWaves = _StageWaveRepositoryLogic:GetTotalWaveCount(definition.WaveTableId)
+		if totalWaves <= 0 then
+			return self:RejectStage(result, "WAVE_TABLE_NOT_FOUND")
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		result.TotalWaves = totalWaves
+		log("[ContentValidation] stage valid stage=" .. result.StageId .. " waveTable=" .. definition.WaveTableId .. " totalWaves=" .. totalWaves .. " cells=" .. definition.CellCount .. " queue=" .. definition.QueueCapacity)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RejectStage(table result, string detailReason)
+		result.Success = false
+		result.Reason = "CONTENT_VALIDATION_FAILED"
+		result.DetailReason = detailReason
+		log_error("[ContentValidation] stage rejected stage=" .. result.StageId .. " reason=" .. detailReason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateSkillById(string skillId)
+		local bundle = _SkillDefinitionRepositoryLogic:GetSkillBundle(skillId)
+		if bundle.Success == false then
+			return {
+				Success = false,
+				Reason = bundle.Reason,
+				SkillId = skillId,
+				Data = bundle
+			}
+		end
+		return self:ValidateSkillBundle(bundle)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateSkillBundle(table bundle)
+		local definition = bundle.Definition
+		local steps = bundle.EffectSteps
+		local result = {
+			Success = false,
+			Reason = "CONTENT_VALIDATION_FAILED",
+			SkillId = definition.SkillId or "",
+			Data = bundle
+		}
+		if definition.SchemaVersion ~= self.SupportedSkillSchemaVersion then
+			return self:RejectSkill(result, "UNSUPPORTED_SKILL_SCHEMA")
+		end
+		if definition.SkillId == nil or definition.SkillId == "" then
+			return self:RejectSkill(result, "INVALID_SKILL_ID")
+		end
+		if definition.DisplayName == nil or definition.DisplayName == "" then
+			return self:RejectSkill(result, "SKILL_DISPLAY_NAME_MISSING")
+		end
+		if definition.TargetingType ~= "FRONT_CELL" then
+			return self:RejectSkill(result, "UNSUPPORTED_TARGETING_TYPE")
+		end
+		if definition.Range == nil or definition.Range < 0 then
+			return self:RejectSkill(result, "INVALID_SKILL_RANGE")
+		end
+		if definition.CooldownTurns == nil or definition.CooldownTurns < 0 then
+			return self:RejectSkill(result, "INVALID_SKILL_COOLDOWN")
+		end
+		if definition.CostValue == nil or definition.CostValue < 0 then
+			return self:RejectSkill(result, "INVALID_SKILL_COST")
+		end
+		if definition.EffectSetId == nil or definition.EffectSetId == "" then
+			return self:RejectSkill(result, "EFFECT_SET_ID_MISSING")
+		end
+		if definition.ActionDuration == nil or definition.ActionDuration <= 0 then
+			return self:RejectSkill(result, "INVALID_ACTION_DURATION")
+		end
+		if steps == nil or #steps == 0 then
+			return self:RejectSkill(result, "EFFECT_STEPS_EMPTY")
+		end
+
+		local expectedStepIndex = 1
+		for _, step in ipairs(steps) do
+			if step.SchemaVersion ~= self.SupportedSkillSchemaVersion then
+				return self:RejectSkill(result, "UNSUPPORTED_EFFECT_SCHEMA")
+			end
+			if step.EffectSetId ~= definition.EffectSetId then
+				return self:RejectSkill(result, "EFFECT_SET_MISMATCH")
+			end
+			if step.StepIndex ~= expectedStepIndex then
+				return self:RejectSkill(result, "INVALID_EFFECT_STEP_SEQUENCE")
+			end
+			if step.EffectType ~= "DAMAGE" and step.EffectType ~= "PUSH" then
+				return self:RejectSkill(result, "UNKNOWN_EFFECT")
+			end
+			if step.TargetSelector ~= "FRONT_TARGET" then
+				return self:RejectSkill(result, "UNSUPPORTED_TARGET_SELECTOR")
+			end
+			if step.Value == nil or step.Value < 0 then
+				return self:RejectSkill(result, "INVALID_EFFECT_VALUE")
+			end
+			expectedStepIndex = expectedStepIndex + 1
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[ContentValidation] skill valid skill=" .. result.SkillId .. " effectSet=" .. definition.EffectSetId .. " steps=" .. #steps .. " cooldown=" .. definition.CooldownTurns)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RejectSkill(table result, string detailReason)
+		result.Success = false
+		result.Reason = "CONTENT_VALIDATION_FAILED"
+		result.DetailReason = detailReason
+		log_error("[ContentValidation] skill rejected skill=" .. result.SkillId .. " reason=" .. detailReason)
+		return result
+	end
+
+end
