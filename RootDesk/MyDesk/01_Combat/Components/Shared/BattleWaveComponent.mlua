@@ -1,0 +1,197 @@
+@Component
+script BattleWaveComponent extends Component
+
+	@Sync property integer CurrentWave = 0
+	@Sync property integer TotalWaves = 1
+	@Sync property string WaveState = "Setup"
+	@Sync property integer WaveSpawnStageTurn = 0
+	@Sync property string CurrentWaveSpawnMode = "CLEAR_ONLY"
+	@Sync property integer ForceAfterTurns = 0
+	@Sync property number ForceAfterSeconds = 0
+	@Sync property boolean ForceSpawnPending = false
+	@Sync property string ForceSpawnPendingReason = ""
+	@Sync property integer CurrentWaveSpawnCount = 0
+	@Sync property integer MaxConcurrentEnemies = 1
+	@Sync property number CurrentClearSpawnDelay = 0
+	@Sync property integer PendingWaveNumber = 0
+
+	property integer WaveTimerId = 0
+	property integer ForceSpawnTimerId = 0
+
+	@ExecSpace("ServerOnly")
+	method void ResetWaveState(integer totalWaves, string reason)
+		self:ClearAllTimers(reason)
+		self.CurrentWave = 0
+		self.TotalWaves = math.max(1, totalWaves)
+		self.WaveState = "Setup"
+		self.WaveSpawnStageTurn = 0
+		self.CurrentWaveSpawnMode = "CLEAR_ONLY"
+		self.ForceAfterTurns = 0
+		self.ForceAfterSeconds = 0
+		self.ForceSpawnPending = false
+		self.ForceSpawnPendingReason = ""
+		self.CurrentWaveSpawnCount = 0
+		self.MaxConcurrentEnemies = 1
+		self.CurrentClearSpawnDelay = 0
+		self.PendingWaveNumber = 0
+		log("[BattleWaveState] reset reason=" .. reason .. " total=" .. self.TotalWaves)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SetTotalWaves(integer totalWaves, string reason)
+		self.TotalWaves = math.max(1, totalWaves)
+		log("[BattleWaveState] total reason=" .. reason .. " value=" .. self.TotalWaves)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SetWaveState(string state, string reason)
+		self.WaveState = state
+		log("[BattleWaveState] state=" .. state .. " wave=" .. self.CurrentWave .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BeginWave(integer waveNumber, string spawnMode, integer forceAfterTurns, number forceAfterSeconds, integer spawnCount, integer maxConcurrent, number clearDelay, integer stageTurn)
+		local result = { Success = false, Reason = "UNKNOWN" }
+		if waveNumber < 1 or waveNumber > self.TotalWaves then
+			result.Reason = "INVALID_WAVE"
+			return result
+		end
+
+		self:ClearForcedSpawnSchedule("WAVE_BEGIN")
+		self.CurrentWave = waveNumber
+		self.WaveState = "Spawning"
+		self.CurrentWaveSpawnMode = spawnMode
+		self.ForceAfterTurns = math.max(0, forceAfterTurns)
+		self.ForceAfterSeconds = math.max(0, forceAfterSeconds)
+		self.CurrentWaveSpawnCount = math.max(1, spawnCount)
+		self.MaxConcurrentEnemies = math.max(1, maxConcurrent)
+		self.CurrentClearSpawnDelay = math.max(0, clearDelay)
+		self.WaveSpawnStageTurn = math.max(1, stageTurn)
+		result.Success = true
+		result.Reason = "WAVE_STARTED"
+		log("[BattleWaveState] begin wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " mode=" .. self.CurrentWaveSpawnMode .. " stageTurn=" .. self.WaveSpawnStageTurn)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkWaveActive(string reason)
+		self.WaveState = "Active"
+		log("[BattleWaveState] active wave=" .. self.CurrentWave .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkSpawnPending(integer waveNumber, string reason)
+		self.ForceSpawnPending = true
+		self.ForceSpawnPendingReason = reason
+		self.PendingWaveNumber = waveNumber
+		self.WaveState = "SpawnPending"
+		log("[BattleWaveState] pending wave=" .. waveNumber .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleForcedSpawnTimer()
+		if self.CurrentWave >= self.TotalWaves then
+			return
+		end
+		if self.CurrentWaveSpawnMode ~= "TIME_LIMIT" and self.CurrentWaveSpawnMode ~= "TURN_OR_TIME" then
+			return
+		end
+		if self.ForceAfterSeconds <= 0 then
+			return
+		end
+
+		local scheduledWave = self.CurrentWave
+		local markPending = function()
+			self.ForceSpawnTimerId = 0
+			if self.CurrentWave ~= scheduledWave then
+				return
+			end
+			self:MarkSpawnPending(scheduledWave + 1, "TIME_LIMIT")
+			local session = self.Entity.Parent:GetComponent("script.BattleSessionComponent")
+			if session ~= nil then
+				session:PublishWaveStateSnapshot("TIME_LIMIT_PENDING")
+			end
+		end
+		self.ForceSpawnTimerId = _TimerService:SetTimerOnce(markPending, self.ForceAfterSeconds)
+		log("[BattleWaveState] timer scheduled wave=" .. scheduledWave .. " seconds=" .. self.ForceAfterSeconds)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearForcedSpawnSchedule(string reason)
+		if self.ForceSpawnTimerId > 0 then
+			_TimerService:ClearTimer(self.ForceSpawnTimerId)
+			self.ForceSpawnTimerId = 0
+		end
+		if self.ForceSpawnPending == true then
+			log("[BattleWaveState] pending cleared wave=" .. self.PendingWaveNumber .. " reason=" .. reason)
+		end
+		self.ForceSpawnPending = false
+		self.ForceSpawnPendingReason = ""
+		self.PendingWaveNumber = 0
+		if self.WaveState == "SpawnPending" then
+			self.WaveState = "Active"
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table EvaluateForcedSpawnAtTurnBoundary(integer stageTurn, boolean battleEnded)
+		local result = { Success = true, Reason = "NO_PENDING_WAVE", ShouldSpawn = false, WaveNumber = 0, PendingReason = "" }
+		if battleEnded == true or self.CurrentWave >= self.TotalWaves then
+			return result
+		end
+
+		if self.CurrentWaveSpawnMode == "TURN_LIMIT" or self.CurrentWaveSpawnMode == "TURN_OR_TIME" then
+			local elapsedTurns = stageTurn - self.WaveSpawnStageTurn
+			if self.ForceAfterTurns > 0 and elapsedTurns >= self.ForceAfterTurns then
+				self:MarkSpawnPending(self.CurrentWave + 1, "TURN_LIMIT")
+			end
+		end
+		if self.ForceSpawnPending == false then
+			return result
+		end
+
+		result.Reason = "PENDING_WAVE"
+		result.ShouldSpawn = true
+		result.WaveNumber = self.PendingWaveNumber
+		result.PendingReason = self.ForceSpawnPendingReason
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleWaveTransition(integer clearedWave, integer nextWave, number delaySeconds)
+		self:ClearWaveTransitionTimer("RESCHEDULE")
+		self.WaveState = "Cleared"
+		local advance = function()
+			self.WaveTimerId = 0
+			if self.CurrentWave ~= clearedWave then
+				return
+			end
+			local session = self.Entity.Parent:GetComponent("script.BattleSessionComponent")
+			if session ~= nil then
+				session:AdvanceClearedWave(clearedWave, nextWave)
+			end
+		end
+		self.WaveTimerId = _TimerService:SetTimerOnce(advance, math.max(0, delaySeconds))
+		log("[BattleWaveState] transition scheduled cleared=" .. clearedWave .. " next=" .. nextWave .. " delay=" .. delaySeconds)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearWaveTransitionTimer(string reason)
+		if self.WaveTimerId > 0 then
+			_TimerService:ClearTimer(self.WaveTimerId)
+			self.WaveTimerId = 0
+			log("[BattleWaveState] transition timer cleared reason=" .. reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearAllTimers(string reason)
+		self:ClearWaveTransitionTimer(reason)
+		if self.ForceSpawnTimerId > 0 then
+			_TimerService:ClearTimer(self.ForceSpawnTimerId)
+			self.ForceSpawnTimerId = 0
+			log("[BattleWaveState] force timer cleared reason=" .. reason)
+		end
+	end
+
+end

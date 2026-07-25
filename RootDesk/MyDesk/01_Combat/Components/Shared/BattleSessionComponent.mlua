@@ -23,6 +23,11 @@ script BattleSessionComponent extends Component
 	@Sync property string PreparedEnemyReason = ""
 	@Sync property integer StageNumber = 1
 	@Sync property string StageId = "stage01"
+	@Sync property string StageDisplayName = ""
+	@Sync property string WaveTableId = ""
+	@Sync property string NextStageId = ""
+	@Sync property string StageRuleId = ""
+	@Sync property integer StageSchemaVersion = 0
 	@Sync property integer RunSeed = 1000
 	@Sync property integer EntryRequestId = 0
 	@Sync property string EntryMode = ""
@@ -88,11 +93,10 @@ script BattleSessionComponent extends Component
 	property Entity PlayerEntity = nil
 	property Entity EnemyEntity = nil
 	property any BoardState = nil
+	property any TurnState = nil
+	property any WaveRuntime = nil
 	property integer ActionTimerId = 0
 	property integer ImpactTimerId = 0
-	property integer WaveTimerId = 0
-	property integer ForceSpawnTimerId = 0
-	property integer PendingWaveNumber = 0
 	property integer LastEnemySpawnOrder = 0
 
 	@ExecSpace("ClientOnly")
@@ -155,6 +159,20 @@ script BattleSessionComponent extends Component
 			return
 		end
 		boardState:ResetRegistry("SESSION_BEGIN")
+		local waveRuntime = self:EnsureWaveStateComponent()
+		if waveRuntime == nil then
+			log_error("[BattleSession] BattleWaveComponent unavailable")
+			return
+		end
+		waveRuntime:ResetWaveState(self.TotalWaves, "SESSION_BEGIN")
+		self:PublishWaveStateSnapshot("SESSION_BEGIN")
+		local turnState = self:EnsureTurnStateComponent()
+		if turnState == nil then
+			log_error("[BattleSession] BattleTurnComponent unavailable")
+			return
+		end
+		turnState:ResetTurnState(self.TileQueueCapacity, "SESSION_BEGIN")
+		self:PublishTurnStateSnapshot("SESSION_BEGIN")
 
 		if self.AutoStartPrototypeBattle == false then
 			log("[BattleSession] waiting for BattleGateway entry")
@@ -181,27 +199,15 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ImpactTimerId)
 			self.ImpactTimerId = 0
 		end
-		if self.WaveTimerId > 0 then
-			_TimerService:ClearTimer(self.WaveTimerId)
-			self.WaveTimerId = 0
+		if self.TurnState ~= nil then
+			self.TurnState:ResetTurnState(self.TileQueueCapacity, "SESSION_END")
+			self:PublishTurnStateSnapshot("SESSION_END")
 		end
-		if self.ForceSpawnTimerId > 0 then
-			_TimerService:ClearTimer(self.ForceSpawnTimerId)
-			self.ForceSpawnTimerId = 0
-		end
-
-		self.QueuedActionType = ""
-		self.QueuedActionDirection = 0
-		self.IsActionProcessing = false
-		self.QueuedTileIds = ""
-		self.QueuedTileCount = 0
-		self.ExecutingTileIds = ""
-		self.ExecutingTileIndex = 0
 		self.BattleResult = ""
-		self.WaveState = "Setup"
-		self.ForceSpawnPending = false
-		self.ForceSpawnPendingReason = ""
-		self.PendingWaveNumber = 0
+		if self.WaveRuntime ~= nil then
+			self.WaveRuntime:ResetWaveState(self.TotalWaves, "SESSION_END")
+			self:PublishWaveStateSnapshot("SESSION_END")
+		end
 		self:ClearPreparedEnemyIntent("END_PLAY")
 		if self.BoardState ~= nil then
 			self.BoardState:ResetRegistry("SESSION_END")
@@ -260,18 +266,48 @@ script BattleSessionComponent extends Component
 	method void StartStageById(string stageId, integer stageNumber)
 		-- Starts one exact StageId so external lobby and selection systems do not depend on numeric formatting.
 		self.StageNumber = math.max(1, stageNumber)
-		self.StageId = stageId
-		local configuredWaves = _StageWaveRepositoryLogic:GetTotalWaveCount(self.StageId)
-		if configuredWaves > 0 then
-			self.TotalWaves = configuredWaves
+		local stageResult = self:LoadAndApplyStageDefinition(stageId)
+		if stageResult.Success == false then
+			self.TurnState:SetPhase("DataError", "STAGE_DATA_ERROR")
+			self:PublishTurnStateSnapshot("STAGE_DATA_ERROR")
+			self.WaveRuntime:SetWaveState("DataError", "STAGE_DATA_ERROR")
+			self:PublishWaveStateSnapshot("STAGE_DATA_ERROR")
+			log_error("[BattleSession] stage start rejected stage=" .. stageId .. " reason=" .. stageResult.Reason .. " detail=" .. (stageResult.DetailReason or ""))
+			return
 		end
 		self.StageTurnNumber = 0
-		self.CurrentWave = 0
 		self.BattleResult = ""
-		self.WaveState = "Setup"
-		self:ClearForcedSpawnSchedule("STAGE_START")
-		log("[BattleWave] stage started stage=" .. self.StageNumber .. " seed=" .. self.RunSeed .. " totalWaves=" .. self.TotalWaves)
+		self.WaveRuntime:ResetWaveState(self.TotalWaves, "STAGE_START")
+		self:PublishWaveStateSnapshot("STAGE_START")
+		log("[BattleWave] stage started stage=" .. self.StageNumber .. " stageId=" .. self.StageId .. " waveTable=" .. self.WaveTableId .. " seed=" .. self.RunSeed .. " totalWaves=" .. self.TotalWaves)
 		self:SpawnWave(1)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LoadAndApplyStageDefinition(string stageId)
+		local validation = _ContentValidatorLogic:ValidateStageById(stageId)
+		if validation.Success == false then
+			return validation
+		end
+
+		local definition = validation.Data
+		self.StageId = definition.StageId
+		self.StageDisplayName = definition.DisplayName
+		self.WaveTableId = definition.WaveTableId
+		self.NextStageId = definition.NextStageId
+		self.StageRuleId = definition.StageRuleId
+		self.StageSchemaVersion = definition.SchemaVersion
+		self.CellCount = definition.CellCount
+		self.CellStartX = definition.CellStartX
+		self.CellSpacing = definition.CellSpacing
+		self.UnitY = definition.UnitY
+		self.PlayerStartCell = definition.PlayerStartCell
+		self.TurnState:SetQueueCapacity(definition.QueueCapacity, "STAGE_DEFINITION")
+		self:PublishTurnStateSnapshot("STAGE_DEFINITION")
+		self.WaveRuntime:SetTotalWaves(validation.TotalWaves, "STAGE_DEFINITION")
+		self:PublishWaveStateSnapshot("STAGE_DEFINITION")
+		log("[BattleSession] stage definition applied stage=" .. self.StageId .. " display=" .. self.StageDisplayName .. " cells=" .. self.CellCount .. " startX=" .. self.CellStartX .. " spacing=" .. self.CellSpacing .. " playerCell=" .. self.PlayerStartCell .. " queue=" .. self.TileQueueCapacity)
+		return validation
 	end
 
 	@ExecSpace("ServerOnly")
@@ -282,17 +318,16 @@ script BattleSessionComponent extends Component
 			return
 		end
 
-		local definition = _StageWaveRepositoryLogic:GetWaveDefinition(self.StageId, waveNumber, self.RunSeed)
+		local definition = _StageWaveRepositoryLogic:GetWaveDefinition(self.WaveTableId, waveNumber, self.RunSeed)
 		if definition.Success == false then
-			self.WaveState = "DataError"
+			self.WaveRuntime:SetWaveState("DataError", "WAVE_DEFINITION_ERROR")
+			self:PublishWaveStateSnapshot("WAVE_DEFINITION_ERROR")
 			log_error("[BattleWave] definition rejected stage=" .. self.StageId .. " wave=" .. waveNumber .. " reason=" .. definition.Reason)
 			return
 		end
 		if self:CanSpawnWave(definition.SpawnCount, definition.MaxConcurrent) == false then
-			self.ForceSpawnPending = true
-			self.ForceSpawnPendingReason = "CAPACITY_WAIT"
-			self.PendingWaveNumber = waveNumber
-			self.WaveState = "SpawnPending"
+			self.WaveRuntime:MarkSpawnPending(waveNumber, "CAPACITY_WAIT")
+			self:PublishWaveStateSnapshot("CAPACITY_WAIT")
 			log_warning("[BattleWave] pending stage=" .. self.StageId .. " wave=" .. waveNumber .. " reason=CAPACITY_WAIT count=" .. definition.SpawnCount .. " maxConcurrent=" .. definition.MaxConcurrent)
 			return
 		end
@@ -301,7 +336,8 @@ script BattleSessionComponent extends Component
 		for spawnIndex = 1, definition.SpawnCount do
 			local spawnDefinition = _StageWaveRepositoryLogic:GetEnemySpawnDefinition(definition.EnemyPoolId, waveNumber, spawnIndex, self.RunSeed)
 			if spawnDefinition.Success == false then
-				self.WaveState = "DataError"
+				self.WaveRuntime:SetWaveState("DataError", "ENEMY_DEFINITION_ERROR")
+				self:PublishWaveStateSnapshot("ENEMY_DEFINITION_ERROR")
 				log_error("[BattleWave] enemy definition rejected stage=" .. self.StageId .. " wave=" .. waveNumber .. " slot=" .. spawnIndex .. " reason=" .. spawnDefinition.Reason)
 				return
 			end
@@ -309,21 +345,28 @@ script BattleSessionComponent extends Component
 			table.insert(compositionIds, spawnDefinition.EnemyDefinitionId)
 		end
 
-		self:ClearForcedSpawnSchedule("WAVE_SPAWN")
-		self:CleanupDefeatedEnemies("BEFORE_WAVE_" .. waveNumber)
-		self.CurrentWave = waveNumber
-		self.WaveState = "Spawning"
-		if waveNumber == 1 then
-			self.BattlePhase = "Setup"
-			self.TurnNumber = 0
+		local waveBegin = self.WaveRuntime:BeginWave(
+			waveNumber,
+			definition.SpawnTriggerMode,
+			definition.ForceAfterTurns,
+			definition.ForceAfterSeconds,
+			definition.SpawnCount,
+			definition.MaxConcurrent,
+			definition.ClearSpawnDelaySeconds,
+			math.max(1, self.StageTurnNumber)
+		)
+		if waveBegin.Success == false then
+			log_error("[BattleWave] begin rejected wave=" .. waveNumber .. " reason=" .. waveBegin.Reason)
+			return
 		end
-		self.QueuedActionType = ""
-		self.QueuedActionDirection = 0
-		self.QueuedTileIds = ""
-		self.QueuedTileCount = 0
-		self.ExecutingTileIds = ""
-		self.ExecutingTileIndex = 0
-		self.IsActionProcessing = false
+		self:PublishWaveStateSnapshot("WAVE_BEGIN")
+		self:CleanupDefeatedEnemies("BEFORE_WAVE_" .. waveNumber)
+		if waveNumber == 1 then
+			self.TurnState:ResetTurnState(self.TileQueueCapacity, "FIRST_WAVE_SPAWN")
+		else
+			self.TurnState:ClearTransientState("WAVE_SPAWN")
+		end
+		self:PublishTurnStateSnapshot("WAVE_SPAWN")
 		self.LastEnemySpawnOrder = 0
 		self:ClearPreparedEnemyIntent("WAVE_SPAWN")
 		local firstSpawnDefinition = spawnDefinitions[1]
@@ -333,14 +376,6 @@ script BattleSessionComponent extends Component
 		self.CurrentEnemyBasicAttackDamage = firstSpawnDefinition.BasicAttackDamage
 		self.CurrentEnemyPatternId = firstSpawnDefinition.PatternId
 		self.CurrentEnemyMovementPolicy = firstSpawnDefinition.MovementPolicy
-		self.CurrentWaveSpawnMode = definition.SpawnTriggerMode
-		self.ForceAfterTurns = definition.ForceAfterTurns
-		self.ForceAfterSeconds = definition.ForceAfterSeconds
-		self.CurrentWaveSpawnCount = definition.SpawnCount
-		self.MaxConcurrentEnemies = definition.MaxConcurrent
-		self.CurrentClearSpawnDelay = definition.ClearSpawnDelaySeconds
-		self.WaveSpawnStageTurn = math.max(1, self.StageTurnNumber)
-
 		local spawnedCount = 0
 		for spawnIndex = 1, definition.SpawnCount do
 			local preferredCell = self.LeftEnemyStartCell
@@ -367,12 +402,14 @@ script BattleSessionComponent extends Component
 		end
 
 		if spawnedCount == 0 then
-			self.WaveState = "SpawnFailed"
+			self.WaveRuntime:SetWaveState("SpawnFailed", "NO_ENEMY_SPAWNED")
+			self:PublishWaveStateSnapshot("NO_ENEMY_SPAWNED")
 			log_error("[BattleWave] spawn failed stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave)
 			return
 		end
 
-		self.WaveState = "Active"
+		self.WaveRuntime:MarkWaveActive("SPAWN_COMPLETED")
+		self:PublishWaveStateSnapshot("SPAWN_COMPLETED")
 		self:ScheduleForcedSpawnTimer()
 		local livingTotal = #self.BoardState:CollectLivingEnemies()
 		log("[BattleWave] spawned stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " seed=" .. self.RunSeed .. " enemies=" .. spawnedCount .. " livingTotal=" .. livingTotal .. " composition=" .. table.concat(compositionIds, ",") .. " mode=" .. self.CurrentWaveSpawnMode .. " forceTurns=" .. self.ForceAfterTurns .. " forceSeconds=" .. self.ForceAfterSeconds)
@@ -402,69 +439,27 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ScheduleForcedSpawnTimer()
-		-- A real-time limit only marks the next wave pending; spawning waits for a stable turn boundary.
-		if self.CurrentWave >= self.TotalWaves then
-			return
-		end
-		if self.CurrentWaveSpawnMode ~= "TIME_LIMIT" and self.CurrentWaveSpawnMode ~= "TURN_OR_TIME" then
-			return
-		end
-		if self.ForceAfterSeconds <= 0 then
-			return
-		end
-
-		local scheduledWave = self.CurrentWave
-		local markPending = function()
-			self.ForceSpawnTimerId = 0
-			if self.BattleResult ~= "" or self.CurrentWave ~= scheduledWave then
-				return
-			end
-			self.ForceSpawnPending = true
-			self.ForceSpawnPendingReason = "TIME_LIMIT"
-			self.PendingWaveNumber = scheduledWave + 1
-			log("[BattleWave] force pending reason=TIME_LIMIT wave=" .. scheduledWave .. " nextWave=" .. self.PendingWaveNumber)
-		end
-		self.ForceSpawnTimerId = _TimerService:SetTimerOnce(markPending, self.ForceAfterSeconds)
+		self.WaveRuntime:ScheduleForcedSpawnTimer()
 	end
 
 	@ExecSpace("ServerOnly")
 	method void ClearForcedSpawnSchedule(string reason)
-		if self.ForceSpawnTimerId > 0 then
-			_TimerService:ClearTimer(self.ForceSpawnTimerId)
-			self.ForceSpawnTimerId = 0
-		end
-		if self.ForceSpawnPending == true then
-			log("[BattleWave] force pending cleared reason=" .. reason .. " pendingWave=" .. self.PendingWaveNumber)
-		end
-		self.ForceSpawnPending = false
-		self.ForceSpawnPendingReason = ""
-		self.PendingWaveNumber = 0
+		self.WaveRuntime:ClearForcedSpawnSchedule(reason)
+		self:PublishWaveStateSnapshot(reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void EvaluateForcedSpawnAtTurnBoundary()
 		-- Evaluates turn pressure and consumes one pending forced wave only after the full enemy round.
-		if self.BattleResult ~= "" or self.CurrentWave >= self.TotalWaves then
-			return
-		end
-		if self.CurrentWaveSpawnMode == "TURN_LIMIT" or self.CurrentWaveSpawnMode == "TURN_OR_TIME" then
-			local elapsedTurns = self.StageTurnNumber - self.WaveSpawnStageTurn
-			if self.ForceAfterTurns > 0 and elapsedTurns >= self.ForceAfterTurns then
-				self.ForceSpawnPending = true
-				self.ForceSpawnPendingReason = "TURN_LIMIT"
-				self.PendingWaveNumber = self.CurrentWave + 1
-				log("[BattleWave] force pending reason=TURN_LIMIT wave=" .. self.CurrentWave .. " elapsedTurns=" .. elapsedTurns .. " nextWave=" .. self.PendingWaveNumber)
-			end
-		end
-		if self.ForceSpawnPending == false then
+		local evaluation = self.WaveRuntime:EvaluateForcedSpawnAtTurnBoundary(self.StageTurnNumber, self.BattleResult ~= "")
+		self:PublishWaveStateSnapshot("TURN_BOUNDARY")
+		if evaluation.ShouldSpawn == false then
 			return
 		end
 
-		local pendingWave = self.PendingWaveNumber
-		local pendingReason = self.ForceSpawnPendingReason
-		self:SpawnWave(pendingWave)
-		if self.CurrentWave == pendingWave then
-			log("[BattleWave] force spawned reason=" .. pendingReason .. " wave=" .. pendingWave .. " stageTurn=" .. self.StageTurnNumber)
+		self:SpawnWave(evaluation.WaveNumber)
+		if self.CurrentWave == evaluation.WaveNumber then
+			log("[BattleWave] force spawned reason=" .. evaluation.PendingReason .. " wave=" .. evaluation.WaveNumber .. " stageTurn=" .. self.StageTurnNumber)
 		end
 	end
 
@@ -595,8 +590,12 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method any EnsureBoardStateComponent()
-		-- Returns the map-scoped BoardStateComponent, attaching it once when this prototype map lacks it.
+		-- Prefers the dedicated map child so each runtime-state entity owns one script component.
 		local boardState = self.Entity:GetComponent("script.BoardStateComponent")
+		local stateEntity = self.Entity:GetChildByName("BattleBoardState")
+		if stateEntity ~= nil then
+			boardState = stateEntity:GetComponent("script.BoardStateComponent")
+		end
 		if boardState == nil then
 			boardState = self.Entity:AddComponent("BoardStateComponent")
 		end
@@ -606,6 +605,96 @@ script BattleSessionComponent extends Component
 		end
 		self.BoardState = boardState
 		return boardState
+	end
+
+	@ExecSpace("ServerOnly")
+	method any EnsureTurnStateComponent()
+		-- BattleTurnComponent is the single mutable owner of turn, action-slot, and skill-queue state.
+		local turnState = self.Entity:GetComponent("script.BattleTurnComponent")
+		local stateEntity = self.Entity:GetChildByName("BattleTurnState")
+		if stateEntity ~= nil then
+			turnState = stateEntity:GetComponent("script.BattleTurnComponent")
+		end
+		if turnState == nil then
+			turnState = self.Entity:AddComponent("BattleTurnComponent")
+		end
+		if turnState == nil then
+			log_error("[BattleSession] failed to attach BattleTurnComponent entity=" .. self.Entity.Name)
+			return nil
+		end
+		self.TurnState = turnState
+		return turnState
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishTurnStateSnapshot(string reason)
+		-- Temporary compatibility bridge: external readers may keep using BattleSession while the owner is BattleTurnComponent.
+		local turnState = self.TurnState
+		if turnState == nil then
+			turnState = self:EnsureTurnStateComponent()
+		end
+		if turnState == nil then
+			return
+		end
+		self.BattlePhase = turnState.BattlePhase
+		self.TurnNumber = turnState.TurnNumber
+		self.QueuedActionType = turnState.QueuedActionType
+		self.QueuedActionDirection = turnState.QueuedActionDirection
+		self.IsActionProcessing = turnState.IsActionProcessing
+		self.QueuedTileIds = turnState.QueuedTileIds
+		self.QueuedTileCount = turnState.QueuedTileCount
+		self.ExecutingTileIds = turnState.ExecutingTileIds
+		self.ExecutingTileIndex = turnState.ExecutingTileIndex
+		self.TileQueueCapacity = turnState.TileQueueCapacity
+		if reason ~= "" then
+			log("[BattleSession] turn snapshot reason=" .. reason .. " phase=" .. self.BattlePhase .. " turn=" .. self.TurnNumber .. " queue=" .. self.QueuedTileCount .. "/" .. self.TileQueueCapacity)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method any EnsureWaveStateComponent()
+		-- Prefers the dedicated map child so Wave state and Timer lifetime stay isolated from Session.
+		local waveRuntime = self.Entity:GetComponent("script.BattleWaveComponent")
+		local stateEntity = self.Entity:GetChildByName("BattleWaveState")
+		if stateEntity ~= nil then
+			waveRuntime = stateEntity:GetComponent("script.BattleWaveComponent")
+		end
+		if waveRuntime == nil then
+			waveRuntime = self.Entity:AddComponent("BattleWaveComponent")
+		end
+		if waveRuntime == nil then
+			log_error("[BattleSession] failed to attach BattleWaveComponent entity=" .. self.Entity.Name)
+			return nil
+		end
+		self.WaveRuntime = waveRuntime
+		return waveRuntime
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishWaveStateSnapshot(string reason)
+		-- Temporary compatibility bridge for existing HUD and external Snapshot consumers.
+		local waveRuntime = self.WaveRuntime
+		if waveRuntime == nil then
+			waveRuntime = self:EnsureWaveStateComponent()
+		end
+		if waveRuntime == nil then
+			return
+		end
+		self.CurrentWave = waveRuntime.CurrentWave
+		self.TotalWaves = waveRuntime.TotalWaves
+		self.WaveState = waveRuntime.WaveState
+		self.WaveSpawnStageTurn = waveRuntime.WaveSpawnStageTurn
+		self.CurrentWaveSpawnMode = waveRuntime.CurrentWaveSpawnMode
+		self.ForceAfterTurns = waveRuntime.ForceAfterTurns
+		self.ForceAfterSeconds = waveRuntime.ForceAfterSeconds
+		self.ForceSpawnPending = waveRuntime.ForceSpawnPending
+		self.ForceSpawnPendingReason = waveRuntime.ForceSpawnPendingReason
+		self.CurrentWaveSpawnCount = waveRuntime.CurrentWaveSpawnCount
+		self.MaxConcurrentEnemies = waveRuntime.MaxConcurrentEnemies
+		self.CurrentClearSpawnDelay = waveRuntime.CurrentClearSpawnDelay
+		if reason ~= "" then
+			log("[BattleSession] wave snapshot reason=" .. reason .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " state=" .. self.WaveState .. " pending=" .. tostring(self.ForceSpawnPending))
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -637,6 +726,19 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method any EnsureSkillRuntimeStateComponent(Entity targetEntity)
+		-- Keeps mutable cooldowns on their owning unit rather than the map session.
+		local runtimeState = targetEntity:GetComponent("script.SkillRuntimeStateComponent")
+		if runtimeState == nil then
+			runtimeState = targetEntity:AddComponent("SkillRuntimeStateComponent")
+		end
+		if runtimeState == nil then
+			log_error("[BattleSession] failed to attach SkillRuntimeStateComponent entity=" .. targetEntity.Name)
+		end
+		return runtimeState
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ConfigureUnit(Entity targetEntity, string unitId, string team, integer cellIndex, string facing, number maxHp, integer spawnOrder)
 		-- Writes the initial logical state and places the entity at its cell position.
 		if self:IsValidCell(cellIndex) == false then
@@ -649,6 +751,11 @@ script BattleSessionComponent extends Component
 			return
 		end
 		self:EnsurePresentationComponent(targetEntity)
+		local skillRuntimeState = self:EnsureSkillRuntimeStateComponent(targetEntity)
+		if skillRuntimeState == nil then
+			return
+		end
+		skillRuntimeState:ResetSkillRuntimeState("UNIT_CONFIGURED")
 
 		unit.UnitId = unitId
 		unit.Team = team
@@ -699,30 +806,7 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table TryQueuePlayerAction(string actionType, integer direction)
 		-- Accepts at most one player action and keeps the slot occupied until presentation time ends.
-		local result = {
-			Success = false,
-			Reason = "UNKNOWN"
-		}
-
-		if self.BattlePhase ~= "PlayerTurn" then
-			result.Reason = "INVALID_PHASE"
-			return result
-		end
-
-		if self.IsActionProcessing == true then
-			result.Reason = "ACTION_PROCESSING"
-			return result
-		end
-
-		if self.QueuedActionType ~= "" then
-			result.Reason = "QUEUE_FULL"
-			return result
-		end
-
-		if self.QueuedTileCount > 0 then
-			result.Reason = "TILE_QUEUE_OCCUPIED"
-			return result
-		end
+		local result = { Success = false, Reason = "UNKNOWN" }
 
 		if actionType ~= "MOVE" and actionType ~= "TURN" and actionType ~= "BASIC_ATTACK" and actionType ~= "HEAVY_SLASH" then
 			result.Reason = "INVALID_ACTION"
@@ -734,10 +818,11 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
-		self.QueuedActionType = actionType
-		self.QueuedActionDirection = direction
-		result.Success = true
-		result.Reason = "QUEUED"
+		result = self.TurnState:TryReserveImmediateAction(actionType, direction)
+		if result.Success == false then
+			return result
+		end
+		self:PublishTurnStateSnapshot("IMMEDIATE_ACTION_QUEUED")
 		log("[BattleQueue] queued action=" .. actionType .. " direction=" .. direction)
 		self:ExecuteQueuedAction()
 		return result
@@ -746,13 +831,12 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void ExecuteQueuedAction()
 		-- Dispatches the queued action through the existing authoritative action functions.
-		local actionType = self.QueuedActionType
-		local direction = self.QueuedActionDirection
+		local actionType = self.TurnState.QueuedActionType
+		local direction = self.TurnState.QueuedActionDirection
 		if actionType == "" then
 			return
 		end
 
-		self.IsActionProcessing = true
 		log("[BattleQueue] started action=" .. actionType .. " direction=" .. direction)
 
 		local actionResult = nil
@@ -803,11 +887,10 @@ script BattleSessionComponent extends Component
 	method void CompleteQueuedAction(string actionType, boolean success, string reason)
 		-- A valid player action hands control to the enemy; invalid actions release input immediately.
 		self.ActionTimerId = 0
-		self.QueuedActionType = ""
-		self.QueuedActionDirection = 0
+		self.TurnState:CompleteImmediateAction(reason)
+		self:PublishTurnStateSnapshot("IMMEDIATE_ACTION_COMPLETED")
 		log("[BattleQueue] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
 		if self.BattleResult ~= "" then
-			self.IsActionProcessing = false
 			return
 		end
 
@@ -816,7 +899,6 @@ script BattleSessionComponent extends Component
 			return
 		end
 
-		self.IsActionProcessing = false
 	end
 
 	@ExecSpace("ServerOnly")
@@ -828,10 +910,8 @@ script BattleSessionComponent extends Component
 			self:PrepareNextEnemyIntent()
 		end
 
-		self.BattlePhase = "EnemyTurn"
-		self.QueuedActionType = "ENEMY_" .. self.PreparedEnemyActionType
-		self.QueuedActionDirection = self.PreparedEnemyDirection
-		self.IsActionProcessing = true
+		self.TurnState:BeginEnemyTurn("ENEMY_" .. self.PreparedEnemyActionType, self.PreparedEnemyDirection, "PREPARED_INTENT")
+		self:PublishTurnStateSnapshot("ENEMY_TURN_BEGIN")
 		log("[BattleEnemyIntent] hold enemy=" .. self.PreparedEnemyId .. " pattern=" .. self.PreparedEnemyPatternId .. " step=" .. self.PreparedEnemyStepIndex .. " action=" .. self.PreparedEnemyActionType .. " tile=" .. self.PreparedEnemyTileId .. " turn=" .. self.PreparedEnemyTurn)
 		log("[BattleTurnFlow] phase=EnemyTurn turn=" .. self.TurnNumber)
 
@@ -1034,8 +1114,8 @@ script BattleSessionComponent extends Component
 
 		local intent = self:GetPreparedEnemyIntent()
 		self.PreparedEnemyIntentState = "EXECUTING"
-		self.QueuedActionType = "ENEMY_" .. intent.ActionType
-		self.QueuedActionDirection = intent.Direction
+		self.TurnState:UpdateEnemyAction("ENEMY_" .. intent.ActionType, intent.Direction)
+		self:PublishTurnStateSnapshot("ENEMY_ACTION")
 		log("[BattleEnemyIntent] execute enemy=" .. intent.EnemyId .. " pattern=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " action=" .. intent.ActionType .. " tile=" .. intent.TileId .. " preparedTurn=" .. intent.PreparedTurn .. " currentTurn=" .. self.TurnNumber)
 
 		local actionResult = nil
@@ -1049,8 +1129,8 @@ script BattleSessionComponent extends Component
 					Success = true,
 					Reason = "WAIT_" .. actionResult.Reason
 				}
-				self.QueuedActionType = "ENEMY_WAIT"
-				self.QueuedActionDirection = 0
+				self.TurnState:UpdateEnemyAction("ENEMY_WAIT", 0)
+				self:PublishTurnStateSnapshot("ENEMY_WAIT")
 			end
 		elseif intent.ActionType == "TURN_TO_PLAYER" then
 			actionResult = self:TryFaceDirection(intent.EnemyId, intent.Direction)
@@ -1130,17 +1210,17 @@ script BattleSessionComponent extends Component
 	method void CompleteEnemyTurn(string actionType, boolean success, string reason)
 		-- Ends the full ordered enemy round and reopens the next player turn.
 		self.ActionTimerId = 0
-		self.QueuedActionType = ""
-		self.QueuedActionDirection = 0
-		self.IsActionProcessing = false
 		if self.BattleResult ~= "" then
+			self.TurnState:ClearTransientState("BATTLE_ENDED")
+			self:PublishTurnStateSnapshot("BATTLE_ENDED")
 			log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason .. " result=" .. self.BattleResult)
 			return
 		end
 
-		self.TurnNumber = self.TurnNumber + 1
+		self.TurnState:CompleteEnemyTurn("ENEMY_ROUND_COMPLETED")
+		self:PublishTurnStateSnapshot("PLAYER_TURN_REOPENED")
 		self.StageTurnNumber = self.TurnNumber
-		self.BattlePhase = "PlayerTurn"
+		self:AdvancePlayerSkillCooldowns("PLAYER_TURN_" .. self.TurnNumber)
 		self.LastEnemySpawnOrder = 0
 		self:EvaluateForcedSpawnAtTurnBoundary()
 		log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
@@ -1377,33 +1457,38 @@ script BattleSessionComponent extends Component
 			QueueCount = self.QueuedTileCount
 		}
 
-		if self.BattlePhase ~= "PlayerTurn" then
-			result.Reason = "INVALID_PHASE"
+		local capacity = self.TurnState.TileQueueCapacity
+
+		local skillValidation = _ContentValidatorLogic:ValidateSkillById(tileId)
+		if skillValidation.Success == false then
+			result.Reason = skillValidation.Reason
+			result.DetailReason = skillValidation.DetailReason or ""
 			return result
 		end
 
-		if self.IsActionProcessing == true then
-			result.Reason = "ACTION_PROCESSING"
+		local runtimeState = self:GetSkillRuntimeState("player_01")
+		if runtimeState == nil then
+			result.Reason = "SKILL_RUNTIME_STATE_MISSING"
+			return result
+		end
+		local cooldownResult = runtimeState:CanUseSkill(tileId)
+		if cooldownResult.Success == false then
+			result.Reason = cooldownResult.Reason
+			result.RemainingTurns = cooldownResult.RemainingTurns
+			return result
+		end
+		local definition = skillValidation.Data.Definition
+		if definition.CooldownTurns > 0 and self.TurnState:QueueContainsSkill(self.TurnState.QueuedTileIds, tileId) then
+			result.Reason = "COOLDOWN_RESERVED"
+			result.RemainingTurns = definition.CooldownTurns
 			return result
 		end
 
-		local capacity = math.max(1, self.TileQueueCapacity)
-		if self.QueuedTileCount >= capacity then
-			result.Reason = "QUEUE_FULL"
+		result = self.TurnState:TryAppendSkill(tileId)
+		if result.Success == false then
 			return result
 		end
-
-		if tileId ~= "basic_slash" and tileId ~= "heavy_slash" and tileId ~= "push" then
-			result.Reason = "INVALID_TILE"
-			return result
-		end
-
-		self.QueuedTileIds = self:AppendTileId(self.QueuedTileIds, tileId)
-		self.QueuedTileCount = self:GetTileIdCount(self.QueuedTileIds)
-		result.Success = true
-		result.Reason = "QUEUED"
-		result.QueueIndex = self.QueuedTileCount
-		result.QueueCount = self.QueuedTileCount
+		self:PublishTurnStateSnapshot("SKILL_QUEUED")
 		log("[BattleTileQueue] registered tile=" .. tileId .. " index=" .. result.QueueIndex .. " count=" .. result.QueueCount .. "/" .. capacity .. " turn=" .. self.TurnNumber)
 		return result
 	end
@@ -1411,34 +1496,11 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table TryExecuteQueuedTile()
 		-- Freezes the registered queue and starts an arbitrary-length sequential execution pass.
-		local result = {
-			Success = false,
-			Reason = "UNKNOWN"
-		}
-
-		if self.BattlePhase ~= "PlayerTurn" then
-			result.Reason = "INVALID_PHASE"
+		local result = self.TurnState:TryFreezeSkillQueue()
+		if result.Success == false then
 			return result
 		end
-
-		if self.IsActionProcessing == true then
-			result.Reason = "ACTION_PROCESSING"
-			return result
-		end
-
-		if self.QueuedTileCount <= 0 or self.QueuedTileIds == "" then
-			result.Reason = "QUEUE_EMPTY"
-			return result
-		end
-
-		self.ExecutingTileIds = self.QueuedTileIds
-		self.ExecutingTileIndex = 1
-		self.QueuedTileIds = ""
-		self.QueuedTileCount = 0
-		self.IsActionProcessing = true
-
-		result.Success = true
-		result.Reason = "EXECUTING"
+		self:PublishTurnStateSnapshot("SKILL_QUEUE_FROZEN")
 		log("[BattleTileQueue] execution started count=" .. self:GetTileIdCount(self.ExecutingTileIds) .. " capacity=" .. self.TileQueueCapacity .. " turn=" .. self.TurnNumber)
 		self:ExecuteNextQueuedTile()
 		return result
@@ -1447,30 +1509,26 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void ExecuteNextQueuedTile()
 		-- Resolves exactly one tile, then advances only after its action duration has completed.
-		local tileCount = self:GetTileIdCount(self.ExecutingTileIds)
-		if self.ExecutingTileIndex <= 0 or self.ExecutingTileIndex > tileCount then
+		local tileCount = self.TurnState:GetTileIdCount(self.TurnState.ExecutingTileIds)
+		if self.TurnState.ExecutingTileIndex <= 0 or self.TurnState.ExecutingTileIndex > tileCount then
 			self:CompleteTileQueueExecution(true, "QUEUE_COMPLETE")
 			return
 		end
 
-		local tileId = self:GetTileIdAt(self.ExecutingTileIds, self.ExecutingTileIndex)
+		local tileId = self.TurnState:GetTileIdAt(self.TurnState.ExecutingTileIds, self.TurnState.ExecutingTileIndex)
 		local actionType = self:GetTileActionType(tileId)
 		if actionType == "" then
-			self:CompleteTileQueueExecution(false, "INVALID_TILE")
+			self:CompleteTileQueueExecution(false, "UNKNOWN_SKILL")
 			return
 		end
 
-		self.QueuedActionType = actionType
-		self.QueuedActionDirection = 0
+		self.TurnState:SetExecutingAction(actionType, 0)
+		self:PublishTurnStateSnapshot("SKILL_EXECUTING")
 		log("[BattleTileQueue] tile started index=" .. self.ExecutingTileIndex .. "/" .. tileCount .. " tile=" .. tileId .. " action=" .. actionType)
 
 		local actionResult = nil
-		if actionType == "BASIC_ATTACK" then
-			actionResult = self:TryBasicAttack("player_01")
-		elseif actionType == "HEAVY_SLASH" then
-			actionResult = self:TryHeavySlash("player_01")
-		elseif actionType == "PUSH" then
-			actionResult = self:TryPush("player_01")
+		if actionType == "EXECUTE_SKILL" then
+			actionResult = self:TryExecuteSkill("player_01", tileId)
 		end
 
 		if actionResult == nil or actionResult.Success == false then
@@ -1482,8 +1540,8 @@ script BattleSessionComponent extends Component
 			return
 		end
 
-		local completedIndex = self.ExecutingTileIndex
-		local duration = self:GetActionDuration(actionType)
+		local completedIndex = self.TurnState.ExecutingTileIndex
+		local duration = self:GetSkillActionDuration(tileId)
 		local complete = function()
 			self.ActionTimerId = 0
 			log("[BattleTileQueue] tile completed index=" .. completedIndex .. "/" .. tileCount .. " tile=" .. tileId .. " reason=" .. actionResult.Reason)
@@ -1491,7 +1549,8 @@ script BattleSessionComponent extends Component
 				self:CompleteTileQueueExecution(true, "BATTLE_ENDED")
 				return
 			end
-			self.ExecutingTileIndex = completedIndex + 1
+			self.TurnState:AdvanceExecutingSkill()
+			self:PublishTurnStateSnapshot("SKILL_ADVANCED")
 			self:ExecuteNextQueuedTile()
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
@@ -1500,23 +1559,19 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void CompleteTileQueueExecution(boolean success, string reason)
 		-- Clears execution state once, then hands control to the enemy only after the full queue succeeds.
-		local executedCount = self:GetTileIdCount(self.ExecutingTileIds)
+		local executedCount = self.TurnState:GetTileIdCount(self.TurnState.ExecutingTileIds)
 		self.ActionTimerId = 0
-		self.QueuedActionType = ""
-		self.QueuedActionDirection = 0
-		self.ExecutingTileIds = ""
-		self.ExecutingTileIndex = 0
+		self.TurnState:CompleteSkillQueue(reason)
+		self:PublishTurnStateSnapshot("SKILL_QUEUE_COMPLETED")
 		log("[BattleTileQueue] execution completed success=" .. tostring(success) .. " reason=" .. reason .. " count=" .. executedCount)
 
 		if self.BattleResult ~= "" then
-			self.IsActionProcessing = false
 			return
 		end
 		if success then
 			self:BeginEnemyTurn()
 			return
 		end
-		self.IsActionProcessing = false
 	end
 
 	method string AppendTileId(string serializedQueue, string tileId)
@@ -1524,6 +1579,15 @@ script BattleSessionComponent extends Component
 			return tileId
 		end
 		return serializedQueue .. "|" .. tileId
+	end
+
+	method boolean QueueContainsSkill(string serializedQueue, string skillId)
+		for queuedSkillId in string.gmatch(serializedQueue, "([^|]+)") do
+			if queuedSkillId == skillId then
+				return true
+			end
+		end
+		return false
 	end
 
 	method integer GetTileIdCount(string serializedQueue)
@@ -1551,45 +1615,39 @@ script BattleSessionComponent extends Component
 		return ""
 	end
 
+	@ExecSpace("ServerOnly")
 	method string GetTileActionType(string tileId)
-		if tileId == "basic_slash" then
-			return "BASIC_ATTACK"
-		elseif tileId == "heavy_slash" then
-			return "HEAVY_SLASH"
-		elseif tileId == "push" then
-			return "PUSH"
+		local validation = _ContentValidatorLogic:ValidateSkillById(tileId)
+		if validation.Success == true then
+			return "EXECUTE_SKILL"
 		end
 		return ""
 	end
 
 	@ExecSpace("ServerOnly")
+	method number GetSkillActionDuration(string skillId)
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then
+			return 0.1
+		end
+		return math.max(0.1, validation.Data.Definition.ActionDuration)
+	end
+
+	@ExecSpace("ServerOnly")
 	method table TryClearQueuedTile()
 		-- Clears every registered tile only while the player still owns an idle input phase.
-		local result = {
-			Success = false,
-			Reason = "UNKNOWN"
-		}
-
-		if self.BattlePhase ~= "PlayerTurn" then
-			result.Reason = "INVALID_PHASE"
-			return result
-		end
-
-		if self.IsActionProcessing == true then
-			result.Reason = "ACTION_PROCESSING"
-			return result
-		end
-
-		if self.QueuedTileCount <= 0 or self.QueuedTileIds == "" then
+		local result = { Success = false, Reason = "UNKNOWN" }
+		if self.TurnState.QueuedTileCount <= 0 or self.TurnState.QueuedTileIds == "" then
 			result.Reason = "QUEUE_EMPTY"
 			return result
 		end
 
-		local clearedCount = self.QueuedTileCount
-		self.QueuedTileIds = ""
-		self.QueuedTileCount = 0
-		result.Success = true
-		result.Reason = "CLEARED"
+		local clearedCount = self.TurnState.QueuedTileCount
+		result = self.TurnState:TryClearQueuedSkills()
+		if result.Success == false then
+			return result
+		end
+		self:PublishTurnStateSnapshot("SKILL_QUEUE_CLEARED")
 		log("[BattleTileQueue] cleared count=" .. clearedCount .. " turn=" .. self.TurnNumber)
 		return result
 	end
@@ -1661,9 +1719,10 @@ script BattleSessionComponent extends Component
 			result.Reason = "INVALID_STAGE_ID"
 			return result
 		end
-		local configuredWaves = _StageWaveRepositoryLogic:GetTotalWaveCount(stageId)
-		if configuredWaves <= 0 then
-			result.Reason = "STAGE_DEFINITION_NOT_FOUND"
+		local stageValidation = _ContentValidatorLogic:ValidateStageById(stageId)
+		if stageValidation.Success == false then
+			result.Reason = stageValidation.Reason
+			result.DetailReason = stageValidation.DetailReason or ""
 			return result
 		end
 		if entryMode ~= "NEW_RUN" and entryMode ~= "CONTINUE_RUN" then
@@ -1684,9 +1743,13 @@ script BattleSessionComponent extends Component
 
 		local stageNumberText = string.match(stageId, "%d+")
 		local stageNumber = tonumber(stageNumberText) or runState.CurrentStageNumber
-		self.StageId = stageId
 		self.StageNumber = math.max(1, stageNumber)
-		self.TotalWaves = configuredWaves
+		local applyResult = self:LoadAndApplyStageDefinition(stageId)
+		if applyResult.Success == false then
+			result.Reason = applyResult.Reason
+			result.DetailReason = applyResult.DetailReason or ""
+			return result
+		end
 		self.RunSeed = runState.RunSeed
 		self.EntryRequestId = requestId
 		self.EntryMode = entryMode
@@ -1705,22 +1768,32 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table GetBattleSnapshot()
 		-- Stable read model for server-side lobby, waiting, result, and flow controllers.
+		local turnState = self:EnsureTurnStateComponent()
+		local waveRuntime = self:EnsureWaveStateComponent()
 		return {
 			Success = true,
 			Reason = "OK",
 			EntryRequestId = self.EntryRequestId,
 			EntryMode = self.EntryMode,
 			StageId = self.StageId,
+			StageDisplayName = self.StageDisplayName,
+			WaveTableId = self.WaveTableId,
+			NextStageId = self.NextStageId,
+			StageRuleId = self.StageRuleId,
+			StageSchemaVersion = self.StageSchemaVersion,
 			StageNumber = self.StageNumber,
 			RunSeed = self.RunSeed,
 			CharacterId = self.SelectedCharacterId,
 			JobId = self.SelectedJobId,
 			LoadoutId = self.SelectedLoadoutId,
-			BattlePhase = self.BattlePhase,
+			BattlePhase = turnState.BattlePhase,
 			BattleResult = self.BattleResult,
-			TurnNumber = self.TurnNumber,
-			CurrentWave = self.CurrentWave,
-			TotalWaves = self.TotalWaves
+			TurnNumber = turnState.TurnNumber,
+			CurrentWave = waveRuntime.CurrentWave,
+			TotalWaves = waveRuntime.TotalWaves,
+			CellCount = self.CellCount,
+			PlayerStartCell = self.PlayerStartCell,
+			QueueCapacity = turnState.TileQueueCapacity
 		}
 	end
 
@@ -1740,23 +1813,12 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ImpactTimerId)
 			self.ImpactTimerId = 0
 		end
-		if self.WaveTimerId > 0 then
-			_TimerService:ClearTimer(self.WaveTimerId)
-			self.WaveTimerId = 0
-		end
-		self:ClearForcedSpawnSchedule(reason)
+		self.WaveRuntime:ClearAllTimers(reason)
 
-		self.BattlePhase = "Setup"
 		self.BattleResult = ""
-		self.TurnNumber = 0
 		self.StageTurnNumber = 0
-		self.QueuedActionType = ""
-		self.QueuedActionDirection = 0
-		self.QueuedTileIds = ""
-		self.QueuedTileCount = 0
-		self.ExecutingTileIds = ""
-		self.ExecutingTileIndex = 0
-		self.IsActionProcessing = false
+		self.TurnState:ResetTurnState(self.TileQueueCapacity, reason)
+		self:PublishTurnStateSnapshot(reason)
 		self.LastEnemySpawnOrder = 0
 		self:ClearPreparedEnemyIntent(reason)
 
@@ -1778,6 +1840,11 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryPush(string sourceUnitId)
+		return self:TryExecuteSkill(sourceUnitId, "push")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryPushWithDefinition(string sourceUnitId, table definition, table effectStep)
 		-- Starts the push presentation, then resolves board displacement at the configured impact frame.
 		local result = {
 			Success = false,
@@ -1805,20 +1872,21 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
+		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
 		if sourcePresentation ~= nil and sourceEntity.PlayerControllerComponent ~= nil then
 			sourcePresentation:PlayCombatMotion(
 				sourceUnitId,
-				self.PushMotionKey,
-				self.PushActionName,
-				self.PushMotionPlayRate,
-				self.PushMotionDuration
+				motionProfile.MotionKey,
+				motionProfile.ActionName,
+				motionProfile.PlayRate,
+				motionProfile.Duration
 			)
 		end
 
-		local safeImpactDelay = math.max(0, self.PushImpactDelay)
+		local safeImpactDelay = math.max(0, motionProfile.ImpactDelay)
 		if safeImpactDelay <= 0 then
-			return _EffectRouterLogic:ExecuteEffect(self, "PUSH", sourceUnitId, "", 0)
+			return _EffectRouterLogic:ExecuteEffect(self, effectStep.EffectType, sourceUnitId, "", effectStep.Value)
 		end
 		if self.ImpactTimerId > 0 then
 			_TimerService:ClearTimer(self.ImpactTimerId)
@@ -1830,7 +1898,7 @@ script BattleSessionComponent extends Component
 			self.ImpactTimerId = 0
 			local elapsed = _UtilLogic.ElapsedSeconds - scheduledAt
 			log("[BattleImpact] triggered effect=PUSH elapsed=" .. tostring(elapsed))
-			local impactResult = _EffectRouterLogic:ExecuteEffect(self, "PUSH", sourceUnitId, "", 0)
+			local impactResult = _EffectRouterLogic:ExecuteEffect(self, effectStep.EffectType, sourceUnitId, "", effectStep.Value)
 			if impactResult.Success == false then
 				log_warning("[BattlePush] failed source=" .. sourceUnitId .. " reason=" .. impactResult.Reason)
 			end
@@ -1923,40 +1991,123 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryBasicAttack(string sourceUnitId)
-		-- Supplies the basic slash profile to the shared front-cell attack resolver.
-		local damageAmount = self.BasicAttackDamage
-		local sourceEntity = self:FindUnitEntity(sourceUnitId)
-		if isvalid(sourceEntity) then
-			local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
-			if sourceUnit ~= nil then
-				damageAmount = sourceUnit.BasicAttackDamage
-			end
-		end
-		return self:TryFrontAttack(
-			sourceUnitId,
-			"basic_slash",
-			damageAmount,
-			self.BasicSlashMotionKey,
-			self.BasicSlashActionName,
-			self.BasicSlashMotionPlayRate,
-			self.BasicSlashMotionDuration,
-			self.BasicSlashImpactDelay
-		)
+		return self:TryExecuteSkill(sourceUnitId, "basic_slash")
 	end
 
 	@ExecSpace("ServerOnly")
 	method table TryHeavySlash(string sourceUnitId)
-		-- Supplies the slower, stronger slash profile without duplicating target or damage rules.
-		return self:TryFrontAttack(
-			sourceUnitId,
-			"heavy_slash",
-			self.HeavySlashDamage,
-			self.HeavySlashMotionKey,
-			self.HeavySlashActionName,
-			self.HeavySlashMotionPlayRate,
-			self.HeavySlashMotionDuration,
-			self.HeavySlashImpactDelay
-		)
+		return self:TryExecuteSkill(sourceUnitId, "heavy_slash")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryExecuteSkill(string sourceUnitId, string skillId)
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then
+			return {
+				Success = false,
+				Reason = validation.Reason,
+				DetailReason = validation.DetailReason or "",
+				SourceUnitId = sourceUnitId,
+				SkillId = skillId
+			}
+		end
+
+		local bundle = validation.Data
+		local definition = bundle.Definition
+		local effectSteps = bundle.EffectSteps
+		local contextResult = _SkillExecutionLogic:BuildContext(self, sourceUnitId, skillId, definition)
+		if contextResult.Success == false then
+			return contextResult
+		end
+
+		local runtimeState = self:GetSkillRuntimeState(sourceUnitId)
+		if runtimeState == nil then
+			return {
+				Success = false,
+				Reason = "SKILL_RUNTIME_STATE_MISSING",
+				SourceUnitId = sourceUnitId,
+				SkillId = skillId
+			}
+		end
+		local cooldownResult = runtimeState:CanUseSkill(skillId)
+		if cooldownResult.Success == false then
+			return {
+				Success = false,
+				Reason = cooldownResult.Reason,
+				RemainingTurns = cooldownResult.RemainingTurns,
+				SourceUnitId = sourceUnitId,
+				SkillId = skillId
+			}
+		end
+		runtimeState:StartCooldown(skillId, definition.CooldownTurns)
+
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
+		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourcePresentation ~= nil and sourceEntity.PlayerControllerComponent ~= nil then
+			sourcePresentation:PlayCombatMotion(
+				sourceUnitId,
+				motionProfile.MotionKey,
+				motionProfile.ActionName,
+				motionProfile.PlayRate,
+				motionProfile.Duration
+			)
+		end
+
+		local context = contextResult.Data
+		local safeImpactDelay = math.max(0, motionProfile.ImpactDelay)
+		local resolveEffects = function()
+			self.ImpactTimerId = 0
+			local effectResult = _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
+			if effectResult.Success == false then
+				log_warning("[SkillExecution] failed skill=" .. skillId .. " source=" .. sourceUnitId .. " reason=" .. effectResult.Reason)
+			end
+		end
+		if safeImpactDelay <= 0 then
+			return _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
+		end
+		if self.ImpactTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactTimerId)
+			self.ImpactTimerId = 0
+		end
+
+		self.ImpactTimerId = _TimerService:SetTimerOnce(resolveEffects, safeImpactDelay)
+		log("[SkillExecution] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " steps=" .. #effectSteps .. " delay=" .. safeImpactDelay)
+		return {
+			Success = true,
+			Reason = "IMPACT_PENDING",
+			SourceUnitId = sourceUnitId,
+			SkillId = skillId,
+			StepCount = #effectSteps
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetSkillMotionProfile(string motionProfileId)
+		if motionProfileId == "heavy_slash" then
+			return {
+				MotionKey = self.HeavySlashMotionKey,
+				ActionName = self.HeavySlashActionName,
+				PlayRate = self.HeavySlashMotionPlayRate,
+				Duration = self.HeavySlashMotionDuration,
+				ImpactDelay = self.HeavySlashImpactDelay
+			}
+		elseif motionProfileId == "push" then
+			return {
+				MotionKey = self.PushMotionKey,
+				ActionName = self.PushActionName,
+				PlayRate = self.PushMotionPlayRate,
+				Duration = self.PushMotionDuration,
+				ImpactDelay = self.PushImpactDelay
+			}
+		end
+		return {
+			MotionKey = self.BasicSlashMotionKey,
+			ActionName = self.BasicSlashActionName,
+			PlayRate = self.BasicSlashMotionPlayRate,
+			Duration = self.BasicSlashMotionDuration,
+			ImpactDelay = self.BasicSlashImpactDelay
+		}
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2219,45 +2370,31 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
 		end
-		self.QueuedActionType = ""
-		self.QueuedActionDirection = 0
-		self.QueuedTileIds = ""
-		self.QueuedTileCount = 0
-		self.ExecutingTileIds = ""
-		self.ExecutingTileIndex = 0
-		self.IsActionProcessing = false
+		self.TurnState:ClearTransientState("UNIT_DIED")
+		self:PublishTurnStateSnapshot("UNIT_DIED")
 		if unit.Team == "Enemy" then
 			if self.CurrentWave < self.TotalWaves then
-				self.BattlePhase = "WaveTransition"
-				self.WaveState = "Cleared"
+				self.TurnState:SetPhase("WaveTransition", "WAVE_CLEARED")
+				self:PublishTurnStateSnapshot("WAVE_CLEARED")
 				self:ClearPreparedEnemyIntent("WAVE_CLEARED")
 				local clearedWave = self.CurrentWave
 				local nextWave = clearedWave + 1
-				local advanceWave = function()
-					self.WaveTimerId = 0
-					if self.BattleResult ~= "" or self.CurrentWave ~= clearedWave then
-						return
-					end
-					self.TurnNumber = self.TurnNumber + 1
-					self.StageTurnNumber = self.TurnNumber
-					self:SpawnWave(nextWave)
-					if self.CurrentWave == nextWave then
-						self.BattlePhase = "PlayerTurn"
-						self.WaveState = "Active"
-						self:PrepareEnemyIntent()
-					end
-				end
-				self.WaveTimerId = _TimerService:SetTimerOnce(advanceWave, math.max(0, self.CurrentClearSpawnDelay))
+				self.WaveRuntime:ScheduleWaveTransition(clearedWave, nextWave, self.CurrentClearSpawnDelay)
+				self:PublishWaveStateSnapshot("WAVE_CLEARED")
 				log("[BattleWave] cleared stage=" .. self.StageNumber .. " wave=" .. clearedWave .. "/" .. self.TotalWaves .. " nextWave=" .. nextWave)
 				return
 			end
 
-			self.BattlePhase = "BattleEnded"
-			self.WaveState = "StageCleared"
+			self.TurnState:SetPhase("BattleEnded", "STAGE_CLEARED")
+			self:PublishTurnStateSnapshot("STAGE_CLEARED")
+			self.WaveRuntime:SetWaveState("StageCleared", "STAGE_CLEARED")
+			self:PublishWaveStateSnapshot("STAGE_CLEARED")
 			self.BattleResult = "Victory"
 		else
-			self.BattlePhase = "BattleEnded"
-			self.WaveState = "Failed"
+			self.TurnState:SetPhase("BattleEnded", "PLAYER_DEFEATED")
+			self:PublishTurnStateSnapshot("PLAYER_DEFEATED")
+			self.WaveRuntime:SetWaveState("Failed", "PLAYER_DEFEATED")
+			self:PublishWaveStateSnapshot("PLAYER_DEFEATED")
 			self.BattleResult = "Defeat"
 		end
 
@@ -2267,6 +2404,25 @@ script BattleSessionComponent extends Component
 		end
 		log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=" .. self.BattleResult .. " wave=" .. self.CurrentWave)
 		log("[BattleResult] result=" .. self.BattleResult .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " runRecorded=" .. tostring(runResultRecorded))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceClearedWave(integer clearedWave, integer nextWave)
+		-- Called only by BattleWaveComponent after its map-scoped transition timer expires.
+		if self.BattleResult ~= "" or self.CurrentWave ~= clearedWave then
+			return
+		end
+		self.TurnState:OpenPlayerTurn(self.TurnNumber + 1, "NEXT_WAVE")
+		self:PublishTurnStateSnapshot("NEXT_WAVE")
+		self.StageTurnNumber = self.TurnNumber
+		self:SpawnWave(nextWave)
+		if self.CurrentWave == nextWave then
+			self.TurnState:SetPhase("PlayerTurn", "NEXT_WAVE_ACTIVE")
+			self:PublishTurnStateSnapshot("NEXT_WAVE_ACTIVE")
+			self.WaveRuntime:MarkWaveActive("NEXT_WAVE_ACTIVE")
+			self:PublishWaveStateSnapshot("NEXT_WAVE_ACTIVE")
+			self:PrepareEnemyIntent()
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2393,6 +2549,25 @@ script BattleSessionComponent extends Component
 		return self.BoardState:FindByUnitId(unitId)
 	end
 
+	@ExecSpace("ServerOnly")
+	method any GetSkillRuntimeState(string unitId)
+		local unitEntity = self:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			return nil
+		end
+		return unitEntity:GetComponent("script.SkillRuntimeStateComponent")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvancePlayerSkillCooldowns(string reason)
+		local runtimeState = self:GetSkillRuntimeState("player_01")
+		if runtimeState == nil then
+			log_warning("[BattleCooldown] advance skipped reason=SKILL_RUNTIME_STATE_MISSING turn=" .. self.TurnNumber)
+			return
+		end
+		runtimeState:AdvanceCooldowns(1, reason)
+	end
+
 	method boolean IsCellOccupied(integer cellIndex, string ignoredUnitId)
 		-- Delegates living-cell occupancy to the map-scoped BoardState registry.
 		if self.BoardState == nil then
@@ -2483,11 +2658,11 @@ script BattleSessionComponent extends Component
 			return
 		end
 
-		self.BattlePhase = "PlayerTurn"
-		self.WaveState = "Active"
-		self.TurnNumber = 1
+		self.TurnState:OpenPlayerTurn(1, "BATTLE_READY")
+		self:PublishTurnStateSnapshot("BATTLE_READY")
+		self.WaveRuntime:MarkWaveActive("BATTLE_READY")
+		self:PublishWaveStateSnapshot("BATTLE_READY")
 		self.StageTurnNumber = 1
-		self.WaveSpawnStageTurn = 1
 		log("[BattleSession] ready phase=" .. self.BattlePhase .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " playerCell=" .. self.PlayerStartCell .. " livingEnemies=" .. #livingEnemies .. " enemyHp=" .. self.CurrentEnemyMaxHp)
 		self:PrepareEnemyIntent()
 	end
