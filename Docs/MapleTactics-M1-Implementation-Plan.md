@@ -300,6 +300,9 @@ StageFlowComponent
 - [ ] Pattern만으로 표현할 수 없는 요구가 실제로 발생한 경우에만 BT Spike 수행.
 - [ ] 스테이지 완료 -> 증강 선택 -> 다음 스테이지 전환.
 - [ ] 양방향(플레이어 좌/우 동시 교전) 시나리오 회귀 테스트.
+- [ ] RegionDefinitions/NodeDefinitions 로더 — 지역별 노드 그래프 로드와 `IsStartNode` 유일성 검증.
+- [ ] 지도판 UI가 NodeDefinitions를 읽어 현재 진행 가능한 노드만 선택 가능하게 표시.
+- [ ] 지역 보스(`BossStageId`) 클리어 시 `UnlockRegionId`로 다음 지역 잠금 해제.
 
 완료 기준:
 
@@ -308,6 +311,7 @@ StageFlowComponent
 - 웨이브가 진행돼도 좌우 배치와 등장 순서가 동일 Seed에서 동일하게 재현된다.
 - `CLEAR_ONLY`는 전멸 전 다음 웨이브를 생성하지 않고, `TURN_LIMIT`은 지정 턴 경계에서 남은 적과 함께 다음 웨이브를 정확히 한 번 생성한다.
 - 마지막 웨이브가 출현한 뒤 모든 웨이브의 생존 적이 0명일 때만 Stage Clear가 발생한다.
+- RegionId만 바꿔 다른 노드 그래프와 몬스터 풀을 로드한다.
 
 ### Phase 4 — 직업 4종과 증강
 
@@ -321,6 +325,10 @@ StageFlowComponent
 - [ ] 재귀 이벤트 SourceTag와 최대 깊이 구현.
 - [ ] 증강 3택 UI와 서버 선택 검증.
 - [ ] 4직업 최소 데이터와 각 직업 대표 패시브 1개.
+- [ ] `ConditionType=CHANCE_ROLL`(RunSeed 기반 결정적 확률 판정) 구현.
+- [ ] `TargetType=REAR_CELL`(현재 Facing 반대편 뒤 칸) Resolver 구현.
+- [ ] ShopItemDefinitions 로더 + Category/CurrencyType Validator.
+- [ ] 상점 UI에서 아이템 구매 → EffectRefType(AUGMENT/SKILL/JOB)에 따라 지급 경로 연결.
 
 완료 기준:
 

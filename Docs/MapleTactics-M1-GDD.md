@@ -80,6 +80,8 @@ M1 직업 슬롯:
 - 후속 웨이브의 기본 배치 정책은 `BALANCED`다. 양쪽에 빈 칸이 있고 2명 이상 생성하면 좌우에 최소 1명씩 먼저 배치하고, 남은 적은 전체 빈 칸에서 뽑는다. `ANY`는 방향 강제 없이 전체 빈 칸에서 뽑는다.
 - 웨이브 등장 칸 선택은 RunSeed+StageIndex+WaveIndex 기반 결정적 규칙을 따른다.
 - 스테이지는 AugmentPoolId를 데이터로 정의한다.
+- 여러 스테이지는 `RegionDefinitions`/`NodeDefinitions`로 묶은 지역 단위 지도판·노드맵으로 진행한다. 지역 하나는 일반 전투 노드 여러 개와 보스 노드 하나로 구성되고, 다음 지역은 `UnlockRegionId`로 이전 지역 보스 클리어를 조건으로 연다.
+- 지역별 등장 몬스터는 `EnemySpawnPools`(MonsterPoolId)로 정의하며, 헤네시스/엘리니아/슬리피우드처럼 지역마다 다른 몬스터 구성을 원시 타입 변경 없이 표로 교체한다.
 
 ## 7. 증강 원칙
 
@@ -88,6 +90,8 @@ M1 직업 슬롯:
 - 증강은 Trigger + Condition + Effect 조합이다.
 - Unique, StackAdd, StackRefresh, ExclusiveGroup 정책을 지원한다.
 - 이벤트 무한 재귀를 막기 위해 SourceTag와 MaxDepth를 둔다.
+- 확률 기반 증강(예: "50% 확률로 후방 공격")은 `ConditionType=CHANCE_ROLL`과 `ConditionValue`(0.0~1.0)로 표현하며, 판정은 RunSeed 기반 결정적 롤을 사용한다.
+- 유물(상점에서 얻는 시작 증강 포함)도 같은 `AugmentDefinitions`/`AugmentEffects` 스키마를 사용한다. 유물 전용 별도 테이블을 만들지 않는다.
 
 ## 8. MSW 구현 결정
 
@@ -133,7 +137,8 @@ M1 직업 슬롯:
 - M1에서 실시간 멀티플레이 전투는 제외한다.
 - 새로운 효과를 완전히 무코드로 정의하는 범용 스크립팅 언어는 만들지 않는다.
 - 모든 일반 적을 BT로 제작하지 않는다.
-- 메타 진행, 상점, 과금, 랭킹은 M1 코어 루프 이후로 미룬다.
+- 메타 진행, 과금 연동, 랭킹은 M1 코어 루프 이후로 미룬다.
+- 상점은 `ShopItemDefinitions` 데이터 구조와 화면만 M1 범위에 포함하고, 실제 결제·재화 지급 연동은 미룬다.
 
 ## 11. 성공 기준
 
@@ -157,3 +162,6 @@ M1 직업 슬롯:
 | 2026-07-25 | 수정 | 초기 방향 결정과 전투 중 방향 행동을 분리하고, 웨이브 배치에 `BALANCED`/`ANY` 정책을 추가 | 생성 위치에 따라 고정 방향 적이 보드 바깥을 향하는 문제를 막고 객체별 책임을 명확히 하기 위함 | EnemyDefinitions, StageEnemySpawns, StageEnemyWaves, 적 Action 의미, Phase 1~3 구현 순서 |
 | 2026-07-25 | 추가 | 적 Intent를 `Prepare → Hold → Execute → Complete` 상태로 분리하고 `EnemyPatternSteps` 표에서 생성되는 PreparedIntent 계약과 개발자별 소유권을 명시 | 밀치기 직후 적이 행동을 재선택해 위치 조작이 무의미해지는 문제를 막고, 여러 개발자가 전투 코어 충돌 없이 표 행으로 적을 확장하기 위함 | Phase 1 Slice 10.5, GDD §3/§6/§8, Data-Dictionary §7.1/§7.2, Implementation-Plan 전투 코어 완료 기준 |
 | 2026-07-25 | 추가 | 웨이브 전멸 기본 진행에 턴/시간 제한 강제 증원 예외와 겹친 웨이브의 최종 승리 조건 추가 | 턴을 오래 소비할수록 적 증원이 누적되는 압박을 만들고, 스테이지 제작자가 표에서 증원 속도를 조절하기 위함 | GDD §6, Data-Dictionary StageEnemyWaves, Implementation-Plan Phase 3 |
+| 2026-07-28 | 추가 | 지역/노드맵 구조(`RegionDefinitions`/`NodeDefinitions`) 신설 | 팀 회의에서 확정된 마을→지도판→노드맵→전투 흐름을 여러 스테이지 데이터로 표현하기 위함 | GDD §6, Data-Dictionary §9/§10, Implementation-Plan Phase 3 |
+| 2026-07-28 | 추가 | 상점 데이터 구조(`ShopItemDefinitions`) 신설, 제외범위에서 "상점 데이터/화면"과 "결제 연동"을 분리 | 팀이 상점(캐시샵 포함) 콘텐츠 구조를 M1 범위에서 먼저 결정하기로 함 | GDD §10, Data-Dictionary §18 |
+| 2026-07-28 | 추가 | AugmentEffects에 `ConditionValue`, `ConditionType=CHANCE_ROLL`, `TargetType=REAR_CELL` 추가 | "자쿰의 투구: 50% 확률 후방 공격"처럼 확률 기반·후방 타깃 유물을 코드 수정 없이 표로 표현하기 위함 | GDD §7, Data-Dictionary §15 |

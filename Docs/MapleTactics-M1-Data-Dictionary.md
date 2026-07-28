@@ -172,7 +172,57 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 
 `OriginX/OriginY/CellWidth`는 월드 좌표 표현용이며 논리 판정에는 사용하지 않는다.
 
-## 9. StageEnemySpawns
+## 9. RegionDefinitions
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| RegionId | string | O | 지역 고유 ID (예: `henesys`) |
+| DisplayName | string | O | 표시 이름 (예: 헤네시스) |
+| NodeGraphId | string | O | NodeDefinitions 참조 |
+| MonsterPoolId | string | O | 이 지역 일반 전투에서 쓰는 EnemySpawnPools 참조 |
+| BossStageId | string | O | 지역 보스 전투(StageDefinitions) 참조 |
+| UnlockRegionId | string | - | 비어 있으면 처음부터 열림. 값이 있으면 그 지역의 `BossStageId` 클리어 후 열림 |
+| Enabled | boolean | O | 콘텐츠 활성 여부 |
+
+기본 키: `RegionId` 유일.
+
+예시:
+
+| RegionId | DisplayName | NodeGraphId | MonsterPoolId | BossStageId | UnlockRegionId |
+|---|---|---|---|---|---|
+| henesys | 헤네시스 | henesys_graph | henesys_common | henesys_boss_mushmom | |
+| ellinia | 엘리니아 | ellinia_graph | ellinia_common | ellinia_boss_dollmaster | henesys |
+| sleepywood | 슬리피우드 | sleepywood_graph | sleepywood_common | sleepywood_boss_balrog | ellinia |
+
+## 10. NodeDefinitions
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| NodeGraphId | string | O | RegionDefinitions.NodeGraphId 참조 |
+| NodeId | string | O | 노드 고유 ID |
+| NodeType | enum | O | 등록된 NodeType |
+| StageId | string | - | `BATTLE`/`BOSS`에서 StageDefinitions 참조, 그 외 타입은 비움 |
+| IsStartNode | boolean | O | 이 NodeGraph에서 지도판 진입 시 처음 여는 노드인지 |
+| NextNodeIds | string | - | `\|` 구분 다음 노드 ID 목록 |
+| PositionX | number | O | 지도판 표시 X (월드 좌표 아님, UI 배치용) |
+| PositionY | number | O | 지도판 표시 Y |
+| Enabled | boolean | O | 콘텐츠 활성 여부 |
+
+허용 NodeType M1: `BATTLE`, `SHOP`, `EVENT`, `REST`, `BOSS`.
+
+기본 키: `(NodeGraphId, NodeId)` 유일. 같은 NodeGraphId 안에 `IsStartNode=true`가 정확히 1개여야 한다. `NextNodeIds`가 참조하는 NodeId는 같은 NodeGraphId 안에 존재해야 한다.
+
+예시(`henesys_graph`, 회의 문서의 "헤네시스 1-1/1-2/1-3" 배치를 노드 3개로 표현):
+
+| NodeGraphId | NodeId | NodeType | StageId | IsStartNode | NextNodeIds |
+|---|---|---|---|---|---|
+| henesys_graph | n1 | BATTLE | henesys_1_1 | true | n2 |
+| henesys_graph | n2 | BATTLE | henesys_1_2 | false | n3 |
+| henesys_graph | n3 | BOSS | henesys_boss_mushmom | false | |
+
+상점/이벤트 노드가 필요하면 같은 그래프에 `NodeType=SHOP`, `StageId`는 비운 행을 추가한다.
+
+## 11. StageEnemySpawns
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -187,7 +237,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 
 같은 StageId·WaveIndex에서 CellIndex 중복 점유를 허용하지 않는다. `WaveIndex=1` 행은 스테이지 시작과 동시에 `SpawnByModelId`로 생성하며 플레이어 좌/우 양쪽 CellIndex를 사용할 수 있다. 맵 파일에 전투 적을 고정 배치하지 않는다.
 
-## 10. EnemySpawnPools
+## 12. EnemySpawnPools
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -209,7 +259,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 `BattleSessionComponent.RunSeed`는 현재 전투에서 사용하는 복사본이다. 새 런 시작은
 `StartNewRun(runSeed)`, 결과 화면 재시작은 현재 Seed를 유지하는 `ResetBattle()`을 사용한다.
 
-## 11. StageEnemyWaves
+## 13. StageEnemyWaves
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -248,7 +298,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 
 Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Spawn 요청 없음 AND Board Registry 전체 생존 적 수 0`이다. 강제 증원으로 이전 웨이브 적이 남아 있어도 이 조건 전에는 Victory를 허용하지 않는다.
 
-## 12. AugmentDefinitions
+## 14. AugmentDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -262,7 +312,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | JobTagFilter | string | - | 비어 있으면 모든 직업 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-## 13. AugmentEffects
+## 15. AugmentEffects
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -270,17 +320,40 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | Seq | integer | O | 증강 내부 순서 |
 | TriggerType | enum | O | 반응할 BattleEvent 종류 |
 | ConditionType | enum | O | 실행 조건 |
+| ConditionValue | number | - | ConditionType이 값을 필요로 할 때 사용 (예: `CHANCE_ROLL`의 0.0~1.0 확률) |
 | EffectType | enum | O | 등록된 EffectType |
 | TargetType | enum | O | 효과 대상 |
 | Priority | integer | O | 이벤트 체인 우선순위 |
-| Amount | number | - | 효과량 |
+| Amount | number | - | 효과량 (피해량 배율 등) |
 | ParamA | string | - | 확장 값 |
 | ParamB | string | - | 확장 값 |
 | ParamC | string | - | 확장 값 |
 
 허용 TriggerType M1: `TURN_START`, `COMMAND_ACCEPTED`, `TILE_QUEUED`, `BEFORE_TILE_EXECUTE`, `AFTER_DAMAGE`, `UNIT_MOVED`, `ENEMY_DIED`, `STAGE_CLEARED`.
 
-## 14. StageAugmentPools
+허용 ConditionType M1: `ALWAYS`, `CHANCE_ROLL`(`ConditionValue`=성공 확률, RunSeed 기반 결정적 롤).
+
+허용 TargetType M1: 타일과 같은 `SELF`, `FRONT_CELL`, `RANGE_OFFSETS`, `FIRST_ENEMY_FORWARD`에 `REAR_CELL`(현재 Facing 반대편 바로 뒤 칸)을 추가한다.
+
+`REAR_CELL`은 이번에 새로 추가하는 원시 TargetType이므로 §20(새 데이터 추가 완료 기준)의 "새 원시 Type" 규칙에 따라 Resolver·Validator 허용 목록·회귀 테스트를 함께 갖춘 뒤에만 실전 배치한다.
+
+### 15.1 예시 — 자쿰의투구 (50% 확률 후방 공격)
+
+`AugmentDefinitions` 행:
+
+| AugmentId | NameKey | Rarity | StackPolicy | MaxStacks |
+|---|---|---|---|---|
+| zakum_helmet | augment.zakum_helmet.name | RARE | UNIQUE | 1 |
+
+`AugmentEffects` 행:
+
+| AugmentId | Seq | TriggerType | ConditionType | ConditionValue | EffectType | TargetType | Amount |
+|---|---|---|---|---|---|---|---|
+| zakum_helmet | 1 | AFTER_DAMAGE | CHANCE_ROLL | 0.5 | DAMAGE | REAR_CELL | 1.0 |
+
+읽는 법: 플레이어의 공격이 적중(`AFTER_DAMAGE`)할 때마다 50%(`CHANCE_ROLL 0.5`) 확률로, 방금 공격과 같은 피해량 배율(`Amount 1.0`)의 피해를 후방 칸(`REAR_CELL`)에 추가로 적용한다.
+
+## 16. StageAugmentPools
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -291,7 +364,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | MaxStageIndex | integer | O | 최대 등장 스테이지 |
 | RequiredJobTag | string | - | 직업 태그 조건 |
 
-## 15. AugmentConflicts
+## 17. AugmentConflicts
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -301,7 +374,37 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 
 충돌은 방향과 무관하게 취급한다. Validator는 A->B만 있어도 B->A를 런타임 인덱스에 함께 등록한다.
 
-## 16. Validator 오류 코드
+## 18. ShopItemDefinitions
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| ItemId | string | O | 상점 아이템 고유 ID |
+| DisplayName | string | O | 표시 이름 |
+| Category | enum | O | 등록된 Category |
+| CurrencyType | enum | O | `GOLD` 또는 `CASH` |
+| Price | integer | O | 0 이상 |
+| EffectRefType | enum | - | `Category`가 다른 표를 참조할 때 어떤 표인지. 참조가 없으면 비움 |
+| EffectRefId | string | - | `EffectRefType`이 가리키는 표의 ID (예: AugmentId, JobId) |
+| UnlockConditionId | string | - | 선행 해금 조건. 비어 있으면 즉시 구매 가능 |
+| Enabled | boolean | O | 콘텐츠 활성 여부 |
+
+허용 Category M1: `CONSUMABLE`(소모품), `STARTER_RELIC`(시작 유물), `SKILL_UNLOCK`(스킬 해금), `PERMANENT_UPGRADE`(영구 성장), `COSMETIC`(외형), `CHARACTER_UNLOCK`(캐릭터/직업 해금).
+
+허용 EffectRefType M1: `AUGMENT`(AugmentDefinitions 참조), `SKILL`(SkillDefinitions 참조), `JOB`(JobDefinitions 참조), 없으면 비움.
+
+`CurrencyType=CASH`는 실제 결제 연동 여부와 무관하게 "캐시성 재화로 판매"라는 콘텐츠 분류만 나타낸다. 결제 연동 자체는 M1 범위 밖이며 별도 결정 사항이다.
+
+기본 키: `ItemId` 유일. `Category=CHARACTER_UNLOCK`이면 `EffectRefType=JOB`이어야 한다.
+
+예시:
+
+| ItemId | DisplayName | Category | CurrencyType | Price | EffectRefType | EffectRefId |
+|---|---|---|---|---|---|---|
+| relic_zakum_helmet | 자쿰의 투구 | STARTER_RELIC | CASH | 4900 | AUGMENT | zakum_helmet |
+| unlock_job_thief | 도적 해금 | CHARACTER_UNLOCK | CASH | 9900 | JOB | thief |
+| potion_hp_small | 체력 물약(소) | CONSUMABLE | GOLD | 50 | | |
+
+## 19. Validator 오류 코드
 
 | 코드 | 의미 | 전투 시작 차단 |
 |---|---|:---:|
@@ -317,6 +420,8 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | DATA_DISABLED_REFERENCE | 활성 콘텐츠가 비활성 콘텐츠 참조 | O |
 | DATA_SPAWN_POOL_EMPTY | EnemySpawnPools의 PoolId에 활성 EnemyId가 하나도 없음 | O |
 | DATA_SPAWN_COUNT_EXCEEDS_BOARD | StageEnemyWaves의 SpawnCount가 BoardSize보다 큼 | O |
+| DATA_NO_START_NODE | NodeDefinitions의 한 NodeGraphId에 IsStartNode=true가 0개 또는 2개 이상 | O |
+| DATA_INVALID_CHARACTER_UNLOCK_REF | ShopItemDefinitions의 Category=CHARACTER_UNLOCK인데 EffectRefType이 JOB이 아님 | O |
 | DATA_UNUSED_ROW | 어디에서도 참조되지 않는 활성 행 | X, 경고 |
 
 로그 예시:
@@ -325,7 +430,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 [DATA_MISSING_REFERENCE] Dataset=TileEffects Row=7 Column=TileId Value=unknown_tile
 ```
 
-## 17. 새 데이터 추가 완료 기준
+## 20. 새 데이터 추가 완료 기준
 
 - Maker에서 wrapper와 CSV가 한 쌍으로 인식된다.
 - Runtime name이 로더에 등록된 이름과 일치한다.
