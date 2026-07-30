@@ -138,7 +138,8 @@ M1 직업 슬롯:
 - 새로운 효과를 완전히 무코드로 정의하는 범용 스크립팅 언어는 만들지 않는다.
 - 모든 일반 적을 BT로 제작하지 않는다.
 - 메타 진행, 과금 연동, 랭킹은 M1 코어 루프 이후로 미룬다.
-- 상점은 `ShopItemDefinitions` 데이터 구조와 화면만 M1 범위에 포함하고, 실제 결제·재화 지급 연동은 미룬다.
+- 상점은 `ShopItemDefinitions`/`CurrencyDefinitions` 데이터 구조와 화면만 M1 범위에 포함하고, 실제 결제(카드/인앱 결제 등) 연동은 미룬다.
+- 스테이지 클리어 보상(`StageRewardDefinitions`)으로 `RUN_SCOPED`/`META_PERSISTENT` 재화를 지급하는 흐름은 M1 범위에 포함한다. `PREMIUM_CASH` 재화는 보상으로 지급하지 않는다.
 
 ## 11. 성공 기준
 
@@ -165,3 +166,4 @@ M1 직업 슬롯:
 | 2026-07-28 | 추가 | 지역/노드맵 구조(`RegionDefinitions`/`NodeDefinitions`) 신설 | 팀 회의에서 확정된 마을→지도판→노드맵→전투 흐름을 여러 스테이지 데이터로 표현하기 위함 | GDD §6, Data-Dictionary §9/§10, Implementation-Plan Phase 3 |
 | 2026-07-28 | 추가 | 상점 데이터 구조(`ShopItemDefinitions`) 신설, 제외범위에서 "상점 데이터/화면"과 "결제 연동"을 분리 | 팀이 상점(캐시샵 포함) 콘텐츠 구조를 M1 범위에서 먼저 결정하기로 함 | GDD §10, Data-Dictionary §18 |
 | 2026-07-28 | 추가 | AugmentEffects에 `ConditionValue`, `ConditionType=CHANCE_ROLL`, `TargetType=REAR_CELL` 추가 | "자쿰의 투구: 50% 확률 후방 공격"처럼 확률 기반·후방 타깃 유물을 코드 수정 없이 표로 표현하기 위함 | GDD §7, Data-Dictionary §15 |
+| 2026-07-30 | 추가 | 재화 레지스트리(`CurrencyDefinitions`) 신설, `ShopItemDefinitions.CurrencyType` 고정 enum을 `CurrencyId` 참조로 변경, 스테이지 클리어 보상(`StageRewardDefinitions`) 신설 | 체력을 재화로 쓰는 방식은 보류하고, 상점과 스테이지 보상이 같은 재화 정의 하나를 참조해 어떤 표든 재화 종류만 데이터로 바꿔 쓸 수 있게 하기 위함 | GDD §10, Data-Dictionary §18(CurrencyDefinitions 신설)/§19(StageRewardDefinitions 신설)/§20(ShopItemDefinitions, 구 §18)/§21(Validator 오류 코드, 구 §19) |

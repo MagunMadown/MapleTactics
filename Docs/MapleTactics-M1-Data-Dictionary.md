@@ -335,7 +335,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 
 허용 TargetType M1: 타일과 같은 `SELF`, `FRONT_CELL`, `RANGE_OFFSETS`, `FIRST_ENEMY_FORWARD`에 `REAR_CELL`(현재 Facing 반대편 바로 뒤 칸)을 추가한다.
 
-`REAR_CELL`은 이번에 새로 추가하는 원시 TargetType이므로 §20(새 데이터 추가 완료 기준)의 "새 원시 Type" 규칙에 따라 Resolver·Validator 허용 목록·회귀 테스트를 함께 갖춘 뒤에만 실전 배치한다.
+`REAR_CELL`은 이번에 새로 추가하는 원시 TargetType이므로 §22(새 데이터 추가 완료 기준)의 "새 원시 Type" 규칙에 따라 Resolver·Validator 허용 목록·회귀 테스트를 함께 갖춘 뒤에만 실전 배치한다.
 
 ### 15.1 예시 — 자쿰의투구 (50% 확률 후방 공격)
 
@@ -374,14 +374,56 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 
 충돌은 방향과 무관하게 취급한다. Validator는 A->B만 있어도 B->A를 런타임 인덱스에 함께 등록한다.
 
-## 18. ShopItemDefinitions
+## 18. CurrencyDefinitions
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| CurrencyId | string | O | 재화 고유 ID |
+| DisplayName | string | O | 표시 이름 |
+| Category | enum | O | 등록된 Category |
+| Enabled | boolean | O | 콘텐츠 활성 여부 |
+
+허용 Category M1: `RUN_SCOPED`(런 종료 시 초기화, 전투/스테이지 보상으로 지급), `META_PERSISTENT`(플레이어 저장 데이터에 누적되어 런 간 유지, M1에서는 정의만 하고 실제 지급 경로는 아직 연결하지 않음), `PREMIUM_CASH`(실제 결제로만 채우는 캐시성 재화. 결제 연동 자체는 여전히 M1 범위 밖이며, 이 값은 "보상으로 지급하지 않는다"는 분류로만 쓰인다).
+
+기본 키: `CurrencyId` 유일.
+
+### 18.1 예시
+
+| CurrencyId | DisplayName | Category |
+|---|---|---|
+| gold | 골드 | RUN_SCOPED |
+| cash | 캐시 | PREMIUM_CASH |
+
+## 19. StageRewardDefinitions
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| StageId | string | O | StageDefinitions 참조 |
+| CurrencyId | string | O | CurrencyDefinitions 참조 |
+| Amount | integer | O | 1 이상 |
+| Enabled | boolean | O | 콘텐츠 활성 여부 |
+
+기본 키: `(StageId, CurrencyId)`는 유일해야 한다. 한 StageId에 여러 CurrencyId 행을 추가하면 스테이지 클리어 시 여러 재화를 동시에 지급한다.
+
+`Category=PREMIUM_CASH`인 CurrencyId는 이 표에서 참조할 수 없다(`DATA_REWARD_CURRENCY_NOT_ALLOWED`).
+
+이 표는 전투/스테이지 클리어 보상만 다룬다. `NodeType=BATTLE`/`BOSS` 노드는 `StageId`를 통해 이 표를 간접 참조한다. `NodeType=SHOP`/`EVENT`/`REST` 노드 자체의 보상은 아직 게임플레이가 정의되지 않았으므로 M1 범위에 포함하지 않는다. 필요해지면 같은 CurrencyId 참조 패턴을 그대로 재사용한다.
+
+### 19.1 예시
+
+| StageId | CurrencyId | Amount |
+|---|---|---|
+| henesys_1_1 | gold | 20 |
+| henesys_boss_mushmom | gold | 100 |
+
+## 20. ShopItemDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
 | ItemId | string | O | 상점 아이템 고유 ID |
 | DisplayName | string | O | 표시 이름 |
 | Category | enum | O | 등록된 Category |
-| CurrencyType | enum | O | `GOLD` 또는 `CASH` |
+| CurrencyId | string | O | CurrencyDefinitions 참조 |
 | Price | integer | O | 0 이상 |
 | EffectRefType | enum | - | `Category`가 다른 표를 참조할 때 어떤 표인지. 참조가 없으면 비움 |
 | EffectRefId | string | - | `EffectRefType`이 가리키는 표의 ID (예: AugmentId, JobId) |
@@ -392,19 +434,19 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 
 허용 EffectRefType M1: `AUGMENT`(AugmentDefinitions 참조), `SKILL`(SkillDefinitions 참조), `JOB`(JobDefinitions 참조), 없으면 비움.
 
-`CurrencyType=CASH`는 실제 결제 연동 여부와 무관하게 "캐시성 재화로 판매"라는 콘텐츠 분류만 나타낸다. 결제 연동 자체는 M1 범위 밖이며 별도 결정 사항이다.
+재화 분류(런 소모/메타 영구/캐시)는 `CurrencyDefinitions`(§18)에서 관리한다.
 
 기본 키: `ItemId` 유일. `Category=CHARACTER_UNLOCK`이면 `EffectRefType=JOB`이어야 한다.
 
 예시:
 
-| ItemId | DisplayName | Category | CurrencyType | Price | EffectRefType | EffectRefId |
+| ItemId | DisplayName | Category | CurrencyId | Price | EffectRefType | EffectRefId |
 |---|---|---|---|---|---|---|
-| relic_zakum_helmet | 자쿰의 투구 | STARTER_RELIC | CASH | 4900 | AUGMENT | zakum_helmet |
-| unlock_job_thief | 도적 해금 | CHARACTER_UNLOCK | CASH | 9900 | JOB | thief |
-| potion_hp_small | 체력 물약(소) | CONSUMABLE | GOLD | 50 | | |
+| relic_zakum_helmet | 자쿰의 투구 | STARTER_RELIC | cash | 4900 | AUGMENT | zakum_helmet |
+| unlock_job_thief | 도적 해금 | CHARACTER_UNLOCK | cash | 9900 | JOB | thief |
+| potion_hp_small | 체력 물약(소) | CONSUMABLE | gold | 50 | | |
 
-## 19. Validator 오류 코드
+## 21. Validator 오류 코드
 
 | 코드 | 의미 | 전투 시작 차단 |
 |---|---|:---:|
@@ -422,6 +464,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | DATA_SPAWN_COUNT_EXCEEDS_BOARD | StageEnemyWaves의 SpawnCount가 BoardSize보다 큼 | O |
 | DATA_NO_START_NODE | NodeDefinitions의 한 NodeGraphId에 IsStartNode=true가 0개 또는 2개 이상 | O |
 | DATA_INVALID_CHARACTER_UNLOCK_REF | ShopItemDefinitions의 Category=CHARACTER_UNLOCK인데 EffectRefType이 JOB이 아님 | O |
+| DATA_REWARD_CURRENCY_NOT_ALLOWED | StageRewardDefinitions가 Category=PREMIUM_CASH인 CurrencyId를 참조 | O |
 | DATA_UNUSED_ROW | 어디에서도 참조되지 않는 활성 행 | X, 경고 |
 
 로그 예시:
@@ -430,7 +473,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 [DATA_MISSING_REFERENCE] Dataset=TileEffects Row=7 Column=TileId Value=unknown_tile
 ```
 
-## 20. 새 데이터 추가 완료 기준
+## 22. 새 데이터 추가 완료 기준
 
 - Maker에서 wrapper와 CSV가 한 쌍으로 인식된다.
 - Runtime name이 로더에 등록된 이름과 일치한다.

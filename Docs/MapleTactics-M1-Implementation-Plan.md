@@ -288,6 +288,9 @@ StageFlowComponent
 - [ ] StageDefinitions/StageEnemySpawns 로더.
 - [ ] CellIndex, FacingOverride, WaveIndex, SpawnOrder로 유닛 스폰.
 - [ ] Stage별 허용 적, 난이도 배수, 보상 풀 연결.
+- [ ] CurrencyDefinitions 로더 + Category 검증.
+- [ ] StageRewardDefinitions 로더 — StageId 클리어 시 CurrencyId/Amount를 재화 Category에 맞는 저장소(RUN_SCOPED는 PlayerRunStateComponent, META_PERSISTENT는 향후 계정 저장 데이터)에 지급.
+- [ ] StageRewardDefinitions가 Category=PREMIUM_CASH 재화를 참조하면 차단하는 Validator 규칙(DATA_REWARD_CURRENCY_NOT_ALLOWED) 구현.
 - [ ] EnemySpawnPools 로더.
 - [ ] StageEnemyWaves 로더 및 `SpawnTriggerMode`(`CLEAR_ONLY`, `TURN_LIMIT`, `TIME_LIMIT`, `TURN_OR_TIME`) 처리.
 - [ ] 웨이브 생성 시 `SpawnedAtStageTurn`/`SpawnedAtSeconds` Snapshot과 Stage 전체에서 증가하는 `StageTurnNumber` 기록.
@@ -312,6 +315,7 @@ StageFlowComponent
 - `CLEAR_ONLY`는 전멸 전 다음 웨이브를 생성하지 않고, `TURN_LIMIT`은 지정 턴 경계에서 남은 적과 함께 다음 웨이브를 정확히 한 번 생성한다.
 - 마지막 웨이브가 출현한 뒤 모든 웨이브의 생존 적이 0명일 때만 Stage Clear가 발생한다.
 - RegionId만 바꿔 다른 노드 그래프와 몬스터 풀을 로드한다.
+- 스테이지 클리어 시 StageRewardDefinitions에 정의된 재화가 정확히 한 번 지급된다.
 
 ### Phase 4 — 직업 4종과 증강
 
@@ -327,7 +331,7 @@ StageFlowComponent
 - [ ] 4직업 최소 데이터와 각 직업 대표 패시브 1개.
 - [ ] `ConditionType=CHANCE_ROLL`(RunSeed 기반 결정적 확률 판정) 구현.
 - [ ] `TargetType=REAR_CELL`(현재 Facing 반대편 뒤 칸) Resolver 구현.
-- [ ] ShopItemDefinitions 로더 + Category/CurrencyType Validator.
+- [ ] ShopItemDefinitions 로더 + Category/CurrencyId(재화 참조) Validator.
 - [ ] 상점 UI에서 아이템 구매 → EffectRefType(AUGMENT/SKILL/JOB)에 따라 지급 경로 연결.
 
 완료 기준:
