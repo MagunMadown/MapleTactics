@@ -87,8 +87,11 @@
 | BasicAttackDamage | number | O | 기본 공격 피해 |
 | PatternId | string | O | EnemyPatternSteps 참조 |
 | MovementPolicy | enum | O | 추적 이동 또는 현재 방향 고정 이동 |
+| InitialFacingPolicy | enum | O | 생성 순간 한 번만 결정되는 초기 방향 |
 
 허용 MovementPolicy M1: `TRACK_PLAYER`, `FIXED_FACING`.
+
+허용 InitialFacingPolicy M1: `FACE_PLAYER`(생성 시 플레이어를 바라보는 방향으로 결정), `FIXED_LEFT`(항상 왼쪽), `FIXED_RIGHT`(항상 오른쪽). 기본값은 `FACE_PLAYER`. `MovementPolicy`가 전투 중 계속 갱신되는 이동/추적 규칙인 것과 달리, `InitialFacingPolicy`는 스폰 순간에만 한 번 적용되고 이후에는 Pattern Action(§7)만 방향을 바꾼다. `StageEnemySpawns.FacingOverride`(§11)가 비어 있을 때, 그리고 `StageEnemyWaves`(§13)의 웨이브 스폰 시 이 값을 읽는다.
 
 적의 실제 `EnemyModelId`는 외형·컴포넌트 템플릿의 배치 책임이므로 `EnemySpawnPools`에서 연결한다.
 Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponent`에 HP·공격력·패턴·이동 정책을 복사한다.
