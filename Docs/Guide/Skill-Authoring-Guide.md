@@ -102,6 +102,8 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 
 ## 새 단일 Effect 스킬 추가 순서
 
+> ⚠ 현재 `SkillDefinitions`/`SkillEffectSteps` Dataset 자체가 프로젝트에 없다(맨 아래 "Dataset 전환" 참고). 아래 순서는 Dataset이 준비된 뒤에만 그대로 실행된다 — 먼저 "Dataset 전환"의 "Gate B를 열기 위한 순서"부터 완료한다. 이 Dataset은 Maker의 생성·가져오기 화면에서만 만들 수 있고, `.userdataset`을 직접 JSON으로 편집하지 않는다.
+
 1. `SkillDefinitions`에 고유 `SkillId` 행을 추가한다.
 2. 고유 `EffectSetId`를 정하고 `SkillEffectSteps`에 Step 1을 추가한다.
 3. 현재 지원하는 Targeting과 EffectType인지 확인한다.
@@ -129,10 +131,22 @@ Motion Profile Repository를 공통 계약으로 확장한다.
 |---|---|---|
 | `UNKNOWN_SKILL` | 없음 | Skill Definition이 없음 |
 | `EFFECT_SET_NOT_FOUND` | 없음 | 연결된 Effect Step이 없음 |
+| `CONTENT_VALIDATION_FAILED` | `UNSUPPORTED_SKILL_SCHEMA` | SchemaVersion이 지원 버전(1)과 다름 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_ID` | SkillId가 비어있음 |
+| `CONTENT_VALIDATION_FAILED` | `SKILL_DISPLAY_NAME_MISSING` | DisplayName이 비어있음 |
 | `CONTENT_VALIDATION_FAILED` | `UNSUPPORTED_TARGETING_TYPE` | 지원하지 않는 타기팅 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_RANGE` | Range가 없거나 음수 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_COOLDOWN` | CooldownTurns가 없거나 음수 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_COST` | CostValue가 없거나 음수 |
+| `CONTENT_VALIDATION_FAILED` | `EFFECT_SET_ID_MISSING` | EffectSetId가 비어있음 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_ACTION_DURATION` | ActionDuration이 없거나 0 이하 |
+| `CONTENT_VALIDATION_FAILED` | `EFFECT_STEPS_EMPTY` | 연결된 Effect Step이 하나도 없음 |
+| `CONTENT_VALIDATION_FAILED` | `UNSUPPORTED_EFFECT_SCHEMA` | Effect Step의 SchemaVersion이 스킬과 다름 |
+| `CONTENT_VALIDATION_FAILED` | `EFFECT_SET_MISMATCH` | Effect Step의 EffectSetId가 스킬 정의와 다름 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_EFFECT_STEP_SEQUENCE` | StepIndex 중복 또는 누락 |
 | `CONTENT_VALIDATION_FAILED` | `UNKNOWN_EFFECT` | 등록되지 않은 EffectType |
 | `CONTENT_VALIDATION_FAILED` | `UNSUPPORTED_TARGET_SELECTOR` | 지원하지 않는 대상 선택 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_EFFECT_VALUE` | Effect Step의 Value가 없거나 음수 |
 | `COOLDOWN_ACTIVE` | 없음 | 이전 사용으로 남은 Cooldown이 있음 |
 | `COOLDOWN_RESERVED` | 없음 | Cooldown이 있는 같은 스킬이 현재 큐에 이미 등록됨 |
 | `SKILL_RUNTIME_STATE_MISSING` | 없음 | 전투 유닛의 Runtime State 초기화 실패 |
