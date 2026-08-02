@@ -10,28 +10,174 @@ script BattleTurnComponent extends Component
 	@Sync property integer QueuedTileCount = 0
 	@Sync property string ExecutingTileIds = ""
 	@Sync property integer ExecutingTileIndex = 0
-	@Sync property integer TileQueueCapacity = 2
+	@Sync property integer BaseQueueCapacity = 3
+	@Sync property integer QueueCapacityBonus = 0
+	@Sync property integer TileQueueCapacity = 3
+	@Sync property integer QueueCapacityMin = 1
+	@Sync property integer QueueCapacityMax = 6
+	@Sync property integer QueueCapacityRevision = 0
+	@Sync property string QueueCapacityModifierSnapshot = ""
+	@Sync property string LastCommandType = ""
+	@Sync property boolean LastCommandSuccess = false
+	@Sync property string LastCommandReason = ""
+	@Sync property integer CommandResultRevision = 0
+	@Sync property integer StateRevision = 0
 
 	@ExecSpace("ServerOnly")
 	method void ResetTurnState(integer queueCapacity, string reason)
+		-- Resets the full turn state and removes the previous command result from the new battle context.
 		self.BattlePhase = "Setup"
 		self.TurnNumber = 0
-		self.TileQueueCapacity = math.max(1, queueCapacity)
+		self:ConfigureQueueCapacity(queueCapacity, self.QueueCapacityMin, self.QueueCapacityMax, reason)
 		self:ClearTransientState(reason)
+		self:ClearCommandResult(reason)
 		log("[BattleTurn] reset reason=" .. reason .. " capacity=" .. self.TileQueueCapacity)
 	end
 
 	@ExecSpace("ServerOnly")
+	method void RecordCommandResult(string commandType, boolean success, string reason)
+		-- Publishes the latest authoritative player-command outcome for client feedback and diagnostics.
+		self.LastCommandType = commandType
+		self.LastCommandSuccess = success
+		self.LastCommandReason = reason
+		self.CommandResultRevision = self.CommandResultRevision + 1
+		self:IncrementStateRevision()
+		log("[BattleCommandResult] command=" .. commandType .. " success=" .. tostring(success) .. " reason=" .. reason .. " revision=" .. self.CommandResultRevision)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearCommandResult(string reason)
+		-- Clears stale command feedback when a battle or Stage is rebuilt.
+		self.LastCommandType = ""
+		self.LastCommandSuccess = false
+		self.LastCommandReason = ""
+		self.CommandResultRevision = self.CommandResultRevision + 1
+		self:IncrementStateRevision()
+		log("[BattleCommandResult] cleared reason=" .. reason .. " revision=" .. self.CommandResultRevision)
+	end
+
+	@ExecSpace("ServerOnly")
 	method void SetQueueCapacity(integer queueCapacity, string reason)
-		self.TileQueueCapacity = math.max(1, queueCapacity)
-		log("[BattleTurn] capacity reason=" .. reason .. " value=" .. self.TileQueueCapacity)
+		self:ConfigureQueueCapacity(queueCapacity, self.QueueCapacityMin, self.QueueCapacityMax, reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConfigureQueueCapacity(integer baseCapacity, integer minCapacity, integer maxCapacity, string reason)
+		-- Configures the base queue capacity and its runtime clamp range.
+		self.QueueCapacityMin = math.max(1, minCapacity)
+		self.QueueCapacityMax = math.max(self.QueueCapacityMin, maxCapacity)
+		self.BaseQueueCapacity = math.max(self.QueueCapacityMin, math.min(self.QueueCapacityMax, baseCapacity))
+		self:RecalculateQueueCapacity(reason)
+		log("[BattleTurn] capacity configured reason=" .. reason .. " base=" .. self.BaseQueueCapacity .. " min=" .. self.QueueCapacityMin .. " max=" .. self.QueueCapacityMax .. " effective=" .. self.TileQueueCapacity)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table UpsertQueueCapacityModifier(string modifierId, string sourceType, string sourceId, integer addValue)
+		-- Adds or replaces one deterministic flat queue-capacity modifier.
+		local result = { Success = false, Reason = "UNKNOWN", EffectiveCapacity = self.TileQueueCapacity }
+		if self:IsValidQueueCapacityModifier(modifierId, sourceType, sourceId) == false then
+			result.Reason = "INVALID_MODIFIER"
+			return result
+		end
+
+		local entries = {}
+		local replaced = false
+		for entry in string.gmatch(self.QueueCapacityModifierSnapshot, "([^|]+)") do
+			local currentId = string.match(entry, "^([^,]+),")
+			if currentId == modifierId then
+				table.insert(entries, modifierId .. "," .. sourceType .. "," .. sourceId .. "," .. tostring(addValue))
+				replaced = true
+			else
+				table.insert(entries, entry)
+			end
+		end
+		if replaced == false then
+			table.insert(entries, modifierId .. "," .. sourceType .. "," .. sourceId .. "," .. tostring(addValue))
+		end
+		table.sort(entries)
+		self.QueueCapacityModifierSnapshot = table.concat(entries, "|")
+		self:RecalculateQueueCapacity("MODIFIER_UPSERT:" .. modifierId)
+		result.Success = true
+		result.Reason = replaced and "UPDATED" or "ADDED"
+		result.EffectiveCapacity = self.TileQueueCapacity
+		log("[BattleQueueCapacity] modifier upsert id=" .. modifierId .. " source=" .. sourceType .. ":" .. sourceId .. " add=" .. addValue .. " effective=" .. self.TileQueueCapacity)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RemoveQueueCapacityModifier(string modifierId)
+		-- Removes one queue-capacity modifier without deleting queued skills.
+		local result = { Success = false, Reason = "NOT_FOUND", EffectiveCapacity = self.TileQueueCapacity }
+		if modifierId == "" then
+			result.Reason = "INVALID_MODIFIER"
+			return result
+		end
+
+		local entries = {}
+		local removed = false
+		for entry in string.gmatch(self.QueueCapacityModifierSnapshot, "([^|]+)") do
+			local currentId = string.match(entry, "^([^,]+),")
+			if currentId == modifierId then
+				removed = true
+			else
+				table.insert(entries, entry)
+			end
+		end
+		if removed == false then
+			return result
+		end
+
+		table.sort(entries)
+		self.QueueCapacityModifierSnapshot = table.concat(entries, "|")
+		self:RecalculateQueueCapacity("MODIFIER_REMOVE:" .. modifierId)
+		result.Success = true
+		result.Reason = "REMOVED"
+		result.EffectiveCapacity = self.TileQueueCapacity
+		log("[BattleQueueCapacity] modifier removed id=" .. modifierId .. " effective=" .. self.TileQueueCapacity)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RecalculateQueueCapacity(string reason)
+		-- Rebuilds the effective capacity from the base value and serialized modifiers.
+		local bonus = 0
+		for entry in string.gmatch(self.QueueCapacityModifierSnapshot, "([^|]+)") do
+			local addValue = string.match(entry, ",(-?%d+)$")
+			bonus = bonus + math.floor(tonumber(addValue) or 0)
+		end
+		self.QueueCapacityBonus = bonus
+		self.TileQueueCapacity = math.max(self.QueueCapacityMin, math.min(self.QueueCapacityMax, self.BaseQueueCapacity + bonus))
+		self.QueueCapacityRevision = self.QueueCapacityRevision + 1
+		self:IncrementStateRevision()
+		log("[BattleQueueCapacity] recalculated reason=" .. reason .. " base=" .. self.BaseQueueCapacity .. " bonus=" .. bonus .. " effective=" .. self.TileQueueCapacity .. " queued=" .. self.QueuedTileCount)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetQueueCapacityState()
+		-- Returns a read-only server snapshot of queue capacity and occupancy.
+		return {
+			Success = true,
+			Reason = "OK",
+			BaseCapacity = self.BaseQueueCapacity,
+			BonusCapacity = self.QueueCapacityBonus,
+			EffectiveCapacity = self.TileQueueCapacity,
+			MinCapacity = self.QueueCapacityMin,
+			MaxCapacity = self.QueueCapacityMax,
+			QueueCount = self.QueuedTileCount,
+			RemainingSlots = math.max(0, self.TileQueueCapacity - self.QueuedTileCount),
+			IsFull = self.QueuedTileCount >= self.TileQueueCapacity,
+			IsOverCapacity = self.QueuedTileCount > self.TileQueueCapacity,
+			Revision = self.QueueCapacityRevision,
+			ModifierSnapshot = self.QueueCapacityModifierSnapshot
+		}
 	end
 
 	@ExecSpace("ServerOnly")
 	method void OpenPlayerTurn(integer turnNumber, string reason)
-		self:ClearTransientState(reason)
+		self:ClearActionState(reason)
 		self.TurnNumber = math.max(1, turnNumber)
 		self.BattlePhase = "PlayerTurn"
+		self:IncrementStateRevision()
 		log("[BattleTurn] phase=PlayerTurn turn=" .. self.TurnNumber .. " reason=" .. reason)
 	end
 
@@ -50,16 +196,12 @@ script BattleTurnComponent extends Component
 			result.Reason = "QUEUE_FULL"
 			return result
 		end
-		if self.QueuedTileCount > 0 then
-			result.Reason = "TILE_QUEUE_OCCUPIED"
-			return result
-		end
-
 		self.QueuedActionType = actionType
 		self.QueuedActionDirection = direction
 		self.IsActionProcessing = true
 		result.Success = true
 		result.Reason = "QUEUED"
+		self:IncrementStateRevision()
 		return result
 	end
 
@@ -68,6 +210,7 @@ script BattleTurnComponent extends Component
 		self.QueuedActionType = ""
 		self.QueuedActionDirection = 0
 		self.IsActionProcessing = false
+		self:IncrementStateRevision()
 		log("[BattleTurn] immediate action released reason=" .. reason)
 	end
 
@@ -93,6 +236,7 @@ script BattleTurnComponent extends Component
 		result.Reason = "QUEUED"
 		result.QueueIndex = self.QueuedTileCount
 		result.QueueCount = self.QueuedTileCount
+		self:IncrementStateRevision()
 		return result
 	end
 
@@ -117,6 +261,7 @@ script BattleTurnComponent extends Component
 		self.QueuedTileIds = ""
 		self.QueuedTileCount = 0
 		self.IsActionProcessing = true
+		self:IncrementStateRevision()
 		result.Success = true
 		result.Reason = "EXECUTING"
 		return result
@@ -126,11 +271,13 @@ script BattleTurnComponent extends Component
 	method void SetExecutingAction(string actionType, integer direction)
 		self.QueuedActionType = actionType
 		self.QueuedActionDirection = direction
+		self:IncrementStateRevision()
 	end
 
 	@ExecSpace("ServerOnly")
 	method void AdvanceExecutingSkill()
 		self.ExecutingTileIndex = self.ExecutingTileIndex + 1
+		self:IncrementStateRevision()
 	end
 
 	@ExecSpace("ServerOnly")
@@ -140,11 +287,13 @@ script BattleTurnComponent extends Component
 		self.ExecutingTileIds = ""
 		self.ExecutingTileIndex = 0
 		self.IsActionProcessing = false
+		self:IncrementStateRevision()
 		log("[BattleTurn] skill queue released reason=" .. reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table TryClearQueuedSkills()
+		-- Clears the editable player queue without consuming a turn.
 		local result = { Success = false, Reason = "UNKNOWN" }
 		if self.BattlePhase ~= "PlayerTurn" then
 			result.Reason = "INVALID_PHASE"
@@ -154,10 +303,89 @@ script BattleTurnComponent extends Component
 			result.Reason = "ACTION_PROCESSING"
 			return result
 		end
+		if self.QueuedTileCount <= 0 or self.QueuedTileIds == "" then
+			result.Reason = "QUEUE_EMPTY"
+			return result
+		end
 		self.QueuedTileIds = ""
 		self.QueuedTileCount = 0
+		self:IncrementStateRevision()
 		result.Success = true
 		result.Reason = "CLEARED"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryRemoveQueuedSkillAt(integer queueIndex)
+		-- Removes one queued skill by its 1-based index without consuming a turn.
+		local result = { Success = false, Reason = "UNKNOWN", RemovedSkillId = "", QueueCount = self.QueuedTileCount }
+		if self.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if self.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+		if queueIndex < 1 or queueIndex > self.QueuedTileCount then
+			result.Reason = "QUEUE_INDEX_OUT_OF_RANGE"
+			return result
+		end
+
+		local remaining = {}
+		local currentIndex = 0
+		for skillId in string.gmatch(self.QueuedTileIds, "([^|]+)") do
+			currentIndex = currentIndex + 1
+			if currentIndex == queueIndex then
+				result.RemovedSkillId = skillId
+			else
+				table.insert(remaining, skillId)
+			end
+		end
+		self.QueuedTileIds = table.concat(remaining, "|")
+		self.QueuedTileCount = #remaining
+		self:IncrementStateRevision()
+		result.Success = true
+		result.Reason = "REMOVED"
+		result.QueueCount = self.QueuedTileCount
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryMoveQueuedSkill(integer fromIndex, integer toIndex)
+		-- Moves one queued skill to another 1-based index without consuming a turn.
+		local result = { Success = false, Reason = "UNKNOWN", FromIndex = fromIndex, ToIndex = toIndex, QueueCount = self.QueuedTileCount }
+		if self.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if self.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+		if fromIndex < 1 or fromIndex > self.QueuedTileCount or toIndex < 1 or toIndex > self.QueuedTileCount then
+			result.Reason = "QUEUE_INDEX_OUT_OF_RANGE"
+			return result
+		end
+
+		if fromIndex == toIndex then
+			result.Success = true
+			result.Reason = "NO_CHANGE"
+			return result
+		end
+
+		local queuedSkills = {}
+		for skillId in string.gmatch(self.QueuedTileIds, "([^|]+)") do
+			table.insert(queuedSkills, skillId)
+		end
+		local movedSkillId = table.remove(queuedSkills, fromIndex)
+		table.insert(queuedSkills, toIndex, movedSkillId)
+		self.QueuedTileIds = table.concat(queuedSkills, "|")
+		self.QueuedTileCount = #queuedSkills
+		self:IncrementStateRevision()
+		result.Success = true
+		result.Reason = "MOVED"
+		result.MovedSkillId = movedSkillId
 		return result
 	end
 
@@ -167,6 +395,7 @@ script BattleTurnComponent extends Component
 		self.QueuedActionType = actionType
 		self.QueuedActionDirection = direction
 		self.IsActionProcessing = true
+		self:IncrementStateRevision()
 		log("[BattleTurn] phase=EnemyTurn turn=" .. self.TurnNumber .. " action=" .. actionType .. " reason=" .. reason)
 	end
 
@@ -174,6 +403,7 @@ script BattleTurnComponent extends Component
 	method void UpdateEnemyAction(string actionType, integer direction)
 		self.QueuedActionType = actionType
 		self.QueuedActionDirection = direction
+		self:IncrementStateRevision()
 	end
 
 	@ExecSpace("ServerOnly")
@@ -184,21 +414,49 @@ script BattleTurnComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void SetPhase(string phase, string reason)
 		self.BattlePhase = phase
+		self:IncrementStateRevision()
 		log("[BattleTurn] phase=" .. phase .. " turn=" .. self.TurnNumber .. " reason=" .. reason)
 	end
 
 	@ExecSpace("ServerOnly")
-	method void ClearTransientState(string reason)
+	method void ClearActionState(string reason)
+		-- Clears only active execution state while preserving the editable player queue.
 		self.QueuedActionType = ""
 		self.QueuedActionDirection = 0
 		self.IsActionProcessing = false
-		self.QueuedTileIds = ""
-		self.QueuedTileCount = 0
 		self.ExecutingTileIds = ""
 		self.ExecutingTileIndex = 0
 		if reason ~= "" then
+			log("[BattleTurn] action state cleared reason=" .. reason .. " queued=" .. self.QueuedTileCount)
+		end
+		self:IncrementStateRevision()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearTransientState(string reason)
+		self:ClearActionState(reason)
+		self.QueuedTileIds = ""
+		self.QueuedTileCount = 0
+		self:IncrementStateRevision()
+		if reason ~= "" then
 			log("[BattleTurn] transient cleared reason=" .. reason)
 		end
+	end
+
+	method boolean IsValidQueueCapacityModifier(string modifierId, string sourceType, string sourceId)
+		-- Validates modifier identifiers and supported source types.
+		if modifierId == "" or sourceId == "" then
+			return false
+		end
+		if string.find(modifierId, "[|,]") ~= nil or string.find(sourceId, "[|,]") ~= nil then
+			return false
+		end
+		return sourceType == "JOB" or sourceType == "SKILL" or sourceType == "AUGMENT" or sourceType == "RELIC" or sourceType == "ITEM" or sourceType == "STAGE_RULE"
+	end
+
+	method void IncrementStateRevision()
+		-- Advances the synchronized revision used by client read models.
+		self.StateRevision = self.StateRevision + 1
 	end
 
 	method string AppendTileId(string serializedQueue, string tileId)

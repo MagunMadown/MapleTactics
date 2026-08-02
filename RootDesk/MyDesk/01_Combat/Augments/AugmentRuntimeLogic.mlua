@@ -1,0 +1,94 @@
+@Logic
+script AugmentRuntimeLogic
+
+	property integer MaxEventDepth = 4
+
+	@ExecSpace("ServerOnly")
+	method table ProcessTrigger(Entity playerEntity, string triggerType, table context)
+		-- Resolves owned augments through Trigger, Condition, and Effect stages in stable order.
+		local result = { Success = false, Reason = "UNKNOWN", TriggerType = triggerType or "", CandidateCount = 0, ExecutedCount = 0, SkippedCount = 0, Effects = {} }
+		if _AugmentTriggerRouterLogic:IsRegistered(triggerType) == false then
+			result.Reason = "AUGMENT_TRIGGER_NOT_REGISTERED"
+			return result
+		end
+		if context == nil or context.SourceUnit == nil then
+			result.Reason = "INVALID_AUGMENT_CONTEXT"
+			return result
+		end
+		local depth = context ~= nil and context.Depth or 0
+		if depth >= self.MaxEventDepth then
+			result.Reason = "AUGMENT_MAX_DEPTH_REACHED"
+			return result
+		end
+		local augmentState = _RunManagerLogic:GetOrCreateRunAugmentState(playerEntity)
+		if augmentState == nil then
+			result.Reason = "RUN_AUGMENT_STATE_UNAVAILABLE"
+			return result
+		end
+		local candidates = {}
+		for _, owned in ipairs(augmentState:GetOwnedEntries()) do
+			local bundle = _AugmentDefinitionRepositoryLogic:GetBundle(owned.AugmentId)
+			if bundle.Success == true then
+				for _, effect in ipairs(bundle.Effects) do
+					if effect.TriggerType == triggerType then
+						table.insert(candidates, { Effect = effect, Stacks = owned.Stacks, AcquiredOrder = owned.AcquiredOrder })
+					end
+				end
+			end
+		end
+		table.sort(candidates, function(left, right)
+			if left.Effect.Priority ~= right.Effect.Priority then
+				return left.Effect.Priority < right.Effect.Priority
+			end
+			if left.AcquiredOrder ~= right.AcquiredOrder then
+				return left.AcquiredOrder < right.AcquiredOrder
+			end
+			if left.Effect.Seq ~= right.Effect.Seq then
+				return left.Effect.Seq < right.Effect.Seq
+			end
+			return left.Effect.AugmentId < right.Effect.AugmentId
+		end)
+		result.CandidateCount = #candidates
+		for _, candidate in ipairs(candidates) do
+			local effect = candidate.Effect
+			local effectSourceTag = "AUGMENT:" .. effect.AugmentId .. ":" .. tostring(effect.Seq)
+			local sourceTag = context ~= nil and context.SourceTag or ""
+			if sourceTag == effectSourceTag then
+				result.SkippedCount = result.SkippedCount + 1
+				table.insert(result.Effects, { Success = false, Reason = "SOURCE_TAG_REENTRY_BLOCKED", AugmentId = effect.AugmentId, Seq = effect.Seq, SourceTag = effectSourceTag })
+			else
+				local condition = _AugmentConditionRouterLogic:Evaluate(effect, context)
+				if condition.Success == false or condition.Passed == false then
+					result.SkippedCount = result.SkippedCount + 1
+					table.insert(result.Effects, { Success = condition.Success, Reason = condition.Reason, AugmentId = effect.AugmentId, Seq = effect.Seq, SourceTag = effectSourceTag })
+				else
+					effect.Amount = effect.Amount * candidate.Stacks
+					local effectContext = {
+						BattleSession = context.BattleSession,
+						SourceEntity = context.SourceEntity,
+						SourceUnit = context.SourceUnit,
+						TurnNumber = context.TurnNumber,
+						SourceTag = effectSourceTag,
+						Depth = depth + 1
+					}
+					local execution = _AugmentEffectRouterLogic:Execute(effect, effectContext)
+					execution.AugmentId = effect.AugmentId
+					execution.Seq = effect.Seq
+					execution.SourceTag = effectSourceTag
+					table.insert(result.Effects, execution)
+					if execution.Success == true then
+						result.ExecutedCount = result.ExecutedCount + 1
+					else
+						result.SkippedCount = result.SkippedCount + 1
+					end
+					log("[AugmentRuntime] effect trigger=" .. triggerType .. " augment=" .. effect.AugmentId .. " seq=" .. effect.Seq .. " effect=" .. effect.EffectType .. " success=" .. tostring(execution.Success) .. " reason=" .. execution.Reason .. " depth=" .. (depth + 1))
+				end
+			end
+		end
+		result.Success = true
+		result.Reason = "PROCESSED"
+		log("[AugmentRuntime] trigger=" .. triggerType .. " candidates=" .. result.CandidateCount .. " executed=" .. result.ExecutedCount .. " skipped=" .. result.SkippedCount .. " depth=" .. depth)
+		return result
+	end
+
+end
