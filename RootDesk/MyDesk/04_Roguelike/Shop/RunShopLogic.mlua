@@ -1,0 +1,195 @@
+@Logic
+script RunShopLogic
+
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateShopState(Entity playerEntity)
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			return nil
+		end
+		local shopState = playerEntity:GetComponent("script.PlayerRunShopStateComponent")
+		if shopState == nil then
+			shopState = playerEntity:AddComponent("PlayerRunShopStateComponent")
+		end
+		return shopState
+	end
+
+	@ExecSpace("ServerOnly")
+	method table OpenShop(Entity playerEntity, string shopId)
+		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
+		local shopState = self:GetOrCreateShopState(playerEntity)
+		if runState == nil or shopState == nil then
+			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
+		end
+		if runState.RunFlowState ~= "AWAITING_SHOP" or runState.ContentTransitionState ~= "READY"
+			or runState.SelectedContentType ~= "SHOP" or runState.SelectedContentId ~= shopId then
+			return { Success = false, Reason = "SHOP_TRANSITION_NOT_READY" }
+		end
+		local validation = _ContentValidatorLogic:ValidateShopById(shopId)
+		if validation.Success == false then
+			return validation
+		end
+		local bundle = validation.Data
+		local offerParts = {}
+		for _, entry in ipairs(bundle.Entries) do
+			table.insert(offerParts, entry.ShopEntryId .. "~" .. entry.DisplayName .. "~" .. entry.RewardType .. "~" .. entry.RewardRefId .. "~" .. tostring(entry.RewardAmount) .. "~" .. entry.PriceCurrencyId .. "~" .. tostring(entry.PriceAmount) .. "~" .. tostring(entry.DisplayOrder))
+		end
+		return shopState:Open(runState.RunSequence, shopId, runState.LastContentSelectionKey, table.concat(offerParts, "|"))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table PurchaseOffer(Entity playerEntity, string shopEntryId, integer requestId)
+		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
+		local shopState = self:GetOrCreateShopState(playerEntity)
+		if runState == nil or shopState == nil then
+			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
+		end
+		if requestId == nil or requestId <= 0 then
+			return { Success = false, Reason = "INVALID_SHOP_PURCHASE_REQUEST" }
+		end
+		if shopState.ShopState ~= "OPEN" or shopState.ActiveRunSequence ~= runState.RunSequence
+			or shopState.ActiveShopId ~= runState.SelectedContentId or runState.RunFlowState ~= "AWAITING_SHOP" then
+			return { Success = false, Reason = "SHOP_NOT_OPEN" }
+		end
+		local requestKey = tostring(runState.RunSequence) .. ":" .. tostring(requestId)
+		if shopState:IsPurchaseRequestApplied(requestKey) then
+			return { Success = true, Reason = "DUPLICATE_PURCHASE_REQUEST_IGNORED", ShopEntryId = shopEntryId, Revision = shopState.ShopRevision }
+		end
+		if shopState:IsOfferPurchased(shopEntryId) then
+			shopState:MarkPurchaseRequestApplied(requestKey)
+			shopState:PublishPurchaseResult(shopEntryId, true, "DUPLICATE_PURCHASE_IGNORED")
+			return { Success = true, Reason = "DUPLICATE_PURCHASE_IGNORED", ShopEntryId = shopEntryId, Revision = shopState.ShopRevision }
+		end
+		local entry = _ShopDefinitionRepositoryLogic:GetEntry(shopState.ActiveShopId, shopEntryId)
+		if entry.Success == false then
+			shopState:PublishPurchaseResult(shopEntryId, false, entry.Reason)
+			return entry
+		end
+		local purchaseKey = "shop:" .. tostring(runState.RunSequence) .. ":" .. tostring(shopState.VisitSequence) .. ":" .. shopEntryId
+		local purchase = _RunManagerLogic:ApplyRunShopPurchase(playerEntity, entry, purchaseKey)
+		if purchase.Success == false then
+			shopState:PublishPurchaseResult(shopEntryId, false, purchase.Reason)
+			return purchase
+		end
+		shopState:MarkPurchaseRequestApplied(requestKey)
+		shopState:MarkPurchased(shopEntryId, purchase.Reason)
+		purchase.ShopId = shopState.ActiveShopId
+		purchase.ShopEntryId = shopEntryId
+		purchase.ShopRevision = shopState.ShopRevision
+		return purchase
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CloseShop(Entity playerEntity, integer requestId)
+		-- Completes the current SHOP node and closes its visit without requiring a purchase.
+		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
+		local shopState = self:GetOrCreateShopState(playerEntity)
+		if runState == nil or shopState == nil then
+			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
+		end
+		if requestId == nil or requestId <= 0 then
+			return { Success = false, Reason = "INVALID_SHOP_CLOSE_REQUEST" }
+		end
+		local completionKey = tostring(runState.RunSequence) .. ":" .. tostring(requestId)
+		if runState.LastContentCompletionKey == completionKey then
+			local duplicate = shopState:GetSnapshot()
+			duplicate.Reason = "DUPLICATE_CONTENT_COMPLETION_IGNORED"
+			duplicate.RunFlowState = runState.RunFlowState
+			duplicate.RunState = runState.RunState
+			return duplicate
+		end
+		if shopState.ShopState ~= "OPEN" or shopState.ActiveRunSequence ~= runState.RunSequence
+			or shopState.ActiveShopId ~= runState.SelectedContentId or runState.RunFlowState ~= "AWAITING_SHOP" then
+			return { Success = false, Reason = "SHOP_NOT_OPEN" }
+		end
+		local flowResult = _RunManagerLogic:CompleteCurrentContent(playerEntity, "SHOP", requestId)
+		if flowResult.Success == false then
+			return flowResult
+		end
+		local closed = shopState:Close(shopState.ActiveRunSequence, shopState.ActiveShopId, flowResult.Reason)
+		if closed.Success == false then
+			return closed
+		end
+		closed.RunFlowState = flowResult.RunFlowState
+		closed.RunState = flowResult.RunState
+		closed.NextNodeIds = flowResult.AvailableNodeIds
+		closed.CompletionKey = completionKey
+		return closed
+	end
+
+	@ExecSpace("Server")
+	method void RequestOpenShop(string shopId)
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:OpenShop(playerEntity, shopId)
+		if result.Success == false then
+			log_warning("[RunShop] open rejected user=" .. senderUserId .. " shop=" .. shopId .. " reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestPurchaseOffer(string shopEntryId, integer requestId)
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:PurchaseOffer(playerEntity, shopEntryId, requestId)
+		if result.Success == false then
+			log_warning("[RunShop] purchase rejected user=" .. senderUserId .. " entry=" .. shopEntryId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			return
+		end
+		log("[RunShop] purchase accepted user=" .. senderUserId .. " entry=" .. shopEntryId .. " request=" .. requestId .. " reason=" .. result.Reason)
+	end
+
+	@ExecSpace("Server")
+	method void RequestCloseShop(integer requestId)
+		-- Lets the owning client finish or skip the active shop through the same completion path.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:CloseShop(playerEntity, requestId)
+		if result.Success == false then
+			log_warning("[RunShop] close rejected user=" .. senderUserId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			return
+		end
+		log("[RunShop] close accepted user=" .. senderUserId .. " request=" .. requestId .. " state=" .. (result.RunFlowState or "") .. " reason=" .. result.Reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalShopUiState()
+		local playerEntity = _UserService.LocalPlayer
+		if playerEntity == nil then
+			return { Success = false, Reason = "LOCAL_PLAYER_UNAVAILABLE" }
+		end
+		local shopState = playerEntity:GetComponent("script.PlayerRunShopStateComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if shopState == nil or inventory == nil or runState == nil then
+			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
+		end
+		return {
+			Success = true,
+			Reason = shopState.ShopState == "CLOSED" and shopState.LastCloseReason or shopState.LastPurchaseReason,
+			RevisionKey = tostring(shopState.ShopRevision) .. ":" .. tostring(inventory.InventoryRevision) .. ":" .. tostring(inventory.SkillInventoryRevision) .. ":" .. tostring(runState.RunFlowRevision) .. ":" .. tostring(runState.ContentTransitionRevision),
+			ShopState = shopState.ShopState,
+			ShopId = shopState.ActiveShopId,
+			VisitSequence = shopState.VisitSequence,
+			OfferSnapshot = shopState.OfferSnapshot,
+			PurchasedOfferIds = shopState.PurchasedOfferIds,
+			CurrencySnapshot = inventory.RunCurrencySnapshot,
+			ConsumableSnapshot = inventory.RunConsumableSnapshot,
+			SkillSnapshot = inventory.RunSkillSnapshot,
+			LastPurchase = {
+				OfferId = shopState.LastPurchaseOfferId,
+				Success = shopState.LastPurchaseSuccess,
+				Reason = shopState.LastPurchaseReason
+			},
+			Completion = {
+				Reason = shopState.LastCloseReason,
+				RunState = runState.RunState,
+				RunFlowState = runState.RunFlowState,
+				LastCompletedContentType = runState.LastCompletedContentType,
+				LastCompletedContentId = runState.LastCompletedContentId
+			},
+			Commands = {
+				CanPurchase = shopState.ShopState == "OPEN",
+				CanClose = shopState.ShopState == "OPEN",
+				CanSkip = shopState.ShopState == "OPEN"
+			}
+		}
+	end
+
+end

@@ -1,0 +1,118 @@
+@Component
+script PlayerRunAugmentComponent extends Component
+
+	@TargetUserSync property integer ActiveRunSequence = 0
+	@TargetUserSync property string OwnedAugmentSnapshot = ""
+	@TargetUserSync property integer AugmentRevision = 0
+	property integer NextAcquiredOrder = 1
+	property string AppliedAugmentRewardKeys = ""
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Reports attachment while all mutable augment instances remain player-owned.
+		log("[RunAugment] attached player=" .. self.Entity.Name .. " runSequence=" .. self.ActiveRunSequence)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResetForRun(integer runSequence)
+		-- Clears all run-scoped augment instances for one new run sequence.
+		self.ActiveRunSequence = math.max(0, runSequence)
+		self.OwnedAugmentSnapshot = ""
+		self.AugmentRevision = self.AugmentRevision + 1
+		self.NextAcquiredOrder = 1
+		self.AppliedAugmentRewardKeys = ""
+		log("[RunAugment] reset runSequence=" .. self.ActiveRunSequence .. " revision=" .. self.AugmentRevision)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GrantUniqueAugment(string augmentId, string sourceType, string rewardKey)
+		-- Adds one validated UNIQUE augment exactly once and records acquisition order.
+		if self.ActiveRunSequence <= 0 then
+			return { Success = false, Reason = "RUN_NOT_STARTED", AugmentId = augmentId or "" }
+		end
+		if self:IsSafeToken(augmentId) == false or self:IsSafeToken(sourceType) == false or self:IsSafeToken(rewardKey) == false then
+			return { Success = false, Reason = "INVALID_AUGMENT_REWARD_KEY", AugmentId = augmentId or "" }
+		end
+		if self:ContainsDelimitedKey(self.AppliedAugmentRewardKeys, rewardKey) then
+			return { Success = true, Reason = "DUPLICATE_REWARD_IGNORED", AugmentId = augmentId, Revision = self.AugmentRevision }
+		end
+		local existing = self:FindOwnedAugment(augmentId)
+		if existing.Success == true then
+			self.AppliedAugmentRewardKeys = self:AppendDelimitedKey(self.AppliedAugmentRewardKeys, rewardKey)
+			return { Success = true, Reason = "AUGMENT_ALREADY_OWNED", AugmentId = augmentId, Stacks = existing.Stacks, AcquiredOrder = existing.AcquiredOrder, Revision = self.AugmentRevision }
+		end
+		local acquiredOrder = self.NextAcquiredOrder
+		self.NextAcquiredOrder = self.NextAcquiredOrder + 1
+		local encoded = augmentId .. "~1~" .. tostring(acquiredOrder) .. "~" .. sourceType
+		self.OwnedAugmentSnapshot = self:AppendDelimitedKey(self.OwnedAugmentSnapshot, encoded)
+		self.AppliedAugmentRewardKeys = self:AppendDelimitedKey(self.AppliedAugmentRewardKeys, rewardKey)
+		self.AugmentRevision = self.AugmentRevision + 1
+		log("[RunAugment] granted id=" .. augmentId .. " source=" .. sourceType .. " order=" .. acquiredOrder .. " revision=" .. self.AugmentRevision)
+		return { Success = true, Reason = "APPLIED", AugmentId = augmentId, Stacks = 1, AcquiredOrder = acquiredOrder, Revision = self.AugmentRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table FindOwnedAugment(string augmentId)
+		-- Finds one owned augment without exposing the serialized representation to callers.
+		for _, entry in ipairs(self:GetOwnedEntries()) do
+			if entry.AugmentId == augmentId then
+				entry.Success = true
+				entry.Reason = "AUGMENT_OWNED"
+				return entry
+			end
+		end
+		return { Success = false, Reason = "AUGMENT_NOT_OWNED", AugmentId = augmentId or "", Stacks = 0, AcquiredOrder = 0 }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetOwnedEntries()
+		-- Decodes owned augment instances in acquisition order for deterministic runtime dispatch.
+		local entries = {}
+		for encoded in string.gmatch(self.OwnedAugmentSnapshot or "", "([^|]+)") do
+			local fields = {}
+			for field in string.gmatch(encoded, "([^~]+)") do
+				table.insert(fields, field)
+			end
+			if #fields == 4 then
+				table.insert(entries, {
+					AugmentId = fields[1],
+					Stacks = math.max(1, math.floor(tonumber(fields[2]) or 1)),
+					AcquiredOrder = math.max(1, math.floor(tonumber(fields[3]) or 1)),
+					SourceType = fields[4]
+				})
+			end
+		end
+		table.sort(entries, function(left, right)
+			if left.AcquiredOrder ~= right.AcquiredOrder then
+				return left.AcquiredOrder < right.AcquiredOrder
+			end
+			return left.AugmentId < right.AugmentId
+		end)
+		return entries
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetSnapshot()
+		-- Returns the stable player-owned augment DTO for battle and external flow systems.
+		return { Success = true, Reason = "OK", RunSequence = self.ActiveRunSequence, OwnedAugmentSnapshot = self.OwnedAugmentSnapshot, OwnedCount = #self:GetOwnedEntries(), Revision = self.AugmentRevision }
+	end
+
+	method boolean ContainsDelimitedKey(string snapshot, string key)
+		-- Tests a pipe-delimited key collection without partial matches.
+		return string.find("|" .. (snapshot or "") .. "|", "|" .. key .. "|", 1, true) ~= nil
+	end
+
+	method string AppendDelimitedKey(string snapshot, string key)
+		-- Appends one encoded entry to a pipe-delimited collection.
+		if snapshot == nil or snapshot == "" then
+			return key
+		end
+		return snapshot .. "|" .. key
+	end
+
+	method boolean IsSafeToken(string value)
+		-- Protects the internal augment snapshot delimiters from ambiguous identifiers.
+		return value ~= nil and value ~= "" and string.find(value, "|", 1, true) == nil and string.find(value, "~", 1, true) == nil
+	end
+
+end
