@@ -1,0 +1,134 @@
+@Logic
+script AugmentDefinitionRepositoryLogic
+
+	property string DefinitionDataSetName = "AugmentDefinitions"
+	property string EffectDataSetName = "AugmentEffects"
+
+	@ExecSpace("ServerOnly")
+	method table GetDefinition(string augmentId)
+		-- Loads one immutable augment definition without storing run ownership here.
+		local result = { Success = false, Reason = "AUGMENT_NOT_FOUND", AugmentId = augmentId or "" }
+		if augmentId == nil or augmentId == "" then
+			result.Reason = "INVALID_AUGMENT_ID"
+			return result
+		end
+		local dataSet = _DataService:GetTable(self.DefinitionDataSetName)
+		if dataSet == nil then
+			result.Reason = "AUGMENT_DATASET_MISSING"
+			return result
+		end
+		local matchCount = 0
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "AugmentId") == augmentId then
+				matchCount = matchCount + 1
+				if result.Success == false then
+					result = self:ConvertDefinitionRow(dataSet, rowIndex)
+				end
+			end
+		end
+		if result.Success == true then
+			result.MatchCount = matchCount
+			log("[AugmentDefinition] loaded id=" .. result.AugmentId .. " policy=" .. result.StackPolicy .. " max=" .. result.MaxStacks)
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEffects(string augmentId)
+		-- Loads enabled effect rows in deterministic Priority, Seq, and AugmentId order.
+		local result = { Success = false, Reason = "AUGMENT_EFFECTS_NOT_FOUND", AugmentId = augmentId or "", Effects = {} }
+		local dataSet = _DataService:GetTable(self.EffectDataSetName)
+		if dataSet == nil then
+			result.Reason = "AUGMENT_EFFECT_DATASET_MISSING"
+			return result
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "AugmentId") == augmentId and self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")) then
+				table.insert(result.Effects, self:ConvertEffectRow(dataSet, rowIndex))
+			end
+		end
+		if #result.Effects == 0 then
+			return result
+		end
+		table.sort(result.Effects, function(left, right)
+			if left.Priority ~= right.Priority then
+				return left.Priority < right.Priority
+			end
+			if left.Seq ~= right.Seq then
+				return left.Seq < right.Seq
+			end
+			return left.AugmentId < right.AugmentId
+		end)
+		result.Success = true
+		result.Reason = "OK"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetBundle(string augmentId)
+		-- Joins one definition with its effect rows for validation and runtime dispatch.
+		local definition = self:GetDefinition(augmentId)
+		if definition.Success == false then
+			return { Success = false, Reason = definition.Reason, AugmentId = augmentId or "", Definition = definition, Effects = {} }
+		end
+		local effects = self:GetEffects(augmentId)
+		if effects.Success == false then
+			return { Success = false, Reason = effects.Reason, AugmentId = augmentId, Definition = definition, Effects = effects.Effects }
+		end
+		return { Success = true, Reason = "OK", AugmentId = augmentId, Definition = definition, Effects = effects.Effects }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConvertDefinitionRow(any dataSet, integer rowIndex)
+		-- Converts string cells into a stable augment definition DTO.
+		return {
+			Success = true,
+			Reason = "OK",
+			SchemaVersion = math.floor(tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")) or 0),
+			AugmentId = dataSet:GetCell(rowIndex, "AugmentId") or "",
+			NameKey = dataSet:GetCell(rowIndex, "NameKey") or "",
+			DescriptionKey = dataSet:GetCell(rowIndex, "DescriptionKey") or "",
+			Rarity = dataSet:GetCell(rowIndex, "Rarity") or "",
+			StackPolicy = dataSet:GetCell(rowIndex, "StackPolicy") or "",
+			MaxStacks = math.floor(tonumber(dataSet:GetCell(rowIndex, "MaxStacks")) or 0),
+			ExclusiveGroup = dataSet:GetCell(rowIndex, "ExclusiveGroup") or "",
+			JobTagFilter = dataSet:GetCell(rowIndex, "JobTagFilter") or "",
+			Enabled = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")),
+			RowIndex = rowIndex,
+			Source = "DATASET"
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConvertEffectRow(any dataSet, integer rowIndex)
+		-- Converts string cells into a stable trigger-condition-effect DTO.
+		return {
+			SchemaVersion = math.floor(tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")) or 0),
+			AugmentId = dataSet:GetCell(rowIndex, "AugmentId") or "",
+			Seq = math.floor(tonumber(dataSet:GetCell(rowIndex, "Seq")) or 0),
+			TriggerType = dataSet:GetCell(rowIndex, "TriggerType") or "",
+			ConditionType = dataSet:GetCell(rowIndex, "ConditionType") or "",
+			ConditionValue = tonumber(dataSet:GetCell(rowIndex, "ConditionValue")) or 0,
+			EffectType = dataSet:GetCell(rowIndex, "EffectType") or "",
+			TargetType = dataSet:GetCell(rowIndex, "TargetType") or "",
+			Priority = math.floor(tonumber(dataSet:GetCell(rowIndex, "Priority")) or 0),
+			Amount = tonumber(dataSet:GetCell(rowIndex, "Amount")) or 0,
+			ParamA = dataSet:GetCell(rowIndex, "ParamA") or "",
+			ParamB = dataSet:GetCell(rowIndex, "ParamB") or "",
+			ParamC = dataSet:GetCell(rowIndex, "ParamC") or "",
+			Enabled = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")),
+			RowIndex = rowIndex,
+			Source = "DATASET"
+		}
+	end
+
+	method boolean ParseBooleanCell(any cellValue)
+		-- Converts common dataset boolean spellings into a strict boolean.
+		if cellValue == true then
+			return true
+		end
+		local normalized = string.lower(tostring(cellValue or ""))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+end

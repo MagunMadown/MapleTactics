@@ -1,0 +1,99 @@
+@Logic
+script JobContentValidatorLogic
+
+	property integer SupportedSchemaVersion = 1
+
+	@ExecSpace("ServerOnly")
+	method table ValidateById(string jobId)
+		local bundle = _JobDefinitionRepositoryLogic:GetJobBundle(jobId)
+		if bundle.Success == false then
+			return { Success = false, Reason = bundle.Reason, JobId = jobId, Data = bundle }
+		end
+		return self:ValidateBundle(bundle)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateBundle(table bundle)
+		local definition = bundle.Definition
+		local entries = bundle.StartingSkills
+		local result = { Success = false, Reason = "CONTENT_VALIDATION_FAILED", JobId = definition.JobId or "", Data = bundle }
+		if definition.SchemaVersion ~= self.SupportedSchemaVersion then
+			return self:Reject(result, "UNSUPPORTED_JOB_SCHEMA")
+		end
+		if definition.JobId == nil or definition.JobId == "" then
+			return self:Reject(result, "INVALID_JOB_ID")
+		end
+		if definition.MatchCount ~= nil and definition.MatchCount > 1 then
+			return self:Reject(result, "DATA_DUPLICATE_JOB_ID")
+		end
+		if definition.Enabled ~= true then
+			return self:Reject(result, "JOB_DISABLED")
+		end
+		if definition.DisplayName == nil or definition.DisplayName == "" then
+			return self:Reject(result, "JOB_DISPLAY_NAME_MISSING")
+		end
+		if definition.BaseMaxHp == nil or definition.BaseMaxHp <= 0 then
+			return self:Reject(result, "INVALID_JOB_MAX_HP")
+		end
+		if definition.BaseQueueCapacity == nil or definition.BaseQueueCapacity < 1 or definition.BaseQueueCapacity > 6 then
+			return self:Reject(result, "INVALID_JOB_QUEUE_CAPACITY")
+		end
+		if definition.StartingSkillSetId == nil or definition.StartingSkillSetId == "" then
+			return self:Reject(result, "STARTING_SKILL_SET_ID_MISSING")
+		end
+		if _JobMechanicRouterLogic:IsRegistered(definition.JobMechanicId) == false then
+			return self:Reject(result, "JOB_MECHANIC_NOT_REGISTERED")
+		end
+		if definition.JobPassiveSetId ~= nil and definition.JobPassiveSetId ~= "" then
+			local passiveValidation = _ContentValidatorLogic:ValidateAugmentById(definition.JobPassiveSetId)
+			if passiveValidation.Success == false then
+				return self:Reject(result, "INVALID_JOB_PASSIVE_REFERENCE")
+			end
+		end
+		if entries == nil or #entries == 0 then
+			return self:Reject(result, "STARTING_SKILL_SET_EMPTY")
+		end
+
+		local expectedSlotIndex = 1
+		local seenSkillIds = {}
+		for _, entry in ipairs(entries) do
+			if entry.SchemaVersion ~= self.SupportedSchemaVersion then
+				return self:Reject(result, "UNSUPPORTED_STARTING_SKILL_SCHEMA")
+			end
+			if entry.StartingSkillSetId ~= definition.StartingSkillSetId then
+				return self:Reject(result, "STARTING_SKILL_SET_MISMATCH")
+			end
+			if entry.SlotIndex ~= expectedSlotIndex then
+				return self:Reject(result, "INVALID_STARTING_SKILL_SEQUENCE")
+			end
+			if entry.Count == nil or entry.Count <= 0 then
+				return self:Reject(result, "INVALID_STARTING_SKILL_COUNT")
+			end
+			if seenSkillIds[entry.SkillId] == true then
+				return self:Reject(result, "DUPLICATE_STARTING_SKILL")
+			end
+			local skillValidation = _ContentValidatorLogic:ValidateSkillById(entry.SkillId)
+			if skillValidation.Success == false then
+				return self:Reject(result, "INVALID_STARTING_SKILL_REFERENCE")
+			end
+			seenSkillIds[entry.SkillId] = true
+			expectedSlotIndex = expectedSlotIndex + 1
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		result.StartingSkillCount = #entries
+		log("[ContentValidation] job valid job=" .. result.JobId .. " mechanic=" .. definition.JobMechanicId .. " startingSkills=" .. #entries .. " hp=" .. definition.BaseMaxHp .. " queue=" .. definition.BaseQueueCapacity)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table Reject(table result, string detailReason)
+		result.Success = false
+		result.Reason = "CONTENT_VALIDATION_FAILED"
+		result.DetailReason = detailReason
+		log_error("[ContentValidation] job rejected job=" .. result.JobId .. " reason=" .. detailReason)
+		return result
+	end
+
+end

@@ -33,6 +33,9 @@ script ContentValidatorLogic
 		if definition.StageId == nil or definition.StageId == "" then
 			return self:RejectStage(result, "INVALID_STAGE_ID")
 		end
+		if definition.MatchCount ~= nil and definition.MatchCount > 1 then
+			return self:RejectStage(result, "DATA_DUPLICATE_STAGE_ID")
+		end
 		if definition.DisplayName == nil or definition.DisplayName == "" then
 			return self:RejectStage(result, "STAGE_DISPLAY_NAME_MISSING")
 		end
@@ -110,14 +113,21 @@ script ContentValidatorLogic
 		if definition.SkillId == nil or definition.SkillId == "" then
 			return self:RejectSkill(result, "INVALID_SKILL_ID")
 		end
+		if definition.MatchCount ~= nil and definition.MatchCount > 1 then
+			return self:RejectSkill(result, "DATA_DUPLICATE_SKILL_ID")
+		end
 		if definition.DisplayName == nil or definition.DisplayName == "" then
 			return self:RejectSkill(result, "SKILL_DISPLAY_NAME_MISSING")
 		end
-		if definition.TargetingType ~= "FRONT_CELL" then
+		if self:IsSupportedSkillTargetingType(definition.TargetingType) == false then
 			return self:RejectSkill(result, "UNSUPPORTED_TARGETING_TYPE")
 		end
-		if definition.Range == nil or definition.Range < 0 then
+		if definition.Range == nil or definition.Range <= 0 then
 			return self:RejectSkill(result, "INVALID_SKILL_RANGE")
+		end
+		if definition.TargetingType == "RANGE_OFFSETS"
+			and self:AreValidTargetOffsets(definition.TargetOffsets, definition.Range) == false then
+			return self:RejectSkill(result, "INVALID_TARGET_OFFSETS")
 		end
 		if definition.CooldownTurns == nil or definition.CooldownTurns < 0 then
 			return self:RejectSkill(result, "INVALID_SKILL_COOLDOWN")
@@ -149,7 +159,7 @@ script ContentValidatorLogic
 			if step.EffectType ~= "DAMAGE" and step.EffectType ~= "PUSH" then
 				return self:RejectSkill(result, "UNKNOWN_EFFECT")
 			end
-			if step.TargetSelector ~= "FRONT_TARGET" then
+			if self:IsSupportedEffectTargetSelector(step.TargetSelector) == false then
 				return self:RejectSkill(result, "UNSUPPORTED_TARGET_SELECTOR")
 			end
 			if step.Value == nil or step.Value < 0 then
@@ -164,6 +174,36 @@ script ContentValidatorLogic
 		return result
 	end
 
+	method boolean IsSupportedSkillTargetingType(string targetingType)
+		return targetingType == "FRONT_CELL"
+			or targetingType == "FIRST_ENEMY_FORWARD"
+			or targetingType == "RANGE_OFFSETS"
+	end
+
+	method boolean IsSupportedEffectTargetSelector(string targetSelector)
+		return targetSelector == "FRONT_TARGET"
+			or targetSelector == "PRIMARY_TARGET"
+			or targetSelector == "ALL_SKILL_TARGETS"
+	end
+
+	method boolean AreValidTargetOffsets(string serializedOffsets, integer range)
+		local count = 0
+		local seen = {}
+		for token in string.gmatch(serializedOffsets or "", "([^|]+)") do
+			local value = tonumber(token)
+			if value == nil or value ~= math.floor(value) or value == 0 or math.abs(value) > range then
+				return false
+			end
+			local key = tostring(math.floor(value))
+			if seen[key] == true then
+				return false
+			end
+			seen[key] = true
+			count = count + 1
+		end
+		return count > 0
+	end
+
 	@ExecSpace("ServerOnly")
 	method table RejectSkill(table result, string detailReason)
 		result.Success = false
@@ -171,6 +211,82 @@ script ContentValidatorLogic
 		result.DetailReason = detailReason
 		log_error("[ContentValidation] skill rejected skill=" .. result.SkillId .. " reason=" .. detailReason)
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateJobById(string jobId)
+		-- Facade entry point. Job-specific rules stay in their dedicated validator object.
+		return _JobContentValidatorLogic:ValidateById(jobId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateJobBundle(table bundle)
+		-- Facade entry point for already-loaded job bundles.
+		return _JobContentValidatorLogic:ValidateBundle(bundle)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateAugmentById(string augmentId)
+		-- Facade entry point. Augment-specific schema and router rules stay isolated.
+		return _AugmentContentValidatorLogic:ValidateById(augmentId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateAugmentBundle(table bundle)
+		-- Facade entry point for already-loaded augment bundles.
+		return _AugmentContentValidatorLogic:ValidateBundle(bundle)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateEnemyDrops()
+		-- Facade entry point. Drop-specific rules stay in their dedicated validator object.
+		return _EnemyDropContentValidatorLogic:EnsureValid()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateStageRewards()
+		-- Facade entry point. Stage reward row and reference rules stay in their dedicated validator object.
+		return _StageRewardContentValidatorLogic:ValidateAll()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateShops()
+		return _ShopContentValidatorLogic:ValidateAll()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateShopById(string shopId)
+		return _ShopContentValidatorLogic:ValidateById(shopId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateNodeGraph(string nodeGraphId)
+		-- Facade entry point for complete run-flow graph and cross-reference validation.
+		return _NodeContentValidatorLogic:ValidateById(nodeGraphId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateEnemyPatternById(string patternId)
+		-- Facade entry point. Enemy pattern row rules stay in their dedicated validator object.
+		return _EnemyPatternContentValidatorLogic:ValidateById(patternId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateEnemyPatternBundle(table bundle)
+		-- Facade entry point for an already-loaded immutable pattern bundle.
+		return _EnemyPatternContentValidatorLogic:ValidateBundle(bundle)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void InvalidateEnemyDropValidation(string reason)
+		-- Invalidates the drop validator cache after static content changes.
+		_EnemyDropContentValidatorLogic:InvalidateCache(reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateAllContent()
+		-- Facade entry point for editor/startup audits. Cross-table traversal stays isolated.
+		return _ContentIntegrityValidatorLogic:ValidateAll()
 	end
 
 end

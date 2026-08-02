@@ -1,0 +1,105 @@
+@Logic
+script NodeContentValidatorLogic
+
+	@ExecSpace("ServerOnly")
+	method table ValidateById(string nodeGraphId)
+		-- Validates one complete graph without storing mutable runtime state in this Logic.
+		local bundle = _NodeDefinitionRepositoryLogic:GetGraphDefinitions(nodeGraphId)
+		if bundle.Success == false then
+			return bundle
+		end
+		return self:ValidateBundle(bundle)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateBundle(table bundle)
+		-- Enforces row, reference, start-node, and reachability invariants for one graph bundle.
+		local result = {
+			Success = false,
+			Reason = "CONTENT_VALIDATION_FAILED",
+			DetailReason = "",
+			NodeGraphId = bundle.NodeGraphId or "",
+			StartNodeId = "",
+			NodeCount = 0,
+			Data = bundle
+		}
+		local definitions = bundle.Definitions or {}
+		if #definitions == 0 then
+			return self:Reject(result, "NODE_GRAPH_EMPTY")
+		end
+
+		local definitionsById = {}
+		local startNodeCount = 0
+		for _, rawDefinition in ipairs(definitions) do
+			local definition = _NodeDefinitionRepositoryLogic:ValidateDefinition(rawDefinition)
+			if definition.Success == false then
+				return self:Reject(result, definition.DetailReason or definition.Reason)
+			end
+			if definitionsById[definition.NodeId] ~= nil then
+				return self:Reject(result, "DUPLICATE_NODE_ID")
+			end
+			definitionsById[definition.NodeId] = definition
+			if definition.IsStartNode == true then
+				startNodeCount = startNodeCount + 1
+				result.StartNodeId = definition.NodeId
+			end
+		end
+		result.NodeCount = #definitions
+		if startNodeCount ~= 1 then
+			return self:Reject(result, "DATA_NO_START_NODE")
+		end
+
+		for _, definition in ipairs(definitions) do
+			if definition.NodeType == "BATTLE" or definition.NodeType == "BOSS" then
+				local stageDefinition = _StageDefinitionRepositoryLogic:GetStageDefinition(definition.StageId)
+				if stageDefinition.Success == false then
+					return self:Reject(result, "NODE_STAGE_REFERENCE_MISSING")
+				end
+			end
+			for nextNodeId in string.gmatch(definition.NextNodeIds or "", "([^|]+)") do
+				if definitionsById[nextNodeId] == nil then
+					result.MissingNodeId = nextNodeId
+					return self:Reject(result, "NEXT_NODE_REFERENCE_MISSING")
+				end
+			end
+		end
+
+		local visited = {}
+		local pending = { result.StartNodeId }
+		local pendingIndex = 1
+		local visitedCount = 0
+		while pendingIndex <= #pending do
+			local nodeId = pending[pendingIndex]
+			pendingIndex = pendingIndex + 1
+			if visited[nodeId] ~= true then
+				visited[nodeId] = true
+				visitedCount = visitedCount + 1
+				local definition = definitionsById[nodeId]
+				for nextNodeId in string.gmatch(definition.NextNodeIds or "", "([^|]+)") do
+					if visited[nextNodeId] ~= true then
+						table.insert(pending, nextNodeId)
+					end
+				end
+			end
+		end
+		if visitedCount ~= result.NodeCount then
+			return self:Reject(result, "UNREACHABLE_NODE")
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[ContentValidation] node graph valid graph=" .. result.NodeGraphId .. " start=" .. result.StartNodeId .. " nodes=" .. result.NodeCount .. " source=DATASET")
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table Reject(table result, string detailReason)
+		-- Returns one stable graph-level validation failure for all flow callers.
+		result.Success = false
+		result.Reason = "CONTENT_VALIDATION_FAILED"
+		result.DetailReason = detailReason
+		log_error("[ContentValidation] node graph rejected graph=" .. (result.NodeGraphId or "") .. " reason=" .. detailReason)
+		return result
+	end
+
+end

@@ -1,0 +1,198 @@
+@Logic
+script ShopDefinitionRepositoryLogic
+
+	property string ShopDataSetName = "ShopDefinitions"
+	property string EntryDataSetName = "ShopEntries"
+	property integer SupportedSchemaVersion = 1
+
+	@ExecSpace("ServerOnly")
+	method table GetShopBundle(string shopId)
+		local result = { Success = false, Reason = "SHOP_DEFINITION_NOT_FOUND", ShopId = shopId or "", Definition = nil, Entries = {}, Source = "" }
+		if shopId == nil or shopId == "" then
+			result.Reason = "INVALID_SHOP_ID"
+			return result
+		end
+		local definitions = _DataService:GetTable(self.ShopDataSetName)
+		local entries = _DataService:GetTable(self.EntryDataSetName)
+		if definitions == nil or entries == nil then
+			result.Reason = "SHOP_DATASET_MISSING"
+			return result
+		end
+		for rowIndex = 1, definitions:GetRowCount() do
+			if definitions:GetCell(rowIndex, "ShopId") == shopId then
+				if result.Definition ~= nil then
+					result.Reason = "CONTENT_VALIDATION_FAILED"
+					result.DetailReason = "DUPLICATE_SHOP_ID"
+					return result
+				end
+				local definition = self:ConvertDefinitionRow(definitions, rowIndex)
+				local validation = self:ValidateDefinition(definition)
+				if validation.Success == false then
+					return validation
+				end
+				if definition.Enabled == true then
+					result.Definition = definition
+				end
+			end
+		end
+		if result.Definition == nil then
+			return result
+		end
+		for rowIndex = 1, entries:GetRowCount() do
+			if entries:GetCell(rowIndex, "ShopId") == shopId then
+				local entry = self:ConvertEntryRow(entries, rowIndex)
+				local validation = self:ValidateEntry(entry)
+				if validation.Success == false then
+					return validation
+				end
+				if entry.Enabled == true then
+					table.insert(result.Entries, entry)
+				end
+			end
+		end
+		table.sort(result.Entries, function(left, right)
+			if left.DisplayOrder == right.DisplayOrder then
+				return left.ShopEntryId < right.ShopEntryId
+			end
+			return left.DisplayOrder < right.DisplayOrder
+		end)
+		if #result.Entries == 0 then
+			result.Reason = "SHOP_ENTRY_SET_EMPTY"
+			return result
+		end
+		result.Success = true
+		result.Reason = "OK"
+		result.Source = "DATASET"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEntry(string shopId, string shopEntryId)
+		local bundle = self:GetShopBundle(shopId)
+		if bundle.Success == false then
+			return bundle
+		end
+		for _, entry in ipairs(bundle.Entries) do
+			if entry.ShopEntryId == shopEntryId then
+				return entry
+			end
+		end
+		return { Success = false, Reason = "SHOP_ENTRY_NOT_FOUND", ShopId = shopId, ShopEntryId = shopEntryId }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetAllShopIds()
+		local result = { Success = false, Reason = "SHOP_DATASET_MISSING", ShopIds = {} }
+		local dataSet = _DataService:GetTable(self.ShopDataSetName)
+		if dataSet == nil then
+			return result
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")) then
+				table.insert(result.ShopIds, dataSet:GetCell(rowIndex, "ShopId") or "")
+			end
+		end
+		result.Success = true
+		result.Reason = "OK"
+		return result
+	end
+
+	method table ConvertDefinitionRow(any dataSet, integer rowIndex)
+		return {
+			Success = true,
+			Reason = "OK",
+			SchemaVersion = math.floor(tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")) or 0),
+			ShopId = dataSet:GetCell(rowIndex, "ShopId") or "",
+			DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+			NodeGraphId = dataSet:GetCell(rowIndex, "NodeGraphId") or "",
+			NodeId = dataSet:GetCell(rowIndex, "NodeId") or "",
+			Enabled = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")),
+			RowIndex = rowIndex,
+			Source = "DATASET"
+		}
+	end
+
+	method table ConvertEntryRow(any dataSet, integer rowIndex)
+		return {
+			Success = true,
+			Reason = "OK",
+			SchemaVersion = math.floor(tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")) or 0),
+			ShopEntryId = dataSet:GetCell(rowIndex, "ShopEntryId") or "",
+			ShopId = dataSet:GetCell(rowIndex, "ShopId") or "",
+			DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+			RewardType = dataSet:GetCell(rowIndex, "RewardType") or "",
+			RewardRefId = dataSet:GetCell(rowIndex, "RewardRefId") or "",
+			RewardAmount = math.floor(tonumber(dataSet:GetCell(rowIndex, "RewardAmount")) or 0),
+			PriceCurrencyId = dataSet:GetCell(rowIndex, "PriceCurrencyId") or "",
+			PriceAmount = math.floor(tonumber(dataSet:GetCell(rowIndex, "PriceAmount")) or 0),
+			DisplayOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "DisplayOrder")) or 0),
+			MaxPurchasesPerVisit = math.floor(tonumber(dataSet:GetCell(rowIndex, "MaxPurchasesPerVisit")) or 0),
+			Enabled = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")),
+			RowIndex = rowIndex,
+			Source = "DATASET"
+		}
+	end
+
+	method table ValidateDefinition(table definition)
+		if definition.SchemaVersion ~= self.SupportedSchemaVersion then
+			return self:Reject(definition, "UNSUPPORTED_SHOP_SCHEMA")
+		end
+		if self:IsSafeToken(definition.ShopId) == false or self:IsSafeToken(definition.NodeGraphId) == false or self:IsSafeToken(definition.NodeId) == false then
+			return self:Reject(definition, "SHOP_REQUIRED_FIELD_MISSING")
+		end
+		if self:IsSafeSnapshotText(definition.DisplayName) == false then
+			return self:Reject(definition, "INVALID_SHOP_DISPLAY_NAME")
+		end
+		return definition
+	end
+
+	method table ValidateEntry(table entry)
+		if entry.SchemaVersion ~= self.SupportedSchemaVersion then
+			return self:Reject(entry, "UNSUPPORTED_SHOP_ENTRY_SCHEMA")
+		end
+		if self:IsSafeToken(entry.ShopEntryId) == false or self:IsSafeToken(entry.ShopId) == false or self:IsSafeToken(entry.RewardRefId) == false or self:IsSafeToken(entry.PriceCurrencyId) == false then
+			return self:Reject(entry, "SHOP_ENTRY_REQUIRED_FIELD_MISSING")
+		end
+		if self:IsSafeSnapshotText(entry.DisplayName) == false then
+			return self:Reject(entry, "INVALID_SHOP_ENTRY_DISPLAY_NAME")
+		end
+		if entry.RewardType ~= "SKILL" and entry.RewardType ~= "CONSUMABLE" then
+			return self:Reject(entry, "INVALID_SHOP_REWARD_TYPE")
+		end
+		if entry.RewardAmount <= 0 or entry.PriceAmount <= 0 or entry.DisplayOrder <= 0 then
+			return self:Reject(entry, "INVALID_SHOP_ENTRY_NUMBER")
+		end
+		if entry.MaxPurchasesPerVisit ~= 1 then
+			return self:Reject(entry, "UNSUPPORTED_SHOP_PURCHASE_LIMIT")
+		end
+		return entry
+	end
+
+	method table Reject(table value, string detailReason)
+		value.Success = false
+		value.Reason = "CONTENT_VALIDATION_FAILED"
+		value.DetailReason = detailReason
+		log_error("[ShopData] rejected shop=" .. (value.ShopId or "") .. " entry=" .. (value.ShopEntryId or "") .. " reason=" .. detailReason)
+		return value
+	end
+
+	method boolean ParseBooleanCell(any cellValue)
+		if cellValue == true then
+			return true
+		end
+		if cellValue == nil or cellValue == false then
+			return false
+		end
+		local normalized = string.lower(tostring(cellValue))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+	method boolean IsSafeToken(string value)
+		return value ~= nil and value ~= "" and string.find(value, "|", 1, true) == nil and string.find(value, "~", 1, true) == nil
+	end
+
+	method boolean IsSafeSnapshotText(string value)
+		return value ~= nil and value ~= "" and string.find(value, "|", 1, true) == nil and string.find(value, "~", 1, true) == nil
+	end
+
+end
