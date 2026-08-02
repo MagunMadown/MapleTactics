@@ -57,7 +57,18 @@ MSW `@Component`와 `@Logic`은 엔진이 생성하고 `OnInitialize`, `OnBeginP
 
 `BattleGatewayLogic`이 `InitializeFromEntry(...)`를 호출해 Session을 초기화한다.
 
+적 Intent의 mutable state는 `EnemyIntentComponent`가 소유하며, 무상태 선택 규칙은
+`EnemyIntentResolverLogic`에 있다. 외부 UI는 이 둘을 직접 호출하지 않고
+`BattleSessionComponent.GetBattleUiState()`의 `EnemyIntents` DTO만 읽는다. DTO의 현재
+`EnemyIntentMode`는 `COMPONENT_SINGLE_COMPAT`이고 각 Intent는 `Revision`을 제공한다.
+
 ## 4. Client UI 공개 API
+
+전투 화면은 시작 가능 여부를 먼저 `GetBattleUiState().ContentValidation`에서 확인한다.
+`State=BLOCKED`이면 전투 명령 버튼을 모두 비활성화하고 `ErrorSnapshot`을 개발용 오류 화면에
+표시한다. `State`, `IsReady`, `Reason`, `ErrorCount`, `ErrorSnapshot`, `Revision`이 공개
+계약이며 UI가 Dataset이나 Validator를 직접 호출해서는 안 된다. Validation Revision은
+`RevisionKey`에도 포함된다.
 
 ### 전투 입장 준비
 
@@ -243,6 +254,94 @@ TotalWaves
 `InitializeFromEntry(...)`는 공개된 형태이지만 Gateway 전용이다. UI나 Stage 스크립트가
 직접 호출하지 않는다.
 
+전투가 끝난 뒤 다음 화면은 Battle Snapshot의 `NextStageId`를 해석하지 않는다.
+서버 Flow Controller는 다음 API로 플레이어별 Run Flow Snapshot을 읽는다.
+
+```lua
+local flow = _RunManagerLogic:GetRunFlowSnapshot(playerEntity)
+```
+
+주요 값은 `RunFlowState`, `CurrentNodeGraphId`, `CurrentNodeId`,
+`LastCompletedStageId`, `AvailableNodeIds`, `AvailableContentTypes`,
+`AvailableContentIds`, `Revision`이다. `Available*` 세 문자열은 `|`로 구분하며 같은
+인덱스가 하나의 다음 콘텐츠 옵션이다. `BATTLE/BOSS`의 ContentId는 StageId,
+`SHOP/EVENT/REST`의 ContentId는 NodeId다.
+
+현재 HUD는 이 계약과 전투 명령을 검증하는 디버그 도구다. 최종 UI 개발자는 HUD의
+배치·문구·버튼 구조를 호환 대상으로 보지 않고, 공개 Snapshot/Request 계약만 사용한다.
+
+## 8.1 드롭·런 인벤토리·소모품 UI 계약
+
+최종 UI는 내부 Component 경로를 조합하지 않고 `GetBattleUiState()`의 다음 DTO를 읽는다.
+
+```text
+Drops.PendingSnapshot
+Drops.PendingCount
+Drops.Revision
+RunInventory.CurrencySnapshot
+RunInventory.ConsumableSnapshot
+RunInventory.SkillSnapshot
+RunInventory.ConsumableCapacity
+RunInventory.SkillRevision
+RunInventory.Revision
+RunAugments.OwnedSnapshot
+RunAugments.LastTriggerType
+RunAugments.LastTriggerReason
+RunAugments.LastExecutedCount
+RunAugments.RuntimeRevision
+RunAugments.Revision
+```
+
+마지막 스킬의 실제 타격 대상은 같은 DTO의 다음 값을 읽는다.
+
+```text
+LastSkillTarget.SkillId
+LastSkillTarget.TargetingType
+LastSkillTarget.TargetUnitIds
+LastSkillTarget.TargetCellIndices
+LastSkillTarget.Reason
+LastSkillTarget.Revision
+```
+
+`TargetUnitIds`와 `TargetCellIndices`는 `|` 구분 문자열이다. 이 값은 타격 시점에 서버
+`SkillTargetResolverLogic`이 확정한 디버그·표시용 Snapshot이다. UI는 사거리나 대상을 다시
+계산하지 않으며 `RevisionKey` 또는 `LastSkillTarget.Revision` 변경에 맞춰 표시만 갱신한다.
+
+`SkillSnapshot`은 `SkillId~Count|SkillId~Count` 형식이다. UI는 이 값으로 보유 버튼을
+숨기거나 비활성화할 수 있지만 최종 권한 검사는 서버 `TryQueueTile`이 수행한다.
+외부 상점·보상 시스템의 공개 스킬 API는 다음과 같다.
+
+```lua
+local owned = _RunManagerLogic:CanUseRunSkill(playerEntity, "basic_slash")
+local grant = _RunManagerLogic:GrantRunSkill(playerEntity, "heavy_slash", 1, rewardKey)
+local snapshot = _RunManagerLogic:GetRunSkillSnapshot(playerEntity)
+```
+
+`rewardKey`는 구매/노드 보상 단위의 고유 키여야 한다. 같은 키를 재전송하면 수량은 다시
+증가하지 않는다.
+
+외부 직업·상점·보상 시스템의 증강 API는 다음과 같다.
+
+```lua
+local grant = _RunManagerLogic:GrantRunAugment(playerEntity, "prototype_warrior_recovery", "JOB", rewardKey)
+local snapshot = _RunManagerLogic:GetRunAugmentSnapshot(playerEntity)
+```
+
+`OwnedSnapshot` 형식은 `AugmentId~Stacks~AcquiredOrder~SourceType`을 `|`로 구분한다.
+최종 UI는 이를 표시만 하고 Trigger/Condition을 다시 계산하지 않는다. `LastTrigger*` 값은 현재
+디버깅·기능 검증용이며 연출 타이밍의 영구 이벤트 스트림 계약은 아니다.
+
+소모품 사용 요청은 다음 메서드만 호출한다.
+
+```lua
+session:RequestUseConsumable("potion_hp_small", clientRequestId)
+```
+
+`clientRequestId`는 한 전투 UI 세션에서 증가시킨다. 서버는 RunSequence와 StageId를
+결합해 UseKey를 만들므로 같은 요청 재전송은 효과·소비 모두 무시한다. UI는 HP 회복량,
+턴 소비 여부, 보유 수량을 직접 계산하지 않는다. 현재 `H` 키와 HUD 문구는 기능 검증용
+어댑터이며 최종 UI 호환 대상이 아니다.
+
 ## 9. 공통 결과
 
 Server API는 다음 형태를 반환한다.
@@ -269,6 +368,9 @@ BATTLE_SESSION_NOT_FOUND
 STAGE_DEFINITION_NOT_FOUND
 CONTENT_VALIDATION_FAILED
 RUN_STATE_UNAVAILABLE
+NODE_DEFINITION_NOT_FOUND
+AMBIGUOUS_STAGE_NODE
+NEXT_NODE_REFERENCE_MISSING
 ```
 
 Stage 시작 전 `StageDefinitionRepositoryLogic`과 `ContentValidatorLogic`이
@@ -280,6 +382,45 @@ Stage Definition, 보드 범위, 큐 용량, Wave 참조를 검증한다.
 
 Stage 제작 규칙은
 [`Stage-Authoring-Guide.md`](./Stage-Authoring-Guide.md)를 따른다.
+
+전투 승리 확정 시 호출 경계는
+`RecordBattleResult(player, stageId, stageNumber, result, entryRequestId)`다. 이 메서드는
+`NodeDefinitions` 전환을 먼저 검증한 뒤 전투 결과와 다음 콘텐츠 옵션을 같은 플레이어
+컴포넌트에 기록한다. 상점이나 다음 맵 시스템이 전투 Session을 직접
+참조하지 않는다.
+
+승리인 경우 `StageRewardDefinitions`를 먼저 해석해 런 인벤토리에 멱등 지급한다. UI는
+보상표를 읽지 않고 `RunInventory.CurrencySnapshot`, `ConsumableSnapshot`, `Revision`을
+표시한다. 상세 제작 규칙은
+[`Stage-Reward-Authoring-Guide.md`](./Stage-Reward-Authoring-Guide.md)를 따른다.
+
+현재 `prototype_run`은 실제 Dataset의 `stage01_battle → shop_after_stage01` 두 행으로 구성되며,
+전투 종료 전 `_ContentValidatorLogic:ValidateNodeGraph("prototype_run")`이 시작점·참조·도달
+가능성을 검증한다. Repository compatibility fallback은 비활성이다.
+
+`RunSequence:StageId:EntryRequestId`를 전투 결과의 멱등 키로 사용한다. 같은 전투 결과가
+중복 전달되면 진행·보상 소비자가 두 번 처리하지 않도록 `[RunManager] duplicate result ignored`
+로그와 함께 성공으로 무시한다. 이후 `StageRewardDefinitions`도 이 키를 그대로 사용한다.
+
+다음 노드 선택과 화면 전환 준비는 전투 Session이 아니라 RunManager가 담당한다.
+
+```lua
+_RunManagerLogic:RequestSelectNextContent(nodeId, requestId)
+local ui = _RunManagerLogic:GetLocalRunFlowUiState()
+```
+
+UI는 `Transition.RouteAction`, `UiRouteId`, `DestinationId`를 표시 계층에 전달한다. 상세 계약은
+[`Run-Content-Flow-Guide.md`](./Run-Content-Flow-Guide.md)를 따른다.
+
+`RouteAction=OPEN_SHOP` 뒤에는 `_RunShopLogic:RequestOpenShop(shopId)`를 호출하고,
+구매는 `_RunShopLogic:RequestPurchaseOffer(shopEntryId, requestId)`만 사용한다. 상점 UI DTO는
+`GetLocalShopUiState()`이며 상세 형식은
+[`Run-Shop-Authoring-Guide.md`](./Run-Shop-Authoring-Guide.md)를 따른다.
+
+구매하거나 건너뛴 뒤에는 `_RunShopLogic:RequestCloseShop(requestId)`를 호출한다. 서버가 현재
+SHOP 전환과 요청 중복을 검증한 뒤 공통 `RunManagerLogic.CompleteCurrentContent()` 경계에서
+다음 노드 또는 `RUN_COMPLETED`를 결정한다. UI가 `NodeDefinitions.NextNodeIds`를 직접 해석하지
+않는다.
 
 ## 10. Prototype 자동 시작
 

@@ -31,7 +31,7 @@
 - 이동·방향 전환·기본 공격이 공통으로 통과하는 서버 기준 행동 큐와 처리 중 입력 잠금
 - Turn·Phase·행동 슬롯·Skill 큐를 맵 수명의 `BattleTurnComponent`가 단일 소유
 - Wave 진행·강제 증원 예약·Wave Timer를 `BattleWaveComponent`가 단일 소유
-- 기본 용량 2인 가변 타일 큐에 `basic_slash`·`heavy_slash`·`push`를 순서대로 등록·실행·전체 비우기 하는 하단 중앙 `BattleQueueHUD`
+- 기본 용량 3인 가변 타일 큐에 `basic_slash`·`heavy_slash`·`push`를 순서대로 등록·실행·전체 비우기 하는 하단 중앙 `BattleQueueHUD`
 - HP 0 사망 판정, `VICTORY`/`DEFEAT` 결과 고정, 현재 전투를 초기화하는 `다시 시작` 버튼
 - 적이 멀면 한 칸 접근하고 인접하면 기본 공격하는 최소 Intent
 - 플레이어 턴 시작 전에 적 행동을 `PreparedIntent`로 고정하고 HUD에 `접근` 또는 `기본 베기`로 표시
@@ -48,12 +48,14 @@ RootDesk/MyDesk/
 │   │       ├── BattleSessionComponent.mlua
 │   │       ├── BattleTurnComponent.mlua
 │   │       ├── BattleWaveComponent.mlua
+│   │       ├── EnemyIntentComponent.mlua
 │   │       ├── BoardStateComponent.mlua
 │   │       ├── BattleUnitComponent.mlua
 │   │       ├── BattleUnitPresentationComponent.mlua
 │   │       └── BattleTileColor.mlua
 │   ├── Resolvers/
 │   │   ├── EffectRouterLogic.mlua
+│   │   ├── EnemyIntentResolverLogic.mlua
 │   │   └── BattleGatewayLogic.mlua
 │   └── Events/
 │       ├── BasicAttackResolvedEvent.mlua
@@ -65,6 +67,7 @@ RootDesk/MyDesk/
 ├── 04_Roguelike/
 │   └── RunManager/
 │       ├── PlayerRunStateComponent.mlua
+│       ├── PlayerRunInventoryComponent.mlua
 │       └── RunManagerLogic.mlua
 └── Models/
     ├── Characters/
@@ -93,10 +96,13 @@ ui/
 - `BattleTurnComponent` 연결과 행동 실행 조정
 - 플레이어의 기본 자유 이동 잠금
 - 플레이어 행동 접수·실행·완료와 중복 입력 거절
-- `TileQueueCapacity`까지 타일을 순서대로 등록하고 전체 큐가 끝날 때까지 적 턴 전환을 보류
+- 일반 타일 등록마다 적 턴을 진행하되 등록 큐를 유지하고, 별도 실행 명령에서 전체 큐를 순서대로 해소
+- 큐를 가진 상태에서도 다음 플레이어 턴에 이동·방향 전환·추가 등록 허용
+- 기본값+Modifier 합산 방식의 큐 용량과 Job/Augment/Relic용 추가·제거 API 제공
+- 큐 항목의 1-based 개별 제거·순서 변경 Request/API 제공; 두 편집은 턴을 소비하지 않음
 - `QueuedTileIds`, `ExecutingTileIds`, `ExecutingTileIndex`로 등록 큐와 실행 큐를 분리
 - 두 공격이 공유하는 `TryFrontAttack → ResolveFrontAttackImpact` 모션·타깃·피해·이벤트 경로
-- `Prepare → Hold → Execute → Complete`로 적 Intent를 준비·유지·실행하고 다음 Turn 개방
+- `EnemyIntentComponent`가 소유한 Prepared Snapshot을 사용해 적 행동 실행을 조정하고 다음 Turn 개방
 - 밀치기 등으로 보드가 바뀌어도 준비한 ActionType/TileId는 유지하고 실행 시 현재 셀에서 명중 판정
 - HP 0 최초 전환의 사망·승패 확정과 현재 Entity를 재사용하는 전투 Reset
 
@@ -116,11 +122,50 @@ Session은 Wave 컴포넌트의 요청을 받아 실제 적 생성과 승패를 
 `BattleWaveState` Entity의 동기화 상태를 읽는다. 상세 규격은
 [`Battle-Wave-Guide.md`](./Battle-Wave-Guide.md)를 따른다.
 
+### EnemyIntentComponent와 EnemyIntentResolverLogic
+
+`EnemyIntentComponent`는 전투 맵 수명의 `PreparedIntent` 상태를 단일 소유한다. Session의
+`PreparedEnemy...` 동기화 필드는 기존 HUD와 외부 코드용 호환 Snapshot이므로 직접 대입하지
+않는다. `EnemyIntentResolverLogic`은 적·플레이어의 논리 Cell/Facing/HP와 검증된
+PatternStep 묶음을 입력받아 ActionType/TileId/Direction을 계산하는 무상태 규칙이다.
+Session은 유닛 상태를 읽어 Resolver에 전달하고, 실행·Timer·다음 적 순서만 조정한다.
+
+적 행동 정의는 `03_Data/EnemyPatternSteps.csv`가 원본이다.
+`EnemyPatternStepRepositoryLogic`은 활성 행을 정렬·변환하고,
+`EnemyPatternContentValidatorLogic`은 실행기가 지원하는 타입만 통과시킨다. 콘텐츠 개발자는
+기존 ActionType 조합이면 CSV만 수정하고, `_DataService`를 전투/UI에서 직접 호출하지 않는다.
+각 적 Entity의 `EnemyPatternRunnerComponent`가 Current/Prepared/Last Completed Step을
+독립 소유한다. Resolver는 Runner의 Current Step에서 실패 분기를 탐색하고, 행동 완료 뒤
+Runner만 성공/실패 다음 Step을 갱신한다. Session은 준비·실행 순서를 연결할 뿐 Step 상태를
+직접 보관하지 않는다.
+
+`CELL_FREE` 조건은 `FRONT`, `BACK`, `TOWARD_PLAYER`, `AWAY_FROM_PLAYER` 중 하나를
+`ParamA`로 사용한다. Session이 `BoardStateComponent`를 통해 준비 시점의 빈칸 boolean만
+Resolver에 전달하며, Resolver나 UI는 Board Registry를 직접 조회하지 않는다. 실제 이동은
+`TryMove()`가 다시 점유와 보드 경계를 검사한다.
+
+`MOVE_AWAY`는 `AWAY_FROM_PLAYER`가 비어 있을 때 플레이어 반대 방향으로 Facing을 맞추고
+1칸 이동한다. `BattleSessionComponent.TryMoveAway()`가 경계·점유를 먼저 검사하므로 막힌
+행동은 위치와 Facing을 모두 유지한다. Stage 1 적에는 아직 배정하지 않았고,
+`prototype_retreat`가 제작·검증용 재사용 패턴을 제공한다.
+
+`TELEGRAPH_TILE`은 피해를 주지 않는 예고 Action이다. `TileId`와 `TelegraphTurns`를 지정하면
+각 적의 `EnemyPatternRunnerComponent`가 남은 턴을 소유한다. Complete마다 `2→1→0`으로
+감소하고 0에서 성공 Step으로 이동하므로, 다음 Step에 같은 `TileId`의 `EXECUTE_TILE`을 둔다.
+취소된 PreparedIntent는 카운트를 소비하지 않는다. 제작 예시는 `prototype_telegraph`를 본다.
+
+신규 UI는 `GetBattleUiState()`의 `EnemyIntents`만 읽는다. 현재 `EnemyIntentMode`는
+`COMPONENT_SINGLE_COMPAT`이며 각 항목에 `Revision`과 `TelegraphTurnsRemaining`이 포함된다. UI에서 Intent 조건을
+다시 계산하거나 Session의 호환 Snapshot 필드를 수정하지 않는다.
+
 새 Run은 `BattleSessionComponent.StartNewRun(seed)`로 시작한다. 이 메서드는 `RunManagerLogic`을 통해 플레이어의 `PlayerRunStateComponent`를 초기화한 뒤 같은 Seed로 Stage 1/Wave 1을 다시 구성한다. 전투 맵의 `RunSeed`는 계산에 쓰는 복사본이며 원본 소유자는 플레이어의 Run 상태다.
 
 ### PlayerRunStateComponent와 RunManagerLogic
 
 `PlayerRunStateComponent`는 플레이어별 Run 상태의 원본이다. `RunSeed`, `RunSequence`, `RunState`, `CurrentStageNumber`, `CompletedStageCount`, `LastBattleResult`를 보관한다.
+
+런 재화·소모품과 지급/사용 멱등 키는 별도 `PlayerRunInventoryComponent`가 소유한다.
+외부 시스템은 두 컴포넌트를 직접 조합하지 않고 `RunManagerLogic` Facade를 사용한다.
 
 `RunManagerLogic`은 이 컴포넌트를 찾고 호출하는 무상태 조정자다. 전역 Logic 안에 특정 사용자의 진행 값을 저장하지 않으므로 이후 map02에서도 같은 플레이어 컴포넌트를 읽어 Run을 이어갈 수 있다. Stage 1 승리 시 현재 구현은 `CompletedStageCount=1`, `CurrentStageNumber=2`, `LastBattleResult=Victory`를 기록한다.
 
@@ -189,7 +234,7 @@ Router는 HP나 CellIndex를 직접 변경하지 않는다. `[BattleEffectRouter
 
 ### BattleQueueHudComponent
 
-`BattleQueueHUD.ui`에 연결된 클라이언트 UI 컴포넌트다. `BattleSessionComponent`의 동기화 속성을 읽어 `TURN`, 등록 타일, Phase, 처리 상태와 준비된 적 행동을 표시하고, 버튼 클릭을 서버 요청으로 전달한다. 전투 판정은 계속 `BattleSessionComponent`가 담당하므로 UI 이미지·색상·배치를 교체해도 피해 규칙은 바뀌지 않는다.
+`BattleQueueHUD.ui`에 연결된 클라이언트 UI 컴포넌트다. `BattleSessionComponent.GetBattleUiState()`의 읽기 전용 DTO를 통해 `TURN`, 등록 타일, Phase, 처리 상태와 준비된 적 행동을 표시하고, 버튼 클릭을 서버 요청으로 전달한다. 전투 판정은 계속 `BattleSessionComponent`가 담당하므로 UI 이미지·색상·배치를 교체해도 피해 규칙은 바뀌지 않는다.
 
 - `기본 공격 타일`: 남은 슬롯에 `basic_slash` 추가
 - `강한 베기 타일`: 남은 슬롯에 `heavy_slash` 추가
@@ -197,7 +242,11 @@ Router는 HP나 CellIndex를 직접 변경하지 않는다. `[BattleEffectRouter
 - `실행`: 등록 순서대로 모든 타일 실행
 - `전체 비우기`: 턴을 소비하지 않고 등록된 타일 전부 제거
 
-버튼 활성 상태도 동기화된다. 플레이어 턴에는 큐가 가득 차기 전까지 타일을 계속 추가할 수 있고, 한 개 이상 등록되면 실행·전체 비우기 버튼을 사용할 수 있다. 기본 `TileQueueCapacity=2`이며 이 값을 3 이상으로 바꿔도 큐 저장·검증·순차 실행과 HUD의 `현재/용량` 표시는 그대로 확장된다.
+버튼 활성 상태도 DTO의 `Commands`와 함께 동기화된다. 플레이어 턴에는 큐가 가득 차기 전까지 타일을 추가할 수 있고, 한 개 이상 등록되면 실행·전체 비우기 버튼을 사용할 수 있다. 일반 타일 등록은 적 턴을 소비하지만 큐는 다음 플레이어 턴까지 유지된다. 기본 용량은 3이며 `BaseQueueCapacity + QueueCapacityBonus`를 1~6 범위로 제한한 값이 실제 용량이다.
+
+개별 제거와 순서 변경은 `RequestRemoveQueuedTile(index)`,
+`RequestMoveQueuedTile(fromIndex, toIndex)`를 사용한다. 서버 API와 DTO는 구현됐으며,
+현재 HUD의 슬롯별 버튼/드래그 조작은 후속 시각 UI Slice다.
 
 적 HP가 0이 되면 해당 적 Sprite와 HP 텍스트만 숨겨진다. 다른 적이 살아 있으면 전투를
 계속한다. 현재 Wave의 모든 적이 사망하면 마지막 Wave가 아닌 경우 `WaveTransition`을
@@ -473,3 +522,12 @@ stage01,3,CLEAR_ONLY,stage01_basic,2,5,BALANCED,0.6,0,0
 ```
 
 최종 승리는 마지막 웨이브가 이미 생성되었고, 이전 웨이브 생존자를 포함한 모든 적이 사망했을 때만 발생한다.
+
+## 10. 적 드롭과 런 자동 회수
+
+- `EnemyDropDefinitionRepositoryLogic`은 적 ID와 TriggerType으로 드롭 행을 읽고 고정 Seed 기반으로 판정한다.
+- `BattleDropComponent`는 적 사망 시 생긴 Pending Drop만 맵 수명 동안 소유한다. 최종 UI는 `BattleSessionComponent:GetBattleSnapshot()`의 `PendingDropSnapshot`, `PendingDropCount`, `DropRevision`을 읽어 임시 표시할 수 있다.
+- Stage 승리 시 Pending Drop은 `RunManagerLogic:GrantRunReward()`를 통해 자동 회수된다. 패배하거나 맵 세션이 끝나면 폐기된다.
+- 회수된 상태는 `RunManagerLogic:GetRunRewardSnapshot(player)`로 읽는다. 반환값에는 `CurrencySnapshot`, `ConsumableSnapshot`, `ConsumableCapacity`, `ConsumableCount`, `Revision`이 있다.
+- Snapshot 문자열은 전송용 DTO다. 다른 기능이 문자열을 직접 수정하면 안 되며, 지급 API와 공개 조회 API만 사용한다.
+- 실제 드롭 표는 `RootDesk/MyDesk/03_Data/EnemyDropDefinitions.userdataset`과 `.csv` 페어이며 데이터 사전 §20.1 규격을 따른다. 초반 적 2종의 4개 행은 실제 Dataset에서 로드되고 Repository fallback은 비활성 상태다.

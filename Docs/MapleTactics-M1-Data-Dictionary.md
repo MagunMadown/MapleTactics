@@ -21,61 +21,78 @@
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
 | JobId | string | O | 직업 고유 ID |
-| NameKey | string | O | LocaleDataSet 키 |
-| MaxHp | integer | O | 시작 최대 HP, 1 이상 |
-| QueueSize | integer | O | 기본 큐 크기, 1~6 |
-| StartingTileSetId | string | O | TileSetEntries의 세트 ID |
-| PassiveId | string | - | 시작 패시브/증강 ID |
-| JobTag | string | O | 증강 풀 필터 태그 |
+| DisplayName | string | O | 제작자용 표시 이름. UI 현지화 키 분리는 이후 가능 |
+| JobTags | string | O | `melee\|control` 형식의 스킬·증강 필터 태그 |
+| BaseMaxHp | integer | O | 시작 최대 HP, 1 이상 |
+| BaseQueueCapacity | integer | O | 기본 큐 크기, 1~6 |
+| StartingSkillSetId | string | O | JobStartingSkillEntries의 세트 ID |
+| JobMechanicId | string | O | JobMechanicRouter에 등록된 직업 고유 규칙 ID. 큐 스킬이 아님 |
+| JobPassiveSetId | string | - | 시작 패시브/증강 세트 ID. 비어 있으면 없음 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-## 3. TileSetEntries
+기본 키: `JobId` 유일. `JobMechanicId`는 반드시 Router에 등록되어야 한다.
+직업은 `SkillDefinitions`를 상속하거나 수정하지 않는다. 시작 공격은 `StartingSkillSetId`,
+이동·교환·밀치기·관통 같은 캐릭터 규칙은 `JobMechanicId`로 독립 구성한다.
+
+## 3. JobStartingSkillEntries
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
-| TileSetId | string | O | 타일 세트 ID |
-| Seq | integer | O | 지급 순서, 1부터 시작 |
-| TileId | string | O | TileDefinitions 참조 |
+| SchemaVersion | integer | O | 현재 `1` |
+| StartingSkillSetId | string | O | 시작 스킬 세트 ID |
+| SlotIndex | integer | O | 지급/표시 순서, 1부터 연속 |
+| SkillId | string | O | SkillDefinitions 참조 |
 | Count | integer | O | 지급 수량, 1 이상 |
-
-기본 키: `(TileSetId, Seq)`는 유일해야 한다.
-
-## 4. TileDefinitions
-
-| 열 | 타입 | 필수 | 설명 |
-|---|---|:---:|---|
-| TileId | string | O | 타일 고유 ID |
-| NameKey | string | O | 표시 이름 Locale 키 |
-| DescriptionKey | string | O | 설명 Locale 키 |
-| Cooldown | integer | O | 기본 쿨다운, 0 이상 |
-| TargetType | enum | O | 등록된 TargetType |
-| RangeValue | integer | O | 타깃 규칙의 기본 범위 |
-| FreePlay | boolean | O | 큐 등록 시 턴 미소비 여부 |
-| QueueDuplicateAllowed | boolean | O | 같은 Runtime Tile 중복 등록 허용 |
-| Tags | string | - | `tag_a|tag_b` 형식의 검색 태그 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-허용 TargetType M1: `SELF`, `FRONT_CELL`, `RANGE_OFFSETS`, `FIRST_ENEMY_FORWARD`.
+기본 키: `(StartingSkillSetId, SlotIndex)`는 유일해야 한다. 같은 세트에서 같은 SkillId를
+중복 행으로 작성하지 않고 수량은 `Count`로 표현한다.
 
-## 5. TileEffects
+런 시작 시 이 수량은 `PlayerRunInventoryComponent.RunSkillSnapshot`의 `SkillId~Count`
+형식으로 변환된다. 현재 큐 등록은 보유 수량이 1 이상인지 검사하며, 한 큐 안의 동일 SkillId
+허용 수는 별도 큐/쿨타임 규칙을 따른다.
+
+## 4. SkillDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
-| TileId | string | O | TileDefinitions 참조 |
-| Seq | integer | O | 타일 내부 실행 순서 |
-| EffectType | enum | O | 등록된 EffectType |
-| TargetTypeOverride | enum | - | 비어 있으면 TileDefinitions 값 사용 |
-| Amount | number | - | 피해/회복/변경량 |
-| Distance | integer | - | 이동/밀치기 거리 |
-| StatusId | string | - | 상태 효과 참조 |
-| DurationTurns | integer | - | 상태 지속 턴 |
-| Priority | integer | O | 같은 이벤트 내 우선순위 |
-| ParamA | string | - | 타입별 확장 값 |
-| ParamB | string | - | 타입별 확장 값 |
-| ParamC | string | - | 타입별 확장 값 |
+| SchemaVersion | integer | O | 현재 `1` |
+| SkillId | string | O | 큐에 넣어 실행하는 일반 스킬 ID |
+| DisplayName | string | O | 표시 이름 |
+| SkillTags | string | - | `attack\|starter` 형식 태그 |
+| TargetingType | enum | O | `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS` |
+| Range | integer | O | Cell 기준 최대 사거리, 1 이상 |
+| TargetOffsets | string | 조건부 | `RANGE_OFFSETS`일 때 필수. Facing 기준 정수 오프셋을 `|`로 구분 |
+| CooldownTurns | integer | O | 실행 후 쿨다운 턴, 0 이상 |
+| CostType | string | - | 비용 종류 |
+| CostValue | number | O | 비용 수치, 0 이상 |
+| MotionProfileId | string | O | 공격 모션 프로필 |
+| EffectSetId | string | O | SkillEffectSteps 참조 |
+| RequiredJobTag | string | - | 비어 있으면 공용 스킬 |
+| ActionDuration | number | O | 실행 연출 시간, 0 초과 |
+| FreePlay | boolean | O | 큐 등록 시 턴 미소비 여부 |
 
-허용 EffectType M1: `DAMAGE`, `PUSH`, `MOVE_SELF`, `TURN_TARGET`, `APPLY_STATUS`, `MODIFY_COOLDOWN`.
+내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
+런 패시브(Augment)는 이 표에 넣지 않는다.
+
+## 5. SkillEffectSteps
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
+| EffectSetId | string | O | SkillDefinitions.EffectSetId 참조 |
+| StepIndex | integer | O | 효과 실행 순서, 1부터 연속 |
+| EffectType | enum | O | 등록된 EffectType |
+| TargetSelector | enum | O | `FRONT_TARGET`(호환), `PRIMARY_TARGET`, `ALL_SKILL_TARGETS` |
+| Value | number | O | 피해량·거리 등 원시 효과 수치 |
+| ParameterA | string | - | 효과별 확장 값 |
+| ParameterB | string | - | 효과별 확장 값 |
+| ConditionId | string | - | 조건 규격 참조용 예약 필드 |
+
+현재 구현 EffectType M1: `DAMAGE`, `PUSH`. 새 타입은 Executor, Router, Validator,
+데이터 사전을 함께 수정한 뒤 사용한다.
 
 ## 6. EnemyDefinitions
 
@@ -88,6 +105,7 @@
 | PatternId | string | O | EnemyPatternSteps 참조 |
 | MovementPolicy | enum | O | 추적 이동 또는 현재 방향 고정 이동 |
 | InitialFacingPolicy | enum | O | 생성 순간 한 번만 결정되는 초기 방향 |
+| IsBoss | boolean | O | `true`이면 사망 시 `BOSS_KILL` 드롭 Trigger를 함께 발행 |
 
 허용 MovementPolicy M1: `TRACK_PLAYER`, `FIXED_FACING`.
 
@@ -101,6 +119,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
 | PatternId | string | O | 패턴 ID |
 | StepIndex | integer | O | 실행 순서, 1 이상 |
 | ActionType | enum | O | 등록된 EnemyActionType |
@@ -112,6 +131,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 | ParamC | string | - | 행동별 인자 |
 | NextStepOnSuccess | integer | - | 비어 있으면 다음 StepIndex |
 | NextStepOnFailure | integer | - | 비어 있으면 다음 StepIndex |
+| Enabled | boolean | O | `true`인 행만 Repository가 로드 |
 
 허용 ActionType M1: `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`.
 
@@ -119,11 +139,53 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 - `MOVE_TOWARD`: 플레이어 방향으로 `Facing`을 바꾼 뒤 그 방향으로 1칸 이동한다.
 - `MOVE_AWAY`: 플레이어 반대 방향으로 `Facing`을 바꾼 뒤 그 방향으로 1칸 이동한다.
 - `MOVE_FIXED_FACING`: 플레이어 위치를 참조하거나 `Facing`을 바꾸지 않고 현재 방향으로 1칸 이동한다.
+- `TELEGRAPH_TILE`: `TileId`를 `TelegraphTurns`회 예고한다. 보드·HP를 바꾸지 않으며 카운트가 끝난 뒤 성공 Step으로 이동한다.
+- `EXECUTE_TILE`: 예고와 분리된 실제 타일 실행이다. 실행 시점의 보드 상태로 대상을 다시 판정한다.
 - 이동 목적지가 보드 밖이거나 점유된 경우 위치와 `Facing`을 유지하고 성공 분기는 `WAIT` 결과로 끝낸다. 자동 반전은 허용하지 않는다.
 
 추적형/고정형은 Pattern 전체에 `TURN_TO_PLAYER`가 있는지로 판정하지 않는다. 각 Step의 Action 의미가 독립적이며 하나의 Pattern에서 추적 Action과 고정 방향 Action을 함께 사용할 수 있다.
 
 허용 ConditionType M1: `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE`.
+
+현재 수직 슬라이스는 `prototype_tracker` 4행, `prototype_fixed` 3행,
+`prototype_retreat` 2행, `prototype_telegraph` 3행을 실제 `EnemyPatternSteps` Dataset으로 제공한다.
+Repository는 `PatternId → StepIndex`로 정렬하고,
+전용 Validator는 SchemaVersion, 연속 StepIndex, Action/Condition enum, TileId와 거리 인자를
+검사한다. Resolver는 `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE`와 `WAIT`,
+`TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`을
+실행 가능 타입으로 받는다. `prototype_retreat`는 `MOVE_AWAY`, `prototype_telegraph`는 2턴 예고 뒤
+`basic_slash` 실행으로 이어지는 재사용 제작 샘플이다.
+
+`CELL_FREE`는 `ParamA`를 셀 선택자로 사용한다.
+
+| ParamA | 검사 Cell |
+|---|---|
+| `FRONT` | 현재 Facing 앞 1칸 |
+| `BACK` | 현재 Facing 뒤 1칸 |
+| `TOWARD_PLAYER` | 플레이어 방향 1칸 |
+| `AWAY_FROM_PLAYER` | 플레이어 반대 방향 1칸 |
+
+보드 밖이거나 살아 있는 다른 유닛이 점유하면 `false`다. Session은 준비 시점의
+`BoardStateComponent` 점유를 Selector별 boolean Snapshot으로 변환하고 Resolver는 이 값만
+읽는다. 이동 Action은 실행 시 `TryMove()`에서 경계와 점유를 다시 검사한다. 준비 후 실행
+사이에 점유가 달라졌다면 이동하지 않고 실패 결과로 Runner 전이를 적용한다.
+
+`MOVE_AWAY`는 Resolver가 플레이어 반대 방향을 PreparedIntent에 저장한다. 실행기는 목적지
+경계와 점유를 먼저 검사한 뒤 Facing 변경과 1칸 이동을 한 행동으로 처리한다. 사전 검사에서
+막히면 위치와 Facing을 모두 유지하고 실패 분기로 이동한다. 예상 밖 이동 실패가 발생해도
+Facing을 이전 값으로 복구한다.
+
+현재 `EnemyPatternRunnerComponent`가 적 Entity마다 `CurrentStepIndex`와 준비 중 Step을
+소유한다. Resolver는 Current Step에서 시작해 조건 또는 Action 적용 가능성 실패 시
+`NextStepOnFailure`를 따라가며, 실행할 행을 PreparedIntent로 고정한다. 실제 행동 성공/실패가
+확정된 뒤에만 Runner가 선택된 행의 `NextStepOnSuccess`/`NextStepOnFailure`로 Current Step을
+갱신한다. 빈 다음 Step 값은 현재 Step 다음 행을 사용하고 마지막 행 뒤에는 Step 1로 순환한다.
+동일 Prepare 중 방문한 Step을 다시 만나면 `PATTERN_FAILURE_BRANCH_CYCLE`로 중단한다.
+
+`TELEGRAPH_TILE`의 남은 턴도 각 적 Runner가 소유한다. 첫 Prepare는 행의 `TelegraphTurns`에서
+시작하고, 성공적으로 Complete될 때만 1 감소한다. 남은 값이 있으면 같은 Step을 유지하고,
+0이 되면 `NextStepOnSuccess`로 이동한다. PreparedIntent가 취소되면 준비 중 복사본만 버리고
+확정 카운트는 줄이지 않으므로 취소·재준비로 턴이 잘못 소비되지 않는다.
 
 ### 7.1 런타임 PreparedIntent 계약
 
@@ -136,12 +198,12 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 | StepIndex | 선택된 EnemyPatternSteps 행 | 불가 |
 | ActionType | 선택된 행 | 불가 |
 | TileId | 선택된 행 | 불가 |
-| TelegraphTurnsRemaining | TelegraphTurns에서 시작 | Tick 때만 감소 |
+| TelegraphTurnsRemaining | Runner의 확정 남은 값 또는 TelegraphTurns에서 시작 | TELEGRAPH_TILE Complete 때만 감소 |
 | PreparedTurn | 준비 시 TurnNumber | 불가 |
 | State | EMPTY/PREPARED/EXECUTING | 상태 전이만 허용 |
 
 - Snapshot에는 `TargetId`나 목표 CellIndex를 저장하지 않는다.
-- `EXECUTE_TILE`은 실행 시점의 현재 CellIndex/Facing과 `TileDefinitions.TargetType`으로 타깃을 다시 계산한다.
+- `EXECUTE_TILE`은 실행 시점의 현재 CellIndex/Facing과 `SkillDefinitions.TargetingType`으로 타깃을 다시 계산한다.
 - 밀치기·이동·회전은 Snapshot의 ActionType/TileId를 바꾸거나 다음 Step을 다시 선택하지 않는다.
 - 실행 성공/실패가 확정된 뒤에만 `NextStepOnSuccess`/`NextStepOnFailure`를 적용한다.
 - Client에는 HUD에 필요한 EnemyId/ActionType/TileId/남은 준비 턴만 읽기 전용 DTO/Event로 전달한다.
@@ -161,19 +223,21 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
-| StageId | string | O | 스테이지 ID |
-| NameKey | string | O | Locale 키 |
-| BoardSize | integer | O | 1차원 셀 수, 3 이상 |
-| OriginX | number | O | Cell 0의 월드 X |
-| OriginY | number | O | 유닛 기준 월드 Y |
-| CellWidth | number | O | 셀 간 월드 거리 |
-| PlayerStartCell | integer | O | 0~BoardSize-1 |
-| AugmentPoolId | string | O | StageAugmentPools 참조 |
-| DifficultyMultiplier | number | O | 0보다 큼 |
-| NextStageId | string | - | 마지막 스테이지면 비움 |
-| Enabled | boolean | O | 콘텐츠 활성 여부 |
+| SchemaVersion | integer | O | 현재 `1` |
+| StageId | string | O | 고유 스테이지 ID |
+| DisplayName | string | O | 표시 이름 |
+| CellCount | integer | O | 1차원 Cell 수, 1 이상 |
+| CellStartX | number | O | Cell 0의 월드 X |
+| CellSpacing | number | O | Cell 중심 간격, 0보다 큼 |
+| UnitY | number | O | 유닛 기준 월드 Y |
+| PlayerStartCell | integer | O | 0 이상 `CellCount` 미만 |
+| QueueCapacity | integer | O | 기본 큐 용량, 1 이상 |
+| WaveTableId | string | O | `StageEnemyWaves.StageId` 참조 |
+| NextStageId | string | - | 초기 호환 열. 실제 다음 콘텐츠는 NodeDefinitions가 결정 |
+| StageRuleId | string | - | 특수 Stage 규칙 ID |
 
-`OriginX/OriginY/CellWidth`는 월드 좌표 표현용이며 논리 판정에는 사용하지 않는다.
+`CellStartX/UnitY/CellSpacing`은 월드 좌표 표현용이며 논리 판정은 CellIndex를 사용한다.
+현재 `stage01`은 실제 Dataset에서 로드되고 compatibility fallback은 비활성이다.
 
 ## 9. RegionDefinitions
 
@@ -201,6 +265,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1`, Loader 지원 버전과 일치해야 함 |
 | NodeGraphId | string | O | RegionDefinitions.NodeGraphId 참조 |
 | NodeId | string | O | 노드 고유 ID |
 | NodeType | enum | O | 등록된 NodeType |
@@ -215,6 +280,28 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 
 기본 키: `(NodeGraphId, NodeId)` 유일. 같은 NodeGraphId 안에 `IsStartNode=true`가 정확히 1개여야 한다. `NextNodeIds`가 참조하는 NodeId는 같은 NodeGraphId 안에 존재해야 한다.
 
+`StageDefinitions.NextStageId`는 초기 호환 열이며 Run의 실제 다음 콘텐츠를 결정하지 않는다.
+전투 종료 뒤 이동 가능한 대상은 `NodeDefinitions.NextNodeIds`만 원본으로 사용한다.
+런타임은 각 다음 노드를 다음 공통 DTO로 정규화한다.
+
+```text
+NextNodeIds         노드 식별자 목록
+NextContentTypes    BATTLE/BOSS/SHOP/EVENT/REST 목록
+NextContentIds      BATTLE/BOSS는 StageId, 그 외는 NodeId
+```
+
+세 문자열은 같은 인덱스끼리 한 옵션이며 `|`로 구분한다. UI, 맵 이동, 상점은 이 DTO를
+읽는 소비자일 뿐 `PlayerRunStateComponent`의 진행 상태를 직접 변경하지 않는다.
+`NodeDefinitionRepositoryLogic`은 SchemaVersion, NodeType, StageId 사용 규칙,
+자기 참조·중복 NextNodeId, 비활성 행을 차단한다.
+
+현재 실제 `NodeDefinitions.userdataset/.csv`에는 `prototype_run` 그래프의
+`stage01_battle(BATTLE) → shop_after_stage01(SHOP)` 두 행이 등록되어 있다.
+`NodeContentValidatorLogic`은 시작 노드가 정확히 1개인지, NodeId 중복·다음 노드·Stage 참조·
+시작점에서 도달 불가능한 노드가 없는지를 그래프 단위로 검증한다. Maker에서 두 행의
+`Source=DATASET`, `StartNodeId=stage01_battle`, 승리 후 `NextContentTypes=SHOP`을 확인했으며
+Repository의 prototype fallback은 비활성 상태다.
+
 예시(`henesys_graph`, 회의 문서의 "헤네시스 1-1/1-2/1-3" 배치를 노드 3개로 표현):
 
 | NodeGraphId | NodeId | NodeType | StageId | IsStartNode | NextNodeIds |
@@ -224,6 +311,9 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 | henesys_graph | n3 | BOSS | henesys_boss_mushmom | false | |
 
 상점/이벤트 노드가 필요하면 같은 그래프에 `NodeType=SHOP`, `StageId`는 비운 행을 추가한다.
+SHOP의 `NextContentId`는 NodeId다. 상점 상품 구성은 `ShopItemDefinitions`가 담당하며,
+노드별 상품 풀 필드가 필요해지는 시점에 별도 참조 열을 추가한다. 전투 StageId나
+`ShopItemDefinitions.ItemId`를 `NextNodeIds`에 직접 넣지 않는다.
 
 ## 11. StageEnemySpawns
 
@@ -305,6 +395,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
 | AugmentId | string | O | 증강 ID |
 | NameKey | string | O | Locale 키 |
 | DescriptionKey | string | O | Locale 키 |
@@ -319,6 +410,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
 | AugmentId | string | O | AugmentDefinitions 참조 |
 | Seq | integer | O | 증강 내부 순서 |
 | TriggerType | enum | O | 반응할 BattleEvent 종류 |
@@ -331,6 +423,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | ParamA | string | - | 확장 값 |
 | ParamB | string | - | 확장 값 |
 | ParamC | string | - | 확장 값 |
+| Enabled | boolean | O | 효과 행 활성 여부 |
 
 허용 TriggerType M1: `TURN_START`, `COMMAND_ACCEPTED`, `TILE_QUEUED`, `BEFORE_TILE_EXECUTE`, `AFTER_DAMAGE`, `UNIT_MOVED`, `ENEMY_DIED`, `STAGE_CLEARED`.
 
@@ -339,6 +432,13 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 허용 TargetType M1: 타일과 같은 `SELF`, `FRONT_CELL`, `RANGE_OFFSETS`, `FIRST_ENEMY_FORWARD`에 `REAR_CELL`(현재 Facing 반대편 바로 뒤 칸)을 추가한다.
 
 `REAR_CELL`은 이번에 새로 추가하는 원시 TargetType이므로 §22(새 데이터 추가 완료 기준)의 "새 원시 Type" 규칙에 따라 Resolver·Validator 허용 목록·회귀 테스트를 함께 갖춘 뒤에만 실전 배치한다.
+
+현재 구현된 최소 부분집합은 `TURN_START`, `ALWAYS`/`HP_RATIO_LE`, `HEAL`/`SELF`다.
+`JobDefinitions.JobPassiveSetId`는 현재 하나의 `AugmentId`를 참조하며, 그 ID에 속한 여러
+`AugmentEffects` 행이 직업 시작 패시브 세트가 된다. 효과 실행 순서는 낮은 `Priority`부터이며,
+동률은 런 획득 순서 → `Seq` → `AugmentId`로 고정한다. 현재 프로토타입 직업은
+`prototype_warrior_recovery`를 런 시작 시 UNIQUE 1스택으로 지급받고, 턴 시작에 HP가 99% 이하이면
+자신을 1 회복한다. 문서의 나머지 M1 Type은 계획된 확장 규격이며 아직 Validator에 등록되지 않았다.
 
 ### 15.1 예시 — 자쿰의투구 (50% 확률 후방 공격)
 
@@ -397,6 +497,29 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | gold | 골드 | RUN_SCOPED |
 | cash | 캐시 | PREMIUM_CASH |
 
+현재 실제 `CurrencyDefinitions.userdataset/.csv`에는 `gold / RUN_SCOPED / Enabled=true`가 등록되어 있다. 적 드롭의 `CURRENCY` 참조는 현재 `RUN_SCOPED`만 허용한다.
+
+### 18.2 ConsumableDefinitions
+
+전투 드롭·상점·런 인벤토리가 같은 소모품 ID를 참조하고, 사용 효과를 원시 Effect Handler에 연결하기 위한 정의다.
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
+| ConsumableId | string | O | 소모품 고유 ID |
+| DisplayName | string | O | 표시 이름 |
+| MaxStack | integer | O | 런에서 보유 가능한 기본 수량 |
+| UseTiming | enum | O | 현재 `BATTLE_FREEPLAY` |
+| ConsumesTurn | boolean | O | 사용 시 턴 소비 여부 |
+| EffectType | enum | O | 등록된 원시 효과. 현재 `HEAL` |
+| EffectValue | number | O | 효과 기본 수치, 0 초과 |
+| TargetType | enum | O | 현재 `SELF` |
+| Enabled | boolean | O | 활성 여부 |
+
+현재 실제 Dataset에는 `potion_hp_small / MaxStack=3 / BATTLE_FREEPLAY /
+ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에만
+`PlayerRunInventoryComponent`가 수량을 차감하며, 같은 UseKey는 효과와 소비 모두 한 번만 처리한다.
+
 ## 19. StageRewardDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
@@ -449,6 +572,44 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | unlock_job_thief | 도적 해금 | CHARACTER_UNLOCK | cash | 9900 | JOB | thief |
 | potion_hp_small | 체력 물약(소) | CONSUMABLE | gold | 50 | | |
 
+## 20.1 EnemyDropDefinitions
+
+적 사망 시 전투 중 생성되는 보상을 정의한다. 스테이지를 완료해서 받는 `StageRewardDefinitions`와 책임을 섞지 않는다. 적 밸런스 담당자는 `EnemyDefinitions`, 드롭 담당자는 이 표의 독립 행을 수정한다.
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1`만 허용 |
+| DropEntryId | string | O | 드롭 행 고유 ID |
+| EnemyDefinitionId | string | O | `EnemyDefinitions` 참조 |
+| TriggerType | enum | O | `ANY_KILL`, `COMBO_KILL`, `BOSS_KILL` |
+| DropType | enum | O | `CURRENCY`, `CONSUMABLE` |
+| DropRefId | string | O | CURRENCY면 `CurrencyDefinitions.CurrencyId`, CONSUMABLE이면 `ConsumableDefinitions.ConsumableId` |
+| ChancePermille | integer | O | 0~1000. 1000은 100% |
+| MinAmount | integer | O | 1 이상 |
+| MaxAmount | integer | O | MinAmount 이상 |
+| Enabled | boolean | O | 콘텐츠 활성 여부 |
+
+기본 키는 `DropEntryId`이며 전역에서 유일해야 한다. 한 적에 여러 행을 연결할 수 있고 각 행은 서로 독립적으로 판정한다. 행이 없는 적은 오류가 아니라 드롭 없음으로 처리한다.
+
+`ANY_KILL`은 모든 적 사망, `COMBO_KILL`은 한 번의 플레이어 큐 실행에서 두 번째 이후
+처치, `BOSS_KILL`은 `EnemyDefinitions.IsBoss=true`인 적 사망에 추가로 발행한다. 한 사망은
+여러 Trigger를 만족할 수 있지만 KillKey는 한 번만 소비한다.
+
+판정은 `RunSeed + StageId + WaveIndex + SpawnOrder + UnitId + DropEntryId`를 입력으로 하는 결정적 RNG를 사용한다. 같은 입력을 재생하면 종류·성공 여부·수량이 같아야 한다. `BattleDropComponent`는 결과를 전투장 Pending 상태로 소유하고, 최종 승리 때 `PlayerRunInventoryComponent`로 자동 회수한다. 패배·세션 종료 시 Pending 드롭은 폐기한다.
+
+런 보상 지급 API는 `RewardKey`를 필수로 받아 같은 키가 재전송되어도 한 번만 반영한다. 현재 소모품 기본 용량은 3이며 초과분은 `OverflowCurrencyId`와 `OverflowCurrencyPerItem` 설정에 따라 런 재화로 전환한다. 이는 런 상태 규격이며 계정 영구 저장·메타 재화 지급은 아직 포함하지 않는다.
+
+### 20.1.1 Prototype 호환 행
+
+| DropEntryId | EnemyDefinitionId | TriggerType | DropType | DropRefId | ChancePermille | MinAmount | MaxAmount |
+|---|---|---|---|---|---:|---:|---:|
+| early_gold | early_mushroom | ANY_KILL | CURRENCY | gold | 1000 | 1 | 1 |
+| early_potion | early_mushroom | ANY_KILL | CONSUMABLE | potion_hp_small | 250 | 1 | 1 |
+| guard_gold | guard_mushroom | ANY_KILL | CURRENCY | gold | 1000 | 1 | 2 |
+| guard_potion | guard_mushroom | ANY_KILL | CONSUMABLE | potion_hp_small | 150 | 1 | 1 |
+
+`RootDesk/MyDesk/03_Data/EnemyDropDefinitions.userdataset/.csv` 페어에 위 4행이 이관되어 있다. Maker 런타임에서 `Source=DATASET`과 각 적 2행을 확인했으며 Repository의 prototype fallback은 비활성 상태다.
+
 ## 21. Validator 오류 코드
 
 | 코드 | 의미 | 전투 시작 차단 |
@@ -468,12 +629,14 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | DATA_NO_START_NODE | NodeDefinitions의 한 NodeGraphId에 IsStartNode=true가 0개 또는 2개 이상 | O |
 | DATA_INVALID_CHARACTER_UNLOCK_REF | ShopItemDefinitions의 Category=CHARACTER_UNLOCK인데 EffectRefType이 JOB이 아님 | O |
 | DATA_REWARD_CURRENCY_NOT_ALLOWED | StageRewardDefinitions가 Category=PREMIUM_CASH인 CurrencyId를 참조 | O |
+| DATA_INVALID_DROP_REFERENCE | EnemyDropDefinitions의 EnemyDefinitionId 또는 DropRefId 참조가 잘못됨 | O |
+| DATA_INVALID_DROP_RANGE | ChancePermille 또는 MinAmount/MaxAmount 범위가 잘못됨 | O |
 | DATA_UNUSED_ROW | 어디에서도 참조되지 않는 활성 행 | X, 경고 |
 
 로그 예시:
 
 ```text
-[DATA_MISSING_REFERENCE] Dataset=TileEffects Row=7 Column=TileId Value=unknown_tile
+[DATA_MISSING_REFERENCE] Dataset=SkillEffectSteps Row=7 Column=EffectSetId Value=unknown_effect_set
 ```
 
 ## 22. 새 데이터 추가 완료 기준

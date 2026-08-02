@@ -1,8 +1,14 @@
 # MapleTactics M1 아키텍처 구현 가능성 검토
 
-문서 상태: 검토 완료  
+문서 상태: **초기 검토 기록(역사 문서)**
 검토 기준: MSW CoreVersion `26.5.0.0`, 현재 저장소, mLua 실행 공간, UserDataSet, UI/Model/Map Builder 규칙  
 대상 맵: `map/map01.map`
+
+> 이 문서는 구현 전 가능성 검토 기록이며 현재 상태 소유권 규격이 아니다.
+> 현재 개발 기준은 `Docs/Guide/Architecture-Standard-v0.1.md`와
+> `Docs/Guide/Development-Workflow-Guide.md`다. 특히 아래의 “BattleSession이 모든
+> 전투 상태의 유일한 소유자”라는 초기 표현은 현재의 Turn/Wave/Unit/Drop 협력
+> Component 분리로 대체됐다.
 
 ## 1. 최종 판정
 
@@ -54,7 +60,9 @@ Static Map의 맵 루트에 `BattleSessionComponent` 하나를 두면 같은 Wor
 
 ### 단일 상태 권한
 
-전투의 유일한 상태 권한은 맵 엔티티에 붙은 `BattleSessionComponent`로 둔다.
+초기 검토에서는 전투의 유일한 상태 권한을 맵 엔티티의 `BattleSessionComponent`로
+표현했다. 현재 구현에서는 Session이 전체 흐름만 조정하고, Turn/Wave/Unit/Drop 상태는
+각 소유 Component가 캡슐화한다. Session이 이들의 필드를 직접 변경하는 것은 금지한다.
 
 이 문장의 전제는 해당 전투 맵이 한 플레이어만 포함하는 Instance Map이라는 것이다. Static Map을 사용한다면 `BattleSessionComponent` 하나로는 부족하며 UserId별 세션 분리가 추가로 필요하다.
 
@@ -216,8 +224,9 @@ UserDataSet은 모든 셀을 문자열로 제공한다. 중첩 JSON 한 셀에 �
 
 ```text
 JobDefinitions
-TileDefinitions
-TileEffects
+JobStartingSkillEntries
+SkillDefinitions
+SkillEffectSteps
 EnemyDefinitions
 EnemyPatternSteps
 StageDefinitions

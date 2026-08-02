@@ -495,7 +495,7 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 
 ### 2026-07-21 — 가변 용량 타일 큐와 순차 실행
 
-- 기본 용량: `TileQueueCapacity=2`; 값 변경만으로 3칸 이상 확장
+- 당시 프로토타입 기본 용량: `TileQueueCapacity=2`; 2026-08-01부터 기본 3과 Modifier 방식으로 대체
 - 등록 상태: `QueuedTileIds`의 `|` 구분 순서 문자열과 `QueuedTileCount`
 - 실행 상태: 등록 큐를 `ExecutingTileIds`로 동결하고 `ExecutingTileIndex`를 한 칸씩 증가
 - 실행 규칙: 각 타일의 모션·ImpactDelay·피해 해결이 끝난 뒤 다음 타일 시작, 전체 큐 완료 뒤에만 적 턴 전환
@@ -755,3 +755,85 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
   - 최종 Snapshot `character_facade_01 / mage / facade_loadout / seed 6001`, `STARTED`, `PlayerTurn`, Wave `1/3`
 - Build Console: 중단 Error/Warning `0`; 최종 runtime Error/Warning `0`
 - 아직 하지 않음: StageId→Map/Instance 이동, Character/Job/Loadout 실제 전투 데이터 적용, 전투 종료 후 보상·로비 이동
+
+### 2026-08-01 — UI 독립 Run Flow 결과 계약
+
+- 상태: ✅ Tested (prototype fallback), 실제 `NodeDefinitions` Dataset 이관은 P0
+- 새 파일: `03_Data/Repositories/NodeDefinitionRepositoryLogic.mlua`
+- 상위 흐름 원본: `StageDefinitions.NextStageId`가 아니라 `NodeDefinitions.NextNodeIds`
+- 공통 결과 DTO: `NextNodeIds`, `NextContentTypes`, `NextContentIds`
+  - `BATTLE/BOSS`: ContentId는 StageId
+  - `SHOP/EVENT/REST`: ContentId는 NodeId
+- 플레이어별 상태: `RunFlowState`, 현재 Graph/Node, 마지막 StageId, 다음 콘텐츠 옵션, Revision
+- 결과 멱등 키: `RunSequence:StageId:EntryRequestId`; 같은 결과 재전달은 성공으로 무시
+- 현재 HUD는 최종 UI 계약이 아닌 디버그·기능 검증 어댑터로 규정
+- Maker 직접 검증:
+  - `stage01` 승리 해석 → `AWAITING_NODE_SELECTION`
+  - 다음 옵션 → `shop_after_stage01 / SHOP / shop_after_stage01`
+  - 같은 키로 결과 2회 기록 → `Revision 3→3`, 중복 1회 무시
+- Build Console Error/Warning `0`; Runtime Error/Fatal `0`
+- 아직 하지 않음: 실제 `NodeDefinitions.userdataset/.csv`, 노드 선택 승인 API,
+  StageReward 지급, Shop Controller, Map/Instance 이동
+
+### 2026-08-01 — 적 드롭과 런 자동 회수 계약
+
+- 상태: ✅ Tested (actual Dataset), fallback 비활성
+- 새 파일:
+  - `03_Data/Repositories/EnemyDropDefinitionRepositoryLogic.mlua`
+  - `03_Data/Repositories/EnemyDropContentValidatorLogic.mlua`
+  - `03_Data/Repositories/ContentReferenceResolverLogic.mlua`
+  - `01_Combat/Components/Shared/BattleDropComponent.mlua`
+- 실제 Definition: `EnemyDropDefinitions` 4행, `CurrencyDefinitions`의 `gold`, `ConsumableDefinitions`의 `potion_hp_small`
+- 데이터 책임: Enemy 수치와 분리된 `EnemyDropDefinitions` 독립 행. `ANY_KILL`, `COMBO_KILL`, `BOSS_KILL` Trigger와 `CURRENCY`, `CONSUMABLE` 보상 타입을 규격화
+- 결정성: `RunSeed + StageId + WaveIndex + SpawnOrder + UnitId + DropEntryId` 기반 판정
+- 수명: 적 사망 결과는 맵 수명의 Pending Drop, 승리 시 플레이어 런 상태로 자동 회수, 패배·세션 종료 시 폐기
+- 멱등성: 모든 지급에 RewardKey를 사용하며 같은 키 재전송은 성공으로 무시
+- 런 상태: 재화·소모품 Snapshot, 소모품 용량, 초과분 런 재화 전환 설정, RewardRevision 제공
+- 공개 API: `RunManagerLogic:GrantRunReward()`, `GetRunRewardSnapshot()` 및 `BattleSessionComponent:GetBattleSnapshot()`의 Drop 필드
+- Maker 검증: 같은 Seed 판정 2회가 동일, RewardKey 중복 지급 무시, 소모품 5개 중 3개 수용·2개 골드 전환, 실제 `HandleUnitDied`에서 Pending Drop 생성, 테스트 후 Battle 재구축
+- Validator 객체 경계: Repository는 로드·행 불변식, Drop Validator는 중복·교차 참조, Reference Resolver Registry는 실제 Dataset 위치와 정책을 담당하고 `ContentValidatorLogic`은 Facade만 담당
+- 참조 계약: `ENEMY_DEFINITION`, `RUN_CURRENCY`, `CONSUMABLE`. 드롭 재화는 `RUN_SCOPED`만 허용해 향후 상점·메타 재화 정책과 분리
+- 차단 Gate: `BattleDropComponent.ResolveEnemyDeath()`가 최초 판정 전에 캐시된 전체 검증 결과를 요구하며, 데이터 변경 테스트는 Facade의 Invalidate API를 사용
+- Validator 음수 검증: 없는 Enemy/Consumable 참조와 중복 DropEntryId를 각각 `DATA_INVALID_DROP_REFERENCE`, `DATA_DUPLICATE_ID`로 차단
+- 최종 양수 검증: 전체 4행 valid, `RUN_CURRENCY/gold` 참조 해결, 처치 후 골드·물약 Pending 2건 생성, 자동 회수 후 `gold~1`, `potion_hp_small~1`
+- Build Console Warning/Error/Fatal `0`; 최종 Runtime Error/Fatal `0`
+- Dataset 전환 검증: `EnemyDropDefinitions` 4행, `early_mushroom` 2행, `guard_mushroom` 2행, `Source=DATASET`, fallback=false, 누락 적 `NO_DROP_ENTRIES`
+- 객체지향 감사 후 교정:
+  - HP 초기화·피해·회복·사망을 `BattleUnitComponent` 소유 API로 캡슐화
+  - 런 진행 `PlayerRunStateComponent`와 보상 인벤토리 `PlayerRunInventoryComponent` 분리
+  - 오래된 Architecture Review를 역사 문서로 표시하고 현재 규격의 협력 Component 소유권으로 교정
+  - `EnemyDefinitions.InitialFacingPolicy` 실제 Dataset/Repository/Spawn 적용 누락 보완
+- 소모품: `potion_hp_small = HEAL 4 / SELF / BATTLE_FREEPLAY / ConsumesTurn=false`; Definition Repository → Effect Router → Heal Handler → Unit API로 실행
+- Trigger: 한 사망에서 `ANY_KILL`, 큐 실행 2번째 처치부터 `COMBO_KILL`, `IsBoss=true`이면 `BOSS_KILL`을 순서대로 함께 해석
+- Maker 검증: 피해 `100→97`, 물약 `97→100`, 1개 소비, 동일 UseKey 중복 무시, Full HP 사용 차단·수량 유지, 복합 Trigger 3개 해석, Client Drop/Inventory DTO 확인
+- Build Warning/Error/Fatal `0`; Runtime Error/Fatal `0`
+- 월드 표시 구현: `BattleDropPickup.model`과 `BattleDropPresentationComponent`를 추가하고
+  코인/물약 SpriteRUID, Cell 좌표 배치, 부유 모션, 회수·폐기 시 Entity 제거를 상태 객체와 분리
+- 월드 표시 Maker 검증: 코인·물약을 Cell 2/4에 생성해 `pending=2`, `visible=2`,
+  두 Entity와 RUID·`TweenFloatingComponent` 유효 확인
+- 표시 정리 검증: 폐기 시 `removed=2`, `pending=0`, `visible=0`, 두 Entity 무효화
+- 자동 회수 검증: Cell 3의 골드 2개를 회수해 `AUTO_COLLECTED`, `currency=gold~2`,
+  `visible 1→0`, `pending=0`; Build Warning/Error/Fatal 0, Runtime Error/Fatal 0
+- 아직 하지 않음: 최종 Drop/Icon·소모품 UI, 계정 영구 저장
+
+### 2026-08-01 — StageDefinitions 실제 Dataset 전환
+
+- 상태: ✅ Tested (actual Dataset), compatibility fallback 비활성
+- 실제 페어: `03_Data/StageDefinitions.userdataset/.csv`
+- `stage01`: 6 Cell, 시작 Cell 2, 큐 3, WaveTable `stage01`
+- Repository는 조회된 StageId의 행 수를 `MatchCount`로 제공하고 Validator가 중복 ID를 차단
+- Maker 검증: `rows=1`, `source=DATASET`, `fallback=false`, `matchCount=1`, `valid=true`, `waves=3`
+- 전투 세션 검증: `sessionStage=stage01`, `sessionWave=1/3`
+- 존재하지 않는 Stage: `STAGE_DEFINITION_NOT_FOUND`
+- Build Warning/Error/Fatal 0; 양수 회귀 Runtime Error/Fatal 0
+
+### 2026-08-01 — SkillDefinitions·SkillEffectSteps 실제 Dataset 전환
+
+- 상태: ✅ Tested (actual Dataset), compatibility fallback 비활성
+- 실제 페어: `03_Data/SkillDefinitions.userdataset/.csv`, `SkillEffectSteps.userdataset/.csv`
+- Skill 5행: 기본·빠른·강한 베기, 밀치기, 베고 밀치기
+- Effect Step 5행: DAMAGE, PUSH와 DAMAGE→PUSH 2단계 조합
+- Maker 검증: `skillRows=5`, `stepRows=5`, 모든 Bundle `source=DATASET`, `matchCount=1`, Validator 통과
+- 실제 실행: `slash_push_combo`가 Step 1 DAMAGE `HP 6→5`, Step 2 PUSH `Cell 3→4` 순서로 처리
+- Cooldown: 실행 직후 `slash_push_combo:2` 확인
+- Build Warning/Error/Fatal 0; Runtime Warning/Error/Fatal 0

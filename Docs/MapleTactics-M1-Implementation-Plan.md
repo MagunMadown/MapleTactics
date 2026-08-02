@@ -208,15 +208,15 @@ StageFlowComponent
 
 목표: 본 구현 전에 가장 위험한 MSW 경계를 작은 코드로 증명한다.
 
-- [ ] `map01`을 SideViewRectTile로 전환할지 확정한다.
+- [x] `map01`은 `TileMapMode=0` MapleTile을 유지하고 전투 유닛은 서버 Cell 스냅 이동을 사용하기로 확정.
 - [ ] 개발용 Static Map과 실제 전투용 Instance Map을 분리하거나, 전투 맵의 InstanceMap 정책을 확정한다.
-- [ ] 전환한다면 Maker에서 사용자가 수행하고 AI가 `TileMapMode=2`를 재확인한다.
-- [ ] 맵 타입에 맞는 Body + MovementComponent를 가진 테스트 유닛 모델을 만든다.
-- [ ] Cell 0 -> 1 -> 0 스냅 이동을 서버에서 수행한다.
-- [ ] UI 버튼에서 Server Command를 요청하고 senderUserId를 검증한다.
-- [ ] 서버 결과를 Client UI 텍스트로 표시한다.
-- [ ] UserDataSet을 읽어 숫자/불리언 변환과 잘못된 참조 검증을 수행한다.
-- [ ] 두 타일 큐에서 첫 타일 Push 후 두 번째 타일 Target 재계산 테스트를 통과한다.
+- [x] 맵 타입 전환 불필요를 확정하고 MapleTile 규칙을 유지.
+- [x] 보드 전투 유닛은 물리 이동 모델이 아니라 Cell 상태 + Transform Presentation으로 구성.
+- [x] Cell 스냅 이동을 서버 권위로 수행.
+- [x] Client Request에서 `senderUserId`를 검증.
+- [x] 서버 Command 결과를 디버그 HUD DTO로 표시.
+- [x] UserDataSet 숫자/불리언 변환과 잘못된 참조 검증 구현.
+- [x] 큐 앞 행동의 이동·밀치기 후 다음 타일 Target 재계산 검증.
 
 완료 기준:
 
@@ -231,20 +231,21 @@ StageFlowComponent
 
 - [x] `BattleTurnComponent` Phase/Turn/Queue 상태 소유와 `BattleSessionComponent` 실행 조정 분리.
 - [x] `BattleWaveComponent` Wave/강제 증원/Timer 상태 소유와 Session Spawn 조정 분리.
-- [ ] `BoardStateComponent`와 점유 조회 구현.
-- [ ] 단일 `EnemyEntity` 참조를 UnitId 기반 다중 유닛 Registry로 교체.
-- [ ] 플레이어 좌우에 적 1명씩 둔 고정 배치 회귀 시나리오.
-- [ ] MOVE, TURN Command 검증/적용.
+- [x] `BoardStateComponent`와 점유 조회 구현.
+- [x] 단일 `EnemyEntity` 참조를 UnitId 기반 다중 유닛 Registry로 교체.
+- [x] 플레이어 좌우에 적을 배치하는 다중 적 회귀 시나리오.
+- [x] MOVE, TURN Command 검증/적용.
 - [x] `BattleTurnComponent` 가변 최대 슬롯과 등록·실행 큐 순서 구현.
-- [ ] QUEUE_TILE의 FreePlay 턴 소비 예외 구현.
-- [ ] EXECUTE_QUEUE의 타일별 타깃 재계산 구현.
-- [ ] DAMAGE, PUSH, TURN, MOVE 원시 Effect 구현.
-- [ ] 사망 제거, Victory/Defeat 구현.
-- [ ] `IsResolving`과 ClientSequence 중복 방지 구현.
-- [ ] 최소 HUD에 Phase, Turn, Queue, Cooldown, Enemy Intent 표시.
-- [ ] 적 Intent를 `Prepare → Hold → Execute → Complete`로 분리하고 플레이어 턴 동안 PreparedIntent를 유지.
-- [ ] 밀치기 후 ActionType/TileId는 유지하고 실행 시 현재 CellIndex/Facing으로 타깃을 다시 계산.
-- [ ] Phase 1 하드코딩 Pattern과 Phase 2 `EnemyPatternSteps`가 같은 PreparedIntent 계약을 사용.
+- [x] QUEUE_TILE의 FreePlay 턴 소비 예외 구현.
+- [x] EXECUTE_QUEUE의 타일별 타깃 재계산 구현.
+- [x] DAMAGE, PUSH, TURN, MOVE 원시 Effect 구현.
+- [x] 사망 제거, Victory/Defeat 구현.
+- [x] `IsResolving`과 ClientSequence 중복 방지 구현.
+- [x] 최소 HUD에 Phase, Turn, Queue, Cooldown, Enemy Intent 표시.
+- [x] 적 Intent를 `Prepare → Hold → Execute → Complete`로 분리하고 플레이어 턴 동안 PreparedIntent 유지.
+- [x] 밀치기 후 ActionType/TileId를 유지하고 실행 시 현재 CellIndex/Facing으로 타깃 재계산.
+- [x] 하드코딩 Pattern과 향후 `EnemyPatternSteps`가 공유할 PreparedIntent 계약 구현.
+- [x] `EnemyIntentComponent` 상태 소유와 `EnemyIntentResolverLogic` 무상태 판정 분리. Maker에서 Prepared 유지, 두 적 순차 실행, UI DTO 회귀 검증 완료.
 
 완료 기준:
 
@@ -266,15 +267,18 @@ StageFlowComponent
 
 목표: 기존 원시 타입 조합만으로 새 타일과 일반 적을 추가한다.
 
-- [ ] TileDefinitions/TileEffects 로더.
-- [ ] EnemyDefinitions/EnemyPatternSteps 로더.
-- [ ] `InitialFacingPolicy`(`FACE_PLAYER`, `FIXED_LEFT`, `FIXED_RIGHT`) Resolver.
-- [ ] TargetType: FRONT_CELL, FIRST_ENEMY_FORWARD, RANGE_OFFSETS 구현.
-- [ ] ConditionType: ALWAYS, DISTANCE_EQ, HP_RATIO_LE, CELL_FREE 구현.
-- [ ] Enemy Action: MOVE_TOWARD, MOVE_AWAY, TURN_TO_PLAYER, TELEGRAPH, EXECUTE_TILE, MOVE_FIXED_FACING 구현.
-- [ ] 이동 실패 시 Facing 유지 + WAIT 결과, 자동 반전 금지 검증.
-- [ ] ContentValidator의 중복 ID, 참조 무결성, 범위, enum 검사 구현.
-- [ ] CSV만 추가해 타일 2종과 적 2종을 추가하는 제작 테스트.
+- [x] 구 TileDefinitions/TileEffects 명칭을 실제 SkillDefinitions/SkillEffectSteps 규격으로 통합.
+- [x] `SkillDefinitions` 9행·`SkillEffectSteps` 9행 실제 Dataset과 fallback 비활성.
+- [x] `EnemyPatternSteps` 실제 Dataset, Repository·전용 Validator, BattleSession→Resolver 연결, fallback 비활성 완료. 현재 `CELL_FREE`, `prototype_retreat`, `prototype_telegraph`를 포함한 12행으로 확장.
+- [x] 적별 `EnemyPatternRunnerComponent` 상태 소유, 실패 분기 탐색, 실행 성공/실패 후 `NextStepOnSuccess/Failure`, 준비 취소 해제 구현. Maker에서 두 적 독립 상태, 성공 `3→1`·`2→1`, 실패 `1→2`, Current Step 2 시작 Resolver 분기, PlayerTurn 복귀를 검증.
+- [x] `InitialFacingPolicy`(`FACE_PLAYER`, `FIXED_LEFT`, `FIXED_RIGHT`) Resolver.
+- [x] TargetType: FRONT_CELL, FIRST_ENEMY_FORWARD, RANGE_OFFSETS 구현. 타격 시점 공용 Resolver와 UI 대상 Snapshot 포함.
+- [x] ConditionType `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE` Resolver 구현. `CELL_FREE` 네 Selector, 미등록 값 거부, 빈칸/점유/경계, 명시적 WAIT, 준비 후 점유 변경의 실행 재검사와 실패 전이까지 Maker 검증.
+- [x] Enemy Action: `MOVE_TOWARD`, `MOVE_AWAY`, `TURN_TO_PLAYER`, `EXECUTE_TILE`, `MOVE_FIXED_FACING`, `WAIT`, `TELEGRAPH_TILE`의 표 기반 선택/실행 구현. `TELEGRAPH_TILE`은 적별 Runner가 남은 턴을 소유하고 Complete 시에만 감소하며, UI DTO로 남은 턴을 제공한다.
+- [x] 이동 실패 시 Facing 유지 + WAIT 결과, 자동 반전 금지 검증. 세 이동 Action이 공통 변환을 사용하고 점유 실패·준비 후 점유 변경에서 상태 불변을 Maker 검증.
+- [x] ContentValidator의 중복 ID, 참조 무결성, 범위, enum 검사 구현. `ValidateAllContent()`가 행 위치를 포함한 전체 오류 목록을 반환하며 Stage·Skill·Job·Augment·Node Graph·Enemy Pattern·Drop을 통합 검사한다.
+- [x] BattleSession 시작·재구축 전 전체 검증 Gate. 실패 시 스폰·턴 시작을 차단하고 `ContentValidation` UI DTO와 RevisionKey를 제공한다.
+- [x] CSV만 추가해 스킬 2종과 적 2종을 추가하는 제작 테스트. 장거리 찌르기·갈라치기와 후퇴형·예고형 적을 기존 Resolver/Executor/Pattern/Model 조합만으로 Maker 검증.
 
 완료 기준:
 
@@ -285,25 +289,41 @@ StageFlowComponent
 
 목표: 스테이지 정의만으로 적 배치와 보상 진입을 구성한다.
 
-- [ ] StageDefinitions/StageEnemySpawns 로더.
-- [ ] CellIndex, FacingOverride, WaveIndex, SpawnOrder로 유닛 스폰.
+- [x] `StageDefinitions`, `StageEnemyWaves`, `EnemySpawnPools` 실제 Dataset 로더.
+- [x] CellIndex, FacingOverride, WaveIndex, SpawnOrder로 유닛 스폰.
 - [ ] Stage별 허용 적, 난이도 배수, 보상 풀 연결.
-- [ ] CurrencyDefinitions 로더 + Category 검증.
-- [ ] StageRewardDefinitions 로더 — StageId 클리어 시 CurrencyId/Amount를 재화 Category에 맞는 저장소(RUN_SCOPED는 PlayerRunStateComponent, META_PERSISTENT는 향후 계정 저장 데이터)에 지급.
-- [ ] StageRewardDefinitions가 Category=PREMIUM_CASH 재화를 참조하면 차단하는 Validator 규칙(DATA_REWARD_CURRENCY_NOT_ALLOWED) 구현.
-- [ ] EnemySpawnPools 로더.
-- [ ] StageEnemyWaves 로더 및 `SpawnTriggerMode`(`CLEAR_ONLY`, `TURN_LIMIT`, `TIME_LIMIT`, `TURN_OR_TIME`) 처리.
-- [ ] 웨이브 생성 시 `SpawnedAtStageTurn`/`SpawnedAtSeconds` Snapshot과 Stage 전체에서 증가하는 `StageTurnNumber` 기록.
-- [ ] 전멸 전 `ForceAfterTurns` 도달 시 다음 턴 경계에서 강제 증원.
-- [ ] 선택 기능인 `ForceAfterSeconds` 도달 시 `ForcedSpawnPending`만 설정하고 행동·모션 종료 후 증원.
-- [ ] 두 제한을 함께 쓰면 먼저 충족한 조건 하나만 소비하고 동일 Wave의 중복 Spawn을 방지.
-- [ ] 겹친 웨이브의 모든 생존 적을 같은 EnemyTurn 대상에 포함하고, `MaxConcurrent`/빈 칸 부족 시 Spawn 요청을 순서 보존 대기.
-- [ ] 웨이브 시작 시 결정적 빈 칸 선택 로직 (RunSeed+StageIndex+WaveIndex, `BALANCED`/`ANY`).
+- [x] CurrencyDefinitions 최소 실제 Dataset + 공통 Reference Registry의 Category 검증(`RUN_SCOPED`).
+- [x] StageRewardDefinitions Repository/Validator — Stage 승리 시 CURRENCY/CONSUMABLE을 PlayerRunInventoryComponent에 멱등 지급.
+- [x] RUN_SCOPED 외 재화 참조를 `DATA_REWARD_CURRENCY_NOT_ALLOWED`로 차단하고 전체 콘텐츠 시작 Gate에 포함.
+- [x] EnemyDropDefinitions Repository와 `ANY_KILL` 결정적 드롭 판정.
+- [x] 적 사망별 Pending Drop 상태, 승리 시 자동 회수, 패배 시 폐기.
+- [x] PlayerRunInventoryComponent의 런 재화·소모품 Snapshot과 RewardKey/UseKey 중복 처리 방지.
+- [x] EnemyDropDefinitions 실제 Dataset 페어 생성, 호환 행 4개 이관, `Source=DATASET`, fallback 비활성.
+- [x] EnemyDropDefinitions의 중복 DropEntryId·EnemyDefinitionId·DropRefId 교차 참조 Validator와 전투 드롭 Gate.
+- [x] ConsumableDefinitions 최소 실제 Dataset과 `potion_hp_small` 참조 등록.
+- [x] 전투 중 데이터 기반 `HEAL` 소모품 사용, 사용 멱등성, 무료/턴 소비 계약 연결.
+- [x] `ANY_KILL` + 큐 실행 2번째 처치 `COMBO_KILL` + `IsBoss` 기반 `BOSS_KILL` Trigger Resolver 연결.
+- [x] 실제 월드 Drop Sprite Presentation — 코인/물약 RUID, Cell 위치 생성, 부유 모션, 자동 회수·폐기 시 제거.
+- [ ] 최종 Drop/Icon·소모품 UI. 현재 DTO/H 키/HUD는 기능 검증용이며 UI 제작자가 교체.
+- [x] EnemySpawnPools 실제 Dataset 로더.
+- [x] StageEnemyWaves 로더 및 `SpawnTriggerMode`(`CLEAR_ONLY`, `TURN_LIMIT`, `TIME_LIMIT`, `TURN_OR_TIME`) 처리.
+- [x] `SpawnedAtStageTurn`/`SpawnedAtSeconds`와 Stage 전체 `StageTurnNumber` 기록.
+- [x] `ForceAfterTurns` 도달 시 다음 안전한 턴 경계에서 강제 증원.
+- [x] `ForceAfterSeconds` 도달 시 Pending 설정 후 행동·모션 종료 경계에서 증원.
+- [x] TURN/TIME 중 먼저 충족한 조건 하나만 소비하고 동일 Wave 중복 Spawn 방지.
+- [x] 겹친 Wave 생존 적 EnemyTurn 포함과 `MaxConcurrent`/빈 칸 부족 대기 처리.
+- [x] RunSeed 기반 결정적 빈 칸 선택(`BALANCED`/`ANY`).
 - [ ] 보스 Phase 조건과 PatternId 교체.
 - [ ] Pattern만으로 표현할 수 없는 요구가 실제로 발생한 경우에만 BT Spike 수행.
 - [ ] 스테이지 완료 -> 증강 선택 -> 다음 스테이지 전환.
 - [ ] 양방향(플레이어 좌/우 동시 교전) 시나리오 회귀 테스트.
-- [ ] RegionDefinitions/NodeDefinitions 로더 — 지역별 노드 그래프 로드와 `IsStartNode` 유일성 검증.
+- [x] NodeDefinitions 단일 Node 조회·Stage 역조회·다음 콘텐츠 DTO와 행 단위 검증 골격.
+- [x] `NodeDefinitions` 실제 Dataset 2행 이관, fallback 비활성, 그래프 시작점·참조·도달 가능성 검증.
+- [x] 다음 노드 선택 RPC, 플레이어별 전환 Snapshot, BATTLE/BOSS·SHOP·EVENT·REST Handler Router와 Client UI DTO.
+- [x] `OPEN_SHOP` 최소 서버 소비기 — ShopDefinitions/ShopEntries, Validator, 구매 원자성, Client DTO/Request.
+- [x] SHOP 구매/건너뛰기 완료 → 공통 비전투 콘텐츠 완료 → 다음 노드 또는 `RUN_COMPLETED`, 종료 요청 멱등성, Client DTO.
+- [ ] 최종 상점 UI와 `OPEN_EVENT`·`OPEN_REST` 소비기, StageId→MapId 전환 Adapter.
+- [ ] RegionDefinitions 로더와 NodeGraph 전체 검증 — 지역별 노드 그래프 로드, `IsStartNode` 정확히 1개, 전체 참조·도달 가능성 검증.
 - [ ] 지도판 UI가 NodeDefinitions를 읽어 현재 진행 가능한 노드만 선택 가능하게 표시.
 - [ ] 지역 보스(`BossStageId`) 클리어 시 `UnlockRegionId`로 다음 지역 잠금 해제.
 
@@ -316,23 +336,28 @@ StageFlowComponent
 - 마지막 웨이브가 출현한 뒤 모든 웨이브의 생존 적이 0명일 때만 Stage Clear가 발생한다.
 - RegionId만 바꿔 다른 노드 그래프와 몬스터 풀을 로드한다.
 - 스테이지 클리어 시 StageRewardDefinitions에 정의된 재화가 정확히 한 번 지급된다.
+- 적 드롭은 같은 Seed와 사망 식별자에서 동일하게 재현되고, 같은 RewardKey를 두 번 처리해도 런 보상은 한 번만 증가한다.
 
 ### Phase 4 — 직업 4종과 증강
 
 목표: Player 클래스 상속 없이 데이터와 패시브 조합으로 직업을 확장한다.
 
-- [ ] JobDefinitions 로더.
-- [ ] 시작 HP, 큐 크기, 시작 타일, JobPassiveId 적용.
-- [ ] AugmentDefinitions/AugmentEffects/Pool/Conflict 로더.
-- [ ] Trigger/Condition/Effect 파이프라인 구현.
+- [x] JobDefinitions/JobStartingSkillEntries 로더와 참조 Validator.
+- [x] 선택한 JobId의 시작 HP·큐 크기를 RunState에, 시작 스킬 수량을 RunInventory에 적용하고 큐 소유권을 검증.
+- [x] JobMechanic Router에 `FORWARD_PUSH` Handler를 등록하고 기존 MOVE 턴 경계에 연결.
+- [x] JobPassiveSetId를 Augment 런타임에 적용.
+- [x] AugmentDefinitions/AugmentEffects 로더와 참조 Validator.
+- [ ] StageAugmentPools/AugmentConflicts 로더와 참조 Validator.
+- [x] Trigger/Condition/Effect 최소 파이프라인 구현 (`TURN_START`, `ALWAYS`/`HP_RATIO_LE`, `HEAL`/`SELF`).
 - [ ] Unique/StackAdd/StackRefresh/ExclusiveGroup 구현.
-- [ ] 재귀 이벤트 SourceTag와 최대 깊이 구현.
+- [x] 재진입 SourceTag 차단과 최대 이벤트 깊이 구현.
 - [ ] 증강 3택 UI와 서버 선택 검증.
 - [ ] 4직업 최소 데이터와 각 직업 대표 패시브 1개.
 - [ ] `ConditionType=CHANCE_ROLL`(RunSeed 기반 결정적 확률 판정) 구현.
 - [ ] `TargetType=REAR_CELL`(현재 Facing 반대편 뒤 칸) Resolver 구현.
-- [ ] ShopItemDefinitions 로더 + Category/CurrencyId(재화 참조) Validator.
-- [ ] 상점 UI에서 아이템 구매 → EffectRefType(AUGMENT/SKILL/JOB)에 따라 지급 경로 연결.
+- [x] ShopDefinitions/ShopEntries 로더 + SHOP Node·RUN_SCOPED Currency·SKILL/CONSUMABLE 참조 Validator.
+- [x] 상점 구매 → SKILL/CONSUMABLE 지급과 재화 차감 원자성, 방문/요청 중복 방지.
+- [ ] 상점 RewardType을 AUGMENT/JOB까지 확장하고 전용 상태 소유자 지급 경로 연결.
 
 완료 기준:
 
@@ -345,7 +370,7 @@ StageFlowComponent
 목표: 다른 제작자가 안전하게 값을 추가할 수 있다.
 
 - [ ] 데이터 사전과 허용 타입 목록 고정.
-- [ ] ContentValidator 전체 실행 진입점.
+- [x] ContentValidator 전체 실행 진입점과 전투 시작 Gate, 구조화된 행 단위 오류 목록.
 - [ ] 대표 전투 시나리오 자동 재생 Command 목록.
 - [ ] Seed + CommandLog 기록과 재현.
 - [ ] 제작자 체크리스트와 오류 코드 문서.

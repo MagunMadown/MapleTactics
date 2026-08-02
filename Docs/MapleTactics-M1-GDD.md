@@ -25,7 +25,9 @@ Milestone: M1 playable vertical slice
 - 전투는 서버 권위이며 가능한 한 결정적이다.
 - 이동, 회전, 일반 타일 큐 등록, 큐 실행은 턴을 소비한다.
 - FreePlay 타일 큐 등록만 턴을 소비하지 않는다.
-- 큐는 최대 3칸을 기본값으로 하며 직업/증강이 변경할 수 있다.
+- 큐는 3칸을 기본값으로 하며 `기본값 + 직업/증강/유물 보너스`를 상하한 안에서 합산한다.
+- 일반 타일을 등록해 적 턴을 보낸 뒤에도 큐는 유지되며, 다음 플레이어 턴에 이동·회전·추가 등록 후 별도 실행 명령으로 한 번에 해소한다.
+- 턴과 큐 항목은 1:1이 아니다. FreePlay 등록·제거·순서 변경은 턴을 넘기지 않고 여러 번 수행할 수 있으며, 일반 등록과 전체 큐 실행만 각각 하나의 턴 소비 Command다.
 - 큐 실행 중 각 타일은 현재 보드에서 타깃을 다시 계산한다.
 - 적의 다음 행동은 플레이어에게 미리 표시된다.
 - 적 Intent는 플레이어 턴 전에 준비되어 ActionType/TileId가 고정되며, 플레이어가 위치를 바꿔도 실행 직전에 다른 행동으로 재선택하지 않는다.
@@ -50,7 +52,8 @@ Milestone: M1 playable vertical slice
 
 ## 5. 직업 설계 원칙
 
-직업은 클래스를 상속하지 않고 `JobDefinitions` 데이터와 공통 `PlayerCombatComponent`의 조합으로 만든다.
+직업은 클래스를 상속하지 않고 `JobDefinitions`, `JobStartingSkillEntries`, 공통
+`PlayerCombatComponent`, 독립 `JobMechanic` Handler의 조합으로 만든다.
 
 M1 직업 슬롯:
 
@@ -59,7 +62,8 @@ M1 직업 슬롯:
 3. 방어/반격 중심
 4. 이동/쿨다운 조작 중심
 
-각 직업은 시작 HP, 큐 크기, 시작 타일 세트, 대표 패시브로 구분한다.
+각 직업은 시작 HP, 큐 크기, 시작 스킬 세트, 직업 고유 메커니즘, 대표 패시브로 구분한다.
+시작 스킬은 일반 `SkillDefinitions`를 재사용하지만 직업 고유 메커니즘은 큐에 등록되지 않는다.
 
 ## 6. 적과 스테이지 원칙
 
@@ -168,3 +172,6 @@ M1 직업 슬롯:
 | 2026-07-28 | 추가 | AugmentEffects에 `ConditionValue`, `ConditionType=CHANCE_ROLL`, `TargetType=REAR_CELL` 추가 | "자쿰의 투구: 50% 확률 후방 공격"처럼 확률 기반·후방 타깃 유물을 코드 수정 없이 표로 표현하기 위함 | GDD §7, Data-Dictionary §15 |
 | 2026-07-30 | 추가 | 재화 레지스트리(`CurrencyDefinitions`) 신설, `ShopItemDefinitions.CurrencyType` 고정 enum을 `CurrencyId` 참조로 변경, 스테이지 클리어 보상(`StageRewardDefinitions`) 신설 | 체력을 재화로 쓰는 방식은 보류하고, 상점과 스테이지 보상이 같은 재화 정의 하나를 참조해 어떤 표든 재화 종류만 데이터로 바꿔 쓸 수 있게 하기 위함 | GDD §10, Data-Dictionary §18(CurrencyDefinitions 신설)/§19(StageRewardDefinitions 신설)/§20(ShopItemDefinitions, 구 §18)/§21(Validator 오류 코드, 구 §19) |
 | 2026-07-31 | 수정 | `EnemyDefinitions` 표에 빠져 있던 `InitialFacingPolicy`(`FACE_PLAYER`/`FIXED_LEFT`/`FIXED_RIGHT`) 컬럼을 추가 | `StageEnemySpawns`(§11)와 `StageEnemyWaves`(§13)가 이미 `EnemyDefinitions.InitialFacingPolicy`를 참조하고 있었는데 정작 §6 표 정의에는 해당 컬럼이 없던 문서 불일치를 바로잡음 | Data-Dictionary §6. 실제 `EnemyDefinitions.userdataset`/`.csv`에 이 컬럼을 추가하는 작업은 Maker의 UserDataSet 편집 화면에서 별도로 진행 필요(직접 JSON 편집 금지) |
+| 2026-08-01 | 추가 | 적 사망 드롭을 `EnemyDropDefinitions`로 분리하고 Pending Drop→승리 자동 회수→런 재화·소모품 상태 흐름을 추가 | 적 밸런스와 드롭표의 파일 충돌을 줄이고, Stage 보상·상점과 같은 런 보상 지급 경계를 재사용하기 위함 | Data-Dictionary §20.1, Implementation Plan Phase 3, Battle Core Guide §10. 실제 Dataset 페어 이관과 fallback 비활성까지 완료; 전투 중 소모품 사용 효과는 후속 작업 |
+| 2026-08-01 | 수정 | 일반 타일 등록과 큐 실행을 분리하고, 등록 후 적 턴에도 큐를 유지하는 쇼군식 흐름 및 기본+Modifier 큐 용량 계약을 확정 | 큐를 쌓는 동안 위치·방향을 조정한 뒤 별도 실행 키로 전체 큐를 해소하는 핵심 플레이를 구현하기 위함 | BattleTurn/BattleSession, BattleQueueHUD, UI 상태 DTO, Queue Modifier API |
+| 2026-08-01 | 수정 | 직업 시작 스킬과 직업 고유 메커니즘을 분리하고 구 TileDefinitions 명칭을 실제 SkillDefinitions 규격으로 통합 | 쇼군식 공격 타일과 캐릭터 고유 이동·전투 규칙은 실행 수명과 턴/쿨타임 계약이 다르므로 독립 확장점이 필요함 | JobDefinitions, JobStartingSkillEntries, JobMechanic Router, Data Dictionary §2~5 |

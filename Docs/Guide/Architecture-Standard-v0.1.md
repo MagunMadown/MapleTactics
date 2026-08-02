@@ -18,6 +18,8 @@
 문서로 사용한다.
 현재 구현에서 부족한 항목과 우선순위, 각 Gate의 해제 조건은 해당 문서의
 `2.1 현재 부족한 항목`을 단일 기준으로 사용한다.
+2026-08-01 객체 책임 감사 결과와 수정·유지·남은 부채는
+[`Architecture-OOP-Audit-2026-08-01.md`](./Architecture-OOP-Audit-2026-08-01.md)에 기록한다.
 
 - **필수**: 신규 코드와 데이터가 반드시 지켜야 한다.
 - **권장**: 특별한 이유가 없다면 따른다.
@@ -66,6 +68,20 @@
 9. 새 콘텐츠는 기본적으로 데이터 행을 추가한다. 새 규칙이 생길 때만 Handler를 추가한다.
 10. 현재 성공한 Stage 1 동작을 유지하면서 책임을 한 영역씩 이동한다.
 
+### 2.1 객체지향 원리 적용 기준
+
+MSW에서는 일반 Lua 클래스 계층보다 Entity/Component 조립과 명시적 메서드 계약을 객체 경계로 사용한다.
+
+- **단일 책임**: 진행, 인벤토리, 전투, 유닛, 표시 상태는 수명과 변경 이유가 다르면 별도 Component가 소유한다.
+- **캡슐화**: 외부 객체는 `CurrentHp` 같은 필드를 직접 대입하지 않고 소유자의 `Initialize/Apply/Mark/Consume` API를 호출한다.
+- **개방-폐쇄**: 새 콘텐츠는 Dataset 행으로 추가한다. 새 원시 규칙만 Router 한 곳과 독립 Handler를 확장한다.
+- **의존 역전**: Session은 구체 Dataset이나 특정 콘텐츠 ID가 아니라 Repository, Validator, Resolver, Facade 계약에 의존한다.
+- **조합 우선**: 직업·스킬·소모품별 상속 클래스를 늘리지 않고 Definition + Runtime Component + Handler를 조합한다.
+- **인터페이스 분리**: UI는 읽기 DTO와 Request API만 사용하며 서버 내부 상태 소유 API를 호출하지 않는다.
+
+Router의 `EffectType`/`ActionType` 분기는 허용되는 닫힌 확장점이다. 특정 `SkillId`,
+`ConsumableId`, `EnemyDefinitionId` 분기는 공용 Runtime에 두지 않는다.
+
 ---
 
 ## 3. 계층과 의존 방향
@@ -86,6 +102,24 @@ Event + @Sync
 UI / Motion / Effect Presentation
 ```
 
+Validator는 다음 객체 경계를 지킨다.
+
+```text
+ContentValidatorLogic (Facade)
+        ↓
+도메인 Validator (예: EnemyDropContentValidatorLogic)
+        ↓
+Repository의 행 객체 + ContentReferenceResolverLogic Registry
+        ↓
+실제 Definition Dataset
+```
+
+- Repository는 로드·변환·행 자체의 타입/범위를 소유한다.
+- 도메인 Validator는 중복과 여러 Definition 사이의 참조 무결성을 소유한다.
+- `ContentReferenceResolverLogic`은 참조 계약별 Dataset·키·활성/정책 열을 Registry로 캡슐화한다. `RUN_CURRENCY`처럼 사용 문맥을 이름에 포함해 상점·메타 재화 정책과 섞이지 않게 한다.
+- Session과 Runtime Component는 구체 Dataset을 알지 않고 `ContentValidatorLogic` Facade만 호출한다.
+- 새 참조 종류는 Validator의 조건문을 복사하지 않고 Registry spec을 등록한다.
+
 역방향 접근은 금지한다.
 
 - Dataset이 Runtime Entity를 참조하지 않는다.
@@ -101,6 +135,8 @@ UI / Motion / Effect Presentation
 | 상태 | 단일 소유자 | 변경 진입점 | 수명 |
 |---|---|---|---|
 | Run Seed, 현재 Stage, 완료 Stage | `PlayerRunStateComponent` | `RunManagerLogic` | 플레이어 Run |
+| 런 재화, 소모품, 지급·사용 멱등 키 | `PlayerRunInventoryComponent` | `RunManagerLogic` | 플레이어 Run |
+| 보유 증강, 스택, 획득 순서, 지급 멱등 키 | `PlayerRunAugmentComponent` | `RunManagerLogic` | 플레이어 Run |
 | BattlePhase, Turn, 행동 큐, 입력 잠금 | `BattleTurnComponent` | Turn 공개 API | 전투 맵 |
 | 승패, Stage 연결, 전체 실행 조정 | `BattleSessionComponent` | Session 공개 API | 전투 맵 |
 | Wave, 증원 예약, Spawn Timer | `BattleWaveComponent` | Wave 공개 API | 전투 맵 |
@@ -108,6 +144,7 @@ UI / Motion / Effect Presentation
 | 보드 등록과 Cell 점유 | `BoardStateComponent` | Registry API | 전투 맵 |
 | 보유 Skill과 Cooldown | `SkillRuntimeStateComponent` | Skill 실행·Turn API | 전투 참가자 |
 | 준비된 적 Intent | `EnemyIntentComponent` 또는 Turn Controller | Intent API | 전투 맵/적 |
+| 전투 중 미회수 드롭 | `BattleDropComponent` | Drop API | 전투 맵 |
 | UI 표시 캐시 | UI Controller | `Refresh...` | 클라이언트 UI |
 
 현재 `SkillRuntimeStateComponent`, `BattleTurnComponent`, `BattleWaveComponent`는
@@ -117,7 +154,8 @@ UI / Motion / Effect Presentation
 `BattleSessionComponent`의 기존 Turn/Queue와 Wave `@Sync` 필드는 단계적
 마이그레이션을 위한 호환 Snapshot이다. 직접 변경하지 않고
 `PublishTurnStateSnapshot()` 또는 `PublishWaveStateSnapshot()`으로만 갱신한다.
-신규 UI와 기능은 각 상태 소유 컴포넌트를 직접 읽거나 공개 메서드를 호출한다.
+신규 서버 기능은 각 상태 소유 컴포넌트의 공개 메서드를 호출한다. UI는 소유 컴포넌트
+경로를 직접 조합하지 않고 Session/Gateway가 제공하는 읽기 DTO와 Request API만 사용한다.
 
 ### 4.1 상태 변경 금지 규칙
 
@@ -154,6 +192,8 @@ RootDesk/MyDesk/
 │   │   └── ModifierPipelineLogic.mlua
 │   ├── Resolvers/
 │   │   └── EffectRouterLogic.mlua
+│   ├── Jobs/
+│   │   └── JobMechanicRouterLogic.mlua
 │   └── Events/
 ├── 03_Data/
 │   ├── Repositories/
@@ -165,6 +205,7 @@ RootDesk/MyDesk/
 │   ├── SkillEffectSteps.userdataset
 │   ├── EnemyPatternSteps.userdataset
 │   ├── JobDefinitions.userdataset
+│   ├── JobStartingSkillEntries.userdataset
 │   ├── AugmentDefinitions.userdataset
 │   └── ItemDefinitions.userdataset
 ├── 04_Roguelike/
@@ -202,15 +243,23 @@ MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은
 - 현재 Turn과 Phase
 - 즉시 행동 슬롯과 가변 Skill 큐
 - 등록 큐와 실행 큐의 분리
+- 기본+Modifier 방식의 큐 용량과 상하한
+- 적 라운드를 지나 유지되는 플레이어 등록 큐
+- 턴 소비 Command와 무료 큐 편집을 분리하는 1:N 상태 계약
 - 실행 중 입력 잠금
 - 행동 완료 후 적 Turn 전환
 - Wave 전환과 전투 종료 Phase 반영
 
-상태 변경은 `ResetTurnState`, `OpenPlayerTurn`, `TryReserveImmediateAction`,
-`TryAppendSkill`, `TryFreezeSkillQueue`, `BeginEnemyTurn`, `CompleteEnemyTurn`,
-`SetPhase`를 통해서만 수행한다. Session은 타깃·피해·모션·적 Intent 실행을 조정하고
+상태 변경은 `ResetTurnState`, `ConfigureQueueCapacity`,
+`UpsertQueueCapacityModifier`, `RemoveQueueCapacityModifier`, `OpenPlayerTurn`,
+`TryReserveImmediateAction`, `TryAppendSkill`, `TryFreezeSkillQueue`,
+`BeginEnemyTurn`, `CompleteEnemyTurn`, `SetPhase`를 통해서만 수행한다.
+Session은 타깃·피해·모션·적 Intent 실행을 조정하고
 행동 경계에서 Turn API를 호출한다. 자세한 사용법은
 [`Battle-Turn-Guide.md`](./Battle-Turn-Guide.md)를 따른다.
+
+Client UI는 Turn Entity 경로와 Session 호환 필드를 직접 조합하지 않고
+`BattleSessionComponent.GetBattleUiState()`의 읽기 전용 DTO를 사용한다.
 
 ### 6.3 BattleWaveComponent — 구현됨
 
@@ -231,6 +280,10 @@ Session은 실제 Enemy Definition 조회와 Spawn, 보드 수용량 판정, 승
 - `CellIndex`, `Facing`
 - `MaxHp`, `CurrentHp`, `IsDead`
 - 적 Definition과 전투 수치 Snapshot
+
+상태 초기화·피해·회복·사망·셀·방향 변경은 각각 `InitializeBattleState`,
+`ApplyDamage`, `ApplyHealing`, `MarkDead`, `ApplyCellChange`, `ApplyFacingState`를
+통한다. Session과 Effect Handler가 소유 필드를 직접 대입하지 않는다.
 
 ### 6.5 BoardStateComponent — 구현됨
 
@@ -289,6 +342,23 @@ Runtime Entity와 Timer를 보관하지 않는다.
 
 MSW 컴포넌트는 외부에서 생성자를 호출하지 않는다. Gateway가 플레이어에 컴포넌트를
 찾거나 추가하고, `Prepare(...)`와 `BattleSession.InitializeFromEntry(...)`를 사용한다.
+
+### 6.11 Drop·Run Inventory·Consumable — 구현됨
+
+- `BattleDropComponent`: 사망별 Trigger 집합 판정 결과와 Pending Drop 수명 소유
+- `BattleDropPresentationComponent`: Pending Drop을 월드 오브젝트로 표시하고 표시 Entity 수명만 소유
+- `EnemyDropTriggerResolverLogic`: `ANY_KILL`, 큐 실행 중 2번째 처치부터 `COMBO_KILL`, `IsBoss=true`의 `BOSS_KILL` 조합
+- `PlayerRunInventoryComponent`: 런 재화·소모품과 지급/사용 멱등 키 소유
+- `ConsumableDefinitionRepositoryLogic`: 사용 시점·턴 소비·효과 DTO 검증
+- `ConsumableEffectRouterLogic`: 원시 EffectType을 독립 Handler에 연결
+- `ConsumableHealEffectLogic`: 유닛 소유 API로 회복 적용
+
+최종 UI는 `GetBattleUiState().Drops`, `RunInventory`를 읽고
+`RequestUseConsumable(consumableId, requestId)`만 호출한다.
+
+드롭 판정과 표시를 분리한다. `BattleDropComponent`의 Pending Snapshot이 권위 상태이며,
+표시 Entity 생성 실패는 보상 판정이나 자동 회수를 취소하지 않는다. 스프라이트·부유 모션·
+OrderInLayer는 `BattleDropPresentationComponent`와 `BattleDropPickup.model`에서 교체한다.
 
 ---
 
@@ -392,7 +462,7 @@ UI 표시 문구는 Reason ID와 분리한다. 서버 Reason을 그대로 사용
 
 ## 10. Stage 콘텐츠 규격
 
-### 10.1 StageDefinitions — 런타임 골격 구현됨
+### 10.1 StageDefinitions — 실제 Dataset 전환 완료
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---:|---|
@@ -412,9 +482,9 @@ UI 표시 문구는 Reason ID와 분리한다. 서버 Reason을 그대로 사용
 Map Entity에는 가능하면 `StageId`만 설정하고 세부 값은 Repository에서 읽는다.
 
 `StageDefinitionRepositoryLogic`과 `ContentValidatorLogic`이 구현되어
-`BattleSessionComponent` 진입 전에 Definition과 Wave 참조를 검증한다. 현재 `stage01`은
-기존 전투 보존을 위한 호환 Definition을 제공하며, Maker의 `StageDefinitions`
-UserDataSet 행이 존재하면 Dataset을 우선한다. 제작 절차와 호환 제거 조건은
+`BattleSessionComponent` 진입 전에 Definition과 Wave 참조를 검증한다. `stage01`은
+실제 `StageDefinitions` Dataset 1행으로 이관됐으며 compatibility fallback은 비활성이다.
+중복 `StageId`는 `DATA_DUPLICATE_STAGE_ID`로 차단한다. 제작 절차는
 [`Stage-Authoring-Guide.md`](./Stage-Authoring-Guide.md)를 따른다.
 
 ### 10.2 기존 Stage Dataset — 구현됨
@@ -458,7 +528,7 @@ SkillDefinition
 → ...
 ```
 
-### 11.2 SkillDefinitions — 런타임 골격 구현됨
+### 11.2 SkillDefinitions — 실제 Dataset 전환 완료
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---:|---|
@@ -468,6 +538,7 @@ SkillDefinition
 | `SkillTags` | string |  | `|` 구분 태그 |
 | `TargetingType` | string | O | 대상 선택 규칙 |
 | `Range` | integer | O | Cell 기준 사거리 |
+| `TargetOffsets` | string |  | `RANGE_OFFSETS`의 Facing 기준 Cell 목록 (`1|2`) |
 | `CooldownTurns` | integer | O | 0 이상 |
 | `CostType` | string |  | 비용이 없으면 빈 문자열 |
 | `CostValue` | number | O | 비용이 없으면 0 |
@@ -475,11 +546,13 @@ SkillDefinition
 | `EffectSetId` | string | O | Effect Step 묶음 |
 | `RequiredJobTag` | string |  | 제한이 없으면 빈 문자열 |
 | `ActionDuration` | number | O | 큐의 다음 행동까지 기다리는 시간 |
+| `FreePlay` | boolean | O | 등록 시 Turn 소비 여부 |
 
-v0.1 최초 구현 TargetingType은 현재 전방 Cell 판정을 표현할 수 있는
-`FRONT_CELL`부터 시작한다. 다른 TargetingType은 실제 기능 Slice에서 추가한다.
+현재 `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS`를 지원한다.
+`SkillTargetResolverLogic`이 실제 타격 시점에 대상 Snapshot을 한 번 만들고, 모든 Effect
+Executor와 UI DTO는 이 결과를 공유한다. Session이나 UI에서 별도로 사거리 판정을 복제하지 않는다.
 
-### 11.3 SkillEffectSteps — 런타임 골격 구현됨
+### 11.3 SkillEffectSteps — 실제 Dataset 전환 완료
 
 | 필드 | 타입 | 필수 | 설명 |
 |---|---|---:|---|
@@ -497,8 +570,9 @@ v0.1 최초 구현 TargetingType은 현재 전방 Cell 판정을 표현할 수 �
 Validation 실패다.
 
 `SkillDefinitionRepositoryLogic`과 `ContentValidatorLogic`이 Definition과 Effect Step을
-조회·변환·검증한다. 현재 기본 베기, 강한 베기, 밀치기는 공통 실행 경로로 이전되었고,
-복수 Effect Step도 `StepIndex` 순서로 실행한다. Cooldown은 유닛의
+조회·변환·검증한다. 기본 스킬 5개, TargetType 검증용 2개, CSV 제작 예제 2개와 Effect Step 9개가
+실제 Dataset으로 이관됐고 fallback은 비활성이다. 중복 SkillId와
+누락·중복 StepIndex를 차단하며 복수 Effect Step은 `StepIndex` 순서로 실행한다. Cooldown은 유닛의
 `SkillRuntimeStateComponent`가 기록하고 Turn 경계에서 감소시킨다.
 세부 제작 절차는 [`Skill-Authoring-Guide.md`](./Skill-Authoring-Guide.md)를 따른다.
 
@@ -556,7 +630,15 @@ Context는 요청 동안만 사용하는 값이다. Executor가 Context를 전�
 
 ## 12. 직업, 아이템, 증강 규격
 
-이 영역은 **스키마 계획됨** 상태다. Skill 실행 파이프라인이 안정된 뒤 구현한다.
+이 영역은 직업 정의와 시작 스킬 로더/검증기, 런 직업 스냅샷, 첫 실제
+`FORWARD_PUSH` JobMechanic, 런 스킬 소유권과 큐 허용 검사까지 구현되었다. 또한
+`JobPassiveSetId → AugmentId` 참조, 플레이어별 증강 상태, 최소 Trigger→Condition→Effect
+파이프라인까지 구현되었다. 증강 후보 풀·충돌/다중 스택 정책과 실제 상점 구매 어댑터는 후속 단계다.
+
+직업의 고정 선택값은 `PlayerRunStateComponent`, 런 중 추가될 수 있는 스킬 수량은
+`PlayerRunInventoryComponent`가 소유한다. BattleSession과 외부 노드는 두 Component를
+직접 조합하지 않고 `RunManagerLogic`의 `CanUseRunSkill`, `GrantRunSkill`,
+`GetRunSkillSnapshot`, `GrantRunAugment`, `GetRunAugmentSnapshot` 경계를 사용한다.
 
 ### 12.1 JobDefinitions
 
@@ -565,11 +647,23 @@ Context는 요청 동안만 사용하는 값이다. Executor가 Context를 전�
 | `JobId` | 직업 ID |
 | `DisplayName` | 표시 이름 |
 | `JobTags` | 사용 가능한 스킬·장비 태그 |
-| `BaseStatSetId` | 기본 능력치 묶음 |
-| `StartingSkillSetId` | 시작 스킬 |
-| `StartingItemSetId` | 시작 아이템 |
+| `BaseMaxHp` | 기본 최대 HP |
+| `BaseQueueCapacity` | 기본 큐 크기 |
+| `StartingSkillSetId` | JobStartingSkillEntries 참조 |
+| `JobMechanicId` | 큐 외부에서 동작하는 직업 고유 규칙 |
+| `JobPassiveSetId` | 시작 패시브/증강 세트 |
 
-직업별 Skill 클래스를 만들지 않는다. 직업은 사용 가능한 Definition 조합을 결정한다.
+직업별 Skill 클래스를 만들지 않는다. 시작 공격은 기존 `SkillDefinitions` 조합이며,
+고유 이동·교환·밀치기·관통 규칙만 `JobMechanicRouterLogic` 계약을 사용한다.
+
+### 12.1.1 JobMechanic 계약
+
+모든 직업 메커니즘은 `CanActivate`, `Execute`, `GetPreview`, `GetUiState`에 대응하는
+정규화 결과를 제공한다. mLua에서 임의의 깊은 상속 트리를 만들지 않고 Router가 독립
+Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알고리즘은 Handler가 소유한다.
+
+`JobMechanic`은 `SkillDefinitions`가 아니므로 스킬 큐·스킬 쿨타임·EffectSet을 자동 적용하지
+않는다. 턴 소비 여부는 실행 결과의 `ConsumedTurn`, UI 표시는 `GetUiState`로 명시한다.
 
 ### 12.2 ItemDefinitions
 
@@ -617,21 +711,24 @@ Context는 요청 동안만 사용하는 값이다. Executor가 Context를 전�
 
 ## 13. Enemy Pattern 규격
 
-### 13.1 EnemyPatternSteps — 계획됨
+### 13.1 EnemyPatternSteps — 구현됨
 
 | 필드 | 설명 |
 |---|---|
 | `PatternId` | 패턴 ID |
 | `StepIndex` | 실행 순서 |
-| `ConditionId` | 실행 조건 |
-| `ActionType` | TURN, MOVE, SKILL, WAIT |
-| `SkillId` | SKILL일 때 사용 |
-| `DirectionPolicy` | 추적, 고정 방향 등 |
+| `ConditionType` | `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE` |
+| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE` |
+| `TileId` | 예고·실행할 스킬 타일 ID |
+| `TelegraphTurns` | `TELEGRAPH_TILE` 예고 턴 수, 1 이상 |
+| `ParamA/B/C` | 조건·행동별 인자 |
 | `NextStepOnSuccess` | 성공 시 다음 Step |
 | `NextStepOnFailure` | 실패 시 다음 Step |
 
-현재 `prototype_basic`의 실제 행동 분기는 `BattleSessionComponent`에 있다. 규격 도입 후
+`EnemyPatternStepRepositoryLogic`과 전용 Validator가 행을 로드·검증하고,
 `EnemyIntentResolverLogic`이 Pattern Definition을 읽어 Prepared Intent Snapshot을 만든다.
+각 적의 `EnemyPatternRunnerComponent`가 Step과 Telegraph 카운트다운을 독립 소유하며,
+`BattleSessionComponent`는 준비·실행·완료 순서와 실제 보드 명령만 조정한다.
 
 UI는 Pattern 조건을 다시 계산하지 않고 Prepared Intent Snapshot만 표시한다.
 
@@ -758,8 +855,8 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 현재 Stage 1을 유지하면서 다음 순서로 진행한다.
 
 1. 이 규격을 공동 기준으로 승인
-2. `StageDefinitions` Repository와 Content Validator 추가 — 런타임 골격 구현, Dataset 전환 검증 중
-3. `SkillDefinitions`, `SkillEffectSteps`와 Repository 추가 — 런타임 골격 구현, Dataset 전환 검증 중
+2. `StageDefinitions` Repository와 Content Validator 추가 — 실제 Dataset 전환 및 fallback 비활성 완료
+3. `SkillDefinitions`, `SkillEffectSteps`와 Repository 추가 — 실제 Dataset 전환 및 fallback 비활성 완료
 4. 기본 베기·강한 베기·밀치기를 데이터 기반 Skill 실행으로 이전 — 단일 Effect 경로 구현
 5. Effect Context와 Executor 계약 정리 — DAMAGE/PUSH 및 다중 Step 실행 구현
 6. `SkillRuntimeStateComponent`와 Cooldown 골격 추가 — 구현됨
@@ -795,11 +892,16 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 | `StageWaveRepositoryLogic` | Stage/Enemy Repository | 책임별 Repository로 확장 |
 | `StageDefinitionRepositoryLogic` | Stage Definition Repository | 구현됨, Stage 1 Dataset 전환 후 호환값 제거 |
 | `ContentValidatorLogic` | 전투 시작 전 콘텐츠 참조 검증 | 구현됨 |
+| `ContentReferenceResolverLogic` | Definition 참조 Registry/Resolver | ENEMY_DEFINITION·RUN_CURRENCY·CONSUMABLE 구현됨 |
+| `EnemyDropContentValidatorLogic` | Drop ID 중복·Enemy/Reward 교차 참조 검증 | 구현됨, 결과 Cache 사용 |
 | `SkillDefinitionRepositoryLogic` | Skill·Effect Step Repository | 구현됨, Dataset 전환 후 호환값 제거 |
 | `StageEnemyWaves` | Stage Wave Definition | 유지 |
 | `EnemySpawnPools` | Spawn Pool Definition | 유지 |
 | `EnemyDefinitions` | Enemy Definition | 유지 |
 | `PlayerRunStateComponent` | Player Run State | 유지 |
+| `PlayerRunInventoryComponent` | Run Reward/Consumable State | 진행 상태와 분리 완료 |
+| `ConsumableDefinitionRepositoryLogic` | Consumable Definition Repository | 구현됨 |
+| `ConsumableEffectRouterLogic` | Consumable primitive effect Router | HEAL Handler 구현됨 |
 | `RunManagerLogic` | Run Coordinator | 유지 |
 | `BattleQueueHudComponent` | HUD Request/Presentation | 유지 후 Skill Definition 표시 연결 |
 

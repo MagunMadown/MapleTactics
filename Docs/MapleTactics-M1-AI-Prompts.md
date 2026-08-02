@@ -141,8 +141,8 @@ Docs/MapleTactics-M1-Implementation-Plan.md의 Phase 1을 끝까지 구현하라
 Phase 2를 구현해 기존 원시 타입 조합만으로 타일과 일반 적을 추가할 수 있게 하라.
 
 데이터셋은 한 셀에 중첩 JSON을 넣지 말고 다음처럼 정규화한다.
-- TileDefinitions
-- TileEffects
+- SkillDefinitions
+- SkillEffectSteps
 - EnemyDefinitions
 - EnemyPatternSteps
 
@@ -204,12 +204,15 @@ Phase 4를 구현하라. 직업별 PlayerComponent 상속 클래스를 만들지
 
 데이터셋:
 - JobDefinitions
+- JobStartingSkillEntries
 - AugmentDefinitions
 - AugmentEffects
 - StageAugmentPools
 - AugmentConflicts
 
-직업은 JobId가 시작 HP, QueueSize, StartingTileSetId, PassiveId를 결정한다.
+직업은 JobId가 BaseMaxHp, BaseQueueCapacity, StartingSkillSetId, JobMechanicId,
+JobPassiveSetId를 결정한다. 시작 공격은 SkillDefinitions 참조이며 직업 고유 기능은
+스킬 큐와 분리된 JobMechanic Router/Handler 계약으로 구현한다.
 
 증강 처리 순서:
 1. BattleEvent 수신

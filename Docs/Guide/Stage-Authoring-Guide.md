@@ -1,5 +1,10 @@
 # Stage 제작 가이드
 
+클리어 보상은 Stage 행에 직접 넣지 않고
+[`Stage-Reward-Authoring-Guide.md`](./Stage-Reward-Authoring-Guide.md)의
+`StageRewardDefinitions`에 독립 행으로 작성한다. 따라서 밸런스 담당자가 Wave 구성과 보상
+구성을 서로 충돌 없이 수정할 수 있다.
+
 ## 현재 적용 범위
 
 Stage 진입은 다음 순서를 사용한다.
@@ -16,31 +21,14 @@ StageId
 `BattleSessionComponent`는 더 이상 `StageId`를 웨이브 테이블 ID로 가정하지 않는다.
 보드 크기, Cell 간격, 플레이어 시작 Cell, 큐 용량도 Stage Definition에서 적용한다.
 
-현재 `stage01`은 기존 동작을 보존하기 위한 호환 Definition을 내장하고 있다.
-Maker에서 `StageDefinitions` UserDataSet을 추가하면 Dataset 행이 호환 Definition보다
-우선한다. `StageDefinitions.userdataset`과 원본 데이터 파일은 JSON을 직접 편집하지 않고
-Maker의 UserDataSet 생성·가져오기 절차를 사용한다.
+현재 `stage01`은 `StageDefinitions.userdataset/.csv` 실제 Dataset에서 로드된다.
+Repository의 compatibility fallback은 비활성이다.
 
 ## 현재 부족 상태
 
-현재 프로젝트에는 `StageDefinitions.userdataset`과 `StageDefinitions.csv` 페어가 없다.
-따라서 `stage01`은 `StageDefinitionRepositoryLogic`의 compatibility fallback으로
-동작하며 Stage 개발 Gate B는 닫혀 있다.
-
-Stage 2 제작 전에 다음 순서를 먼저 완료한다.
-
-1. Maker의 `RootDesk/MyDesk/03_Data/`에서 이름이 정확히 `StageDefinitions`인
-   UserDataSet을 생성한다.
-2. Maker가 생성한 `StageDefinitions.userdataset`과 `StageDefinitions.csv`가 같은
-   폴더에 있는지 확인한다.
-3. 아래 Stage 1 기준 CSV를 Maker Dataset 화면에서 입력하거나 가져온다.
-4. Workspace Refresh 후 Play에서
-   `[StageDefinition] loaded` 로그의 `stage=stage01`, `source=DATASET`을 확인한다.
-5. Stage 1의 시작·Wave·Victory·Reset 회귀 테스트를 통과한다.
-6. `AllowStage01CompatibilityFallback=false`로 바꾸고 존재하지 않는 Stage 실패도 확인한다.
-
-`.userdataset` 메타데이터는 직접 JSON으로 편집하지 않는다. CSV는 실제 행 데이터
-sidecar이지만 최초 페어와 열 정의는 Maker가 생성하도록 한다.
+Stage 개발 Gate는 열려 있다. 새 Stage는 기존 Dataset 페어의 CSV 행을 추가하고 Maker
+Refresh 후 `source=DATASET`, Wave 참조, 시작·Victory를 검증한다. `.userdataset`
+메타데이터는 새 Dataset을 만들 때만 Maker가 생성하며 기존 파일의 ID를 복제하지 않는다.
 
 ## StageDefinitions 스키마
 
@@ -54,7 +42,7 @@ sidecar이지만 최초 페어와 열 정의는 Maker가 생성하도록 한다.
 | `CellSpacing` | number | `1.12` | 0보다 커야 함 |
 | `UnitY` | number | `0.12` | 유닛 배치 world Y |
 | `PlayerStartCell` | integer | `2` | 0 이상, `CellCount` 미만 |
-| `QueueCapacity` | integer | `2` | 1 이상 |
+| `QueueCapacity` | integer | `3` | 1 이상 |
 | `WaveTableId` | string | `stage01` | `StageEnemyWaves.StageId`와 연결 |
 | `NextStageId` | string | 빈 문자열 | 마지막 Stage면 비움 |
 | `StageRuleId` | string | 빈 문자열 | 공용 규칙이면 비움 |
@@ -63,7 +51,7 @@ sidecar이지만 최초 페어와 열 정의는 Maker가 생성하도록 한다.
 
 ```csv
 SchemaVersion,StageId,DisplayName,CellCount,CellStartX,CellSpacing,UnitY,PlayerStartCell,QueueCapacity,WaveTableId,NextStageId,StageRuleId
-1,stage01,Stage 1,6,-2.8,1.12,0.12,2,2,stage01,,
+1,stage01,Stage 1,6,-2.8,1.12,0.12,2,3,stage01,,
 ```
 
 MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값을 그대로 입력하지 않는다.
@@ -94,15 +82,11 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 | `CONTENT_VALIDATION_FAILED` | `INVALID_QUEUE_CAPACITY` | 큐 용량이 1 미만 |
 | `CONTENT_VALIDATION_FAILED` | `WAVE_TABLE_NOT_FOUND` | 연결된 Wave가 없음 |
 | `CONTENT_VALIDATION_FAILED` | `NEXT_STAGE_SELF_REFERENCE` | 다음 Stage가 자기 자신 |
+| `CONTENT_VALIDATION_FAILED` | `DATA_DUPLICATE_STAGE_ID` | 같은 StageId가 여러 행에 존재 |
 
 UI는 `DetailReason`을 그대로 사용자 문구로 표시하지 않고 별도의 현지화 문구로 변환한다.
 
-## 호환 Definition 제거 조건
+## 호환 상태
 
-다음 조건을 모두 통과한 뒤
-`StageDefinitionRepositoryLogic.AllowStage01CompatibilityFallback`을 `false`로 바꾼다.
-
-1. `StageDefinitions`에서 `stage01`이 정상 조회된다.
-2. 로그의 Definition `source`가 `DATASET`이다.
-3. Stage 1 전체 회귀 테스트가 통과한다.
-4. 존재하지 않는 Stage가 `STAGE_DEFINITION_NOT_FOUND`로 거절된다.
+`AllowStage01CompatibilityFallback=false` 전환이 완료됐다. 존재하지 않는 Stage는
+`STAGE_DEFINITION_NOT_FOUND`로 거절하며 production Stage 하드코딩을 다시 추가하지 않는다.

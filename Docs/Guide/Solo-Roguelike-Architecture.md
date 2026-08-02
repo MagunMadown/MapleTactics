@@ -12,6 +12,7 @@ MapleTactics는 여러 플레이어가 하나의 전투를 공유하는 멀티�
 ```text
 플레이어의 한 번의 Run
 ├── PlayerRunStateComponent  맵을 넘어 유지되는 개인 진행
+├── PlayerRunInventoryComponent  해당 Run의 재화·소모품
 │   ├── 현재 스테이지
 │   ├── 덱과 공격 타일
 │   ├── 보유 증강
@@ -35,12 +36,13 @@ MapleTactics는 여러 플레이어가 하나의 전투를 공유하는 멀티�
 플레이어 엔티티에 붙는 개인 Run 상태 컴포넌트다. 플레이어 엔티티가 맵을 이동해도 유지되므로 스테이지 사이에 이어져야 하는 값을 보관한다.
 
 - 현재 구현: Run Seed, Run 순번, Run 상태, 현재 스테이지, 완료 스테이지 수, 마지막 전투 결과
+- 현재 NodeGraph/Node, 마지막 완료 StageId, 선택 가능한 다음 Node/Content DTO, Flow Revision
 - 선택한 직업
 - 덱과 공격 타일
 - 획득한 증강
 - Run 보상과 종료 상태
 
-현재 `04_Roguelike/RunManager/PlayerRunStateComponent.mlua`로 구현되어 있다. 플레이어마다 별도 컴포넌트를 가지므로 한 플레이어의 Run 값이 다른 플레이어와 섞이지 않는다. 덱·증강·보상과 영구 저장은 해당 기능을 구현하는 시점에 확장한다.
+현재 `04_Roguelike/RunManager/PlayerRunStateComponent.mlua`로 구현되어 있다. 플레이어마다 별도 컴포넌트를 가지므로 한 플레이어의 Run 값이 다른 플레이어와 섞이지 않는다. 런 재화·소모품은 `PlayerRunInventoryComponent`로 분리됐으며, 덱·증강과 영구 저장은 해당 기능을 구현하는 시점에 확장한다.
 
 ### RunManagerLogic
 
@@ -49,8 +51,11 @@ MapleTactics는 여러 플레이어가 하나의 전투를 공유하는 멀티�
 - 플레이어에서 `PlayerRunStateComponent`를 찾거나 최초 1회 추가
 - 기존 Run을 이어 쓸지 새 Run을 시작할지 결정
 - 전투 결과를 해당 플레이어의 Run 상태로 전달
+- `NodeDefinitions`를 통해 다음 전투·상점·이벤트·휴식 후보를 같은 DTO로 정규화
+- 실제 `NodeDefinitions` Dataset 그래프를 `NodeContentValidatorLogic`으로 검증하고 코드 fallback 없이 조회
 
-현재 공개 진입점은 `EnsureRunState(player, fallbackSeed)`, `StartNewRun(player, seed)`, `RecordBattleResult(player, stageNumber, result)`다.
+현재 공개 진입점은 `EnsureRunState(player, fallbackSeed)`, `StartNewRun(player, seed)`,
+`RecordBattleResult(player, stageId, stageNumber, result, entryRequestId)`, `GetRunFlowSnapshot(player)`다.
 
 ### BattleSessionComponent
 
@@ -155,8 +160,10 @@ BattleHUDController 또는 플레이어 입력
 BattleSession 승리 판정
 → RunManagerLogic.RecordBattleResult
 → 해당 플레이어의 PlayerRunStateComponent에 결과 기록
-→ 증강 선택
-→ 다음 Instance 전투 맵 입장
+→ NodeDefinitionRepositoryLogic이 NextNodeIds 검증·정규화
+→ RunFlowState=AWAITING_NODE_SELECTION
+→ 후속 시스템이 BATTLE/BOSS/SHOP/EVENT/REST 중 하나를 선택
+→ 다음 콘텐츠 입장
 → 새 BattleSession 생성
 → 기존 Run 상태를 읽어 전투 초기화
 ```
@@ -173,8 +180,9 @@ BattleSession 승리 판정
 6. 완전한 턴 루프
 7. map02용 Stage 설정 분리
 8. PlayerRunStateComponent와 RunManagerLogic 연결 ✅
-9. 증강 선택과 다음 스테이지 연결
-10. Instance Map 전환과 Run 영구 저장
+9. NodeDefinitions 결과 계약과 다음 콘텐츠 후보 기록 ✅
+10. 노드 선택 승인 API와 증강·상점·다음 스테이지 연결
+11. Instance Map 전환과 Run 영구 저장
 
 이 순서를 따르면 전투 규칙이 안정되기 전에 Run, 저장, Dataset 구조가 커지는 것을 막을 수 있다.
 
