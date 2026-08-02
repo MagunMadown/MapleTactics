@@ -47,11 +47,11 @@
 - Skill 실행·Cooldown·Wave·승패 연결
 - Client UI용 읽기 전용 Snapshot 조립
 
-### 향후 EnemyAttackQueueComponent
+### EnemyActionPlanComponent
 
-- 적별 등록 큐와 실행 큐
-- 적별 Queue Revision
-- `EnemyPatternRunnerComponent`가 준비한 다음 Command 실행
+- 적별로 이번 라운드의 고정 행동 큐와 실행 Index 소유
+- 적별 Queue Revision과 Trait Snapshot 제공
+- `EnemyPatternRunnerComponent`가 선택한 Step을 Trait Router로 장식한 뒤 보관
 
 ## 3. 큐 용량 API
 
@@ -136,10 +136,12 @@ UI는 동기화 필드를 직접 변경하지 않고 기존 `Request...` API만 
 
 ### Slice 5 — 적별 큐
 
-- 적 엔티티별 Attack Queue
-- 모든 적의 Prepared Command 동시 공개
-- 일반 적 준비 후 다음 행동에 실행
-- `QUICK` 적의 준비·즉시 실행 예외
+- 적 엔티티별 Action Plan Queue — 구현
+- 모든 적의 Prepared Command 동시 공개 — 구현
+- 플레이어 행동 전 전체 계획 동결, 적 실행 중 재판정 금지 — 구현
+- `HEAVY` 강제 이동 면역, `DOUBLE_STRIKE` 복수 행동 Queue — 구현
+- `QUICK` 실행 준비 지연 정책 — 구현, 원작형 타일 등록 즉시 발동은 후속 세부화
+- `EXPLOSIVE`, `REACTIVE_SHIELD` 실행기 — 후속
 
 ## 7. 회귀 시나리오
 
@@ -203,7 +205,7 @@ UI는 동기화 필드를 직접 변경하지 않고 기존 `Request...` API만 
 
 - 실제 `SkillDefinitions` UserDataSet 생성 후 `FreePlay=true` CSV 행의 무턴 등록 재검증
 - HUD 슬롯별 제거·정렬 버튼 또는 드래그 조작
-- Slice 5 적별 공격 큐와 다중 Intent DTO
+- Slice 5 Maker 다중 적 계획 불변성·Trait 회귀
 
 ### 2026-08-01 FreePlay 검증 준비
 

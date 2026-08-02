@@ -30,7 +30,7 @@
 | 전투 Turn·행동 Queue | 구현·회귀 검증 완료 | 가능 |
 | 논리 Cell 이동·방향·점유 | 구현·회귀 검증 완료 | 가능 |
 | Skill·Effect·Target Resolver | 데이터 기반 최소 규격 완료 | 가능 |
-| 적 Intent·Pattern Runner | 다중 적과 준비/실행 상태 구현 | 가능 |
+| 적 Intent·Pattern Runner | 적별 동시 계획·행동 Queue·Trait 최소 규격 회귀 완료 | 가능 |
 | Wave·강제 증원 | 전멸/턴/시간 조건 구현 | 가능 |
 | 적 Drop·Stage Reward | 재화·소모품 지급과 중복 방지 구현 | 가능 |
 | Job·Augment | 직업 1종과 최소 패시브 파이프라인 구현 | 조건부 가능 |
@@ -74,6 +74,13 @@
 - 종료 뒤 추가 종료: `SHOP_NOT_OPEN`
 - BATTLE 완료 우회: `CONTENT_TYPE_NOT_COMPLETABLE`
 - Client Run/Shop DTO 동기화: 통과
+- 적별 동시 계획: Turn 1의 생존 적 `2/2`를 플레이어 행동 전에 고정
+- 계획 불변 실행: 첫 적 이동 뒤 두 번째 적의 고정 Action을 재판정 없이 실행
+- Client 적 계획 DTO: `PER_ENEMY_FROZEN_PLAN_V1`, `count=2`, `parsed=2`
+- `HEAVY`: 밀치기 결과 `PUSH_BLOCKED_HEAVY_TRAIT`, Cell `4→4`
+- `DOUBLE_STRIKE`: 동일 Pattern Step의 행동 Queue `ActionCount=2`, Index `1→2`
+- 이번 변경 Build Console: Info 262, Warning 0, Error 0
+- 이번 변경 Runtime Warning/Error/Fatal: 0
 
 ## 5. 지금 병렬로 진행 가능한 작업
 
@@ -98,12 +105,13 @@
 
 ## 6. 다음 우선순위
 
-1. 최종 UI 담당자에게 Battle/Run/Shop DTO 인계
-2. EVENT와 REST 소비기를 `CompleteCurrentContent()` 규격으로 구현
-3. StageId→MapId Adapter와 Instance Map 정책 확정
-4. 증강 후보 Pool·충돌·3택 서버 검증
-5. 보스 Phase와 두 번째 Stage 데이터 제작
-6. Seed+CommandLog 재현과 저장 경계 추가
+1. 적별 동시 계획·Trait Queue Battle DTO를 UI 담당자에게 인계
+2. `EXPLOSIVE`, `REACTIVE_SHIELD` Trait 실행기 구현
+3. EVENT와 REST 소비기를 `CompleteCurrentContent()` 규격으로 구현
+4. StageId→MapId Adapter와 Instance Map 정책 확정
+5. 증강 후보 Pool·충돌·3택 서버 검증
+6. 보스 Phase와 두 번째 Stage 데이터 제작
+7. Seed+CommandLog 재현과 저장 경계 추가
 
 상세 체크리스트는 [`../MapleTactics-M1-Implementation-Plan.md`](../MapleTactics-M1-Implementation-Plan.md)를
 기준으로 한다.

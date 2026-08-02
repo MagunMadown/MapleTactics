@@ -78,7 +78,7 @@
 | 완료 | Stage 클리어 보상 | `StageRewardDefinitions`의 재화·소모품 보상을 승리 결과에서 멱등 지급 | 새 보상은 표 행으로 추가하고 런 전용 참조 정책과 중복 지급 회귀를 통과 |
 | 완료 | ContentType 전환 준비 계약 | 노드 선택을 BATTLE·SHOP·EVENT·REST Handler에 분배하고 플레이어별 READY Snapshot 제공 | 실제 UI·맵 Adapter는 `RouteAction`과 `DestinationId`만 소비 |
 | 완료 | 최소 런 상점 백엔드 | SHOP Node 연결, 고정 상품 DTO, RUN_SCOPED 골드 차감, 스킬·소모품 지급과 방문/요청 멱등성 | 상품은 CSV로 추가하고 UI는 RunShop DTO/Request만 사용 |
-| 완료 | Enemy Intent 상태·판정 분리 | `EnemyIntentComponent`가 Snapshot을 소유하고 `EnemyIntentResolverLogic`이 무상태 판정을 담당. Session은 실행 조정·호환 Snapshot만 유지 | Prepared 유지, 두 적 순차 실행, UI DTO `COMPONENT_SINGLE_COMPAT` Maker 검증 완료 |
+| 완료 | 적별 동시 계획·행동 Queue·Trait 규격 | 각 적의 `EnemyActionPlanComponent`가 플레이어 행동 전 고정 계획을 소유하고 Session은 순차 실행. `TraitIds`와 Router로 HEAVY·DOUBLE_STRIKE·QUICK 확장 | 다중 적 계획 Snapshot과 Client DTO 2건, 계획 불변성, HEAVY Cell 유지, DOUBLE_STRIKE `1→2`, Build/Runtime 오류 0 검증 완료 |
 | 완료 | `EnemyPatternSteps` 실제 Dataset | 전용 Repository/Validator, Resolver 연결과 fallback 비활성 | 추적·고정·후퇴·2턴 예고 샘플을 포함한 12행. 예고 카운트와 기존 전투 회귀까지 Maker 검증 |
 | 완료 | `TELEGRAPH_TILE` Action | 적별 Runner 카운트다운, 취소 시 미소비, TileId/남은 턴 PreparedIntent 고정 | `prototype_telegraph`의 `2→1→EXECUTE_TILE` 전이와 UI DTO 남은 턴 검증 |
 | 완료 | `MOVE_AWAY` Action | 플레이어 반대 방향 계산, 원자적 Facing·이동, 막힘 시 상태 유지, `prototype_retreat` | Cell `3→4`, Facing `Left→Right`, 점유 실패 시 상태 유지와 Runner `1→2`, 기존 Stage PlayerTurn 2 복귀, 빌드·런타임 Warning/Error 0건 검증 완료 |

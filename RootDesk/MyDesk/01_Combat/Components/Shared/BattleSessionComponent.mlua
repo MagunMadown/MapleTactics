@@ -22,6 +22,9 @@ script BattleSessionComponent extends Component
 	@Sync property integer PreparedEnemyDirection = 0
 	@Sync property integer PreparedEnemyTurn = 0
 	@Sync property string PreparedEnemyReason = ""
+	@Sync property string EnemyPlanSnapshot = ""
+	@Sync property integer EnemyPlanCount = 0
+	@Sync property integer EnemyPlanRevision = 0
 	@Sync property string LastSkillTargetSkillId = ""
 	@Sync property string LastSkillTargetingType = ""
 	@Sync property string LastSkillTargetUnitIds = ""
@@ -568,11 +571,11 @@ script BattleSessionComponent extends Component
 		self:ConfigureUnit(enemy, unitId, "Enemy", startCell, resolvedFacing, spawnDefinition.MaxHp, spawnOrder)
 		local enemyUnit = enemy:GetComponent("script.BattleUnitComponent")
 		if enemyUnit ~= nil then
-			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, spawnDefinition.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.IsBoss == true)
+			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, spawnDefinition.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.TraitIds or "", spawnDefinition.IsBoss == true)
 			if enemyConfiguration.Success == false then
 				log_error("[EnemyData] apply failed unit=" .. unitId .. " reason=" .. enemyConfiguration.Reason)
 			end
-			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " boss=" .. tostring(enemyUnit.IsBoss) .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
+			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " traits=" .. enemyUnit.EnemyTraitIds .. " boss=" .. tostring(enemyUnit.IsBoss) .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
 		end
 		return enemy
 	end
@@ -761,6 +764,56 @@ script BattleSessionComponent extends Component
 		if reason ~= "" then
 			log("[BattleSession] enemy intent snapshot reason=" .. reason .. " state=" .. snapshot.State .. " enemy=" .. snapshot.EnemyId .. " action=" .. snapshot.ActionType .. " revision=" .. snapshot.Revision)
 		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishEnemyPlanSnapshot(string reason)
+		-- Synchronizes a compact read-only list so UI can render every enemy without running AI rules.
+		local entries = {}
+		if self.BoardState ~= nil then
+			local livingEnemies = self.BoardState:CollectLivingEnemies()
+			for _, enemyEntity in ipairs(livingEnemies) do
+				local unit = enemyEntity:GetComponent("script.BattleUnitComponent")
+				local plan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+				if unit ~= nil and plan ~= nil and plan.PlanState ~= "EMPTY" then
+					local current = plan:GetCurrentAction()
+					local actionType = ""
+					local tileId = ""
+					local direction = 0
+					local telegraphTurns = 0
+					local patternId = unit.EnemyPatternId
+					local stepIndex = 0
+					if current.Success == true then
+						actionType = current.ActionType
+						tileId = current.TileId
+						direction = current.Direction
+						telegraphTurns = current.TelegraphTurnsRemaining
+						patternId = current.PatternId
+						stepIndex = current.StepIndex
+					end
+					table.insert(entries, table.concat({
+						unit.UnitId,
+						tostring(unit.SpawnOrder),
+						plan.PlanState,
+						tostring(plan.CurrentActionIndex),
+						tostring(plan.PlannedActionCount),
+						plan.TraitIds ~= "" and plan.TraitIds or "-",
+						actionType ~= "" and actionType or "-",
+						tileId ~= "" and tileId or "-",
+						tostring(direction),
+						tostring(telegraphTurns),
+						patternId ~= "" and patternId or "-",
+						tostring(stepIndex),
+						tostring(plan.PlanRevision),
+						plan.PlannedActionSnapshot ~= "" and plan.PlannedActionSnapshot or "-"
+					}, ","))
+				end
+			end
+		end
+		self.EnemyPlanSnapshot = table.concat(entries, "#")
+		self.EnemyPlanCount = #entries
+		self.EnemyPlanRevision = self.EnemyPlanRevision + 1
+		log("[EnemyRoundPlan] publish reason=" .. reason .. " count=" .. self.EnemyPlanCount .. " revision=" .. self.EnemyPlanRevision .. " snapshot=" .. self.EnemyPlanSnapshot)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1066,12 +1119,15 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void BeginEnemyTurn()
-		-- Executes the intent that stayed visible and immutable throughout the player turn.
+		-- Executes only actions that were frozen for every enemy before the player committed this turn.
 		local preparedIntent = self:GetPreparedEnemyIntent()
 		if preparedIntent.State ~= "PREPARED" then
-			log_warning("[BattleEnemyIntent] missing before enemy turn; preparing fallback turn=" .. self.TurnNumber)
-			self.LastEnemySpawnOrder = 0
-			self:PrepareNextEnemyIntent()
+			log_warning("[BattleEnemyIntent] compatibility cursor missing; selecting frozen plan turn=" .. self.TurnNumber)
+			local selection = self:PrepareNextEnemyIntent()
+			if selection.Success == false then
+				self:CompleteEnemyTurn("WAIT", false, selection.Reason)
+				return
+			end
 			preparedIntent = self:GetPreparedEnemyIntent()
 		end
 
@@ -1083,7 +1139,15 @@ script BattleSessionComponent extends Component
 		local execute = function()
 			self:ExecutePreparedEnemyIntent()
 		end
-		self.ActionTimerId = _TimerService:SetTimerOnce(execute, math.max(0.05, self.EnemyThinkDuration))
+		local enemyEntity = self:FindUnitEntity(preparedIntent.EnemyId)
+		local traitIds = ""
+		if isvalid(enemyEntity) then
+			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+			if enemyUnit ~= nil then
+				traitIds = enemyUnit.EnemyTraitIds
+			end
+		end
+		self.ActionTimerId = _TimerService:SetTimerOnce(execute, _EnemyTraitRouterLogic:GetEnemyThinkDuration(traitIds, self.EnemyThinkDuration))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1157,14 +1221,34 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table PrepareEnemyIntent()
-		-- Starts a new enemy round by selecting the first living enemy in stable SpawnOrder.
+		-- Freezes every living enemy plan while the board still represents the same player decision point.
 		self.LastEnemySpawnOrder = 0
-		return self:PrepareNextEnemyIntent()
+		self:ClearPreparedEnemyIntent("PLAN_ALL_ENEMIES")
+		if self.BoardState == nil then
+			return { Success = false, Reason = "REGISTRY_MISSING" }
+		end
+		local livingEnemies = self.BoardState:CollectLivingEnemies()
+		local preparedCount = 0
+		for _, enemyEntity in ipairs(livingEnemies) do
+			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+			if enemyUnit ~= nil then
+				local planResult = self:PrepareEnemyIntentForUnit(enemyUnit.UnitId)
+				if planResult.Success == true then
+					preparedCount = preparedCount + 1
+				else
+					log_error("[EnemyRoundPlan] enemy plan failed enemy=" .. enemyUnit.UnitId .. " reason=" .. planResult.Reason)
+				end
+			end
+		end
+		self:PublishEnemyPlanSnapshot("ALL_PLANS_FROZEN")
+		local selection = self:PrepareNextEnemyIntent()
+		log("[EnemyRoundPlan] frozen turn=" .. self.TurnNumber .. " living=" .. #livingEnemies .. " prepared=" .. preparedCount .. " selected=" .. self.PreparedEnemyId .. " revision=" .. self.EnemyPlanRevision)
+		return { Success = preparedCount > 0, Reason = preparedCount > 0 and "ALL_PLANS_FROZEN" or "NO_ENEMY_PLAN_PREPARED", PreparedCount = preparedCount, SelectionReason = selection.Reason }
 	end
 
 	@ExecSpace("ServerOnly")
 	method table PrepareNextEnemyIntent()
-		-- Selects the next living enemy whose SpawnOrder follows the last completed enemy.
+		-- Moves the compatibility cursor to the next already-frozen per-enemy plan; it never rebuilds AI here.
 		local result = {
 			Success = false,
 			Reason = "UNKNOWN"
@@ -1188,7 +1272,8 @@ script BattleSessionComponent extends Component
 		local selectedUnitId = ""
 		for _, enemyEntity in ipairs(livingEnemies) do
 			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
-			if enemyUnit ~= nil and enemyUnit.SpawnOrder > self.LastEnemySpawnOrder then
+			local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+			if enemyUnit ~= nil and actionPlan ~= nil and actionPlan.PlanState == "PREPARED" and enemyUnit.SpawnOrder > self.LastEnemySpawnOrder then
 				selectedUnitId = enemyUnit.UnitId
 				break
 			end
@@ -1198,12 +1283,12 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
-		return self:PrepareEnemyIntentForUnit(selectedUnitId)
+		return self:LoadEnemyPlanActionToCompatibility(selectedUnitId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table PrepareEnemyIntentForUnit(string enemyUnitId)
-		-- Converts one enemy's prototype PatternStep into the synchronized read-only runtime snapshot.
+		-- Resolves one base pattern step, decorates it through traits, and stores it on the enemy object.
 		local result = {
 			Success = false,
 			Reason = "UNKNOWN"
@@ -1212,50 +1297,69 @@ script BattleSessionComponent extends Component
 			result.Reason = "BATTLE_ENDED"
 			return result
 		end
-		local intentRuntime = self.EnemyIntentRuntime
-		if intentRuntime == nil then
-			intentRuntime = self:EnsureEnemyIntentComponent()
-		end
-		if intentRuntime == nil then
-			result.Reason = "INTENT_STATE_MISSING"
-			return result
-		end
-		if intentRuntime.IntentState ~= "EMPTY" then
-			result.Reason = "INTENT_ALREADY_PREPARED"
-			return result
-		end
-
 		local intent = self:BuildEnemyIntent(enemyUnitId)
-		result = intentRuntime:TryPrepare(enemyUnitId, intent.PatternId, intent.StepIndex, intent.ActionType, intent.TileId, intent.TelegraphTurnsRemaining or 0, intent.Direction, self.TurnNumber, intent.Reason)
-		if result.Success == false then
-			return result
-		end
 		local preparedMovementPolicy = ""
 		local preparedEnemyEntity = self:FindUnitEntity(enemyUnitId)
 		if isvalid(preparedEnemyEntity) == false then
-			intentRuntime:ResetIntent("ENEMY_MISSING_AFTER_PREPARE")
-			self:PublishEnemyIntentSnapshot("ENEMY_MISSING_AFTER_PREPARE")
 			return { Success = false, Reason = "ENEMY_MISSING_AFTER_PREPARE" }
 		else
 			local preparedEnemyUnit = preparedEnemyEntity:GetComponent("script.BattleUnitComponent")
+			local actionPlan = preparedEnemyEntity:GetComponent("script.EnemyActionPlanComponent")
 			if preparedEnemyUnit ~= nil then
 				preparedMovementPolicy = preparedEnemyUnit.EnemyMovementPolicy
 			end
+			if preparedEnemyUnit == nil or actionPlan == nil then
+				return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING" }
+			end
+			if actionPlan.PlanState ~= "EMPTY" then
+				actionPlan:ResetPlan("REPLAN")
+			end
 			local patternRunner = preparedEnemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
 			if patternRunner == nil then
-				intentRuntime:ResetIntent("PATTERN_RUNNER_MISSING")
-				self:PublishEnemyIntentSnapshot("PATTERN_RUNNER_MISSING")
 				return { Success = false, Reason = "PATTERN_RUNNER_MISSING" }
+			end
+			local traitPlan = _EnemyTraitRouterLogic:BuildActionPlan(preparedEnemyUnit.EnemyTraitIds, intent)
+			if traitPlan.Success == false then
+				return traitPlan
 			end
 			local markResult = patternRunner:TryMarkPrepared(intent.PatternId, intent.StepIndex, intent.PatternStepCount or 0, intent.ActionType, intent.TelegraphTurnsRemaining or 0)
 			if markResult.Success == false then
-				intentRuntime:ResetIntent(markResult.Reason)
-				self:PublishEnemyIntentSnapshot(markResult.Reason)
 				return markResult
 			end
+			result = actionPlan:ReplacePlan(enemyUnitId, traitPlan.Actions, self.TurnNumber, preparedEnemyUnit.EnemyTraitIds, intent.Reason)
+			if result.Success == false then
+				patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, result.Reason)
+				return result
+			end
 		end
-		self:PublishEnemyIntentSnapshot("PREPARED")
-		log("[BattleEnemyIntent] prepare enemy=" .. self.PreparedEnemyId .. " pattern=" .. self.PreparedEnemyPatternId .. " step=" .. self.PreparedEnemyStepIndex .. " action=" .. self.PreparedEnemyActionType .. " tile=" .. self.PreparedEnemyTileId .. " telegraphRemaining=" .. self.PreparedEnemyTelegraphTurnsRemaining .. " direction=" .. self.PreparedEnemyDirection .. " turn=" .. self.PreparedEnemyTurn .. " policy=" .. preparedMovementPolicy .. " reason=" .. self.PreparedEnemyReason)
+		log("[BattleEnemyIntent] plan enemy=" .. enemyUnitId .. " pattern=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " action=" .. intent.ActionType .. " tile=" .. intent.TileId .. " telegraphRemaining=" .. (intent.TelegraphTurnsRemaining or 0) .. " direction=" .. intent.Direction .. " turn=" .. self.TurnNumber .. " policy=" .. preparedMovementPolicy .. " reason=" .. intent.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LoadEnemyPlanActionToCompatibility(string enemyUnitId)
+		local enemyEntity = self:FindUnitEntity(enemyUnitId)
+		if isvalid(enemyEntity) == false then
+			return { Success = false, Reason = "ENEMY_MISSING" }
+		end
+		local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+		if actionPlan == nil then
+			return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING" }
+		end
+		local action = actionPlan:GetCurrentAction()
+		if action.Success == false then
+			return action
+		end
+		local intentRuntime = self:EnsureEnemyIntentComponent()
+		if intentRuntime == nil then
+			return { Success = false, Reason = "INTENT_STATE_MISSING" }
+		end
+		if intentRuntime.IntentState ~= "EMPTY" then
+			intentRuntime:ResetIntent("COMPATIBILITY_CURSOR_ADVANCE")
+		end
+		local result = intentRuntime:TryPrepare(enemyUnitId, action.PatternId, action.StepIndex, action.ActionType, action.TileId, action.TelegraphTurnsRemaining, action.Direction, action.PreparedTurn, action.ActionReason)
+		self:PublishEnemyIntentSnapshot("PLAN_CURSOR_SELECTED")
+		self:PublishEnemyPlanSnapshot("PLAN_CURSOR_SELECTED")
 		return result
 	end
 
@@ -1289,7 +1393,24 @@ script BattleSessionComponent extends Component
 			self:CompleteEnemyTurn("WAIT", false, beginResult.Reason)
 			return
 		end
+		local executingEnemy = self:FindUnitEntity(intent.EnemyId)
+		local executingPlan = nil
+		if isvalid(executingEnemy) then
+			executingPlan = executingEnemy:GetComponent("script.EnemyActionPlanComponent")
+		end
+		if executingPlan == nil then
+			log_error("[BattleEnemyIntent] execute rejected reason=ENEMY_PLAN_COMPONENT_MISSING enemy=" .. intent.EnemyId)
+			self:CompleteEnemyTurn("WAIT", false, "ENEMY_PLAN_COMPONENT_MISSING")
+			return
+		end
+		local planBegin = executingPlan:TryBeginCurrentAction()
+		if planBegin.Success == false then
+			log_error("[BattleEnemyIntent] plan execute rejected reason=" .. planBegin.Reason .. " enemy=" .. intent.EnemyId)
+			self:CompleteEnemyTurn("WAIT", false, planBegin.Reason)
+			return
+		end
 		self:PublishEnemyIntentSnapshot("EXECUTING")
+		self:PublishEnemyPlanSnapshot("ACTION_EXECUTING")
 		self.TurnState:UpdateEnemyAction("ENEMY_" .. intent.ActionType, intent.Direction)
 		self:PublishTurnStateSnapshot("ENEMY_ACTION")
 		log("[BattleEnemyIntent] execute enemy=" .. intent.EnemyId .. " pattern=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " action=" .. intent.ActionType .. " tile=" .. intent.TileId .. " telegraphRemaining=" .. intent.TelegraphTurnsRemaining .. " preparedTurn=" .. intent.PreparedTurn .. " currentTurn=" .. self.TurnNumber)
@@ -1369,20 +1490,42 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CompletePreparedEnemyIntent(string enemyId, string patternId, integer stepIndex, string actionType, string tileId, integer telegraphTurnsRemaining, boolean success, string reason)
-		-- Completes one enemy snapshot, then advances to the next living enemy before ending the round.
+		-- Advances within the enemy-owned queue; pattern progression occurs once after the full plan.
 		log("[BattleEnemyIntent] complete enemy=" .. enemyId .. " pattern=" .. patternId .. " step=" .. stepIndex .. " action=" .. actionType .. " tile=" .. tileId .. " telegraphRemaining=" .. telegraphTurnsRemaining .. " success=" .. tostring(success) .. " reason=" .. reason)
-		local progression = self:CompleteEnemyPatternStep(enemyId, patternId, stepIndex, success)
-		if progression.Success == false then
-			log_error("[BattleEnemyIntent] pattern progression failed enemy=" .. enemyId .. " pattern=" .. patternId .. " step=" .. stepIndex .. " reason=" .. progression.Reason)
-		end
 		local completedEnemy = self:FindUnitEntity(enemyId)
+		local completedPlan = nil
+		local planCompletion = { Success = false, Reason = "ENEMY_MISSING", HasNextAction = false, AggregateSuccess = success }
 		if isvalid(completedEnemy) then
 			local completedUnit = completedEnemy:GetComponent("script.BattleUnitComponent")
+			completedPlan = completedEnemy:GetComponent("script.EnemyActionPlanComponent")
+			if completedPlan ~= nil then
+				planCompletion = completedPlan:CompleteCurrentAction(success, reason)
+			end
 			if completedUnit ~= nil then
 				self.LastEnemySpawnOrder = completedUnit.SpawnOrder
 			end
 		end
-		self:ClearPreparedEnemyIntent("COMPLETED")
+		if self.EnemyIntentRuntime ~= nil then
+			self.EnemyIntentRuntime:ResetIntent("ACTION_COMPLETED")
+		end
+		self:PublishEnemyIntentSnapshot("ACTION_COMPLETED")
+		self:PublishEnemyPlanSnapshot("ACTION_COMPLETED")
+		if self.BattleResult ~= "" then
+			self:ClearPreparedEnemyIntent("BATTLE_ENDED")
+			self:CompleteEnemyTurn(actionType, success, reason)
+			return
+		end
+		if planCompletion.Success == true and planCompletion.HasNextAction == true then
+			local nextAction = self:LoadEnemyPlanActionToCompatibility(enemyId)
+			if nextAction.Success == true then
+				self:BeginEnemyTurn()
+				return
+			end
+		end
+		local progression = self:CompleteEnemyPatternStep(enemyId, patternId, stepIndex, planCompletion.AggregateSuccess == true)
+		if progression.Success == false then
+			log_error("[BattleEnemyIntent] pattern progression failed enemy=" .. enemyId .. " pattern=" .. patternId .. " step=" .. stepIndex .. " reason=" .. progression.Reason)
+		end
 		if self.BattleResult == "" then
 			local nextResult = self:PrepareNextEnemyIntent()
 			if nextResult.Success == true then
@@ -1422,25 +1565,30 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ClearPreparedEnemyIntent(string reason)
-		-- Clears the runtime snapshot without selecting the next PatternStep.
+		-- Cancels every per-enemy frozen plan at a real round/battle boundary.
 		local intentRuntime = self.EnemyIntentRuntime
 		if intentRuntime == nil then
 			intentRuntime = self:EnsureEnemyIntentComponent()
 		end
-		if intentRuntime ~= nil then
-			local snapshot = intentRuntime:GetSnapshot()
-			if snapshot.EnemyId ~= "" and snapshot.PatternId ~= "" then
-				local enemyEntity = self:FindUnitEntity(snapshot.EnemyId)
-				if isvalid(enemyEntity) then
-					local patternRunner = enemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
-					if patternRunner ~= nil then
-						patternRunner:CancelPreparedStep(snapshot.PatternId, snapshot.StepIndex, reason)
+		if self.BoardState ~= nil then
+			local livingEnemies = self.BoardState:CollectLivingEnemies()
+			for _, enemyEntity in ipairs(livingEnemies) do
+				local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+				local patternRunner = enemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
+				if actionPlan ~= nil and actionPlan.PlanState ~= "EMPTY" then
+					local current = actionPlan:GetCurrentAction()
+					if patternRunner ~= nil and current.Success == true then
+						patternRunner:CancelPreparedStep(current.PatternId, current.StepIndex, reason)
 					end
+					actionPlan:ResetPlan(reason)
 				end
 			end
+		end
+		if intentRuntime ~= nil then
 			intentRuntime:ResetIntent(reason)
 		end
 		self:PublishEnemyIntentSnapshot(reason)
+		self:PublishEnemyPlanSnapshot(reason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2230,6 +2378,72 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method table ParseEnemyPlanSnapshot(string serializedPlans)
+		-- Parses the server DTO only; no pattern, targeting, or trait rule is repeated on the client.
+		local plans = {}
+		for entry in string.gmatch(serializedPlans or "", "([^#]+)") do
+			local fields = {}
+			for field in string.gmatch(entry, "([^,]+)") do
+				table.insert(fields, field)
+			end
+			if #fields == 14 and fields[1] ~= "" then
+				local unitId = self:DecodeEnemyPlanField(fields[1])
+				local traitIds = self:DecodeEnemyPlanField(fields[6])
+				local actionType = self:DecodeEnemyPlanField(fields[7])
+				local tileId = self:DecodeEnemyPlanField(fields[8])
+				local patternId = self:DecodeEnemyPlanField(fields[11])
+				local actionSnapshot = self:DecodeEnemyPlanField(fields[14])
+				local queuedTileIds = ""
+				for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+					local actionFields = {}
+					for actionField in string.gmatch(actionEntry, "([^~]+)") do
+						table.insert(actionFields, actionField)
+					end
+					local queuedTileId = ""
+					if #actionFields >= 3 then
+						queuedTileId = self:DecodeEnemyPlanField(actionFields[3])
+					end
+					if queuedTileId ~= "" then
+						if queuedTileIds ~= "" then
+							queuedTileIds = queuedTileIds .. "|"
+						end
+						queuedTileIds = queuedTileIds .. queuedTileId
+					end
+				end
+				table.insert(plans, {
+					UnitId = unitId,
+					SpawnOrder = math.floor(tonumber(fields[2]) or 0),
+					State = self:DecodeEnemyPlanField(fields[3]),
+					CurrentActionIndex = math.floor(tonumber(fields[4]) or 0),
+					ActionCount = math.floor(tonumber(fields[5]) or 0),
+					TraitIds = traitIds,
+					CommandType = actionType,
+					TileId = tileId,
+					Direction = math.floor(tonumber(fields[9]) or 0),
+					TelegraphTurnsRemaining = math.floor(tonumber(fields[10]) or 0),
+					PatternId = patternId,
+					StepIndex = math.floor(tonumber(fields[12]) or 0),
+					Revision = math.floor(tonumber(fields[13]) or 0),
+					QueuedActionSnapshot = actionSnapshot,
+					QueuedTileIds = queuedTileIds
+				})
+			end
+		end
+		table.sort(plans, function(left, right)
+			return left.SpawnOrder < right.SpawnOrder
+		end)
+		return plans
+	end
+
+	@ExecSpace("ClientOnly")
+	method string DecodeEnemyPlanField(string value)
+		if value == "-" then
+			return ""
+		end
+		return value or ""
+	end
+
+	@ExecSpace("ClientOnly")
 	method table GetBattleUiState()
 		-- Builds one read-only client DTO from synchronized map, turn, wave, cooldown, and intent state.
 		local stateEntity = self.Entity:GetChildByName("BattleTurnState")
@@ -2308,7 +2522,7 @@ script BattleSessionComponent extends Component
 			queueIndex = queueIndex + 1
 			table.insert(queuedItems, { Index = queueIndex, SkillId = skillId })
 		end
-		local enemyIntents = {}
+		local enemyIntents = self:ParseEnemyPlanSnapshot(self.EnemyPlanSnapshot)
 		local preparedIntent = {
 			State = self.PreparedEnemyIntentState,
 			EnemyId = self.PreparedEnemyId,
@@ -2335,7 +2549,7 @@ script BattleSessionComponent extends Component
 			preparedIntent.Reason = intentState.IntentReason
 			preparedIntent.Revision = intentState.IntentRevision
 		end
-		if preparedIntent.State ~= "EMPTY" and preparedIntent.EnemyId ~= "" then
+		if #enemyIntents == 0 and preparedIntent.State ~= "EMPTY" and preparedIntent.EnemyId ~= "" then
 			table.insert(enemyIntents, {
 				UnitId = preparedIntent.EnemyId,
 				State = preparedIntent.State,
@@ -2355,7 +2569,7 @@ script BattleSessionComponent extends Component
 		return {
 			Success = true,
 			Reason = "OK",
-			RevisionKey = tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. self.BattleResult,
+			RevisionKey = tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. self.BattleResult,
 			Phase = turnState.BattlePhase,
 			TurnNumber = turnState.TurnNumber,
 			IsProcessing = turnState.IsActionProcessing,
@@ -2431,7 +2645,9 @@ script BattleSessionComponent extends Component
 				ModifierSnapshot = turnState.QueueCapacityModifierSnapshot,
 				Revision = turnState.QueueCapacityRevision
 			},
-			EnemyIntentMode = "COMPONENT_SINGLE_COMPAT",
+			EnemyIntentMode = "PER_ENEMY_FROZEN_PLAN_V1",
+			EnemyPlanRevision = self.EnemyPlanRevision,
+			EnemyPlanCount = self.EnemyPlanCount,
 			EnemyIntents = enemyIntents,
 			CooldownSnapshot = cooldownSnapshot,
 			CooldownRevision = cooldownRevision,
@@ -2790,6 +3006,13 @@ script BattleSessionComponent extends Component
 		result.TargetUnitId = targetUnit.UnitId
 		result.FromCell = targetUnit.CellIndex
 		result.ToCell = targetUnit.CellIndex + direction
+		if targetUnit.Team == "Enemy" and _EnemyTraitRouterLogic:BlocksForcedDisplacement(targetUnit.EnemyTraitIds) then
+			result.Success = true
+			result.ToCell = result.FromCell
+			result.Reason = "PUSH_BLOCKED_HEAVY_TRAIT"
+			log("[EnemyTrait] HEAVY blocked push target=" .. result.TargetUnitId .. " cell=" .. result.FromCell)
+			return result
+		end
 		if self:IsValidCell(result.ToCell) == false then
 			result.Success = true
 			result.Reason = "PUSH_BLOCKED_OUT_OF_BOUNDS"
@@ -2860,6 +3083,13 @@ script BattleSessionComponent extends Component
 		result.TargetCell = targetUnit.CellIndex
 		result.FromCell = targetUnit.CellIndex
 		result.ToCell = targetUnit.CellIndex + direction
+		if targetUnit.Team == "Enemy" and _EnemyTraitRouterLogic:BlocksForcedDisplacement(targetUnit.EnemyTraitIds) then
+			result.Success = true
+			result.ToCell = result.FromCell
+			result.Reason = "PUSH_BLOCKED_HEAVY_TRAIT"
+			log("[EnemyTrait] HEAVY blocked push target=" .. targetUnitId .. " cell=" .. result.FromCell)
+			return result
+		end
 		if self:IsValidCell(result.ToCell) == false then
 			result.Success = true
 			result.Reason = "PUSH_BLOCKED_OUT_OF_BOUNDS"

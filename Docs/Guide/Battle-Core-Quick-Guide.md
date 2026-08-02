@@ -155,8 +155,11 @@ Resolver에 전달하며, Resolver나 UI는 Board Registry를 직접 조회하�
 취소된 PreparedIntent는 카운트를 소비하지 않는다. 제작 예시는 `prototype_telegraph`를 본다.
 
 신규 UI는 `GetBattleUiState()`의 `EnemyIntents`만 읽는다. 현재 `EnemyIntentMode`는
-`COMPONENT_SINGLE_COMPAT`이며 각 항목에 `Revision`과 `TelegraphTurnsRemaining`이 포함된다. UI에서 Intent 조건을
-다시 계산하거나 Session의 호환 Snapshot 필드를 수정하지 않는다.
+`PER_ENEMY_FROZEN_PLAN_V1`이며 플레이어 행동 전에 모든 생존 적 계획이 같은 보드 상태에서
+고정된다. 각 항목에는 `SpawnOrder`, `CurrentActionIndex`, `ActionCount`, `TraitIds`, `Revision`,
+`TelegraphTurnsRemaining`이 포함된다. UI에서 Intent 조건을 다시 계산하거나 Session의 호환
+`PreparedEnemy*` Cursor를 전체 계획으로 해석하지 않는다. 제작 규격은
+[`Enemy-Plan-Trait-Guide.md`](./Enemy-Plan-Trait-Guide.md)를 따른다.
 
 새 Run은 `BattleSessionComponent.StartNewRun(seed)`로 시작한다. 이 메서드는 `RunManagerLogic`을 통해 플레이어의 `PlayerRunStateComponent`를 초기화한 뒤 같은 Seed로 Stage 1/Wave 1을 다시 구성한다. 전투 맵의 `RunSeed`는 계산에 쓰는 복사본이며 원본 소유자는 플레이어의 Run 상태다.
 

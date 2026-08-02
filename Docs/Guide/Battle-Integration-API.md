@@ -57,10 +57,12 @@ MSW `@Component`와 `@Logic`은 엔진이 생성하고 `OnInitialize`, `OnBeginP
 
 `BattleGatewayLogic`이 `InitializeFromEntry(...)`를 호출해 Session을 초기화한다.
 
-적 Intent의 mutable state는 `EnemyIntentComponent`가 소유하며, 무상태 선택 규칙은
-`EnemyIntentResolverLogic`에 있다. 외부 UI는 이 둘을 직접 호출하지 않고
-`BattleSessionComponent.GetBattleUiState()`의 `EnemyIntents` DTO만 읽는다. DTO의 현재
-`EnemyIntentMode`는 `COMPONENT_SINGLE_COMPAT`이고 각 Intent는 `Revision`을 제공한다.
+적별 Pattern 진행은 `EnemyPatternRunnerComponent`, 이번 라운드 실행 Queue는 각 적의
+`EnemyActionPlanComponent`가 소유한다. 무상태 선택 규칙은 `EnemyIntentResolverLogic`, Trait에
+따른 계획 장식과 규칙 Query는 `EnemyTraitRouterLogic`이 담당한다. 외부 UI는 이 객체를 직접
+호출하지 않고 `BattleSessionComponent.GetBattleUiState()`의 `EnemyIntents` DTO만 읽는다.
+현재 `EnemyIntentMode`는 `PER_ENEMY_FROZEN_PLAN_V1`이며 `EnemyPlanCount`,
+`EnemyPlanRevision`, 적별 `ActionCount`, `CurrentActionIndex`, `TraitIds`, `Revision`을 제공한다.
 
 ## 4. Client UI 공개 API
 
