@@ -1,0 +1,264 @@
+@Logic
+script StageWaveRepositoryLogic
+
+	property string WaveDataSetName = "StageEnemyWaves"
+	property string PoolDataSetName = "EnemySpawnPools"
+	property string EnemyDefinitionDataSetName = "EnemyDefinitions"
+
+	@ExecSpace("ServerOnly")
+	method integer GetTotalWaveCount(string stageId)
+		-- Returns the largest validated WaveIndex for one stage.
+		local dataSet = _DataService:GetTable(self.WaveDataSetName)
+		if dataSet == nil then
+			log_error("[StageWaveData] dataset missing name=" .. self.WaveDataSetName)
+			return 0
+		end
+
+		local totalWaves = 0
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "StageId") == stageId then
+				local waveIndex = math.floor(tonumber(dataSet:GetCell(rowIndex, "WaveIndex")) or 0)
+				totalWaves = math.max(totalWaves, waveIndex)
+			end
+		end
+		log("[StageWaveData] stage loaded stage=" .. stageId .. " totalWaves=" .. totalWaves)
+		return totalWaves
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetWaveDefinition(string stageId, integer waveIndex, integer runSeed)
+		-- Validates and converts one UserDataSet row into a runtime wave definition.
+		local result = {
+			Success = false,
+			Reason = "ROW_NOT_FOUND",
+			StageId = stageId,
+			WaveIndex = waveIndex
+		}
+		local dataSet = _DataService:GetTable(self.WaveDataSetName)
+		if dataSet == nil then
+			result.Reason = "DATASET_MISSING"
+			return result
+		end
+
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local rowStageId = dataSet:GetCell(rowIndex, "StageId")
+			local rowWaveIndex = math.floor(tonumber(dataSet:GetCell(rowIndex, "WaveIndex")) or 0)
+			if rowStageId == stageId and rowWaveIndex == waveIndex then
+				local triggerMode = dataSet:GetCell(rowIndex, "SpawnTriggerMode") or ""
+				if self:IsValidSpawnTriggerMode(triggerMode) == false then
+					result.Reason = "INVALID_TRIGGER_MODE"
+					log_error("[StageWaveData] invalid mode stage=" .. stageId .. " wave=" .. waveIndex .. " value=" .. triggerMode)
+					return result
+				end
+
+				result.EnemyPoolId = dataSet:GetCell(rowIndex, "EnemyPoolId") or ""
+				result.SpawnCount = math.max(1, math.floor(tonumber(dataSet:GetCell(rowIndex, "SpawnCount")) or 1))
+				result.MaxConcurrent = math.max(1, math.floor(tonumber(dataSet:GetCell(rowIndex, "MaxConcurrent")) or result.SpawnCount))
+				result.SpawnSidePolicy = dataSet:GetCell(rowIndex, "SpawnSidePolicy") or "BALANCED"
+				result.ClearSpawnDelaySeconds = math.max(0, tonumber(dataSet:GetCell(rowIndex, "ClearSpawnDelaySeconds")) or 0)
+				result.SpawnTriggerMode = triggerMode
+				result.ForceAfterTurns = math.max(0, math.floor(tonumber(dataSet:GetCell(rowIndex, "ForceAfterTurns")) or 0))
+				result.ForceAfterSeconds = math.max(0, tonumber(dataSet:GetCell(rowIndex, "ForceAfterSeconds")) or 0)
+				local enemySpawnDefinition = self:GetEnemySpawnDefinition(result.EnemyPoolId, waveIndex, 1, runSeed)
+				result.EnemyModelId = enemySpawnDefinition.EnemyModelId or ""
+				result.EnemyDefinitionId = enemySpawnDefinition.EnemyDefinitionId or ""
+				if result.EnemyPoolId == "" or enemySpawnDefinition.Success == false then
+					result.Reason = "ENEMY_POOL_EMPTY"
+					return result
+				end
+				result.EnemyMaxHp = enemySpawnDefinition.MaxHp
+				result.EnemyBasicAttackDamage = enemySpawnDefinition.BasicAttackDamage
+				result.EnemyPatternId = enemySpawnDefinition.PatternId
+				result.EnemyMovementPolicy = enemySpawnDefinition.MovementPolicy
+				result.EnemyIsBoss = enemySpawnDefinition.IsBoss
+				if (triggerMode == "TURN_LIMIT" or triggerMode == "TURN_OR_TIME") and result.ForceAfterTurns <= 0 then
+					result.Reason = "TURN_LIMIT_MISSING"
+					return result
+				end
+				if (triggerMode == "TIME_LIMIT" or triggerMode == "TURN_OR_TIME") and result.ForceAfterSeconds <= 0 then
+					result.Reason = "TIME_LIMIT_MISSING"
+					return result
+				end
+
+				result.Success = true
+				result.Reason = "OK"
+				log("[StageWaveData] wave loaded stage=" .. stageId .. " wave=" .. waveIndex .. " enemy=" .. result.EnemyDefinitionId .. " hp=" .. result.EnemyMaxHp .. " attack=" .. result.EnemyBasicAttackDamage .. " mode=" .. triggerMode .. " count=" .. result.SpawnCount .. " maxConcurrent=" .. result.MaxConcurrent .. " forceTurns=" .. result.ForceAfterTurns .. " forceSeconds=" .. result.ForceAfterSeconds)
+				return result
+			end
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEnemySpawnDefinition(string poolId, integer waveIndex, integer spawnIndex, integer runSeed)
+		-- Combines one weighted pool row with its validated combat definition.
+		local poolEntry = self:GetEnemyPoolEntry(poolId, waveIndex, spawnIndex, runSeed)
+		if poolEntry.Success == false then
+			return poolEntry
+		end
+		local enemyDefinition = self:GetEnemyDefinition(poolEntry.EnemyDefinitionId)
+		if enemyDefinition.Success == false then
+			return enemyDefinition
+		end
+		enemyDefinition.EnemyModelId = poolEntry.EnemyModelId
+		enemyDefinition.SelectedWeight = poolEntry.SelectedWeight
+		enemyDefinition.SelectionRoll = poolEntry.SelectionRoll
+		enemyDefinition.TotalWeight = poolEntry.TotalWeight
+		return enemyDefinition
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEnemyPoolEntry(string poolId, integer waveIndex, integer spawnIndex, integer runSeed)
+		-- Uses the run seed and slot coordinates to make weighted selection reproducible.
+		local result = {
+			Success = false,
+			Reason = "POOL_EMPTY",
+			EnemyDefinitionId = "",
+			EnemyModelId = "",
+			SelectedWeight = 0,
+			SelectionRoll = 0,
+			TotalWeight = 0
+		}
+		local dataSet = _DataService:GetTable(self.PoolDataSetName)
+		if dataSet == nil then
+			log_error("[StageWaveData] dataset missing name=" .. self.PoolDataSetName)
+			result.Reason = "POOL_DATASET_MISSING"
+			return result
+		end
+
+		local candidates = {}
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "PoolId") == poolId then
+				local minWave = math.floor(tonumber(dataSet:GetCell(rowIndex, "MinWaveIndex")) or 1)
+				local maxWave = math.floor(tonumber(dataSet:GetCell(rowIndex, "MaxWaveIndex")) or waveIndex)
+				if waveIndex >= minWave and waveIndex <= maxWave then
+					local modelId = dataSet:GetCell(rowIndex, "EnemyModelId") or ""
+					local enemyDefinitionId = dataSet:GetCell(rowIndex, "EnemyDefinitionId") or ""
+					local weight = math.floor(tonumber(dataSet:GetCell(rowIndex, "Weight")) or 0)
+					if modelId ~= "" and enemyDefinitionId ~= "" and weight > 0 then
+						table.insert(candidates, {
+							EnemyDefinitionId = enemyDefinitionId,
+							EnemyModelId = modelId,
+							Weight = weight,
+							SortKey = enemyDefinitionId .. "|" .. modelId
+						})
+					end
+				end
+			end
+		end
+		table.sort(candidates, function(left, right)
+			return left.SortKey < right.SortKey
+		end)
+		if #candidates == 0 then
+			log_error("[StageWaveData] pool empty pool=" .. poolId .. " wave=" .. waveIndex)
+			return result
+		end
+		local totalWeight = 0
+		for _, candidate in ipairs(candidates) do
+			totalWeight = totalWeight + candidate.Weight
+		end
+		local safeSpawnIndex = math.max(1, spawnIndex)
+		local safeRunSeed = math.max(0, math.floor(math.abs(runSeed)))
+		local seedOffset = safeRunSeed % totalWeight
+		local selectionOrdinal = seedOffset + ((math.max(1, waveIndex) - 1) * 31) + safeSpawnIndex
+		local selectionRoll = ((selectionOrdinal - 1) % totalWeight) + 1
+		local accumulatedWeight = 0
+		local selected = candidates[1]
+		for _, candidate in ipairs(candidates) do
+			accumulatedWeight = accumulatedWeight + candidate.Weight
+			if selectionRoll <= accumulatedWeight then
+				selected = candidate
+				break
+			end
+		end
+		result.Success = true
+		result.Reason = "OK"
+		result.EnemyDefinitionId = selected.EnemyDefinitionId
+		result.EnemyModelId = selected.EnemyModelId
+		result.SelectedWeight = selected.Weight
+		result.SelectionRoll = selectionRoll
+		result.TotalWeight = totalWeight
+		log("[EnemyPool] selected pool=" .. poolId .. " wave=" .. waveIndex .. " slot=" .. safeSpawnIndex .. " seed=" .. safeRunSeed .. " roll=" .. selectionRoll .. "/" .. totalWeight .. " definition=" .. result.EnemyDefinitionId .. " weight=" .. result.SelectedWeight)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEnemyDefinition(string enemyDefinitionId)
+		-- Validates one enemy row and converts string cells into runtime combat values.
+		local result = {
+			Success = false,
+			Reason = "ENEMY_DEFINITION_NOT_FOUND",
+			EnemyDefinitionId = enemyDefinitionId
+		}
+		local dataSet = _DataService:GetTable(self.EnemyDefinitionDataSetName)
+		if dataSet == nil then
+			result.Reason = "ENEMY_DEFINITION_DATASET_MISSING"
+			log_error("[EnemyData] dataset missing name=" .. self.EnemyDefinitionDataSetName)
+			return result
+		end
+
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "EnemyDefinitionId") == enemyDefinitionId then
+				result.DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or enemyDefinitionId
+				result.MaxHp = math.max(1, tonumber(dataSet:GetCell(rowIndex, "MaxHp")) or 1)
+				result.BasicAttackDamage = math.max(0, tonumber(dataSet:GetCell(rowIndex, "BasicAttackDamage")) or 0)
+				result.PatternId = dataSet:GetCell(rowIndex, "PatternId") or ""
+					result.MovementPolicy = dataSet:GetCell(rowIndex, "MovementPolicy") or ""
+					result.InitialFacingPolicy = dataSet:GetCell(rowIndex, "InitialFacingPolicy") or "FACE_PLAYER"
+					result.TraitIds = dataSet:GetCell(rowIndex, "TraitIds") or ""
+					result.IsBoss = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "IsBoss"))
+				if result.PatternId == "" then
+					result.Reason = "ENEMY_PATTERN_MISSING"
+					return result
+				end
+				if result.MovementPolicy ~= "TRACK_PLAYER" and result.MovementPolicy ~= "FIXED_FACING" then
+					result.Reason = "INVALID_ENEMY_MOVEMENT_POLICY"
+					return result
+				end
+					if result.InitialFacingPolicy ~= "FACE_PLAYER" and result.InitialFacingPolicy ~= "FIXED_LEFT" and result.InitialFacingPolicy ~= "FIXED_RIGHT" then
+					result.Reason = "INVALID_INITIAL_FACING_POLICY"
+					return result
+					end
+					local traitValidation = _EnemyTraitRouterLogic:ValidateTraitIds(result.TraitIds)
+					if traitValidation.Success == false then
+						result.Reason = traitValidation.Reason
+						result.DetailReason = traitValidation.TraitId
+						return result
+					end
+				local patternValidation = _EnemyPatternContentValidatorLogic:ValidateById(result.PatternId)
+				if patternValidation.Success == false then
+					result.Reason = "INVALID_ENEMY_PATTERN_REFERENCE"
+					result.DetailReason = patternValidation.DetailReason or patternValidation.Reason
+					return result
+				end
+				result.Success = true
+				result.Reason = "OK"
+					log("[EnemyData] loaded id=" .. enemyDefinitionId .. " hp=" .. result.MaxHp .. " attack=" .. result.BasicAttackDamage .. " pattern=" .. result.PatternId .. " movement=" .. result.MovementPolicy .. " traits=" .. result.TraitIds)
+				return result
+			end
+		end
+		log_error("[EnemyData] definition missing id=" .. enemyDefinitionId)
+		return result
+	end
+
+	method boolean IsValidSpawnTriggerMode(string triggerMode)
+		-- Recognizes the closed set of wave pressure policies supported by the runtime.
+		return triggerMode == "CLEAR_ONLY"
+			or triggerMode == "TURN_LIMIT"
+			or triggerMode == "TIME_LIMIT"
+			or triggerMode == "TURN_OR_TIME"
+	end
+
+	method boolean ParseBooleanCell(any cellValue)
+		-- Converts common dataset boolean spellings into a strict boolean.
+		if cellValue == true then
+			return true
+		end
+		if cellValue == nil or cellValue == false then
+			return false
+		end
+		local normalized = string.lower(tostring(cellValue))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+end

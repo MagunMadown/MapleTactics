@@ -1,0 +1,197 @@
+@Logic
+script BattleGatewayLogic
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		log("[BattleGateway] ready")
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateEntryState(Entity playerEntity)
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			log_error("[BattleGateway] entry state unavailable reason=INVALID_PLAYER")
+			return nil
+		end
+
+		local entryState = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		if entryState == nil then
+			entryState = playerEntity:AddComponent("BattleEntryStateComponent")
+		end
+		if entryState == nil then
+			log_error("[BattleGateway] entry state unavailable reason=COMPONENT_ATTACH_FAILED player=" .. playerEntity.Name)
+			return nil
+		end
+		return entryState
+	end
+
+	@ExecSpace("ServerOnly")
+	method table PrepareBattleEntry(Entity playerEntity, string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode)
+		local entryState = self:GetOrCreateEntryState(playerEntity)
+		if entryState == nil then
+			return {
+				Success = false,
+				Reason = "ENTRY_STATE_UNAVAILABLE",
+				RequestId = 0
+			}
+		end
+		return entryState:Prepare(stageId, characterId, jobId, loadoutId, runSeed, entryMode)
+	end
+
+	@ExecSpace("Server")
+	method void RequestPrepareBattleEntry(string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode)
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:PrepareBattleEntry(playerEntity, stageId, characterId, jobId, loadoutId, runSeed, entryMode)
+		if result.Success == false then
+			log_warning("[BattleGateway] prepare rejected user=" .. senderUserId .. " reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table StartPreparedBattle(Entity playerEntity)
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			return {
+				Success = false,
+				Reason = "INVALID_PLAYER",
+				RequestId = 0
+			}
+		end
+		local entryState = self:GetOrCreateEntryState(playerEntity)
+		if entryState == nil then
+			return {
+				Success = false,
+				Reason = "ENTRY_STATE_UNAVAILABLE",
+				RequestId = 0
+			}
+		end
+		if entryState.EntryState ~= "PREPARED" then
+			return {
+				Success = false,
+				Reason = "ENTRY_NOT_PREPARED",
+				RequestId = entryState.RequestId
+			}
+		end
+		local currentMap = playerEntity.CurrentMap
+		if isvalid(currentMap) == false then
+			return entryState:RecordFailure("CURRENT_MAP_UNAVAILABLE")
+		end
+		local battleSession = currentMap:GetComponent("script.BattleSessionComponent")
+		if battleSession == nil then
+			return entryState:RecordFailure("BATTLE_SESSION_NOT_FOUND")
+		end
+		return self:ConsumePreparedBattle(playerEntity, battleSession)
+	end
+
+	@ExecSpace("Server")
+	method void RequestStartPreparedBattle()
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:StartPreparedBattle(playerEntity)
+		if result.Success == false then
+			log_warning("[BattleGateway] start rejected user=" .. senderUserId .. " reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BeginBattle(Entity playerEntity, string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode)
+		local prepareResult = self:PrepareBattleEntry(playerEntity, stageId, characterId, jobId, loadoutId, runSeed, entryMode)
+		if prepareResult.Success == false then
+			return prepareResult
+		end
+		return self:StartPreparedBattle(playerEntity)
+	end
+
+	@ExecSpace("Server")
+	method void RequestBeginBattle(string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode)
+		-- Single-call Client facade for flows where the player is already inside a battle map.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:BeginBattle(playerEntity, stageId, characterId, jobId, loadoutId, runSeed, entryMode)
+		if result.Success == false then
+			log_warning("[BattleGateway] begin rejected user=" .. senderUserId .. " reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConsumePreparedBattle(Entity playerEntity, any battleSession)
+		if isvalid(playerEntity) == false or battleSession == nil then
+			return {
+				Success = false,
+				Reason = "INVALID_BATTLE_CONTEXT",
+				RequestId = 0
+			}
+		end
+		local entryState = self:GetOrCreateEntryState(playerEntity)
+		if entryState == nil then
+			return {
+				Success = false,
+				Reason = "ENTRY_STATE_UNAVAILABLE",
+				RequestId = 0
+			}
+		end
+		if entryState.EntryState ~= "PREPARED" then
+			return {
+				Success = false,
+				Reason = "ENTRY_NOT_PREPARED",
+				RequestId = entryState.RequestId
+			}
+		end
+
+		local startResult = battleSession:InitializeFromEntry(
+			playerEntity,
+			entryState.StageId,
+			entryState.CharacterId,
+			entryState.JobId,
+			entryState.LoadoutId,
+			entryState.RunSeed,
+			entryState.EntryMode,
+			entryState.RequestId
+		)
+		if startResult.Success == false then
+			entryState:RecordFailure(startResult.Reason)
+			log_warning("[BattleGateway] consume rejected request=" .. entryState.RequestId .. " reason=" .. startResult.Reason)
+			return startResult
+		end
+
+		local markResult = entryState:MarkStarted()
+		log("[BattleGateway] consumed request=" .. entryState.RequestId .. " stage=" .. entryState.StageId .. " result=" .. startResult.Reason)
+		return {
+			Success = markResult.Success,
+			Reason = startResult.Reason,
+			RequestId = entryState.RequestId,
+			StageId = entryState.StageId
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CancelBattleEntry(Entity playerEntity, string reason)
+		local entryState = self:GetOrCreateEntryState(playerEntity)
+		if entryState == nil then
+			return {
+				Success = false,
+				Reason = "ENTRY_STATE_UNAVAILABLE",
+				RequestId = 0
+			}
+		end
+		return entryState:Cancel(reason)
+	end
+
+	@ExecSpace("Server")
+	method void RequestCancelBattleEntry()
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:CancelBattleEntry(playerEntity, "CANCELLED_BY_PLAYER")
+		if result.Success == false then
+			log_warning("[BattleGateway] cancel rejected user=" .. senderUserId .. " reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetBattleEntrySnapshot(Entity playerEntity)
+		local entryState = self:GetOrCreateEntryState(playerEntity)
+		if entryState == nil then
+			return {
+				Success = false,
+				Reason = "ENTRY_STATE_UNAVAILABLE"
+			}
+		end
+		return entryState:GetSnapshot()
+	end
+
+end

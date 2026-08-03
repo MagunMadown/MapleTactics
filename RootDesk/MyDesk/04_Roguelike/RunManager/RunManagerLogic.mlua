@@ -1,0 +1,590 @@
+@Logic
+script RunManagerLogic
+
+	property integer DefaultRunSeed = 1000
+	property string DefaultJobId = "prototype_warrior"
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- This Logic coordinates run state but never stores one user's mutable run as global data.
+		log("[RunManager] ready defaultSeed=" .. self.DefaultRunSeed .. " defaultJob=" .. self.DefaultJobId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method string ResolveJobId(string jobId)
+		-- Normalizes legacy callers without duplicating the default-job policy in map components.
+		if jobId == nil or jobId == "" then
+			return self.DefaultJobId
+		end
+		return jobId
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyJobSelection(Entity playerEntity, string jobId)
+		-- Validates and applies one job at the run boundary while preventing mid-run job swaps.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		local resolvedJobId = self:ResolveJobId(jobId)
+		if (jobId == nil or jobId == "") and runState.SelectedJobId ~= "" then
+			resolvedJobId = runState.SelectedJobId
+		end
+		if runState.SelectedJobId ~= "" and runState.SelectedJobId ~= resolvedJobId then
+			return { Success = false, Reason = "JOB_CHANGE_NOT_ALLOWED", JobId = resolvedJobId }
+		end
+		local jobSnapshot = nil
+		if runState.SelectedJobId == resolvedJobId and runState.JobBaseMaxHp > 0 then
+			jobSnapshot = runState:GetJobSnapshot()
+		else
+			local validation = _ContentValidatorLogic:ValidateJobById(resolvedJobId)
+			if validation.Success == false then
+				return validation
+			end
+			jobSnapshot = runState:ApplyJobBundle(validation.Data)
+		end
+		if jobSnapshot.Success == false then
+			return jobSnapshot
+		end
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if inventory == nil or inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_INVENTORY_SEQUENCE_MISMATCH", JobId = resolvedJobId }
+		end
+		if inventory.RunSkillSnapshot == "" then
+			local skillResult = inventory:InitializeStartingSkills(runState.StartingSkillIds)
+			if skillResult.Success == false then
+				return skillResult
+			end
+		end
+		jobSnapshot.OwnedSkillSnapshot = inventory.RunSkillSnapshot
+		jobSnapshot.SkillInventoryRevision = inventory.SkillInventoryRevision
+		local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
+		if augmentState == nil or augmentState.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_AUGMENT_SEQUENCE_MISMATCH", JobId = resolvedJobId }
+		end
+		if runState.SelectedJobPassiveSetId ~= "" then
+			local passiveResult = self:GrantRunAugment(
+				playerEntity,
+				runState.SelectedJobPassiveSetId,
+				"JOB",
+				"job:" .. tostring(runState.RunSequence) .. ":" .. runState.SelectedJobPassiveSetId
+			)
+			if passiveResult.Success == false then
+				return passiveResult
+			end
+		end
+		jobSnapshot.OwnedAugmentSnapshot = augmentState.OwnedAugmentSnapshot
+		jobSnapshot.AugmentRevision = augmentState.AugmentRevision
+		return jobSnapshot
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunJobSnapshot(Entity playerEntity)
+		-- Exposes the selected job to lobby, battle, shop, and result systems through one facade.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		return runState:GetJobSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateRunState(Entity playerEntity)
+		-- Returns the player-owned run progression component without storing mutable state in this Logic.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			log_error("[RunManager] state unavailable reason=INVALID_PLAYER")
+			return nil
+		end
+
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil then
+			runState = playerEntity:AddComponent("PlayerRunStateComponent")
+		end
+		if runState == nil then
+			log_error("[RunManager] state unavailable reason=COMPONENT_ATTACH_FAILED player=" .. playerEntity.Name)
+			return nil
+		end
+		return runState
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateRunInventory(Entity playerEntity)
+		-- Returns the separate player-owned run inventory component.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			log_error("[RunManager] inventory unavailable reason=INVALID_PLAYER")
+			return nil
+		end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then
+			inventory = playerEntity:AddComponent("PlayerRunInventoryComponent")
+		end
+		if inventory == nil then
+			log_error("[RunManager] inventory unavailable reason=COMPONENT_ATTACH_FAILED player=" .. playerEntity.Name)
+		end
+		return inventory
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateRunAugmentState(Entity playerEntity)
+		-- Returns the player-owned run augment component without storing instances in global Logic state.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			log_error("[RunManager] augment state unavailable reason=INVALID_PLAYER")
+			return nil
+		end
+		local augmentState = playerEntity:GetComponent("script.PlayerRunAugmentComponent")
+		if augmentState == nil then
+			augmentState = playerEntity:AddComponent("PlayerRunAugmentComponent")
+		end
+		if augmentState == nil then
+			log_error("[RunManager] augment state unavailable reason=COMPONENT_ATTACH_FAILED player=" .. playerEntity.Name)
+		end
+		return augmentState
+	end
+
+	@ExecSpace("ServerOnly")
+	method any EnsureRunState(Entity playerEntity, integer fallbackSeed)
+		-- Reuses an active run or initializes progression and inventory as one boundary.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return nil
+		end
+
+		if runState.RunSequence <= 0 or runState.RunState == "Idle" then
+			local seed = fallbackSeed
+			if seed < 0 then
+				seed = self.DefaultRunSeed
+			end
+			runState:BeginNewRun(seed)
+			local inventory = self:GetOrCreateRunInventory(playerEntity)
+			if inventory == nil then
+				return nil
+			end
+			inventory:ResetForRun(runState.RunSequence)
+			local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
+			if augmentState == nil then
+				return nil
+			end
+			augmentState:ResetForRun(runState.RunSequence)
+			log("[RunManager] initialized player=" .. playerEntity.Name .. " sequence=" .. runState.RunSequence .. " seed=" .. runState.RunSeed)
+		else
+			self:GetOrCreateRunInventory(playerEntity)
+			local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
+			if augmentState == nil then
+				return nil
+			end
+			if augmentState.ActiveRunSequence ~= runState.RunSequence then
+				augmentState:ResetForRun(runState.RunSequence)
+				log("[RunManager] migrated augment state sequence=" .. runState.RunSequence)
+			end
+			log("[RunManager] reused player=" .. playerEntity.Name .. " sequence=" .. runState.RunSequence .. " seed=" .. runState.RunSeed .. " state=" .. runState.RunState)
+		end
+		return runState
+	end
+
+	@ExecSpace("ServerOnly")
+	method any StartNewRun(Entity playerEntity, integer runSeed)
+		-- Starts progression and resets independently owned inventory and augment state.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return nil
+		end
+
+		runState:BeginNewRun(runSeed)
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if inventory == nil then
+			return nil
+		end
+		inventory:ResetForRun(runState.RunSequence)
+		local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
+		if augmentState == nil then
+			return nil
+		end
+		augmentState:ResetForRun(runState.RunSequence)
+		log("[RunManager] new run player=" .. playerEntity.Name .. " sequence=" .. runState.RunSequence .. " seed=" .. runState.RunSeed)
+		return runState
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean RecordBattleResult(Entity playerEntity, string stageId, integer stageNumber, string battleResult, integer entryRequestId)
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return false
+		end
+		local battleRecordKey = tostring(runState.RunSequence) .. ":" .. stageId .. ":" .. tostring(entryRequestId)
+		if runState.LastBattleRecordKey == battleRecordKey then
+			log_warning("[RunManager] duplicate result ignored key=" .. battleRecordKey)
+			return true
+		end
+		local flowResult = _NodeDefinitionRepositoryLogic:ResolveBattleOutcome(
+			runState.CurrentNodeGraphId,
+			runState.CurrentNodeId,
+			stageId,
+			battleResult
+		)
+		if flowResult.Success == false then
+			log_error("[RunManager] flow resolution failed stage=" .. stageId .. " reason=" .. flowResult.Reason)
+			return false
+		end
+		if battleResult == "Victory" then
+			local rewardResult = self:ApplyStageClearRewards(playerEntity, stageId, battleRecordKey)
+			if rewardResult.Success == false then
+				log_error("[RunManager] stage reward failed stage=" .. stageId .. " reason=" .. rewardResult.Reason .. " detail=" .. (rewardResult.DetailReason or ""))
+				return false
+			end
+		end
+		if runState:RecordBattleResult(stageNumber, battleResult, battleRecordKey) == false then
+			return false
+		end
+		return runState:ApplyBattleFlowResult(flowResult)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyStageClearRewards(Entity playerEntity, string stageId, string battleRecordKey)
+		-- Resolves static Stage rewards, then delegates every mutation and duplicate guard to the run inventory owner.
+		local validation = _ContentValidatorLogic:ValidateStageRewards()
+		if validation.Success == false then
+			return { Success = false, Reason = "STAGE_REWARD_VALIDATION_FAILED", DetailReason = validation.DetailReason or validation.Reason, AppliedCount = 0 }
+		end
+		local definitions = _StageRewardDefinitionRepositoryLogic:GetRewardsForStage(stageId)
+		if definitions.Success == false then
+			return { Success = false, Reason = definitions.Reason, DetailReason = definitions.DetailReason or "", AppliedCount = 0 }
+		end
+		local result = { Success = true, Reason = definitions.Reason, StageId = stageId, AppliedCount = 0, DuplicateCount = 0, RewardSnapshot = "" }
+		for _, entry in ipairs(definitions.Entries) do
+			local rewardKey = "stage:" .. battleRecordKey .. ":" .. entry.StageRewardEntryId
+			local grant = self:GrantRunReward(playerEntity, entry.RewardType, entry.RewardRefId, entry.Amount, rewardKey)
+			if grant.Success == false then
+				result.Success = false
+				result.Reason = "STAGE_REWARD_GRANT_FAILED"
+				result.DetailReason = entry.StageRewardEntryId .. ":" .. grant.Reason
+				return result
+			end
+			if grant.Reason == "DUPLICATE_REWARD_IGNORED" then
+				result.DuplicateCount = result.DuplicateCount + 1
+			else
+				result.AppliedCount = result.AppliedCount + 1
+			end
+			local snapshotEntry = entry.StageRewardEntryId .. "~" .. entry.RewardType .. "~" .. entry.RewardRefId .. "~" .. tostring(entry.Amount)
+			result.RewardSnapshot = result.RewardSnapshot == "" and snapshotEntry or result.RewardSnapshot .. "|" .. snapshotEntry
+		end
+		log("[StageReward] resolved stage=" .. stageId .. " battleKey=" .. battleRecordKey .. " applied=" .. result.AppliedCount .. " duplicate=" .. result.DuplicateCount .. " rewards=" .. result.RewardSnapshot)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunFlowSnapshot(Entity playerEntity)
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		return runState:GetRunFlowSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SelectNextContent(Entity playerEntity, string nodeId, integer requestId)
+		-- Authenticated callers select only one option already published in the player-owned flow snapshot.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		if requestId == nil or requestId <= 0 then
+			return { Success = false, Reason = "INVALID_CONTENT_SELECTION_REQUEST" }
+		end
+		local selectionKey = tostring(runState.RunSequence) .. ":" .. tostring(requestId)
+		if runState.LastContentSelectionKey == selectionKey then
+			local duplicate = runState:GetRunFlowSnapshot()
+			duplicate.Reason = "DUPLICATE_SELECTION_IGNORED"
+			return duplicate
+		end
+		if runState.RunFlowState ~= "AWAITING_NODE_SELECTION" or runState.ContentTransitionState ~= "SELECTION_REQUIRED" then
+			return { Success = false, Reason = "NODE_SELECTION_NOT_AVAILABLE", RunFlowState = runState.RunFlowState, ContentTransitionState = runState.ContentTransitionState }
+		end
+
+		local selection = self:ResolveAvailableContentSelection(runState, nodeId)
+		if selection.Success == false then
+			return selection
+		end
+		local route = _RunContentFlowRouterLogic:Resolve(selection)
+		if route.Success == false then
+			return route
+		end
+		local applied = runState:ApplyContentTransition(selection, route, selectionKey)
+		applied.Reason = route.Reason
+		return applied
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CompleteCurrentContent(Entity playerEntity, string expectedContentType, integer requestId)
+		-- Completes one selected non-battle node through a shared server-authoritative boundary.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		if requestId == nil or requestId <= 0 then
+			return { Success = false, Reason = "INVALID_CONTENT_COMPLETION_REQUEST" }
+		end
+		local completionKey = tostring(runState.RunSequence) .. ":" .. tostring(requestId)
+		if runState.LastContentCompletionKey == completionKey then
+			local duplicate = runState:GetRunFlowSnapshot()
+			duplicate.Reason = "DUPLICATE_CONTENT_COMPLETION_IGNORED"
+			return duplicate
+		end
+		if expectedContentType ~= "SHOP" and expectedContentType ~= "EVENT" and expectedContentType ~= "REST" then
+			return { Success = false, Reason = "CONTENT_TYPE_NOT_COMPLETABLE", ContentType = expectedContentType or "" }
+		end
+		if runState.SelectedContentType ~= expectedContentType then
+			return { Success = false, Reason = "CONTENT_TYPE_MISMATCH", ExpectedContentType = expectedContentType, SelectedContentType = runState.SelectedContentType }
+		end
+		local expectedFlowState = "AWAITING_" .. expectedContentType
+		if runState.RunFlowState ~= expectedFlowState or runState.ContentTransitionState ~= "READY" then
+			return { Success = false, Reason = "CONTENT_COMPLETION_NOT_READY", RunFlowState = runState.RunFlowState, ContentTransitionState = runState.ContentTransitionState }
+		end
+		if runState.CurrentNodeGraphId == "" or runState.SelectedNodeId == "" or runState.CurrentNodeId ~= runState.SelectedNodeId then
+			return { Success = false, Reason = "CONTENT_NODE_CONTEXT_MISMATCH" }
+		end
+		local flowResult = _NodeDefinitionRepositoryLogic:ResolveContentCompletion(runState.CurrentNodeGraphId, runState.SelectedNodeId)
+		if flowResult.Success == false then
+			return flowResult
+		end
+		return runState:ApplyContentCompletion(flowResult, completionKey)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveAvailableContentSelection(any runState, string nodeId)
+		local nodeIds = self:SplitPipeValues(runState.AvailableNodeIds)
+		local contentTypes = self:SplitPipeValues(runState.AvailableContentTypes)
+		local contentIds = self:SplitPipeValues(runState.AvailableContentIds)
+		if #nodeIds ~= #contentTypes or #nodeIds ~= #contentIds then
+			return { Success = false, Reason = "RUN_FLOW_OPTION_SNAPSHOT_MISMATCH" }
+		end
+		for index = 1, #nodeIds do
+			if nodeIds[index] == nodeId then
+				local nodeDefinition = _NodeDefinitionRepositoryLogic:GetNodeDefinition(runState.CurrentNodeGraphId, nodeId)
+				if nodeDefinition.Success == false then
+					return { Success = false, Reason = nodeDefinition.Reason, DetailReason = nodeDefinition.DetailReason or "" }
+				end
+				local expectedContentId = nodeDefinition.NodeId
+				if nodeDefinition.NodeType == "BATTLE" or nodeDefinition.NodeType == "BOSS" then
+					expectedContentId = nodeDefinition.StageId
+				end
+				if nodeDefinition.NodeType ~= contentTypes[index] or expectedContentId ~= contentIds[index] then
+					return { Success = false, Reason = "RUN_FLOW_OPTION_DEFINITION_MISMATCH", NodeId = nodeId }
+				end
+				return {
+					Success = true,
+					Reason = "AVAILABLE_CONTENT_SELECTED",
+					NodeGraphId = runState.CurrentNodeGraphId,
+					NodeId = nodeId,
+					ContentType = contentTypes[index],
+					ContentId = contentIds[index]
+				}
+			end
+		end
+		return { Success = false, Reason = "NODE_NOT_AVAILABLE", NodeId = nodeId or "" }
+	end
+
+	method table SplitPipeValues(string snapshot)
+		local values = {}
+		for value in string.gmatch(snapshot or "", "([^|]+)") do
+			table.insert(values, value)
+		end
+		return values
+	end
+
+	@ExecSpace("Server")
+	method void RequestSelectNextContent(string nodeId, integer requestId)
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:SelectNextContent(playerEntity, nodeId, requestId)
+		if result.Success == false then
+			log_warning("[RunContentFlow] selection rejected user=" .. senderUserId .. " node=" .. nodeId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			return
+		end
+		log("[RunContentFlow] selection accepted user=" .. senderUserId .. " node=" .. nodeId .. " request=" .. requestId .. " action=" .. (result.RouteAction or "") .. " reason=" .. result.Reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalRunFlowUiState()
+		-- Client UI reads one DTO and never parses NodeDefinitions or calls content handlers.
+		local playerEntity = _UserService.LocalPlayer
+		if playerEntity == nil then
+			return { Success = false, Reason = "LOCAL_PLAYER_UNAVAILABLE" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		return {
+			Success = true,
+			Reason = runState.ContentTransitionReason,
+			RevisionKey = tostring(runState.RunFlowRevision) .. ":" .. tostring(runState.ContentTransitionRevision),
+			RunState = runState.RunState,
+			RunFlowState = runState.RunFlowState,
+			CurrentNodeGraphId = runState.CurrentNodeGraphId,
+			CurrentNodeId = runState.CurrentNodeId,
+			AvailableNodeIds = runState.AvailableNodeIds,
+			AvailableContentTypes = runState.AvailableContentTypes,
+			AvailableContentIds = runState.AvailableContentIds,
+			Transition = {
+				State = runState.ContentTransitionState,
+				SelectedNodeId = runState.SelectedNodeId,
+				ContentType = runState.SelectedContentType,
+				ContentId = runState.SelectedContentId,
+				RouteAction = runState.ContentRouteAction,
+				UiRouteId = runState.ContentUiRouteId,
+				DestinationType = runState.ContentDestinationType,
+				DestinationId = runState.ContentDestinationId,
+				RequiresMapTransfer = runState.ContentRequiresMapTransfer,
+				Reason = runState.ContentTransitionReason,
+				Revision = runState.ContentTransitionRevision
+			},
+			Commands = {
+				CanSelectNode = runState.RunFlowState == "AWAITING_NODE_SELECTION" and runState.ContentTransitionState == "SELECTION_REQUIRED",
+				CanConsumeTransition = runState.ContentTransitionState == "READY",
+				CanCompleteContent = runState.ContentTransitionState == "READY"
+					and (runState.SelectedContentType == "SHOP" or runState.SelectedContentType == "EVENT" or runState.SelectedContentType == "REST")
+			}
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GrantRunReward(Entity playerEntity, string rewardType, string rewardRefId, integer amount, string rewardKey)
+		-- Public reward boundary for battle, shop, event, and future node implementations.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if runState == nil or inventory == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		if runState.RunSequence <= 0 or runState.RunState == "Idle" then
+			return { Success = false, Reason = "RUN_NOT_STARTED" }
+		end
+		if inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_INVENTORY_SEQUENCE_MISMATCH" }
+		end
+		return inventory:GrantRunReward(rewardType, rewardRefId, amount, rewardKey)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyRunShopPurchase(Entity playerEntity, table shopEntry, string purchaseKey)
+		-- Shop validates immutable content; RunManager enforces run ownership before the inventory performs one atomic mutation.
+		if shopEntry == nil or shopEntry.Success ~= true then
+			return { Success = false, Reason = "INVALID_SHOP_ENTRY" }
+		end
+		local runState = self:GetOrCreateRunState(playerEntity)
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if runState == nil or inventory == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		if inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_INVENTORY_SEQUENCE_MISMATCH" }
+		end
+		return inventory:ApplyShopPurchase(
+			shopEntry.PriceCurrencyId,
+			shopEntry.PriceAmount,
+			shopEntry.RewardType,
+			shopEntry.RewardRefId,
+			shopEntry.RewardAmount,
+			purchaseKey
+		)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunRewardSnapshot(Entity playerEntity)
+		-- Returns the inventory DTO through the stable RunManager facade.
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if inventory == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		return inventory:GetSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CanUseRunSkill(Entity playerEntity, string skillId)
+		-- Checks player-owned run skill eligibility through the inventory facade.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if runState == nil or inventory == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE", SkillId = skillId or "" }
+		end
+		if inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_INVENTORY_SEQUENCE_MISMATCH", SkillId = skillId or "" }
+		end
+		return inventory:CanUseSkill(skillId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GrantRunSkill(Entity playerEntity, string skillId, integer amount, string rewardKey)
+		-- Validates a skill reference before granting it from a future shop, reward, or event adapter.
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then
+			return validation
+		end
+		local runState = self:GetOrCreateRunState(playerEntity)
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if runState == nil or inventory == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE", SkillId = skillId or "" }
+		end
+		if inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_INVENTORY_SEQUENCE_MISMATCH", SkillId = skillId or "" }
+		end
+		return inventory:GrantSkill(skillId, amount, rewardKey)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunSkillSnapshot(Entity playerEntity)
+		-- Returns the mutable run-owned skill DTO for server integrations and tests.
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if inventory == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		return inventory:GetSkillSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GrantRunAugment(Entity playerEntity, string augmentId, string sourceType, string rewardKey)
+		-- Validates static content before mutating the player-owned augment instance collection.
+		local validation = _ContentValidatorLogic:ValidateAugmentById(augmentId)
+		if validation.Success == false then
+			return validation
+		end
+		local runState = self:GetOrCreateRunState(playerEntity)
+		local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
+		if runState == nil or augmentState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE", AugmentId = augmentId or "" }
+		end
+		if augmentState.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_AUGMENT_SEQUENCE_MISMATCH", AugmentId = augmentId or "" }
+		end
+		return augmentState:GrantUniqueAugment(augmentId, sourceType, rewardKey)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunAugmentSnapshot(Entity playerEntity)
+		-- Returns the mutable run augment DTO for battle, shop, result, and tests.
+		local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
+		if augmentState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		return augmentState:GetSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CanUseRunConsumable(Entity playerEntity, string consumableId, string useKey)
+		-- Checks one consumable without exposing the inventory component to battle code.
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if inventory == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		return inventory:CanConsume(consumableId, 1, useKey)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConsumeRunConsumable(Entity playerEntity, string consumableId, string useKey)
+		-- Commits one validated consumable use through the run inventory owner.
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if inventory == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		return inventory:Consume(consumableId, 1, useKey)
+	end
+
+end

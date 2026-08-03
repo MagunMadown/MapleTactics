@@ -1,0 +1,289 @@
+@Component
+script PlayerRunStateComponent extends Component
+
+	@Sync property integer RunSeed = 1000
+	@Sync property integer RunSequence = 0
+	@Sync property string RunState = "Idle"
+	@Sync property integer CurrentStageNumber = 1
+	@Sync property integer CompletedStageCount = 0
+	@Sync property string LastBattleResult = ""
+	@Sync property string RunFlowState = "IDLE"
+	@Sync property string CurrentNodeGraphId = ""
+	@Sync property string CurrentNodeId = ""
+	@Sync property string LastCompletedStageId = ""
+	@Sync property string AvailableNodeIds = ""
+	@Sync property string AvailableContentTypes = ""
+	@Sync property string AvailableContentIds = ""
+	@Sync property integer RunFlowRevision = 0
+	@Sync property string LastBattleRecordKey = ""
+	@Sync property string ContentTransitionState = "IDLE"
+	@Sync property string SelectedNodeId = ""
+	@Sync property string SelectedContentType = ""
+	@Sync property string SelectedContentId = ""
+	@Sync property string ContentRouteAction = ""
+	@Sync property string ContentUiRouteId = ""
+	@Sync property string ContentDestinationType = ""
+	@Sync property string ContentDestinationId = ""
+	@Sync property boolean ContentRequiresMapTransfer = false
+	@Sync property string ContentTransitionReason = ""
+	@Sync property integer ContentTransitionRevision = 0
+	@Sync property string LastContentSelectionKey = ""
+	@Sync property string LastContentCompletionKey = ""
+	@Sync property string LastCompletedContentType = ""
+	@Sync property string LastCompletedContentId = ""
+	@Sync property string SelectedJobId = ""
+	@Sync property string SelectedJobMechanicId = "NONE"
+	@Sync property string SelectedJobPassiveSetId = ""
+	@Sync property string StartingSkillIds = ""
+	@Sync property integer JobBaseMaxHp = 0
+	@Sync property integer JobBaseQueueCapacity = 0
+	@Sync property integer JobRevision = 0
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- The player owns this state so separate users never share one roguelike run.
+		log("[PlayerRunState] attached player=" .. self.Entity.Name .. " sequence=" .. self.RunSequence .. " seed=" .. self.RunSeed .. " state=" .. self.RunState)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginNewRun(integer runSeed)
+		-- Resets run progression and its immutable-at-runtime job selection boundary.
+		self.RunSeed = math.max(0, math.floor(math.abs(runSeed)))
+		self.RunSequence = self.RunSequence + 1
+		self.RunState = "Active"
+		self.CurrentStageNumber = 1
+		self.CompletedStageCount = 0
+		self.LastBattleResult = ""
+		self.RunFlowState = "AWAITING_BATTLE"
+		self.CurrentNodeGraphId = ""
+		self.CurrentNodeId = ""
+		self.LastCompletedStageId = ""
+		self.AvailableNodeIds = ""
+		self.AvailableContentTypes = ""
+		self.AvailableContentIds = ""
+		self.RunFlowRevision = self.RunFlowRevision + 1
+		self.LastBattleRecordKey = ""
+		self.LastContentCompletionKey = ""
+		self.LastCompletedContentType = ""
+		self.LastCompletedContentId = ""
+		self:ResetContentTransition("NEW_RUN")
+		self.SelectedJobId = ""
+		self.SelectedJobMechanicId = "NONE"
+		self.SelectedJobPassiveSetId = ""
+		self.StartingSkillIds = ""
+		self.JobBaseMaxHp = 0
+		self.JobBaseQueueCapacity = 0
+		self.JobRevision = self.JobRevision + 1
+		log("[PlayerRunState] begun sequence=" .. self.RunSequence .. " seed=" .. self.RunSeed .. " stage=" .. self.CurrentStageNumber)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyJobBundle(table bundle)
+		-- Stores only the validated run snapshot so later stages do not depend on mutable dataset rows.
+		if bundle == nil or bundle.Success ~= true or bundle.Definition == nil then
+			return { Success = false, Reason = "INVALID_JOB_BUNDLE" }
+		end
+		local definition = bundle.Definition
+		local skillIds = {}
+		for _, entry in ipairs(bundle.StartingSkills or {}) do
+			for copyIndex = 1, math.max(1, entry.Count or 1) do
+				table.insert(skillIds, entry.SkillId)
+			end
+		end
+		self.SelectedJobId = definition.JobId
+		self.SelectedJobMechanicId = definition.JobMechanicId
+		self.SelectedJobPassiveSetId = definition.JobPassiveSetId or ""
+		self.StartingSkillIds = table.concat(skillIds, "|")
+		self.JobBaseMaxHp = definition.BaseMaxHp
+		self.JobBaseQueueCapacity = definition.BaseQueueCapacity
+		self.JobRevision = self.JobRevision + 1
+		log("[PlayerRunState] job applied job=" .. self.SelectedJobId .. " mechanic=" .. self.SelectedJobMechanicId .. " passive=" .. self.SelectedJobPassiveSetId .. " hp=" .. self.JobBaseMaxHp .. " queue=" .. self.JobBaseQueueCapacity .. " skills=" .. self.StartingSkillIds .. " revision=" .. self.JobRevision)
+		return self:GetJobSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetJobSnapshot()
+		-- Returns the job-owned portion of the run through a stable DTO.
+		return {
+			Success = self.SelectedJobId ~= "",
+			Reason = self.SelectedJobId ~= "" and "OK" or "JOB_NOT_SELECTED",
+			JobId = self.SelectedJobId,
+			MechanicId = self.SelectedJobMechanicId,
+			PassiveSetId = self.SelectedJobPassiveSetId,
+			StartingSkillIds = self.StartingSkillIds,
+			BaseMaxHp = self.JobBaseMaxHp,
+			BaseQueueCapacity = self.JobBaseQueueCapacity,
+			Revision = self.JobRevision
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean RecordBattleResult(integer stageNumber, string battleResult, string battleRecordKey)
+		if self.RunSequence <= 0 then
+			log_warning("[PlayerRunState] result rejected reason=RUN_NOT_STARTED")
+			return false
+		end
+		if battleResult ~= "Victory" and battleResult ~= "Defeat" then
+			log_warning("[PlayerRunState] result rejected reason=INVALID_RESULT value=" .. battleResult)
+			return false
+		end
+		if battleRecordKey == nil or battleRecordKey == "" then
+			log_warning("[PlayerRunState] result rejected reason=INVALID_RECORD_KEY")
+			return false
+		end
+
+		self.LastBattleResult = battleResult
+		self.LastBattleRecordKey = battleRecordKey
+		if battleResult == "Victory" then
+			self.CompletedStageCount = math.max(self.CompletedStageCount, stageNumber)
+			self.CurrentStageNumber = math.max(self.CurrentStageNumber, stageNumber + 1)
+			self.RunState = "Active"
+		else
+			self.RunState = "Failed"
+		end
+		log("[PlayerRunState] result recorded sequence=" .. self.RunSequence .. " seed=" .. self.RunSeed .. " result=" .. battleResult .. " stage=" .. stageNumber .. " nextStage=" .. self.CurrentStageNumber .. " completed=" .. self.CompletedStageCount .. " state=" .. self.RunState)
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean ApplyBattleFlowResult(table flowResult)
+		if flowResult == nil or flowResult.Success ~= true then
+			log_error("[PlayerRunState] flow rejected reason=INVALID_FLOW_RESULT")
+			return false
+		end
+		self.RunFlowState = flowResult.FlowState or "DATA_ERROR"
+		self.CurrentNodeGraphId = flowResult.NodeGraphId or self.CurrentNodeGraphId
+		self.CurrentNodeId = flowResult.CompletedNodeId or self.CurrentNodeId
+		self.LastCompletedStageId = flowResult.CompletedStageId or ""
+		self.AvailableNodeIds = flowResult.NextNodeIds or ""
+		self.AvailableContentTypes = flowResult.NextContentTypes or ""
+		self.AvailableContentIds = flowResult.NextContentIds or ""
+		self:ResetContentTransition("BATTLE_FLOW_APPLIED")
+		if self.RunFlowState == "AWAITING_NODE_SELECTION" then
+			self.ContentTransitionState = "SELECTION_REQUIRED"
+			self.ContentTransitionReason = "NEXT_NODE_SELECTION_REQUIRED"
+			self.ContentTransitionRevision = self.ContentTransitionRevision + 1
+		end
+		self.RunFlowRevision = self.RunFlowRevision + 1
+		if self.RunFlowState == "RUN_COMPLETED" then
+			self.RunState = "Completed"
+		elseif self.RunFlowState == "RUN_FAILED" then
+			self.RunState = "Failed"
+		end
+		log("[PlayerRunState] flow applied state=" .. self.RunFlowState .. " graph=" .. self.CurrentNodeGraphId .. " node=" .. self.CurrentNodeId .. " nextNodes=" .. self.AvailableNodeIds .. " nextTypes=" .. self.AvailableContentTypes .. " revision=" .. self.RunFlowRevision)
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyContentTransition(table selection, table route, string selectionKey)
+		if selection == nil or route == nil or route.Success ~= true then
+			return { Success = false, Reason = "INVALID_CONTENT_TRANSITION" }
+		end
+		self.CurrentNodeId = selection.NodeId
+		self.SelectedNodeId = selection.NodeId
+		self.SelectedContentType = selection.ContentType
+		self.SelectedContentId = selection.ContentId
+		self.ContentRouteAction = route.RouteAction or ""
+		self.ContentUiRouteId = route.UiRouteId or ""
+		self.ContentDestinationType = route.DestinationType or selection.ContentType
+		self.ContentDestinationId = route.DestinationId or selection.ContentId
+		self.ContentRequiresMapTransfer = route.RequiresMapTransfer == true
+		self.ContentTransitionState = "READY"
+		self.ContentTransitionReason = route.Reason or "CONTENT_TRANSITION_READY"
+		self.LastContentSelectionKey = selectionKey
+		self.AvailableNodeIds = ""
+		self.AvailableContentTypes = ""
+		self.AvailableContentIds = ""
+		self.RunFlowState = route.FlowState or "CONTENT_READY"
+		self.ContentTransitionRevision = self.ContentTransitionRevision + 1
+		self.RunFlowRevision = self.RunFlowRevision + 1
+		log("[RunContentFlow] prepared node=" .. self.SelectedNodeId .. " type=" .. self.SelectedContentType .. " content=" .. self.SelectedContentId .. " action=" .. self.ContentRouteAction .. " ui=" .. self.ContentUiRouteId .. " mapTransfer=" .. tostring(self.ContentRequiresMapTransfer) .. " revision=" .. self.ContentTransitionRevision)
+		return self:GetRunFlowSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyContentCompletion(table flowResult, string completionKey)
+		-- Commits one validated non-battle completion and clears the consumed transition atomically.
+		if flowResult == nil or flowResult.Success ~= true then
+			return { Success = false, Reason = "INVALID_CONTENT_COMPLETION_FLOW" }
+		end
+		if completionKey == nil or completionKey == "" then
+			return { Success = false, Reason = "INVALID_CONTENT_COMPLETION_KEY" }
+		end
+		local completedContentType = self.SelectedContentType
+		local completedContentId = self.SelectedContentId
+		self.CurrentNodeGraphId = flowResult.NodeGraphId or self.CurrentNodeGraphId
+		self.CurrentNodeId = flowResult.CompletedNodeId or self.CurrentNodeId
+		self.AvailableNodeIds = flowResult.NextNodeIds or ""
+		self.AvailableContentTypes = flowResult.NextContentTypes or ""
+		self.AvailableContentIds = flowResult.NextContentIds or ""
+		self:ResetContentTransition("CONTENT_COMPLETED")
+		self.LastContentCompletionKey = completionKey
+		self.LastCompletedContentType = completedContentType
+		self.LastCompletedContentId = completedContentId
+		self.RunFlowState = flowResult.FlowState or "DATA_ERROR"
+		if self.RunFlowState == "AWAITING_NODE_SELECTION" then
+			self.ContentTransitionState = "SELECTION_REQUIRED"
+			self.ContentTransitionReason = "NEXT_NODE_SELECTION_REQUIRED"
+			self.ContentTransitionRevision = self.ContentTransitionRevision + 1
+		elseif self.RunFlowState == "RUN_COMPLETED" then
+			self.RunState = "Completed"
+		end
+		self.RunFlowRevision = self.RunFlowRevision + 1
+		log("[RunContentFlow] completed type=" .. completedContentType .. " content=" .. completedContentId .. " state=" .. self.RunFlowState .. " nextNodes=" .. self.AvailableNodeIds .. " key=" .. completionKey .. " revision=" .. self.RunFlowRevision)
+		local snapshot = self:GetRunFlowSnapshot()
+		snapshot.Reason = flowResult.Reason or "CONTENT_COMPLETED"
+		return snapshot
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResetContentTransition(string reason)
+		self.ContentTransitionState = "IDLE"
+		self.SelectedNodeId = ""
+		self.SelectedContentType = ""
+		self.SelectedContentId = ""
+		self.ContentRouteAction = ""
+		self.ContentUiRouteId = ""
+		self.ContentDestinationType = ""
+		self.ContentDestinationId = ""
+		self.ContentRequiresMapTransfer = false
+		self.ContentTransitionReason = reason or ""
+		self.LastContentSelectionKey = ""
+		self.ContentTransitionRevision = self.ContentTransitionRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunFlowSnapshot()
+		return {
+			Success = true,
+			Reason = "OK",
+			RunSequence = self.RunSequence,
+			RunState = self.RunState,
+			RunFlowState = self.RunFlowState,
+			CurrentNodeGraphId = self.CurrentNodeGraphId,
+			CurrentNodeId = self.CurrentNodeId,
+			LastCompletedStageId = self.LastCompletedStageId,
+			AvailableNodeIds = self.AvailableNodeIds,
+			AvailableContentTypes = self.AvailableContentTypes,
+			AvailableContentIds = self.AvailableContentIds,
+			Revision = self.RunFlowRevision,
+			BattleRecordKey = self.LastBattleRecordKey,
+			ContentTransitionState = self.ContentTransitionState,
+			SelectedNodeId = self.SelectedNodeId,
+			SelectedContentType = self.SelectedContentType,
+			SelectedContentId = self.SelectedContentId,
+			RouteAction = self.ContentRouteAction,
+			UiRouteId = self.ContentUiRouteId,
+			DestinationType = self.ContentDestinationType,
+			DestinationId = self.ContentDestinationId,
+			RequiresMapTransfer = self.ContentRequiresMapTransfer,
+			ContentTransitionReason = self.ContentTransitionReason,
+			ContentTransitionRevision = self.ContentTransitionRevision,
+			LastContentSelectionKey = self.LastContentSelectionKey,
+			LastContentCompletionKey = self.LastContentCompletionKey,
+			LastCompletedContentType = self.LastCompletedContentType,
+			LastCompletedContentId = self.LastCompletedContentId
+		}
+	end
+
+end

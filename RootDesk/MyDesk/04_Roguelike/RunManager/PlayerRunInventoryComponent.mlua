@@ -1,0 +1,339 @@
+@Component
+script PlayerRunInventoryComponent extends Component
+
+	@TargetUserSync property integer ActiveRunSequence = 0
+	@TargetUserSync property string RunCurrencySnapshot = ""
+	@TargetUserSync property string RunConsumableSnapshot = ""
+	@TargetUserSync property string RunSkillSnapshot = ""
+	@TargetUserSync property integer ConsumableCapacity = 3
+	@TargetUserSync property string OverflowCurrencyId = "gold"
+	@TargetUserSync property integer OverflowCurrencyPerItem = 1
+	@TargetUserSync property integer InventoryRevision = 0
+	@TargetUserSync property integer SkillInventoryRevision = 0
+
+	property string AppliedRewardKeys = ""
+	property string AppliedUseKeys = ""
+	property string AppliedPurchaseKeys = ""
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Reports attachment while all mutable inventory state remains player-owned.
+		log("[RunInventory] attached player=" .. self.Entity.Name .. " runSequence=" .. self.ActiveRunSequence)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResetForRun(integer runSequence)
+		-- Clears run-scoped rewards exactly when a new run sequence begins.
+		self.ActiveRunSequence = math.max(0, runSequence)
+		self.RunCurrencySnapshot = ""
+		self.RunConsumableSnapshot = ""
+		self.RunSkillSnapshot = ""
+		self.AppliedRewardKeys = ""
+		self.AppliedUseKeys = ""
+		self.AppliedPurchaseKeys = ""
+		self.InventoryRevision = self.InventoryRevision + 1
+		self.SkillInventoryRevision = self.SkillInventoryRevision + 1
+		log("[RunInventory] reset runSequence=" .. self.ActiveRunSequence .. " revision=" .. self.InventoryRevision)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table InitializeStartingSkills(string startingSkillIds)
+		-- Rebuilds mutable run skill ownership from the validated immutable job snapshot.
+		if self.ActiveRunSequence <= 0 then
+			return { Success = false, Reason = "RUN_NOT_STARTED" }
+		end
+		local snapshot = ""
+		for skillId in string.gmatch(startingSkillIds or "", "([^|]+)") do
+			if self:IsSafeToken(skillId) == false then
+				return { Success = false, Reason = "INVALID_STARTING_SKILL_ID", SkillId = skillId }
+			end
+			snapshot = self:AddSnapshotAmount(snapshot, skillId, 1)
+		end
+		if snapshot == "" then
+			return { Success = false, Reason = "STARTING_SKILL_SET_EMPTY" }
+		end
+		self.RunSkillSnapshot = snapshot
+		self.InventoryRevision = self.InventoryRevision + 1
+		self.SkillInventoryRevision = self.SkillInventoryRevision + 1
+		log("[RunSkillInventory] initialized runSequence=" .. self.ActiveRunSequence .. " skills=" .. self.RunSkillSnapshot .. " revision=" .. self.SkillInventoryRevision)
+		return self:GetSkillSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CanUseSkill(string skillId)
+		-- Checks run ownership without mutating inventory or combat cooldown state.
+		if self.ActiveRunSequence <= 0 then
+			return { Success = false, Reason = "RUN_NOT_STARTED", SkillId = skillId or "", OwnedAmount = 0 }
+		end
+		if self:IsSafeToken(skillId) == false then
+			return { Success = false, Reason = "INVALID_SKILL_ID", SkillId = skillId or "", OwnedAmount = 0 }
+		end
+		local ownedAmount = self:GetSnapshotAmount(self.RunSkillSnapshot, skillId)
+		if ownedAmount <= 0 then
+			return { Success = false, Reason = "SKILL_NOT_OWNED", SkillId = skillId, OwnedAmount = 0 }
+		end
+		return { Success = true, Reason = "SKILL_OWNED", SkillId = skillId, OwnedAmount = ownedAmount }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GrantSkill(string skillId, integer amount, string rewardKey)
+		-- Adds a validated skill reward exactly once for future shop and node integrations.
+		if self.ActiveRunSequence <= 0 then
+			return { Success = false, Reason = "RUN_NOT_STARTED", SkillId = skillId or "", GrantedAmount = 0 }
+		end
+		if self:IsSafeToken(skillId) == false or self:IsSafeToken(rewardKey) == false then
+			return { Success = false, Reason = "INVALID_SKILL_REWARD_KEY", SkillId = skillId or "", GrantedAmount = 0 }
+		end
+		if amount == nil or amount <= 0 then
+			return { Success = false, Reason = "INVALID_REWARD_AMOUNT", SkillId = skillId, GrantedAmount = 0 }
+		end
+		if self:ContainsDelimitedKey(self.AppliedRewardKeys, rewardKey) then
+			return { Success = true, Reason = "DUPLICATE_REWARD_IGNORED", SkillId = skillId, GrantedAmount = 0, Revision = self.SkillInventoryRevision }
+		end
+		self.RunSkillSnapshot = self:AddSnapshotAmount(self.RunSkillSnapshot, skillId, amount)
+		self.AppliedRewardKeys = self:AppendDelimitedKey(self.AppliedRewardKeys, rewardKey)
+		self.InventoryRevision = self.InventoryRevision + 1
+		self.SkillInventoryRevision = self.SkillInventoryRevision + 1
+		log("[RunSkillInventory] granted key=" .. rewardKey .. " skill=" .. skillId .. " amount=" .. amount .. " owned=" .. self:GetSnapshotAmount(self.RunSkillSnapshot, skillId) .. " revision=" .. self.SkillInventoryRevision)
+		return { Success = true, Reason = "APPLIED", SkillId = skillId, GrantedAmount = amount, OwnedAmount = self:GetSnapshotAmount(self.RunSkillSnapshot, skillId), Revision = self.SkillInventoryRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetSkillSnapshot()
+		-- Returns the skill-only DTO without exposing currency and consumable mutation details.
+		return { Success = true, Reason = "OK", RunSequence = self.ActiveRunSequence, SkillSnapshot = self.RunSkillSnapshot, SkillCount = self:GetSnapshotTotal(self.RunSkillSnapshot), Revision = self.SkillInventoryRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GrantRunReward(string rewardType, string rewardRefId, integer amount, string rewardKey)
+		-- Applies one run-scoped reward exactly once and converts consumable overflow by policy.
+		local result = { Success = false, Reason = "UNKNOWN", RewardType = rewardType, RewardRefId = rewardRefId, RequestedAmount = amount, AcceptedAmount = 0, OverflowAmount = 0, Revision = self.InventoryRevision }
+		if self.ActiveRunSequence <= 0 then
+			result.Reason = "RUN_NOT_STARTED"
+			return result
+		end
+		if self:IsSafeToken(rewardRefId) == false or self:IsSafeToken(rewardKey) == false then
+			result.Reason = "INVALID_REWARD_KEY"
+			return result
+		end
+		if amount == nil or amount <= 0 then
+			result.Reason = "INVALID_REWARD_AMOUNT"
+			return result
+		end
+		if rewardType ~= "CURRENCY" and rewardType ~= "CONSUMABLE" then
+			result.Reason = "UNSUPPORTED_REWARD_TYPE"
+			return result
+		end
+		if self:ContainsDelimitedKey(self.AppliedRewardKeys, rewardKey) then
+			result.Success = true
+			result.Reason = "DUPLICATE_REWARD_IGNORED"
+			return result
+		end
+
+		if rewardType == "CURRENCY" then
+			self.RunCurrencySnapshot = self:AddSnapshotAmount(self.RunCurrencySnapshot, rewardRefId, amount)
+			result.AcceptedAmount = amount
+		else
+			local usedCapacity = self:GetSnapshotTotal(self.RunConsumableSnapshot)
+			local remainingCapacity = math.max(0, self.ConsumableCapacity - usedCapacity)
+			result.AcceptedAmount = math.min(amount, remainingCapacity)
+			result.OverflowAmount = amount - result.AcceptedAmount
+			if result.AcceptedAmount > 0 then
+				self.RunConsumableSnapshot = self:AddSnapshotAmount(self.RunConsumableSnapshot, rewardRefId, result.AcceptedAmount)
+			end
+			if result.OverflowAmount > 0 and self.OverflowCurrencyPerItem > 0 and self.OverflowCurrencyId ~= "" then
+				self.RunCurrencySnapshot = self:AddSnapshotAmount(self.RunCurrencySnapshot, self.OverflowCurrencyId, result.OverflowAmount * self.OverflowCurrencyPerItem)
+			end
+		end
+
+		self.AppliedRewardKeys = self:AppendDelimitedKey(self.AppliedRewardKeys, rewardKey)
+		self.InventoryRevision = self.InventoryRevision + 1
+		result.Success = true
+		result.Reason = "APPLIED"
+		result.Revision = self.InventoryRevision
+		log("[RunInventory] reward applied key=" .. rewardKey .. " type=" .. rewardType .. " ref=" .. rewardRefId .. " accepted=" .. result.AcceptedAmount .. " overflow=" .. result.OverflowAmount .. " revision=" .. self.InventoryRevision)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyShopPurchase(string priceCurrencyId, integer priceAmount, string rewardType, string rewardRefId, integer rewardAmount, string purchaseKey)
+		-- Owns the atomic currency deduction and reward mutation for one validated run-shop offer.
+		local result = { Success = false, Reason = "UNKNOWN", PriceCurrencyId = priceCurrencyId or "", PriceAmount = priceAmount or 0, RewardType = rewardType or "", RewardRefId = rewardRefId or "", RewardAmount = rewardAmount or 0, BalanceBefore = 0, BalanceAfter = 0, AcceptedAmount = 0, OverflowAmount = 0, Revision = self.InventoryRevision }
+		if self.ActiveRunSequence <= 0 then
+			result.Reason = "RUN_NOT_STARTED"
+			return result
+		end
+		if self:IsSafeToken(priceCurrencyId) == false or self:IsSafeToken(rewardRefId) == false or self:IsSafeToken(purchaseKey) == false then
+			result.Reason = "INVALID_PURCHASE_KEY"
+			return result
+		end
+		if priceAmount == nil or priceAmount <= 0 or rewardAmount == nil or rewardAmount <= 0 then
+			result.Reason = "INVALID_PURCHASE_AMOUNT"
+			return result
+		end
+		if rewardType ~= "SKILL" and rewardType ~= "CONSUMABLE" then
+			result.Reason = "UNSUPPORTED_PURCHASE_REWARD_TYPE"
+			return result
+		end
+		if self:ContainsDelimitedKey(self.AppliedPurchaseKeys, purchaseKey) then
+			result.Success = true
+			result.Reason = "DUPLICATE_PURCHASE_IGNORED"
+			result.BalanceBefore = self:GetSnapshotAmount(self.RunCurrencySnapshot, priceCurrencyId)
+			result.BalanceAfter = result.BalanceBefore
+			return result
+		end
+
+		result.BalanceBefore = self:GetSnapshotAmount(self.RunCurrencySnapshot, priceCurrencyId)
+		if result.BalanceBefore < priceAmount then
+			result.Reason = "INSUFFICIENT_CURRENCY"
+			result.BalanceAfter = result.BalanceBefore
+			return result
+		end
+		result.BalanceAfter = result.BalanceBefore - priceAmount
+		self.RunCurrencySnapshot = self:SetSnapshotAmount(self.RunCurrencySnapshot, priceCurrencyId, result.BalanceAfter)
+		if rewardType == "SKILL" then
+			self.RunSkillSnapshot = self:AddSnapshotAmount(self.RunSkillSnapshot, rewardRefId, rewardAmount)
+			result.AcceptedAmount = rewardAmount
+			self.SkillInventoryRevision = self.SkillInventoryRevision + 1
+		else
+			local usedCapacity = self:GetSnapshotTotal(self.RunConsumableSnapshot)
+			local remainingCapacity = math.max(0, self.ConsumableCapacity - usedCapacity)
+			result.AcceptedAmount = math.min(rewardAmount, remainingCapacity)
+			result.OverflowAmount = rewardAmount - result.AcceptedAmount
+			if result.AcceptedAmount > 0 then
+				self.RunConsumableSnapshot = self:AddSnapshotAmount(self.RunConsumableSnapshot, rewardRefId, result.AcceptedAmount)
+			end
+			if result.OverflowAmount > 0 and self.OverflowCurrencyPerItem > 0 and self.OverflowCurrencyId ~= "" then
+				self.RunCurrencySnapshot = self:AddSnapshotAmount(self.RunCurrencySnapshot, self.OverflowCurrencyId, result.OverflowAmount * self.OverflowCurrencyPerItem)
+				result.BalanceAfter = self:GetSnapshotAmount(self.RunCurrencySnapshot, priceCurrencyId)
+			end
+		end
+		self.AppliedPurchaseKeys = self:AppendDelimitedKey(self.AppliedPurchaseKeys, purchaseKey)
+		self.InventoryRevision = self.InventoryRevision + 1
+		result.Success = true
+		result.Reason = "PURCHASE_APPLIED"
+		result.Revision = self.InventoryRevision
+		log("[RunInventory] purchase applied key=" .. purchaseKey .. " price=" .. priceCurrencyId .. ":" .. priceAmount .. " balance=" .. result.BalanceBefore .. "->" .. result.BalanceAfter .. " reward=" .. rewardType .. ":" .. rewardRefId .. " amount=" .. result.AcceptedAmount .. " overflow=" .. result.OverflowAmount .. " revision=" .. self.InventoryRevision)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CanConsume(string consumableId, integer amount, string useKey)
+		-- Checks inventory availability without changing state.
+		local ownedAmount = self:GetSnapshotAmount(self.RunConsumableSnapshot, consumableId)
+		if self.ActiveRunSequence <= 0 then
+			return { Success = false, Reason = "RUN_NOT_STARTED", OwnedAmount = ownedAmount }
+		end
+		if amount <= 0 then
+			return { Success = false, Reason = "INVALID_CONSUME_AMOUNT", OwnedAmount = ownedAmount }
+		end
+		if useKey ~= nil and useKey ~= "" and self:ContainsDelimitedKey(self.AppliedUseKeys, useKey) then
+			return { Success = true, Reason = "DUPLICATE_USE_IGNORED", OwnedAmount = ownedAmount, AlreadyApplied = true }
+		end
+		if ownedAmount < amount then
+			return { Success = false, Reason = "CONSUMABLE_NOT_OWNED", OwnedAmount = ownedAmount }
+		end
+		return { Success = true, Reason = "AVAILABLE", OwnedAmount = ownedAmount, AlreadyApplied = false }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table Consume(string consumableId, integer amount, string useKey)
+		-- Removes a consumable exactly once after its gameplay effect succeeds.
+		if self:IsSafeToken(consumableId) == false or self:IsSafeToken(useKey) == false then
+			return { Success = false, Reason = "INVALID_USE_KEY", ConsumedAmount = 0 }
+		end
+		if self:ContainsDelimitedKey(self.AppliedUseKeys, useKey) then
+			return { Success = true, Reason = "DUPLICATE_USE_IGNORED", ConsumedAmount = 0, Revision = self.InventoryRevision }
+		end
+		local availability = self:CanConsume(consumableId, amount, useKey)
+		if availability.Success == false then
+			return { Success = false, Reason = availability.Reason, ConsumedAmount = 0, OwnedAmount = availability.OwnedAmount }
+		end
+		if availability.AlreadyApplied == true then
+			return { Success = true, Reason = "DUPLICATE_USE_IGNORED", ConsumedAmount = 0, Revision = self.InventoryRevision }
+		end
+		self.RunConsumableSnapshot = self:SetSnapshotAmount(self.RunConsumableSnapshot, consumableId, availability.OwnedAmount - amount)
+		self.AppliedUseKeys = self:AppendDelimitedKey(self.AppliedUseKeys, useKey)
+		self.InventoryRevision = self.InventoryRevision + 1
+		log("[RunInventory] consumable used key=" .. useKey .. " ref=" .. consumableId .. " amount=" .. amount .. " remaining=" .. (availability.OwnedAmount - amount) .. " revision=" .. self.InventoryRevision)
+		return { Success = true, Reason = "CONSUMED", ConsumedAmount = amount, RemainingAmount = availability.OwnedAmount - amount, Revision = self.InventoryRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetSnapshot()
+		-- Returns the stable DTO used by RunManager, battle adapters, and tests.
+		return { Success = true, Reason = "OK", RunSequence = self.ActiveRunSequence, CurrencySnapshot = self.RunCurrencySnapshot, ConsumableSnapshot = self.RunConsumableSnapshot, SkillSnapshot = self.RunSkillSnapshot, ConsumableCapacity = self.ConsumableCapacity, ConsumableCount = self:GetSnapshotTotal(self.RunConsumableSnapshot), SkillCount = self:GetSnapshotTotal(self.RunSkillSnapshot), OverflowCurrencyId = self.OverflowCurrencyId, OverflowCurrencyPerItem = self.OverflowCurrencyPerItem, SkillRevision = self.SkillInventoryRevision, Revision = self.InventoryRevision }
+	end
+
+	method boolean ContainsDelimitedKey(string snapshot, string key)
+		-- Tests a pipe-delimited key collection without partial matches.
+		return string.find("|" .. (snapshot or "") .. "|", "|" .. key .. "|", 1, true) ~= nil
+	end
+
+	method string AppendDelimitedKey(string snapshot, string key)
+		-- Appends one opaque key to a pipe-delimited internal collection.
+		if snapshot == nil or snapshot == "" then
+			return key
+		end
+		return snapshot .. "|" .. key
+	end
+
+	method boolean IsSafeToken(string value)
+		-- Protects the internal delimiter format from ambiguous identifiers.
+		return value ~= nil and value ~= "" and string.find(value, "|", 1, true) == nil and string.find(value, "~", 1, true) == nil
+	end
+
+	method integer GetSnapshotTotal(string snapshot)
+		-- Sums all amounts in an id~amount snapshot.
+		local total = 0
+		for entry in string.gmatch(snapshot or "", "([^|]+)") do
+			local separator, _ = string.find(entry, "~", 1, true)
+			if separator ~= nil then
+				total = total + math.max(0, math.floor(tonumber(string.sub(entry, separator + 1)) or 0))
+			end
+		end
+		return total
+	end
+
+	method integer GetSnapshotAmount(string snapshot, string rewardRefId)
+		-- Reads one amount from an id~amount snapshot.
+		for entry in string.gmatch(snapshot or "", "([^|]+)") do
+			local separator, _ = string.find(entry, "~", 1, true)
+			if separator ~= nil and string.sub(entry, 1, separator - 1) == rewardRefId then
+				return math.max(0, math.floor(tonumber(string.sub(entry, separator + 1)) or 0))
+			end
+		end
+		return 0
+	end
+
+	method string AddSnapshotAmount(string snapshot, string rewardRefId, integer amount)
+		-- Adds an amount while preserving stable identifier sorting.
+		return self:SetSnapshotAmount(snapshot, rewardRefId, self:GetSnapshotAmount(snapshot, rewardRefId) + amount)
+	end
+
+	method string SetSnapshotAmount(string snapshot, string rewardRefId, integer amount)
+		-- Rebuilds one snapshot with a replacement amount and stable identifier ordering.
+		local amounts = {}
+		for entry in string.gmatch(snapshot or "", "([^|]+)") do
+			local separator, _ = string.find(entry, "~", 1, true)
+			if separator ~= nil then
+				local entryId = string.sub(entry, 1, separator - 1)
+				amounts[entryId] = math.max(0, math.floor(tonumber(string.sub(entry, separator + 1)) or 0))
+			end
+		end
+		amounts[rewardRefId] = math.max(0, amount)
+		local ids = {}
+		for entryId, entryAmount in pairs(amounts) do
+			if entryAmount > 0 then
+				table.insert(ids, entryId)
+			end
+		end
+		table.sort(ids)
+		local entries = {}
+		for _, entryId in ipairs(ids) do
+			table.insert(entries, entryId .. "~" .. tostring(amounts[entryId]))
+		end
+		return table.concat(entries, "|")
+	end
+
+end

@@ -1,0 +1,94 @@
+@Logic
+script AugmentContentValidatorLogic
+
+	property integer SupportedSchemaVersion = 1
+
+	@ExecSpace("ServerOnly")
+	method table ValidateById(string augmentId)
+		-- Loads and validates one complete augment bundle before it enters run state.
+		local bundle = _AugmentDefinitionRepositoryLogic:GetBundle(augmentId)
+		if bundle.Success == false then
+			return { Success = false, Reason = bundle.Reason, AugmentId = augmentId or "", Data = bundle }
+		end
+		return self:ValidateBundle(bundle)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateBundle(table bundle)
+		-- Enforces schema, references, and executable trigger-condition-effect registrations.
+		local definition = bundle.Definition
+		local result = { Success = false, Reason = "CONTENT_VALIDATION_FAILED", AugmentId = definition.AugmentId or "", Data = bundle }
+		if definition.SchemaVersion ~= self.SupportedSchemaVersion then
+			return self:Reject(result, "UNSUPPORTED_AUGMENT_SCHEMA")
+		end
+		if definition.AugmentId == "" or definition.NameKey == "" or definition.DescriptionKey == "" then
+			return self:Reject(result, "AUGMENT_REQUIRED_FIELD_MISSING")
+		end
+		if definition.MatchCount ~= nil and definition.MatchCount > 1 then
+			return self:Reject(result, "DATA_DUPLICATE_AUGMENT_ID")
+		end
+		if definition.Enabled ~= true then
+			return self:Reject(result, "AUGMENT_DISABLED")
+		end
+		if definition.Rarity ~= "COMMON" and definition.Rarity ~= "RARE" and definition.Rarity ~= "EPIC" then
+			return self:Reject(result, "INVALID_AUGMENT_RARITY")
+		end
+		if definition.StackPolicy ~= "UNIQUE" or definition.MaxStacks ~= 1 then
+			return self:Reject(result, "AUGMENT_STACK_POLICY_NOT_IMPLEMENTED")
+		end
+		local effectCount = 0
+		local seenSeq = {}
+		for _, effect in ipairs(bundle.Effects or {}) do
+			if effect.SchemaVersion ~= self.SupportedSchemaVersion then
+				return self:Reject(result, "UNSUPPORTED_AUGMENT_EFFECT_SCHEMA")
+			end
+			if effect.AugmentId ~= definition.AugmentId then
+				return self:Reject(result, "INVALID_AUGMENT_EFFECT_SEQUENCE")
+			end
+			if effect.Seq == nil or effect.Seq <= 0 or seenSeq[effect.Seq] == true then
+				return self:Reject(result, "INVALID_AUGMENT_EFFECT_SEQUENCE")
+			end
+			seenSeq[effect.Seq] = true
+			effectCount = effectCount + 1
+			if _AugmentTriggerRouterLogic:IsRegistered(effect.TriggerType) == false then
+				return self:Reject(result, "AUGMENT_TRIGGER_NOT_REGISTERED")
+			end
+			if _AugmentConditionRouterLogic:IsRegistered(effect.ConditionType) == false then
+				return self:Reject(result, "AUGMENT_CONDITION_NOT_REGISTERED")
+			end
+			if effect.ConditionType == "HP_RATIO_LE" and (effect.ConditionValue <= 0 or effect.ConditionValue > 1) then
+				return self:Reject(result, "INVALID_AUGMENT_CONDITION_VALUE")
+			end
+			if _AugmentEffectRouterLogic:IsRegistered(effect.EffectType, effect.TargetType) == false then
+				return self:Reject(result, "AUGMENT_EFFECT_NOT_REGISTERED")
+			end
+			if effect.Amount <= 0 then
+				return self:Reject(result, "INVALID_AUGMENT_EFFECT_AMOUNT")
+			end
+		end
+		if effectCount == 0 then
+			return self:Reject(result, "AUGMENT_EFFECT_SET_EMPTY")
+		end
+		for seq = 1, effectCount do
+			if seenSeq[seq] ~= true then
+				return self:Reject(result, "INVALID_AUGMENT_EFFECT_SEQUENCE")
+			end
+		end
+		result.Success = true
+		result.Reason = "OK"
+		result.EffectCount = effectCount
+		log("[ContentValidation] augment valid id=" .. result.AugmentId .. " effects=" .. result.EffectCount .. " policy=" .. definition.StackPolicy)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table Reject(table result, string detailReason)
+		-- Returns a uniform validation failure for external content loaders.
+		result.Success = false
+		result.Reason = "CONTENT_VALIDATION_FAILED"
+		result.DetailReason = detailReason
+		log_error("[ContentValidation] augment rejected id=" .. result.AugmentId .. " detail=" .. detailReason)
+		return result
+	end
+
+end
