@@ -327,7 +327,7 @@ WorldY = 0.12
 
 HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행된다. 플레이어가 사망하면 즉시 `Defeat`이며, 웨이브의 마지막 적이 사망하면 `WaveTransition`으로 들어간다. 마지막 웨이브까지 끝났을 때만 `BattlePhase=BattleEnded`, `WaveState=StageCleared`, `BattleResult=Victory`가 된다.
 
-`map01`에는 적을 고정 배치하지 않는다. `BattleSessionComponent`가 시작할 때 `BattleDummyEnemy.model`의 ID인 `battledummyenemy`로 Wave 1을 생성하고, 웨이브 완료 시 기존 적을 Registry에서 해제·파괴한 뒤 다음 웨이브를 생성한다. 현재 Stage 1은 `TotalWaves=3`, 웨이브당 좌우 적 2명이며 HP는 `EnemyDefinitions.csv`의 적 정의를 따른다. 현재 `early_mushroom`은 HP 6, `guard_mushroom`은 HP 9다. `다시 시작`도 같은 런타임 생성 경로로 Stage 1 / Wave 1을 다시 만든다.
+`map01`에는 적을 고정 배치하지 않는다. `BattleSessionComponent`가 시작할 때 `BattleDummyEnemy.model`의 ID인 `battledummyenemy`로 Wave 1을 생성하고, 웨이브 완료 시 기존 적을 Registry에서 해제·파괴한 뒤 다음 웨이브를 생성한다. 현재 Stage 1은 `TotalWaves=3`, Wave 1/2는 1명, 마지막 Wave 3은 2명으로 총 4명이 등장하며 최대 동시 생존은 3명이다. HP는 `EnemyDefinitions.csv`의 적 정의를 따르며 `early_mushroom`은 HP 6, `guard_mushroom`은 HP 9다. `다시 시작`도 같은 런타임 생성 경로로 Stage 1 / Wave 1을 다시 만든다.
 
 ## 6. 다음 기능을 추가할 때
 
@@ -506,8 +506,9 @@ stage01_basic,guard_mushroom,battledummyenemy,1,1,3
 
 ```csv
 StageId,WaveIndex,SpawnTriggerMode,EnemyPoolId,SpawnCount,MaxConcurrent,SpawnSidePolicy,ClearSpawnDelaySeconds,ForceAfterTurns,ForceAfterSeconds
-stage01,1,TURN_LIMIT,stage01_basic,2,5,BALANCED,0.6,4,0
-stage01,3,CLEAR_ONLY,stage01_basic,2,5,BALANCED,0.6,0,0
+stage01,1,TURN_LIMIT,stage01_basic,1,3,BALANCED,0.6,4,0
+stage01,2,TURN_LIMIT,stage01_basic,1,3,BALANCED,0.6,4,0
+stage01,3,CLEAR_ONLY,stage01_basic,2,3,BALANCED,0.6,0,0
 ```
 
 설정 변경 후 Maker에서 Refresh하고 Play한다. Console에서 아래 순서로 확인할 수 있다.
@@ -526,11 +527,11 @@ stage01,3,CLEAR_ONLY,stage01_basic,2,5,BALANCED,0.6,0,0
 
 최종 승리는 마지막 웨이브가 이미 생성되었고, 이전 웨이브 생존자를 포함한 모든 적이 사망했을 때만 발생한다.
 
-## 10. 적 드롭과 런 자동 회수
+## 10. 적 드롭과 Cell 회수
 
 - `EnemyDropDefinitionRepositoryLogic`은 적 ID와 TriggerType으로 드롭 행을 읽고 고정 Seed 기반으로 판정한다.
 - `BattleDropComponent`는 적 사망 시 생긴 Pending Drop만 맵 수명 동안 소유한다. 최종 UI는 `BattleSessionComponent:GetBattleSnapshot()`의 `PendingDropSnapshot`, `PendingDropCount`, `DropRevision`을 읽어 임시 표시할 수 있다.
-- Stage 승리 시 Pending Drop은 `RunManagerLogic:GrantRunReward()`를 통해 자동 회수된다. 패배하거나 맵 세션이 끝나면 폐기된다.
+- 플레이어가 드롭의 Cell을 밟으면 `BattleDropComponent.CollectAtCell()`이 `RunManagerLogic:GrantRunReward()`를 통해 즉시 회수한다. 밟지 않고 남은 Pending Drop은 Stage 승리 시 자동 회수되며, 패배하거나 맵 세션이 끝나면 폐기된다.
 - 회수된 상태는 `RunManagerLogic:GetRunRewardSnapshot(player)`로 읽는다. 반환값에는 `CurrencySnapshot`, `ConsumableSnapshot`, `ConsumableCapacity`, `ConsumableCount`, `Revision`이 있다.
 - Snapshot 문자열은 전송용 DTO다. 다른 기능이 문자열을 직접 수정하면 안 되며, 지급 API와 공개 조회 API만 사용한다.
 - 실제 드롭 표는 `RootDesk/MyDesk/03_Data/EnemyDropDefinitions.userdataset`과 `.csv` 페어이며 데이터 사전 §21 규격을 따른다. 초반 적 2종의 4개 행은 실제 Dataset에서 로드되고 Repository fallback은 비활성 상태다.

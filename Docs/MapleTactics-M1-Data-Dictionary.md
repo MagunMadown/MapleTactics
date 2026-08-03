@@ -650,7 +650,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 처치, `BOSS_KILL`은 `EnemyDefinitions.IsBoss=true`인 적 사망에 추가로 발행한다. 한 사망은
 여러 Trigger를 만족할 수 있지만 KillKey는 한 번만 소비한다.
 
-판정은 `RunSeed + StageId + WaveIndex + SpawnOrder + UnitId + DropEntryId`를 입력으로 하는 결정적 RNG를 사용한다. 같은 입력을 재생하면 종류·성공 여부·수량이 같아야 한다. `BattleDropComponent`는 결과를 전투장 Pending 상태로 소유하고, 최종 승리 때 `PlayerRunInventoryComponent`로 자동 회수한다. 패배·세션 종료 시 Pending 드롭은 폐기한다.
+판정은 `RunSeed + StageId + WaveIndex + SpawnOrder + UnitId + DropEntryId`를 입력으로 하는 결정적 RNG를 사용한다. 같은 입력을 재생하면 종류·성공 여부·수량이 같아야 한다. `BattleDropComponent`는 결과를 전투장 Pending 상태로 소유한다. 플레이어가 해당 Cell로 이동하면 즉시 `PlayerRunInventoryComponent`로 회수하고, 밟지 않은 나머지는 최종 승리 때 자동 회수한다. 패배·세션 종료 시 Pending 드롭은 폐기한다.
 
 런 보상 지급 API는 `RewardKey`를 필수로 받아 같은 키가 재전송되어도 한 번만 반영한다. 현재 소모품 기본 용량은 3이며 초과분은 `OverflowCurrencyId`와 `OverflowCurrencyPerItem` 설정에 따라 런 재화로 전환한다. 이는 런 상태 규격이며 계정 영구 저장·메타 재화 지급은 아직 포함하지 않는다.
 

@@ -297,6 +297,7 @@ StageFlowComponent
 - [x] RUN_SCOPED 외 재화 참조를 `DATA_REWARD_CURRENCY_NOT_ALLOWED`로 차단하고 전체 콘텐츠 시작 Gate에 포함.
 - [x] EnemyDropDefinitions Repository와 `ANY_KILL` 결정적 드롭 판정.
 - [x] 적 사망별 Pending Drop 상태, 승리 시 자동 회수, 패배 시 폐기.
+- [x] 플레이어가 드롭 Cell로 이동할 때 즉시 런 인벤토리로 회수하고 월드 표시를 제거하는 경로.
 - [x] PlayerRunInventoryComponent의 런 재화·소모품 Snapshot과 RewardKey/UseKey 중복 처리 방지.
 - [x] EnemyDropDefinitions 실제 Dataset 페어 생성, 호환 행 4개 이관, `Source=DATASET`, fallback 비활성.
 - [x] EnemyDropDefinitions의 중복 DropEntryId·EnemyDefinitionId·DropRefId 교차 참조 Validator와 전투 드롭 Gate.

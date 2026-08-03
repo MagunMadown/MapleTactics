@@ -600,13 +600,14 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 - 진행 구조: `Stage 1 → Wave 1 → Wave 2 → Wave 3 → Stage Clear`
 - 시작 방식: `map01`의 고정 적 두 Entity를 제거하고, 게임 시작부터 `BattleSessionComponent.StartStage(1)`이 Wave 1을 생성
 - 생성 원본: `BattleDummyEnemy.model`, `EnemyModelId=battledummyenemy`
-- 현재 설정: `TotalWaves=3`, 웨이브당 좌우 적 2명, `EnemyDefinitions.csv` 기준 `early_mushroom` HP 6·`guard_mushroom` HP 9, 웨이브 전환 `0.60초`
+- 당시 검증 설정: `TotalWaves=3`, 웨이브당 좌우 적 2명, `EnemyDefinitions.csv` 기준 `early_mushroom` HP 6·`guard_mushroom` HP 9, 웨이브 전환 `0.60초`
 - UnitId: `enemy_w{wave}_left`, `enemy_w{wave}_right`; Entity 이름도 Wave 번호를 포함해 런타임 추적 가능
 - 스폰 위치: 기본 Cell 0/5를 우선 사용하고, 생존 플레이어가 점유 중이면 해당 가장자리에서 안쪽 빈 셀을 탐색
 - 전환 처리: 마지막 적 사망 시 행동·Impact 타이머와 큐를 정리하고 `WaveTransition/Cleared`; 기존 적을 Registry에서 해제·파괴한 뒤 다음 웨이브 생성
 - 완료 처리: Wave 1·2 종료는 Victory가 아니며, Wave 3 종료에서만 `BattleEnded/StageCleared/Victory`
 - Reset: 런타임 적을 정리하고 플레이어를 초기 Cell 2로 복원한 뒤 동일한 Stage 1 / Wave 1 생성 경로 재사용
 - HUD: 넓은 상태 문구에 `STAGE 1 · WAVE 1/3` 표시, 전환 중 `웨이브 완료 · 다음 웨이브 준비` 표시
+- 2026-08-03 테스트 난이도 조정: 실제 `StageEnemyWaves.csv`는 Wave 1/2 각 1명, Wave 3 2명(총 4명), `MaxConcurrent=3`으로 낮췄다. 위 2026-07-25 검증 기록은 당시 2명씩 생성한 이력이다.
 - Maker 검증:
   - 최초 등록 `player_01 + enemy_w1_left + enemy_w1_right`, 적 HP `6 / 6`
   - Wave 1 전멸 → `WaveTransition` → Wave 2 적 2명 생성

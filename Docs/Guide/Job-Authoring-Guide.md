@@ -81,4 +81,6 @@ SkillDefinitions 참조 검증과 중복 RewardKey 방지를 함께 수행한다
 
 현재 프로토타입은 `prototype_warrior`, 시작 스킬 `basic_slash`와 `push`,
 `JobMechanicId=FORWARD_PUSH`를 제공한다. 직업 스냅샷·스킬 소유권·큐 등록·실제 이동
-메커니즘은 연결됐으며, 직업 패시브와 실제 상점 구매 어댑터는 아직 남아 있다.
+메커니즘과 `prototype_warrior_recovery` 시작 패시브가 연결됐다. 런 상점은
+`ShopDefinitions`/`ShopEntries` 기반으로 `SKILL`·`CONSUMABLE` 구매와 지급까지 연결됐으며,
+최종 상점 화면·추가 직업 데이터·증강 선택 UI는 후속 범위다.

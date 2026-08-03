@@ -20,6 +20,11 @@ ContentType에 맞는 전환 명령을 준비한다.
 `AWAITING_SHOP / OPEN_SHOP / RUN_SHOP` 상태가 된다. 상점을 닫거나 구매 없이 건너뛰면 현재
 SHOP 노드의 `NextNodeIds`가 비어 있으므로 `RUN_COMPLETED`로 종료된다.
 
+현재 전투 결과 HUD는 이 후보를 선택하거나 `OPEN_SHOP` Route를 여는 소비기가 아니므로
+실제 화면 전환은 하지 않는다. 대신 승리 시 디버그 HUD 상태 줄에 Run Flow DTO의 첫 다음 콘텐츠를 읽어
+`이동 이벤트 · 상점으로 이동합니다`를 표시한다. 내부 NodeId는 DTO에만 유지한다. 다음 후보·상점 서버
+계약까지는 구현되어 있지만 실제 상점 화면과 StageId→MapId Adapter는 미구현이다.
+
 ## 책임 분리
 
 | 객체 | 책임 |
