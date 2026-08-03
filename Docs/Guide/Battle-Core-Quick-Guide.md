@@ -258,7 +258,7 @@ Router는 HP나 CellIndex를 직접 변경하지 않는다. `[BattleEffectRouter
 결과 패널은 다시 숨겨지고 플레이어 HP 100, 시작 셀과 방향, Turn 1로 복원되며 Wave 1의
 적은 현재 적 정의에 따라 다시 생성된다.
 
-초반 적 체력은 `RootDesk/MyDesk/03_Data/EnemyDefinitions.csv`의 `MaxHp`에서 적 정의별로 조정한다. 현재 `early_mushroom`은 HP 6, `guard_mushroom`은 HP 9이며, Stage의 Wave·Pool 설정이 사용할 적 정의를 선택한다. `BattleSessionComponent.EarlyStageEnemyMaxHp`는 신규 밸런스 설정 경로로 사용하지 않는다.
+초반 적 체력은 `RootDesk/MyDesk/03_Data/EnemyDefinitions.csv`의 `MaxHp`에서 적 정의별로 조정한다. 현재 `early_mushroom`은 HP 4, `guard_mushroom`은 HP 6이며, Stage의 Wave·Pool 설정이 사용할 적 정의를 선택한다. `BattleSessionComponent.EarlyStageEnemyMaxHp`는 신규 밸런스 설정 경로로 사용하지 않는다.
 
 ## 4. 셀과 화면 좌표
 
@@ -327,7 +327,7 @@ WorldY = 0.12
 
 HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행된다. 플레이어가 사망하면 즉시 `Defeat`이며, 웨이브의 마지막 적이 사망하면 `WaveTransition`으로 들어간다. 마지막 웨이브까지 끝났을 때만 `BattlePhase=BattleEnded`, `WaveState=StageCleared`, `BattleResult=Victory`가 된다.
 
-`map01`에는 적을 고정 배치하지 않는다. `BattleSessionComponent`가 시작할 때 `BattleDummyEnemy.model`의 ID인 `battledummyenemy`로 Wave 1을 생성하고, 웨이브 완료 시 기존 적을 Registry에서 해제·파괴한 뒤 다음 웨이브를 생성한다. 현재 Stage 1은 `TotalWaves=3`, Wave 1/2는 1명, 마지막 Wave 3은 2명으로 총 4명이 등장하며 최대 동시 생존은 3명이다. HP는 `EnemyDefinitions.csv`의 적 정의를 따르며 `early_mushroom`은 HP 6, `guard_mushroom`은 HP 9다. `다시 시작`도 같은 런타임 생성 경로로 Stage 1 / Wave 1을 다시 만든다.
+`map01`에는 적을 고정 배치하지 않는다. `BattleSessionComponent`가 시작할 때 `BattleDummyEnemy.model`의 ID인 `battledummyenemy`로 Wave 1을 생성하고, 웨이브 완료 시 기존 적을 Registry에서 해제·파괴한 뒤 다음 웨이브를 생성한다. 현재 Stage 1은 `TotalWaves=3`, 웨이브마다 1명씩 총 3명이 등장하며 최대 동시 생존은 2명이다. HP는 `EnemyDefinitions.csv`의 적 정의를 따르며 `early_mushroom`은 HP 4, `guard_mushroom`은 HP 6다. `다시 시작`도 같은 런타임 생성 경로로 Stage 1 / Wave 1을 다시 만든다.
 
 ## 6. 다음 기능을 추가할 때
 
@@ -422,11 +422,11 @@ HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행된다. �
 웨이브 전환과 Reset은 다음 로그로 확인한다.
 
 ```text
-[BattleWave] spawned stage=1 wave=1/3 enemies=2 hp=6
+[BattleWave] spawned stage=1 wave=1/3 enemies=1 hp=4
 [BattleWave] cleared stage=1 wave=1/3 nextWave=2
-[BattleWave] spawned stage=1 wave=2/3 enemies=2 hp=6
+[BattleWave] spawned stage=1 wave=2/3 enemies=1 hp=6
 [BattleResult] result=Victory stage=1 wave=3/3 turn=1
-[BattleReset] completed stage=1 wave=1/3 playerCell=2 enemyHp=6
+[BattleReset] completed stage=1 wave=1/3 playerCell=2 enemyHp=4
 ```
 
 ## 7. 파일 작업 주의사항
@@ -506,22 +506,22 @@ stage01_basic,guard_mushroom,battledummyenemy,1,1,3
 
 ```csv
 StageId,WaveIndex,SpawnTriggerMode,EnemyPoolId,SpawnCount,MaxConcurrent,SpawnSidePolicy,ClearSpawnDelaySeconds,ForceAfterTurns,ForceAfterSeconds
-stage01,1,TURN_LIMIT,stage01_basic,1,3,BALANCED,0.6,4,0
-stage01,2,TURN_LIMIT,stage01_basic,1,3,BALANCED,0.6,4,0
-stage01,3,CLEAR_ONLY,stage01_basic,2,3,BALANCED,0.6,0,0
+stage01,1,TURN_LIMIT,stage01_basic,1,2,BALANCED,0.6,4,0
+stage01,2,TURN_LIMIT,stage01_basic,1,2,BALANCED,0.6,4,0
+stage01,3,CLEAR_ONLY,stage01_basic,1,2,BALANCED,0.6,0,0
 ```
 
 설정 변경 후 Maker에서 Refresh하고 Play한다. Console에서 아래 순서로 확인할 수 있다.
 
 ```text
 [StageWaveData] stage loaded stage=stage01 totalWaves=3
-[EnemyData] loaded id=early_mushroom hp=6 attack=3 pattern=prototype_basic movement=TRACK_PLAYER
-[StageWaveData] wave loaded stage=stage01 wave=1 enemy=early_mushroom hp=6 attack=3 mode=TURN_LIMIT
-[EnemyPool] selected pool=stage01_basic wave=1 slot=2 seed=1000 roll=2/2 definition=guard_mushroom weight=1
-[EnemyData] applied unit=enemy_w1_right definition=guard_mushroom hp=9.0 attack=2.0 pattern=prototype_basic movement=FIXED_FACING roll=2/2
-[BattleWave] spawned stage=1 wave=1/3 seed=1000 enemies=2 livingTotal=2 composition=early_mushroom,guard_mushroom
+[EnemyData] loaded id=early_mushroom hp=4 attack=3 pattern=prototype_tracker movement=TRACK_PLAYER
+[StageWaveData] wave loaded stage=stage01 wave=1 enemy=early_mushroom hp=4 attack=3 mode=TURN_LIMIT
+[BattleWave] spawned stage=1 wave=1/3 seed=1000 enemies=1 livingTotal=1 composition=early_mushroom
 [BattleWave] force pending reason=TURN_LIMIT wave=1 nextWave=2
-[BattleWave] spawned stage=1 wave=2/3 enemies=2 livingTotal=4
+[EnemyPool] selected pool=stage01_basic wave=2 slot=1 seed=1000 roll=2/2 definition=guard_mushroom weight=1
+[EnemyData] applied unit=enemy_w2_left definition=guard_mushroom hp=6.0 attack=2.0 pattern=prototype_fixed movement=FIXED_FACING roll=2/2
+[BattleWave] spawned stage=1 wave=2/3 enemies=1 livingTotal=2
 [BattleWave] force spawned reason=TURN_LIMIT wave=2
 ```
 

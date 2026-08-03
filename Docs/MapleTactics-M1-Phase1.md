@@ -608,6 +608,7 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 - Reset: 런타임 적을 정리하고 플레이어를 초기 Cell 2로 복원한 뒤 동일한 Stage 1 / Wave 1 생성 경로 재사용
 - HUD: 넓은 상태 문구에 `STAGE 1 · WAVE 1/3` 표시, 전환 중 `웨이브 완료 · 다음 웨이브 준비` 표시
 - 2026-08-03 테스트 난이도 조정: 실제 `StageEnemyWaves.csv`는 Wave 1/2 각 1명, Wave 3 2명(총 4명), `MaxConcurrent=3`으로 낮췄다. 위 2026-07-25 검증 기록은 당시 2명씩 생성한 이력이다.
+- 2026-08-03 추가 난이도 조정: Wave 3도 2명 → 1명으로 낮춰 스테이지 전체 등장 수를 4명 → 3명(웨이브당 1명)으로 통일하고 `MaxConcurrent`를 3 → 2로 낮췄다. `EnemyDefinitions.csv`의 HP도 `early_mushroom` 6→4, `guard_mushroom` 9→6으로 낮췄다. `csv_retreat_mushroom`/`csv_telegraph_mushroom`은 stage01 스폰 풀에 없는 CSV 제작 테스트 전용 행이라 그대로 뒀다.
 - Maker 검증:
   - 최초 등록 `player_01 + enemy_w1_left + enemy_w1_right`, 적 HP `6 / 6`
   - Wave 1 전멸 → `WaveTransition` → Wave 2 적 2명 생성
