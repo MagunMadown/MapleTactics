@@ -17,6 +17,12 @@
 - 소수는 `.`을 사용하고 퍼센트는 `0.0~1.0` 비율로 기록한다.
 - 한 셀에 JSON 배열이나 실행 코드를 저장하지 않는다.
 
+문서의 지원 상태는 다음 의미로 사용한다.
+
+- `IMPLEMENTED`: 실제 Dataset/Repository/Validator/Runtime 경로가 연결되어 콘텐츠 제작자가 사용할 수 있다.
+- `PLANNED`: 목표 스키마 또는 예약 값이다. Dataset이나 Router/Validator가 아직 없을 수 있으므로 실전 데이터에 사용하지 않는다.
+- 별도 상태가 없는 기존 표는 실제 Dataset 존재 여부와 해당 제작 가이드를 함께 확인한다. 새 표에는 상태를 명시한다.
+
 ## 2. JobDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
@@ -311,9 +317,10 @@ Repository의 prototype fallback은 비활성 상태다.
 | henesys_graph | n3 | BOSS | henesys_boss_mushmom | false | |
 
 상점/이벤트 노드가 필요하면 같은 그래프에 `NodeType=SHOP`, `StageId`는 비운 행을 추가한다.
-SHOP의 `NextContentId`는 NodeId다. 상점 상품 구성은 `ShopItemDefinitions`가 담당하며,
-노드별 상품 풀 필드가 필요해지는 시점에 별도 참조 열을 추가한다. 전투 StageId나
-`ShopItemDefinitions.ItemId`를 `NextNodeIds`에 직접 넣지 않는다.
+SHOP의 `NextContentId`는 NodeId다. 현재 런 상점은 SHOP Node와 같은 NodeGraphId/NodeId를 가진
+`ShopDefinitions`를 찾고, `ShopEntries.ShopId`로 상품을 구성한다. 전투 StageId나
+`ShopEntryId`를 `NextNodeIds`에 직접 넣지 않는다. 계획 단계의 메타/월드 상점
+`ShopItemDefinitions`는 NodeDefinitions 진행 그래프에 연결하지 않는다.
 
 ## 11. StageEnemySpawns
 
@@ -400,8 +407,8 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 | NameKey | string | O | Locale 키 |
 | DescriptionKey | string | O | Locale 키 |
 | Rarity | enum | O | COMMON, RARE, EPIC |
-| StackPolicy | enum | O | UNIQUE, STACK_ADD, STACK_REFRESH, EXCLUSIVE_GROUP |
-| MaxStacks | integer | O | 1 이상 |
+| StackPolicy | enum | O | 현재 `UNIQUE`만 구현. `STACK_ADD`, `STACK_REFRESH`, `EXCLUSIVE_GROUP`은 PLANNED |
+| MaxStacks | integer | O | 현재 반드시 `1`. 다중 스택 구현 후 1 이상으로 확장 |
 | ExclusiveGroup | string | - | 배타 그룹 ID |
 | JobTagFilter | string | - | 비어 있으면 모든 직업 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
@@ -427,20 +434,23 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 
 허용 TriggerType M1: `TURN_START`, `COMMAND_ACCEPTED`, `TILE_QUEUED`, `BEFORE_TILE_EXECUTE`, `AFTER_DAMAGE`, `UNIT_MOVED`, `ENEMY_DIED`, `STAGE_CLEARED`.
 
-허용 ConditionType M1: `ALWAYS`, `CHANCE_ROLL`(`ConditionValue`=성공 확률, RunSeed 기반 결정적 롤).
+현재 `IMPLEMENTED` ConditionType은 `ALWAYS`, `HP_RATIO_LE`다. `HP_RATIO_LE`는
+`ConditionValue`에 0 초과 1 이하의 HP 비율을 사용한다.
 
-허용 TargetType M1: 타일과 같은 `SELF`, `FRONT_CELL`, `RANGE_OFFSETS`, `FIRST_ENEMY_FORWARD`에 `REAR_CELL`(현재 Facing 반대편 바로 뒤 칸)을 추가한다.
+현재 `IMPLEMENTED` TargetType은 `SELF`다. 현재 구현된 전체 최소 조합은
+`TURN_START`, `ALWAYS`/`HP_RATIO_LE`, `HEAL`/`SELF`다.
 
-`REAR_CELL`은 이번에 새로 추가하는 원시 TargetType이므로 §22(새 데이터 추가 완료 기준)의 "새 원시 Type" 규칙에 따라 Resolver·Validator 허용 목록·회귀 테스트를 함께 갖춘 뒤에만 실전 배치한다.
-
-현재 구현된 최소 부분집합은 `TURN_START`, `ALWAYS`/`HP_RATIO_LE`, `HEAL`/`SELF`다.
+`CHANCE_ROLL`(`ConditionValue`=0.0~1.0의 성공 확률, RunSeed 기반 결정적 롤)과
+`FRONT_CELL`, `RANGE_OFFSETS`, `FIRST_ENEMY_FORWARD`, `REAR_CELL`은 `PLANNED`다.
+이 값들은 §23(새 데이터 추가 완료 기준)의 "새 원시 Type" 규칙에 따라 Router/Resolver,
+Validator 허용 목록, 회귀 테스트를 함께 갖춘 뒤에만 `IMPLEMENTED`로 전환하고 실전 데이터에 배치한다.
 `JobDefinitions.JobPassiveSetId`는 현재 하나의 `AugmentId`를 참조하며, 그 ID에 속한 여러
 `AugmentEffects` 행이 직업 시작 패시브 세트가 된다. 효과 실행 순서는 낮은 `Priority`부터이며,
 동률은 런 획득 순서 → `Seq` → `AugmentId`로 고정한다. 현재 프로토타입 직업은
 `prototype_warrior_recovery`를 런 시작 시 UNIQUE 1스택으로 지급받고, 턴 시작에 HP가 99% 이하이면
 자신을 1 회복한다. 문서의 나머지 M1 Type은 계획된 확장 규격이며 아직 Validator에 등록되지 않았다.
 
-### 15.1 예시 — 자쿰의투구 (50% 확률 후방 공격)
+### 15.1 계획 예시 — 자쿰의투구 (50% 확률 후방 공격, PLANNED)
 
 `AugmentDefinitions` 행:
 
@@ -454,7 +464,7 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 |---|---|---|---|---|---|---|---|
 | zakum_helmet | 1 | AFTER_DAMAGE | CHANCE_ROLL | 0.5 | DAMAGE | REAR_CELL | 1.0 |
 
-읽는 법: 플레이어의 공격이 적중(`AFTER_DAMAGE`)할 때마다 50%(`CHANCE_ROLL 0.5`) 확률로, 방금 공격과 같은 피해량 배율(`Amount 1.0`)의 피해를 후방 칸(`REAR_CELL`)에 추가로 적용한다.
+읽는 법: 플레이어의 공격이 적중(`AFTER_DAMAGE`)할 때마다 50%(`CHANCE_ROLL 0.5`) 확률로, 방금 공격과 같은 피해량 배율(`Amount 1.0`)의 피해를 후방 칸(`REAR_CELL`)에 추가로 적용한다. 현재 Router/Validator에는 `CHANCE_ROLL`, `DAMAGE`, `REAR_CELL` 조합이 등록되지 않았으므로 이 행은 설계 예시일 뿐 CSV에 추가할 수 없다.
 
 ## 16. StageAugmentPools
 
@@ -542,7 +552,52 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | henesys_1_1 | gold | 20 |
 | henesys_boss_mushmom | gold | 100 |
 
-## 20. ShopItemDefinitions
+## 20. 상점 데이터
+
+상점은 수명과 재화 책임에 따라 두 시스템으로 분리한다. 현재 플레이 가능한 것은
+`RUN_SCOPED` 재화를 사용하는 런 상점이며, 영구 상품·직업 해금·캐시 결제를 다루는
+메타/월드 상점은 계획 단계다. 두 시스템은 `CurrencyDefinitions`와 보상 대상 ID를 공유할 수
+있지만, 구매 상태와 검증 경로를 합치지 않는다.
+
+### 20.1 ShopDefinitions (IMPLEMENTED)
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
+| ShopId | string | O | 런 상점 고유 ID |
+| DisplayName | string | O | 제작자/UI 표시 이름 |
+| NodeGraphId | string | O | NodeDefinitions.NodeGraphId 참조 |
+| NodeId | string | O | 같은 그래프의 `NodeType=SHOP` NodeId 참조 |
+| Enabled | boolean | O | 콘텐츠 활성 여부 |
+
+기본 키는 `ShopId`이며 전역에서 유일해야 한다. 현재 규격에서는 `ShopId`와 `NodeId`가 같아야 한다.
+
+### 20.2 ShopEntries (IMPLEMENTED)
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
+| ShopEntryId | string | O | 전체 런 상점에서 유일한 상품 행 ID |
+| ShopId | string | O | ShopDefinitions.ShopId 참조 |
+| DisplayName | string | O | 제작자/UI 표시 이름 |
+| RewardType | enum | O | 현재 `SKILL`, `CONSUMABLE` |
+| RewardRefId | string | O | RewardType에 맞는 SkillId 또는 ConsumableId |
+| RewardAmount | integer | O | 지급 수량, 1 이상 |
+| PriceCurrencyId | string | O | `RUN_SCOPED` CurrencyDefinitions.CurrencyId 참조 |
+| PriceAmount | integer | O | 가격, 0 이상 |
+| DisplayOrder | integer | O | 같은 ShopId 안의 오름차순 표시 순서 |
+| MaxPurchasesPerVisit | integer | O | 현재 반드시 `1` |
+| Enabled | boolean | O | 콘텐츠 활성 여부 |
+
+현재 실제 Dataset에는 `shop_after_stage01` 상점과 `heavy_slash`, `potion_hp_small` 상품이
+등록되어 있다. 서버는 Dataset의 가격과 보상 참조를 다시 조회한 뒤 재화 차감과 지급을
+원자적으로 확정한다. 자세한 제작·API 규격은 `Guide/Run-Shop-Authoring-Guide.md`를 따른다.
+
+### 20.3 ShopItemDefinitions (PLANNED — Meta/World Shop)
+
+이 표는 영구 상품·시작 유물·직업 해금·캐시성 상품을 위한 목표 스키마다. 현재 대응하는
+`.userdataset`/`.csv`, Repository, Validator, 구매 Runtime은 없으므로 콘텐츠 제작에 사용할 수 없다.
+런 상점 상품은 이 표가 아니라 §20.1~20.2를 사용한다.
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
@@ -556,9 +611,9 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | UnlockConditionId | string | - | 선행 해금 조건. 비어 있으면 즉시 구매 가능 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-허용 Category M1: `CONSUMABLE`(소모품), `STARTER_RELIC`(시작 유물), `SKILL_UNLOCK`(스킬 해금), `PERMANENT_UPGRADE`(영구 성장), `COSMETIC`(외형), `CHARACTER_UNLOCK`(캐릭터/직업 해금).
+계획 Category: `CONSUMABLE`(소모품), `STARTER_RELIC`(시작 유물), `SKILL_UNLOCK`(스킬 해금), `PERMANENT_UPGRADE`(영구 성장), `COSMETIC`(외형), `CHARACTER_UNLOCK`(캐릭터/직업 해금).
 
-허용 EffectRefType M1: `AUGMENT`(AugmentDefinitions 참조), `SKILL`(SkillDefinitions 참조), `JOB`(JobDefinitions 참조), 없으면 비움.
+계획 EffectRefType: `AUGMENT`(AugmentDefinitions 참조), `SKILL`(SkillDefinitions 참조), `JOB`(JobDefinitions 참조), 없으면 비움.
 
 재화 분류(런 소모/메타 영구/캐시)는 `CurrencyDefinitions`(§18)에서 관리한다.
 
@@ -572,7 +627,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | unlock_job_thief | 도적 해금 | CHARACTER_UNLOCK | cash | 9900 | JOB | thief |
 | potion_hp_small | 체력 물약(소) | CONSUMABLE | gold | 50 | | |
 
-## 20.1 EnemyDropDefinitions
+## 21. EnemyDropDefinitions
 
 적 사망 시 전투 중 생성되는 보상을 정의한다. 스테이지를 완료해서 받는 `StageRewardDefinitions`와 책임을 섞지 않는다. 적 밸런스 담당자는 `EnemyDefinitions`, 드롭 담당자는 이 표의 독립 행을 수정한다.
 
@@ -599,7 +654,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 
 런 보상 지급 API는 `RewardKey`를 필수로 받아 같은 키가 재전송되어도 한 번만 반영한다. 현재 소모품 기본 용량은 3이며 초과분은 `OverflowCurrencyId`와 `OverflowCurrencyPerItem` 설정에 따라 런 재화로 전환한다. 이는 런 상태 규격이며 계정 영구 저장·메타 재화 지급은 아직 포함하지 않는다.
 
-### 20.1.1 Prototype 호환 행
+### 21.1 Prototype 호환 행
 
 | DropEntryId | EnemyDefinitionId | TriggerType | DropType | DropRefId | ChancePermille | MinAmount | MaxAmount |
 |---|---|---|---|---|---:|---:|---:|
@@ -610,7 +665,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 
 `RootDesk/MyDesk/03_Data/EnemyDropDefinitions.userdataset/.csv` 페어에 위 4행이 이관되어 있다. Maker 런타임에서 `Source=DATASET`과 각 적 2행을 확인했으며 Repository의 prototype fallback은 비활성 상태다.
 
-## 21. Validator 오류 코드
+## 22. Validator 오류 코드
 
 | 코드 | 의미 | 전투 시작 차단 |
 |---|---|:---:|
@@ -627,7 +682,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | DATA_SPAWN_POOL_EMPTY | EnemySpawnPools의 PoolId에 활성 EnemyId가 하나도 없음 | O |
 | DATA_SPAWN_COUNT_EXCEEDS_BOARD | StageEnemyWaves의 SpawnCount가 BoardSize보다 큼 | O |
 | DATA_NO_START_NODE | NodeDefinitions의 한 NodeGraphId에 IsStartNode=true가 0개 또는 2개 이상 | O |
-| DATA_INVALID_CHARACTER_UNLOCK_REF | ShopItemDefinitions의 Category=CHARACTER_UNLOCK인데 EffectRefType이 JOB이 아님 | O |
+| DATA_INVALID_CHARACTER_UNLOCK_REF | PLANNED: Meta/World Shop의 Category=CHARACTER_UNLOCK인데 EffectRefType이 JOB이 아님 | O |
 | DATA_REWARD_CURRENCY_NOT_ALLOWED | StageRewardDefinitions가 Category=PREMIUM_CASH인 CurrencyId를 참조 | O |
 | DATA_INVALID_DROP_REFERENCE | EnemyDropDefinitions의 EnemyDefinitionId 또는 DropRefId 참조가 잘못됨 | O |
 | DATA_INVALID_DROP_RANGE | ChancePermille 또는 MinAmount/MaxAmount 범위가 잘못됨 | O |
@@ -639,7 +694,10 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 [DATA_MISSING_REFERENCE] Dataset=SkillEffectSteps Row=7 Column=EffectSetId Value=unknown_effect_set
 ```
 
-## 22. 새 데이터 추가 완료 기준
+`DATA_INVALID_CHARACTER_UNLOCK_REF`는 §20.3 목표 스키마에 예약된 코드이며 현재 런 상점
+Validator가 반환하는 코드가 아니다.
+
+## 23. 새 데이터 추가 완료 기준
 
 - Maker에서 wrapper와 CSV가 한 쌍으로 인식된다.
 - Runtime name이 로더에 등록된 이름과 일치한다.

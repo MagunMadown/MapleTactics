@@ -533,4 +533,4 @@ stage01,3,CLEAR_ONLY,stage01_basic,2,5,BALANCED,0.6,0,0
 - Stage 승리 시 Pending Drop은 `RunManagerLogic:GrantRunReward()`를 통해 자동 회수된다. 패배하거나 맵 세션이 끝나면 폐기된다.
 - 회수된 상태는 `RunManagerLogic:GetRunRewardSnapshot(player)`로 읽는다. 반환값에는 `CurrencySnapshot`, `ConsumableSnapshot`, `ConsumableCapacity`, `ConsumableCount`, `Revision`이 있다.
 - Snapshot 문자열은 전송용 DTO다. 다른 기능이 문자열을 직접 수정하면 안 되며, 지급 API와 공개 조회 API만 사용한다.
-- 실제 드롭 표는 `RootDesk/MyDesk/03_Data/EnemyDropDefinitions.userdataset`과 `.csv` 페어이며 데이터 사전 §20.1 규격을 따른다. 초반 적 2종의 4개 행은 실제 Dataset에서 로드되고 Repository fallback은 비활성 상태다.
+- 실제 드롭 표는 `RootDesk/MyDesk/03_Data/EnemyDropDefinitions.userdataset`과 `.csv` 페어이며 데이터 사전 §21 규격을 따른다. 초반 적 2종의 4개 행은 실제 Dataset에서 로드되고 Repository fallback은 비활성 상태다.

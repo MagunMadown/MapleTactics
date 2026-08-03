@@ -12,6 +12,10 @@
 | EffectType / TargetType | `HEAL` / `SELF` |
 | StackPolicy | `UNIQUE`, `MaxStacks=1` |
 
+데이터 사전에 `PLANNED`로 표시된 `CHANCE_ROLL`, 셀 대상 타입, 다중 StackPolicy는 아직
+CSV에서 사용할 수 없다. 새 타입은 Router/Resolver, Validator와 회귀 테스트가 모두 추가된 뒤
+`IMPLEMENTED`로 전환한다.
+
 ## 새 증강 추가 순서
 
 1. `AugmentDefinitions.csv`에 전역 유일한 `AugmentId`와 `SchemaVersion=1`을 추가한다.

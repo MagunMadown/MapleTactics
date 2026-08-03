@@ -358,6 +358,7 @@ StageFlowComponent
 - [x] ShopDefinitions/ShopEntries 로더 + SHOP Node·RUN_SCOPED Currency·SKILL/CONSUMABLE 참조 Validator.
 - [x] 상점 구매 → SKILL/CONSUMABLE 지급과 재화 차감 원자성, 방문/요청 중복 방지.
 - [ ] 상점 RewardType을 AUGMENT/JOB까지 확장하고 전용 상태 소유자 지급 경로 연결.
+- [ ] Meta/World Shop용 ShopItemDefinitions Dataset·Repository·Validator·영구 구매 상태 구현. 현재 RUN_SCOPED 런 상점과 별도 수명으로 유지한다.
 
 완료 기준:
 

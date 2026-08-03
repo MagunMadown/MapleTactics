@@ -92,9 +92,9 @@ M1 직업 슬롯:
 - 각 스테이지 완료 후 3개 후보 중 하나를 선택한다.
 - 후보는 RunSeed와 StageIndex에서 결정적으로 생성한다.
 - 증강은 Trigger + Condition + Effect 조합이다.
-- Unique, StackAdd, StackRefresh, ExclusiveGroup 정책을 지원한다.
+- 최종 규격은 Unique, StackAdd, StackRefresh, ExclusiveGroup 정책을 지원한다. 현재 구현은 Unique 1스택뿐이며 나머지는 계획 단계다.
 - 이벤트 무한 재귀를 막기 위해 SourceTag와 MaxDepth를 둔다.
-- 확률 기반 증강(예: "50% 확률로 후방 공격")은 `ConditionType=CHANCE_ROLL`과 `ConditionValue`(0.0~1.0)로 표현하며, 판정은 RunSeed 기반 결정적 롤을 사용한다.
+- 계획된 확률 기반 증강(예: "50% 확률로 후방 공격")은 `ConditionType=CHANCE_ROLL`과 `ConditionValue`(0.0~1.0)로 표현하며, 판정은 RunSeed 기반 결정적 롤을 사용한다. Router/Validator 구현 전에는 실전 데이터에 사용하지 않는다.
 - 유물(상점에서 얻는 시작 증강 포함)도 같은 `AugmentDefinitions`/`AugmentEffects` 스키마를 사용한다. 유물 전용 별도 테이블을 만들지 않는다.
 
 ## 8. MSW 구현 결정
@@ -142,7 +142,7 @@ M1 직업 슬롯:
 - 새로운 효과를 완전히 무코드로 정의하는 범용 스크립팅 언어는 만들지 않는다.
 - 모든 일반 적을 BT로 제작하지 않는다.
 - 메타 진행, 과금 연동, 랭킹은 M1 코어 루프 이후로 미룬다.
-- 상점은 `ShopItemDefinitions`/`CurrencyDefinitions` 데이터 구조와 화면만 M1 범위에 포함하고, 실제 결제(카드/인앱 결제 등) 연동은 미룬다.
+- M1은 `ShopDefinitions`/`ShopEntries` 기반 RUN_SCOPED 런 상점의 서버 흐름과 디버그 DTO를 포함한다. 최종 상점 UI와 `ShopItemDefinitions` 기반 Meta/World Shop, 영구 구매 상태, 실제 결제 연동은 이후 범위다.
 - 스테이지 클리어 보상(`StageRewardDefinitions`)으로 `RUN_SCOPED`/`META_PERSISTENT` 재화를 지급하는 흐름은 M1 범위에 포함한다. `PREMIUM_CASH` 재화는 보상으로 지급하지 않는다.
 
 ## 11. 성공 기준
@@ -168,10 +168,11 @@ M1 직업 슬롯:
 | 2026-07-25 | 추가 | 적 Intent를 `Prepare → Hold → Execute → Complete` 상태로 분리하고 `EnemyPatternSteps` 표에서 생성되는 PreparedIntent 계약과 개발자별 소유권을 명시 | 밀치기 직후 적이 행동을 재선택해 위치 조작이 무의미해지는 문제를 막고, 여러 개발자가 전투 코어 충돌 없이 표 행으로 적을 확장하기 위함 | Phase 1 Slice 10.5, GDD §3/§6/§8, Data-Dictionary §7.1/§7.2, Implementation-Plan 전투 코어 완료 기준 |
 | 2026-07-25 | 추가 | 웨이브 전멸 기본 진행에 턴/시간 제한 강제 증원 예외와 겹친 웨이브의 최종 승리 조건 추가 | 턴을 오래 소비할수록 적 증원이 누적되는 압박을 만들고, 스테이지 제작자가 표에서 증원 속도를 조절하기 위함 | GDD §6, Data-Dictionary StageEnemyWaves, Implementation-Plan Phase 3 |
 | 2026-07-28 | 추가 | 지역/노드맵 구조(`RegionDefinitions`/`NodeDefinitions`) 신설 | 팀 회의에서 확정된 마을→지도판→노드맵→전투 흐름을 여러 스테이지 데이터로 표현하기 위함 | GDD §6, Data-Dictionary §9/§10, Implementation-Plan Phase 3 |
-| 2026-07-28 | 추가 | 상점 데이터 구조(`ShopItemDefinitions`) 신설, 제외범위에서 "상점 데이터/화면"과 "결제 연동"을 분리 | 팀이 상점(캐시샵 포함) 콘텐츠 구조를 M1 범위에서 먼저 결정하기로 함 | GDD §10, Data-Dictionary §18 |
+| 2026-07-28 | 추가 | 상점 데이터 구조(`ShopItemDefinitions`) 신설, 제외범위에서 "상점 데이터/화면"과 "결제 연동"을 분리 | 팀이 상점(캐시샵 포함) 콘텐츠 구조를 M1 범위에서 먼저 결정하기로 함 | GDD §10, 현재 Data-Dictionary §20.3 |
 | 2026-07-28 | 추가 | AugmentEffects에 `ConditionValue`, `ConditionType=CHANCE_ROLL`, `TargetType=REAR_CELL` 추가 | "자쿰의 투구: 50% 확률 후방 공격"처럼 확률 기반·후방 타깃 유물을 코드 수정 없이 표로 표현하기 위함 | GDD §7, Data-Dictionary §15 |
-| 2026-07-30 | 추가 | 재화 레지스트리(`CurrencyDefinitions`) 신설, `ShopItemDefinitions.CurrencyType` 고정 enum을 `CurrencyId` 참조로 변경, 스테이지 클리어 보상(`StageRewardDefinitions`) 신설 | 체력을 재화로 쓰는 방식은 보류하고, 상점과 스테이지 보상이 같은 재화 정의 하나를 참조해 어떤 표든 재화 종류만 데이터로 바꿔 쓸 수 있게 하기 위함 | GDD §10, Data-Dictionary §18(CurrencyDefinitions 신설)/§19(StageRewardDefinitions 신설)/§20(ShopItemDefinitions, 구 §18)/§21(Validator 오류 코드, 구 §19) |
+| 2026-07-30 | 추가 | 재화 레지스트리(`CurrencyDefinitions`) 신설, `ShopItemDefinitions.CurrencyType` 고정 enum을 `CurrencyId` 참조로 변경, 스테이지 클리어 보상(`StageRewardDefinitions`) 신설 | 체력을 재화로 쓰는 방식은 보류하고, 상점과 스테이지 보상이 같은 재화 정의 하나를 참조해 어떤 표든 재화 종류만 데이터로 바꿔 쓸 수 있게 하기 위함 | GDD §10, 현재 Data-Dictionary §18(CurrencyDefinitions)/§19(StageRewardDefinitions)/§20.3(ShopItemDefinitions)/§22(Validator 오류 코드) |
 | 2026-07-31 | 수정 | `EnemyDefinitions` 표에 빠져 있던 `InitialFacingPolicy`(`FACE_PLAYER`/`FIXED_LEFT`/`FIXED_RIGHT`) 컬럼을 추가 | `StageEnemySpawns`(§11)와 `StageEnemyWaves`(§13)가 이미 `EnemyDefinitions.InitialFacingPolicy`를 참조하고 있었는데 정작 §6 표 정의에는 해당 컬럼이 없던 문서 불일치를 바로잡음 | Data-Dictionary §6. 실제 `EnemyDefinitions.userdataset`/`.csv`에 이 컬럼을 추가하는 작업은 Maker의 UserDataSet 편집 화면에서 별도로 진행 필요(직접 JSON 편집 금지) |
-| 2026-08-01 | 추가 | 적 사망 드롭을 `EnemyDropDefinitions`로 분리하고 Pending Drop→승리 자동 회수→런 재화·소모품 상태 흐름을 추가 | 적 밸런스와 드롭표의 파일 충돌을 줄이고, Stage 보상·상점과 같은 런 보상 지급 경계를 재사용하기 위함 | Data-Dictionary §20.1, Implementation Plan Phase 3, Battle Core Guide §10. 실제 Dataset 페어 이관과 fallback 비활성까지 완료; 전투 중 소모품 사용 효과는 후속 작업 |
+| 2026-08-01 | 추가 | 적 사망 드롭을 `EnemyDropDefinitions`로 분리하고 Pending Drop→승리 자동 회수→런 재화·소모품 상태 흐름을 추가 | 적 밸런스와 드롭표의 파일 충돌을 줄이고, Stage 보상·상점과 같은 런 보상 지급 경계를 재사용하기 위함 | Data-Dictionary §21, Implementation Plan Phase 3, Battle Core Guide §10. 실제 Dataset 페어 이관과 fallback 비활성까지 완료; 전투 중 소모품 사용 효과는 후속 작업 |
 | 2026-08-01 | 수정 | 일반 타일 등록과 큐 실행을 분리하고, 등록 후 적 턴에도 큐를 유지하는 쇼군식 흐름 및 기본+Modifier 큐 용량 계약을 확정 | 큐를 쌓는 동안 위치·방향을 조정한 뒤 별도 실행 키로 전체 큐를 해소하는 핵심 플레이를 구현하기 위함 | BattleTurn/BattleSession, BattleQueueHUD, UI 상태 DTO, Queue Modifier API |
 | 2026-08-01 | 수정 | 직업 시작 스킬과 직업 고유 메커니즘을 분리하고 구 TileDefinitions 명칭을 실제 SkillDefinitions 규격으로 통합 | 쇼군식 공격 타일과 캐릭터 고유 이동·전투 규칙은 실행 수명과 턴/쿨타임 계약이 다르므로 독립 확장점이 필요함 | JobDefinitions, JobStartingSkillEntries, JobMechanic Router, Data Dictionary §2~5 |
+| 2026-08-03 | 수정 | 구현 상태 표기와 상점 책임을 정리하고, 증강 허용값·StackPolicy·EnemyDrop 장 번호를 실제 코드에 맞춤 | 표 기반 제작자가 미구현 값을 지원 값으로 오해하거나 런 상점과 Meta/World Shop 데이터를 혼용하지 않도록 하기 위함 | Data-Dictionary §1/§14/§15/§20~23, GDD §7/§10, 관련 제작 가이드 |

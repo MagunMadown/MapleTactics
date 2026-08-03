@@ -5,6 +5,9 @@
 이 상점은 한 로그라이크 Run에서 획득한 `RUN_SCOPED` 골드로 스킬이나 소모품을 구매하는
 시스템이다. 영구 상품·캐시 결제·DB 구매 횟수를 사용하는 WorldShop과 분리한다.
 
+데이터 사전 §20.1~20.2의 `ShopDefinitions`/`ShopEntries`가 이 시스템의 기준 규격이다.
+§20.3의 `ShopItemDefinitions`는 Meta/World Shop용 `PLANNED` 스키마이며 런 상점에서 읽지 않는다.
+
 현재 UI는 구현하지 않는다. 상점 화면 담당자는 서버 DTO와 Request API만 사용한다.
 
 ## 기본 흐름
