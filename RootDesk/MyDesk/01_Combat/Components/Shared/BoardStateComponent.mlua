@@ -1,0 +1,168 @@
+@Component
+script BoardStateComponent extends Component
+
+	@Sync property integer RegisteredUnitCount = 0
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Session may initialize this child component before its own BeginPlay callback runs.
+		if self._T.UnitsById == nil then
+			self:ResetRegistry("BEGIN_PLAY")
+		end
+		log("[BattleBoard] ready map=" .. self.Entity.Name)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Releases entity references when the owning battle map ends.
+		self:ResetRegistry("END_PLAY")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResetRegistry(string reason)
+		-- Clears all registered unit references without changing the unit components themselves.
+		self._T.UnitsById = {}
+		self.RegisteredUnitCount = 0
+		log("[BattleBoard] reset reason=" .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RegisterUnit(Entity unitEntity)
+		-- Adds or refreshes one configured BattleUnitComponent by its stable UnitId.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			UnitId = ""
+		}
+		if isvalid(unitEntity) == false then
+			result.Reason = "ENTITY_INVALID"
+			return result
+		end
+
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if unit.UnitId == "" then
+			result.Reason = "UNIT_ID_EMPTY"
+			return result
+		end
+
+		if self._T.UnitsById == nil then
+			self._T.UnitsById = {}
+		end
+		local previous = self._T.UnitsById[unit.UnitId]
+		if isvalid(previous) and previous ~= unitEntity then
+			log_warning("[BattleBoard] replaced duplicate unitId=" .. unit.UnitId .. " previous=" .. previous.Name .. " current=" .. unitEntity.Name)
+		end
+
+		local isNew = isvalid(previous) == false
+		self._T.UnitsById[unit.UnitId] = unitEntity
+		if isNew then
+			self.RegisteredUnitCount = self.RegisteredUnitCount + 1
+		end
+
+		result.Success = true
+		result.Reason = isNew and "REGISTERED" or "REFRESHED"
+		result.UnitId = unit.UnitId
+		log("[BattleBoard] register unit=" .. unit.UnitId .. " team=" .. unit.Team .. " cell=" .. unit.CellIndex .. " spawnOrder=" .. unit.SpawnOrder .. " count=" .. self.RegisteredUnitCount .. " reason=" .. result.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table UnregisterUnit(string unitId)
+		-- Removes one UnitId mapping for later runtime despawn flows.
+		local result = {
+			Success = false,
+			Reason = "UNIT_NOT_FOUND"
+		}
+		if self._T.UnitsById == nil then
+			return result
+		end
+
+		local unitEntity = self._T.UnitsById[unitId]
+		if unitEntity == nil then
+			return result
+		end
+
+		self._T.UnitsById[unitId] = nil
+		self.RegisteredUnitCount = math.max(0, self.RegisteredUnitCount - 1)
+		result.Success = true
+		result.Reason = "UNREGISTERED"
+		log("[BattleBoard] unregister unit=" .. unitId .. " count=" .. self.RegisteredUnitCount)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method Entity FindByUnitId(string unitId)
+		-- Returns a registered unit regardless of life state so Reset can reuse dead entities.
+		if self._T.UnitsById == nil then
+			return nil
+		end
+		local unitEntity = self._T.UnitsById[unitId]
+		if isvalid(unitEntity) == false then
+			return nil
+		end
+		return unitEntity
+	end
+
+	@ExecSpace("ServerOnly")
+	method Entity FindAtCell(integer cellIndex, string ignoredUnitId)
+		-- Returns the first living unit at a cell using stable SpawnOrder and UnitId ordering.
+		local orderedUnits = self:CollectRegisteredUnits()
+		for _, unitEntity in ipairs(orderedUnits) do
+			local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil and unit.UnitId ~= ignoredUnitId and unit.IsDead == false and unit.CellIndex == cellIndex then
+				return unitEntity
+			end
+		end
+		return nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CollectLivingEnemies()
+		-- Collects living Enemy units in deterministic SpawnOrder then UnitId order.
+		local result = {}
+		local orderedUnits = self:CollectRegisteredUnits()
+		for _, unitEntity in ipairs(orderedUnits) do
+			local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil and unit.Team == "Enemy" and unit.IsDead == false then
+				table.insert(result, unitEntity)
+			end
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CollectRegisteredUnits()
+		-- Normalizes the internal dictionary into a deterministic array before any ordered query.
+		local result = {}
+		if self._T.UnitsById == nil then
+			return result
+		end
+
+		for _, unitEntity in pairs(self._T.UnitsById) do
+			if isvalid(unitEntity) then
+				table.insert(result, unitEntity)
+			end
+		end
+
+		table.sort(result, function(leftEntity, rightEntity)
+			local left = leftEntity:GetComponent("script.BattleUnitComponent")
+			local right = rightEntity:GetComponent("script.BattleUnitComponent")
+			if left == nil then
+				return false
+			end
+			if right == nil then
+				return true
+			end
+			if left.SpawnOrder ~= right.SpawnOrder then
+				return left.SpawnOrder < right.SpawnOrder
+			end
+			return left.UnitId < right.UnitId
+		end)
+		return result
+	end
+
+end

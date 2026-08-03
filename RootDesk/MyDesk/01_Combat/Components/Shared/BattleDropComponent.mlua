@@ -1,0 +1,256 @@
+@Component
+script BattleDropComponent extends Component
+
+	@Sync property string PendingDropSnapshot = ""
+	@Sync property integer PendingDropCount = 0
+	@Sync property integer DropRevision = 0
+	property string ProcessedKillKeys = ""
+	property any Presentation = nil
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		self.Presentation = self:EnsurePresentation()
+		log("[BattleDrop] attached entity=" .. self.Entity.Name)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResetDropState(string reason)
+		local presentation = self:EnsurePresentation()
+		if presentation ~= nil then
+			presentation:ClearAll(reason)
+		end
+		self.PendingDropSnapshot = ""
+		self.PendingDropCount = 0
+		self.ProcessedKillKeys = ""
+		self.DropRevision = self.DropRevision + 1
+		log("[BattleDrop] reset reason=" .. reason .. " revision=" .. self.DropRevision)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveEnemyDeath(integer runSeed, string stageId, integer waveIndex, string enemyDefinitionId, string unitId, integer spawnOrder, integer cellIndex, string triggerSnapshot)
+		-- Resolves one death exactly once across an ordered set of contextual trigger contracts.
+		local contentValidation = _ContentValidatorLogic:ValidateEnemyDrops()
+		if contentValidation.Success == false then
+			log_error("[BattleDrop] resolution blocked reason=" .. contentValidation.Reason .. " detail=" .. (contentValidation.DetailReason or ""))
+			return { Success = false, Reason = contentValidation.Reason, DetailReason = contentValidation.DetailReason, AddedCount = 0 }
+		end
+		local killKey = stageId .. ":" .. tostring(waveIndex) .. ":" .. tostring(spawnOrder) .. ":" .. unitId
+		if self:ContainsKey(self.ProcessedKillKeys, killKey) then
+			log_warning("[BattleDrop] duplicate kill ignored key=" .. killKey)
+			return { Success = true, Reason = "DUPLICATE_KILL_IGNORED", AddedCount = 0 }
+		end
+		local addedCount = 0
+		local resolvedTriggers = 0
+		for triggerType in string.gmatch(triggerSnapshot or "", "([^|]+)") do
+			local rollResult = _EnemyDropDefinitionRepositoryLogic:ResolveDrops(enemyDefinitionId, triggerType, runSeed, stageId, waveIndex, unitId, spawnOrder)
+			if rollResult.Success == false then
+				log_error("[BattleDrop] resolution failed enemy=" .. enemyDefinitionId .. " unit=" .. unitId .. " trigger=" .. triggerType .. " reason=" .. rollResult.Reason)
+				return { Success = false, Reason = rollResult.Reason, AddedCount = addedCount, ResolvedTriggerCount = resolvedTriggers }
+			end
+			resolvedTriggers = resolvedTriggers + 1
+			for _, drop in ipairs(rollResult.Drops) do
+				local rewardKey = killKey .. ":" .. drop.DropEntryId
+				self:AddPendingDrop(rewardKey, drop.DropType, drop.DropRefId, drop.Amount, cellIndex)
+				addedCount = addedCount + 1
+			end
+		end
+		if resolvedTriggers <= 0 then
+			return { Success = false, Reason = "DROP_TRIGGER_MISSING", AddedCount = 0, ResolvedTriggerCount = 0 }
+		end
+		self.ProcessedKillKeys = self:AppendKey(self.ProcessedKillKeys, killKey)
+		log("[BattleDrop] death resolved enemy=" .. enemyDefinitionId .. " unit=" .. unitId .. " triggers=" .. triggerSnapshot .. " added=" .. addedCount .. " pending=" .. self.PendingDropCount)
+		return { Success = true, Reason = addedCount > 0 and "DROP_ROLLED" or "NO_DROP_ROLLED", AddedCount = addedCount, ResolvedTriggerCount = resolvedTriggers }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AddPendingDrop(string rewardKey, string dropType, string dropRefId, integer amount, integer cellIndex)
+		local record = rewardKey .. "~" .. dropType .. "~" .. dropRefId .. "~" .. tostring(amount) .. "~" .. tostring(cellIndex)
+		if self.PendingDropSnapshot == "" then
+			self.PendingDropSnapshot = record
+		else
+			self.PendingDropSnapshot = self.PendingDropSnapshot .. "|" .. record
+		end
+		self.PendingDropCount = self.PendingDropCount + 1
+		self.DropRevision = self.DropRevision + 1
+		local presentation = self:EnsurePresentation()
+		if presentation ~= nil then
+			local presentationResult = presentation:ShowDrop(rewardKey, dropType, dropRefId, amount, cellIndex)
+			if presentationResult.Success == false then
+				log_warning("[BattleDrop] presentation skipped key=" .. rewardKey .. " reason=" .. presentationResult.Reason)
+			end
+		end
+		log("[BattleDrop] pending added key=" .. rewardKey .. " reward=" .. dropType .. ":" .. dropRefId .. " amount=" .. amount .. " cell=" .. cellIndex .. " revision=" .. self.DropRevision)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CollectAtCell(Entity playerEntity, string battleRecordKey, integer cellIndex)
+		-- Transfers every pending drop on the entered board cell through the run reward facade.
+		local result = { Success = false, Reason = "UNKNOWN", CellIndex = cellIndex, CollectedCount = 0, FailedCount = 0 }
+		if isvalid(playerEntity) == false then
+			result.Reason = "INVALID_PLAYER"
+			return result
+		end
+		if battleRecordKey == nil or battleRecordKey == "" then
+			result.Reason = "INVALID_BATTLE_RECORD_KEY"
+			return result
+		end
+		if cellIndex < 0 then
+			result.Reason = "INVALID_CELL_INDEX"
+			return result
+		end
+
+		local remainingRecords = {}
+		for record in string.gmatch(self.PendingDropSnapshot, "([^|]+)") do
+			local fields = {}
+			for field in string.gmatch(record, "([^~]+)") do
+				table.insert(fields, field)
+			end
+			local isTargetCell = #fields == 5 and math.floor(tonumber(fields[5]) or -1) == cellIndex
+			if isTargetCell then
+				local rewardKey = battleRecordKey .. ":drop:" .. fields[1]
+				local grantResult = _RunManagerLogic:GrantRunReward(playerEntity, fields[2], fields[3], math.floor(tonumber(fields[4]) or 0), rewardKey)
+				if grantResult.Success == true then
+					result.CollectedCount = result.CollectedCount + 1
+					local presentation = self:EnsurePresentation()
+					if presentation ~= nil then
+						presentation:RemoveDrop(fields[1], "CELL_COLLECTED")
+					end
+				else
+					table.insert(remainingRecords, record)
+					result.FailedCount = result.FailedCount + 1
+				end
+			else
+				table.insert(remainingRecords, record)
+			end
+		end
+
+		if result.CollectedCount > 0 then
+			self.PendingDropSnapshot = table.concat(remainingRecords, "|")
+			self.PendingDropCount = #remainingRecords
+			self.DropRevision = self.DropRevision + 1
+		end
+		result.Success = result.FailedCount == 0
+		if result.CollectedCount <= 0 and result.FailedCount <= 0 then
+			result.Reason = "NO_DROP_AT_CELL"
+		elseif result.FailedCount > 0 then
+			result.Reason = "CELL_COLLECT_PARTIAL"
+		else
+			result.Reason = "CELL_COLLECTED"
+		end
+		log("[BattleDrop] cell collect cell=" .. cellIndex .. " result=" .. result.Reason .. " collected=" .. result.CollectedCount .. " failed=" .. result.FailedCount .. " remaining=" .. self.PendingDropCount .. " revision=" .. self.DropRevision)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table AutoCollectAll(Entity playerEntity, string battleRecordKey)
+		local result = { Success = false, Reason = "UNKNOWN", CollectedCount = 0, FailedCount = 0 }
+		if isvalid(playerEntity) == false then
+			result.Reason = "INVALID_PLAYER"
+			return result
+		end
+		if battleRecordKey == nil or battleRecordKey == "" then
+			result.Reason = "INVALID_BATTLE_RECORD_KEY"
+			return result
+		end
+
+		local failedRecords = {}
+		for record in string.gmatch(self.PendingDropSnapshot, "([^|]+)") do
+			local fields = {}
+			for field in string.gmatch(record, "([^~]+)") do
+				table.insert(fields, field)
+			end
+			if #fields == 5 then
+				local rewardKey = battleRecordKey .. ":drop:" .. fields[1]
+				local grantResult = _RunManagerLogic:GrantRunReward(playerEntity, fields[2], fields[3], math.floor(tonumber(fields[4]) or 0), rewardKey)
+				if grantResult.Success == true then
+					result.CollectedCount = result.CollectedCount + 1
+					local presentation = self:EnsurePresentation()
+					if presentation ~= nil then
+						presentation:RemoveDrop(fields[1], "AUTO_COLLECTED")
+					end
+				else
+					table.insert(failedRecords, record)
+					result.FailedCount = result.FailedCount + 1
+				end
+			else
+				table.insert(failedRecords, record)
+				result.FailedCount = result.FailedCount + 1
+			end
+		end
+
+		self.PendingDropSnapshot = table.concat(failedRecords, "|")
+		self.PendingDropCount = #failedRecords
+		self.DropRevision = self.DropRevision + 1
+		result.Success = result.FailedCount == 0
+		result.Reason = result.Success and "AUTO_COLLECTED" or "AUTO_COLLECT_PARTIAL"
+		log("[BattleDrop] auto collect result=" .. result.Reason .. " collected=" .. result.CollectedCount .. " failed=" .. result.FailedCount .. " remaining=" .. self.PendingDropCount .. " revision=" .. self.DropRevision)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DiscardPending(string reason)
+		local discarded = self.PendingDropCount
+		local presentation = self:EnsurePresentation()
+		if presentation ~= nil then
+			presentation:ClearAll(reason)
+		end
+		self.PendingDropSnapshot = ""
+		self.PendingDropCount = 0
+		self.DropRevision = self.DropRevision + 1
+		log("[BattleDrop] discarded reason=" .. reason .. " count=" .. discarded .. " revision=" .. self.DropRevision)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetSnapshot()
+		local visibleCount = 0
+		local presentation = self:EnsurePresentation()
+		if presentation ~= nil then
+			visibleCount = presentation:GetVisibleDropCount()
+		end
+		return {
+			Success = true,
+			Reason = "OK",
+			PendingDropSnapshot = self.PendingDropSnapshot,
+			PendingDropCount = self.PendingDropCount,
+			Revision = self.DropRevision,
+			VisibleDropCount = visibleCount
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConfigurePresentation(number cellStartX, number cellSpacing, number unitY)
+		local presentation = self:EnsurePresentation()
+		if presentation ~= nil then
+			presentation:ConfigureBoard(cellStartX, cellSpacing, unitY)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method any EnsurePresentation()
+		if self.Presentation ~= nil then
+			return self.Presentation
+		end
+		local presentation = self.Entity:GetComponent("script.BattleDropPresentationComponent")
+		if presentation == nil then
+			presentation = self.Entity:AddComponent("BattleDropPresentationComponent")
+		end
+		if presentation == nil then
+			log_error("[BattleDrop] BattleDropPresentationComponent unavailable")
+			return nil
+		end
+		self.Presentation = presentation
+		return presentation
+	end
+
+	method boolean ContainsKey(string keySnapshot, string key)
+		return string.find("|" .. (keySnapshot or "") .. "|", "|" .. key .. "|", 1, true) ~= nil
+	end
+
+	method string AppendKey(string keySnapshot, string key)
+		if keySnapshot == nil or keySnapshot == "" then
+			return key
+		end
+		return keySnapshot .. "|" .. key
+	end
+
+end

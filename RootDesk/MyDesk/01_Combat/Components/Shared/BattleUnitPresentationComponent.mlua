@@ -1,0 +1,194 @@
+@Component
+script BattleUnitPresentationComponent extends Component
+
+	property string HpTextChildName = "BattleHpText"
+	property string HpTextFont = "Maple"
+	property number HpTextFontSize = 1.2
+	property Color HpTextColor = Color(1, 1, 1, 1)
+	property Vector2 HpTextOffset = Vector2(0, 0)
+	property Vector2 HpTextRectSize = Vector2(2.4, 0.5)
+	property string HpTextSortingLayer = "MapLayer0"
+	property integer HpTextOrderInLayer = 20
+	property Color HpTextOutlineColor = Color(0, 0, 0, 1)
+	property number HpTextOutlineWidth = 0.18
+
+	property Color HitFlashColor = Color(1, 0.35, 0.35, 1)
+	property number HitFlashDuration = 0.18
+	property string CombatMotionReturnState = "IDLE"
+
+	property string LastDisplayedHp = ""
+	property integer HitFlashTimerId = 0
+	property integer MotionTimerId = 0
+	property boolean HasOriginalSpriteColor = false
+	property Color OriginalSpriteColor = Color(1, 1, 1, 1)
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Presentation settings are local-only and never mutate logical battle state.
+		log("[BattlePresentation] ready entity=" .. self.Entity.Name .. " flashDuration=" .. self.HitFlashDuration)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		if self.HitFlashTimerId > 0 then
+			_TimerService:ClearTimer(self.HitFlashTimerId)
+			self.HitFlashTimerId = 0
+		end
+		if self.MotionTimerId > 0 then
+			_TimerService:ClearTimer(self.MotionTimerId)
+			self.MotionTimerId = 0
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshHpDisplay(string unitId, string team, number currentHp, number maxHp)
+		-- Only entities with the configured child opt in to a world-space HP label.
+		if team ~= "Enemy" then
+			return
+		end
+
+		local hpTextEntity = self.Entity:GetChildByName(self.HpTextChildName, false)
+		if isvalid(hpTextEntity) == false or hpTextEntity.TextRendererComponent == nil then
+			return
+		end
+
+		local displayText = "HP " .. math.floor(currentHp) .. " / " .. math.floor(maxHp)
+		if self.LastDisplayedHp == displayText then
+			return
+		end
+
+		local renderer = hpTextEntity.TextRendererComponent
+		renderer.Text = displayText
+		renderer.Font = self.HpTextFont
+		renderer.FontSize = self.HpTextFontSize
+		renderer.FontColor = self.HpTextColor
+		renderer.RectOffset = self.HpTextOffset
+		renderer.RectSize = self.HpTextRectSize
+		renderer.HorizontalAlignment = TextHorizontalAlignmentOption.Center
+		renderer.VerticalAlignment = TextVerticalAlignmentOption.Middle
+		renderer.SortingLayer = self.HpTextSortingLayer
+		renderer.OrderInLayer = self.HpTextOrderInLayer
+		renderer.OutlineColor = self.HpTextOutlineColor
+		renderer.OutlineWidth = self.HpTextOutlineWidth
+
+		self.LastDisplayedHp = displayText
+		log("[BattlePresentation] hp refreshed unit=" .. unitId .. " text=" .. displayText)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshDefeatedDisplay(string unitId, string team, boolean isDead)
+		-- Hides only the placed enemy sprite and HP label; player defeat remains visible behind the result UI.
+		if team ~= "Enemy" then
+			return
+		end
+
+		if self.Entity.SpriteRendererComponent ~= nil then
+			self.Entity.SpriteRendererComponent.Enable = isDead == false
+		end
+
+		local hpTextEntity = self.Entity:GetChildByName(self.HpTextChildName, false)
+		if isvalid(hpTextEntity) and hpTextEntity.TextRendererComponent ~= nil then
+			hpTextEntity.TextRendererComponent.Enable = isDead == false
+		end
+		log("[BattlePresentation] defeated display unit=" .. unitId .. " hidden=" .. tostring(isDead))
+	end
+
+	@ExecSpace("Client")
+	method void PlayHitFlash(string unitId)
+		-- Restarts one configurable sprite tint flash without changing combat state.
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer == nil then
+			log_warning("[BattlePresentation] hit flash skipped unit=" .. unitId .. " reason=SPRITE_RENDERER_MISSING")
+			return
+		end
+
+		if self.HasOriginalSpriteColor == false then
+			self.OriginalSpriteColor = renderer.Color
+			self.HasOriginalSpriteColor = true
+		end
+
+		if self.HitFlashTimerId > 0 then
+			_TimerService:ClearTimer(self.HitFlashTimerId)
+			self.HitFlashTimerId = 0
+		end
+
+		renderer.Color = self.HitFlashColor
+		log("[BattlePresentation] hit flash started unit=" .. unitId .. " duration=" .. self.HitFlashDuration)
+
+		local restore = function()
+			if isvalid(self.Entity) and self.Entity.SpriteRendererComponent ~= nil then
+				self.Entity.SpriteRendererComponent.Color = self.OriginalSpriteColor
+			end
+			self.HitFlashTimerId = 0
+			self.HasOriginalSpriteColor = false
+			log("[BattlePresentation] hit flash restored unit=" .. unitId)
+		end
+
+		local duration = math.max(0.05, self.HitFlashDuration)
+		self.HitFlashTimerId = _TimerService:SetTimerOnce(restore, duration)
+	end
+
+	@ExecSpace("Client")
+	method void PlayCombatMotion(string unitId, string motionKey, string actionName, number playRate, number duration)
+		-- Plays either the equipped weapon attack or one arbitrary one-shot avatar action for this attack profile.
+		local state = self.Entity.StateComponent
+		local avatarRenderer = self.Entity.AvatarRendererComponent
+		if state == nil or avatarRenderer == nil then
+			log_warning("[BattleMotion] skipped unit=" .. unitId .. " motion=" .. motionKey .. " reason=AVATAR_COMPONENT_MISSING")
+			return
+		end
+		if motionKey == "" then
+			log_warning("[BattleMotion] skipped unit=" .. unitId .. " reason=MOTION_KEY_EMPTY")
+			return
+		end
+
+		if self.MotionTimerId > 0 then
+			_TimerService:ClearTimer(self.MotionTimerId)
+			self.MotionTimerId = 0
+		end
+
+		local safePlayRate = math.max(0.1, playRate)
+		local safeDuration = math.max(0.1, duration)
+
+		local motionMode = "BUILTIN_BODY_ACTION"
+		if actionName == "" then
+			local attackEvent = BodyActionStateChangeEvent()
+			attackEvent.ActionState = MapleAvatarBodyActionState.Attack
+			attackEvent.needResetAction = true
+			attackEvent.playRate = safePlayRate
+			self.Entity:SendEvent(attackEvent)
+		else
+			local body = avatarRenderer:GetBodyEntity()
+			if isvalid(body) == false then
+				log_warning("[BattleMotion] skipped unit=" .. unitId .. " motion=" .. motionKey .. " reason=AVATAR_BODY_MISSING")
+				return
+			end
+
+			motionMode = "CUSTOM_ACTION"
+			local actionEvent = ActionStateChangedEvent()
+			actionEvent.CoreActionName = actionName
+			actionEvent.PartsActionName = actionName
+			actionEvent.PlayRate = safePlayRate
+			actionEvent.PlayType = SpriteAnimClipPlayType.Onetime
+			body:SendEvent(actionEvent)
+		end
+		log("[BattleMotion] started unit=" .. unitId .. " motion=" .. motionKey .. " mode=" .. motionMode .. " action=" .. actionName .. " rate=" .. safePlayRate .. " duration=" .. safeDuration)
+
+		local restore = function()
+			if isvalid(self.Entity) then
+				if self.Entity.StateComponent ~= nil then
+					self.Entity.StateComponent:ChangeState(self.CombatMotionReturnState)
+				end
+				local resetEvent = BodyActionStateChangeEvent()
+				resetEvent.ActionState = MapleAvatarBodyActionState.Stand
+				resetEvent.needResetAction = true
+				self.Entity:SendEvent(resetEvent)
+				log("[BattleMotion] restored unit=" .. unitId .. " motion=" .. motionKey .. " state=" .. self.CombatMotionReturnState)
+			end
+			self.MotionTimerId = 0
+		end
+
+		self.MotionTimerId = _TimerService:SetTimerOnce(restore, safeDuration)
+	end
+
+end

@@ -1,0 +1,427 @@
+@Logic
+script NodeDefinitionRepositoryLogic
+
+	property string DataSetName = "NodeDefinitions"
+	property integer SupportedSchemaVersion = 1
+	property boolean AllowPrototypeCompatibilityFallback = false
+
+	@ExecSpace("ServerOnly")
+	method table GetNodeDefinition(string nodeGraphId, string nodeId)
+		-- Returns one unique enabled node from the requested graph.
+		local result = {
+			Success = false,
+			Reason = "NODE_DEFINITION_NOT_FOUND",
+			NodeGraphId = nodeGraphId or "",
+			NodeId = nodeId or ""
+		}
+		if nodeGraphId == nil or nodeGraphId == "" then
+			result.Reason = "INVALID_NODE_GRAPH_ID"
+			return result
+		end
+		if nodeId == nil or nodeId == "" then
+			result.Reason = "INVALID_NODE_ID"
+			return result
+		end
+
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		local foundRowIndex = 0
+		if dataSet ~= nil then
+			for rowIndex = 1, dataSet:GetRowCount() do
+				if dataSet:GetCell(rowIndex, "NodeGraphId") == nodeGraphId
+					and dataSet:GetCell(rowIndex, "NodeId") == nodeId then
+					if foundRowIndex > 0 then
+						result.Reason = "CONTENT_VALIDATION_FAILED"
+						result.DetailReason = "DUPLICATE_NODE_ID"
+						log_error("[NodeDefinition] duplicate graph=" .. nodeGraphId .. " node=" .. nodeId)
+						return result
+					end
+					foundRowIndex = rowIndex
+				end
+			end
+		end
+		if foundRowIndex > 0 then
+			return self:ValidateDefinition(self:ConvertRow(dataSet, foundRowIndex))
+		end
+
+		local fallback = self:GetPrototypeCompatibilityDefinition(nodeGraphId, nodeId)
+		if fallback.Success == true then
+			log("[NodeDefinition] compatibility fallback graph=" .. nodeGraphId .. " node=" .. nodeId)
+			return self:ValidateDefinition(fallback)
+		end
+
+		log_warning("[NodeDefinition] missing graph=" .. nodeGraphId .. " node=" .. nodeId .. " dataset=" .. self.DataSetName)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table FindNodeByStageId(string stageId)
+		-- Resolves one battle node by its globally unique StageId reference.
+		local result = {
+			Success = false,
+			Reason = "STAGE_NODE_NOT_FOUND",
+			StageId = stageId or ""
+		}
+		if stageId == nil or stageId == "" then
+			result.Reason = "INVALID_STAGE_ID"
+			return result
+		end
+
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		local foundRowIndex = 0
+		if dataSet ~= nil then
+			for rowIndex = 1, dataSet:GetRowCount() do
+				if dataSet:GetCell(rowIndex, "StageId") == stageId then
+					if foundRowIndex > 0 then
+						result.Reason = "AMBIGUOUS_STAGE_NODE"
+						log_error("[NodeDefinition] ambiguous stage=" .. stageId .. " dataset=" .. self.DataSetName)
+						return result
+					end
+					foundRowIndex = rowIndex
+				end
+			end
+		end
+		if foundRowIndex > 0 then
+			return self:ValidateDefinition(self:ConvertRow(dataSet, foundRowIndex))
+		end
+
+		if self.AllowPrototypeCompatibilityFallback == true and stageId == "stage01" then
+			return self:GetPrototypeCompatibilityDefinition("prototype_run", "stage01_battle")
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveBattleOutcome(string currentNodeGraphId, string currentNodeId, string stageId, string battleResult)
+		-- Converts one authoritative battle result into the next-content selection DTO.
+		local result = {
+			Success = false,
+			Reason = "RUN_FLOW_RESOLUTION_FAILED",
+			FlowState = "DATA_ERROR",
+			NodeGraphId = currentNodeGraphId or "",
+			CompletedNodeId = currentNodeId or "",
+			CompletedStageId = stageId or "",
+			NextNodeIds = "",
+			NextContentTypes = "",
+			NextContentIds = ""
+		}
+		if battleResult == "Defeat" then
+			result.Success = true
+			result.Reason = "RUN_FAILED"
+			result.FlowState = "RUN_FAILED"
+			return result
+		end
+		if battleResult ~= "Victory" then
+			result.Reason = "INVALID_BATTLE_RESULT"
+			return result
+		end
+
+		local currentNode = nil
+		if currentNodeGraphId ~= nil and currentNodeGraphId ~= ""
+			and currentNodeId ~= nil and currentNodeId ~= "" then
+			currentNode = self:GetNodeDefinition(currentNodeGraphId, currentNodeId)
+		else
+			currentNode = self:FindNodeByStageId(stageId)
+		end
+		if currentNode.Success == false then
+			result.Reason = currentNode.Reason
+			result.DetailReason = currentNode.DetailReason or ""
+			return result
+		end
+		local graphValidation = _ContentValidatorLogic:ValidateNodeGraph(currentNode.NodeGraphId)
+		if graphValidation.Success == false then
+			result.Reason = graphValidation.Reason
+			result.DetailReason = graphValidation.DetailReason or ""
+			return result
+		end
+		if currentNode.StageId ~= stageId then
+			result.Reason = "CURRENT_NODE_STAGE_MISMATCH"
+			return result
+		end
+
+		result.NodeGraphId = currentNode.NodeGraphId
+		result.CompletedNodeId = currentNode.NodeId
+		if currentNode.NextNodeIds == nil or currentNode.NextNodeIds == "" then
+			result.Success = true
+			result.Reason = "RUN_COMPLETED"
+			result.FlowState = "RUN_COMPLETED"
+			return result
+		end
+
+		local nextNodeIds = {}
+		local nextContentTypes = {}
+		local nextContentIds = {}
+		for nextNodeId in string.gmatch(currentNode.NextNodeIds, "([^|]+)") do
+			local nextNode = self:GetNodeDefinition(currentNode.NodeGraphId, nextNodeId)
+			if nextNode.Success == false then
+				result.Reason = "NEXT_NODE_REFERENCE_MISSING"
+				result.MissingNodeId = nextNodeId
+				return result
+			end
+			table.insert(nextNodeIds, nextNode.NodeId)
+			table.insert(nextContentTypes, nextNode.NodeType)
+			local contentId = nextNode.NodeId
+			if nextNode.NodeType == "BATTLE" or nextNode.NodeType == "BOSS" then
+				contentId = nextNode.StageId
+			end
+			table.insert(nextContentIds, contentId)
+		end
+
+		result.Success = true
+		result.Reason = "NEXT_NODE_SELECTION_REQUIRED"
+		result.FlowState = "AWAITING_NODE_SELECTION"
+		result.NextNodeIds = table.concat(nextNodeIds, "|")
+		result.NextContentTypes = table.concat(nextContentTypes, "|")
+		result.NextContentIds = table.concat(nextContentIds, "|")
+		log("[RunFlow] outcome resolved stage=" .. stageId .. " graph=" .. result.NodeGraphId .. " node=" .. result.CompletedNodeId .. " nextNodes=" .. result.NextNodeIds .. " nextTypes=" .. result.NextContentTypes)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveContentCompletion(string currentNodeGraphId, string currentNodeId)
+		-- Resolves a completed non-battle node into either the next selection or terminal run state.
+		local result = {
+			Success = false,
+			Reason = "RUN_FLOW_RESOLUTION_FAILED",
+			FlowState = "DATA_ERROR",
+			NodeGraphId = currentNodeGraphId or "",
+			CompletedNodeId = currentNodeId or "",
+			CompletedStageId = "",
+			NextNodeIds = "",
+			NextContentTypes = "",
+			NextContentIds = ""
+		}
+		if currentNodeGraphId == nil or currentNodeGraphId == "" then
+			result.Reason = "INVALID_NODE_GRAPH_ID"
+			return result
+		end
+		if currentNodeId == nil or currentNodeId == "" then
+			result.Reason = "INVALID_NODE_ID"
+			return result
+		end
+
+		local currentNode = self:GetNodeDefinition(currentNodeGraphId, currentNodeId)
+		if currentNode.Success == false then
+			result.Reason = currentNode.Reason
+			result.DetailReason = currentNode.DetailReason or ""
+			return result
+		end
+		if currentNode.NodeType == "BATTLE" or currentNode.NodeType == "BOSS" then
+			result.Reason = "BATTLE_COMPLETION_REQUIRES_RESULT"
+			return result
+		end
+		local graphValidation = _ContentValidatorLogic:ValidateNodeGraph(currentNode.NodeGraphId)
+		if graphValidation.Success == false then
+			result.Reason = graphValidation.Reason
+			result.DetailReason = graphValidation.DetailReason or ""
+			return result
+		end
+
+		result.NodeGraphId = currentNode.NodeGraphId
+		result.CompletedNodeId = currentNode.NodeId
+		if currentNode.NextNodeIds == nil or currentNode.NextNodeIds == "" then
+			result.Success = true
+			result.Reason = "RUN_COMPLETED"
+			result.FlowState = "RUN_COMPLETED"
+			log("[RunFlow] content completed graph=" .. result.NodeGraphId .. " node=" .. result.CompletedNodeId .. " type=" .. currentNode.NodeType .. " next=RUN_COMPLETED")
+			return result
+		end
+
+		local nextNodeIds = {}
+		local nextContentTypes = {}
+		local nextContentIds = {}
+		for nextNodeId in string.gmatch(currentNode.NextNodeIds, "([^|]+)") do
+			local nextNode = self:GetNodeDefinition(currentNode.NodeGraphId, nextNodeId)
+			if nextNode.Success == false then
+				result.Reason = "NEXT_NODE_REFERENCE_MISSING"
+				result.MissingNodeId = nextNodeId
+				return result
+			end
+			table.insert(nextNodeIds, nextNode.NodeId)
+			table.insert(nextContentTypes, nextNode.NodeType)
+			local contentId = nextNode.NodeId
+			if nextNode.NodeType == "BATTLE" or nextNode.NodeType == "BOSS" then
+				contentId = nextNode.StageId
+			end
+			table.insert(nextContentIds, contentId)
+		end
+
+		result.Success = true
+		result.Reason = "NEXT_NODE_SELECTION_REQUIRED"
+		result.FlowState = "AWAITING_NODE_SELECTION"
+		result.NextNodeIds = table.concat(nextNodeIds, "|")
+		result.NextContentTypes = table.concat(nextContentTypes, "|")
+		result.NextContentIds = table.concat(nextContentIds, "|")
+		log("[RunFlow] content completed graph=" .. result.NodeGraphId .. " node=" .. result.CompletedNodeId .. " type=" .. currentNode.NodeType .. " nextNodes=" .. result.NextNodeIds .. " nextTypes=" .. result.NextContentTypes)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetGraphDefinitions(string nodeGraphId)
+		-- Loads one complete graph bundle while leaving policy validation to NodeContentValidatorLogic.
+		local result = {
+			Success = false,
+			Reason = "NODE_GRAPH_NOT_FOUND",
+			NodeGraphId = nodeGraphId or "",
+			NodeCount = 0,
+			Definitions = {}
+		}
+		if nodeGraphId == nil or nodeGraphId == "" then
+			result.Reason = "INVALID_NODE_GRAPH_ID"
+			return result
+		end
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		if dataSet == nil then
+			result.Reason = "NODE_DATASET_NOT_FOUND"
+			return result
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "NodeGraphId") == nodeGraphId then
+				table.insert(result.Definitions, self:ConvertRow(dataSet, rowIndex))
+			end
+		end
+		result.NodeCount = #result.Definitions
+		if result.NodeCount == 0 then
+			result.Reason = "NODE_GRAPH_EMPTY"
+			return result
+		end
+		result.Success = true
+		result.Reason = "OK"
+		log("[NodeDefinition] graph loaded graph=" .. nodeGraphId .. " nodes=" .. result.NodeCount .. " source=DATASET")
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConvertRow(any dataSet, integer rowIndex)
+		-- Converts string cells into the typed node definition consumed by run flow.
+		local nodeGraphId = dataSet:GetCell(rowIndex, "NodeGraphId") or ""
+		local nodeId = dataSet:GetCell(rowIndex, "NodeId") or ""
+		return {
+			Success = true,
+			Reason = "OK",
+			SchemaVersion = math.floor(tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")) or 1),
+			NodeGraphId = nodeGraphId,
+			NodeId = nodeId,
+			NodeType = dataSet:GetCell(rowIndex, "NodeType") or "",
+			StageId = dataSet:GetCell(rowIndex, "StageId") or "",
+			IsStartNode = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "IsStartNode")),
+			NextNodeIds = dataSet:GetCell(rowIndex, "NextNodeIds") or "",
+			PositionX = tonumber(dataSet:GetCell(rowIndex, "PositionX")),
+			PositionY = tonumber(dataSet:GetCell(rowIndex, "PositionY")),
+			Enabled = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")),
+			Source = "DATASET"
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateDefinition(table definition)
+		-- Validates one row without mutating global run or battle state.
+		if definition.SchemaVersion ~= self.SupportedSchemaVersion then
+			return self:RejectDefinition(definition, "UNSUPPORTED_NODE_SCHEMA")
+		end
+		if definition.NodeGraphId == nil or definition.NodeGraphId == "" then
+			return self:RejectDefinition(definition, "NODE_GRAPH_ID_MISSING")
+		end
+		if definition.NodeId == nil or definition.NodeId == "" then
+			return self:RejectDefinition(definition, "NODE_ID_MISSING")
+		end
+		local nodeType = definition.NodeType
+		if nodeType ~= "BATTLE" and nodeType ~= "BOSS" and nodeType ~= "SHOP"
+			and nodeType ~= "EVENT" and nodeType ~= "REST" then
+			return self:RejectDefinition(definition, "INVALID_NODE_TYPE")
+		end
+		if (nodeType == "BATTLE" or nodeType == "BOSS")
+			and (definition.StageId == nil or definition.StageId == "") then
+			return self:RejectDefinition(definition, "BATTLE_STAGE_ID_MISSING")
+		end
+		if nodeType ~= "BATTLE" and nodeType ~= "BOSS"
+			and definition.StageId ~= nil and definition.StageId ~= "" then
+			return self:RejectDefinition(definition, "NON_BATTLE_STAGE_ID_NOT_EMPTY")
+		end
+		if definition.Enabled ~= true then
+			return self:RejectDefinition(definition, "NODE_DISABLED")
+		end
+		if definition.PositionX == nil or definition.PositionY == nil then
+			return self:RejectDefinition(definition, "INVALID_NODE_POSITION")
+		end
+
+		local seenNextNodeIds = {}
+		for nextNodeId in string.gmatch(definition.NextNodeIds or "", "([^|]+)") do
+			if nextNodeId == definition.NodeId then
+				return self:RejectDefinition(definition, "NEXT_NODE_SELF_REFERENCE")
+			end
+			if seenNextNodeIds[nextNodeId] == true then
+				return self:RejectDefinition(definition, "DUPLICATE_NEXT_NODE_ID")
+			end
+			seenNextNodeIds[nextNodeId] = true
+		end
+		definition.Success = true
+		definition.Reason = "OK"
+		return definition
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RejectDefinition(table definition, string detailReason)
+		-- Normalizes one node validation failure for all callers.
+		definition.Success = false
+		definition.Reason = "CONTENT_VALIDATION_FAILED"
+		definition.DetailReason = detailReason
+		log_error("[NodeDefinition] rejected graph=" .. (definition.NodeGraphId or "") .. " node=" .. (definition.NodeId or "") .. " reason=" .. detailReason)
+		return definition
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetPrototypeCompatibilityDefinition(string nodeGraphId, string nodeId)
+		-- Keeps the retired prototype rows available only when fallback is explicitly re-enabled.
+		if self.AllowPrototypeCompatibilityFallback == false or nodeGraphId ~= "prototype_run" then
+			return { Success = false, Reason = "NODE_DEFINITION_NOT_FOUND" }
+		end
+		if nodeId == "stage01_battle" then
+			return {
+				Success = true,
+				Reason = "OK",
+				SchemaVersion = 1,
+				NodeGraphId = "prototype_run",
+				NodeId = "stage01_battle",
+				NodeType = "BATTLE",
+				StageId = "stage01",
+				IsStartNode = true,
+				NextNodeIds = "shop_after_stage01",
+				PositionX = 0,
+				PositionY = 0,
+				Enabled = true,
+				Source = "COMPATIBILITY_FALLBACK"
+			}
+		end
+		if nodeId == "shop_after_stage01" then
+			return {
+				Success = true,
+				Reason = "OK",
+				SchemaVersion = 1,
+				NodeGraphId = "prototype_run",
+				NodeId = "shop_after_stage01",
+				NodeType = "SHOP",
+				StageId = "",
+				IsStartNode = false,
+				NextNodeIds = "",
+				PositionX = 240,
+				PositionY = 0,
+				Enabled = true,
+				Source = "COMPATIBILITY_FALLBACK"
+			}
+		end
+		return { Success = false, Reason = "NODE_DEFINITION_NOT_FOUND" }
+	end
+
+	method boolean ParseBooleanCell(any cellValue)
+		-- Converts Dataset string booleans using the shared accepted spellings.
+		if cellValue == true then
+			return true
+		end
+		if cellValue == nil or cellValue == false then
+			return false
+		end
+		local normalized = string.lower(tostring(cellValue))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+end
