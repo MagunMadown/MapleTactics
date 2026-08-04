@@ -1,0 +1,441 @@
+@Logic
+script LobbyCharacterSelectionLogic
+
+	property string JobDataSetName = "JobDefinitions"
+	property string PopupRootPath = "/ui/CharacterSelectionUI/Popup"
+	property string CharacterNamePath = "/ui/CharacterSelectionUI/Popup/Window/CharacterName"
+	property string DescriptionPath = "/ui/CharacterSelectionUI/Popup/Window/Description"
+	property string StatusPath = "/ui/CharacterSelectionUI/Popup/Window/Status"
+	property string ConfirmButtonPath = "/ui/CharacterSelectionUI/Popup/Window/BtnConfirm"
+	property string CloseButtonPath = "/ui/CharacterSelectionUI/Popup/Window/BtnClose"
+	property string Card1Path = "/ui/CharacterSelectionUI/Popup/Window/Card1"
+	property string Card2Path = "/ui/CharacterSelectionUI/Popup/Window/Card2"
+	property string Card3Path = "/ui/CharacterSelectionUI/Popup/Window/Card3"
+	property string Card4Path = "/ui/CharacterSelectionUI/Popup/Window/Card4"
+	property string InteractionZonePath = "/maps/loby/Lobby_2F/FutureZones/CharacterSelectZone"
+
+	property Entity PopupRoot = nil
+	property TextGUIRendererComponent CharacterNameText = nil
+	property TextGUIRendererComponent DescriptionText = nil
+	property TextGUIRendererComponent StatusText = nil
+	property ButtonComponent ConfirmButton = nil
+	property ButtonComponent CloseButton = nil
+	property ButtonComponent Card1Button = nil
+	property ButtonComponent Card2Button = nil
+	property ButtonComponent Card3Button = nil
+	property ButtonComponent Card4Button = nil
+	property any ConfirmClickHandler = nil
+	property any CloseClickHandler = nil
+	property any Card1ClickHandler = nil
+	property any Card2ClickHandler = nil
+	property any Card3ClickHandler = nil
+	property any Card4ClickHandler = nil
+	property any AvailableCharacters = nil
+	property boolean IsUiConnected = false
+	property boolean IsPopupOpen = false
+	property boolean IsApplyPending = false
+	property string CandidateCharacterId = ""
+	property string AppliedCharacterId = ""
+	property integer RequestId = 0
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self.AvailableCharacters = {}
+		self:EnsureUiConnection()
+		self:SetPopupEnabled(false)
+		log("[LobbyCharacterSelect] ready dataset=" .. self.JobDataSetName)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		self:DisconnectUiEvents()
+		self.IsPopupOpen = false
+		self.IsApplyPending = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean OpenPopup()
+		if self.IsPopupOpen then
+			log("[LobbyCharacterSelect] open ignored reason=ALREADY_OPEN")
+			return false
+		end
+		if self:EnsureUiConnection() == false then
+			log_error("[LobbyCharacterSelect] open failed reason=UI_BINDING_MISSING")
+			return false
+		end
+
+		self:LoadAvailableCharacters()
+		self.AppliedCharacterId = self:GetCurrentAppliedCharacterId()
+		if self:IsAvailableCharacter(self.AppliedCharacterId) then
+			self.CandidateCharacterId = self.AppliedCharacterId
+		else
+			self.CandidateCharacterId = ""
+		end
+		self.IsApplyPending = false
+		self.IsPopupOpen = true
+		self:SetPopupEnabled(true)
+		self:SetStatus("")
+		self:RefreshView()
+		log("[LobbyCharacterSelect] opened available=" .. #self.AvailableCharacters .. " applied=" .. self.AppliedCharacterId)
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClosePopup(boolean selectionApplied)
+		if self.IsPopupOpen == false then
+			return
+		end
+		self.IsPopupOpen = false
+		self.IsApplyPending = false
+		self.CandidateCharacterId = ""
+		self:SetPopupEnabled(false)
+		self:RestoreInteractionPrompt()
+		log("[LobbyCharacterSelect] closed applied=" .. tostring(selectionApplied) .. " current=" .. self.AppliedCharacterId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsOpen()
+		return self.IsPopupOpen
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCard1Clicked()
+		self:SelectCard(1)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCard2Clicked()
+		self:SelectCard(2)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCard3Clicked()
+		self:SelectCard(3)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCard4Clicked()
+		self:SelectCard(4)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCloseClicked()
+		if self.IsApplyPending then
+			return
+		end
+		self:ClosePopup(false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnConfirmClicked()
+		if self.IsPopupOpen == false or self.IsApplyPending then
+			return
+		end
+		if self:IsAvailableCharacter(self.CandidateCharacterId) == false then
+			self:SetStatus("사용 가능한 캐릭터를 선택하세요.")
+			self:RefreshView()
+			return
+		end
+
+		self.IsApplyPending = true
+		self.RequestId = self.RequestId + 1
+		self:SetStatus("선택을 적용하는 중입니다...")
+		self:RefreshView()
+		log("[LobbyCharacterSelect] apply requested id=" .. self.CandidateCharacterId .. " request=" .. self.RequestId)
+		self:RequestApplyCharacter(self.CandidateCharacterId, self.RequestId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectCard(integer cardIndex)
+		if self.IsPopupOpen == false or self.IsApplyPending then
+			return
+		end
+		if cardIndex < 1 or cardIndex > #self.AvailableCharacters then
+			return
+		end
+		local character = self.AvailableCharacters[cardIndex]
+		if character == nil or character.Id == nil or character.Id == "" then
+			return
+		end
+		self.CandidateCharacterId = character.Id
+		self:SetStatus("")
+		self:RefreshView()
+		log("[LobbyCharacterSelect] card selected id=" .. character.Id)
+	end
+
+	@ExecSpace("Server")
+	method void RequestApplyCharacter(string characterId, integer requestId)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if isvalid(player) == false or player.PlayerComponent == nil then
+			self:NotifyApplyResult(senderUserId, requestId, false, "PLAYER_UNAVAILABLE", characterId)
+			return
+		end
+
+		local validation = _ContentValidatorLogic:ValidateJobById(characterId)
+		if validation == nil or validation.Success == false then
+			local reason = validation == nil and "VALIDATION_UNAVAILABLE" or validation.Reason
+			log_warning("[LobbyCharacterSelect] apply rejected user=" .. senderUserId .. " id=" .. characterId .. " reason=" .. reason)
+			self:NotifyApplyResult(senderUserId, requestId, false, reason, characterId)
+			return
+		end
+
+		local result = _RunManagerLogic:ApplyJobSelection(player, characterId)
+		if result == nil or result.Success == false then
+			local reason = result == nil and "APPLY_RESULT_MISSING" or result.Reason
+			log_warning("[LobbyCharacterSelect] apply failed user=" .. senderUserId .. " id=" .. characterId .. " reason=" .. reason)
+			self:NotifyApplyResult(senderUserId, requestId, false, reason, characterId)
+			return
+		end
+
+		log("[LobbyCharacterSelect] apply success user=" .. senderUserId .. " id=" .. characterId .. " player=" .. player.Name)
+		self:NotifyApplyResult(senderUserId, requestId, true, "OK", characterId)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyApplyResult(string targetUserId, integer requestId, boolean success, string reason, string characterId)
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.PlayerComponent == nil or player.PlayerComponent.UserId ~= targetUserId then
+			return
+		end
+		if self.IsPopupOpen == false or self.IsApplyPending == false or requestId ~= self.RequestId then
+			return
+		end
+
+		self.IsApplyPending = false
+		if success then
+			self.AppliedCharacterId = characterId
+			self:SetStatus("선택이 적용되었습니다.")
+			self:ClosePopup(true)
+			return
+		end
+
+		self:SetStatus("선택 적용 실패: " .. reason)
+		self:RefreshView()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void LoadAvailableCharacters()
+		self.AvailableCharacters = {}
+		local dataSet = _DataService:GetTable(self.JobDataSetName)
+		if dataSet == nil then
+			self:SetStatus("캐릭터 데이터가 없습니다.")
+			log_error("[LobbyCharacterSelect] dataset missing name=" .. self.JobDataSetName)
+			return
+		end
+
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if self:ParseBoolean(dataSet:GetCell(rowIndex, "Enabled")) then
+				local characterId = dataSet:GetCell(rowIndex, "JobId") or ""
+				local displayName = dataSet:GetCell(rowIndex, "DisplayName") or characterId
+				if characterId ~= "" then
+					table.insert(self.AvailableCharacters, {
+						Id = characterId,
+						Name = displayName,
+						Description = dataSet:GetCell(rowIndex, "JobTags") or ""
+					})
+				end
+			end
+		end
+		log("[LobbyCharacterSelect] dataset loaded count=" .. #self.AvailableCharacters)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshView()
+		if self.IsPopupOpen == false then
+			return
+		end
+		self:RefreshCard(1, self.Card1Button)
+		self:RefreshCard(2, self.Card2Button)
+		self:RefreshCard(3, self.Card3Button)
+		self:RefreshCard(4, self.Card4Button)
+
+		local selected = self:GetAvailableCharacter(self.CandidateCharacterId)
+		if selected == nil then
+			self.CharacterNameText.Text = "캐릭터를 선택하세요"
+			self.DescriptionText.Text = ""
+		else
+			self.CharacterNameText.Text = selected.Name
+			self.DescriptionText.Text = selected.Description
+		end
+
+		local canConfirm = selected ~= nil and self.IsApplyPending == false
+		self.ConfirmButton.Enable = canConfirm
+		if self.ConfirmButton.Entity.SpriteGUIRendererComponent ~= nil then
+			if canConfirm then
+				self.ConfirmButton.Entity.SpriteGUIRendererComponent.Color = Color(0.20, 0.55, 0.32, 1.00)
+			else
+				self.ConfirmButton.Entity.SpriteGUIRendererComponent.Color = Color(0.24, 0.24, 0.24, 0.75)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshCard(integer cardIndex, ButtonComponent cardButton)
+		if cardButton == nil or isvalid(cardButton.Entity) == false then
+			return
+		end
+		local character = nil
+		if cardIndex <= #self.AvailableCharacters then
+			character = self.AvailableCharacters[cardIndex]
+		end
+		if character == nil then
+			cardButton.Entity:SetEnable(false)
+			return
+		end
+
+		cardButton.Entity:SetEnable(true)
+		cardButton.Enable = self.IsApplyPending == false
+		if cardButton.Entity.TextGUIRendererComponent ~= nil then
+			cardButton.Entity.TextGUIRendererComponent.Text = character.Name
+		end
+		if cardButton.Entity.SpriteGUIRendererComponent ~= nil then
+			if character.Id == self.CandidateCharacterId then
+				cardButton.Entity.SpriteGUIRendererComponent.Color = Color(0.22, 0.48, 0.82, 1.00)
+			else
+				cardButton.Entity.SpriteGUIRendererComponent.Color = Color(0.13, 0.16, 0.22, 0.96)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureUiConnection()
+		if self.IsUiConnected then
+			return true
+		end
+
+		self.PopupRoot = _EntityService:GetEntityByPath(self.PopupRootPath)
+		local nameEntity = _EntityService:GetEntityByPath(self.CharacterNamePath)
+		local descriptionEntity = _EntityService:GetEntityByPath(self.DescriptionPath)
+		local statusEntity = _EntityService:GetEntityByPath(self.StatusPath)
+		local confirmEntity = _EntityService:GetEntityByPath(self.ConfirmButtonPath)
+		local closeEntity = _EntityService:GetEntityByPath(self.CloseButtonPath)
+		local card1Entity = _EntityService:GetEntityByPath(self.Card1Path)
+		local card2Entity = _EntityService:GetEntityByPath(self.Card2Path)
+		local card3Entity = _EntityService:GetEntityByPath(self.Card3Path)
+		local card4Entity = _EntityService:GetEntityByPath(self.Card4Path)
+
+		if isvalid(self.PopupRoot) == false or isvalid(nameEntity) == false or isvalid(descriptionEntity) == false
+			or isvalid(statusEntity) == false or isvalid(confirmEntity) == false or isvalid(closeEntity) == false
+			or isvalid(card1Entity) == false or isvalid(card2Entity) == false or isvalid(card3Entity) == false or isvalid(card4Entity) == false then
+			return false
+		end
+
+		self.CharacterNameText = nameEntity.TextGUIRendererComponent
+		self.DescriptionText = descriptionEntity.TextGUIRendererComponent
+		self.StatusText = statusEntity.TextGUIRendererComponent
+		self.ConfirmButton = confirmEntity.ButtonComponent
+		self.CloseButton = closeEntity.ButtonComponent
+		self.Card1Button = card1Entity.ButtonComponent
+		self.Card2Button = card2Entity.ButtonComponent
+		self.Card3Button = card3Entity.ButtonComponent
+		self.Card4Button = card4Entity.ButtonComponent
+
+		if self.CharacterNameText == nil or self.DescriptionText == nil or self.StatusText == nil
+			or self.ConfirmButton == nil or self.CloseButton == nil or self.Card1Button == nil
+			or self.Card2Button == nil or self.Card3Button == nil or self.Card4Button == nil then
+			return false
+		end
+
+		self.Card1ClickHandler = card1Entity:ConnectEvent(ButtonClickEvent, self.OnCard1Clicked)
+		self.Card2ClickHandler = card2Entity:ConnectEvent(ButtonClickEvent, self.OnCard2Clicked)
+		self.Card3ClickHandler = card3Entity:ConnectEvent(ButtonClickEvent, self.OnCard3Clicked)
+		self.Card4ClickHandler = card4Entity:ConnectEvent(ButtonClickEvent, self.OnCard4Clicked)
+		self.ConfirmClickHandler = confirmEntity:ConnectEvent(ButtonClickEvent, self.OnConfirmClicked)
+		self.CloseClickHandler = closeEntity:ConnectEvent(ButtonClickEvent, self.OnCloseClicked)
+		self.IsUiConnected = true
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DisconnectUiEvents()
+		if self.IsUiConnected == false then
+			return
+		end
+		self:DisconnectButtonEvent(self.Card1Button, self.Card1ClickHandler)
+		self:DisconnectButtonEvent(self.Card2Button, self.Card2ClickHandler)
+		self:DisconnectButtonEvent(self.Card3Button, self.Card3ClickHandler)
+		self:DisconnectButtonEvent(self.Card4Button, self.Card4ClickHandler)
+		self:DisconnectButtonEvent(self.ConfirmButton, self.ConfirmClickHandler)
+		self:DisconnectButtonEvent(self.CloseButton, self.CloseClickHandler)
+		self.Card1ClickHandler = nil
+		self.Card2ClickHandler = nil
+		self.Card3ClickHandler = nil
+		self.Card4ClickHandler = nil
+		self.ConfirmClickHandler = nil
+		self.CloseClickHandler = nil
+		self.IsUiConnected = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DisconnectButtonEvent(ButtonComponent button, any handlerId)
+		if button ~= nil and isvalid(button.Entity) and handlerId ~= nil then
+			button.Entity:DisconnectEvent(ButtonClickEvent, handlerId)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetPopupEnabled(boolean enabled)
+		if isvalid(self.PopupRoot) then
+			self.PopupRoot:SetEnable(enabled)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetStatus(string message)
+		if self.StatusText ~= nil then
+			self.StatusText.Text = message or ""
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetCurrentAppliedCharacterId()
+		local player = _UserService.LocalPlayer
+		if isvalid(player) then
+			local runState = player:GetComponent("script.PlayerRunStateComponent")
+			if runState ~= nil and runState.SelectedJobId ~= "" then
+				return runState.SelectedJobId
+			end
+		end
+		return self.AppliedCharacterId
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetAvailableCharacter(string characterId)
+		if characterId == nil or characterId == "" then
+			return nil
+		end
+		for _, character in ipairs(self.AvailableCharacters) do
+			if character.Id == characterId then
+				return character
+			end
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsAvailableCharacter(string characterId)
+		return self:GetAvailableCharacter(characterId) ~= nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ParseBoolean(any value)
+		if value == true then
+			return true
+		end
+		local normalized = string.lower(tostring(value or ""))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreInteractionPrompt()
+		local zone = _EntityService:GetEntityByPath(self.InteractionZonePath)
+		if isvalid(zone) == false then
+			return
+		end
+		local interaction = zone:GetComponent("script.LobbyInteractionComponent")
+		if interaction ~= nil and interaction.IsPlayerInRange then
+			interaction:ShowPrompt()
+		end
+	end
+
+end

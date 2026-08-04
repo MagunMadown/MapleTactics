@@ -1,0 +1,187 @@
+@Component
+script LobbyInteractionComponent extends Component
+
+	property string InteractionId = ""
+	property string InteractionPromptText = "Interact"
+	property string InteractionKeyLabel = "E"
+	property string TestMessage = "Interaction triggered."
+	property number InteractionRangeX = 1.5
+	property number InteractionRangeY = 1.5
+	property boolean IsPlayerInRange = false
+	property string PromptRootPath = "/ui/DefaultGroup/LobbyInteractionPrompt"
+	property string PromptTextPath = "/ui/DefaultGroup/LobbyInteractionPrompt/PromptText"
+	property Entity InteractionPromptRoot = nil
+	property TextGUIRendererComponent PromptTextRenderer = nil
+	property integer MessageTimerId = 0
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleInteractionKeyDown(KeyDownEvent event)
+		-- Routes one E key press to the active lobby interaction zone.
+		if event.key ~= KeyboardKey.E or self.IsPlayerInRange == false then
+			return
+		end
+
+		self:OnInteract()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Initializes the reusable distance-based lobby interaction in a hidden state.
+		self.IsPlayerInRange = false
+		self:ResolvePromptBinding()
+		self:HidePrompt()
+		log("[LobbyInteraction] ready id=" .. self.InteractionId .. " key=" .. self.InteractionKeyLabel)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Detects local-player entry and exit without requiring a native TriggerComponent.
+		local localPlayer = _UserService.LocalPlayer
+		if isvalid(localPlayer) == false or localPlayer.TransformComponent == nil or self.Entity.TransformComponent == nil then
+			if self.IsPlayerInRange then
+				self.IsPlayerInRange = false
+				self:HidePrompt()
+			end
+			return
+		end
+
+		if localPlayer.CurrentMap ~= self.Entity.CurrentMap then
+			if self.IsPlayerInRange then
+				self:OnPlayerExit(localPlayer)
+			end
+			return
+		end
+
+		local playerPosition = localPlayer.TransformComponent.WorldPosition
+		local zonePosition = self.Entity.TransformComponent.WorldPosition
+		local insideRange = math.abs(playerPosition.x - zonePosition.x) <= self.InteractionRangeX
+			and math.abs(playerPosition.y - zonePosition.y) <= self.InteractionRangeY
+
+		if insideRange and self.IsPlayerInRange == false then
+			self:OnPlayerEnter(localPlayer)
+		elseif insideRange == false and self.IsPlayerInRange then
+			self:OnPlayerExit(localPlayer)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Clears the temporary message timer and hides the prompt when the zone unloads.
+		if self.MessageTimerId ~= 0 then
+			_TimerService:ClearTimer(self.MessageTimerId)
+			self.MessageTimerId = 0
+		end
+
+		self.IsPlayerInRange = false
+		self:HidePrompt()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnPlayerEnter(Entity playerEntity)
+		-- Records local-player overlap and shows the configured interaction prompt.
+		if isvalid(playerEntity) == false or playerEntity ~= _UserService.LocalPlayer then
+			return
+		end
+
+		self.IsPlayerInRange = true
+		self:ShowPrompt()
+		log("[LobbyInteraction] enter id=" .. self.InteractionId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnPlayerExit(Entity playerEntity)
+		-- Clears local-player overlap and hides any prompt or temporary message.
+		if isvalid(playerEntity) == false or playerEntity ~= _UserService.LocalPlayer then
+			return
+		end
+
+		self.IsPlayerInRange = false
+		if self.InteractionId == "CharacterSelect" and _LobbyCharacterSelectionLogic:IsOpen() then
+			_LobbyCharacterSelectionLogic:ClosePopup(false)
+		end
+		if self.MessageTimerId ~= 0 then
+			_TimerService:ClearTimer(self.MessageTimerId)
+			self.MessageTimerId = 0
+		end
+
+		self:HidePrompt()
+		log("[LobbyInteraction] exit id=" .. self.InteractionId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnInteract()
+		-- Routes configured lobby interactions while retaining the temporary fallback action.
+		if self.IsPlayerInRange == false then
+			return
+		end
+		if self.InteractionId == "CharacterSelect" then
+			self:HidePrompt()
+			local opened = _LobbyCharacterSelectionLogic:OpenPopup()
+			if opened == false and _LobbyCharacterSelectionLogic:IsOpen() == false then
+				self:ShowPrompt()
+			end
+			return
+		end
+
+		log(self.TestMessage)
+		if self:ResolvePromptBinding() then
+			self.PromptTextRenderer.Text = self.TestMessage
+			self.InteractionPromptRoot:SetEnable(true)
+		end
+
+		if self.MessageTimerId ~= 0 then
+			_TimerService:ClearTimer(self.MessageTimerId)
+		end
+
+		local restorePrompt = function()
+			self.MessageTimerId = 0
+			if self.IsPlayerInRange then
+				self:ShowPrompt()
+			else
+				self:HidePrompt()
+			end
+		end
+		self.MessageTimerId = _TimerService:SetTimerOnce(restorePrompt, 1.5)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowPrompt()
+		-- Displays the interaction key and configured label for this zone.
+		if self:ResolvePromptBinding() == false then
+			log_warning("[LobbyInteraction] prompt binding missing id=" .. self.InteractionId)
+			return
+		end
+
+		self.PromptTextRenderer.Text = "[" .. self.InteractionKeyLabel .. "] " .. self.InteractionPromptText
+		self.InteractionPromptRoot:SetEnable(true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HidePrompt()
+		-- Hides the shared prompt without changing the zone range state.
+		if self:ResolvePromptBinding() then
+			self.InteractionPromptRoot:SetEnable(false)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ResolvePromptBinding()
+		-- Resolves client-only UI entities by path instead of a cross-hierarchy serialized reference.
+		if isvalid(self.InteractionPromptRoot) and self.PromptTextRenderer ~= nil then
+			return true
+		end
+
+		local promptRoot = _EntityService:GetEntityByPath(self.PromptRootPath)
+		local promptTextEntity = _EntityService:GetEntityByPath(self.PromptTextPath)
+		if isvalid(promptRoot) then
+			self.InteractionPromptRoot = promptRoot
+		end
+		if isvalid(promptTextEntity) and promptTextEntity.TextGUIRendererComponent ~= nil then
+			self.PromptTextRenderer = promptTextEntity.TextGUIRendererComponent
+		end
+
+		return isvalid(self.InteractionPromptRoot) and self.PromptTextRenderer ~= nil
+	end
+
+end
