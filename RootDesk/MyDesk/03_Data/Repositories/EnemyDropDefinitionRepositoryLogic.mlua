@@ -1,0 +1,271 @@
+@Logic
+script EnemyDropDefinitionRepositoryLogic
+
+	property string DataSetName = "EnemyDropDefinitions"
+	property integer SupportedSchemaVersion = 1
+	property boolean AllowPrototypeCompatibilityFallback = false
+
+	@ExecSpace("ServerOnly")
+	method table GetAllEntries()
+		-- Repository owns loading and row invariants; collection/reference rules belong to EnemyDropContentValidatorLogic.
+		local result = { Success = false, Reason = "DROP_DATASET_MISSING", DetailReason = "", Entries = {}, Source = "" }
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		if dataSet == nil then
+			return result
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local entry = self:ConvertRow(dataSet, rowIndex)
+			local validation = self:ValidateEntry(entry)
+			if validation.Success == false then
+				result.Reason = validation.Reason
+				result.DetailReason = validation.DetailReason or validation.Reason
+				return result
+			end
+			if entry.Enabled == true then
+				table.insert(result.Entries, entry)
+			end
+		end
+		table.sort(result.Entries, function(left, right)
+			return left.DropEntryId < right.DropEntryId
+		end)
+		result.Success = true
+		result.Reason = "OK"
+		result.Source = "DATASET"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetDropEntries(string enemyDefinitionId, string triggerType)
+		local result = {
+			Success = false,
+			Reason = "DROP_DEFINITION_NOT_FOUND",
+			EnemyDefinitionId = enemyDefinitionId or "",
+			TriggerType = triggerType or "",
+			Entries = {},
+			Source = ""
+		}
+		if enemyDefinitionId == nil or enemyDefinitionId == "" then
+			result.Reason = "INVALID_ENEMY_DEFINITION_ID"
+			return result
+		end
+		if self:IsValidTriggerType(triggerType) == false then
+			result.Reason = "INVALID_DROP_TRIGGER_TYPE"
+			return result
+		end
+
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		if dataSet ~= nil then
+			for rowIndex = 1, dataSet:GetRowCount() do
+				if dataSet:GetCell(rowIndex, "EnemyDefinitionId") == enemyDefinitionId
+					and dataSet:GetCell(rowIndex, "TriggerType") == triggerType then
+					local entry = self:ConvertRow(dataSet, rowIndex)
+					local validation = self:ValidateEntry(entry)
+					if validation.Success == false then
+						return {
+							Success = false,
+							Reason = "CONTENT_VALIDATION_FAILED",
+							DetailReason = validation.DetailReason,
+							EnemyDefinitionId = enemyDefinitionId,
+							TriggerType = triggerType,
+							Entries = {}
+						}
+					end
+					if entry.Enabled == true then
+						table.insert(result.Entries, entry)
+					end
+				end
+			end
+			if #result.Entries > 0 then
+				table.sort(result.Entries, function(left, right)
+					return left.DropEntryId < right.DropEntryId
+				end)
+				result.Success = true
+				result.Reason = "OK"
+				result.Source = "DATASET"
+				return result
+			end
+		end
+
+		local fallbackEntries = self:GetPrototypeCompatibilityEntries(enemyDefinitionId, triggerType)
+		if #fallbackEntries > 0 then
+			result.Success = true
+			result.Reason = "OK"
+			result.Entries = fallbackEntries
+			result.Source = "COMPATIBILITY_FALLBACK"
+			log("[EnemyDropData] compatibility fallback enemy=" .. enemyDefinitionId .. " trigger=" .. triggerType .. " entries=" .. #fallbackEntries)
+			return result
+		end
+
+		-- An enemy without a drop row is valid and simply produces no drop.
+		result.Success = true
+		result.Reason = "NO_DROP_ENTRIES"
+		result.Source = dataSet ~= nil and "DATASET" or "NONE"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveDrops(string enemyDefinitionId, string triggerType, integer runSeed, string stageId, integer waveIndex, string unitId, integer spawnOrder)
+		local definitions = self:GetDropEntries(enemyDefinitionId, triggerType)
+		local result = {
+			Success = definitions.Success,
+			Reason = definitions.Reason,
+			EnemyDefinitionId = enemyDefinitionId,
+			TriggerType = triggerType,
+			Drops = {},
+			Source = definitions.Source or ""
+		}
+		if definitions.Success == false then
+			return result
+		end
+
+		for _, entry in ipairs(definitions.Entries) do
+			local seedKey = tostring(math.max(0, runSeed))
+				.. ":" .. (stageId or "")
+				.. ":" .. tostring(math.max(0, waveIndex))
+				.. ":" .. tostring(math.max(0, spawnOrder))
+				.. ":" .. (unitId or "")
+				.. ":" .. entry.DropEntryId
+			local roll = self:ComputeStableRoll(seedKey, 1000)
+			if roll <= entry.ChancePermille then
+				local amount = entry.MinAmount
+				if entry.MaxAmount > entry.MinAmount then
+					amount = entry.MinAmount + self:ComputeStableRoll(seedKey .. ":amount", entry.MaxAmount - entry.MinAmount + 1) - 1
+				end
+				table.insert(result.Drops, {
+					DropEntryId = entry.DropEntryId,
+					DropType = entry.DropType,
+					DropRefId = entry.DropRefId,
+					Amount = amount,
+					Roll = roll,
+					ChancePermille = entry.ChancePermille
+				})
+				log("[EnemyDropRoll] success enemy=" .. enemyDefinitionId .. " unit=" .. unitId .. " entry=" .. entry.DropEntryId .. " roll=" .. roll .. "/" .. entry.ChancePermille .. " reward=" .. entry.DropType .. ":" .. entry.DropRefId .. " amount=" .. amount)
+			else
+				log("[EnemyDropRoll] miss enemy=" .. enemyDefinitionId .. " unit=" .. unitId .. " entry=" .. entry.DropEntryId .. " roll=" .. roll .. "/" .. entry.ChancePermille)
+			end
+		end
+		result.Reason = #result.Drops > 0 and "DROP_ROLLED" or "NO_DROP_ROLLED"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConvertRow(any dataSet, integer rowIndex)
+		return {
+			Success = true,
+			Reason = "OK",
+			SchemaVersion = math.floor(tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")) or 1),
+			DropEntryId = dataSet:GetCell(rowIndex, "DropEntryId") or "",
+			EnemyDefinitionId = dataSet:GetCell(rowIndex, "EnemyDefinitionId") or "",
+			TriggerType = dataSet:GetCell(rowIndex, "TriggerType") or "",
+			DropType = dataSet:GetCell(rowIndex, "DropType") or "",
+			DropRefId = dataSet:GetCell(rowIndex, "DropRefId") or "",
+			ChancePermille = math.floor(tonumber(dataSet:GetCell(rowIndex, "ChancePermille")) or -1),
+			MinAmount = math.floor(tonumber(dataSet:GetCell(rowIndex, "MinAmount")) or 0),
+			MaxAmount = math.floor(tonumber(dataSet:GetCell(rowIndex, "MaxAmount")) or 0),
+			Enabled = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")),
+			RowIndex = rowIndex,
+			Source = "DATASET"
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateEntry(table entry)
+		if entry.SchemaVersion ~= self.SupportedSchemaVersion then
+			return self:RejectEntry(entry, "UNSUPPORTED_DROP_SCHEMA")
+		end
+		if entry.DropEntryId == nil or entry.DropEntryId == "" then
+			return self:RejectEntry(entry, "DROP_ENTRY_ID_MISSING")
+		end
+		if entry.EnemyDefinitionId == nil or entry.EnemyDefinitionId == "" then
+			return self:RejectEntry(entry, "DROP_ENEMY_REFERENCE_MISSING")
+		end
+		if self:IsValidTriggerType(entry.TriggerType) == false then
+			return self:RejectEntry(entry, "INVALID_DROP_TRIGGER_TYPE")
+		end
+		if entry.DropType ~= "CURRENCY" and entry.DropType ~= "CONSUMABLE" then
+			return self:RejectEntry(entry, "INVALID_DROP_TYPE")
+		end
+		if entry.DropRefId == nil or entry.DropRefId == "" then
+			return self:RejectEntry(entry, "DROP_REFERENCE_MISSING")
+		end
+		if entry.ChancePermille < 0 or entry.ChancePermille > 1000 then
+			return self:RejectEntry(entry, "INVALID_DROP_CHANCE")
+		end
+		if entry.MinAmount <= 0 or entry.MaxAmount < entry.MinAmount then
+			return self:RejectEntry(entry, "INVALID_DROP_AMOUNT_RANGE")
+		end
+		entry.Success = true
+		entry.Reason = "OK"
+		return entry
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RejectEntry(table entry, string detailReason)
+		entry.Success = false
+		entry.Reason = "CONTENT_VALIDATION_FAILED"
+		entry.DetailReason = detailReason
+		log_error("[EnemyDropData] rejected entry=" .. (entry.DropEntryId or "") .. " enemy=" .. (entry.EnemyDefinitionId or "") .. " reason=" .. detailReason)
+		return entry
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetPrototypeCompatibilityEntries(string enemyDefinitionId, string triggerType)
+		local entries = {}
+		if self.AllowPrototypeCompatibilityFallback == false or triggerType ~= "ANY_KILL" then
+			return entries
+		end
+		if enemyDefinitionId == "early_mushroom" then
+			table.insert(entries, self:BuildCompatibilityEntry("early_gold", enemyDefinitionId, "CURRENCY", "gold", 1000, 1, 1))
+			table.insert(entries, self:BuildCompatibilityEntry("early_potion", enemyDefinitionId, "CONSUMABLE", "potion_hp_small", 250, 1, 1))
+		elseif enemyDefinitionId == "guard_mushroom" then
+			table.insert(entries, self:BuildCompatibilityEntry("guard_gold", enemyDefinitionId, "CURRENCY", "gold", 1000, 1, 2))
+			table.insert(entries, self:BuildCompatibilityEntry("guard_potion", enemyDefinitionId, "CONSUMABLE", "potion_hp_small", 150, 1, 1))
+		end
+		return entries
+	end
+
+	method table BuildCompatibilityEntry(string dropEntryId, string enemyDefinitionId, string dropType, string dropRefId, integer chancePermille, integer minAmount, integer maxAmount)
+		return {
+			Success = true,
+			Reason = "OK",
+			SchemaVersion = 1,
+			DropEntryId = dropEntryId,
+			EnemyDefinitionId = enemyDefinitionId,
+			TriggerType = "ANY_KILL",
+			DropType = dropType,
+			DropRefId = dropRefId,
+			ChancePermille = chancePermille,
+			MinAmount = minAmount,
+			MaxAmount = maxAmount,
+			Enabled = true,
+			Source = "COMPATIBILITY_FALLBACK"
+		}
+	end
+
+	method integer ComputeStableRoll(string seedKey, integer modulus)
+		local safeModulus = math.max(1, modulus)
+		local hash = 17
+		for index = 1, string.len(seedKey) do
+			hash = (hash * 31 + string.byte(seedKey, index)) % 2147483647
+		end
+		return (hash % safeModulus) + 1
+	end
+
+	method boolean ParseBooleanCell(any cellValue)
+		if cellValue == true then
+			return true
+		end
+		if cellValue == nil or cellValue == false then
+			return false
+		end
+		local normalized = string.lower(tostring(cellValue))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+	method boolean IsValidTriggerType(string triggerType)
+		return triggerType == "ANY_KILL"
+			or triggerType == "COMBO_KILL"
+			or triggerType == "BOSS_KILL"
+	end
+
+end

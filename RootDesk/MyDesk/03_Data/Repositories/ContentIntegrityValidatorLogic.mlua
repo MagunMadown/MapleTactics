@@ -1,0 +1,206 @@
+@Logic
+script ContentIntegrityValidatorLogic
+
+	@ExecSpace("ServerOnly")
+	method table ValidateAll()
+		-- Cross-table audit only. Row rules remain owned by each domain validator.
+		local result = {
+			Success = false,
+			Reason = "CONTENT_INTEGRITY_FAILED",
+			CheckedStageCount = 0,
+			CheckedSkillCount = 0,
+			CheckedEffectStepCount = 0,
+			CheckedJobCount = 0,
+			CheckedAugmentCount = 0,
+			CheckedNodeGraphCount = 0,
+			CheckedEnemyPatternCount = 0,
+			CheckedStageRewardCount = 0,
+			CheckedShopCount = 0,
+			CheckedShopEntryCount = 0,
+			ErrorCount = 0,
+			Errors = {},
+			ErrorSnapshot = ""
+		}
+		local stageData = _DataService:GetTable(_StageDefinitionRepositoryLogic.DataSetName)
+		local skillData = _DataService:GetTable(_SkillDefinitionRepositoryLogic.SkillDataSetName)
+		local effectData = _DataService:GetTable(_SkillDefinitionRepositoryLogic.EffectStepDataSetName)
+		if stageData == nil then
+			self:AddError(result, "StageDefinitions", 0, "", "DATASET_NOT_FOUND")
+		else
+			self:ValidateStages(stageData, result)
+		end
+		if skillData == nil then
+			self:AddError(result, "SkillDefinitions", 0, "", "DATASET_NOT_FOUND")
+		end
+		if effectData == nil then
+			self:AddError(result, "SkillEffectSteps", 0, "", "DATASET_NOT_FOUND")
+		end
+		if skillData ~= nil and effectData ~= nil then
+			self:ValidateSkillsAndEffects(skillData, effectData, result)
+		end
+		self:ValidateRegisteredDomains(result)
+
+		result.ErrorCount = #result.Errors
+		result.ErrorSnapshot = self:SerializeErrors(result.Errors)
+		if result.ErrorCount == 0 then
+			result.Success = true
+			result.Reason = "OK"
+			log("[ContentIntegrity] valid stages=" .. result.CheckedStageCount .. " skills=" .. result.CheckedSkillCount .. " effectSteps=" .. result.CheckedEffectStepCount .. " jobs=" .. result.CheckedJobCount .. " augments=" .. result.CheckedAugmentCount .. " nodeGraphs=" .. result.CheckedNodeGraphCount .. " enemyPatterns=" .. result.CheckedEnemyPatternCount .. " stageRewards=" .. result.CheckedStageRewardCount .. " shops=" .. result.CheckedShopCount .. " shopEntries=" .. result.CheckedShopEntryCount)
+		else
+			log_error("[ContentIntegrity] rejected errors=" .. result.ErrorCount .. " details=" .. result.ErrorSnapshot)
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ValidateRegisteredDomains(table result)
+		self:ValidateDomainIds("JobDefinitions", "JobId", "JOB", result)
+		self:ValidateDomainIds("AugmentDefinitions", "AugmentId", "AUGMENT", result)
+		self:ValidateDomainIds("NodeDefinitions", "NodeGraphId", "NODE_GRAPH", result)
+		self:ValidateDomainIds("EnemyPatternSteps", "PatternId", "ENEMY_PATTERN", result)
+		local dropValidation = _ContentValidatorLogic:ValidateEnemyDrops()
+		if dropValidation.Success == false then
+			self:AddError(result, "EnemyDropDefinitions", 0, "", dropValidation.DetailReason or dropValidation.Reason)
+		end
+		local stageRewardValidation = _ContentValidatorLogic:ValidateStageRewards()
+		if stageRewardValidation.Success == false then
+			self:AddError(result, "StageRewardDefinitions", stageRewardValidation.RowIndex or 0, stageRewardValidation.StageRewardEntryId or "", stageRewardValidation.DetailReason or stageRewardValidation.Reason)
+		else
+			result.CheckedStageRewardCount = stageRewardValidation.ValidatedCount or 0
+		end
+		local shopValidation = _ContentValidatorLogic:ValidateShops()
+		if shopValidation.Success == false then
+			self:AddError(result, "ShopDefinitions", shopValidation.RowIndex or 0, shopValidation.ShopEntryId or shopValidation.ShopId or "", shopValidation.DetailReason or shopValidation.Reason)
+		else
+			result.CheckedShopCount = shopValidation.ValidatedShopCount or 0
+			result.CheckedShopEntryCount = shopValidation.ValidatedEntryCount or 0
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ValidateDomainIds(string dataSetName, string idColumn, string domainType, table result)
+		local dataSet = _DataService:GetTable(dataSetName)
+		if dataSet == nil then
+			self:AddError(result, dataSetName, 0, "", "DATASET_NOT_FOUND")
+			return
+		end
+		local seen = {}
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local contentId = dataSet:GetCell(rowIndex, idColumn) or ""
+			if contentId == "" then
+				self:AddError(result, dataSetName, rowIndex, contentId, "INVALID_CONTENT_ID")
+			elseif seen[contentId] ~= true then
+				seen[contentId] = true
+				local validation = nil
+				if domainType == "JOB" then
+					result.CheckedJobCount = result.CheckedJobCount + 1
+					validation = _ContentValidatorLogic:ValidateJobById(contentId)
+				elseif domainType == "AUGMENT" then
+					result.CheckedAugmentCount = result.CheckedAugmentCount + 1
+					validation = _ContentValidatorLogic:ValidateAugmentById(contentId)
+				elseif domainType == "NODE_GRAPH" then
+					result.CheckedNodeGraphCount = result.CheckedNodeGraphCount + 1
+					validation = _ContentValidatorLogic:ValidateNodeGraph(contentId)
+				elseif domainType == "ENEMY_PATTERN" then
+					result.CheckedEnemyPatternCount = result.CheckedEnemyPatternCount + 1
+					validation = _ContentValidatorLogic:ValidateEnemyPatternById(contentId)
+				end
+				if validation == nil then
+					self:AddError(result, dataSetName, rowIndex, contentId, "DOMAIN_VALIDATOR_NOT_REGISTERED")
+				elseif validation.Success == false then
+					self:AddError(result, dataSetName, rowIndex, contentId, validation.DetailReason or validation.Reason)
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ValidateStages(any dataSet, table result)
+		local seen = {}
+		for rowIndex = 1, dataSet:GetRowCount() do
+			result.CheckedStageCount = result.CheckedStageCount + 1
+			local stageId = dataSet:GetCell(rowIndex, "StageId") or ""
+			if stageId == "" then
+				self:AddError(result, "StageDefinitions", rowIndex, stageId, "INVALID_STAGE_ID")
+			elseif seen[stageId] == true then
+				self:AddError(result, "StageDefinitions", rowIndex, stageId, "DATA_DUPLICATE_STAGE_ID")
+			else
+				seen[stageId] = true
+				local validation = _ContentValidatorLogic:ValidateStageById(stageId)
+				if validation.Success == false then
+					self:AddError(result, "StageDefinitions", rowIndex, stageId, validation.DetailReason or validation.Reason)
+				end
+			end
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local stageId = dataSet:GetCell(rowIndex, "StageId") or ""
+			local nextStageId = dataSet:GetCell(rowIndex, "NextStageId") or ""
+			if nextStageId ~= "" and nextStageId ~= stageId and seen[nextStageId] ~= true then
+				self:AddError(result, "StageDefinitions", rowIndex, stageId, "NEXT_STAGE_NOT_FOUND:" .. nextStageId)
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ValidateSkillsAndEffects(any skillData, any effectData, table result)
+		local seenSkills = {}
+		local referencedEffectSets = {}
+		for rowIndex = 1, skillData:GetRowCount() do
+			result.CheckedSkillCount = result.CheckedSkillCount + 1
+			local skillId = skillData:GetCell(rowIndex, "SkillId") or ""
+			local effectSetId = skillData:GetCell(rowIndex, "EffectSetId") or ""
+			if effectSetId ~= "" then
+				referencedEffectSets[effectSetId] = true
+			end
+			if skillId == "" then
+				self:AddError(result, "SkillDefinitions", rowIndex, skillId, "INVALID_SKILL_ID")
+			elseif seenSkills[skillId] == true then
+				self:AddError(result, "SkillDefinitions", rowIndex, skillId, "DATA_DUPLICATE_SKILL_ID")
+			else
+				seenSkills[skillId] = true
+				local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+				if validation.Success == false then
+					self:AddError(result, "SkillDefinitions", rowIndex, skillId, validation.DetailReason or validation.Reason)
+				end
+			end
+		end
+
+		local seenStepKeys = {}
+		for rowIndex = 1, effectData:GetRowCount() do
+			result.CheckedEffectStepCount = result.CheckedEffectStepCount + 1
+			local effectSetId = effectData:GetCell(rowIndex, "EffectSetId") or ""
+			local stepIndex = math.floor(tonumber(effectData:GetCell(rowIndex, "StepIndex")) or 0)
+			local stepKey = effectSetId .. "#" .. tostring(stepIndex)
+			if effectSetId == "" then
+				self:AddError(result, "SkillEffectSteps", rowIndex, stepKey, "INVALID_EFFECT_SET_ID")
+			elseif referencedEffectSets[effectSetId] ~= true then
+				self:AddError(result, "SkillEffectSteps", rowIndex, stepKey, "ORPHAN_EFFECT_SET")
+			end
+			if stepIndex <= 0 then
+				self:AddError(result, "SkillEffectSteps", rowIndex, stepKey, "INVALID_EFFECT_STEP_INDEX")
+			elseif seenStepKeys[stepKey] == true then
+				self:AddError(result, "SkillEffectSteps", rowIndex, stepKey, "DUPLICATE_EFFECT_STEP_INDEX")
+			else
+				seenStepKeys[stepKey] = true
+			end
+		end
+	end
+
+	method void AddError(table result, string dataSetName, integer rowIndex, string contentId, string detailReason)
+		table.insert(result.Errors, {
+			DataSetName = dataSetName,
+			RowIndex = rowIndex,
+			ContentId = contentId or "",
+			DetailReason = detailReason or "UNKNOWN"
+		})
+	end
+
+	method string SerializeErrors(table errors)
+		local parts = {}
+		for _, item in ipairs(errors or {}) do
+			table.insert(parts, item.DataSetName .. "[" .. tostring(item.RowIndex) .. "]" .. item.ContentId .. "=" .. item.DetailReason)
+		end
+		return table.concat(parts, "|")
+	end
+
+end

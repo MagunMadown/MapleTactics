@@ -1,0 +1,114 @@
+@Logic
+script ContentReferenceResolverLogic
+
+	property any ReferenceSpecs = nil
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		self:InitializeReferenceSpecs()
+		log("[ContentReference] registry ready types=ENEMY_DEFINITION|STAGE_DEFINITION|RUN_CURRENCY|CONSUMABLE|SKILL")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void InitializeReferenceSpecs()
+		-- Registry entries are data descriptions. Validators depend on this abstraction, not concrete repositories.
+		self.ReferenceSpecs = {}
+		self:RegisterReferenceType("ENEMY_DEFINITION", "EnemyDefinitions", "EnemyDefinitionId", "", "", "")
+		self:RegisterReferenceType("STAGE_DEFINITION", "StageDefinitions", "StageId", "", "", "")
+		self:RegisterReferenceType("RUN_CURRENCY", "CurrencyDefinitions", "CurrencyId", "Enabled", "Category", "RUN_SCOPED")
+		self:RegisterReferenceType("CONSUMABLE", "ConsumableDefinitions", "ConsumableId", "Enabled", "", "")
+		self:RegisterReferenceType("SKILL", "SkillDefinitions", "SkillId", "", "", "")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RegisterReferenceType(string referenceType, string dataSetName, string keyColumn, string enabledColumn, string policyColumn, string allowedPolicyValues)
+		local result = { Success = false, Reason = "UNKNOWN", ReferenceType = referenceType }
+		if referenceType == nil or referenceType == "" or dataSetName == nil or dataSetName == "" or keyColumn == nil or keyColumn == "" then
+			result.Reason = "INVALID_REFERENCE_SPEC"
+			return result
+		end
+		if self.ReferenceSpecs == nil then
+			self.ReferenceSpecs = {}
+		end
+		self.ReferenceSpecs[referenceType] = {
+			DataSetName = dataSetName,
+			KeyColumn = keyColumn,
+			EnabledColumn = enabledColumn or "",
+			PolicyColumn = policyColumn or "",
+			AllowedPolicyValues = allowedPolicyValues or ""
+		}
+		result.Success = true
+		result.Reason = "REGISTERED"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveReference(string referenceType, string referenceId)
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN_REFERENCE",
+			ReferenceType = referenceType or "",
+			ReferenceId = referenceId or "",
+			DataSetName = "",
+			RowIndex = 0
+		}
+		if referenceType == nil or referenceType == "" or referenceId == nil or referenceId == "" then
+			result.Reason = "INVALID_REFERENCE_REQUEST"
+			return result
+		end
+		if self.ReferenceSpecs == nil then
+			self:InitializeReferenceSpecs()
+		end
+		local spec = self.ReferenceSpecs[referenceType]
+		if spec == nil then
+			result.Reason = "REFERENCE_TYPE_NOT_REGISTERED"
+			return result
+		end
+		result.DataSetName = spec.DataSetName
+
+		local dataSet = _DataService:GetTable(spec.DataSetName)
+		if dataSet == nil then
+			result.Reason = "REFERENCE_DATASET_MISSING"
+			return result
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, spec.KeyColumn) == referenceId then
+				if spec.EnabledColumn ~= "" and self:ParseBooleanCell(dataSet:GetCell(rowIndex, spec.EnabledColumn)) == false then
+					result.Reason = "REFERENCE_DISABLED"
+					result.RowIndex = rowIndex
+					return result
+				end
+				if spec.PolicyColumn ~= "" and spec.AllowedPolicyValues ~= "" then
+					local policyValue = dataSet:GetCell(rowIndex, spec.PolicyColumn) or ""
+					if self:ContainsPipeValue(spec.AllowedPolicyValues, policyValue) == false then
+						result.Reason = "REFERENCE_POLICY_NOT_ALLOWED"
+						result.RowIndex = rowIndex
+						return result
+					end
+				end
+				result.Success = true
+				result.Reason = "REFERENCE_RESOLVED"
+				result.RowIndex = rowIndex
+				return result
+			end
+		end
+		result.Reason = "REFERENCE_NOT_FOUND"
+		return result
+	end
+
+	method boolean ContainsPipeValue(string values, string target)
+		return string.find("|" .. values .. "|", "|" .. target .. "|", 1, true) ~= nil
+	end
+
+	method boolean ParseBooleanCell(any cellValue)
+		if cellValue == true then
+			return true
+		end
+		if cellValue == nil or cellValue == false then
+			return false
+		end
+		local normalized = string.lower(tostring(cellValue))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+end

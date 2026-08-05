@@ -1,0 +1,132 @@
+@Logic
+script SkillTargetResolverLogic
+
+	@ExecSpace("ServerOnly")
+	method table Resolve(any battleSession, string sourceUnitId, table definition)
+		-- Converts one skill's data-only targeting rule into an immutable impact-time target snapshot.
+		local result = {
+			Success = false,
+			Reason = "INVALID_TARGET_CONTEXT",
+			SkillId = definition ~= nil and definition.SkillId or "",
+			TargetingType = definition ~= nil and definition.TargetingType or "",
+			SourceUnitId = sourceUnitId or "",
+			PrimaryTargetUnitId = "",
+			TargetUnitIds = {},
+			TargetCellIndices = {},
+			TargetCellsByUnitId = {}
+		}
+		if battleSession == nil or definition == nil then
+			return result
+		end
+		if battleSession.BoardState == nil then
+			result.Reason = "BOARD_STATE_MISSING"
+			return result
+		end
+
+		local sourceEntity = battleSession:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		if sourceUnit.IsDead == true then
+			result.Reason = "SOURCE_DEAD"
+			return result
+		end
+
+		local facingDirection = sourceUnit.Facing == "Right" and 1 or -1
+		local offsets = self:BuildOffsets(definition.TargetingType, definition.Range, definition.TargetOffsets)
+		if offsets.Success == false then
+			result.Reason = offsets.Reason
+			return result
+		end
+
+		for _, offset in ipairs(offsets.Values) do
+			local targetCell = sourceUnit.CellIndex + facingDirection * offset
+			if battleSession:IsValidCell(targetCell) then
+				table.insert(result.TargetCellIndices, targetCell)
+				local targetEntity = battleSession.BoardState:FindAtCell(targetCell, sourceUnitId)
+				if isvalid(targetEntity) then
+					local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+					if targetUnit ~= nil and targetUnit.IsDead == false and targetUnit.Team ~= sourceUnit.Team then
+						table.insert(result.TargetUnitIds, targetUnit.UnitId)
+						result.TargetCellsByUnitId[targetUnit.UnitId] = targetCell
+						if result.PrimaryTargetUnitId == "" then
+							result.PrimaryTargetUnitId = targetUnit.UnitId
+						end
+						if definition.TargetingType == "FIRST_ENEMY_FORWARD" then
+							break
+						end
+					end
+				end
+			end
+		end
+
+		result.Success = true
+		result.Reason = #result.TargetUnitIds > 0 and "TARGETS_RESOLVED" or "NO_TARGET"
+		log("[SkillTarget] resolved skill=" .. result.SkillId .. " type=" .. result.TargetingType .. " source=" .. result.SourceUnitId .. " cells=" .. self:SerializeIntegers(result.TargetCellIndices) .. " targets=" .. self:SerializeStrings(result.TargetUnitIds) .. " reason=" .. result.Reason)
+		return result
+	end
+
+	method table BuildOffsets(string targetingType, integer range, string serializedOffsets)
+		local result = { Success = true, Reason = "OK", Values = {} }
+		if targetingType == "FRONT_CELL" then
+			result.Values = { 1 }
+			return result
+		elseif targetingType == "FIRST_ENEMY_FORWARD" then
+			for offset = 1, math.max(1, range) do
+				table.insert(result.Values, offset)
+			end
+			return result
+		elseif targetingType == "RANGE_OFFSETS" then
+			for token in string.gmatch(serializedOffsets or "", "([^|]+)") do
+				local offset = tonumber(token)
+				if offset ~= nil then
+					table.insert(result.Values, math.floor(offset))
+				end
+			end
+			if #result.Values == 0 then
+				result.Success = false
+				result.Reason = "TARGET_OFFSETS_EMPTY"
+			end
+			return result
+		end
+		result.Success = false
+		result.Reason = "UNSUPPORTED_TARGETING_TYPE"
+		return result
+	end
+
+	method table SelectEffectTargets(table context, string targetSelector)
+		-- Effect rows choose either the primary target or every target from the shared skill snapshot.
+		local selected = {}
+		if targetSelector == "ALL_SKILL_TARGETS" then
+			for _, unitId in ipairs(context.TargetUnitIds or {}) do
+				table.insert(selected, unitId)
+			end
+		elseif context.PrimaryTargetUnitId ~= nil and context.PrimaryTargetUnitId ~= "" then
+			table.insert(selected, context.PrimaryTargetUnitId)
+		end
+		return selected
+	end
+
+	method string SerializeStrings(table values)
+		local parts = {}
+		for _, value in ipairs(values or {}) do
+			table.insert(parts, tostring(value))
+		end
+		return table.concat(parts, "|")
+	end
+
+	method string SerializeIntegers(table values)
+		local parts = {}
+		for _, value in ipairs(values or {}) do
+			table.insert(parts, tostring(math.floor(value)))
+		end
+		return table.concat(parts, "|")
+	end
+
+end

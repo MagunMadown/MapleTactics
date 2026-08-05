@@ -1,0 +1,180 @@
+@Component
+script BattleUnitComponent extends Component
+
+	@Sync property string UnitId = ""
+	@Sync property string Team = ""
+	@Sync property integer SpawnOrder = 0
+	@Sync property integer CellIndex = -1
+	@Sync property string Facing = "Right"
+	@Sync property number MaxHp = 100
+	@Sync property number CurrentHp = 100
+	@Sync property boolean IsDead = false
+	@Sync property string EnemyDefinitionId = ""
+	@Sync property number BasicAttackDamage = 3
+	@Sync property string EnemyPatternId = "prototype_basic"
+	@Sync property string EnemyMovementPolicy = "TRACK_PLAYER"
+	@Sync property string EnemyTraitIds = ""
+	@Sync property boolean IsBoss = false
+
+	method void OnBeginPlay()
+		-- Reports server registration and forwards initial values to optional presentation logic.
+		if self:IsServer() then
+			log("[BattleUnit] attached entity=" .. self.Entity.Name)
+		end
+
+		if self:IsClient() then
+			self:RefreshPresentation()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table InitializeBattleState(string unitId, string team, integer cellIndex, string facing, number maxHp, integer spawnOrder)
+		-- Initializes the complete mutable unit state through its owning component.
+		self.UnitId = unitId
+		self.Team = team
+		self.SpawnOrder = spawnOrder
+		self.CellIndex = cellIndex
+		self.Facing = facing
+		self.MaxHp = math.max(1, maxHp)
+		self.CurrentHp = self.MaxHp
+		self.IsDead = false
+		self.IsBoss = false
+		return { Success = true, Reason = "INITIALIZED", HpAfter = self.CurrentHp }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConfigureEnemyDefinition(string enemyDefinitionId, number basicAttackDamage, string enemyPatternId, string enemyMovementPolicy, string enemyTraitIds, boolean isBoss)
+		-- Stores the validated enemy definition snapshot without exposing field writes to the session.
+		if self.Team ~= "Enemy" then
+			return { Success = false, Reason = "NOT_ENEMY_UNIT" }
+		end
+		self.EnemyDefinitionId = enemyDefinitionId
+		self.BasicAttackDamage = math.max(0, basicAttackDamage)
+		self.EnemyPatternId = enemyPatternId
+		self.EnemyMovementPolicy = enemyMovementPolicy
+		self.EnemyTraitIds = enemyTraitIds or ""
+		self.IsBoss = isBoss
+		local patternRunner = self.Entity:GetComponent("script.EnemyPatternRunnerComponent")
+		if patternRunner == nil then
+			patternRunner = self.Entity:AddComponent("EnemyPatternRunnerComponent")
+		end
+		if patternRunner == nil then
+			return { Success = false, Reason = "PATTERN_RUNNER_ATTACH_FAILED" }
+		end
+		local patternInitialization = patternRunner:InitializePattern(enemyPatternId, 1)
+		if patternInitialization.Success == false then
+			return patternInitialization
+		end
+		local actionPlan = self.Entity:GetComponent("script.EnemyActionPlanComponent")
+		if actionPlan == nil then
+			actionPlan = self.Entity:AddComponent("EnemyActionPlanComponent")
+		end
+		if actionPlan == nil then
+			return { Success = false, Reason = "ACTION_PLAN_ATTACH_FAILED" }
+		end
+		actionPlan.OwnerUnitId = self.UnitId
+		actionPlan.TraitIds = self.EnemyTraitIds
+		return { Success = true, Reason = "ENEMY_DEFINITION_APPLIED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyDamage(number amount)
+		-- Applies damage to this unit and reports whether this call reached zero HP.
+		local result = { Success = false, Reason = "UNKNOWN", AppliedAmount = 0, HpBefore = self.CurrentHp, HpAfter = self.CurrentHp, ReachedZero = false }
+		if amount <= 0 then
+			result.Reason = "INVALID_AMOUNT"
+			return result
+		end
+		if self.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		result.HpAfter = math.max(0, result.HpBefore - amount)
+		result.AppliedAmount = result.HpBefore - result.HpAfter
+		result.ReachedZero = result.HpAfter <= 0
+		self.CurrentHp = result.HpAfter
+		result.Success = true
+		result.Reason = "DAMAGE_APPLIED"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyHealing(number amount)
+		-- Restores HP without reviving and clamps the result to MaxHp.
+		local result = { Success = false, Reason = "UNKNOWN", AppliedAmount = 0, HpBefore = self.CurrentHp, HpAfter = self.CurrentHp }
+		if amount <= 0 then
+			result.Reason = "INVALID_AMOUNT"
+			return result
+		end
+		if self.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		result.HpAfter = math.min(self.MaxHp, result.HpBefore + amount)
+		result.AppliedAmount = result.HpAfter - result.HpBefore
+		if result.AppliedAmount <= 0 then
+			result.Reason = "HP_ALREADY_FULL"
+			return result
+		end
+		self.CurrentHp = result.HpAfter
+		result.Success = true
+		result.Reason = "HEALING_APPLIED"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table MarkDead()
+		-- Performs the first living-to-dead transition while keeping HP non-negative.
+		if self.IsDead == true then
+			return { Success = true, Reason = "ALREADY_DEAD" }
+		end
+		self.CurrentHp = math.max(0, self.CurrentHp)
+		self.IsDead = true
+		return { Success = true, Reason = "MARKED_DEAD" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyCellChange(integer nextCellIndex)
+		-- Changes the logical board cell while reporting the previous value to the coordinator.
+		if self.IsDead == true then
+			return { Success = false, Reason = "UNIT_DEAD", FromCell = self.CellIndex, ToCell = self.CellIndex }
+		end
+		local previousCell = self.CellIndex
+		self.CellIndex = nextCellIndex
+		return { Success = true, Reason = "CELL_CHANGED", FromCell = previousCell, ToCell = self.CellIndex }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyFacingState(string nextFacing)
+		-- Changes the logical facing after the coordinator validates action timing.
+		if self.IsDead == true then
+			return { Success = false, Reason = "UNIT_DEAD", PreviousFacing = self.Facing, CurrentFacing = self.Facing }
+		end
+		if nextFacing ~= "Left" and nextFacing ~= "Right" then
+			return { Success = false, Reason = "INVALID_FACING", PreviousFacing = self.Facing, CurrentFacing = self.Facing }
+		end
+		local previousFacing = self.Facing
+		self.Facing = nextFacing
+		return { Success = true, Reason = previousFacing == self.Facing and "ALREADY_FACING" or "FACING_CHANGED", PreviousFacing = previousFacing, CurrentFacing = self.Facing }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- Forwards only synchronized identity or HP changes; presentation owns all visual settings.
+		if name == "Team" or name == "UnitId" or name == "MaxHp" or name == "CurrentHp" or name == "IsDead" then
+			self:RefreshPresentation()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshPresentation()
+		-- Units without a presentation component remain valid logical battle units.
+		local presentation = self.Entity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			return
+		end
+		presentation:RefreshHpDisplay(self.UnitId, self.Team, self.CurrentHp, self.MaxHp)
+		presentation:RefreshDefeatedDisplay(self.UnitId, self.Team, self.IsDead)
+	end
+
+end

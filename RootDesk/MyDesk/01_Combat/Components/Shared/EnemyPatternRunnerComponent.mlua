@@ -1,0 +1,154 @@
+@Component
+script EnemyPatternRunnerComponent extends Component
+
+	property string PatternId = ""
+	property integer CurrentStepIndex = 1
+	property integer PreparedStepIndex = 0
+	property integer TelegraphTurnsRemaining = 0
+	property integer PreparedTelegraphTurnsRemaining = 0
+	property integer LastCompletedStepIndex = 0
+	property boolean LastCompletionSuccess = false
+	property integer PatternRevision = 0
+
+	@ExecSpace("ServerOnly")
+	method table InitializePattern(string patternId, integer startStepIndex)
+		-- Owns only per-enemy mutable progression; definitions remain in the Dataset repository.
+		if patternId == nil or patternId == "" then
+			return { Success = false, Reason = "INVALID_PATTERN_ID" }
+		end
+		self.PatternId = patternId
+		self.CurrentStepIndex = math.max(1, startStepIndex)
+		self.PreparedStepIndex = 0
+		self.TelegraphTurnsRemaining = 0
+		self.PreparedTelegraphTurnsRemaining = 0
+		self.LastCompletedStepIndex = 0
+		self.LastCompletionSuccess = false
+		self.PatternRevision = self.PatternRevision + 1
+		log("[EnemyPatternRunner] initialized entity=" .. self.Entity.Name .. " pattern=" .. self.PatternId .. " current=" .. self.CurrentStepIndex .. " revision=" .. self.PatternRevision)
+		return { Success = true, Reason = "PATTERN_INITIALIZED", CurrentStepIndex = self.CurrentStepIndex, Revision = self.PatternRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryMarkPrepared(string patternId, integer selectedStepIndex, integer stepCount, string actionType, integer telegraphTurnsRemaining)
+		local result = { Success = false, Reason = "UNKNOWN", CurrentStepIndex = self.CurrentStepIndex, PreparedStepIndex = self.PreparedStepIndex }
+		if patternId ~= self.PatternId then
+			result.Reason = "PATTERN_ID_MISMATCH"
+			return result
+		end
+		if self.PreparedStepIndex > 0 then
+			result.Reason = "PATTERN_STEP_ALREADY_PREPARED"
+			return result
+		end
+		if selectedStepIndex < 1 or selectedStepIndex > stepCount then
+			result.Reason = "INVALID_SELECTED_STEP"
+			return result
+		end
+		self.PreparedStepIndex = selectedStepIndex
+		self.PreparedTelegraphTurnsRemaining = 0
+		if actionType == "TELEGRAPH_TILE" then
+			self.PreparedTelegraphTurnsRemaining = math.max(1, telegraphTurnsRemaining)
+		end
+		self.PatternRevision = self.PatternRevision + 1
+		result.Success = true
+		result.Reason = "PATTERN_STEP_PREPARED"
+		result.PreparedStepIndex = self.PreparedStepIndex
+		result.TelegraphTurnsRemaining = self.PreparedTelegraphTurnsRemaining
+		result.Revision = self.PatternRevision
+		log("[EnemyPatternRunner] prepared entity=" .. self.Entity.Name .. " pattern=" .. self.PatternId .. " current=" .. self.CurrentStepIndex .. " selected=" .. self.PreparedStepIndex .. " telegraphRemaining=" .. self.PreparedTelegraphTurnsRemaining .. " revision=" .. self.PatternRevision)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CompletePreparedStep(string patternId, integer completedStepIndex, boolean success, integer nextStepOnSuccess, integer nextStepOnFailure, integer stepCount, string actionType)
+		local result = { Success = false, Reason = "UNKNOWN", PreviousStepIndex = self.CurrentStepIndex, NextStepIndex = self.CurrentStepIndex }
+		if patternId ~= self.PatternId then
+			result.Reason = "PATTERN_ID_MISMATCH"
+			return result
+		end
+		if completedStepIndex ~= self.PreparedStepIndex then
+			result.Reason = "PREPARED_STEP_MISMATCH"
+			return result
+		end
+
+		if actionType == "TELEGRAPH_TILE" and success == true and self.PreparedTelegraphTurnsRemaining > 1 then
+			self.LastCompletedStepIndex = completedStepIndex
+			self.LastCompletionSuccess = true
+			self.CurrentStepIndex = completedStepIndex
+			self.TelegraphTurnsRemaining = self.PreparedTelegraphTurnsRemaining - 1
+			self.PreparedStepIndex = 0
+			self.PreparedTelegraphTurnsRemaining = 0
+			self.PatternRevision = self.PatternRevision + 1
+			result.Success = true
+			result.Reason = "TELEGRAPH_CONTINUES"
+			result.NextStepIndex = self.CurrentStepIndex
+			result.TelegraphTurnsRemaining = self.TelegraphTurnsRemaining
+			result.Revision = self.PatternRevision
+			log("[EnemyPatternRunner] telegraph continues entity=" .. self.Entity.Name .. " pattern=" .. self.PatternId .. " step=" .. completedStepIndex .. " remaining=" .. self.TelegraphTurnsRemaining .. " revision=" .. self.PatternRevision)
+			return result
+		end
+
+		local nextStepIndex = nextStepOnFailure
+		if success == true then
+			nextStepIndex = nextStepOnSuccess
+		end
+		if nextStepIndex <= 0 then
+			nextStepIndex = completedStepIndex + 1
+			if nextStepIndex > stepCount then
+				nextStepIndex = 1
+			end
+		end
+		if nextStepIndex < 1 or nextStepIndex > stepCount then
+			result.Reason = "NEXT_STEP_OUT_OF_RANGE"
+			return result
+		end
+
+		self.LastCompletedStepIndex = completedStepIndex
+		self.LastCompletionSuccess = success
+		self.CurrentStepIndex = nextStepIndex
+		self.PreparedStepIndex = 0
+		self.TelegraphTurnsRemaining = 0
+		self.PreparedTelegraphTurnsRemaining = 0
+		self.PatternRevision = self.PatternRevision + 1
+		result.Success = true
+		result.Reason = "PATTERN_STEP_COMPLETED"
+		result.NextStepIndex = self.CurrentStepIndex
+		result.Revision = self.PatternRevision
+		log("[EnemyPatternRunner] completed entity=" .. self.Entity.Name .. " pattern=" .. self.PatternId .. " step=" .. completedStepIndex .. " success=" .. tostring(success) .. " next=" .. self.CurrentStepIndex .. " revision=" .. self.PatternRevision)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CancelPreparedStep(string patternId, integer preparedStepIndex, string reason)
+		-- Releases only the in-flight selection; CurrentStepIndex stays unchanged for a later Prepare.
+		if patternId ~= self.PatternId then
+			return { Success = false, Reason = "PATTERN_ID_MISMATCH" }
+		end
+		if self.PreparedStepIndex == 0 then
+			return { Success = true, Reason = "NO_PATTERN_STEP_PREPARED", CurrentStepIndex = self.CurrentStepIndex }
+		end
+		if preparedStepIndex > 0 and preparedStepIndex ~= self.PreparedStepIndex then
+			return { Success = false, Reason = "PREPARED_STEP_MISMATCH" }
+		end
+		local cancelledStepIndex = self.PreparedStepIndex
+		self.PreparedStepIndex = 0
+		self.PreparedTelegraphTurnsRemaining = 0
+		self.PatternRevision = self.PatternRevision + 1
+		log("[EnemyPatternRunner] cancelled entity=" .. self.Entity.Name .. " pattern=" .. self.PatternId .. " step=" .. cancelledStepIndex .. " reason=" .. reason .. " revision=" .. self.PatternRevision)
+		return { Success = true, Reason = "PATTERN_STEP_CANCELLED", CurrentStepIndex = self.CurrentStepIndex, Revision = self.PatternRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetSnapshot()
+		return {
+			PatternId = self.PatternId,
+			CurrentStepIndex = self.CurrentStepIndex,
+			PreparedStepIndex = self.PreparedStepIndex,
+			TelegraphTurnsRemaining = self.TelegraphTurnsRemaining,
+			PreparedTelegraphTurnsRemaining = self.PreparedTelegraphTurnsRemaining,
+			LastCompletedStepIndex = self.LastCompletedStepIndex,
+			LastCompletionSuccess = self.LastCompletionSuccess,
+			Revision = self.PatternRevision
+		}
+	end
+
+end
