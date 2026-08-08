@@ -59,12 +59,11 @@ RootDesk/MyDesk/
 │     ├─ BTNodes/                # M1 기본 범위에서는 비움
 │     └─ BehaviourTrees/         # 복잡한 보스가 필요할 때만 추가
 │
-├─ 02_Deck/
-│  ├─ Components/
-│  │  ├─ AttackQueueComponent.mlua
-│  │  └─ TileInventoryComponent.mlua
-│  └─ Catalog/
-│     └─ TileCatalogLogic.mlua
+├─ 02_UI/
+│  ├─ BattleQueueHudComponent.mlua
+│  ├─ MapTeleportButton.mlua
+│  ├─ MapTeleportManager.mlua
+│  └─ MinimapUI.mlua
 │
 ├─ 03_Data/
 │  ├─ Combat/
@@ -80,9 +79,11 @@ RootDesk/MyDesk/
 │     ├─ AugmentOfferLogic.mlua
 │     └─ AugmentTriggerLogic.mlua
 │
-├─ 05_UI/
-│  ├─ HUD/BattleHUDLogic.mlua
-│  └─ Popup/AugmentSelectLogic.mlua
+├─ 05_Deck/                       # 보유·편성·드로우 기능 착수 시에만 생성
+│  ├─ Components/
+│  │  ├─ DeckLoadoutComponent.mlua
+│  │  └─ TileInventoryComponent.mlua
+│  └─ Catalog/TileCatalogLogic.mlua
 │
 ├─ 06_Characters/
 │  └─ Models/
