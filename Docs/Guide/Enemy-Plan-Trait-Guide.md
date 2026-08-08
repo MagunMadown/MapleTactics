@@ -28,6 +28,7 @@ UI는 `GetBattleUiState()`에서 다음 필드를 읽는다.
 - `EnemyPlanCount`, `EnemyPlanRevision`
 - `EnemyIntents[]`
 - 각 항목의 `UnitId`, `SpawnOrder`, `State`, `CommandType`, `TileId`
+- 보스 항목의 `BossPhaseId`, `BossPhaseIndex`, `BossPhaseRevision`
 - `CurrentActionIndex`, `ActionCount`, `QueuedActionSnapshot`, `QueuedTileIds`
 - `TraitIds`, `TelegraphTurnsRemaining`, `PatternId`, `StepIndex`, `Revision`
 
@@ -73,3 +74,16 @@ elite_swordsman,...,QUICK|DOUBLE_STRIKE,false
 - `HEAVY` 적 밀치기가 `PUSH_BLOCKED_HEAVY_TRAIT`로 종료되고 Cell이 유지된다.
 - `DOUBLE_STRIKE`는 `ActionCount=2`, `CurrentActionIndex=1→2`로 실행된다.
 - 다음 플레이어 턴에서 이전 계획이 초기화되고 새 계획 Revision이 생성된다.
+
+## 6. 근접·원거리 공격 제작 규칙
+
+`EnemyPatternSteps.ActionType=EXECUTE_TILE`일 때 `TileId`는 실제 `SkillDefinitions.SkillId`다.
+Session에 특정 스킬 ID 분기를 추가하지 않는다. 실행은 항상 공용 Skill Targeting/Effect 경로를 사용한다.
+
+- 근접 공격: `DISTANCE_EQ=1` + `FRONT_CELL`
+- 원거리 공격: `DISTANCE_LE=N` + `FIRST_ENEMY_FORWARD`, `Range=N`
+- `EXECUTE_TILE`은 적이 플레이어를 바라볼 때만 적용 가능하다.
+- 실제 사거리와 피해량은 Pattern이 아니라 `SkillDefinitions`와 `SkillEffectSteps`에서 정한다.
+- Validator는 `TileId`가 유효한 Skill인지 검사한다.
+
+현재 예시는 `region_01_ranged_basic → enemy_ranged_shot`이며 최대 3칸 앞의 첫 플레이어를 공격한다.
