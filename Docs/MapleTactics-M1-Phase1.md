@@ -423,7 +423,7 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 ### 2026-07-21 — 최소 행동 큐 HUD
 
 - UI 파일: `ui/BattleQueueHUD.ui`
-- 표시 컴포넌트: `05_UI/HUD/BattleQueueHudComponent.mlua`
+- 표시 컴포넌트: `02_UI/BattleQueueHudComponent.mlua`
 - 표시 상태: `TurnNumber`, `QueuedActionType`, `BattlePhase`, `IsActionProcessing`
 - Maker 검증: `D` 입력 시 `대기 → 이동 → 적 행동 준비 → 적 이동 → 대기`, `TURN 1 → TURN 2` 전환 확인
 - 런타임 최종 텍스트: `TURN 2 / 대기 / 플레이어 턴 · 입력 가능`

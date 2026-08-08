@@ -172,12 +172,15 @@ UI / 외부 시스템
 | `03_Data/Repositories/` | 콘텐츠 데이터 | 조회·변환·검증 | Runtime Entity와 Timer 저장 |
 | `01_Combat/Skills/` | Skill 실행 | Definition 실행과 Effect Context 조정 | UI 표시, Stage 하드코딩 |
 | `01_Combat/Resolvers/` | 판정·Router | 결정적 계산과 Effect 라우팅 | 장기 Runtime 상태 |
-| `05_UI/`과 `ui/` | UI | 상태 표시와 Request 전송 | 서버 전투 상태 직접 대입 |
+| `02_UI/`과 `ui/` | UI | 상태 표시와 Request 전송 | 서버 전투 상태 직접 대입 |
 | `Docs/Guide/` | 공동 규격 | API·책임·작업 절차 갱신 | 실제 구현과 다른 미래 상태를 구현됨으로 표기 |
 
 같은 작업에서 두 명 이상이 `BattleSessionComponent.mlua`를 수정하지 않는다. Session 변경이
 필요한 작업은 먼저 공개 메서드 추가만으로 해결 가능한지 검토하고, 불가능할 때만 담당자가
 수정한다.
+
+UI 런타임 스크립트는 `02_UI/`에만 둔다. `05_Deck/`은 보유 타일·장착 구성·드로우/셔플을
+개발하기 전에는 만들지 않으며, 전투 큐 실행 로직을 UI나 Deck 폴더로 이동하지 않는다.
 
 전투 코어 담당자가 아직 지정되지 않은 동안에는 다음 임시 절차를 사용한다.
 
