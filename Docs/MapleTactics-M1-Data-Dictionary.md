@@ -42,6 +42,21 @@
 직업은 `SkillDefinitions`를 상속하거나 수정하지 않는다. 시작 공격은 `StartingSkillSetId`,
 이동·교환·밀치기·관통 같은 캐릭터 규칙은 `JobMechanicId`로 독립 구성한다.
 
+현재 실제 `JobDefinitions.userdataset/.csv`에는 5개 직업이 등록되어 있다.
+
+| JobId | DisplayName | JobTags | JobMechanicId | StartingSkillSetId | JobPassiveSetId |
+|---|---|---|---|---|---|
+| warrior | 전사 | melee\|control | FORWARD_PUSH | warrior_start | warrior_recovery |
+| mage | 마법사 | ranged\|magic | NONE | mage_start | mage_focus |
+| archer | 궁수 | ranged\|piercing | NONE | archer_start | archer_focus |
+| thief | 도적 | melee\|mobility | NONE | thief_start | thief_focus |
+| pirate | 해적 | melee\|control | NONE | pirate_start | pirate_focus |
+
+`warrior`만 기준 구현인 `FORWARD_PUSH` JobMechanic을 가지며, 나머지 4개 직업은 아직 고유
+메커니즘 없이 `JobMechanicId=NONE`으로 스탯·시작 스킬 구성만 다른 상태다. 각 직업 고유
+메커니즘은 후속 범위이며, 추가할 때는 `Job-Authoring-Guide.md`의 절차대로 독립 Handler를
+만들고 `JobMechanicRouterLogic`에 등록한다.
+
 ## 3. JobStartingSkillEntries
 
 | 열 | 타입 | 필수 | 설명 |
@@ -59,6 +74,10 @@
 런 시작 시 이 수량은 `PlayerRunInventoryComponent.RunSkillSnapshot`의 `SkillId~Count`
 형식으로 변환된다. 현재 큐 등록은 보유 수량이 1 이상인지 검사하며, 한 큐 안의 동일 SkillId
 허용 수는 별도 큐/쿨타임 규칙을 따른다.
+
+현재 각 직업은 §2의 원래 시작 스킬 2개 뒤에, §4.1에서 설명하는 직업별 SkillDefinitions
+테이블의 스킬을 슬롯 3(마법사는 3·4)으로 추가로 받는다. 기존 슬롯을 대체하지 않고 뒤에
+이어 붙이는 방식이다.
 
 ## 4. SkillDefinitions
 
@@ -82,6 +101,42 @@
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
+
+### 4.1 직업별 SkillDefinitions 분리 (신규)
+
+`SkillDefinitions`는 여러 직업이 공유하는 범용 공격 타일(`basic_slash`, `push` 등)을
+계속 보관하는 공용 표다. 이와 별개로, 특정 직업 전용 스킬은 **같은 열 스키마를 가진
+직업별 테이블**에 나눠 담는다. 각각 `RootDesk/MyDesk/03_Data/`에 `.userdataset`+`.csv`
+쌍으로 존재한다.
+
+| 직업 | 테이블 이름 (runtime name) | 수록 SkillId |
+|---|---|---|
+| 전사 | `WarriorSkillDefinitions` | `brandish` |
+| 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing` |
+| 도적 | `ThiefSkillDefinitions` | `shuriken_burst` |
+| 해적 | `PirateSkillDefinitions` | `magnum_shot` |
+
+`SkillDefinitionRepositoryLogic.JobSkillDataSetNames`(쉼표 구분 문자열)가 이 5개 테이블
+이름을 보관하고, `GetSkillDataSetNames()`가 `SkillDefinitions` + 이 목록을 합쳐 반환한다.
+`GetSkillDefinition(skillId)`는 이 전체 목록을 순회하며 `SkillId`를 찾으므로,
+`ValidateSkillById`·상점 구매·`GrantRunSkill` 등 기존 호출부는 스킬이 어느 테이블에 있는지
+알 필요가 없다. 중복 `SkillId` 검사(`DATA_DUPLICATE_SKILL_ID`)도 6개 테이블 전체를 대상으로
+한다 — 같은 SkillId가 서로 다른 테이블에 나뉘어 있어도 중복으로 잡힌다.
+
+`SkillEffectSteps`는 나누지 않고 공용 표로 유지한다. 직업별 테이블의 스킬도 같은
+`SkillEffectSteps`에서 `EffectSetId`로 Effect Step을 참조한다.
+
+`ContentIntegrityValidatorLogic.ValidateAllContent()`의 전체 무결성 감사도 같은 6개 테이블을
+전부 스캔하도록 갱신되어 있다 — 이 갱신이 없으면 직업별 테이블의 스킬이 참조하는
+`EffectSetId`가 `ORPHAN_EFFECT_SET`으로 오탐지된다.
+
+새 직업 전용 스킬을 추가할 때는:
+
+1. 그 직업의 `{Job}SkillDefinitions.csv`에 행을 추가한다 (공용 `SkillDefinitions`에는 넣지 않는다).
+2. `SkillEffectSteps.csv`에 `EffectSetId` 행을 추가한다.
+3. `JobStartingSkillEntries.csv`에 필요하면 슬롯을 추가한다.
+4. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
 
 ## 5. SkillEffectSteps
 
@@ -446,9 +501,11 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 Validator 허용 목록, 회귀 테스트를 함께 갖춘 뒤에만 `IMPLEMENTED`로 전환하고 실전 데이터에 배치한다.
 `JobDefinitions.JobPassiveSetId`는 현재 하나의 `AugmentId`를 참조하며, 그 ID에 속한 여러
 `AugmentEffects` 행이 직업 시작 패시브 세트가 된다. 효과 실행 순서는 낮은 `Priority`부터이며,
-동률은 런 획득 순서 → `Seq` → `AugmentId`로 고정한다. 현재 프로토타입 직업은
-`prototype_warrior_recovery`를 런 시작 시 UNIQUE 1스택으로 지급받고, 턴 시작에 HP가 99% 이하이면
-자신을 1 회복한다. 문서의 나머지 M1 Type은 계획된 확장 규격이며 아직 Validator에 등록되지 않았다.
+동률은 런 획득 순서 → `Seq` → `AugmentId`로 고정한다. 현재 5개 직업은 각각 `warrior_recovery`,
+`mage_focus`, `archer_focus`, `thief_focus`, `pirate_focus`를 런 시작 시 UNIQUE 1스택으로
+지급받는다. 다섯 모두 같은 `TURN_START`/`HP_RATIO_LE 0.99`/`HEAL`/`SELF` 최소 조합을 재사용해
+턴 시작에 HP가 99% 이하이면 자신을 1 회복하는 동일한 패턴이며, 직업별 차별화된 패시브 효과는
+아직 설계되지 않았다. 문서의 나머지 M1 Type은 계획된 확장 규격이며 아직 Validator에 등록되지 않았다.
 
 ### 15.1 계획 예시 — 자쿰의투구 (50% 확률 후방 공격, PLANNED)
 
