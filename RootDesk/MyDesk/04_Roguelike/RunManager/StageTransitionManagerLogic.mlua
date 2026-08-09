@@ -1,0 +1,150 @@
+@Logic
+script StageTransitionManagerLogic
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		log("[StageTransition] ready")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void HandleVictoryTransition(Entity playerEntity, string clearedStageId)
+		-- Determines the intermediate map and next stage after a battle victory.
+		if isvalid(playerEntity) == false then
+			log_warning("[StageTransition] HandleVictoryTransition failed: playerEntity is invalid")
+			return
+		end
+
+		local stageDefinition = _StageDefinitionRepositoryLogic:GetStageDefinition(clearedStageId)
+		local nextStageId = ""
+		if stageDefinition.Success == true and stageDefinition.NextStageId ~= nil then
+			nextStageId = stageDefinition.NextStageId
+		end
+
+		if nextStageId == "" then
+			log("[StageTransition] no NextStageId for stage=" .. clearedStageId .. " — no transition")
+			return
+		end
+
+		local intermediateMap = self:DetermineIntermediateMap(clearedStageId)
+		if intermediateMap == "" then
+			log_warning("[StageTransition] no intermediate map resolved for stage=" .. clearedStageId)
+			return
+		end
+
+		self:StoreNextStageForPlayer(playerEntity, nextStageId)
+
+		log("[StageTransition] victory stage=" .. clearedStageId .. " nextStage=" .. nextStageId .. " intermediateMap=" .. intermediateMap)
+
+		local targetPlayer = playerEntity
+		local targetMap = intermediateMap
+		_TimerService:SetTimerOnce(function()
+			if isvalid(targetPlayer) then
+				log("[StageTransition] teleporting player=" .. targetPlayer.Name .. " to map=" .. targetMap)
+				_TeleportService:TeleportToMapPosition(targetPlayer, Vector3(0, 0.5, 0), targetMap)
+			end
+		end, 1.5)
+	end
+
+	@ExecSpace("ServerOnly")
+	method string DetermineIntermediateMap(string clearedStageId)
+		-- Returns the intermediate (reward/skill selection) map name based on cleared stage.
+		-- stage01 (stage01_1 map) -> always new_skill_stage
+		-- stage01_2 -> 75% new_upgrade_stage, 25% new_skill_stage
+		if clearedStageId == "stage01" or clearedStageId == "stage01_1" then
+			return "new_skill_stage"
+		elseif clearedStageId == "stage01_2" then
+			local roll = math.random(1, 100)
+			if roll <= 75 then
+				log("[StageTransition] stage01_2 roll=" .. roll .. " -> new_upgrade_stage")
+				return "new_upgrade_stage"
+			else
+				log("[StageTransition] stage01_2 roll=" .. roll .. " -> new_skill_stage")
+				return "new_skill_stage"
+			end
+		end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method void StoreNextStageForPlayer(Entity playerEntity, string nextStageId)
+		-- Stores the next battle stage map name on the player entity for intermediate map objects to read.
+		if isvalid(playerEntity) == false then
+			return
+		end
+
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if runState ~= nil then
+			runState.PendingNextStageMapName = nextStageId
+			log("[StageTransition] stored nextStage=" .. nextStageId .. " on player=" .. playerEntity.Name)
+			return
+		end
+
+		log_warning("[StageTransition] PlayerRunStateComponent not found, storing as tag")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetNextStageMapNameForPlayer(Entity playerEntity)
+		-- Reads the stored next battle stage map name from the player entity.
+		if isvalid(playerEntity) == false then
+			return ""
+		end
+
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if runState ~= nil and runState.PendingNextStageMapName ~= nil then
+			return runState.PendingNextStageMapName
+		end
+
+		return ""
+	end
+
+	@ExecSpace("Server")
+	method void RequestNextStageMapName()
+		-- Client requests the stored next stage. Server reads it and calls client back.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		if isvalid(playerEntity) == false then
+			return
+		end
+
+		local nextStage = self:GetNextStageMapNameForPlayer(playerEntity)
+		log("[StageTransition] client requested nextStage=" .. nextStage .. " user=" .. senderUserId)
+		self:RespondNextStageMapName(senderUserId, nextStage)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RespondNextStageMapName(string userId, string nextStageMapName)
+		-- Client receives the next stage map name and broadcasts it to MapTeleportButton instances.
+		log("[StageTransition] received nextStage=" .. nextStageMapName .. " for local player")
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap == nil then
+			return
+		end
+
+		local currentMap = player.CurrentMap
+		self:UpdateTeleportButtonsOnMap(currentMap, nextStageMapName)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateTeleportButtonsOnMap(Entity mapEntity, string nextStageMapName)
+		-- Iterates children of the map entity and updates MapTeleportButton targets.
+		if isvalid(mapEntity) == false or nextStageMapName == "" then
+			return
+		end
+
+		local children = mapEntity.Children
+		if children == nil then
+			return
+		end
+
+		for i = 1, #children do
+			local child = children[i]
+			if isvalid(child) then
+				local teleportBtn = child:GetComponent("script.MapTeleportButton")
+				if teleportBtn ~= nil and (teleportBtn.TargetMapName == "" or teleportBtn.TargetMapName == nil) then
+					teleportBtn.TargetMapName = nextStageMapName
+					log("[StageTransition] updated MapTeleportButton on " .. child.Name .. " targetMap=" .. nextStageMapName)
+				end
+			end
+		end
+	end
+
+end
