@@ -61,9 +61,8 @@ RootDesk/MyDesk/
 │       ├── BasicAttackResolvedEvent.mlua
 │       ├── UnitMovedEvent.mlua
 │       └── UnitTurnedEvent.mlua
-├── 05_UI/
-│   └── HUD/
-│       └── BattleQueueHudComponent.mlua
+├── 02_UI/
+│   └── BattleQueueHudComponent.mlua
 ├── 04_Roguelike/
 │   └── RunManager/
 │       ├── PlayerRunStateComponent.mlua

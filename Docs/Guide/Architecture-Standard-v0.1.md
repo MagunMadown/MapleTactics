@@ -195,6 +195,8 @@ RootDesk/MyDesk/
 │   ├── Jobs/
 │   │   └── JobMechanicRouterLogic.mlua
 │   └── Events/
+├── 02_UI/
+│   └── BattleQueueHudComponent.mlua
 ├── 03_Data/
 │   ├── Repositories/
 │   ├── StageDefinitions.userdataset
@@ -208,11 +210,8 @@ RootDesk/MyDesk/
 │   ├── JobStartingSkillEntries.userdataset
 │   ├── AugmentDefinitions.userdataset
 │   └── ItemDefinitions.userdataset
-├── 04_Roguelike/
-│   └── RunManager/
-└── 05_UI/
-    ├── HUD/
-    └── Popup/
+└── 04_Roguelike/
+    └── RunManager/
 ```
 
 MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은 `map/`,
@@ -220,6 +219,11 @@ MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은
 `.codeblock`은 직접 수정하지 않는다.
 
 폴더 이동은 기능 마이그레이션과 동시에 수행한다. 빈 폴더를 먼저 대량 생성하지 않는다.
+
+`02_UI/`를 런타임 UI 스크립트의 단일 진입 폴더로 사용한다. Deck은 현재 범위에 포함하지
+않으며, 보유 타일·장착 구성·드로우/셔플 같은 독립 덱 기능을 실제로 개발할 때만
+`05_Deck/`을 생성한다. 전투 행동 큐의 실행 상태는 Deck이 아니라 Combat Runtime이
+소유한다.
 
 ---
 
