@@ -1,7 +1,6 @@
 @Logic
 script LobbyCharacterSelectionLogic
 
-	property string JobDataSetName = "JobDefinitions"
 	property string PopupRootPath = "/ui/CharacterSelectionUI/Popup"
 	property string CharacterNamePath = "/ui/CharacterSelectionUI/Popup/Window/CharacterName"
 	property string DescriptionPath = "/ui/CharacterSelectionUI/Popup/Window/Description"
@@ -30,20 +29,20 @@ script LobbyCharacterSelectionLogic
 	property any Card2ClickHandler = nil
 	property any Card3ClickHandler = nil
 	property any Card4ClickHandler = nil
-	property any AvailableCharacters = nil
+	property any AvailableClasses = nil
 	property boolean IsUiConnected = false
 	property boolean IsPopupOpen = false
 	property boolean IsApplyPending = false
-	property string CandidateCharacterId = ""
-	property string AppliedCharacterId = ""
+	property string PendingClassId = ""
+	property string SelectedClassId = ""
 	property integer RequestId = 0
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
-		self.AvailableCharacters = {}
+		self:LoadAvailableJobs()
 		self:EnsureUiConnection()
 		self:SetPopupEnabled(false)
-		log("[LobbyCharacterSelect] ready dataset=" .. self.JobDataSetName)
+		log("[LobbyClassSelect] ready availableJobs=" .. #self.AvailableClasses)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -64,19 +63,15 @@ script LobbyCharacterSelectionLogic
 			return false
 		end
 
-		self:LoadAvailableCharacters()
-		self.AppliedCharacterId = self:GetCurrentAppliedCharacterId()
-		if self:IsAvailableCharacter(self.AppliedCharacterId) then
-			self.CandidateCharacterId = self.AppliedCharacterId
-		else
-			self.CandidateCharacterId = ""
-		end
+		self:LoadAvailableJobs()
+		self.SelectedClassId = self:GetSelectedClassId()
+		self.PendingClassId = self.SelectedClassId
 		self.IsApplyPending = false
 		self.IsPopupOpen = true
 		self:SetPopupEnabled(true)
 		self:SetStatus("")
 		self:RefreshView()
-		log("[LobbyCharacterSelect] opened available=" .. #self.AvailableCharacters .. " applied=" .. self.AppliedCharacterId)
+		log("[LobbyClassSelect] opened selectedClass=" .. self.SelectedClassId)
 		return true
 	end
 
@@ -87,10 +82,10 @@ script LobbyCharacterSelectionLogic
 		end
 		self.IsPopupOpen = false
 		self.IsApplyPending = false
-		self.CandidateCharacterId = ""
+		self.PendingClassId = ""
 		self:SetPopupEnabled(false)
 		self:RestoreInteractionPrompt()
-		log("[LobbyCharacterSelect] closed applied=" .. tostring(selectionApplied) .. " current=" .. self.AppliedCharacterId)
+		log("[LobbyClassSelect] closed applied=" .. tostring(selectionApplied) .. " selectedClass=" .. self.SelectedClassId)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -131,8 +126,8 @@ script LobbyCharacterSelectionLogic
 		if self.IsPopupOpen == false or self.IsApplyPending then
 			return
 		end
-		if self:IsAvailableCharacter(self.CandidateCharacterId) == false then
-			self:SetStatus("사용 가능한 캐릭터를 선택하세요.")
+		if self:IsAvailableClass(self.PendingClassId) == false then
+			self:SetStatus("사용 가능한 클래스를 선택하세요.")
 			self:RefreshView()
 			return
 		end
@@ -141,8 +136,8 @@ script LobbyCharacterSelectionLogic
 		self.RequestId = self.RequestId + 1
 		self:SetStatus("선택을 적용하는 중입니다...")
 		self:RefreshView()
-		log("[LobbyCharacterSelect] apply requested id=" .. self.CandidateCharacterId .. " request=" .. self.RequestId)
-		self:RequestApplyCharacter(self.CandidateCharacterId, self.RequestId)
+		log("[LobbyClassSelect] confirm requested id=" .. self.PendingClassId .. " request=" .. self.RequestId)
+		self:RequestConfirmClass(self.PendingClassId, self.RequestId)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -150,51 +145,71 @@ script LobbyCharacterSelectionLogic
 		if self.IsPopupOpen == false or self.IsApplyPending then
 			return
 		end
-		if cardIndex < 1 or cardIndex > #self.AvailableCharacters then
+		if cardIndex < 1 or cardIndex > #self.AvailableClasses then
 			return
 		end
-		local character = self.AvailableCharacters[cardIndex]
+		local character = self.AvailableClasses[cardIndex]
 		if character == nil or character.Id == nil or character.Id == "" then
 			return
 		end
-		self.CandidateCharacterId = character.Id
+		self.PendingClassId = character.Id
 		self:SetStatus("")
 		self:RefreshView()
 		log("[LobbyCharacterSelect] card selected id=" .. character.Id)
 	end
 
 	@ExecSpace("Server")
-	method void RequestApplyCharacter(string characterId, integer requestId)
+	method void RequestConfirmClass(string classId, integer requestId)
 		local player = _UserService:GetUserEntityByUserId(senderUserId)
 		if isvalid(player) == false or player.PlayerComponent == nil then
-			self:NotifyApplyResult(senderUserId, requestId, false, "PLAYER_UNAVAILABLE", characterId)
+			self:NotifyConfirmResult(requestId, false, "PLAYER_UNAVAILABLE", classId, senderUserId)
 			return
 		end
 
-		local validation = _ContentValidatorLogic:ValidateJobById(characterId)
-		if validation == nil or validation.Success == false then
-			local reason = validation == nil and "VALIDATION_UNAVAILABLE" or validation.Reason
-			log_warning("[LobbyCharacterSelect] apply rejected user=" .. senderUserId .. " id=" .. characterId .. " reason=" .. reason)
-			self:NotifyApplyResult(senderUserId, requestId, false, reason, characterId)
+		local jobDefinition = _JobDefinitionRepositoryLogic:GetJobDefinition(classId)
+		if jobDefinition.Success == false or jobDefinition.Enabled == false then
+			log_warning("[LobbyClassSelect] confirm rejected user=" .. senderUserId .. " jobId=" .. classId .. " reason=JOB_UNAVAILABLE")
+			self:NotifyConfirmResult(requestId, false, "JOB_UNAVAILABLE", classId, senderUserId)
 			return
 		end
 
-		local result = _RunManagerLogic:ApplyJobSelection(player, characterId)
-		if result == nil or result.Success == false then
-			local reason = result == nil and "APPLY_RESULT_MISSING" or result.Reason
-			log_warning("[LobbyCharacterSelect] apply failed user=" .. senderUserId .. " id=" .. characterId .. " reason=" .. reason)
-			self:NotifyApplyResult(senderUserId, requestId, false, reason, characterId)
+		local state = self:GetOrCreateTemporaryClassState(player)
+		if state == nil then
+			self:NotifyConfirmResult(requestId, false, "TEMPORARY_CLASS_STATE_UNAVAILABLE", classId, senderUserId)
 			return
 		end
+		state:SetSelectedJobId(classId)
+		self:OnClassConfirmed(player, classId)
+		local weaponResult = _PrototypeWeaponController:ApplyJobWeapon(player, classId)
+		if weaponResult == nil or weaponResult.Success == false then
+			local weaponReason = weaponResult == nil and "WEAPON_RESULT_MISSING" or weaponResult.Reason
+			log_warning("[LobbyClassSelect] weapon presentation skipped user=" .. senderUserId .. " jobId=" .. classId .. " reason=" .. weaponReason)
+		end
+		log("[LobbyClassSelect] confirm success user=" .. senderUserId .. " classId=" .. classId)
+		self:NotifyConfirmResult(requestId, true, "OK", classId, senderUserId)
+	end
 
-		log("[LobbyCharacterSelect] apply success user=" .. senderUserId .. " id=" .. characterId .. " player=" .. player.Name)
-		self:NotifyApplyResult(senderUserId, requestId, true, "OK", characterId)
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateTemporaryClassState(Entity player)
+		local state = player:GetComponent("script.TemporaryClassSelectionStateComponent")
+		if state == nil then
+			state = player:AddComponent("TemporaryClassSelectionStateComponent")
+		end
+		return state
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnClassConfirmed(Entity player, string classId)
+		local event = TemporaryClassConfirmedEvent()
+		event.ClassId = classId
+		player:SendEvent(event)
+		log("[LobbyClassSelect] OnClassConfirmed player=" .. player.Name .. " classId=" .. classId)
 	end
 
 	@ExecSpace("Client")
-	method void NotifyApplyResult(string targetUserId, integer requestId, boolean success, string reason, string characterId)
+	method void NotifyConfirmResult(integer requestId, boolean success, string reason, string classId)
 		local player = _UserService.LocalPlayer
-		if isvalid(player) == false or player.PlayerComponent == nil or player.PlayerComponent.UserId ~= targetUserId then
+		if isvalid(player) == false or player.PlayerComponent == nil then
 			return
 		end
 		if self.IsPopupOpen == false or self.IsApplyPending == false or requestId ~= self.RequestId then
@@ -203,7 +218,7 @@ script LobbyCharacterSelectionLogic
 
 		self.IsApplyPending = false
 		if success then
-			self.AppliedCharacterId = characterId
+			self.SelectedClassId = classId
 			self:SetStatus("선택이 적용되었습니다.")
 			self:ClosePopup(true)
 			return
@@ -214,29 +229,8 @@ script LobbyCharacterSelectionLogic
 	end
 
 	@ExecSpace("ClientOnly")
-	method void LoadAvailableCharacters()
-		self.AvailableCharacters = {}
-		local dataSet = _DataService:GetTable(self.JobDataSetName)
-		if dataSet == nil then
-			self:SetStatus("캐릭터 데이터가 없습니다.")
-			log_error("[LobbyCharacterSelect] dataset missing name=" .. self.JobDataSetName)
-			return
-		end
-
-		for rowIndex = 1, dataSet:GetRowCount() do
-			if self:ParseBoolean(dataSet:GetCell(rowIndex, "Enabled")) then
-				local characterId = dataSet:GetCell(rowIndex, "JobId") or ""
-				local displayName = dataSet:GetCell(rowIndex, "DisplayName") or characterId
-				if characterId ~= "" then
-					table.insert(self.AvailableCharacters, {
-						Id = characterId,
-						Name = displayName,
-						Description = dataSet:GetCell(rowIndex, "JobTags") or ""
-					})
-				end
-			end
-		end
-		log("[LobbyCharacterSelect] dataset loaded count=" .. #self.AvailableCharacters)
+	method void LoadAvailableJobs()
+		self.AvailableClasses = _LobbyJobSelectionProvider:GetEntries()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -249,9 +243,9 @@ script LobbyCharacterSelectionLogic
 		self:RefreshCard(3, self.Card3Button)
 		self:RefreshCard(4, self.Card4Button)
 
-		local selected = self:GetAvailableCharacter(self.CandidateCharacterId)
+		local selected = self:GetAvailableClass(self.PendingClassId)
 		if selected == nil then
-			self.CharacterNameText.Text = "캐릭터를 선택하세요"
+			self.CharacterNameText.Text = "클래스를 선택하세요"
 			self.DescriptionText.Text = ""
 		else
 			self.CharacterNameText.Text = selected.Name
@@ -275,8 +269,8 @@ script LobbyCharacterSelectionLogic
 			return
 		end
 		local character = nil
-		if cardIndex <= #self.AvailableCharacters then
-			character = self.AvailableCharacters[cardIndex]
+		if cardIndex <= #self.AvailableClasses then
+			character = self.AvailableClasses[cardIndex]
 		end
 		if character == nil then
 			cardButton.Entity:SetEnable(false)
@@ -289,7 +283,7 @@ script LobbyCharacterSelectionLogic
 			cardButton.Entity.TextGUIRendererComponent.Text = character.Name
 		end
 		if cardButton.Entity.SpriteGUIRendererComponent ~= nil then
-			if character.Id == self.CandidateCharacterId then
+			if character.Id == self.PendingClassId then
 				cardButton.Entity.SpriteGUIRendererComponent.Color = Color(0.22, 0.48, 0.82, 1.00)
 			else
 				cardButton.Entity.SpriteGUIRendererComponent.Color = Color(0.13, 0.16, 0.22, 0.96)
@@ -388,24 +382,24 @@ script LobbyCharacterSelectionLogic
 	end
 
 	@ExecSpace("ClientOnly")
-	method string GetCurrentAppliedCharacterId()
+	method string GetSelectedClassId()
 		local player = _UserService.LocalPlayer
 		if isvalid(player) then
-			local runState = player:GetComponent("script.PlayerRunStateComponent")
-			if runState ~= nil and runState.SelectedJobId ~= "" then
-				return runState.SelectedJobId
+			local state = player:GetComponent("script.TemporaryClassSelectionStateComponent")
+			if state ~= nil and state.SelectedJobId ~= "" then
+				return state.SelectedJobId
 			end
 		end
-		return self.AppliedCharacterId
+		return self.SelectedClassId
 	end
 
 	@ExecSpace("ClientOnly")
-	method any GetAvailableCharacter(string characterId)
-		if characterId == nil or characterId == "" then
+	method any GetAvailableClass(string classId)
+		if classId == nil or classId == "" then
 			return nil
 		end
-		for _, character in ipairs(self.AvailableCharacters) do
-			if character.Id == characterId then
+		for _, character in ipairs(self.AvailableClasses) do
+			if character.Id == classId then
 				return character
 			end
 		end
@@ -413,17 +407,8 @@ script LobbyCharacterSelectionLogic
 	end
 
 	@ExecSpace("ClientOnly")
-	method boolean IsAvailableCharacter(string characterId)
-		return self:GetAvailableCharacter(characterId) ~= nil
-	end
-
-	@ExecSpace("ClientOnly")
-	method boolean ParseBoolean(any value)
-		if value == true then
-			return true
-		end
-		local normalized = string.lower(tostring(value or ""))
-		return normalized == "true" or normalized == "1" or normalized == "yes"
+	method boolean IsAvailableClass(string classId)
+		return self:GetAvailableClass(classId) ~= nil
 	end
 
 	@ExecSpace("ClientOnly")

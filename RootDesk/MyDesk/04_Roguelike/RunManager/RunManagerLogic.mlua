@@ -3,6 +3,7 @@ script RunManagerLogic
 
 	property integer DefaultRunSeed = 1000
 	property string DefaultJobId = "prototype_warrior"
+	property string LobbyPrototypeStageId = "stage01"
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
@@ -86,6 +87,100 @@ script RunManagerLogic
 			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
 		end
 		return runState:GetJobSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetLobbyBattleEntryContext(Entity playerEntity)
+		-- Aggregates existing owners only; this facade does not own lobby, job, or run state.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { IsReady = false, Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		local jobState = playerEntity:GetComponent("script.TemporaryClassSelectionStateComponent")
+		if jobState == nil or jobState.SelectedJobId == "" then
+			return { IsReady = false, Success = false, Reason = "JOB_NOT_SELECTED" }
+		end
+
+		local stageId = self:ResolveLobbyBattleStageId(runState)
+		local stageDefinition = _StageDefinitionRepositoryLogic:GetStageDefinition(stageId)
+		if stageDefinition.Success == false then
+			return { IsReady = false, Success = false, Reason = stageDefinition.Reason, StageId = stageId }
+		end
+		local jobDefinition = _JobDefinitionRepositoryLogic:GetJobDefinition(jobState.SelectedJobId)
+		if jobDefinition.Success == false or jobDefinition.Enabled ~= true then
+			return { IsReady = false, Success = false, Reason = jobDefinition.Reason, StageId = stageId, JobId = jobState.SelectedJobId }
+		end
+
+		local entryMode = self:ResolveLobbyBattleEntryMode(runState)
+		return {
+			IsReady = true,
+			Success = true,
+			Reason = "OK",
+			StageId = stageId,
+			JobId = jobState.SelectedJobId,
+			RunSeed = runState.RunSeed,
+			EntryMode = entryMode,
+			CharacterId = "",
+			LoadoutId = "",
+			CharacterIdRequired = false,
+			LoadoutIdRequired = false
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method string ResolveLobbyBattleStageId(any runState)
+		-- A selected battle/boss node is authoritative; otherwise use the real StageDefinitions prototype row.
+		if runState ~= nil
+			and (runState.SelectedContentType == "BATTLE" or runState.SelectedContentType == "BOSS")
+			and runState.SelectedContentId ~= "" then
+			return runState.SelectedContentId
+		end
+		return self.LobbyPrototypeStageId
+	end
+
+	method string ResolveLobbyBattleEntryMode(any runState)
+		-- Only an active run is resumable in the existing lifecycle; Idle, Failed, and Completed start new.
+		if runState ~= nil and runState.RunSequence > 0 and runState.RunState == "Active" then
+			return "CONTINUE_RUN"
+		end
+		return "NEW_RUN"
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalLobbyBattleEntryContext()
+		-- UI-facing read DTO built from synced player-owned state; no random/default IDs are generated here.
+		local playerEntity = _UserService.LocalPlayer
+		if playerEntity == nil then
+			return { IsReady = false, Success = false, Reason = "LOCAL_PLAYER_UNAVAILABLE" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local jobState = playerEntity:GetComponent("script.TemporaryClassSelectionStateComponent")
+		if jobState == nil or jobState.SelectedJobId == "" then
+			return { IsReady = false, Success = false, Reason = "JOB_NOT_SELECTED" }
+		end
+		local stageId = self.LobbyPrototypeStageId
+		if runState ~= nil
+			and (runState.SelectedContentType == "BATTLE" or runState.SelectedContentType == "BOSS")
+			and runState.SelectedContentId ~= "" then
+			stageId = runState.SelectedContentId
+		end
+		local runSeed = self.DefaultRunSeed
+		if runState ~= nil then
+			runSeed = runState.RunSeed
+		end
+		return {
+			IsReady = stageId ~= "",
+			Success = stageId ~= "",
+			Reason = stageId ~= "" and "OK" or "STAGE_NOT_RESOLVED",
+			StageId = stageId,
+			JobId = jobState.SelectedJobId,
+			RunSeed = runSeed,
+			EntryMode = self:ResolveLobbyBattleEntryMode(runState),
+			CharacterId = "",
+			LoadoutId = "",
+			CharacterIdRequired = false,
+			LoadoutIdRequired = false
+		}
 	end
 
 	@ExecSpace("ServerOnly")
