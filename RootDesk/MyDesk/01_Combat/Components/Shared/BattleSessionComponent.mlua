@@ -106,6 +106,10 @@ script BattleSessionComponent extends Component
 	property number PushMotionPlayRate = 0.9
 	property number PushMotionDuration = 0.40
 	property number PushImpactDelay = 0.18
+	property string ActiveEffectSkillId = ""
+	property string ActiveHitEffectRuid = ""
+	property number ActiveEffectScale = 1
+	property boolean ActiveEffectFlipX = false
 	property number MoveActionDuration = 0.12
 	property number TurnActionDuration = 0.12
 	property number BasicAttackActionDuration = 0.45
@@ -2927,6 +2931,7 @@ script BattleSessionComponent extends Component
 				motionProfile.Duration
 			)
 		end
+		self:BeginSkillEffectPresentation(sourceUnitId, definition)
 
 		local safeImpactDelay = math.max(0, motionProfile.ImpactDelay)
 		if safeImpactDelay <= 0 then
@@ -3083,6 +3088,8 @@ script BattleSessionComponent extends Component
 		result.TargetCell = targetUnit.CellIndex
 		result.FromCell = targetUnit.CellIndex
 		result.ToCell = targetUnit.CellIndex + direction
+		-- The impact lands even when displacement is later blocked, so present the hit before those branches.
+		self:PlayActiveHitEffect(targetUnitId)
 		if targetUnit.Team == "Enemy" and _EnemyTraitRouterLogic:BlocksForcedDisplacement(targetUnit.EnemyTraitIds) then
 			result.Success = true
 			result.ToCell = result.FromCell
@@ -3182,6 +3189,7 @@ script BattleSessionComponent extends Component
 				motionProfile.Duration
 			)
 		end
+		self:BeginSkillEffectPresentation(sourceUnitId, definition)
 
 		local context = contextResult.Data
 		local safeImpactDelay = math.max(0, motionProfile.ImpactDelay)
@@ -3209,6 +3217,54 @@ script BattleSessionComponent extends Component
 			SkillId = skillId,
 			StepCount = #effectSteps
 		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginSkillEffectPresentation(string sourceUnitId, table definition)
+		-- Plays the caster-side effect and latches the target-side effect for this action's impact frame.
+		-- Battle actions resolve strictly one at a time, so a single latched slot is enough.
+		self.ActiveEffectSkillId = definition.SkillId or ""
+		self.ActiveHitEffectRuid = definition.HitEffectRuid or ""
+		self.ActiveEffectScale = definition.EffectScale or 1
+		self.ActiveEffectFlipX = false
+
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			return
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit ~= nil then
+			self.ActiveEffectFlipX = sourceUnit.Facing == "Right"
+		end
+
+		local castEffectRuid = definition.CastEffectRuid or ""
+		if castEffectRuid == "" then
+			return
+		end
+		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourcePresentation == nil then
+			log_warning("[BattleEffect] cast skipped unit=" .. sourceUnitId .. " skill=" .. self.ActiveEffectSkillId .. " reason=PRESENTATION_MISSING")
+			return
+		end
+		sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayActiveHitEffect(string targetUnitId)
+		-- Presents the latched hit effect on one target at its impact frame; never gates gameplay resolution.
+		if self.ActiveHitEffectRuid == "" then
+			return
+		end
+		local targetEntity = self:FindUnitEntity(targetUnitId)
+		if isvalid(targetEntity) == false then
+			return
+		end
+		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if targetPresentation == nil then
+			log_warning("[BattleEffect] hit skipped unit=" .. targetUnitId .. " skill=" .. self.ActiveEffectSkillId .. " reason=PRESENTATION_MISSING")
+			return
+		end
+		targetPresentation:PlaySkillEffect(targetUnitId, "HIT", self.ActiveHitEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3445,6 +3501,7 @@ script BattleSessionComponent extends Component
 		result.DamageAmount = damageResult.AppliedAmount
 		result.TargetHpBefore = damageResult.HpBefore
 		result.TargetHpAfter = damageResult.HpAfter
+		self:PlayActiveHitEffect(targetUnitId)
 
 		local attackEvent = BasicAttackResolvedEvent()
 		attackEvent.SourceUnitId = sourceUnitId
