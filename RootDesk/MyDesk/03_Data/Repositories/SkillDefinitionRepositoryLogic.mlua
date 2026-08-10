@@ -3,17 +3,44 @@ script SkillDefinitionRepositoryLogic extends Logic
 
 	property string SkillDataSetName = "SkillDefinitions"
 	property string JobSkillDataSetNames = "WarriorSkillDefinitions,MageSkillDefinitions,ArcherSkillDefinitions,ThiefSkillDefinitions,PirateSkillDefinitions"
+	property string EnemySkillDataSetName = "EnemySkillDefinitions"
 	property string EffectStepDataSetName = "SkillEffectSteps"
-	property boolean AllowPrototypeCompatibilityFallback = false
 
 	@ExecSpace("ServerOnly")
 	method table GetSkillDataSetNames()
-		-- Single source of truth for which datasets constitute "skills": the shared table plus one CSV per job class.
+		-- Single source of truth for which datasets constitute "skills": the shared table, one CSV per job
+		-- class, and the enemy-only table. Enemy rows are deliberately kept out of the job catalogs so a
+		-- player can never be granted them and so player skill edits cannot break monster attacks.
 		local names = { self.SkillDataSetName }
 		for token in string.gmatch(self.JobSkillDataSetNames or "", "([^,]+)") do
 			table.insert(names, token)
 		end
+		if self.EnemySkillDataSetName ~= "" then
+			table.insert(names, self.EnemySkillDataSetName)
+		end
 		return names
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetPlayerGrantableSkillIds()
+		-- Skill ids a player may own. Enemy-only rows are excluded so HUD slots and rewards never surface them.
+		local names = { self.SkillDataSetName }
+		for token in string.gmatch(self.JobSkillDataSetNames or "", "([^,]+)") do
+			table.insert(names, token)
+		end
+		local skillIds = {}
+		for _, dataSetName in ipairs(names) do
+			local dataSet = _DataService:GetTable(dataSetName)
+			if dataSet ~= nil then
+				for rowIndex = 1, dataSet:GetRowCount() do
+					local skillId = dataSet:GetCell(rowIndex, "SkillId") or ""
+					if skillId ~= "" then
+						table.insert(skillIds, skillId)
+					end
+				end
+			end
+		end
+		return skillIds
 	end
 
 	@ExecSpace("ServerOnly")
@@ -48,14 +75,6 @@ script SkillDefinitionRepositoryLogic extends Logic
 			return matchedDefinition
 		end
 
-		if self.AllowPrototypeCompatibilityFallback == true then
-			local fallback = self:GetCompatibilitySkillDefinition(skillId)
-			if fallback.Success == true then
-				log("[SkillDefinition] compatibility fallback skill=" .. skillId)
-				return fallback
-			end
-		end
-
 		log_warning("[SkillDefinition] missing skill=" .. skillId .. " dataset=" .. self.SkillDataSetName)
 		return result
 	end
@@ -82,12 +101,6 @@ script SkillDefinitionRepositoryLogic extends Logic
 			end
 		end
 
-		if #result.Steps == 0 and self.AllowPrototypeCompatibilityFallback == true then
-			result.Steps = self:GetCompatibilityEffectSteps(effectSetId)
-			if #result.Steps > 0 then
-				log("[SkillEffectData] compatibility fallback effectSet=" .. effectSetId .. " steps=" .. #result.Steps)
-			end
-		end
 		if #result.Steps == 0 then
 			log_warning("[SkillEffectData] missing effectSet=" .. effectSetId .. " dataset=" .. self.EffectStepDataSetName)
 			return result
@@ -178,100 +191,6 @@ script SkillDefinitionRepositoryLogic extends Logic
 		}
 	end
 
-	@ExecSpace("ServerOnly")
-	method table GetCompatibilitySkillDefinition(string skillId)
-		if skillId == "basic_slash" then
-			return self:CreateCompatibilitySkill(
-				"basic_slash",
-				"기본 베기",
-				"attack|starter",
-				0,
-				"basic_slash",
-				"basic_slash_effects",
-				0.45,
-				false
-			)
-		elseif skillId == "quick_slash" then
-			return self:CreateCompatibilitySkill(
-				"quick_slash",
-				"빠른 베기",
-				"attack|starter|freeplay",
-				0,
-				"basic_slash",
-				"basic_slash_effects",
-				0.35,
-				true
-			)
-		elseif skillId == "heavy_slash" then
-			return self:CreateCompatibilitySkill(
-				"heavy_slash",
-				"강한 베기",
-				"attack|heavy",
-				1,
-				"heavy_slash",
-				"heavy_slash_effects",
-				0.70,
-				false
-			)
-		elseif skillId == "push" then
-			return self:CreateCompatibilitySkill(
-				"push",
-				"밀치기",
-				"control|displacement",
-				1,
-				"push",
-				"push_effects",
-				0.40,
-				false
-			)
-		elseif skillId == "slash_push_combo" then
-			return self:CreateCompatibilitySkill(
-				"slash_push_combo",
-				"베고 밀치기",
-				"attack|control|combo",
-				2,
-				"basic_slash",
-				"slash_push_combo_effects",
-				0.55,
-				false
-			)
-		end
-		return {
-			Success = false,
-			Reason = "UNKNOWN_SKILL",
-			SkillId = skillId
-		}
-	end
-
-	@ExecSpace("ServerOnly")
-	method table CreateCompatibilitySkill(string skillId, string displayName, string skillTags, integer cooldownTurns, string motionProfileId, string effectSetId, number actionDuration, boolean freePlay)
-		-- Creates one prototype definition while preserving the same schema as Dataset-backed skills.
-		return {
-			Success = true,
-			Reason = "OK",
-			SchemaVersion = 1,
-			SkillId = skillId,
-			DisplayName = displayName,
-			SkillTags = skillTags,
-			TargetingType = "FRONT_CELL",
-			Range = 1,
-			TargetOffsets = "",
-			CooldownTurns = cooldownTurns,
-			CostType = "",
-			CostValue = 0,
-			MotionProfileId = motionProfileId,
-			EffectSetId = effectSetId,
-			RequiredJobTag = "",
-			FreePlay = freePlay,
-			ActionDuration = actionDuration,
-			CastEffectRuid = "",
-			HitEffectRuid = "",
-			EffectScale = 1,
-			Source = "COMPATIBILITY_FALLBACK",
-			MatchCount = 1
-		}
-	end
-
 	method boolean ParseBooleanCell(any cellValue)
 		-- Accepts native booleans and the string values emitted by CSV-backed UserDataSets.
 		if cellValue == true then
@@ -281,43 +200,5 @@ script SkillDefinitionRepositoryLogic extends Logic
 		return normalized == "true" or normalized == "1" or normalized == "yes"
 	end
 
-	@ExecSpace("ServerOnly")
-	method table GetCompatibilityEffectSteps(string effectSetId)
-		if effectSetId == "basic_slash_effects" then
-			return {
-				self:CreateCompatibilityEffectStep(effectSetId, 1, "DAMAGE", "FRONT_TARGET", 3, "SOURCE_BASIC_ATTACK")
-			}
-		elseif effectSetId == "heavy_slash_effects" then
-			return {
-				self:CreateCompatibilityEffectStep(effectSetId, 1, "DAMAGE", "FRONT_TARGET", 6, "")
-			}
-		elseif effectSetId == "push_effects" then
-			return {
-				self:CreateCompatibilityEffectStep(effectSetId, 1, "PUSH", "FRONT_TARGET", 1, "")
-			}
-		elseif effectSetId == "slash_push_combo_effects" then
-			return {
-				self:CreateCompatibilityEffectStep(effectSetId, 1, "DAMAGE", "FRONT_TARGET", 1, ""),
-				self:CreateCompatibilityEffectStep(effectSetId, 2, "PUSH", "FRONT_TARGET", 1, "")
-			}
-		end
-		return {}
-	end
-
-	@ExecSpace("ServerOnly")
-	method table CreateCompatibilityEffectStep(string effectSetId, integer stepIndex, string effectType, string targetSelector, number value, string parameterA)
-		return {
-			SchemaVersion = 1,
-			EffectSetId = effectSetId,
-			StepIndex = stepIndex,
-			EffectType = effectType,
-			TargetSelector = targetSelector,
-			Value = value,
-			ParameterA = parameterA,
-			ParameterB = "",
-			ConditionId = "",
-			Source = "COMPATIBILITY_FALLBACK"
-		}
-	end
-
 end
+
