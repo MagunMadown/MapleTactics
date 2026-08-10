@@ -1,0 +1,79 @@
+@Logic
+script BossPhaseContentValidatorLogic
+
+	@ExecSpace("ServerOnly")
+	method table ValidateByEnemyDefinitionId(string enemyDefinitionId)
+		local bundle = _BossPhaseDefinitionRepositoryLogic:GetPhaseDefinitions(enemyDefinitionId)
+		if bundle.Success == false then
+			return bundle
+		end
+		return self:ValidateBundle(bundle)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateBundle(table bundle)
+		local result = { Success = false, Reason = "CONTENT_VALIDATION_FAILED", DetailReason = "", EnemyDefinitionId = bundle.EnemyDefinitionId or "", PhaseCount = 0, Data = bundle }
+		local definitions = bundle.Definitions or {}
+		local enemyReference = self:GetBossEnemyReference(result.EnemyDefinitionId)
+		if enemyReference.Success == false then
+			return self:Reject(result, enemyReference.Reason)
+		end
+		local previousThreshold = 2
+		local seenPhaseIds = {}
+		for expectedIndex, definition in ipairs(definitions) do
+			if definition.SchemaVersion ~= _BossPhaseDefinitionRepositoryLogic.SupportedSchemaVersion then
+				return self:Reject(result, "UNSUPPORTED_BOSS_PHASE_SCHEMA")
+			end
+			if definition.PhaseIndex ~= expectedIndex then
+				return self:Reject(result, "INVALID_BOSS_PHASE_SEQUENCE")
+			end
+			if definition.PhaseId == "" or seenPhaseIds[definition.PhaseId] == true then
+				return self:Reject(result, "INVALID_BOSS_PHASE_ID")
+			end
+			if definition.HpRatioLE <= 0 or definition.HpRatioLE > 1 or definition.HpRatioLE >= previousThreshold then
+				return self:Reject(result, "INVALID_BOSS_PHASE_HP_THRESHOLD")
+			end
+			if expectedIndex == 1 and definition.HpRatioLE ~= 1 then
+				return self:Reject(result, "BOSS_PHASE_ONE_MUST_COVER_FULL_HP")
+			end
+			local patternValidation = _EnemyPatternContentValidatorLogic:ValidateById(definition.PatternId)
+			if patternValidation.Success == false then
+				return self:Reject(result, "INVALID_BOSS_PHASE_PATTERN_REFERENCE")
+			end
+			seenPhaseIds[definition.PhaseId] = true
+			previousThreshold = definition.HpRatioLE
+		end
+		if definitions[1].PatternId ~= enemyReference.PatternId then
+			return self:Reject(result, "BOSS_INITIAL_PATTERN_MISMATCH")
+		end
+		result.Success = true
+		result.Reason = "OK"
+		result.PhaseCount = #definitions
+		log("[ContentValidation] boss phases valid enemy=" .. result.EnemyDefinitionId .. " phases=" .. result.PhaseCount)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetBossEnemyReference(string enemyDefinitionId)
+		local dataSet = _DataService:GetTable("EnemyDefinitions")
+		if dataSet == nil then return { Success = false, Reason = "ENEMY_DEFINITION_DATASET_MISSING" } end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "EnemyDefinitionId") == enemyDefinitionId then
+				local isBossValue = string.lower(tostring(dataSet:GetCell(rowIndex, "IsBoss") or ""))
+				if isBossValue ~= "true" and isBossValue ~= "1" and isBossValue ~= "yes" then
+					return { Success = false, Reason = "BOSS_PHASE_OWNER_NOT_BOSS" }
+				end
+				return { Success = true, Reason = "OK", PatternId = dataSet:GetCell(rowIndex, "PatternId") or "" }
+			end
+		end
+		return { Success = false, Reason = "BOSS_PHASE_OWNER_NOT_FOUND" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table Reject(table result, string detailReason)
+		result.DetailReason = detailReason
+		log_error("[ContentValidation] boss phases rejected enemy=" .. (result.EnemyDefinitionId or "") .. " reason=" .. detailReason)
+		return result
+	end
+
+end

@@ -130,7 +130,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 | StepIndex | integer | O | 실행 순서, 1 이상 |
 | ActionType | enum | O | 등록된 EnemyActionType |
 | ConditionType | enum | O | 실행 조건, 기본 ALWAYS |
-| TileId | string | - | TELEGRAPH/EXECUTE_TILE에서 사용 |
+| TileId | string | - | TELEGRAPH/EXECUTE_TILE에서 사용하는 `SkillDefinitions.SkillId` |
 | TelegraphTurns | integer | O | 준비 턴 수, 0 이상 |
 | ParamA | string | - | 행동별 인자 |
 | ParamB | string | - | 행동별 인자 |
@@ -151,16 +151,21 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 
 추적형/고정형은 Pattern 전체에 `TURN_TO_PLAYER`가 있는지로 판정하지 않는다. 각 Step의 Action 의미가 독립적이며 하나의 Pattern에서 추적 Action과 고정 방향 Action을 함께 사용할 수 있다.
 
-허용 ConditionType M1: `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE`.
+허용 ConditionType M1: `ALWAYS`, `DISTANCE_EQ`, `DISTANCE_LE`, `HP_RATIO_LE`, `CELL_FREE`.
 
 현재 수직 슬라이스는 `prototype_tracker` 4행, `prototype_fixed` 3행,
-`prototype_retreat` 2행, `prototype_telegraph` 3행을 실제 `EnemyPatternSteps` Dataset으로 제공한다.
+`prototype_retreat` 2행, `prototype_telegraph` 3행, `region_01_ranged_basic` 4행을
+실제 `EnemyPatternSteps` Dataset으로 제공한다.
 Repository는 `PatternId → StepIndex`로 정렬하고,
 전용 Validator는 SchemaVersion, 연속 StepIndex, Action/Condition enum, TileId와 거리 인자를
-검사한다. Resolver는 `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE`와 `WAIT`,
+검사한다. Resolver는 `ALWAYS`, `DISTANCE_EQ`, `DISTANCE_LE`, `HP_RATIO_LE`, `CELL_FREE`와 `WAIT`,
 `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`을
 실행 가능 타입으로 받는다. `prototype_retreat`는 `MOVE_AWAY`, `prototype_telegraph`는 2턴 예고 뒤
 `basic_slash` 실행으로 이어지는 재사용 제작 샘플이다.
+
+`EXECUTE_TILE`과 `TELEGRAPH_TILE`의 `TileId`는 `SkillDefinitions.SkillId` 참조다.
+특정 스킬 ID를 Session에서 분기하지 않으며, 적 공격도 공용 Skill Targeting/Effect 파이프라인으로 실행한다.
+`DISTANCE_LE`의 `ParamA`는 1 이상의 최대 Cell 거리다.
 
 `CELL_FREE`는 `ParamA`를 셀 선택자로 사용한다.
 
@@ -225,12 +230,30 @@ Facing을 이전 값으로 복구한다.
 - 새 ActionType 추가는 코어 개발자가 Router, Validator enum, 데이터 사전, positive log 테스트를 함께 변경한다.
 - 동일 CSV에서 실제 병합 충돌이 반복되기 전에는 별도 생성기를 도입하지 않는다. 충돌이 반복되면 PatternId별 소스 조각을 결정적으로 병합하는 도구를 Phase 5 제작자 도구 범위로 추가한다.
 
-## 8. StageDefinitions
+### 7.3 BossPhaseDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
 | SchemaVersion | integer | O | 현재 `1` |
+| EnemyDefinitionId | string | O | `IsBoss=true`인 EnemyDefinitions 참조 |
+| PhaseIndex | integer | O | 1부터 연속 |
+| PhaseId | string | O | 보스 안에서 유일한 표시/상태 ID |
+| HpRatioLE | number | O | `(0,1]`, 뒤 Phase일수록 작은 임계값 |
+| PatternId | string | O | EnemyPatternSteps 참조 |
+| Enabled | boolean | O | 활성 행 여부 |
+
+첫 Phase는 `HpRatioLE=1.0`이고 `EnemyDefinitions.PatternId`와 같아야 한다.
+Phase 전환은 이미 고정된 적 Queue를 바꾸지 않으며, 다음 라운드 계획부터 새 Pattern을 사용한다.
+
+## 8. StageDefinitions
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `2` |
 | StageId | string | O | 고유 스테이지 ID |
+| RegionId | string | O | `RegionDefinitions.RegionId` 참조 |
+| StageIndex | integer | O | Region 안 전투 순서, 1 이상 |
+| StageType | enum | O | 현재 `NORMAL`, `BOSS` |
 | DisplayName | string | O | 표시 이름 |
 | CellCount | integer | O | 1차원 Cell 수, 1 이상 |
 | CellStartX | number | O | Cell 0의 월드 X |
@@ -238,41 +261,41 @@ Facing을 이전 값으로 복구한다.
 | UnitY | number | O | 유닛 기준 월드 Y |
 | PlayerStartCell | integer | O | 0 이상 `CellCount` 미만 |
 | QueueCapacity | integer | O | 기본 큐 용량, 1 이상 |
-| WaveTableId | string | O | `StageEnemyWaves.StageId` 참조 |
+| WaveTableId | string | O | `StageEnemyWaves.WaveTableId` 참조 |
 | NextStageId | string | - | 초기 호환 열. 실제 다음 콘텐츠는 NodeDefinitions가 결정 |
 | StageRuleId | string | - | 특수 Stage 규칙 ID |
 
 `CellStartX/UnitY/CellSpacing`은 월드 좌표 표현용이며 논리 판정은 CellIndex를 사용한다.
-현재 `stage01`은 실제 Dataset에서 로드되고 compatibility fallback은 비활성이다.
+현재 `region_01_stage_01`은 실제 Dataset에서 로드되고 compatibility fallback은 제거됐다.
+`StageId`는 조회에만 사용한다. 코드가 ID 문자열에서 Region, 순서, Type을 추출하면 안 된다.
 
 ## 9. RegionDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
-| RegionId | string | O | 지역 고유 ID (예: `henesys`) |
-| DisplayName | string | O | 표시 이름 (예: 헤네시스) |
-| NodeGraphId | string | O | NodeDefinitions 참조 |
-| MonsterPoolId | string | O | 이 지역 일반 전투에서 쓰는 EnemySpawnPools 참조 |
-| BossStageId | string | O | 지역 보스 전투(StageDefinitions) 참조 |
-| UnlockRegionId | string | - | 비어 있으면 처음부터 열림. 값이 있으면 그 지역의 `BossStageId` 클리어 후 열림 |
+| SchemaVersion | integer | O | 현재 `1` |
+| RegionId | string | O | 변경하지 않는 지역 고유 ID |
+| DisplayName | string | O | 화면 표시 이름 |
+| RegionOrder | integer | O | Region 표시 순서, 1 이상 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
 기본 키: `RegionId` 유일.
 
 예시:
 
-| RegionId | DisplayName | NodeGraphId | MonsterPoolId | BossStageId | UnlockRegionId |
-|---|---|---|---|---|---|
-| henesys | 헤네시스 | henesys_graph | henesys_common | henesys_boss_mushmom | |
-| ellinia | 엘리니아 | ellinia_graph | ellinia_common | ellinia_boss_dollmaster | henesys |
-| sleepywood | 슬리피우드 | sleepywood_graph | sleepywood_common | sleepywood_boss_balrog | ellinia |
+| RegionId | DisplayName | RegionOrder | Enabled |
+|---|---|---:|---|
+| region_01 | Region 1 | 1 | true |
+
+Region은 소속과 표시 순서만 소유한다. Node Graph, 공통 적 Pool, 보스 Stage는 각각
+`NodeDefinitions`, `EnemySpawnPools`, `StageDefinitions`가 소유하며 Region 행에 중복 저장하지 않는다.
 
 ## 10. NodeDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
 | SchemaVersion | integer | O | 현재 `1`, Loader 지원 버전과 일치해야 함 |
-| NodeGraphId | string | O | RegionDefinitions.NodeGraphId 참조 |
+| NodeGraphId | string | O | 독립된 진행 그래프 ID. RegionId와 문자열 파싱으로 연결하지 않음 |
 | NodeId | string | O | 노드 고유 ID |
 | NodeType | enum | O | 등록된 NodeType |
 | StageId | string | - | `BATTLE`/`BOSS`에서 StageDefinitions 참조, 그 외 타입은 비움 |
@@ -283,6 +306,8 @@ Facing을 이전 값으로 복구한다.
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
 허용 NodeType M1: `BATTLE`, `SHOP`, `EVENT`, `REST`, `BOSS`.
+신규 데이터는 보스도 `NodeType=BATTLE`로 작성하고 `StageDefinitions.StageType=BOSS`로 구분한다.
+`NodeType=BOSS`는 기존 데이터 호환용으로만 허용한다.
 
 기본 키: `(NodeGraphId, NodeId)` 유일. 같은 NodeGraphId 안에 `IsStartNode=true`가 정확히 1개여야 한다. `NextNodeIds`가 참조하는 NodeId는 같은 NodeGraphId 안에 존재해야 한다.
 
@@ -326,7 +351,7 @@ SHOP의 `NextContentId`는 NodeId다. 현재 런 상점은 SHOP Node와 같은 N
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
-| StageId | string | O | StageDefinitions 참조 |
+| WaveTableId | string | O | `StageDefinitions.WaveTableId`가 참조하는 웨이브 표 ID |
 | WaveIndex | integer | O | 몇 번째 웨이브 소속인지. 첫 웨이브는 `1`이며 스테이지 시작 시 런타임 생성 |
 | SpawnOrder | integer | O | 같은 Wave 안 결정적 생성/행동 동률 순서 |
 | EnemyId | string | O | EnemyDefinitions 참조 |
@@ -363,7 +388,7 @@ SHOP의 `NextContentId`는 NodeId다. 현재 런 상점은 SHOP Node와 같은 N
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
-| StageId | string | O | StageDefinitions 참조 |
+| WaveTableId | string | O | `StageDefinitions.WaveTableId`가 참조하는 웨이브 표 ID |
 | WaveIndex | integer | O | `1`부터 시작하는 웨이브 순서. 첫 행도 Stage 시작 시 같은 런타임 Spawn 경로 사용 |
 | SpawnTriggerMode | enum | O | 전멸 기본 조건과 강제 증원 예외 방식 |
 | EnemyPoolId | string | O | EnemySpawnPools 참조 |
