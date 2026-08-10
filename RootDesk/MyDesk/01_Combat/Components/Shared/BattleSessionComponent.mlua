@@ -37,7 +37,10 @@ script BattleSessionComponent extends Component
 	@Sync property string ContentValidationErrorSnapshot = ""
 	@Sync property integer ContentValidationRevision = 0
 	@Sync property integer StageNumber = 1
-	@Sync property string StageId = "stage01"
+	@Sync property string StageId = "region_01_stage_01"
+	@Sync property string RegionId = "region_01"
+	@Sync property integer StageIndex = 1
+	@Sync property string StageType = "NORMAL"
 	@Sync property string StageDisplayName = ""
 	@Sync property string WaveTableId = ""
 	@Sync property string NextStageId = ""
@@ -247,7 +250,7 @@ script BattleSessionComponent extends Component
 			end
 		end
 
-		self:StartStage(1)
+		self:StartStageById(self.StageId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -321,16 +324,8 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method void StartStage(integer stageNumber)
-		-- Loads the stage wave table and starts Wave 1 through the same runtime spawn path.
-		local normalizedStageNumber = math.max(1, stageNumber)
-		self:StartStageById(string.format("stage%02d", normalizedStageNumber), normalizedStageNumber)
-	end
-
-	@ExecSpace("ServerOnly")
-	method void StartStageById(string stageId, integer stageNumber)
-		-- Starts one exact StageId so external lobby and selection systems do not depend on numeric formatting.
-		self.StageNumber = math.max(1, stageNumber)
+	method void StartStageById(string stageId)
+		-- Starts one exact StageId. Region, order, and type always come from StageDefinitions.
 		local stageResult = self:LoadAndApplyStageDefinition(stageId)
 		if stageResult.Success == false then
 			self.TurnState:SetPhase("DataError", "STAGE_DATA_ERROR")
@@ -358,6 +353,10 @@ script BattleSessionComponent extends Component
 
 		local definition = validation.Data
 		self.StageId = definition.StageId
+		self.RegionId = definition.RegionId
+		self.StageIndex = definition.StageIndex
+		self.StageType = definition.StageType
+		self.StageNumber = definition.StageIndex
 		self.StageDisplayName = definition.DisplayName
 		self.WaveTableId = definition.WaveTableId
 		self.NextStageId = definition.NextStageId
@@ -382,7 +381,7 @@ script BattleSessionComponent extends Component
 		self:PublishTurnStateSnapshot("STAGE_DEFINITION")
 		self.WaveRuntime:SetTotalWaves(validation.TotalWaves, "STAGE_DEFINITION")
 		self:PublishWaveStateSnapshot("STAGE_DEFINITION")
-		log("[BattleSession] stage definition applied stage=" .. self.StageId .. " display=" .. self.StageDisplayName .. " cells=" .. self.CellCount .. " startX=" .. self.CellStartX .. " spacing=" .. self.CellSpacing .. " playerCell=" .. self.PlayerStartCell .. " queue=" .. self.TileQueueCapacity)
+		log("[BattleSession] stage definition applied stage=" .. self.StageId .. " region=" .. self.RegionId .. " index=" .. self.StageIndex .. " type=" .. self.StageType .. " display=" .. self.StageDisplayName .. " cells=" .. self.CellCount .. " startX=" .. self.CellStartX .. " spacing=" .. self.CellSpacing .. " playerCell=" .. self.PlayerStartCell .. " queue=" .. self.TileQueueCapacity)
 		return validation
 	end
 
@@ -568,14 +567,27 @@ script BattleSessionComponent extends Component
 		elseif spawnDefinition.InitialFacingPolicy == "FIXED_RIGHT" then
 			resolvedFacing = "Right"
 		end
-		self:ConfigureUnit(enemy, unitId, "Enemy", startCell, resolvedFacing, spawnDefinition.MaxHp, spawnOrder)
+		local unitInitialization = self:InitializeUnitState(enemy, unitId, "Enemy", startCell, resolvedFacing, spawnDefinition.MaxHp, spawnOrder)
+		if unitInitialization.Success == false then
+			log_error("[BattleWave] enemy initialization failed unit=" .. unitId .. " reason=" .. unitInitialization.Reason)
+			_EntityService:Destroy(enemy)
+			return nil
+		end
 		local enemyUnit = enemy:GetComponent("script.BattleUnitComponent")
 		if enemyUnit ~= nil then
 			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, spawnDefinition.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.TraitIds or "", spawnDefinition.IsBoss == true)
 			if enemyConfiguration.Success == false then
 				log_error("[EnemyData] apply failed unit=" .. unitId .. " reason=" .. enemyConfiguration.Reason)
+				_EntityService:Destroy(enemy)
+				return nil
 			end
 			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " traits=" .. enemyUnit.EnemyTraitIds .. " boss=" .. tostring(enemyUnit.IsBoss) .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
+		end
+		local registration = self:RegisterConfiguredUnit(enemy)
+		if registration.Success == false then
+			log_error("[BattleWave] enemy registration failed unit=" .. unitId .. " reason=" .. registration.Reason)
+			_EntityService:Destroy(enemy)
+			return nil
 		end
 		return enemy
 	end
@@ -776,6 +788,15 @@ script BattleSessionComponent extends Component
 				local unit = enemyEntity:GetComponent("script.BattleUnitComponent")
 				local plan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
 				if unit ~= nil and plan ~= nil and plan.PlanState ~= "EMPTY" then
+					local bossPhase = enemyEntity:GetComponent("script.BossPhaseStateComponent")
+					local bossPhaseId = ""
+					local bossPhaseIndex = 0
+					local bossPhaseRevision = 0
+					if bossPhase ~= nil then
+						bossPhaseId = bossPhase.PhaseId
+						bossPhaseIndex = bossPhase.PhaseIndex
+						bossPhaseRevision = bossPhase.PhaseRevision
+					end
 					local current = plan:GetCurrentAction()
 					local actionType = ""
 					local tileId = ""
@@ -805,7 +826,10 @@ script BattleSessionComponent extends Component
 						patternId ~= "" and patternId or "-",
 						tostring(stepIndex),
 						tostring(plan.PlanRevision),
-						plan.PlannedActionSnapshot ~= "" and plan.PlannedActionSnapshot or "-"
+						plan.PlannedActionSnapshot ~= "" and plan.PlannedActionSnapshot or "-",
+						bossPhaseId ~= "" and bossPhaseId or "-",
+						tostring(bossPhaseIndex),
+						tostring(bossPhaseRevision)
 					}, ","))
 				end
 			end
@@ -957,27 +981,39 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ConfigureUnit(Entity targetEntity, string unitId, string team, integer cellIndex, string facing, number maxHp, integer spawnOrder)
-		-- Writes the initial logical state and places the entity at its cell position.
-		if self:IsValidCell(cellIndex) == false then
-			log_error("[BattleSession] invalid initial cell=" .. cellIndex .. " unit=" .. unitId)
+		-- Convenience path for player units; enemies defer registry visibility until definition setup completes.
+		local initialization = self:InitializeUnitState(targetEntity, unitId, team, cellIndex, facing, maxHp, spawnOrder)
+		if initialization.Success == false then
+			log_error("[BattleSession] unit initialization failed unit=" .. unitId .. " reason=" .. initialization.Reason)
 			return
+		end
+		local registration = self:RegisterConfiguredUnit(targetEntity)
+		if registration.Success == false then
+			log_error("[BattleSession] registry rejected unit=" .. unitId .. " reason=" .. registration.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table InitializeUnitState(Entity targetEntity, string unitId, string team, integer cellIndex, string facing, number maxHp, integer spawnOrder)
+		-- Builds a complete unit object before it becomes visible to BoardState and turn planning.
+		if self:IsValidCell(cellIndex) == false then
+			return { Success = false, Reason = "INVALID_INITIAL_CELL" }
 		end
 
 		local unit = self:EnsureUnitComponent(targetEntity)
 		if unit == nil then
-			return
+			return { Success = false, Reason = "UNIT_COMPONENT_MISSING" }
 		end
 		self:EnsurePresentationComponent(targetEntity)
 		local skillRuntimeState = self:EnsureSkillRuntimeStateComponent(targetEntity)
 		if skillRuntimeState == nil then
-			return
+			return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" }
 		end
 		skillRuntimeState:ResetSkillRuntimeState("UNIT_CONFIGURED")
 
 		local initializeResult = unit:InitializeBattleState(unitId, team, cellIndex, facing, maxHp, spawnOrder)
 		if initializeResult.Success == false then
-			log_error("[BattleSession] unit initialization failed unit=" .. unitId .. " reason=" .. initializeResult.Reason)
-			return
+			return initializeResult
 		end
 		self:ApplyFacing(targetEntity, facing)
 
@@ -986,16 +1022,23 @@ script BattleSessionComponent extends Component
 		if team == "Player" and targetEntity.PlayerComponent ~= nil then
 			self:LockBoardCamera(self:GetBoardCenterX(), targetEntity.PlayerComponent.UserId)
 		end
+		return { Success = true, Reason = "UNIT_STATE_INITIALIZED", UnitId = unitId, PositionX = position.x }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RegisterConfiguredUnit(Entity targetEntity)
+		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then return { Success = false, Reason = "UNIT_COMPONENT_MISSING" } end
 		if self.BoardState == nil then
-			log_error("[BattleSession] registry missing during configure unit=" .. unitId)
-			return
+			return { Success = false, Reason = "REGISTRY_MISSING" }
 		end
 		local registerResult = self.BoardState:RegisterUnit(targetEntity)
 		if registerResult.Success == false then
-			log_error("[BattleSession] registry rejected unit=" .. unitId .. " reason=" .. registerResult.Reason)
-			return
+			return registerResult
 		end
-		log("[BattleSession] unit registered id=" .. unitId .. " team=" .. team .. " cell=" .. cellIndex .. " spawnOrder=" .. spawnOrder .. " x=" .. position.x)
+		local position = self:GetCellPosition(unit.CellIndex)
+		log("[BattleSession] unit registered id=" .. unit.UnitId .. " team=" .. unit.Team .. " cell=" .. unit.CellIndex .. " spawnOrder=" .. unit.SpawnOrder .. " x=" .. position.x)
+		return { Success = true, Reason = "UNIT_REGISTERED", UnitId = unit.UnitId }
 	end
 
 	@ExecSpace("Server")
@@ -1426,8 +1469,10 @@ script BattleSessionComponent extends Component
 			actionResult = self:TryFaceDirection(intent.EnemyId, intent.Direction)
 		elseif intent.ActionType == "TELEGRAPH_TILE" then
 			actionResult = { Success = true, Reason = "TELEGRAPH_COMPLETED" }
-		elseif intent.ActionType == "EXECUTE_TILE" and intent.TileId == "basic_slash" then
-			actionResult = self:TryBasicAttack(intent.EnemyId)
+		elseif intent.ActionType == "EXECUTE_TILE" then
+			-- Enemy Pattern TileId is a SkillId contract. Route every enemy attack through the same
+			-- data-driven skill pipeline used by players instead of branching on concrete skill IDs.
+			actionResult = self:TryExecuteSkill(intent.EnemyId, intent.TileId)
 		else
 			 actionResult = { Success = true, Reason = intent.Reason }
 		end
@@ -1441,7 +1486,7 @@ script BattleSessionComponent extends Component
 			reason = actionResult.Reason
 		end
 
-		local duration = self:GetEnemyActionDuration(intent.ActionType)
+		local duration = self:GetEnemyActionDuration(intent.ActionType, intent.TileId)
 		local complete = function()
 			self:CompletePreparedEnemyIntent(intent.EnemyId, intent.PatternId, intent.StepIndex, intent.ActionType, intent.TileId, intent.TelegraphTurnsRemaining, success, reason)
 		end
@@ -1474,14 +1519,15 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method number GetEnemyActionDuration(string actionType)
+	method number GetEnemyActionDuration(string actionType, string tileId)
 		-- Returns the presentation lock duration for each prepared enemy action meaning.
 		if actionType == "MOVE_TOWARD" or actionType == "MOVE_AWAY" or actionType == "MOVE_FIXED_FACING" then
 			return math.max(0.05, self.EnemyMoveActionDuration)
 		elseif actionType == "TURN_TO_PLAYER" then
 			return math.max(0.05, self.TurnActionDuration)
 		elseif actionType == "EXECUTE_TILE" then
-			return math.max(0.1, self.EnemyAttackActionDuration)
+			-- Keep the enemy turn open through the Skill's configured impact/presentation window.
+			return math.max(0.1, self:GetSkillActionDuration(tileId))
 		elseif actionType == "TELEGRAPH_TILE" then
 			return 0.05
 		end
@@ -1547,6 +1593,12 @@ script BattleSessionComponent extends Component
 		local patternRunner = enemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
 		if patternRunner == nil then
 			return { Success = false, Reason = "PATTERN_RUNNER_MISSING" }
+		end
+		if patternRunner.PatternId ~= patternId then
+			-- A boss may cross a phase threshold after this round's plan was frozen. The frozen
+			-- action still resolves, but its old Step must not advance the replacement Pattern.
+			log("[BattleEnemyIntent] pattern progression skipped enemy=" .. enemyId .. " oldPattern=" .. patternId .. " currentPattern=" .. patternRunner.PatternId .. " reason=PATTERN_SUPERSEDED")
+			return { Success = true, Reason = "PATTERN_SUPERSEDED", PreviousPatternId = patternId, CurrentPatternId = patternRunner.PatternId }
 		end
 		local stepResult = _EnemyPatternStepRepositoryLogic:GetPatternStep(patternId, stepIndex)
 		if stepResult.Success == false then
@@ -2300,9 +2352,6 @@ script BattleSessionComponent extends Component
 		end
 		self:ApplyRunJobConfiguration(runState)
 
-		local stageNumberText = string.match(stageId, "%d+")
-		local stageNumber = tonumber(stageNumberText) or runState.CurrentStageNumber
-		self.StageNumber = math.max(1, stageNumber)
 		local applyResult = self:LoadAndApplyStageDefinition(stageId)
 		if applyResult.Success == false then
 			result.Reason = applyResult.Reason
@@ -2386,13 +2435,21 @@ script BattleSessionComponent extends Component
 			for field in string.gmatch(entry, "([^,]+)") do
 				table.insert(fields, field)
 			end
-			if #fields == 14 and fields[1] ~= "" then
+			if #fields >= 14 and fields[1] ~= "" then
 				local unitId = self:DecodeEnemyPlanField(fields[1])
 				local traitIds = self:DecodeEnemyPlanField(fields[6])
 				local actionType = self:DecodeEnemyPlanField(fields[7])
 				local tileId = self:DecodeEnemyPlanField(fields[8])
 				local patternId = self:DecodeEnemyPlanField(fields[11])
 				local actionSnapshot = self:DecodeEnemyPlanField(fields[14])
+				local bossPhaseId = ""
+				local bossPhaseIndex = 0
+				local bossPhaseRevision = 0
+				if #fields >= 17 then
+					bossPhaseId = self:DecodeEnemyPlanField(fields[15])
+					bossPhaseIndex = math.floor(tonumber(fields[16]) or 0)
+					bossPhaseRevision = math.floor(tonumber(fields[17]) or 0)
+				end
 				local queuedTileIds = ""
 				for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
 					local actionFields = {}
@@ -2425,7 +2482,10 @@ script BattleSessionComponent extends Component
 					StepIndex = math.floor(tonumber(fields[12]) or 0),
 					Revision = math.floor(tonumber(fields[13]) or 0),
 					QueuedActionSnapshot = actionSnapshot,
-					QueuedTileIds = queuedTileIds
+					QueuedTileIds = queuedTileIds,
+					BossPhaseId = bossPhaseId,
+					BossPhaseIndex = bossPhaseIndex,
+					BossPhaseRevision = bossPhaseRevision
 				})
 			end
 		end
@@ -2574,6 +2634,14 @@ script BattleSessionComponent extends Component
 			TurnNumber = turnState.TurnNumber,
 			IsProcessing = turnState.IsActionProcessing,
 			BattleResult = self.BattleResult,
+			Stage = {
+				StageId = self.StageId,
+				RegionId = self.RegionId,
+				StageIndex = self.StageIndex,
+				StageType = self.StageType,
+				DisplayName = self.StageDisplayName,
+				SchemaVersion = self.StageSchemaVersion
+			},
 			Commands = {
 				CanMove = isIdlePlayerTurn,
 				CanTurn = isIdlePlayerTurn,
@@ -2794,6 +2862,9 @@ script BattleSessionComponent extends Component
 			EntryRequestId = self.EntryRequestId,
 			EntryMode = self.EntryMode,
 			StageId = self.StageId,
+			RegionId = self.RegionId,
+			StageIndex = self.StageIndex,
+			StageType = self.StageType,
 			StageDisplayName = self.StageDisplayName,
 			WaveTableId = self.WaveTableId,
 			NextStageId = self.NextStageId,
@@ -2874,7 +2945,7 @@ script BattleSessionComponent extends Component
 		self:CleanupRegisteredEnemies(reason)
 		self.PlayerEntity = playerEntity
 		self:ConfigureUnit(playerEntity, "player_01", "Player", self.PlayerStartCell, "Right", 100, 1)
-		self:StartStageById(self.StageId, self.StageNumber)
+		self:StartStageById(self.StageId)
 
 		result.Success = true
 		result.Reason = reason
