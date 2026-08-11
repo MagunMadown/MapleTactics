@@ -135,6 +135,8 @@ script BattleSessionComponent extends Component
 	property integer LastEnemySpawnOrder = 0
 	property integer CurrentPlayerActionKillCount = 0
 	property integer ConsumableRequestSequence = 0
+	property boolean EntryPolicyResolved = false
+	property integer LastInitializedEntryRequestId = 0
 
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
@@ -236,18 +238,11 @@ script BattleSessionComponent extends Component
 			return
 		end
 
-		if self.AutoStartPrototypeBattle == false then
-			log("[BattleSession] waiting for BattleGateway entry")
-			return
-		end
-		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
-		if users ~= nil then
-			for _, player in ipairs(users) do
-				self:RegisterPlayer(player)
-			end
-		end
-
-		self:StartStage(1)
+		-- The map component can begin before the transferred player is visible. OnUpdate
+		-- routes the first visible player through OnMapEnter so PREPARED always wins.
+		self.EntryPolicyResolved = false
+		self.LastInitializedEntryRequestId = 0
+		log("[BattleSession] waiting for player entry policy")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -281,20 +276,21 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void OnUpdate(number delta)
-		-- Polls only during Setup so a player spawned after the map component can be registered.
-		if self.BattlePhase ~= "Setup" then
+		-- Route the first visible player through the existing entry path exactly once.
+		if self.EntryPolicyResolved == false then
+			local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
+			if users ~= nil then
+				for _, player in ipairs(users) do
+					self:OnMapEnter(player)
+					break
+				end
+			end
 			return
 		end
 
-		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
-		if users ~= nil then
-			for _, player in ipairs(users) do
-				self:RegisterPlayer(player)
-				break
-			end
+		if self.BattlePhase == "Setup" then
+			self:TryStartBattle()
 		end
-
-		self:TryStartBattle()
 	end
 
 	@ExecSpace("ServerOnly")
@@ -303,21 +299,33 @@ script BattleSessionComponent extends Component
 		if enteredEntity == nil or enteredEntity.PlayerComponent == nil then
 			return
 		end
+		if self.EntryPolicyResolved == true then
+			log("[BattleSession] duplicate map entry ignored player=" .. enteredEntity.Name)
+			return
+		end
+
+		log("[BattleSession] map entered player=" .. enteredEntity.Name)
 
 		local entryState = enteredEntity:GetComponent("script.BattleEntryStateComponent")
 		if entryState ~= nil and entryState.EntryState == "PREPARED" then
+			self.EntryPolicyResolved = true
+			log("[BattleSession] prepared entry detected, prototype auto start skipped request=" .. entryState.RequestId)
 			local entryResult = _BattleGatewayLogic:ConsumePreparedBattle(enteredEntity, self)
 			if entryResult.Success == true then
 				return
 			end
-			log_warning("[BattleSession] prepared entry fallback request=" .. entryState.RequestId .. " reason=" .. entryResult.Reason)
+			log_warning("[BattleSession] prepared entry blocked request=" .. entryState.RequestId .. " reason=" .. entryResult.Reason)
+			return
 		end
 		if self.AutoStartPrototypeBattle == false then
+			self.EntryPolicyResolved = true
 			log("[BattleSession] player waiting for prepared entry player=" .. enteredEntity.Name)
 			return
 		end
+		self.EntryPolicyResolved = true
+		log("[BattleSession] no prepared entry, prototype auto start player=" .. enteredEntity.Name)
 		self:RegisterPlayer(enteredEntity)
-		self:TryStartBattle()
+		self:StartStage(1)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -340,6 +348,7 @@ script BattleSessionComponent extends Component
 			log_error("[BattleSession] stage start rejected stage=" .. stageId .. " reason=" .. stageResult.Reason .. " detail=" .. (stageResult.DetailReason or ""))
 			return
 		end
+		log("[BattleSession] stage definition loaded stageId=" .. self.StageId)
 		self.StageTurnNumber = 0
 		self.BattleResult = ""
 		self.DropRuntime:ResetDropState("STAGE_START")
@@ -490,6 +499,7 @@ script BattleSessionComponent extends Component
 		self:ScheduleForcedSpawnTimer()
 		local livingTotal = #self.BoardState:CollectLivingEnemies()
 		log("[BattleWave] spawned stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " seed=" .. self.RunSeed .. " enemies=" .. spawnedCount .. " livingTotal=" .. livingTotal .. " composition=" .. table.concat(compositionIds, ",") .. " mode=" .. self.CurrentWaveSpawnMode .. " forceTurns=" .. self.ForceAfterTurns .. " forceSeconds=" .. self.ForceAfterSeconds)
+		log("[BattleSession] wave spawned wave=" .. waveNumber .. " enemies=" .. spawnedCount)
 		if waveNumber == 1 then
 			self:TryStartBattle()
 		end
@@ -2271,6 +2281,12 @@ script BattleSessionComponent extends Component
 			result.Reason = "INVALID_STAGE_ID"
 			return result
 		end
+		if requestId > 0 and requestId == self.LastInitializedEntryRequestId then
+			result.Reason = "DUPLICATE_ENTRY_INITIALIZATION"
+			log_warning("[BattleSession] duplicate entry initialization blocked request=" .. requestId .. " stageId=" .. stageId)
+			return result
+		end
+		log("[BattleSession] initialize from entry stageId=" .. stageId .. " request=" .. requestId)
 		local stageValidation = _ContentValidatorLogic:ValidateStageById(stageId)
 		if stageValidation.Success == false then
 			result.Reason = stageValidation.Reason
@@ -2319,6 +2335,9 @@ script BattleSessionComponent extends Component
 		local rebuildResult = self:RebuildBattleState("BATTLE_ENTRY")
 		result.Success = rebuildResult.Success
 		result.Reason = rebuildResult.Reason
+		if result.Success == true then
+			self.LastInitializedEntryRequestId = requestId
+		end
 		log("[BattleSession] entry initialized request=" .. requestId .. " stage=" .. self.StageId .. " character=" .. self.SelectedCharacterId .. " job=" .. self.SelectedJobId .. " loadout=" .. self.SelectedLoadoutId .. " seed=" .. self.RunSeed .. " mode=" .. self.EntryMode .. " success=" .. tostring(result.Success))
 		return result
 	end
@@ -4083,6 +4102,7 @@ script BattleSessionComponent extends Component
 		self.StageTurnNumber = 1
 		self:ProcessAugmentTrigger("TURN_START", "TURN:1", 0)
 		log("[BattleSession] ready phase=" .. self.BattlePhase .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " playerCell=" .. self.PlayerStartCell .. " livingEnemies=" .. #livingEnemies .. " enemyHp=" .. self.CurrentEnemyMaxHp)
+		log("[BattleSession] battle started stageId=" .. self.StageId .. " wave=" .. self.CurrentWave)
 		self:PrepareEnemyIntent()
 	end
 
