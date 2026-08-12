@@ -1,0 +1,237 @@
+@Logic
+script BattleHudPresenterLogic extends Logic
+
+	property number RefreshInterval = 0.05
+	property number RefreshElapsed = 0
+	property integer StateRevision = 0
+	property integer LastCommandRevision = -1
+	property string LastSignature = ""
+	property table CurrentState = nil
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		log("[BattleHudPresenter] ready")
+		self:RefreshState(true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		self.RefreshElapsed = self.RefreshElapsed + delta
+		if self.RefreshElapsed < self.RefreshInterval then
+			return
+		end
+
+		self.RefreshElapsed = 0
+		self:RefreshState(false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetCurrentState()
+		if self.CurrentState == nil then
+			return {
+				Success = false,
+				ContextVisible = false,
+				ContextReason = "NOT_INITIALIZED",
+				Revision = self.StateRevision,
+				RevisionKey = "Unavailable:NOT_INITIALIZED"
+			}
+		end
+		return self.CurrentState
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshState(boolean force)
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishUnavailableState("BATTLE_CONTEXT_MISSING", force)
+			return
+		end
+
+		local uiState = session:GetBattleUiState()
+		if uiState == nil or uiState.Success == false then
+			self:PublishUnavailableState(uiState == nil and "UI_STATE_MISSING" or uiState.Reason, force)
+			return
+		end
+
+		local waveState = self:GetBattleWaveState()
+		if waveState == nil then
+			self:PublishUnavailableState("WAVE_STATE_MISSING", force)
+			return
+		end
+
+		local runFlowUi = _RunManagerLogic:GetLocalRunFlowUiState()
+		local runFlowRevision = ""
+		if runFlowUi ~= nil and runFlowUi.Success == true then
+			runFlowRevision = runFlowUi.RevisionKey
+		end
+
+		local signature = tostring(session.StageNumber) .. ":" .. tostring(session.StageTurnNumber) .. ":" .. uiState.RevisionKey .. ":" .. tostring(waveState.CurrentWaveSpawnMode) .. ":" .. tostring(waveState.ForceAfterTurns) .. ":" .. tostring(waveState.WaveSpawnStageTurn) .. ":" .. tostring(waveState.ForceSpawnPending) .. ":" .. tostring(waveState.ForceSpawnPendingReason) .. ":" .. tostring(uiState.Drops.Revision) .. ":" .. tostring(uiState.RunInventory.Revision) .. ":" .. runFlowRevision
+		if force == false and self.LastSignature == signature then
+			return
+		end
+
+		self.LastSignature = signature
+		self.StateRevision = self.StateRevision + 1
+		self.CurrentState = {
+			Success = true,
+			ContextVisible = true,
+			ContextReason = "BATTLE_CONTEXT_READY",
+			Revision = self.StateRevision,
+			RevisionKey = signature,
+			Session = {
+				StageNumber = session.StageNumber,
+				StageTurnNumber = session.StageTurnNumber,
+				PreparedEnemyIntentState = session.PreparedEnemyIntentState,
+				PreparedEnemyActionType = session.PreparedEnemyActionType,
+				PreparedEnemyTileId = session.PreparedEnemyTileId,
+				PreparedEnemyTelegraphTurnsRemaining = session.PreparedEnemyTelegraphTurnsRemaining,
+				PreparedEnemyTurn = session.PreparedEnemyTurn,
+				BattleResult = session.BattleResult
+			},
+			Turn = {
+				BattlePhase = uiState.Phase,
+				TurnNumber = uiState.TurnNumber,
+				QueuedTileIds = uiState.PlayerQueue.QueuedTileIds,
+				ExecutingTileIds = uiState.PlayerQueue.ExecutingTileIds,
+				ExecutingTileIndex = uiState.PlayerQueue.ExecutingIndex,
+				QueuedTileCount = uiState.PlayerQueue.Count,
+				TileQueueCapacity = uiState.PlayerQueue.EffectiveCapacity,
+				QueuedActionType = uiState.LastCommand.Type,
+				IsActionProcessing = uiState.IsProcessing
+			},
+			Wave = {
+				CurrentWave = uiState.Wave.Current,
+				TotalWaves = uiState.Wave.Total,
+				WaveState = uiState.Wave.State,
+				CurrentWaveSpawnMode = waveState.CurrentWaveSpawnMode,
+				ForceAfterTurns = waveState.ForceAfterTurns,
+				WaveSpawnStageTurn = waveState.WaveSpawnStageTurn,
+				ForceSpawnPending = waveState.ForceSpawnPending,
+				ForceSpawnPendingReason = waveState.ForceSpawnPendingReason
+			},
+			UiState = uiState,
+			RunFlowUi = runFlowUi
+		}
+
+		self:PublishStateChanged("BATTLE_CONTEXT_READY")
+		self:PublishAuthoritativeCommandResult(uiState.LastCommand)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PublishUnavailableState(string reason, boolean force)
+		local signature = "Unavailable:" .. tostring(reason)
+		if force == false and self.LastSignature == signature then
+			return
+		end
+
+		self.LastSignature = signature
+		self.StateRevision = self.StateRevision + 1
+		self.CurrentState = {
+			Success = false,
+			ContextVisible = false,
+			ContextReason = reason,
+			Revision = self.StateRevision,
+			RevisionKey = signature
+		}
+		self:PublishStateChanged(reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PublishStateChanged(string reason)
+		local state = self:GetCurrentState()
+		local event = BattleHudStateChangedEvent()
+		event.Revision = state.Revision
+		event.RevisionKey = state.RevisionKey
+		event.ContextVisible = state.ContextVisible
+		event.Reason = reason
+		self:SendEvent(event)
+		log("[BattleHudPresenter] state revision=" .. tostring(state.Revision) .. " visible=" .. tostring(state.ContextVisible) .. " reason=" .. tostring(reason))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PublishAuthoritativeCommandResult(table lastCommand)
+		if lastCommand == nil or lastCommand.Revision == nil or lastCommand.Revision <= 0 or lastCommand.Type == nil or lastCommand.Type == "" then
+			return
+		end
+		if lastCommand.Revision <= self.LastCommandRevision then
+			return
+		end
+
+		self.LastCommandRevision = lastCommand.Revision
+		self:PublishCommandResult(lastCommand.Type, lastCommand.Success, lastCommand.Reason, lastCommand.Revision)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PublishCommandResult(string commandType, boolean success, string reason, integer revision)
+		local event = BattleHudCommandResultEvent()
+		event.CommandType = commandType
+		event.Success = success
+		event.Reason = reason
+		event.Revision = revision
+		self:SendEvent(event)
+		log("[BattleHudPresenter] command type=" .. tostring(commandType) .. " success=" .. tostring(success) .. " reason=" .. tostring(reason) .. " revision=" .. tostring(revision))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestQueueTile(string tileId)
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishCommandResult("QUEUE_TILE", false, "SESSION_MISSING", 0)
+			return
+		end
+		session:RequestQueueTile(tileId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestExecuteQueue()
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishCommandResult("EXECUTE_QUEUE", false, "SESSION_MISSING", 0)
+			return
+		end
+		session:RequestExecuteQueuedTile()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestClearQueue()
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishCommandResult("CLEAR_QUEUE", false, "SESSION_MISSING", 0)
+			return
+		end
+		session:RequestClearQueuedTile()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestResetBattle()
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishCommandResult("RESET_BATTLE", false, "SESSION_MISSING", 0)
+			return
+		end
+		session:RequestResetBattle()
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetBattleSession()
+		local player = _UserService.LocalPlayer
+		if player == nil or player.CurrentMap == nil then
+			return nil
+		end
+		return player.CurrentMap:GetComponent("script.BattleSessionComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetBattleWaveState()
+		local player = _UserService.LocalPlayer
+		if player == nil or player.CurrentMap == nil then
+			return nil
+		end
+		local stateEntity = player.CurrentMap:GetChildByName("BattleWaveState")
+		if stateEntity == nil then
+			return player.CurrentMap:GetComponent("script.BattleWaveComponent")
+		end
+		return stateEntity:GetComponent("script.BattleWaveComponent")
+	end
+
+end

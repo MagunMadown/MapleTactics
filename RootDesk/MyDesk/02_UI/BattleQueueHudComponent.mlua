@@ -17,11 +17,11 @@ script BattleQueueHudComponent extends Component
 	property ButtonComponent ResetButton = "bf41edb1-bbbf-44d6-9d43-630e31343807"
 	property SpriteGUIRendererComponent ResetButtonSprite = "bf41edb1-bbbf-44d6-9d43-630e31343807"
 	property TextGUIRendererComponent ResetButtonText = "bf41edb1-bbbf-44d6-9d43-630e31343807"
-	property number RefreshInterval = 0.05
-	property number RefreshElapsed = 0
 	property string LastSignature = ""
 	property boolean HasHudContextState = false
 	property boolean IsHudContextVisible = false
+	property any PresenterStateChangedHandler = nil
+	property any PresenterCommandResultHandler = nil
 	property any BasicSlashClickHandler = nil
 	property any HeavySlashClickHandler = nil
 	property any PushClickHandler = nil
@@ -31,9 +31,11 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
-		-- The HUD reads turn state from BattleTurnComponent and sends commands through BattleSessionComponent.
+		-- The view binds UI controls and consumes presentation state without reading battle components directly.
 		log("[BattleQueueHUD] ready")
 		self:SetHudContextVisible(false, "INITIALIZING")
+		self.PresenterStateChangedHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudStateChangedEvent, self.OnPresenterStateChanged)
+		self.PresenterCommandResultHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudCommandResultEvent, self.OnPresenterCommandResult)
 		self.BasicSlashClickHandler = self.BasicSlashButton.Entity:ConnectEvent(ButtonClickEvent, self.OnBasicSlashClicked)
 		self.HeavySlashClickHandler = self.HeavySlashButton.Entity:ConnectEvent(ButtonClickEvent, self.OnHeavySlashClicked)
 		self.PushClickHandler = self.PushButton.Entity:ConnectEvent(ButtonClickEvent, self.OnPushClicked)
@@ -46,6 +48,14 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
 		-- Disconnects button callbacks so UI reloads cannot duplicate tile requests.
+		if self.PresenterStateChangedHandler ~= nil then
+			_BattleHudPresenterLogic:DisconnectEvent(BattleHudStateChangedEvent, self.PresenterStateChangedHandler)
+			self.PresenterStateChangedHandler = nil
+		end
+		if self.PresenterCommandResultHandler ~= nil then
+			_BattleHudPresenterLogic:DisconnectEvent(BattleHudCommandResultEvent, self.PresenterCommandResultHandler)
+			self.PresenterCommandResultHandler = nil
+		end
 		if self.BasicSlashClickHandler ~= nil then
 			self.BasicSlashButton.Entity:DisconnectEvent(ButtonClickEvent, self.BasicSlashClickHandler)
 			self.BasicSlashClickHandler = nil
@@ -73,37 +83,22 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method void OnUpdate(number delta)
-		-- A short poll also covers sync updates that arrive after UI initialization.
-		self.RefreshElapsed = self.RefreshElapsed + delta
-		if self.RefreshElapsed < self.RefreshInterval then
-			return
-		end
-
-		self.RefreshElapsed = 0
-		self:RefreshHud(false)
-	end
-
-	@ExecSpace("ClientOnly")
 	method void RefreshHud(boolean force)
-		-- Mirrors the registered tile, running action, phase, and input availability from the map session.
-		local session = self:GetBattleSession()
-		local turnState = self:GetBattleTurnState()
-		local waveState = self:GetBattleWaveState()
-		if session == nil or turnState == nil or waveState == nil then
-			self:SetHudContextVisible(false, "BATTLE_CONTEXT_MISSING")
+		-- Renders the latest Presenter snapshot; this view has no map/session/runtime dependencies.
+		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
+		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
+			local reason = presenterState == nil and "PRESENTER_STATE_MISSING" or presenterState.ContextReason
+			self:SetHudContextVisible(false, reason)
 			self:SetUnavailableState("전투 상태 없음")
 			return
 		end
-		local uiState = session:GetBattleUiState()
-		if uiState == nil or uiState.Success == false then
-			self:SetHudContextVisible(false, uiState == nil and "UI_STATE_MISSING" or uiState.Reason)
-			self:SetUnavailableState(uiState == nil and "UI 상태 없음" or uiState.Reason)
-			return
-		end
+		local session = presenterState.Session
+		local turnState = presenterState.Turn
+		local waveState = presenterState.Wave
+		local uiState = presenterState.UiState
 		self:SetHudContextVisible(true, "BATTLE_CONTEXT_READY")
 		local queueState = uiState.PlayerQueue
-		local runFlowUi = _RunManagerLogic:GetLocalRunFlowUiState()
+		local runFlowUi = presenterState.RunFlowUi
 		local runFlowRevision = ""
 		if runFlowUi ~= nil and runFlowUi.Success == true then
 			runFlowRevision = runFlowUi.RevisionKey
@@ -144,7 +139,7 @@ script BattleQueueHudComponent extends Component
 		local reinforcementLabel = self:GetReinforcementLabel(session.StageTurnNumber, waveState)
 		local cooldownSnapshot = uiState.CooldownSnapshot
 		local cooldownLabel = self:GetCooldownLabel(cooldownSnapshot)
-		local signature = session.StageNumber .. ":" .. session.StageTurnNumber .. ":" .. uiState.RevisionKey .. ":" .. waveState.CurrentWaveSpawnMode .. ":" .. waveState.ForceAfterTurns .. ":" .. waveState.WaveSpawnStageTurn .. ":" .. tostring(waveState.ForceSpawnPending) .. ":" .. waveState.ForceSpawnPendingReason .. ":" .. tostring(uiState.Drops.Revision) .. ":" .. tostring(uiState.RunInventory.Revision) .. ":" .. runFlowRevision
+		local signature = presenterState.RevisionKey .. ":" .. runFlowRevision
 		if force == false and self.LastSignature == signature then
 			return
 		end
@@ -176,6 +171,16 @@ script BattleQueueHudComponent extends Component
 		self:SetResultVisibility(uiState.BattleResult)
 
 		log("[BattleQueueHUD] refreshed stage=" .. session.StageNumber .. " wave=" .. waveState.CurrentWave .. "/" .. waveState.TotalWaves .. " waveState=" .. waveState.WaveState .. " reinforcement=" .. reinforcementLabel .. " phase=" .. turnState.BattlePhase .. " turn=" .. turnState.TurnNumber .. " queued=" .. turnState.QueuedTileIds .. " executing=" .. turnState.ExecutingTileIds .. " index=" .. turnState.ExecutingTileIndex .. " count=" .. turnState.QueuedTileCount .. "/" .. turnState.TileQueueCapacity .. " action=" .. turnState.QueuedActionType .. " processing=" .. tostring(turnState.IsActionProcessing) .. " cooldowns=" .. cooldownSnapshot .. " intentState=" .. session.PreparedEnemyIntentState .. " intentAction=" .. session.PreparedEnemyActionType .. " intentTile=" .. session.PreparedEnemyTileId .. " intentTelegraphRemaining=" .. session.PreparedEnemyTelegraphTurnsRemaining .. " intentTurn=" .. session.PreparedEnemyTurn .. " result=" .. session.BattleResult)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnPresenterStateChanged(BattleHudStateChangedEvent stateChangedEvent)
+		self:RefreshHud(true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnPresenterCommandResult(BattleHudCommandResultEvent commandResultEvent)
+		log("[BattleQueueHUD] command result type=" .. commandResultEvent.CommandType .. " success=" .. tostring(commandResultEvent.Success) .. " reason=" .. commandResultEvent.Reason .. " revision=" .. tostring(commandResultEvent.Revision))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -268,52 +273,6 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method any GetBattleSession()
-		-- Returns the local player's current map-scoped battle session component.
-		local player = _UserService.LocalPlayer
-		if player == nil or player.CurrentMap == nil then
-			return nil
-		end
-
-		return player.CurrentMap:GetComponent("script.BattleSessionComponent")
-	end
-
-	@ExecSpace("ClientOnly")
-	method any GetBattleTurnState()
-		local player = _UserService.LocalPlayer
-		if player == nil or player.CurrentMap == nil then
-			return nil
-		end
-		local stateEntity = player.CurrentMap:GetChildByName("BattleTurnState")
-		if stateEntity == nil then
-			return player.CurrentMap:GetComponent("script.BattleTurnComponent")
-		end
-		return stateEntity:GetComponent("script.BattleTurnComponent")
-	end
-
-	@ExecSpace("ClientOnly")
-	method any GetBattleWaveState()
-		local player = _UserService.LocalPlayer
-		if player == nil or player.CurrentMap == nil then
-			return nil
-		end
-		local stateEntity = player.CurrentMap:GetChildByName("BattleWaveState")
-		if stateEntity == nil then
-			return player.CurrentMap:GetComponent("script.BattleWaveComponent")
-		end
-		return stateEntity:GetComponent("script.BattleWaveComponent")
-	end
-
-	@ExecSpace("ClientOnly")
-	method any GetLocalSkillRuntimeState()
-		local player = _UserService.LocalPlayer
-		if player == nil then
-			return nil
-		end
-		return player:GetComponent("script.SkillRuntimeStateComponent")
-	end
-
-	@ExecSpace("ClientOnly")
 	method integer GetCooldownTurns(string cooldownSnapshot, string skillId)
 		for entry in string.gmatch(cooldownSnapshot, "([^|]+)") do
 			local entrySkillId = string.match(entry, "^([^:]+):")
@@ -368,80 +327,39 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnBasicSlashClicked()
-		-- Requests registration of the first minimal attack tile without executing it immediately.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] register click ignored reason=SESSION_MISSING")
-			return
-		end
-
+		-- Delegates the command to the Presenter so the view never resolves the battle session.
 		log("[BattleQueueHUD] register clicked tile=basic_slash")
-		session:RequestQueueTile("basic_slash")
+		_BattleHudPresenterLogic:RequestQueueTile("basic_slash")
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnHeavySlashClicked()
-		-- Registers the second attack tile while preserving the same one-slot queue rules.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] register click ignored tile=heavy_slash reason=SESSION_MISSING")
-			return
-		end
-
 		log("[BattleQueueHUD] register clicked tile=heavy_slash")
-		session:RequestQueueTile("heavy_slash")
+		_BattleHudPresenterLogic:RequestQueueTile("heavy_slash")
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnPushClicked()
-		-- Registers a displacement tile that moves the current front target one cell away at impact time.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] register click ignored tile=push reason=SESSION_MISSING")
-			return
-		end
-
 		log("[BattleQueueHUD] register clicked tile=push")
-		session:RequestQueueTile("push")
+		_BattleHudPresenterLogic:RequestQueueTile("push")
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnExecuteClicked()
-		-- Requests execution of the currently registered tile through the server battle session.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] execute click ignored reason=SESSION_MISSING")
-			return
-		end
-
 		log("[BattleQueueHUD] execute clicked")
-		session:RequestExecuteQueuedTile()
+		_BattleHudPresenterLogic:RequestExecuteQueue()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnClearClicked()
-		-- Requests removal of the registered tile without consuming the player's turn.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] clear click ignored reason=SESSION_MISSING")
-			return
-		end
-
 		log("[BattleQueueHUD] clear clicked")
-		session:RequestClearQueuedTile()
+		_BattleHudPresenterLogic:RequestClearQueue()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnResetClicked()
-		-- Requests restoration of the current map-scoped battle after a final result.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] reset click ignored reason=SESSION_MISSING")
-			return
-		end
-
 		log("[BattleQueueHUD] reset clicked")
-		session:RequestResetBattle()
+		_BattleHudPresenterLogic:RequestResetBattle()
 	end
 
 	@ExecSpace("ClientOnly")
