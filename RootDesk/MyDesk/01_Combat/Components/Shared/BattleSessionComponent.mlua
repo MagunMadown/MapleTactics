@@ -54,6 +54,13 @@ script BattleSessionComponent extends Component
 	@Sync property string SelectedJobMechanicId = "NONE"
 	@Sync property string SelectedJobPassiveSetId = ""
 	@Sync property string SelectedJobStartingSkillIds = ""
+	@Sync property string SkillSlotIds = ""
+	@Sync property string SkillSlotNames = ""
+	property string SkillSlotSourceSnapshot = ""
+	property integer SkillSlotCount = 3
+	-- One knob for how fast every skill plays. Above 1 speeds the swing, the effects, the impact frame,
+	-- and the queue slot together, so presentation and pacing never drift apart.
+	@Sync property number SkillSpeedMultiplier = 1.25
 	@Sync property integer SelectedJobBaseMaxHp = 0
 	@Sync property integer SelectedJobBaseQueueCapacity = 0
 	@Sync property integer SelectedJobRevision = 0
@@ -109,6 +116,10 @@ script BattleSessionComponent extends Component
 	property number PushMotionPlayRate = 0.9
 	property number PushMotionDuration = 0.40
 	property number PushImpactDelay = 0.18
+	property string ActiveEffectSkillId = ""
+	property string ActiveHitEffectRuid = ""
+	property number ActiveEffectScale = 1
+	property boolean ActiveEffectFlipX = false
 	property number MoveActionDuration = 0.12
 	property number TurnActionDuration = 0.12
 	property number BasicAttackActionDuration = 0.45
@@ -148,12 +159,6 @@ script BattleSessionComponent extends Component
 		if event.key == KeyboardKey.Space then
 			log("[BattleInput] turn requested")
 			self:RequestTurn()
-			return
-		end
-
-		if event.key == KeyboardKey.F then
-			log("[BattleInput] basic attack requested")
-			self:RequestBasicAttack()
 			return
 		end
 
@@ -1084,7 +1089,7 @@ script BattleSessionComponent extends Component
 		-- Accepts at most one player action and keeps the slot occupied until presentation time ends.
 		local result = { Success = false, Reason = "UNKNOWN" }
 
-		if actionType ~= "MOVE" and actionType ~= "TURN" and actionType ~= "BASIC_ATTACK" and actionType ~= "HEAVY_SLASH" then
+		if actionType ~= "MOVE" and actionType ~= "TURN" then
 			result.Reason = "INVALID_ACTION"
 			return result
 		end
@@ -1121,10 +1126,6 @@ script BattleSessionComponent extends Component
 			actionResult = self:TryMove("player_01", direction)
 		elseif actionType == "TURN" then
 			actionResult = self:TryTurn("player_01")
-		elseif actionType == "BASIC_ATTACK" then
-			actionResult = self:TryBasicAttack("player_01")
-		elseif actionType == "HEAVY_SLASH" then
-			actionResult = self:TryHeavySlash("player_01")
 		end
 
 		if actionResult == nil or actionResult.Success == false then
@@ -1149,10 +1150,6 @@ script BattleSessionComponent extends Component
 			return math.max(0.05, self.MoveActionDuration)
 		elseif actionType == "TURN" then
 			return math.max(0.05, self.TurnActionDuration)
-		elseif actionType == "BASIC_ATTACK" then
-			return math.max(0.1, self.BasicAttackActionDuration)
-		elseif actionType == "HEAVY_SLASH" then
-			return math.max(0.1, self.HeavySlashActionDuration)
 		elseif actionType == "PUSH" then
 			return math.max(0.1, self.PushActionDuration)
 		end
@@ -1487,9 +1484,8 @@ script BattleSessionComponent extends Component
 			actionResult = self:TryFaceDirection(intent.EnemyId, intent.Direction)
 		elseif intent.ActionType == "TELEGRAPH_TILE" then
 			actionResult = { Success = true, Reason = "TELEGRAPH_COMPLETED" }
-		elseif intent.ActionType == "EXECUTE_TILE" then
-			-- Enemy Pattern TileId is a SkillId contract. Route every enemy attack through the same
-			-- data-driven skill pipeline used by players instead of branching on concrete skill IDs.
+		elseif intent.ActionType == "EXECUTE_TILE" and intent.TileId ~= "" then
+			-- Resolves the pattern's TileId through the enemy-only skill table and shared skill pipeline.
 			actionResult = self:TryExecuteSkill(intent.EnemyId, intent.TileId)
 		else
 			 actionResult = { Success = true, Reason = intent.Reason }
@@ -1870,26 +1866,6 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
-	method void RequestBasicAttack()
-		-- Validates the requesting client before resolving a basic front-cell attack.
-		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil then
-			log_warning("[BattleAttack] rejected reason=PLAYER_MISSING")
-			return
-		end
-
-		if self.PlayerEntity.PlayerComponent.UserId ~= senderUserId then
-			log_warning("[BattleAttack] rejected reason=INVALID_SENDER")
-			return
-		end
-
-		local result = self:TryQueuePlayerAction("BASIC_ATTACK", 0)
-		self:PublishPlayerCommandResult("BASIC_ATTACK", result)
-		if result.Success == false then
-			log_warning("[BattleQueue] rejected action=BASIC_ATTACK reason=" .. result.Reason)
-		end
-	end
-
-	@ExecSpace("Server")
 	method void RequestQueueTile(string tileId)
 		-- Validates the requesting player before registering one supported tile in the queue slot.
 		if self:IsValidPlayerRequest(senderUserId) == false then
@@ -2206,11 +2182,13 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method number GetSkillActionDuration(string skillId)
+		-- Scaled by the same multiplier as the motion, so the queue slot frees when the swing ends
+		-- instead of holding the turn for the original 1x duration.
 		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
 		if validation.Success == false then
 			return 0.1
 		end
-		return math.max(0.1, validation.Data.Definition.ActionDuration)
+		return math.max(0.1, validation.Data.Definition.ActionDuration / self:GetSkillSpeedMultiplier())
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2296,6 +2274,63 @@ script BattleSessionComponent extends Component
 		self.SelectedJobBaseQueueCapacity = runState.JobBaseQueueCapacity
 		self.SelectedJobRevision = runState.JobRevision
 		log("[BattleJob] configuration applied job=" .. self.SelectedJobId .. " mechanic=" .. self.SelectedJobMechanicId .. " passive=" .. self.SelectedJobPassiveSetId .. " hp=" .. self.SelectedJobBaseMaxHp .. " queue=" .. self.SelectedJobBaseQueueCapacity .. " skills=" .. self.SelectedJobStartingSkillIds .. " revision=" .. self.SelectedJobRevision)
+		self:RefreshSkillSlots("JOB_APPLIED")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshSkillSlots(string reason)
+		-- Draws this battle's HUD slots at random from the skills the player actually owns, and resolves
+		-- their display names here because the skill DataSets are server-only and the HUD cannot read them.
+		-- Re-rolls only when the owned set changes, so slots stay stable for the duration of a battle.
+		local ownedSnapshot = ""
+		if isvalid(self.PlayerEntity) then
+			local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+			if inventory ~= nil then
+				ownedSnapshot = inventory.RunSkillSnapshot
+			end
+		end
+		if ownedSnapshot == "" then
+			ownedSnapshot = self.SelectedJobStartingSkillIds
+		end
+		if ownedSnapshot == self.SkillSlotSourceSnapshot then
+			return
+		end
+		self.SkillSlotSourceSnapshot = ownedSnapshot
+
+		local candidates = {}
+		local seen = {}
+		for token in string.gmatch(ownedSnapshot or "", "([^|]+)") do
+			-- Inventory snapshot entries carry an owned-amount suffix ("brandish~1"); only the id selects a slot.
+			local skillId = string.match(token, "^([^~]+)")
+			if skillId ~= nil and skillId ~= "" and seen[skillId] == nil then
+				seen[skillId] = true
+				table.insert(candidates, skillId)
+			end
+		end
+
+		-- Fisher-Yates so every owned skill has an equal chance of reaching a slot.
+		for index = #candidates, 2, -1 do
+			local swap = _UtilLogic:RandomIntegerRange(1, index)
+			local held = candidates[index]
+			candidates[index] = candidates[swap]
+			candidates[swap] = held
+		end
+
+		local slotIds = {}
+		local slotNames = {}
+		local slotCount = math.min(self.SkillSlotCount, #candidates)
+		for index = 1, slotCount do
+			local skillId = candidates[index]
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+			if definition.Success == true then
+				table.insert(slotIds, skillId)
+				table.insert(slotNames, definition.DisplayName)
+			end
+		end
+
+		self.SkillSlotIds = table.concat(slotIds, "|")
+		self.SkillSlotNames = table.concat(slotNames, "|")
+		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " slots=" .. self.SkillSlotIds .. " names=" .. self.SkillSlotNames)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2981,79 +3016,6 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method table TryPush(string sourceUnitId)
-		return self:TryExecuteSkill(sourceUnitId, "push")
-	end
-
-	@ExecSpace("ServerOnly")
-	method table TryPushWithDefinition(string sourceUnitId, table definition, table effectStep)
-		-- Starts the push presentation, then resolves board displacement at the configured impact frame.
-		local result = {
-			Success = false,
-			Reason = "UNKNOWN",
-			SourceUnitId = sourceUnitId
-		}
-
-		local sourceEntity = self:FindUnitEntity(sourceUnitId)
-		if isvalid(sourceEntity) == false then
-			result.Reason = "SOURCE_NOT_FOUND"
-			return result
-		end
-
-		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
-		if sourceUnit == nil then
-			result.Reason = "SOURCE_COMPONENT_MISSING"
-			return result
-		end
-		if self:IsTeamTurn(sourceUnit.Team) == false then
-			result.Reason = "INVALID_PHASE"
-			return result
-		end
-		if sourceUnit.IsDead == true then
-			result.Reason = "SOURCE_DEAD"
-			return result
-		end
-
-		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
-		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if sourcePresentation ~= nil and sourceEntity.PlayerControllerComponent ~= nil then
-			sourcePresentation:PlayCombatMotion(
-				sourceUnitId,
-				motionProfile.MotionKey,
-				motionProfile.ActionName,
-				motionProfile.PlayRate,
-				motionProfile.Duration
-			)
-		end
-
-		local safeImpactDelay = math.max(0, motionProfile.ImpactDelay)
-		if safeImpactDelay <= 0 then
-			return _EffectRouterLogic:ExecuteEffect(self, effectStep.EffectType, sourceUnitId, "", effectStep.Value)
-		end
-		if self.ImpactTimerId > 0 then
-			_TimerService:ClearTimer(self.ImpactTimerId)
-			self.ImpactTimerId = 0
-		end
-
-		local scheduledAt = _UtilLogic.ElapsedSeconds
-		local resolveImpact = function()
-			self.ImpactTimerId = 0
-			local elapsed = _UtilLogic.ElapsedSeconds - scheduledAt
-			log("[BattleImpact] triggered effect=PUSH elapsed=" .. tostring(elapsed))
-			local impactResult = _EffectRouterLogic:ExecuteEffect(self, effectStep.EffectType, sourceUnitId, "", effectStep.Value)
-			if impactResult.Success == false then
-				log_warning("[BattlePush] failed source=" .. sourceUnitId .. " reason=" .. impactResult.Reason)
-			end
-		end
-		self.ImpactTimerId = _TimerService:SetTimerOnce(resolveImpact, safeImpactDelay)
-
-		result.Success = true
-		result.Reason = "IMPACT_PENDING"
-		log("[BattleImpact] scheduled effect=PUSH delay=" .. tostring(safeImpactDelay))
-		return result
-	end
-
-	@ExecSpace("ServerOnly")
 	method table ResolvePushImpact(string sourceUnitId)
 		-- Re-resolves the front target and moves it one logical cell away from the source.
 		local result = {
@@ -3181,6 +3143,8 @@ script BattleSessionComponent extends Component
 		result.TargetCell = targetUnit.CellIndex
 		result.FromCell = targetUnit.CellIndex
 		result.ToCell = targetUnit.CellIndex + direction
+		-- The impact lands even when displacement is later blocked, so present the hit before those branches.
+		self:PlayActiveHitEffect(targetUnitId)
 		if targetUnit.Team == "Enemy" and _EnemyTraitRouterLogic:BlocksForcedDisplacement(targetUnit.EnemyTraitIds) then
 			result.Success = true
 			result.ToCell = result.FromCell
@@ -3214,16 +3178,6 @@ script BattleSessionComponent extends Component
 		result.Reason = "PUSHED"
 		log("[BattlePushTarget] resolved source=" .. sourceUnitId .. " target=" .. targetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
 		return result
-	end
-
-	@ExecSpace("ServerOnly")
-	method table TryBasicAttack(string sourceUnitId)
-		return self:TryExecuteSkill(sourceUnitId, "basic_slash")
-	end
-
-	@ExecSpace("ServerOnly")
-	method table TryHeavySlash(string sourceUnitId)
-		return self:TryExecuteSkill(sourceUnitId, "heavy_slash")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3280,6 +3234,7 @@ script BattleSessionComponent extends Component
 				motionProfile.Duration
 			)
 		end
+		self:BeginSkillEffectPresentation(sourceUnitId, definition)
 
 		local context = contextResult.Data
 		local safeImpactDelay = math.max(0, motionProfile.ImpactDelay)
@@ -3310,108 +3265,91 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method void BeginSkillEffectPresentation(string sourceUnitId, table definition)
+		-- Plays the caster-side effect and latches the target-side effect for this action's impact frame.
+		-- Battle actions resolve strictly one at a time, so a single latched slot is enough.
+		self.ActiveEffectSkillId = definition.SkillId or ""
+		self.ActiveHitEffectRuid = definition.HitEffectRuid or ""
+		self.ActiveEffectScale = definition.EffectScale or 1
+		self.ActiveEffectFlipX = false
+
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			return
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit ~= nil then
+			self.ActiveEffectFlipX = sourceUnit.Facing == "Right"
+		end
+
+		local castEffectRuid = definition.CastEffectRuid or ""
+		if castEffectRuid == "" then
+			return
+		end
+		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourcePresentation == nil then
+			log_warning("[BattleEffect] cast skipped unit=" .. sourceUnitId .. " skill=" .. self.ActiveEffectSkillId .. " reason=PRESENTATION_MISSING")
+			return
+		end
+		sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayActiveHitEffect(string targetUnitId)
+		-- Presents the latched hit effect on one target at its impact frame; never gates gameplay resolution.
+		if self.ActiveHitEffectRuid == "" then
+			return
+		end
+		local targetEntity = self:FindUnitEntity(targetUnitId)
+		if isvalid(targetEntity) == false then
+			return
+		end
+		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if targetPresentation == nil then
+			log_warning("[BattleEffect] hit skipped unit=" .. targetUnitId .. " skill=" .. self.ActiveEffectSkillId .. " reason=PRESENTATION_MISSING")
+			return
+		end
+		targetPresentation:PlaySkillEffect(targetUnitId, "HIT", self.ActiveHitEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetSkillSpeedMultiplier()
+		-- Guarded so a mistyped inspector value can never stall or invert skill playback.
+		return math.max(0.1, self.SkillSpeedMultiplier)
+	end
+
+	@ExecSpace("ServerOnly")
 	method table GetSkillMotionProfile(string motionProfileId)
+		-- Authored values describe the skill at 1x; the speed multiplier scales them on the way out,
+		-- so the swing, the impact frame, and the effect play rate all move together.
+		local speed = self:GetSkillSpeedMultiplier()
 		if motionProfileId == "heavy_slash" then
 			return {
 				MotionKey = self.HeavySlashMotionKey,
 				ActionName = self.HeavySlashActionName,
-				PlayRate = self.HeavySlashMotionPlayRate,
-				Duration = self.HeavySlashMotionDuration,
-				ImpactDelay = self.HeavySlashImpactDelay
+				PlayRate = self.HeavySlashMotionPlayRate * speed,
+				Duration = self.HeavySlashMotionDuration / speed,
+				ImpactDelay = self.HeavySlashImpactDelay / speed,
+				EffectPlayRate = speed
 			}
 		elseif motionProfileId == "push" then
 			return {
 				MotionKey = self.PushMotionKey,
 				ActionName = self.PushActionName,
-				PlayRate = self.PushMotionPlayRate,
-				Duration = self.PushMotionDuration,
-				ImpactDelay = self.PushImpactDelay
+				PlayRate = self.PushMotionPlayRate * speed,
+				Duration = self.PushMotionDuration / speed,
+				ImpactDelay = self.PushImpactDelay / speed,
+				EffectPlayRate = speed
 			}
 		end
 		return {
 			MotionKey = self.BasicSlashMotionKey,
 			ActionName = self.BasicSlashActionName,
-			PlayRate = self.BasicSlashMotionPlayRate,
-			Duration = self.BasicSlashMotionDuration,
-			ImpactDelay = self.BasicSlashImpactDelay
+			PlayRate = self.BasicSlashMotionPlayRate * speed,
+			Duration = self.BasicSlashMotionDuration / speed,
+			ImpactDelay = self.BasicSlashImpactDelay / speed,
+			EffectPlayRate = speed
 		}
-	end
-
-	@ExecSpace("ServerOnly")
-	method table TryFrontAttack(string sourceUnitId, string attackId, number damageAmount, string motionKey, string actionName, number motionPlayRate, number motionDuration, number impactDelay)
-		-- Starts presentation immediately, then resolves the logical front-cell hit at the attack's impact frame.
-		local result = {
-			Success = false,
-			Hit = false,
-			Reason = "UNKNOWN",
-			SourceUnitId = sourceUnitId,
-			AttackId = attackId,
-			TargetUnitId = "",
-			TargetCell = -1,
-			DamageAmount = 0,
-			TargetHpBefore = -1,
-			TargetHpAfter = -1
-		}
-
-		local sourceEntity = self:FindUnitEntity(sourceUnitId)
-		if isvalid(sourceEntity) == false then
-			result.Reason = "SOURCE_NOT_FOUND"
-			return result
-		end
-
-		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
-		if sourceUnit == nil then
-			result.Reason = "SOURCE_COMPONENT_MISSING"
-			return result
-		end
-
-		if self:IsTeamTurn(sourceUnit.Team) == false then
-			result.Reason = "INVALID_PHASE"
-			return result
-		end
-
-		if sourceUnit.IsDead == true then
-			result.Reason = "SOURCE_DEAD"
-			return result
-		end
-
-		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if sourcePresentation ~= nil and sourceEntity.PlayerControllerComponent ~= nil then
-			sourcePresentation:PlayCombatMotion(
-				sourceUnitId,
-				motionKey,
-				actionName,
-				motionPlayRate,
-				motionDuration
-			)
-		end
-
-		local safeImpactDelay = math.max(0, impactDelay)
-		if safeImpactDelay <= 0 then
-			return self:ResolveFrontAttackImpact(sourceUnitId, attackId, damageAmount)
-		end
-
-		if self.ImpactTimerId > 0 then
-			_TimerService:ClearTimer(self.ImpactTimerId)
-			self.ImpactTimerId = 0
-		end
-
-		local scheduledAt = _UtilLogic.ElapsedSeconds
-		local resolveImpact = function()
-			self.ImpactTimerId = 0
-			local elapsed = _UtilLogic.ElapsedSeconds - scheduledAt
-			log("[BattleImpact] triggered attack=" .. attackId .. " elapsed=" .. tostring(elapsed))
-			local impactResult = self:ResolveFrontAttackImpact(sourceUnitId, attackId, damageAmount)
-			if impactResult.Success == false then
-				log_warning("[BattleImpact] failed attack=" .. attackId .. " reason=" .. impactResult.Reason)
-			end
-		end
-		self.ImpactTimerId = _TimerService:SetTimerOnce(resolveImpact, safeImpactDelay)
-
-		result.Success = true
-		result.Reason = "IMPACT_PENDING"
-		log("[BattleImpact] scheduled attack=" .. attackId .. " delay=" .. tostring(safeImpactDelay))
-		return result
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3500,6 +3438,61 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ResolveSkillHealImpact(string sourceUnitId, string skillId, string targetUnitId, number healAmount)
+		-- Restores HP on one impact-time target. Support skills stay castable with no enemy on the board,
+		-- so this path never requires a resolved enemy target.
+		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, SkillId = skillId, TargetUnitId = targetUnitId, HealAmount = 0, TargetHpBefore = -1, TargetHpAfter = -1 }
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		local targetEntity = self:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		if isvalid(targetEntity) == false then
+			result.Reason = "TARGET_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if self:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		if sourceUnit.Team ~= targetUnit.Team then
+			result.Reason = "TARGET_NOT_ALLY"
+			return result
+		end
+
+		local healResult = targetUnit:ApplyHealing(healAmount)
+		if healResult.Success == false then
+			result.Reason = "HEAL_FAILED_" .. healResult.Reason
+			return result
+		end
+		result.Success = true
+		result.Hit = true
+		result.Reason = "HEALED"
+		result.HealAmount = healResult.AppliedAmount
+		result.TargetHpBefore = healResult.HpBefore
+		result.TargetHpAfter = healResult.HpAfter
+		self:PlayActiveHitEffect(targetUnitId)
+
+		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if targetPresentation ~= nil then
+			targetPresentation:RefreshHpDisplay(targetUnitId, targetUnit.Team, targetUnit.CurrentHp, targetUnit.MaxHp)
+		end
+		log("[BattleHeal] resolved skill=" .. skillId .. " source=" .. sourceUnitId .. " target=" .. targetUnitId .. " amount=" .. result.HealAmount .. " hp=" .. result.TargetHpBefore .. "->" .. result.TargetHpAfter)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method table ResolveSkillDamageImpact(string sourceUnitId, string skillId, string targetUnitId, integer targetCell, number damageAmount)
 		-- Applies damage to an immutable impact-time target selected by the shared skill Target Resolver.
 		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, AttackId = skillId, TargetUnitId = targetUnitId, TargetCell = targetCell, DamageAmount = 0, TargetHpBefore = -1, TargetHpAfter = -1 }
@@ -3543,6 +3536,7 @@ script BattleSessionComponent extends Component
 		result.DamageAmount = damageResult.AppliedAmount
 		result.TargetHpBefore = damageResult.HpBefore
 		result.TargetHpAfter = damageResult.HpAfter
+		self:PlayActiveHitEffect(targetUnitId)
 
 		local attackEvent = BasicAttackResolvedEvent()
 		attackEvent.SourceUnitId = sourceUnitId
