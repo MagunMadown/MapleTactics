@@ -2,6 +2,8 @@
 script BattleQueueHudComponent extends Component
 
 	property TextGUIRendererComponent TurnText = "9131478e-61b4-4407-aa83-e7a6713b52e1"
+	property Entity QueuePanelEntity = "a51334db-adb4-47a6-8e35-f2753dd6b18c"
+	property Entity ResultPanelEntity = "6f0764a9-6582-48bb-8163-cb30159fcf81"
 	property TextGUIRendererComponent QueueText = "2de108e0-4a2c-47d5-978b-95abcc41cfc4"
 	property TextGUIRendererComponent StateText = "58f909f5-23c5-4f42-8146-636e325bc6f2"
 	property SpriteGUIRendererComponent QueueSlotSprite = "0d724bbe-bc8a-4688-b32f-4d0e1e9db038"
@@ -19,9 +21,11 @@ script BattleQueueHudComponent extends Component
 	property ButtonComponent ResetButton = "bf41edb1-bbbf-44d6-9d43-630e31343807"
 	property SpriteGUIRendererComponent ResetButtonSprite = "bf41edb1-bbbf-44d6-9d43-630e31343807"
 	property TextGUIRendererComponent ResetButtonText = "bf41edb1-bbbf-44d6-9d43-630e31343807"
-	property number RefreshInterval = 0.05
-	property number RefreshElapsed = 0
 	property string LastSignature = ""
+	property boolean HasHudContextState = false
+	property boolean IsHudContextVisible = false
+	property any PresenterStateChangedHandler = nil
+	property any PresenterCommandResultHandler = nil
 	property any SkillSlot1ClickHandler = nil
 	property any SkillSlot2ClickHandler = nil
 	property any SkillSlot3ClickHandler = nil
@@ -33,8 +37,11 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
-		-- The HUD reads turn state from BattleTurnComponent and sends commands through BattleSessionComponent.
+		-- The view binds UI controls and consumes presentation state without reading battle components directly.
 		log("[BattleQueueHUD] ready")
+		self:SetHudContextVisible(false, "INITIALIZING")
+		self.PresenterStateChangedHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudStateChangedEvent, self.OnPresenterStateChanged)
+		self.PresenterCommandResultHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudCommandResultEvent, self.OnPresenterCommandResult)
 		self.SkillSlot1ClickHandler = self.SkillSlot1Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot1Clicked)
 		self.SkillSlot2ClickHandler = self.SkillSlot2Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot2Clicked)
 		self.SkillSlot3ClickHandler = self.SkillSlot3Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot3Clicked)
@@ -47,6 +54,14 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
 		-- Disconnects button callbacks so UI reloads cannot duplicate tile requests.
+		if self.PresenterStateChangedHandler ~= nil then
+			_BattleHudPresenterLogic:DisconnectEvent(BattleHudStateChangedEvent, self.PresenterStateChangedHandler)
+			self.PresenterStateChangedHandler = nil
+		end
+		if self.PresenterCommandResultHandler ~= nil then
+			_BattleHudPresenterLogic:DisconnectEvent(BattleHudCommandResultEvent, self.PresenterCommandResultHandler)
+			self.PresenterCommandResultHandler = nil
+		end
 		if self.SkillSlot1ClickHandler ~= nil then
 			self.SkillSlot1Button.Entity:DisconnectEvent(ButtonClickEvent, self.SkillSlot1ClickHandler)
 			self.SkillSlot1ClickHandler = nil
@@ -74,34 +89,22 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method void OnUpdate(number delta)
-		-- A short poll also covers sync updates that arrive after UI initialization.
-		self.RefreshElapsed = self.RefreshElapsed + delta
-		if self.RefreshElapsed < self.RefreshInterval then
-			return
-		end
-
-		self.RefreshElapsed = 0
-		self:RefreshHud(false)
-	end
-
-	@ExecSpace("ClientOnly")
 	method void RefreshHud(boolean force)
-		-- Mirrors the registered tile, running action, phase, and input availability from the map session.
-		local session = self:GetBattleSession()
-		local turnState = self:GetBattleTurnState()
-		local waveState = self:GetBattleWaveState()
-		if session == nil or turnState == nil or waveState == nil then
+		-- Renders the latest Presenter snapshot; this view has no map/session/runtime dependencies.
+		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
+		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
+			local reason = presenterState == nil and "PRESENTER_STATE_MISSING" or presenterState.ContextReason
+			self:SetHudContextVisible(false, reason)
 			self:SetUnavailableState("전투 상태 없음")
 			return
 		end
-		local uiState = session:GetBattleUiState()
-		if uiState == nil or uiState.Success == false then
-			self:SetUnavailableState(uiState == nil and "UI 상태 없음" or uiState.Reason)
-			return
-		end
+		local session = presenterState.Session
+		local turnState = presenterState.Turn
+		local waveState = presenterState.Wave
+		local uiState = presenterState.UiState
+		self:SetHudContextVisible(true, "BATTLE_CONTEXT_READY")
 		local queueState = uiState.PlayerQueue
-		local runFlowUi = _RunManagerLogic:GetLocalRunFlowUiState()
+		local runFlowUi = presenterState.RunFlowUi
 		local runFlowRevision = ""
 		if runFlowUi ~= nil and runFlowUi.Success == true then
 			runFlowRevision = runFlowUi.RevisionKey
@@ -142,7 +145,7 @@ script BattleQueueHudComponent extends Component
 		local reinforcementLabel = self:GetReinforcementLabel(session.StageTurnNumber, waveState)
 		local cooldownSnapshot = uiState.CooldownSnapshot
 		local cooldownLabel = self:GetCooldownLabel(cooldownSnapshot)
-		local signature = session.StageNumber .. ":" .. session.StageTurnNumber .. ":" .. uiState.RevisionKey .. ":" .. waveState.CurrentWaveSpawnMode .. ":" .. waveState.ForceAfterTurns .. ":" .. waveState.WaveSpawnStageTurn .. ":" .. tostring(waveState.ForceSpawnPending) .. ":" .. waveState.ForceSpawnPendingReason .. ":" .. tostring(uiState.Drops.Revision) .. ":" .. tostring(uiState.RunInventory.Revision) .. ":" .. runFlowRevision
+		local signature = presenterState.RevisionKey .. ":" .. runFlowRevision
 		if force == false and self.LastSignature == signature then
 			return
 		end
@@ -179,6 +182,34 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void OnPresenterStateChanged(BattleHudStateChangedEvent stateChangedEvent)
+		self:RefreshHud(true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnPresenterCommandResult(BattleHudCommandResultEvent commandResultEvent)
+		log("[BattleQueueHUD] command result type=" .. commandResultEvent.CommandType .. " success=" .. tostring(commandResultEvent.Success) .. " reason=" .. commandResultEvent.Reason .. " revision=" .. tostring(commandResultEvent.Revision))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetHudContextVisible(boolean visible, string reason)
+		-- Keeps the UIGroup and controller alive while hiding only battle-specific content outside battle maps.
+		if self.QueuePanelEntity ~= nil then
+			self.QueuePanelEntity.Enable = visible
+		end
+		if visible == false and self.ResultPanelEntity ~= nil then
+			self.ResultPanelEntity.Enable = false
+		end
+		if self.HasHudContextState and self.IsHudContextVisible == visible then
+			return
+		end
+
+		self.HasHudContextState = true
+		self.IsHudContextVisible = visible
+		log("[BattleQueueHUD] context visible=" .. tostring(visible) .. " reason=" .. tostring(reason))
+	end
+
+	@ExecSpace("ClientOnly")
 	method void SetUnavailableState(string reason)
 		-- Shows a safe inactive state until the local player and map session are available.
 		local signature = "Unavailable:" .. reason
@@ -202,7 +233,10 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void SetResultVisibility(string battleResult)
 		-- Shows the compact result panel only after the synchronized battle result is final.
-		local visible = battleResult ~= ""
+		local visible = self.IsHudContextVisible and battleResult ~= ""
+		if self.ResultPanelEntity ~= nil then
+			self.ResultPanelEntity.Enable = visible
+		end
 		self.ResultPanelSprite.Enable = visible
 		self.ResultText.Enable = visible
 		self.ResetButton.Enable = visible
@@ -244,52 +278,6 @@ script BattleQueueHudComponent extends Component
 			return value
 		end
 		return ""
-	end
-
-	@ExecSpace("ClientOnly")
-	method any GetBattleSession()
-		-- Returns the local player's current map-scoped battle session component.
-		local player = _UserService.LocalPlayer
-		if player == nil or player.CurrentMap == nil then
-			return nil
-		end
-
-		return player.CurrentMap:GetComponent("script.BattleSessionComponent")
-	end
-
-	@ExecSpace("ClientOnly")
-	method any GetBattleTurnState()
-		local player = _UserService.LocalPlayer
-		if player == nil or player.CurrentMap == nil then
-			return nil
-		end
-		local stateEntity = player.CurrentMap:GetChildByName("BattleTurnState")
-		if stateEntity == nil then
-			return player.CurrentMap:GetComponent("script.BattleTurnComponent")
-		end
-		return stateEntity:GetComponent("script.BattleTurnComponent")
-	end
-
-	@ExecSpace("ClientOnly")
-	method any GetBattleWaveState()
-		local player = _UserService.LocalPlayer
-		if player == nil or player.CurrentMap == nil then
-			return nil
-		end
-		local stateEntity = player.CurrentMap:GetChildByName("BattleWaveState")
-		if stateEntity == nil then
-			return player.CurrentMap:GetComponent("script.BattleWaveComponent")
-		end
-		return stateEntity:GetComponent("script.BattleWaveComponent")
-	end
-
-	@ExecSpace("ClientOnly")
-	method any GetLocalSkillRuntimeState()
-		local player = _UserService.LocalPlayer
-		if player == nil then
-			return nil
-		end
-		return player:GetComponent("script.SkillRuntimeStateComponent")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -393,13 +381,7 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void RequestSlotSkill(integer slotIndex)
-		-- Queues whichever skill currently occupies the slot; the server re-validates ownership.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] register click ignored slot=" .. slotIndex .. " reason=SESSION_MISSING")
-			return
-		end
-
+		-- Queues whichever skill currently occupies the slot through the Presenter; the server re-validates ownership.
 		local skillId = self:GetSlotSkillId(slotIndex)
 		if skillId == "" then
 			log_warning("[BattleQueueHUD] register click ignored slot=" .. slotIndex .. " reason=SLOT_EMPTY")
@@ -407,7 +389,7 @@ script BattleQueueHudComponent extends Component
 		end
 
 		log("[BattleQueueHUD] register clicked slot=" .. slotIndex .. " tile=" .. skillId)
-		session:RequestQueueTile(skillId)
+		_BattleHudPresenterLogic:RequestQueueTile(skillId)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -427,41 +409,20 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnExecuteClicked()
-		-- Requests execution of the currently registered tile through the server battle session.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] execute click ignored reason=SESSION_MISSING")
-			return
-		end
-
 		log("[BattleQueueHUD] execute clicked")
-		session:RequestExecuteQueuedTile()
+		_BattleHudPresenterLogic:RequestExecuteQueue()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnClearClicked()
-		-- Requests removal of the registered tile without consuming the player's turn.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] clear click ignored reason=SESSION_MISSING")
-			return
-		end
-
 		log("[BattleQueueHUD] clear clicked")
-		session:RequestClearQueuedTile()
+		_BattleHudPresenterLogic:RequestClearQueue()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnResetClicked()
-		-- Requests restoration of the current map-scoped battle after a final result.
-		local session = self:GetBattleSession()
-		if session == nil then
-			log_warning("[BattleQueueHUD] reset click ignored reason=SESSION_MISSING")
-			return
-		end
-
 		log("[BattleQueueHUD] reset clicked")
-		session:RequestResetBattle()
+		_BattleHudPresenterLogic:RequestResetBattle()
 	end
 
 	@ExecSpace("ClientOnly")
