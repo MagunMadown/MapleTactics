@@ -1,0 +1,368 @@
+@Component
+script PlayerJumpController extends Component
+
+	-- Lobby-only movement points. The lobby map overrides these values with its current grid range.
+	property number CellSize = 1.12
+	property number MinX = -35.06
+	property number MaxX = -17.14
+	property number MoveDuration = 0.25
+
+	property any keyHandler = nil
+	property any MoveBlockState = nil
+	property boolean LocalInputLocked = false
+	property any MovingUsers = nil
+	property any CurrentIndices = nil
+	property any PendingTargets = nil
+
+	method integer GetPositionCount()
+		return math.floor(((self.MaxX - self.MinX) / self.CellSize) + 0.5) + 1
+	end
+
+	method integer GetNearestIndex(number x)
+		local count = self:GetPositionCount()
+		local index = math.floor(((x - self.MinX) / self.CellSize) + 0.5) + 1
+		if index < 1 then
+			return 1
+		end
+		if index > count then
+			return count
+		end
+		return index
+	end
+
+	method number GetPositionX(integer index)
+		return self.MinX + ((index - 1) * self.CellSize)
+	end
+
+	method void OnBeginPlay()
+		log("[PlayerJumpController] lobby controller begin positions=" .. self:GetPositionCount())
+
+		if self:IsServer() then
+			self:InitializeServerState()
+			local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
+			if users ~= nil then
+				for _, player in ipairs(users) do
+					self:RegisterLobbyPlayer(player)
+				end
+			end
+		end
+
+		if self:IsClient() then
+			self:SetLocalInputBlock(true)
+			self.keyHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+		end
+	end
+
+	method void OnMapEnter(Entity enteredEntity)
+		if self:IsServer() then
+			self:RegisterLobbyPlayer(enteredEntity)
+		end
+
+		if self:IsClient() and enteredEntity == _UserService.LocalPlayer then
+			self:SetLocalInputBlock(true)
+		end
+	end
+
+	method void OnMapLeave(Entity leftEntity)
+		if self:IsServer() then
+			self:UnregisterLobbyPlayer(leftEntity)
+		end
+
+		if self:IsClient() and leftEntity == _UserService.LocalPlayer then
+			self.LocalInputLocked = false
+			self:SetLocalInputBlock(false)
+		end
+	end
+
+	method void OnEndPlay()
+		log("[PlayerJumpController] lobby controller end")
+
+		if self:IsClient() then
+			self.LocalInputLocked = false
+			self:SetLocalInputBlock(false)
+			if self.keyHandler ~= nil then
+				_InputService:DisconnectEvent(KeyDownEvent, self.keyHandler)
+				self.keyHandler = nil
+			end
+		end
+
+		if self:IsServer() then
+			local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
+			if users ~= nil then
+				for _, player in ipairs(users) do
+					self:RestorePlayerPhysics(player)
+				end
+			end
+			self.MovingUsers = nil
+			self.CurrentIndices = nil
+			self.PendingTargets = nil
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetLocalInputBlock(boolean enabled)
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= self.Entity then
+			if enabled == false and self.MoveBlockState ~= nil then
+				self.MoveBlockState.enabled = false
+				self.MoveBlockState = nil
+			end
+			return
+		end
+
+		local controller = player.PlayerControllerComponent
+		if controller == nil then
+			return
+		end
+
+		if enabled then
+			if self.MoveBlockState == nil then
+				local moveBlock = { enabled = true }
+				self.MoveBlockState = moveBlock
+				controller:AddCondition("Move", function()
+					return not moveBlock.enabled
+				end)
+			else
+				self.MoveBlockState.enabled = true
+			end
+		else
+			if self.MoveBlockState ~= nil then
+				self.MoveBlockState.enabled = false
+				self.MoveBlockState = nil
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnKeyDown(KeyDownEvent event)
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= self.Entity then
+			return
+		end
+
+		if _LobbyCharacterSelectionLogic:IsOpen() then
+			return
+		end
+
+		if self.LocalInputLocked then
+			log("[PlayerJumpController] input ignored reason=MOVING")
+			return
+		end
+
+		if event.key == KeyboardKey.A or event.key == KeyboardKey.LeftArrow then
+			self.LocalInputLocked = true
+			self:RequestJumpLeft()
+		elseif event.key == KeyboardKey.D or event.key == KeyboardKey.RightArrow then
+			self.LocalInputLocked = true
+			self:RequestJumpRight()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void InitializeServerState()
+		if self.MovingUsers == nil then
+			self.MovingUsers = {}
+		end
+		if self.CurrentIndices == nil then
+			self.CurrentIndices = {}
+		end
+		if self.PendingTargets == nil then
+			self.PendingTargets = {}
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RegisterLobbyPlayer(Entity player)
+		if isvalid(player) == false or player.PlayerComponent == nil then
+			return
+		end
+		if player.CurrentMap ~= self.Entity or player.TransformComponent == nil then
+			return
+		end
+
+		self:InitializeServerState()
+		local userId = player.PlayerComponent.UserId
+		local current = player.TransformComponent.WorldPosition
+		local index = self:GetNearestIndex(current.x)
+		self.CurrentIndices[userId] = index
+		self.MovingUsers[userId] = false
+		self.PendingTargets[userId] = nil
+
+		if player.MovementComponent ~= nil then
+			player.MovementComponent:Stop()
+		end
+		log("[PlayerJumpController] player registered user=" .. userId .. " index=" .. index)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UnregisterLobbyPlayer(Entity player)
+		if isvalid(player) == false or player.PlayerComponent == nil then
+			return
+		end
+
+		local userId = player.PlayerComponent.UserId
+		self:RestorePlayerPhysics(player)
+		if self.MovingUsers ~= nil then
+			self.MovingUsers[userId] = nil
+		end
+		if self.CurrentIndices ~= nil then
+			self.CurrentIndices[userId] = nil
+		end
+		if self.PendingTargets ~= nil then
+			self.PendingTargets[userId] = nil
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestJumpLeft()
+		self:BeginJump(senderUserId, -1)
+	end
+
+	@ExecSpace("Server")
+	method void RequestJumpRight()
+		self:BeginJump(senderUserId, 1)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginJump(string userId, integer direction)
+		self:InitializeServerState()
+		local player = _UserService:GetUserEntityByUserId(userId)
+		if isvalid(player) == false or player.PlayerComponent == nil or player.CurrentMap ~= self.Entity then
+			self:UnlockMoveClient(userId, "INVALID_PLAYER")
+			return
+		end
+		if direction ~= -1 and direction ~= 1 then
+			self:UnlockMoveClient(userId, "INVALID_DIRECTION")
+			return
+		end
+		if self.MovingUsers[userId] == true then
+			self:UnlockMoveClient(userId, "ALREADY_MOVING")
+			return
+		end
+		if player.TransformComponent == nil then
+			self:UnlockMoveClient(userId, "TRANSFORM_MISSING")
+			return
+		end
+
+		local current = player.TransformComponent.WorldPosition
+		local currentIndex = self.CurrentIndices[userId]
+		if currentIndex == nil then
+			currentIndex = self:GetNearestIndex(current.x)
+		end
+		local targetIndex = currentIndex + direction
+		local count = self:GetPositionCount()
+		if targetIndex < 1 or targetIndex > count then
+			log("[PlayerJumpController] boundary user=" .. userId .. " index=" .. currentIndex)
+			self:UnlockMoveClient(userId, "BOUNDARY")
+			return
+		end
+
+		local target = Vector2(self:GetPositionX(targetIndex), current.y)
+		self.MovingUsers[userId] = true
+		self.CurrentIndices[userId] = targetIndex
+		self.PendingTargets[userId] = target
+
+		if player.MovementComponent ~= nil then
+			player.MovementComponent:Stop()
+		end
+		if player.PlayerControllerComponent ~= nil then
+			player.PlayerControllerComponent.LookDirectionX = direction
+		end
+		if player.RigidbodyComponent ~= nil then
+			player.RigidbodyComponent.Enable = false
+		end
+
+		log("[PlayerJumpController] jump user=" .. userId .. " index=" .. targetIndex .. " target=" .. tostring(target))
+		self:PlayJumpTweenClient(target.x, target.y, userId)
+
+		_TimerService:SetTimerOnce(function()
+			if isvalid(self.Entity) == false or self.MovingUsers == nil then
+				return
+			end
+			if self.MovingUsers[userId] == true then
+				log_warning("[PlayerJumpController] tween timeout user=" .. userId)
+				self:FinishJump(userId)
+			end
+		end, self.MoveDuration + 0.75)
+	end
+
+	@ExecSpace("Client")
+	method void PlayJumpTweenClient(number targetX, number targetY, string userId)
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.PlayerComponent == nil then
+			return
+		end
+		if player.PlayerComponent.UserId ~= userId or player.CurrentMap ~= self.Entity then
+			return
+		end
+
+		local rigidbody = player.RigidbodyComponent
+		local transform = player.TransformComponent
+		if rigidbody == nil or transform == nil then
+			self:RequestEndJump()
+			return
+		end
+
+		local moveTween = _TweenLogic:MoveTo(player, Vector2(targetX, targetY), self.MoveDuration, EaseType.QuadEaseOut)
+		moveTween:SetOnEndCallback(function()
+			if isvalid(player) == false then
+				return
+			end
+			self:RequestEndJump()
+		end)
+	end
+
+	@ExecSpace("Server")
+	method void RequestEndJump()
+		self:FinishJump(senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishJump(string userId)
+		self:InitializeServerState()
+		local player = _UserService:GetUserEntityByUserId(userId)
+		local target = self.PendingTargets[userId]
+		if isvalid(player) and player.CurrentMap == self.Entity then
+			local rigidbody = player.RigidbodyComponent
+			if rigidbody ~= nil then
+				if target ~= nil then
+					rigidbody:SetWorldPosition(target)
+				end
+				rigidbody.Enable = true
+				rigidbody:PositionReset()
+			end
+		end
+
+		self.MovingUsers[userId] = false
+		self.PendingTargets[userId] = nil
+		self:UnlockMoveClient(userId, "COMPLETE")
+		log("[PlayerJumpController] jump complete user=" .. userId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RestorePlayerPhysics(Entity player)
+		if isvalid(player) == false then
+			return
+		end
+		if player.RigidbodyComponent ~= nil then
+			player.RigidbodyComponent.Enable = true
+			player.RigidbodyComponent:PositionReset()
+		end
+	end
+
+	@ExecSpace("Client")
+	method void UnlockMoveClient(string userId, string reason)
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.PlayerComponent == nil then
+			return
+		end
+		if player.PlayerComponent.UserId ~= userId then
+			return
+		end
+		self.LocalInputLocked = false
+		if reason ~= "COMPLETE" then
+			log("[PlayerJumpController] move rejected reason=" .. reason)
+		end
+	end
+
+end
