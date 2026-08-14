@@ -63,28 +63,60 @@ TryQueueTile
 | `RequiredJobTag` | string | 빈 문자열 | 제한이 없으면 비움 |
 | `ActionDuration` | number | `0.45` | 큐에서 다음 스킬로 넘어가기까지의 시간 |
 | `FreePlay` | boolean | `false` | `false`면 등록 자체가 턴을 소비하고, `true`면 등록 후 플레이어 턴 유지 |
+| `CastEffectRuid` | string | 32자리 hex | 시전자에게 붙는 이펙트. 비우면 생략 |
+| `HitEffectRuid` | string | 32자리 hex | 피격 대상에게 붙는 이펙트. 비우면 생략 |
+| `EffectScale` | number | `0.9` | 이펙트 배율. 0.05 미만은 0.05로 보정 |
+| `WeaponType` | string | `ONE_HANDED_SWORD` | `WeaponDefinitions.WeaponType` 참조. 비우면 현재 장착 무기 유지 |
+
+## WeaponType과 무기 카탈로그
+
+`WeaponType`은 "이 스킬을 어떤 무기로 사용하는가"를 나타내며 실제 RUID와 장착 슬롯은
+`WeaponDefinitions` Dataset이 소유한다. 스킬 CSV에는 토큰만 적으므로 무기 아트를 교체할 때
+스킬 행을 건드리지 않는다.
+
+| 열 | 타입 | 예시 | 규칙 |
+|---|---|---|---|
+| `SchemaVersion` | integer | `1` | 현재 지원 버전은 1 |
+| `WeaponType` | string | `BOW` | 고유 `UPPER_SNAKE_CASE` ID |
+| `DisplayName` | string | `활` | 도감 표시용. 빈 문자열 금지 |
+| `EquipSlot` | string | `TWO_HANDED` | `ONE_HANDED` 또는 `TWO_HANDED` |
+| `WeaponRuid` | string | 32자리 hex | `avataritem` RUID. 빈 문자열 금지 |
+| `Enabled` | boolean | `true` | `false`면 참조하는 스킬이 검증에서 탈락 |
+
+현재 등록된 12종: `ONE_HANDED_SWORD`, `TWO_HANDED_SWORD`, `SPEAR`, `POLEARM`, `BOW`,
+`CROSSBOW`, `WAND`, `STAFF`, `DAGGER`, `CLAW`, `GUN`, `KNUCKLE`.
+
+런타임 경로는 다음과 같다.
+
+```text
+SkillDefinition.WeaponType
+→ BattleSessionComponent.ApplySkillWeapon
+→ SkillWeaponEquipLogic.ApplyWeaponForSkill
+→ WeaponDefinitionRepositoryLogic.GetWeaponDefinition
+→ CostumeManagerComponent.SetEquip
+```
+
+- 무기 장착은 **모션 재생 직전**에 일어나므로 스윙 모션이 해당 무기로 보인다.
+- 순수 표현이며 전투를 막지 않는다. Costume이 없거나(적 유닛) 데이터가 잘못돼도
+  `log_warning`만 남기고 스킬은 그대로 해결된다.
+- 이미 같은 무기를 들고 있으면 재장착을 건너뛴다(`ALREADY_EQUIPPED`).
+- `TWO_HANDED`는 1H·보조무기 슬롯을 함께 쓰므로 장착 전에 두 슬롯을 모두 비운다.
+- 빈 `WeaponType`은 유효한 저작 선택이다. 적 스킬 3행은 모두 비어 있다.
 
 현재 실제 Dataset Definition은 다음과 같다.
 
 ```csv
-SchemaVersion,SkillId,DisplayName,SkillTags,TargetingType,Range,TargetOffsets,CooldownTurns,CostType,CostValue,MotionProfileId,EffectSetId,RequiredJobTag,ActionDuration,FreePlay
-1,basic_slash,기본 베기,attack|starter,FRONT_CELL,1,,0,,0,basic_slash,basic_slash_effects,,0.45,false
-1,quick_slash,빠른 베기,attack|starter|freeplay,FRONT_CELL,1,,0,,0,basic_slash,basic_slash_effects,,0.35,true
-1,heavy_slash,강한 베기,attack|heavy,FRONT_CELL,1,,1,,0,heavy_slash,heavy_slash_effects,,0.70,false
-1,push,밀치기,control|displacement,FRONT_CELL,1,,1,,0,push,push_effects,,0.40,false
-1,slash_push_combo,베고 밀치기,attack|control|combo,FRONT_CELL,1,,2,,0,basic_slash,slash_push_combo_effects,,0.55,false
-1,prototype_line_slash,전방 참격,attack|prototype,FIRST_ENEMY_FORWARD,3,,0,,0,basic_slash,line_slash_effects,,0.45,false
-1,prototype_sweep,휩쓸기,attack|prototype,RANGE_OFFSETS,2,1|2,0,,0,heavy_slash,sweep_effects,,0.60,false
+SchemaVersion,SkillId,DisplayName,SkillTags,TargetingType,Range,TargetOffsets,CooldownTurns,CostType,CostValue,MotionProfileId,EffectSetId,RequiredJobTag,ActionDuration,FreePlay,CastEffectRuid,HitEffectRuid,EffectScale,WeaponType
+1,brandish,브랜디쉬,attack|warrior|maple,RANGE_OFFSETS,2,1|2,1,,0,heavy_slash,brandish_effects,warrior,0.60,false,8b26a0cdb63d455e82d1ca0fddf5e139,38e9351c34b843ddbcc191c762e7464c,0.9,ONE_HANDED_SWORD
 ```
+
+행 전체는 코드 대신 실제 CSV를 본다. 스킬은 직업별 테이블로 나뉘어 있으며 어느 파일에
+무엇이 들어 있는지는 [`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.1이
+소유한다. 공용 `SkillDefinitions`는 현재 헤더만 있고 행이 없다.
 
 `FreePlay`는 효과 타입에서 자동 추론하지 않는다. 같은 `DAMAGE` 스킬이라도 Definition의
 값에 따라 턴 소비 여부가 달라진다. CSV 셀은 문자열로 읽히므로 `true`/`1`/`yes`를
-참으로 해석하며, 그 외 값과 빈 셀은 `false`로 취급한다. 현재 `quick_slash`는 이 흐름을
-검증하기 위한 실제 Definition이며 기본 베기의 모션·효과를 재사용한다.
-
-2026-08-01 Maker 회귀에서 `quick_slash` 등록은 `ConsumesTurn=false`로 같은
-PlayerTurn을 유지했고, 뒤이어 일반 `basic_slash`를 등록했을 때만 적 라운드와 Turn 증가가
-발생했다. 두 스킬의 큐 순서는 적 라운드 뒤에도 유지되고 전체 실행 후 정상적으로 비워졌다.
+참으로 해석하며, 그 외 값과 빈 셀은 `false`로 취급한다. 현재 모든 행이 `FreePlay=false`다.
 
 ## SkillEffectSteps
 
@@ -100,18 +132,17 @@ PlayerTurn을 유지했고, 뒤이어 일반 `basic_slash`를 등록했을 때�
 | `ParameterB` | string | 빈 문자열 | Effect별 선택 매개변수 |
 | `ConditionId` | string | 빈 문자열 | 조건이 없으면 비움 |
 
-현재 실제 Dataset Effect Step은 다음과 같다.
+한 `EffectSetId`에 여러 Step을 붙이면 같은 임팩트 시점에 `StepIndex` 순서로 실행된다.
 
 ```csv
 SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,ParameterB,ConditionId
-1,basic_slash_effects,1,DAMAGE,FRONT_TARGET,3,SOURCE_BASIC_ATTACK,,
-1,heavy_slash_effects,1,DAMAGE,FRONT_TARGET,6,,,
-1,push_effects,1,PUSH,FRONT_TARGET,1,,,
-1,slash_push_combo_effects,1,DAMAGE,FRONT_TARGET,1,,,
-1,slash_push_combo_effects,2,PUSH,FRONT_TARGET,1,,,
-1,line_slash_effects,1,DAMAGE,PRIMARY_TARGET,2,,,
-1,sweep_effects,1,DAMAGE,ALL_SKILL_TARGETS,1,,,
+1,enemy_basic_attack_effects,1,DAMAGE,FRONT_TARGET,3,SOURCE_BASIC_ATTACK,,
+1,magnum_shot_effects,1,DAMAGE,PRIMARY_TARGET,4,,,
+1,magnum_shot_effects,2,PUSH,PRIMARY_TARGET,1,,,
 ```
+
+현재 지원 `EffectType`은 `DAMAGE`, `PUSH`, `HEAL` 세 가지다. 전체 행은
+`RootDesk/MyDesk/03_Data/SkillEffectSteps.csv`를 직접 본다.
 
 `SOURCE_BASIC_ATTACK`은 고정 `Value` 대신 시전자
 `BattleUnitComponent.BasicAttackDamage`를 사용하는 공용 규칙이다.
@@ -120,12 +151,14 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 
 `SkillDefinitions`와 `SkillEffectSteps` Dataset 전환이 완료되어 아래 절차로 바로 추가할 수 있다.
 
-1. `SkillDefinitions`에 고유 `SkillId` 행을 추가한다.
+1. 해당 직업의 `{Job}SkillDefinitions.csv`에 고유 `SkillId` 행을 추가한다.
 2. 고유 `EffectSetId`를 정하고 `SkillEffectSteps`에 Step 1을 추가한다.
 3. 현재 지원하는 Targeting과 EffectType인지 확인한다.
-4. 큐 또는 서버 테스트에서 `TryQueueTile(SkillId)`를 호출한다.
-5. `[ContentValidation] skill valid`와 `[SkillExecution] started` 로그를 확인한다.
-6. 타격 Cell, 피해 또는 밀치기, 모션, 큐 완료 시점을 확인한다.
+4. `WeaponType`을 `WeaponDefinitions`의 12종 중에서 고른다. 무기를 바꾸지 않으면 비운다.
+5. 큐 또는 서버 테스트에서 `TryQueueTile(SkillId)`를 호출한다.
+6. `[ContentValidation] skill valid ... weapon=`과 `[SkillExecution] started` 로그를 확인한다.
+7. 무기를 지정했다면 `[SkillWeapon] equipped ...` 로그도 함께 확인한다.
+8. 타격 Cell, 피해 또는 밀치기, 모션, 큐 완료 시점을 확인한다.
 
 새 스킬을 추가하기 위해 `TryQueueTile`이나 `ExecuteNextQueuedTile`에 SkillId 분기를 넣지 않는다.
 
@@ -171,6 +204,7 @@ Motion Profile Repository를 공통 계약으로 확장한다.
 | `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_COST` | CostValue가 없거나 음수 |
 | `CONTENT_VALIDATION_FAILED` | `EFFECT_SET_ID_MISSING` | EffectSetId가 비어있음 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_ACTION_DURATION` | ActionDuration이 없거나 0 이하 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_WEAPON_REFERENCE` | WeaponType이 비어있지 않은데 `WeaponDefinitions`에서 유효하지 않음 |
 | `CONTENT_VALIDATION_FAILED` | `EFFECT_STEPS_EMPTY` | 연결된 Effect Step이 하나도 없음 |
 | `CONTENT_VALIDATION_FAILED` | `UNSUPPORTED_EFFECT_SCHEMA` | Effect Step의 SchemaVersion이 스킬과 다름 |
 | `CONTENT_VALIDATION_FAILED` | `EFFECT_SET_MISMATCH` | Effect Step의 EffectSetId가 스킬 정의와 다름 |
@@ -187,9 +221,10 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 
 ## Dataset 상태
 
-`SkillDefinitions` 5행과 `SkillEffectSteps` 5행의 실제 Dataset 전환이 완료됐다.
-`AllowPrototypeCompatibilityFallback=false`이며 production Skill 하드코딩을 다시 추가하지
-않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를 복제하지 않는다.
+플레이어 스킬 18행(직업별 5개 테이블), 적 전용 3행, Effect Step 23행, 무기 12행이
+실제 Dataset으로 올라가 있다. `AllowPrototypeCompatibilityFallback=false`이며 production
+Skill 하드코딩을 다시 추가하지 않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를
+복제하지 않는다.
 
 신규 Skill 제작 Gate B는 열려 있다. 기존 Dataset 페어의 CSV에 Definition과 Effect
 Step을 함께 추가하고 Maker Refresh 후 `source=DATASET`, Validator, 실제 Effect와 Cooldown을

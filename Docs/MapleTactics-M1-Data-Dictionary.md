@@ -112,6 +112,7 @@
 | CastEffectRuid | string | - | 시전자에게 재생할 animationclip RUID. 비우면 시전 이펙트 없음 |
 | HitEffectRuid | string | - | 피격 대상에게 재생할 animationclip RUID. 비우면 피격 이펙트 없음 |
 | EffectScale | number | - | 두 이펙트에 공통 적용할 배율. 비우면 `1` |
+| WeaponType | string | - | §4.4 `WeaponDefinitions.WeaponType` 참조. 비우면 현재 장착 무기를 유지 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -141,6 +142,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 구분 | 테이블 이름 (runtime name) | 수록 SkillId |
 |---|---|---|
 | 공용 | `SkillDefinitions` | (없음 — 헤더만) |
+| 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
 | 궁수 | `ArcherSkillDefinitions` | `piercing`, `wind_shot`, `cardinal_discharge` |
@@ -190,7 +192,8 @@ SkillId는 예외 없이 `UNKNOWN_SKILL`이다.
 2. `SkillEffectSteps.csv`에 `EffectSetId` 행을 추가한다.
 3. `JobStartingSkillEntries.csv`에 필요하면 슬롯을 추가한다.
 4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다.
-5. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
+5. `WeaponType`을 §4.4 목록에서 고른다. 무기를 바꾸지 않는 스킬이면 비운다.
+6. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
 
 ### 4.2 HUD 스킬 슬롯 배정
 
@@ -231,6 +234,52 @@ CSV와 모션 프로필의 값은 **1배속 기준 원본 그대로** 두고, �
 `basic_slash`(1배속 0.18초), `heavy_slash`(0.38초), `push`(0.18초) 세 가지이며 같은 프로필을
 쓰는 스킬은 임팩트 시점을 공유한다. 스킬마다 다른 임팩트가 필요해지면 `SkillDefinitions`에
 `ImpactDelay` 열을 추가하는 것이 다음 단계다.
+
+### 4.4 WeaponDefinitions (IMPLEMENTED)
+
+런타임 이름 `WeaponDefinitions`. `SkillDefinitions.WeaponType`이 참조하는 무기 카탈로그다.
+스킬 행에는 토큰만 두고 실제 아바타 RUID와 장착 슬롯은 이 표가 소유하므로, 무기 아트를
+교체할 때 스킬 행을 건드리지 않는다.
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
+| WeaponType | string | O | 무기 종류 ID. `UPPER_SNAKE_CASE` |
+| DisplayName | string | O | 도감 표시 이름 |
+| EquipSlot | enum | O | `ONE_HANDED` 또는 `TWO_HANDED` |
+| WeaponRuid | string | O | `avataritem` RUID |
+| Enabled | boolean | O | `false`면 참조하는 스킬이 검증에서 탈락 |
+
+기본 키: `WeaponType` 유일. 현재 12행이 등록되어 있다.
+
+| EquipSlot | WeaponType |
+|---|---|
+| ONE_HANDED | `ONE_HANDED_SWORD`, `WAND`, `DAGGER`, `CLAW`, `GUN`, `KNUCKLE` |
+| TWO_HANDED | `TWO_HANDED_SWORD`, `SPEAR`, `POLEARM`, `BOW`, `CROSSBOW`, `STAFF` |
+
+`POLEARM`은 아직 참조하는 스킬이 없는 예약 행이다.
+
+#### 실행 경로
+
+```text
+SkillDefinition.WeaponType
+→ BattleSessionComponent.ApplySkillWeapon
+→ SkillWeaponEquipLogic.ApplyWeaponForSkill
+→ WeaponDefinitionRepositoryLogic.GetWeaponDefinition
+→ CostumeManagerComponent.SetEquip
+```
+
+- 장착은 **모션 재생 직전**에 일어나므로 스윙 모션이 해당 무기로 보인다.
+- 순수 표현이며 전투를 막지 않는다. 실패는 전부 `log_warning`으로 끝나고 스킬은 그대로
+  해결된다. 반환 Reason은 `OK`, `ALREADY_EQUIPPED`, `NO_WEAPON_REQUIRED`,
+  `UNKNOWN_WEAPON_TYPE`, `WEAPON_DISABLED`, `WEAPON_RUID_MISSING`,
+  `UNSUPPORTED_WEAPON_EQUIP_SLOT`, `COSTUME_MANAGER_MISSING`, `UNIT_UNAVAILABLE`이다.
+- 같은 무기를 이미 들고 있으면 재장착을 건너뛴다(`ALREADY_EQUIPPED`). 불필요한 코스튬
+  재구성과 그에 따른 깜빡임을 막기 위한 것이다.
+- `TWO_HANDED`는 1H·보조무기 슬롯을 함께 쓰므로 장착 전에 두 슬롯을 모두 비운다.
+- 적 유닛에는 `CostumeManagerComponent`가 없다. 그래서 `EnemySkillDefinitions` 3행은
+  `WeaponType`이 모두 비어 있고, 적 스킬에 값을 넣는 것은 데이터 실수다.
+- 무기는 스킬이 바꾸기 전까지 유지된다. 턴이나 전투가 끝나도 되돌리지 않는다.
 
 ## 5. SkillEffectSteps
 
@@ -885,6 +934,10 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | DATA_INVALID_DROP_REFERENCE | EnemyDropDefinitions의 EnemyDefinitionId 또는 DropRefId 참조가 잘못됨 | O |
 | DATA_INVALID_DROP_RANGE | ChancePermille 또는 MinAmount/MaxAmount 범위가 잘못됨 | O |
 | DATA_UNUSED_ROW | 어디에서도 참조되지 않는 활성 행 | X, 경고 |
+| INVALID_SKILL_WEAPON_REFERENCE | SkillDefinitions의 WeaponType이 비어 있지 않은데 §4.4에서 유효하지 않음 | O |
+| UNSUPPORTED_WEAPON_EQUIP_SLOT | WeaponDefinitions의 EquipSlot이 ONE_HANDED/TWO_HANDED가 아님 | O |
+| WEAPON_RUID_MISSING | WeaponDefinitions의 WeaponRuid가 비어 있음 | O |
+| WEAPON_DISABLED | 활성 스킬이 Enabled=false인 무기를 참조 | O |
 
 로그 예시:
 

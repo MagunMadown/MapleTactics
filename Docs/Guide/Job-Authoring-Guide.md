@@ -13,6 +13,7 @@
 1. `JobDefinitions.csv`에 JobId와 기본 HP·큐 크기를 추가한다.
 2. 고유한 `StartingSkillSetId`를 정하고 `JobStartingSkillEntries.csv`에 SlotIndex 1부터 연속으로 작성한다.
 3. 시작 SkillId가 모두 `SkillDefinitions`에 존재하는지 확인한다.
+   각 스킬의 `WeaponType`도 `WeaponDefinitions`에 있는 값인지 함께 본다.
 4. 고유 기능이 없으면 `JobMechanicId=NONE`을 사용한다.
 5. 고유 기능이 있으면 별도 Handler를 만들고 `JobMechanicRouterLogic`에 등록한다.
 6. `_ContentValidatorLogic:ValidateJobById(jobId)`가 성공하는지 확인한다.
