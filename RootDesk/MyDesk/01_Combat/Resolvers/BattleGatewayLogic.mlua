@@ -47,6 +47,123 @@ script BattleGatewayLogic
 	end
 
 	@ExecSpace("ServerOnly")
+	method table PrepareLobbyBattleEntry(Entity playerEntity)
+		-- High-level lobby boundary: callers do not fabricate optional compatibility metadata.
+		local context = _RunManagerLogic:GetLobbyBattleEntryContext(playerEntity)
+		if context.Success == false then
+			return { Success = false, Reason = context.Reason, RequestId = 0 }
+		end
+		return self:PrepareBattleEntry(
+			playerEntity,
+			context.StageId,
+			context.CharacterId,
+			context.JobId,
+			context.LoadoutId,
+			context.RunSeed,
+			context.EntryMode
+		)
+	end
+
+	@ExecSpace("Server")
+	method void RequestPrepareLobbyBattleEntry()
+		-- Prepares and transfers one lobby entry, then reports the result to the requesting client's button.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:PrepareLobbyBattleEntry(playerEntity)
+		if result.Success == false then
+			log_warning("[BattleGateway] lobby prepare rejected user=" .. senderUserId .. " reason=" .. result.Reason)
+			self:NotifyLobbyBattleEntryResult(false, result.Reason, senderUserId)
+			return
+		end
+		local transferResult = self:TransferPreparedLobbyBattleEntry(playerEntity, result.RequestId)
+		if transferResult.Success == false then
+			log_warning("[BattleGateway] lobby transfer rejected user=" .. senderUserId .. " request=" .. result.RequestId .. " reason=" .. transferResult.Reason)
+			self:NotifyLobbyBattleEntryResult(false, transferResult.Reason, senderUserId)
+			return
+		end
+		self:NotifyLobbyBattleEntryResult(true, transferResult.Reason, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyLobbyBattleEntryResult(boolean success, string reason)
+		-- Forwards only the request outcome to the lobby UI; the UI never performs battle or transfer work.
+		local uiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		if isvalid(uiRoot) == false then
+			log_warning("[Lobby] battle entry result ignored reason=UI_ROOT_MISSING")
+			return
+		end
+		local startButton = uiRoot:GetComponent("script.LobbyStartButtonComponent")
+		if startButton == nil then
+			log_warning("[Lobby] battle entry result ignored reason=START_BUTTON_COMPONENT_MISSING")
+			return
+		end
+		startButton:HandleBattleEntryResult(success, reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TransferPreparedLobbyBattleEntry(Entity playerEntity, integer requestId)
+		local result = { Success = false, Reason = "UNKNOWN", RequestId = requestId }
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			result.Reason = "INVALID_PLAYER"
+			log_warning("[BattleGateway] transfer blocked request=" .. tostring(requestId) .. " reason=" .. result.Reason)
+			return result
+		end
+
+		local entryState = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		if entryState == nil then
+			result.Reason = "ENTRY_STATE_UNAVAILABLE"
+			log_warning("[BattleGateway] transfer blocked request=" .. tostring(requestId) .. " reason=" .. result.Reason)
+			return result
+		end
+		if entryState.EntryState ~= "PREPARED" then
+			result.Reason = "ENTRY_NOT_PREPARED"
+			log_warning("[BattleGateway] transfer blocked request=" .. tostring(requestId) .. " reason=" .. result.Reason .. " state=" .. entryState.EntryState)
+			return result
+		end
+		if entryState.RequestId ~= requestId then
+			result.Reason = "ENTRY_REQUEST_MISMATCH"
+			log_warning("[BattleGateway] transfer blocked request=" .. tostring(requestId) .. " reason=" .. result.Reason .. " current=" .. entryState.RequestId)
+			return result
+		end
+		if entryState.StageId == nil or entryState.StageId == "" then
+			result.Reason = "INVALID_STAGE_ID"
+			log_warning("[BattleGateway] transfer blocked request=" .. tostring(requestId) .. " reason=" .. result.Reason)
+			return result
+		end
+		log("[BattleGateway] lobby battle entry prepared stageId=" .. entryState.StageId .. " request=" .. requestId)
+
+		local route = _StageMapRouteRepositoryLogic:GetMapRoute(entryState.StageId)
+		if route == nil or route.Success ~= true then
+			result.Reason = route == nil and "STAGE_MAP_ROUTE_RESULT_MISSING" or route.Reason
+			log_warning("[BattleGateway] transfer blocked stageId=" .. entryState.StageId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			return result
+		end
+		if route.MapId == nil or route.MapId == "" then
+			result.Reason = "STAGE_MAP_ROUTE_MAP_ID_MISSING"
+			log_warning("[BattleGateway] transfer blocked stageId=" .. entryState.StageId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			return result
+		end
+		log("[BattleGateway] battle route resolved stageId=" .. entryState.StageId .. " mapId=" .. route.MapId)
+
+		if entryState:TryMarkTransferRequested(requestId) == false then
+			result.Reason = "DUPLICATE_TRANSFER_REQUEST"
+			log_warning("[BattleGateway] transfer blocked stageId=" .. entryState.StageId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			return result
+		end
+
+		local spawnX = route.SpawnX or 0
+		local spawnY = route.SpawnY or 0
+		log("[BattleGateway] transferring player mapId=" .. route.MapId .. " spawn=(" .. tostring(spawnX) .. "," .. tostring(spawnY) .. ") request=" .. requestId)
+		playerEntity.PlayerComponent:MoveToMapPosition(route.MapId, Vector2(spawnX, spawnY))
+		result.Success = true
+		result.Reason = "TRANSFER_REQUESTED"
+		result.StageId = entryState.StageId
+		result.MapId = route.MapId
+		result.SpawnX = spawnX
+		result.SpawnY = spawnY
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method table StartPreparedBattle(Entity playerEntity)
 		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
 			return {
@@ -152,6 +269,9 @@ script BattleGatewayLogic
 
 		local markResult = entryState:MarkStarted()
 		log("[BattleGateway] consumed request=" .. entryState.RequestId .. " stage=" .. entryState.StageId .. " result=" .. startResult.Reason)
+		if markResult.Success == true then
+			log("[BattleGateway] prepared battle consumed stageId=" .. entryState.StageId .. " request=" .. entryState.RequestId)
+		end
 		return {
 			Success = markResult.Success,
 			Reason = startResult.Reason,

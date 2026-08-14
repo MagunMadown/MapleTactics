@@ -42,6 +42,21 @@
 직업은 `SkillDefinitions`를 상속하거나 수정하지 않는다. 시작 공격은 `StartingSkillSetId`,
 이동·교환·밀치기·관통 같은 캐릭터 규칙은 `JobMechanicId`로 독립 구성한다.
 
+현재 실제 `JobDefinitions.userdataset/.csv`에는 5개 직업이 등록되어 있다.
+
+| JobId | DisplayName | JobTags | JobMechanicId | StartingSkillSetId | JobPassiveSetId |
+|---|---|---|---|---|---|
+| warrior | 전사 | melee\|control | FORWARD_PUSH | warrior_start | warrior_recovery |
+| mage | 마법사 | ranged\|magic | NONE | mage_start | mage_focus |
+| archer | 궁수 | ranged\|piercing | NONE | archer_start | archer_focus |
+| thief | 도적 | melee\|mobility | NONE | thief_start | thief_focus |
+| pirate | 해적 | melee\|control | NONE | pirate_start | pirate_focus |
+
+`warrior`만 기준 구현인 `FORWARD_PUSH` JobMechanic을 가지며, 나머지 4개 직업은 아직 고유
+메커니즘 없이 `JobMechanicId=NONE`으로 스탯·시작 스킬 구성만 다른 상태다. 각 직업 고유
+메커니즘은 후속 범위이며, 추가할 때는 `Job-Authoring-Guide.md`의 절차대로 독립 Handler를
+만들고 `JobMechanicRouterLogic`에 등록한다.
+
 ## 3. JobStartingSkillEntries
 
 | 열 | 타입 | 필수 | 설명 |
@@ -60,6 +75,21 @@
 형식으로 변환된다. 현재 큐 등록은 보유 수량이 1 이상인지 검사하며, 한 큐 안의 동일 SkillId
 허용 수는 별도 큐/쿨타임 규칙을 따른다.
 
+현재 모든 시작 스킬은 §4.1의 직업별 SkillDefinitions 테이블에서 온다. 공용
+`SkillDefinitions`를 참조하는 시작 슬롯은 더 이상 없다. 직업별 슬롯 구성은 다음과 같다.
+
+| StartingSkillSetId | 슬롯 수 | SkillId |
+|---|:---:|---|
+| warrior_start | 3 | `brandish`, `divine_swing`, `spear_pulling` |
+| mage_start | 6 | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
+| archer_start | 3 | `piercing`, `wind_shot`, `cardinal_discharge` |
+| thief_start | 3 | `shuriken_burst`, `savage_blow`, `fatal_blow` |
+| pirate_start | 3 | `magnum_shot`, `slug_shot`, `shock_wave` |
+
+전투 HUD의 스킬 슬롯은 3칸이므로, 보유 스킬이 슬롯 수보다 많은 직업(현재 마법사)은
+전투 시작 시 보유 스킬 중 3개가 무작위로 배정된다. 배정은 서버가 수행하며 자세한 규칙은
+§4.2를 따른다.
+
 ## 4. SkillDefinitions
 
 | 열 | 타입 | 필수 | 설명 |
@@ -68,8 +98,8 @@
 | SkillId | string | O | 큐에 넣어 실행하는 일반 스킬 ID |
 | DisplayName | string | O | 표시 이름 |
 | SkillTags | string | - | `attack\|starter` 형식 태그 |
-| TargetingType | enum | O | `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS` |
-| Range | integer | O | Cell 기준 최대 사거리, 1 이상 |
+| TargetingType | enum | O | `SELF`, `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS` |
+| Range | integer | O | Cell 기준 최대 사거리, 1 이상. `SELF`도 Validator 규칙상 1 이상을 넣는다 |
 | TargetOffsets | string | 조건부 | `RANGE_OFFSETS`일 때 필수. Facing 기준 정수 오프셋을 `|`로 구분 |
 | CooldownTurns | integer | O | 실행 후 쿨다운 턴, 0 이상 |
 | CostType | string | - | 비용 종류 |
@@ -77,11 +107,130 @@
 | MotionProfileId | string | O | 공격 모션 프로필 |
 | EffectSetId | string | O | SkillEffectSteps 참조 |
 | RequiredJobTag | string | - | 비어 있으면 공용 스킬 |
-| ActionDuration | number | O | 실행 연출 시간, 0 초과 |
+| ActionDuration | number | O | 실행 연출 시간, 0 초과. 1배속 기준 원본 값이며 §4.3의 배속으로 나눠 사용된다 |
 | FreePlay | boolean | O | 큐 등록 시 턴 미소비 여부 |
+| CastEffectRuid | string | - | 시전자에게 재생할 animationclip RUID. 비우면 시전 이펙트 없음 |
+| HitEffectRuid | string | - | 피격 대상에게 재생할 animationclip RUID. 비우면 피격 이펙트 없음 |
+| EffectScale | number | - | 두 이펙트에 공통 적용할 배율. 비우면 `1` |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
+
+`TargetingType=SELF`는 보드 Cell을 하나도 잡지 않는다. 대상은 §5의 `SELF_UNIT`
+TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 수 있는 지원 스킬에 사용한다.
+
+### 4.0 이펙트 RUID 규칙
+
+`CastEffectRuid`/`HitEffectRuid`는 `sprite`가 아니라 **`animationclip` RUID**여야 한다.
+값은 각 스킬의 공식 리소스 팩에서 가져오며, 팩 안의 `effect` 엘리먼트가 시전,
+`hit/0`이 피격에 해당한다. 팩에 `hit` 클립이 없으면(예: 스피어 풀링) 같은 계열 스킬의
+피격 클립을 재사용한다.
+
+메이플 스킬 클립은 피벗이 이미 캐릭터 기준점에 맞춰 저작되어 있으므로 별도 오프셋을
+주지 않는다. `BattleUnitPresentationComponent.SkillEffectOffsetY` 기본값이 `0`인 이유이며,
+값을 올리면 이펙트가 유닛 머리 위로 뜬다.
+
+`EffectScale`은 클립 원본 크기가 셀 간격(약 1.12 월드 유닛) 대비 과도할 때만 낮춘다.
+현재 대부분 `0.9`이고, 폭이 넓은 피어싱만 `0.7`이다.
+
+### 4.1 스킬 테이블 분리
+
+스킬 행은 **같은 열 스키마를 가진 7개 테이블**에 나뉘어 있다. 각각
+`RootDesk/MyDesk/03_Data/`에 `.userdataset`+`.csv` 쌍으로 존재한다.
+
+| 구분 | 테이블 이름 (runtime name) | 수록 SkillId |
+|---|---|---|
+| 공용 | `SkillDefinitions` | (없음 — 헤더만) |
+| 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling` |
+| 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `wind_shot`, `cardinal_discharge` |
+| 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` |
+| 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` |
+| 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack` |
+
+공용 `SkillDefinitions`는 현재 **행이 하나도 없다**. 이전의 범용 프로토타입 타일
+(`basic_slash`, `quick_slash`, `heavy_slash`, `push`, `slash_push_combo`, `prototype_*`,
+`csv_*`, 직업 맛보기 스킬 7종)은 모두 제거되었고, 플레이어가 쓸 수 있는 스킬은 전부
+직업별 테이블에서 온다. 표 자체는 여러 직업이 공유할 스킬이 생길 때를 위해 남겨 둔다.
+
+`EnemySkillDefinitions`는 몬스터만 쓰는 행을 담는다. 예전에는 적이 플레이어 스킬
+`basic_slash`를 그대로 재사용했기 때문에 플레이어 스킬을 수정하면 몬스터 공격이 조용히
+깨졌다. 이 표를 분리해 그 결합을 끊었다.
+
+#### 조회 경로
+
+| 메서드 | 대상 테이블 | 용도 |
+|---|---|---|
+| `GetSkillDataSetNames()` | 7개 전부 | 스킬 정의 조회·무결성 검사 |
+| `GetPlayerGrantableSkillIds()` | 적 전용 제외 6개 | 플레이어에게 지급 가능한 SkillId 목록 |
+
+`SkillDefinitionRepositoryLogic.JobSkillDataSetNames`(쉼표 구분 문자열)가 직업 5개 테이블
+이름을, `EnemySkillDataSetName`이 적 전용 테이블 이름을 보관한다.
+`GetSkillDefinition(skillId)`는 `GetSkillDataSetNames()` 전체를 순회하므로
+`ValidateSkillById`·상점 구매·`GrantRunSkill` 등 호출부는 스킬이 어느 테이블에 있는지 알
+필요가 없다. 중복 `SkillId` 검사도 7개 테이블 전체를 대상으로 한다.
+
+플레이어 지급 경로는 `GetPlayerGrantableSkillIds()`를 써서 적 전용 행을 제외한다. 이
+구분이 없으면 보상·상점·HUD 슬롯에 `enemy_basic_attack`이 노출될 수 있다.
+
+`SkillEffectSteps`는 나누지 않고 공용 표로 유지한다. 적 전용 스킬도 같은
+`SkillEffectSteps`에서 `EffectSetId`로 Effect Step을 참조한다.
+
+`ContentIntegrityValidatorLogic.ValidateAllContent()`의 전체 무결성 감사도 같은 7개 테이블을
+전부 스캔한다 — 누락되면 해당 테이블 스킬이 참조하는 `EffectSetId`가
+`ORPHAN_EFFECT_SET`으로 오탐지된다.
+
+프로토타입 호환 fallback은 제거되었다. `SkillDefinitionRepositoryLogic`에 하드코딩되어 있던
+`AllowPrototypeCompatibilityFallback` 속성과 관련 메서드가 없으므로, 이제 Dataset에 없는
+SkillId는 예외 없이 `UNKNOWN_SKILL`이다.
+
+새 직업 전용 스킬을 추가할 때는:
+
+1. 그 직업의 `{Job}SkillDefinitions.csv`에 행을 추가한다 (공용 `SkillDefinitions`에는 넣지 않는다).
+2. `SkillEffectSteps.csv`에 `EffectSetId` 행을 추가한다.
+3. `JobStartingSkillEntries.csv`에 필요하면 슬롯을 추가한다.
+4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다.
+5. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
+
+### 4.2 HUD 스킬 슬롯 배정
+
+전투 HUD는 스킬 버튼 3칸을 가진다. 어떤 스킬이 어느 칸에 오는지는 CSV가 아니라 런타임이
+정한다.
+
+- 배정 주체는 **서버**다. `BattleSessionComponent.RefreshSkillSlots()`가 보유 스킬 스냅샷을
+  Fisher-Yates로 섞어 앞에서 `SkillSlotCount`(현재 3)개를 고른다.
+- 결과는 `SkillSlotIds`/`SkillSlotNames`로 동기화된다. 표시 이름을 함께 내려보내는 이유는
+  스킬 Dataset이 `serveronly=true`라 클라이언트가 `DisplayName`을 직접 읽을 수 없기 때문이다.
+- 클라이언트가 슬롯을 정하지 않으므로 보유하지 않은 스킬을 큐에 넣을 수 없다.
+- 재추첨 시점은 보유 스킬 집합이 바뀔 때다. 전투 도중 스킬을 새로 얻어도 그 전투의 슬롯은
+  유지되고 다음 배정부터 후보에 들어간다.
+
+보유 스냅샷은 `SkillId~Count` 형식(§3)이므로, 슬롯 후보를 뽑을 때 `~` 앞부분만 SkillId로
+사용한다.
+
+### 4.3 스킬 배속
+
+`BattleSessionComponent.SkillSpeedMultiplier`가 스킬 연출·판정 속도를 한 번에 조절한다.
+현재 값은 `1.25`이며 최소 `0.1`로 하한이 걸려 있다.
+
+CSV와 모션 프로필의 값은 **1배속 기준 원본 그대로** 두고, 읽는 시점에 배속을 적용한다.
+따라서 배속을 바꾸거나 1로 되돌려도 원본 데이터는 손상되지 않는다.
+
+| 대상 | 적용 |
+|---|---|
+| 모션 재생속도 (`PlayRate`) | × 배속 |
+| 모션 지속시간 (`Duration`) | ÷ 배속 |
+| 임팩트 시점 (`ImpactDelay`) | ÷ 배속 |
+| 이펙트 클립 재생속도 | × 배속 |
+| 큐 액션 지속시간 (`ActionDuration`) | ÷ 배속 |
+
+다섯 항목을 함께 스케일해야 한다. 특히 마지막 항목을 빼면 애니메이션이 먼저 끝나는데 큐
+슬롯이 원래 시간만큼 턴을 붙잡아 전투가 늘어진다.
+
+`ImpactDelay`는 스킬별 값이 아니라 `MotionProfileId`가 결정한다. 현재 프로필은
+`basic_slash`(1배속 0.18초), `heavy_slash`(0.38초), `push`(0.18초) 세 가지이며 같은 프로필을
+쓰는 스킬은 임팩트 시점을 공유한다. 스킬마다 다른 임팩트가 필요해지면 `SkillDefinitions`에
+`ImpactDelay` 열을 추가하는 것이 다음 단계다.
 
 ## 5. SkillEffectSteps
 
@@ -91,14 +240,25 @@
 | EffectSetId | string | O | SkillDefinitions.EffectSetId 참조 |
 | StepIndex | integer | O | 효과 실행 순서, 1부터 연속 |
 | EffectType | enum | O | 등록된 EffectType |
-| TargetSelector | enum | O | `FRONT_TARGET`(호환), `PRIMARY_TARGET`, `ALL_SKILL_TARGETS` |
-| Value | number | O | 피해량·거리 등 원시 효과 수치 |
+| TargetSelector | enum | O | `SELF_UNIT`, `FRONT_TARGET`(호환), `PRIMARY_TARGET`, `ALL_SKILL_TARGETS` |
+| Value | number | O | 피해량·회복량·거리 등 원시 효과 수치 |
 | ParameterA | string | - | 효과별 확장 값 |
 | ParameterB | string | - | 효과별 확장 값 |
 | ConditionId | string | - | 조건 규격 참조용 예약 필드 |
 
-현재 구현 EffectType M1: `DAMAGE`, `PUSH`. 새 타입은 Executor, Router, Validator,
+현재 구현 EffectType M1: `DAMAGE`, `PUSH`, `HEAL`. 새 타입은 Executor, Router, Validator,
 데이터 사전을 함께 수정한 뒤 사용한다.
+
+`HEAL`은 `HealEffectExecutorLogic`이 처리하며 `BattleSessionComponent.ResolveSkillHealImpact`로
+내려간다. 같은 팀 대상만 회복하고 사망한 유닛은 부활시키지 않는다.
+
+`SELF_UNIT`은 보드 타깃 스냅샷을 보지 않고 시전자 자신을 반환한다. `TargetingType=SELF`
+(§4)와 짝을 이뤄, 사거리 안에 적이 없어도 성립하는 지원 스킬을 만든다. 현재 조합 사용
+사례는 마법사의 `heal`(`SELF` + `HEAL`/`SELF_UNIT`)이다.
+
+`ParameterA=SOURCE_BASIC_ATTACK`은 `Value` 대신 시전 유닛의
+`BattleUnitComponent.BasicAttackDamage`를 피해량으로 사용한다. 적마다 다른 공격력을 쓰는
+`enemy_basic_attack_effects`가 이 방식을 쓴다.
 
 ## 6. EnemyDefinitions
 
@@ -130,7 +290,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 | StepIndex | integer | O | 실행 순서, 1 이상 |
 | ActionType | enum | O | 등록된 EnemyActionType |
 | ConditionType | enum | O | 실행 조건, 기본 ALWAYS |
-| TileId | string | - | TELEGRAPH/EXECUTE_TILE에서 사용하는 `SkillDefinitions.SkillId` |
+| TileId | string | - | TELEGRAPH/EXECUTE_TILE에서 사용. 적이 쓰는 값이므로 `EnemySkillDefinitions`(§4.1)의 SkillId를 넣는다 |
 | TelegraphTurns | integer | O | 준비 턴 수, 0 이상 |
 | ParamA | string | - | 행동별 인자 |
 | ParamB | string | - | 행동별 인자 |
@@ -161,9 +321,14 @@ Repository는 `PatternId → StepIndex`로 정렬하고,
 검사한다. Resolver는 `ALWAYS`, `DISTANCE_EQ`, `DISTANCE_LE`, `HP_RATIO_LE`, `CELL_FREE`와 `WAIT`,
 `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`을
 실행 가능 타입으로 받는다. `prototype_retreat`는 `MOVE_AWAY`, `prototype_telegraph`는 2턴 예고 뒤
-`basic_slash` 실행으로 이어지는 재사용 제작 샘플이다.
+`enemy_basic_attack` 실행으로 이어지는 재사용 제작 샘플이다.
 
-`EXECUTE_TILE`과 `TELEGRAPH_TILE`의 `TileId`는 `SkillDefinitions.SkillId` 참조다.
+`EXECUTE_TILE` 분기는 특정 SkillId를 하드코딩하지 않고 `TileId`를 그대로
+`TryExecuteSkill(enemyId, intent.TileId)`에 넘긴다. 따라서 적에게 새 행동을 주려면
+`EnemySkillDefinitions`에 행을 추가하고 패턴의 `TileId`만 바꾸면 되며, 전투 코드는 수정하지
+않는다.
+
+`EXECUTE_TILE`과 `TELEGRAPH_TILE`의 `TileId`는 `EnemySkillDefinitions.SkillId` 참조다.
 특정 스킬 ID를 Session에서 분기하지 않으며, 적 공격도 공용 Skill Targeting/Effect 파이프라인으로 실행한다.
 `DISTANCE_LE`의 `ParamA`는 1 이상의 최대 Cell 거리다.
 
@@ -471,9 +636,11 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 Validator 허용 목록, 회귀 테스트를 함께 갖춘 뒤에만 `IMPLEMENTED`로 전환하고 실전 데이터에 배치한다.
 `JobDefinitions.JobPassiveSetId`는 현재 하나의 `AugmentId`를 참조하며, 그 ID에 속한 여러
 `AugmentEffects` 행이 직업 시작 패시브 세트가 된다. 효과 실행 순서는 낮은 `Priority`부터이며,
-동률은 런 획득 순서 → `Seq` → `AugmentId`로 고정한다. 현재 프로토타입 직업은
-`prototype_warrior_recovery`를 런 시작 시 UNIQUE 1스택으로 지급받고, 턴 시작에 HP가 99% 이하이면
-자신을 1 회복한다. 문서의 나머지 M1 Type은 계획된 확장 규격이며 아직 Validator에 등록되지 않았다.
+동률은 런 획득 순서 → `Seq` → `AugmentId`로 고정한다. 현재 5개 직업은 각각 `warrior_recovery`,
+`mage_focus`, `archer_focus`, `thief_focus`, `pirate_focus`를 런 시작 시 UNIQUE 1스택으로
+지급받는다. 다섯 모두 같은 `TURN_START`/`HP_RATIO_LE 0.99`/`HEAL`/`SELF` 최소 조합을 재사용해
+턴 시작에 HP가 99% 이하이면 자신을 1 회복하는 동일한 패턴이며, 직업별 차별화된 패시브 효과는
+아직 설계되지 않았다. 문서의 나머지 M1 Type은 계획된 확장 규격이며 아직 Validator에 등록되지 않았다.
 
 ### 15.1 계획 예시 — 자쿰의투구 (50% 확률 후방 공격, PLANNED)
 
@@ -614,9 +781,15 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | MaxPurchasesPerVisit | integer | O | 현재 반드시 `1` |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-현재 실제 Dataset에는 `shop_after_stage01` 상점과 `heavy_slash`, `potion_hp_small` 상품이
-등록되어 있다. 서버는 Dataset의 가격과 보상 참조를 다시 조회한 뒤 재화 차감과 지급을
-원자적으로 확정한다. 자세한 제작·API 규격은 `Guide/Run-Shop-Authoring-Guide.md`를 따른다.
+현재 실제 Dataset에는 `shop_after_stage01` 상점과 `potion_hp_small` 상품 1행이 등록되어 있다.
+`RewardType=SKILL` 상품은 현재 없다 — 판매하던 `heavy_slash`가 §4.1의 스킬 정리에서
+제거되면서 함께 삭제했다. 서버는 Dataset의 가격과 보상 참조를 다시 조회한 뒤 재화 차감과
+지급을 원자적으로 확정한다. 자세한 제작·API 규격은 `Guide/Run-Shop-Authoring-Guide.md`를
+따른다.
+
+`RewardType=SKILL` 상품을 다시 넣을 때는 `RewardRefId`가 §4.1의
+`GetPlayerGrantableSkillIds()` 범위 안에 있어야 한다. 적 전용 SkillId를 넣으면 플레이어가
+몬스터 전용 행을 보유하게 된다.
 
 ### 20.3 ShopItemDefinitions (PLANNED — Meta/World Shop)
 
