@@ -96,11 +96,7 @@ StageId→MapId 이동은 후속 시스템이 이 계약 위에 구현한다. �
 
 ## Region 1 연동 경계
 
-현재 `StageDefinitions`에는 `region_01_stage_01`부터 `region_01_stage_04`까지 존재하지만,
-통합된 `NodeDefinitions`는 아직 1-1 전투 뒤 기존 상점으로 가는 최소 그래프만 가진다.
-따라서 1-2~1-4는 데이터/직접 진입 테스트는 가능하되 정식 Run 경로에서는 아직 선택되지 않는다.
-
-REST/증강 담당자가 그래프를 연결할 때 다음 규칙만 지키면 전투 코드를 수정할 필요가 없다.
+`NodeDefinitions`는 Region 1의 전투와 보상 구간을 다음 순서로 연결한다.
 
 ```text
 BATTLE(StageId=region_01_stage_01)
@@ -109,7 +105,7 @@ BATTLE(StageId=region_01_stage_01)
 → REST
 → BATTLE(StageId=region_01_stage_03)
 → REST
-→ BATTLE(StageId=region_01_stage_04, StageType=BOSS)
+→ 종료 (1-4 맵과 Route 추가 전까지)
 ```
 
 - `NodeType`으로 BATTLE/REST를 구분하며 NodeId 문자열을 파싱하지 않는다.
@@ -117,3 +113,5 @@ BATTLE(StageId=region_01_stage_01)
 - BATTLE의 `ContentId`는 StageId, REST의 `ContentId`는 NodeId다.
 - REST 완료는 `CompleteCurrentContent(player, "REST", requestId)` 경계만 사용한다.
 - 전투 팀은 다른 팀의 NodeId, REST 데이터, `NextNodeIds`를 임의로 변경하지 않는다.
+- `StageTransitionManagerLogic`은 이 그래프의 `BATTLE → REST → BATTLE` 체인에서 다음 StageId를 해석한다.
+- 첫 전투의 REST 보상 맵은 항상 `new_skill_stage`이며 이후 보상 맵은 보상 정책으로 결정한다.

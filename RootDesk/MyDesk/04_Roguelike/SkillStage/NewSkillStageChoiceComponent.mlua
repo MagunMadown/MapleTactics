@@ -49,7 +49,7 @@ script NewSkillStageChoiceComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table ResolveOffer(Entity playerEntity, integer choiceIndex)
-		-- Selects a stable, non-duplicated slot from the job-specific skill dataset.
+		-- Prefers unowned job skills and fills exhausted slots with distinct owned skills for a level upgrade.
 		if isvalid(playerEntity) == false then
 			return { Success = false, Reason = "INVALID_PLAYER" }
 		end
@@ -61,10 +61,42 @@ script NewSkillStageChoiceComponent extends Component
 		if catalog.Success == false then
 			return catalog
 		end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" }
+		end
+		local candidateSkills = {}
+		local candidateSkillIds = {}
+		local unownedSkillCount = 0
+		for _, skillDefinition in ipairs(catalog.Skills) do
+			local ownership = inventory:CanUseSkill(skillDefinition.SkillId)
+			if ownership.Success == false and ownership.Reason == "SKILL_NOT_OWNED" then
+				table.insert(candidateSkills, skillDefinition)
+				candidateSkillIds[skillDefinition.SkillId] = true
+				unownedSkillCount = unownedSkillCount + 1
+			end
+		end
+		if #candidateSkills < 2 then
+			for _, skillDefinition in ipairs(catalog.Skills) do
+				if candidateSkillIds[skillDefinition.SkillId] ~= true then
+					table.insert(candidateSkills, skillDefinition)
+					candidateSkillIds[skillDefinition.SkillId] = true
+					if #candidateSkills >= 2 then
+						break
+					end
+				end
+			end
+		end
 		local normalizedChoiceIndex = math.max(1, math.floor(choiceIndex or 1))
+		if normalizedChoiceIndex > #candidateSkills then
+			log_warning("[NewSkillStage] offer pool unavailable job=" .. runState.SelectedJobId .. " slot=" .. normalizedChoiceIndex .. " candidates=" .. #candidateSkills .. " owned=" .. inventory.RunSkillSnapshot)
+			return { Success = false, Reason = "JOB_SKILL_CANDIDATES_INSUFFICIENT", JobId = runState.SelectedJobId }
+		end
 		local rotation = math.abs(runState.RunSeed + runState.CompletedStageCount * 17)
-		local skillIndex = ((rotation + normalizedChoiceIndex - 1) % #catalog.Skills) + 1
-		local definition = catalog.Skills[skillIndex]
+		local skillIndex = ((rotation + normalizedChoiceIndex - 1) % #candidateSkills) + 1
+		local definition = candidateSkills[skillIndex]
+		local offerMode = unownedSkillCount > 0 and candidateSkillIds[definition.SkillId] == true and inventory:CanUseSkill(definition.SkillId).Success == false and "NEW" or "UPGRADE"
+		log("[NewSkillStage] offer filtered job=" .. runState.SelectedJobId .. " slot=" .. normalizedChoiceIndex .. " mode=" .. offerMode .. " catalog=" .. #catalog.Skills .. " unowned=" .. unownedSkillCount .. " candidates=" .. #candidateSkills .. " owned=" .. inventory.RunSkillSnapshot .. " selected=" .. definition.SkillId)
 		return {
 			Success = true,
 			Reason = "OK",
@@ -127,7 +159,7 @@ script NewSkillStageChoiceComponent extends Component
 		if offer.Success == false or offer.SkillId ~= skillId then
 			local reason = offer.Success == false and offer.Reason or "OFFER_MISMATCH"
 			log_warning("[NewSkillStage] selection rejected user=" .. senderUserId .. " slot=" .. choiceIndex .. " reason=" .. reason)
-			self:ReceiveSelectionResult(false, reason, skillId, senderUserId)
+			self:ReceiveSelectionResult(false, reason, skillId, "", senderUserId)
 			return
 		end
 		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
@@ -136,28 +168,28 @@ script NewSkillStageChoiceComponent extends Component
 		if result.Success == false or result.GrantedAmount ~= 1 then
 			local reason = result.Success == false and result.Reason or "SKILL_ALREADY_SELECTED"
 			log_warning("[NewSkillStage] grant rejected user=" .. senderUserId .. " skill=" .. skillId .. " reason=" .. reason)
-			self:ReceiveSelectionResult(false, reason, skillId, senderUserId)
+			self:ReceiveSelectionResult(false, reason, skillId, "", senderUserId)
 			return
 		end
-		log("[NewSkillStage] grant applied user=" .. senderUserId .. " job=" .. offer.JobId .. " skill=" .. skillId .. " key=" .. rewardKey)
-		self:ReceiveSelectionResult(true, "APPLIED", skillId, senderUserId)
+		local nextStageMapName = _StageTransitionManagerLogic:GetNextStageMapNameForPlayer(playerEntity)
+		if nextStageMapName == "" then
+			log_warning("[NewSkillStage] grant applied but next map missing user=" .. senderUserId .. " skill=" .. skillId .. " key=" .. rewardKey)
+			self:ReceiveSelectionResult(false, "NEXT_STAGE_MAP_UNAVAILABLE", skillId, "", senderUserId)
+			return
+		end
+		log("[NewSkillStage] grant applied user=" .. senderUserId .. " job=" .. offer.JobId .. " skill=" .. skillId .. " key=" .. rewardKey .. " nextMap=" .. nextStageMapName)
+		self:ReceiveSelectionResult(true, "APPLIED", skillId, nextStageMapName, senderUserId)
 	end
 
 	@ExecSpace("Client")
-	method void ReceiveSelectionResult(boolean success, string reason, string skillId)
-		-- Teleports only after the server confirms that this stage granted exactly one skill.
+	method void ReceiveSelectionResult(boolean success, string reason, string skillId, string nextStageMapName)
+		-- Teleports with the server-resolved map after this stage grants exactly one skill.
 		if success == false then
 			self.SelectionLocked = false
 			log_warning("[NewSkillStage] selection failed skill=" .. skillId .. " reason=" .. reason)
 			return
 		end
-		local playerEntity = _UserService.LocalPlayer
-		if isvalid(playerEntity) then
-			local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
-			if runState ~= nil then
-				self.TargetMapName = runState.PendingNextStageMapName or ""
-			end
-		end
+		self.TargetMapName = nextStageMapName or ""
 		if self.TargetMapName == "" then
 			self.SelectionLocked = false
 			log_warning("[NewSkillStage] selection applied but next map is unavailable skill=" .. skillId)

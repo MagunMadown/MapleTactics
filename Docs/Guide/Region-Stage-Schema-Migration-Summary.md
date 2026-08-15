@@ -34,19 +34,20 @@ ID는 조회와 참조에만 사용한다. 코드에서 `match`, `find`, `sub`�
 - 다음 콘텐츠: `NodeDefinitions.NextNodeIds`
 - Wave 원본: `WaveTableId`
 
-## 3. StageDefinitions v2
+## 3. StageDefinitions v3
 
 필수 식별 필드는 다음과 같다.
 
 ```csv
-SchemaVersion,StageId,RegionId,StageIndex,StageType,...,WaveTableId,NextStageId,StageRuleId
-2,region_01_stage_01,region_01,1,NORMAL,...,region_01_stage_01_waves,,
+SchemaVersion,StageId,RegionId,StageIndex,StageType,...,WaveTableId,StageRuleId
+3,region_01_stage_01,region_01,1,NORMAL,...,region_01_stage_01_waves,
 ```
 
 - `(RegionId, StageIndex)`는 유일해야 한다.
 - `RegionId`는 활성 `RegionDefinitions` 행을 참조한다.
 - `StageType`은 현재 `NORMAL`, `BOSS`만 허용한다.
-- `NextStageId`는 호환 열이며 신규 진행 흐름은 Node Graph가 소유한다.
+- Stage 간 진행 열은 두지 않으며 신규 진행 흐름은 Node Graph가 단독으로 소유한다.
+- v3에서 기존 호환 열 `NextStageId`를 제거하고 Repository, Battle Snapshot, Validator의 관련 계약도 함께 삭제했다.
 - Repository의 `stage01` 하드코딩 fallback은 제거됐다.
 
 ## 4. StageEnemyWaves

@@ -762,7 +762,7 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 
 - 상태: ✅ Tested (prototype fallback), 실제 `NodeDefinitions` Dataset 이관은 P0
 - 새 파일: `03_Data/Repositories/NodeDefinitionRepositoryLogic.mlua`
-- 상위 흐름 원본: `StageDefinitions.NextStageId`가 아니라 `NodeDefinitions.NextNodeIds`
+- 상위 흐름 원본: `NodeDefinitions.NextNodeIds` 단일 원본
 - 공통 결과 DTO: `NextNodeIds`, `NextContentTypes`, `NextContentIds`
   - `BATTLE/BOSS`: ContentId는 StageId
   - `SHOP/EVENT/REST`: ContentId는 NodeId

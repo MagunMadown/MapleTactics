@@ -1,65 +1,128 @@
 @Logic
-script StageTransitionManagerLogic
+script StageTransitionManagerLogic extends Logic
 	
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
+		-- Initializes the reward-stage transition adapter.
 		log("[StageTransition] ready")
 	end
-	
+
 	@ExecSpace("ServerOnly")
 	method void HandleVictoryTransition(Entity playerEntity, string clearedStageId)
-		-- Determines the intermediate map and next stage after a battle victory.
+		-- Stores the next Stage map and moves the player through the configured reward map.
 		if isvalid(playerEntity) == false then
-			log_warning("[StageTransition] HandleVictoryTransition failed: playerEntity is invalid")
+			log_warning("[StageTransition] victory transition rejected reason=INVALID_PLAYER stage=" .. clearedStageId)
 			return
 		end
-		
-		local stageDefinition = _StageDefinitionRepositoryLogic:GetStageDefinition(clearedStageId)
-		local nextStageId = ""
-		if stageDefinition.Success == true and stageDefinition.NextStageId ~= nil then
-			nextStageId = stageDefinition.NextStageId
-		end
-		
-		if nextStageId == "" then
-			log("[StageTransition] no NextStageId for stage=" .. clearedStageId .. " — no transition")
+		local graphTransition = self:ResolveGraphTransition(clearedStageId)
+		if graphTransition.Success == false then
+			log("[StageTransition] no graph transition current=" .. clearedStageId .. " reason=" .. graphTransition.Reason)
 			return
 		end
-
-		local nextStageRoute = _StageMapRouteRepositoryLogic:GetMapRoute(nextStageId)
-		if nextStageRoute == nil or nextStageRoute.Success ~= true then
-			local reason = nextStageRoute == nil and "STAGE_MAP_ROUTE_RESULT_MISSING" or nextStageRoute.Reason
-			log_warning("[StageTransition] next stage route missing stage=" .. nextStageId .. " reason=" .. reason)
+		local rewardMap = self:DetermineIntermediateMap(playerEntity, clearedStageId)
+		if rewardMap == "" then
+			log_warning("[StageTransition] reward map unresolved stage=" .. clearedStageId)
 			return
 		end
-		
-		local intermediateMap = self:DetermineIntermediateMap(clearedStageId)
-		if intermediateMap == "" then
-			log_warning("[StageTransition] no intermediate map resolved for stage=" .. clearedStageId)
-			return
+		local nextStageMap = ""
+		if graphTransition.NextBattleStageId ~= "" then
+			local nextStageRoute = _StageMapRouteRepositoryLogic:GetMapRoute(graphTransition.NextBattleStageId)
+			if nextStageRoute == nil or nextStageRoute.Success ~= true then
+				local reason = nextStageRoute == nil and "STAGE_MAP_ROUTE_RESULT_MISSING" or nextStageRoute.Reason
+				log_warning("[StageTransition] next stage route missing stage=" .. graphTransition.NextBattleStageId .. " reason=" .. reason)
+			else
+				nextStageMap = nextStageRoute.MapId
+			end
 		end
-		
-		self:StoreNextStageMapForPlayer(playerEntity, nextStageRoute.MapId)
-		
-		log("[StageTransition] victory stage=" .. clearedStageId .. " nextStage=" .. nextStageId .. " nextMap=" .. nextStageRoute.MapId .. " intermediateMap=" .. intermediateMap)
-		
+		self:StoreNextStageMapForPlayer(playerEntity, nextStageMap)
+		log("[StageTransition] victory current=" .. clearedStageId .. " rewardNode=" .. graphTransition.RewardNodeId .. " next=" .. graphTransition.NextBattleStageId .. " nextMap=" .. nextStageMap .. " rewardMap=" .. rewardMap)
 		local targetPlayer = playerEntity
-		local targetMap = intermediateMap
+		local targetMap = rewardMap
 		_TimerService:SetTimerOnce(function()
 			if isvalid(targetPlayer) then
-				log("[StageTransition] teleporting player=" .. targetPlayer.Name .. " to map=" .. targetMap)
+				log("[StageTransition] teleporting player=" .. targetPlayer.Name .. " rewardMap=" .. targetMap)
 				_TeleportService:TeleportToMapPosition(targetPlayer, Vector3(0, 0.5, 0), targetMap)
 			end
 		end, 1.5)
 	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveGraphTransition(string clearedStageId)
+		-- Resolves the required battle-to-reward-to-battle chain from NodeDefinitions.
+		local currentBattle = _NodeDefinitionRepositoryLogic:FindNodeByStageId(clearedStageId)
+		if currentBattle.Success == false then
+			return { Success = false, Reason = currentBattle.Reason or "CURRENT_BATTLE_NODE_NOT_FOUND" }
+		end
+		local rewardNodeId = self:GetSingleNextNodeId(currentBattle.NextNodeIds)
+		if rewardNodeId == "" then
+			return { Success = false, Reason = "REWARD_NODE_NOT_CONFIGURED" }
+		end
+		local rewardNode = _NodeDefinitionRepositoryLogic:GetNodeDefinition(currentBattle.NodeGraphId, rewardNodeId)
+		if rewardNode.Success == false then
+			return { Success = false, Reason = rewardNode.Reason or "REWARD_NODE_NOT_FOUND" }
+		end
+		if rewardNode.NodeType ~= "REST" then
+			return { Success = false, Reason = "REWARD_NODE_TYPE_INVALID", RewardNodeId = rewardNode.NodeId }
+		end
+		if rewardNode.NextNodeIds == nil or rewardNode.NextNodeIds == "" then
+			return {
+				Success = true,
+				Reason = "TERMINAL_REWARD_NODE",
+				NodeGraphId = currentBattle.NodeGraphId,
+				RewardNodeId = rewardNode.NodeId,
+				NextBattleNodeId = "",
+				NextBattleStageId = ""
+			}
+		end
+		local nextBattleNodeId = self:GetSingleNextNodeId(rewardNode.NextNodeIds)
+		if nextBattleNodeId == "" then
+			return { Success = false, Reason = "NEXT_BATTLE_NODE_NOT_CONFIGURED", RewardNodeId = rewardNode.NodeId }
+		end
+		local nextBattle = _NodeDefinitionRepositoryLogic:GetNodeDefinition(currentBattle.NodeGraphId, nextBattleNodeId)
+		if nextBattle.Success == false then
+			return { Success = false, Reason = nextBattle.Reason or "NEXT_BATTLE_NODE_NOT_FOUND" }
+		end
+		if nextBattle.NodeType ~= "BATTLE" and nextBattle.NodeType ~= "BOSS" then
+			return { Success = false, Reason = "NEXT_NODE_NOT_BATTLE", NextNodeId = nextBattle.NodeId }
+		end
+		return {
+			Success = true,
+			Reason = "OK",
+			NodeGraphId = currentBattle.NodeGraphId,
+			RewardNodeId = rewardNode.NodeId,
+			NextBattleNodeId = nextBattle.NodeId,
+			NextBattleStageId = nextBattle.StageId
+		}
+	end
+
+	method string GetSingleNextNodeId(string nextNodeIds)
+		-- Returns one configured next node and rejects empty or branching transition chains.
+		local resolvedNodeId = ""
+		local count = 0
+		for nodeId in string.gmatch(nextNodeIds or "", "([^|]+)") do
+			count = count + 1
+			resolvedNodeId = nodeId
+		end
+		if count ~= 1 then
+			return ""
+		end
+		return resolvedNodeId
+	end
 	
 	@ExecSpace("ServerOnly")
-	method string DetermineIntermediateMap(string clearedStageId)
+	method string DetermineIntermediateMap(Entity playerEntity, string clearedStageId)
 		-- Returns the intermediate (reward/skill selection) map name based on cleared stage.
 		-- region_01_stage_01 (region_01_stage_01 map) -> always new_skill_stage
 		-- otherwise -> 75% new_upgrade_stage, 25% new_skill_stage
 		if clearedStageId == "region_01_stage_01" then
+			log("[StageTransition] first clear reward fixed stage=" .. clearedStageId .. " -> new_skill_stage")
 			return "new_skill_stage"
-		else
+		end
+		if self:HasAtLeastUnownedJobSkills(playerEntity, 2) == false then
+			log("[StageTransition] new skill stage skipped reason=INSUFFICIENT_UNOWNED_JOB_SKILLS stage=" .. clearedStageId .. " -> new_upgrade_stage")
+			return "new_upgrade_stage"
+		end
+		if clearedStageId ~= "" then
 			local roll = math.random(1, 100)
 			if roll <= 75 then
 				log("[StageTransition] " .. clearedStageId .. " roll=" .. roll .. " -> new_upgrade_stage")
@@ -70,6 +133,37 @@ script StageTransitionManagerLogic
 			end
 		end
 		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean HasAtLeastUnownedJobSkills(Entity playerEntity, integer requiredCount)
+		-- Prevents entry into a two-choice skill stage when the selected job has fewer than two new skills.
+		if isvalid(playerEntity) == false then
+			return false
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if runState == nil or runState.SelectedJobId == "" or inventory == nil then
+			return false
+		end
+		local catalog = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(runState.SelectedJobId)
+		if catalog.Success == false then
+			return false
+		end
+		local needed = math.max(1, math.floor(requiredCount or 1))
+		local availableCount = 0
+		for _, definition in ipairs(catalog.Skills) do
+			local ownership = inventory:CanUseSkill(definition.SkillId)
+			if ownership.Success == false and ownership.Reason == "SKILL_NOT_OWNED" then
+				availableCount = availableCount + 1
+				if availableCount >= needed then
+					log("[StageTransition] new skill stage available job=" .. runState.SelectedJobId .. " available=" .. availableCount .. " required=" .. needed)
+					return true
+				end
+			end
+		end
+		log("[StageTransition] new skill stage unavailable job=" .. runState.SelectedJobId .. " available=" .. availableCount .. " required=" .. needed .. " owned=" .. inventory.RunSkillSnapshot)
+		return false
 	end
 	
 	@ExecSpace("ServerOnly")
