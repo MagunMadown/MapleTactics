@@ -414,7 +414,7 @@ Phase 전환은 이미 고정된 적 Queue를 바꾸지 않으며, 다음 라운
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
-| SchemaVersion | integer | O | 현재 `2` |
+| SchemaVersion | integer | O | 현재 `3` |
 | StageId | string | O | 고유 스테이지 ID |
 | RegionId | string | O | `RegionDefinitions.RegionId` 참조 |
 | StageIndex | integer | O | Region 안 전투 순서, 1 이상 |
@@ -427,7 +427,6 @@ Phase 전환은 이미 고정된 적 Queue를 바꾸지 않으며, 다음 라운
 | PlayerStartCell | integer | O | 0 이상 `CellCount` 미만 |
 | QueueCapacity | integer | O | 기본 큐 용량, 1 이상 |
 | WaveTableId | string | O | `StageEnemyWaves.WaveTableId` 참조 |
-| NextStageId | string | - | 초기 호환 열. 실제 다음 콘텐츠는 NodeDefinitions가 결정 |
 | StageRuleId | string | - | 특수 Stage 규칙 ID |
 
 `CellStartX/UnitY/CellSpacing`은 월드 좌표 표현용이며 논리 판정은 CellIndex를 사용한다.
@@ -476,8 +475,8 @@ Region은 소속과 표시 순서만 소유한다. Node Graph, 공통 적 Pool, 
 
 기본 키: `(NodeGraphId, NodeId)` 유일. 같은 NodeGraphId 안에 `IsStartNode=true`가 정확히 1개여야 한다. `NextNodeIds`가 참조하는 NodeId는 같은 NodeGraphId 안에 존재해야 한다.
 
-`StageDefinitions.NextStageId`는 초기 호환 열이며 Run의 실제 다음 콘텐츠를 결정하지 않는다.
-전투 종료 뒤 이동 가능한 대상은 `NodeDefinitions.NextNodeIds`만 원본으로 사용한다.
+StageDefinitions에는 진행 관계를 저장하지 않는다. 전투 종료 뒤 이동 가능한 대상은
+`NodeDefinitions.NextNodeIds`만 원본으로 사용한다.
 런타임은 각 다음 노드를 다음 공통 DTO로 정규화한다.
 
 ```text
@@ -494,9 +493,9 @@ NextContentIds      BATTLE/BOSS는 StageId, 그 외는 NodeId
 현재 실제 `NodeDefinitions.userdataset/.csv`에는 `prototype_run` 그래프의
 `stage01_battle(BATTLE) → shop_after_stage01(SHOP)` 두 행이 등록되어 있다.
 `NodeContentValidatorLogic`은 시작 노드가 정확히 1개인지, NodeId 중복·다음 노드·Stage 참조·
-시작점에서 도달 불가능한 노드가 없는지를 그래프 단위로 검증한다. Maker에서 두 행의
-`Source=DATASET`, `StartNodeId=stage01_battle`, 승리 후 `NextContentTypes=SHOP`을 확인했으며
-Repository의 prototype fallback은 비활성 상태다.
+시작점에서 도달 불가능한 노드가 없는지를 그래프 단위로 검증한다. 현재 prototype_run은
+Region 1의 세 전투 뒤에 REST 보상 노드를 두며 세 번째 보상은 현재 종단 노드다. Repository의 prototype fallback은
+비활성 상태다.
 
 예시(`henesys_graph`, 회의 문서의 "헤네시스 1-1/1-2/1-3" 배치를 노드 3개로 표현):
 
