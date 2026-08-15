@@ -103,6 +103,14 @@ UI가 HP나 셀을 직접 변경해서는 안 된다. UI는 서버의 `BattleSes
 
 Instance Room 안에서는 각 플레이어의 전투 맵과 `BattleSessionComponent`가 다른 플레이어와 섞이지 않는다.
 
+> 현황(2026-08-15): "정적 로비 맵"은 `RootDesk/MyDesk/00_Core/Lobby/`에 실제로 구현됐다 —
+> `LobbyCharacterSelectionLogic`/`LobbyJobSelectionProvider`로 직업 선택, `LobbyCodexLogic`
+> 계열(Monster/Skill/Item CodexProvider)로 도감 열람, `LobbyGridMovementComponent`로 로비 전용
+> 좌우 이동을 제공한다. 이 이동은 전투의 `BoardStateComponent`/`BattleSessionComponent.TryMove()`
+> 를 재사용하지 않고, 플레이어 `TransformComponent`를 `MinX`/`MaxX` 범위 안에서 직접 스텝
+> 이동시키는 별도의 단순한 구현이다(유닛 간 점유 검사 없음). Instance Map 분리 자체는 여전히
+> 미확정 상태로 남아있다.
+
 현재 `map01`은 `IsInstanceMap=false`인 화면·전투 프로토타입이다. 기본 전투 루프를 검증하는 동안에는 그대로 유지한다. 실제 스테이지 이동을 구현하기 전에 다음 중 하나를 확정한다.
 
 1. 현재 map01을 첫 Instance 전투 맵으로 전환한다.

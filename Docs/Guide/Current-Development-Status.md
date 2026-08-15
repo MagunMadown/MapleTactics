@@ -1,15 +1,15 @@
 # MapleTactics 현재 개발 현황
 
-기준일: 2026-08-08
-기준 브랜치: `feat/battle-new-enemy-logic`
+기준일: 2026-08-15
+기준 브랜치: `develop` (`0f13495`, `codex/battle-core-variable-queue`에 fast-forward 반영 완료)
 
 ## 1. 현재 도달한 수직 슬라이스
 
 현재 백엔드 규격은 다음 한 사이클을 실행할 수 있다.
 
 ```text
-새 Run
-→ 직업 적용
+로비 입장 → 직업 선택(전사/마법사/궁수/도적/해적 5종)
+→ 새 Run
 → Stage 1 전투
 → 이동·회전·행동 큐 실행
 → 적 Intent·Wave 처리
@@ -20,6 +20,9 @@
 → SHOP Node 완료
 → RUN_COMPLETED
 ```
+
+로비 진입 시점부터의 직업 선택·도감(Codex) 열람은 `RootDesk/MyDesk/00_Core/Lobby/`
+서브시스템이 담당하며, 전투 진입 이전 단계다.
 
 최종 UI와 연출은 아직 제작 대상이다. 현재 HUD와 Snapshot은 기능 검증 및 UI 연동 계약이다.
 
@@ -36,7 +39,7 @@
 | 적 Intent·Pattern Runner | 적별 동시 계획·행동 Queue·Trait 최소 규격 회귀 완료 | 가능 |
 | Wave·강제 증원 | 전멸/턴/시간 조건 구현 | 가능 |
 | 적 Drop·Stage Reward | 재화·소모품 지급과 중복 방지 구현 | 가능 |
-| Job·Augment | 직업 1종과 최소 패시브 파이프라인 구현 | 조건부 가능 |
+| Job·Augment | 직업 5종(전사/마법사/궁수/도적/해적) 데이터와 직업별 패시브 1개씩 구현 | 가능 |
 | Node Graph·Run Flow | 전투→상점→런 완료 구현 | 가능 |
 | Region·Stage Identity | Region/StageIndex/StageType 명시 규격 및 ID 파싱 제거 완료 | 가능 |
 | Region 1 일반 전투 | 1-1~1-3 Stage/Wave/Pool 및 근접·원거리 적 데이터 완료 | 가능 |
@@ -48,8 +51,10 @@
 | StageId→MapId Adapter | 계약만 존재 | 미구현 |
 | Instance Map 정책 | 미확정 | 합의 필요 |
 | 보스 Phase | HP 임계 전환·Pattern 교체·UI DTO 최소 규격 완료 | 확장 가능 |
-| 증강 3택·4직업 | 미구현 | 후속 작업 |
+| 증강 3택 | 미구현 | 후속 작업 |
 | 저장·재접속 | 미구현 | 후속 작업 |
+| 로비 Codex·캐릭터/직업 선택 | `LobbyCodexLogic`/`LobbyCharacterSelectionLogic`/`LobbyJobSelectionProvider`/`LobbyGridMovementComponent` 등 구현 완료, 문서화 안 됨 | 가능 |
+| 전투 HUD Presenter | `BattleHudPresenterLogic`(이벤트 기반)으로 디커플 완료. 옛 `BattleQueueHudComponent`는 대체된 뒤 미부착 상태로 방치 — 삭제 후보 | 가능 |
 
 ## 3. 현재 실제 콘텐츠 수
 
@@ -57,18 +62,23 @@
 
 - Stage: 4
 - Region: 1
-- Skill: 11
-- Skill Effect Step: 11
-- Job: 1
-- Augment: 1
-- Node Graph: 1
+- Job: 5 (전사/마법사/궁수/도적/해적)
+- Skill: 직업별 테이블 합 21 (전사 3·마법사 6·궁수 3·도적 3·해적 3) + 적 전용 3, 공용 `SkillDefinitions`는 0행
+- Skill Effect Step: 23
+- Augment: 5 (직업별 패시브 1개씩)
+- Node Graph: 1 (2 Node: `stage01_battle`→`shop_after_stage01`, 1-2~1-4 데이터는 있으나 Node Graph 미연결)
 - Enemy Pattern: 7
-- Boss Phase Owner: 1
+- Boss Phase Owner: 1 (Phase 2개: `OPENING`→`ENRAGED`)
 - Stage Reward: 4
 - Shop: 1
-- Shop Entry: 2
+- Shop Entry: 1
 
 ## 4. 마지막 Maker 검증
+
+> 아래 로그는 이 문서의 이전 스냅샷(2026-08-08, `feat/battle-new-enemy-logic`) 시점 것이다.
+> 그 이후 반영된 직업/스킬 로스터 전면 개편, 로비 Codex, 전투 HUD Presenter 리팩터 등은
+> 이번 문서 갱신 세션에서 Maker MCP 연결 없이 코드/데이터 대조만으로 확인했고 새로 Play
+> 검증하지는 못했다.
 
 검증 환경은 `map01`, `TileMapMode=0` MapleTile이다. 전투 유닛 이동은 물리 이동이 아니라
 서버 권위 논리 Cell Snapshot 방식이다.
@@ -124,6 +134,7 @@
 5. 증강 후보 Pool·충돌·3택 서버 검증
 6. Region 1 Stage/Node/REST 연결을 다른 팀 데이터와 통합 검증
 7. Seed+CommandLog 재현과 저장 경계 추가
+8. 로비 Codex·HUD Presenter 시스템 문서화, 대체된 `BattleQueueHudComponent.mlua` 정리
 
 상세 체크리스트는 [`../MapleTactics-M1-Implementation-Plan.md`](../MapleTactics-M1-Implementation-Plan.md)를
 기준으로 한다.

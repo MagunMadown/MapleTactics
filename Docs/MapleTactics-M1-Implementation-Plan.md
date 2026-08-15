@@ -3,7 +3,7 @@
 상태: Phase 1 프로토타입 진행 중, 양방향 전투 확장 계획 반영
 
 목표: 한 스테이지를 시작해 이동·회전·타일 큐 등록·큐 실행·적 행동·증강 선택까지 한 사이클을 완료하는 수직 슬라이스  
-범위: 싱글 플레이 우선, 직업 1종/일반 적 2종/보스 1종으로 구조를 증명한 뒤 데이터로 4직업과 추가 스테이지를 확장
+범위: 싱글 플레이 우선, 직업 1종/일반 적 2종/보스 1종으로 구조를 증명한 뒤 데이터로 직업(현재 5종: 전사/마법사/궁수/도적/해적)과 추가 스테이지를 확장
 
 ## 0. 확정 결정
 
@@ -315,7 +315,7 @@ StageFlowComponent
 - [x] TURN/TIME 중 먼저 충족한 조건 하나만 소비하고 동일 Wave 중복 Spawn 방지.
 - [x] 겹친 Wave 생존 적 EnemyTurn 포함과 `MaxConcurrent`/빈 칸 부족 대기 처리.
 - [x] RunSeed 기반 결정적 빈 칸 선택(`BALANCED`/`ANY`).
-- [ ] 보스 Phase 조건과 PatternId 교체.
+- [x] 보스 Phase 조건과 PatternId 교체. `BossPhaseDefinitions`(`OPENING`→`ENRAGED`, HP 비율 임계)와 `BossPhaseStateComponent` 구현 확인.
 - [ ] Pattern만으로 표현할 수 없는 요구가 실제로 발생한 경우에만 BT Spike 수행.
 - [ ] 스테이지 완료 -> 증강 선택 -> 다음 스테이지 전환.
 - [ ] 양방향(플레이어 좌/우 동시 교전) 시나리오 회귀 테스트.
@@ -325,7 +325,7 @@ StageFlowComponent
 - [x] `OPEN_SHOP` 최소 서버 소비기 — ShopDefinitions/ShopEntries, Validator, 구매 원자성, Client DTO/Request.
 - [x] SHOP 구매/건너뛰기 완료 → 공통 비전투 콘텐츠 완료 → 다음 노드 또는 `RUN_COMPLETED`, 종료 요청 멱등성, Client DTO.
 - [ ] 최종 상점 UI와 `OPEN_EVENT`·`OPEN_REST` 소비기, StageId→MapId 전환 Adapter.
-- [ ] RegionDefinitions 로더와 NodeGraph 전체 검증 — 지역별 노드 그래프 로드, `IsStartNode` 정확히 1개, 전체 참조·도달 가능성 검증.
+- [x] RegionDefinitions 로더와 NodeGraph 전체 검증 — `RegionDefinitionRepositoryLogic`/`RegionContentValidatorLogic`과 `NodeContentValidatorLogic`의 `IsStartNode` 검사 구현 확인.
 - [ ] 지도판 UI가 NodeDefinitions를 읽어 현재 진행 가능한 노드만 선택 가능하게 표시.
 - [ ] 지역 보스(`BossStageId`) 클리어 시 `UnlockRegionId`로 다음 지역 잠금 해제.
 
@@ -340,7 +340,7 @@ StageFlowComponent
 - 스테이지 클리어 시 StageRewardDefinitions에 정의된 재화가 정확히 한 번 지급된다.
 - 적 드롭은 같은 Seed와 사망 식별자에서 동일하게 재현되고, 같은 RewardKey를 두 번 처리해도 런 보상은 한 번만 증가한다.
 
-### Phase 4 — 직업 4종과 증강
+### Phase 4 — 직업 5종과 증강
 
 목표: Player 클래스 상속 없이 데이터와 패시브 조합으로 직업을 확장한다.
 
@@ -354,7 +354,7 @@ StageFlowComponent
 - [ ] Unique/StackAdd/StackRefresh/ExclusiveGroup 구현.
 - [x] 재진입 SourceTag 차단과 최대 이벤트 깊이 구현.
 - [ ] 증강 3택 UI와 서버 선택 검증.
-- [ ] 4직업 최소 데이터와 각 직업 대표 패시브 1개.
+- [x] 5직업(전사/마법사/궁수/도적/해적) 최소 데이터와 각 직업 대표 패시브 1개. `JobDefinitions.csv` 5행 + `AugmentDefinitions`/`AugmentEffects`에 직업별 패시브 1개씩 확인(원래 "4직업"이었으나 실제로는 5직업으로 확장됨).
 - [ ] `ConditionType=CHANCE_ROLL`(RunSeed 기반 결정적 확률 판정) 구현.
 - [ ] `TargetType=REAR_CELL`(현재 Facing 반대편 뒤 칸) Resolver 구현.
 - [x] ShopDefinitions/ShopEntries 로더 + SHOP Node·RUN_SCOPED Currency·SKILL/CONSUMABLE 참조 Validator.
@@ -386,6 +386,9 @@ StageFlowComponent
 
 ### Phase 6 — 연출과 출시 준비
 
+- [x] 로비 Codex(도감)·캐릭터/직업 선택·그리드 이동 구현 (`LobbyCodexLogic`/`LobbyCharacterSelectionLogic`/`LobbyJobSelectionProvider`/`LobbyGridMovementComponent` 등, `RootDesk/MyDesk/00_Core/Lobby/`).
+- [x] 전투 HUD를 `BattleHudPresenterLogic` 이벤트(`BattleHudStateChangedEvent`/`BattleHudCommandResultEvent`) 기반으로 디커플.
+- [ ] 대체된 `BattleQueueHudComponent.mlua`/`.codeblock` 삭제 — `AddComponent`/`.map` 어디에도 붙지 않는 죽은 코드로 확인됨.
 - [ ] 논리 즉시 해결과 클라이언트 연출 큐 분리.
 - [ ] 이동/밀치기/공격/사망 애니메이션.
 - [ ] 짧은 연출은 create/destroy positive log로 검증.
