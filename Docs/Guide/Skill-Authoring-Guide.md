@@ -119,6 +119,8 @@ SkillDefinition.WeaponType
 
 - **투사체는 시전 이펙트와 동시에 나가는 것이 기본이다.** 근접 스킬의 피해 시점인 모션
   `ImpactDelay`에 묶지 않는다. 늦춰야 하는 스킬만 `ProjectileLaunchDelay`에 양수를 적는다.
+  현재 유일한 사례는 `poison_breath`(`0.25`)다. 값은 이론이 아니라 플레이로 정한다 —
+  0초로 먼저 확인하고, 이르게 보이면 조금씩 올린다.
 - 비행시간은 저작값이 아니라 `거리 / (ProjectileSpeed × 배속)`이다. 가까운 적은 빨리,
   먼 적은 늦게 맞는다.
 - 큐 슬롯 시간은 `max(ActionDuration, 발사지연 + 최대사거리 비행시간)`으로 자동 보정되므로
@@ -128,7 +130,10 @@ SkillDefinition.WeaponType
 - `TargetingType=SELF`에는 쓸 수 없다.
 - **투사체 이미지는 그 스킬 리소스 팩에 실제로 날아가는 물체(`ball` 등)가 있을 때만 쓴다**
   (`effect`=시전, `hit`=피격과 같은 팩). 팩에 없다고 다른 스킬 것을 빌려오면 서로 같은
-  그림이 되어 구분이 사라지므로, 그런 스킬은 투사체 없이 즉발로 둔다.
+  그림이 되어 구분이 사라지므로, 그런 스킬은 투사체 없이 즉발로 둔다. 확인 방법은
+  `CastEffectRuid`로 팩을 역추적하는 것이다 —
+  `node scripts/msw_resource_api.cjs packs <CastEffectRuid>` 결과의 `elements`에
+  `rel_path: "ball"`이 있는지 본다.
 - `ProjectileScale`은 클립 픽셀 크기를 셀 간격(1.12 유닛 = 112px)에 맞추는 값이다.
 
 전체 목록과 엔티티 구성은
@@ -256,7 +261,7 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 ## Dataset 상태
 
 플레이어 스킬 18행(직업별 5개 테이블), 적 전용 3행, Effect Step 23행, 무기 12행이
-실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은 5행이다. `AllowPrototypeCompatibilityFallback=false`이며 production
+실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은 6행이다. `AllowPrototypeCompatibilityFallback=false`이며 production
 Skill 하드코딩을 다시 추가하지 않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를
 복제하지 않는다.
 

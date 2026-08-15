@@ -339,15 +339,20 @@ SkillDefinition.ProjectileRuid
 `SkillProjectileComponent`는 `.model`에 넣지 않고 스폰 직후 `AddComponent`로 붙인다.
 `.codeblock`이 없을 때 모델의 스크립트 컴포넌트가 조용히 누락되는 경로를 피하기 위해서다.
 
-현재 투사체를 쓰는 스킬 5종이다. 모두 `ProjectileLaunchDelay=0`이다.
+현재 투사체를 쓰는 스킬 6종이다.
 
-| SkillId | 직업 | 투사체 출처 | Speed | Scale |
-|---|---|---|:--:|:--:|
-| `piercing` | 궁수 | 피어싱 팩 `ball` | 14 | 0.55 |
-| `arrow_bomb` | 궁수 | 바람의 시 팩 `ball` | 14 | 0.9 |
-| `cardinal_discharge` | 궁수 | 카디널 블래스트 팩 `shootobj/layerList/b1` | 14 | 0.28 |
-| `flame_orb` | 마법사 | 플레임 오브 팩 `ball` | 12 | 0.7 |
-| `slug_shot` | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 |
+| SkillId | 직업 | 투사체 출처 | Speed | Scale | LaunchDelay |
+|---|---|---|:--:|:--:|:--:|
+| `piercing` | 궁수 | 피어싱 팩 `ball` | 14 | 0.55 | 0 |
+| `arrow_bomb` | 궁수 | 바람의 시 팩 `ball` | 14 | 0.9 | 0 |
+| `cardinal_discharge` | 궁수 | 카디널 블래스트 팩 `shootobj/layerList/b1` | 14 | 0.28 | 0 |
+| `flame_orb` | 마법사 | 플레임 오브 팩 `ball` | 12 | 0.7 | 0 |
+| `poison_breath` | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
+| `slug_shot` | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
+
+`poison_breath`만 발사 지연이 있다. 플레이 확인에서 0초 동시 발사가 이르게 보인다는
+피드백을 받아 0.15 → 0.25로 두 번 조정한 결과다(배속 적용 후 0.2초). 피해도 그만큼 밀려
+`0.2 + 0.224 = 0.424초`가 되지만 `ActionDuration` 0.65초 안이라 큐 슬롯 길이는 변하지 않는다.
 
 `ball`은 §4.0의 `effect`(시전)·`hit`(피격)과 같은 리소스 팩 안의 엘리먼트이며 날아가는
 물체에 해당한다.
@@ -361,6 +366,10 @@ SkillDefinition.ProjectileRuid
 `magnum_shot`, `enemy_ranged_shot`. 넷 다 자기 팩에 `ball`이 없어 남의 것을 쓰고 있었다.
 이들은 투사체 없이 즉발로 해결되며, 전사·도적은 원래 투사체 스킬이 없다.
 
+반대로 `poison_breath`는 나중에 추가했다. 자기 팩(`skill/210.img/skill/2101005`)에
+`ball`이 실제로 들어 있어 기준을 그대로 만족한다. 남은 무투사체 스킬들을 다시 확인할 때는
+같은 절차를 쓴다 — `CastEffectRuid`로 팩을 역추적(`packs`)해 `ball` 유무를 본다.
+
 예외는 `cardinal_discharge` 하나다. 자기 팩에는 `ball`이 없지만 같은 직업군(패스파인더)
 스킬인 카디널 블래스트의 발사체를 의도적으로 가져왔다. 카디널 블래스트 팩은 `ball` 대신
 `shootobj/layerList/b1`(발사체 몸체)과 `e1`(착탄)을 갖는다. 팩이 4종(330 / 331 강화 / 332 /
@@ -369,6 +378,8 @@ SkillDefinition.ProjectileRuid
 
 `ProjectileScale`은 클립 원본 픽셀 크기를 셀 간격(1.12 월드 유닛 = 112px)에 맞춘 값이다.
 예: 피어싱 `ball`은 285px이라 배율 1이면 2.5칸을 덮으므로 0.55로 줄여 약 1.4칸에 맞춘다.
+포이즌 브레스 `ball`은 96px이라 배율 1에서 약 0.86칸으로, 같은 마법사 스킬인 플레임 오브
+(137px × 0.7 ≈ 96px)와 화면상 크기가 맞는다.
 
 ## 5. SkillEffectSteps
 
