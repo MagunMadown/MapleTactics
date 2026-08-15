@@ -480,7 +480,6 @@ UI 표시 문구는 Reason ID와 분리한다. 서버 Reason을 그대로 사용
 | `PlayerStartCell` | integer | O | Player 시작 Cell |
 | `QueueCapacity` | integer | O | 기본 타일 큐 용량 |
 | `WaveTableId` | string | O | Wave 묶음 ID |
-| `NextStageId` | string |  | 마지막이면 빈 문자열 |
 | `StageRuleId` | string |  | 특수 규칙 Handler ID |
 
 Map Entity에는 가능하면 `StageId`만 설정하고 세부 값은 Repository에서 읽는다.

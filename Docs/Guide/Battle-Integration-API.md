@@ -256,8 +256,8 @@ TotalWaves
 `InitializeFromEntry(...)`는 공개된 형태이지만 Gateway 전용이다. UI나 Stage 스크립트가
 직접 호출하지 않는다.
 
-전투가 끝난 뒤 다음 화면은 Battle Snapshot의 `NextStageId`를 해석하지 않는다.
-서버 Flow Controller는 다음 API로 플레이어별 Run Flow Snapshot을 읽는다.
+전투가 끝난 뒤 다음 화면은 Battle Snapshot이 아니라 서버 Flow Controller의
+플레이어별 Run Flow Snapshot에서 다음 콘텐츠를 읽는다.
 
 ```lua
 local flow = _RunManagerLogic:GetRunFlowSnapshot(playerEntity)
