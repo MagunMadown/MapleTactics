@@ -117,6 +117,7 @@
 | ProjectileSpeed | number | 조건부 | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 (1배속 기준) |
 | ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
 | ProjectileLaunchDelay | number | - | 발사를 늦출 초 (1배속 기준). 비우거나 `0`이면 시전과 동시 발사 |
+| IconRuid | string | - | §4.6 스킬 아이콘 sprite RUID. 비우면 표시 측에서 기본 스프라이트로 대체 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -380,6 +381,46 @@ SkillDefinition.ProjectileRuid
 예: 피어싱 `ball`은 285px이라 배율 1이면 2.5칸을 덮으므로 0.55로 줄여 약 1.4칸에 맞춘다.
 포이즌 브레스 `ball`은 96px이라 배율 1에서 약 0.86칸으로, 같은 마법사 스킬인 플레임 오브
 (137px × 0.7 ≈ 96px)와 화면상 크기가 맞는다.
+
+### 4.6 스킬 아이콘 (IMPLEMENTED)
+
+`IconRuid`는 그 스킬 리소스 팩의 `icon` 엘리먼트다. §4.0의 `effect`(시전)·`hit`(피격),
+§4.5의 `ball`(투사체)과 같은 팩에서 나오므로 스킬 하나의 표현이 한 출처로 묶인다.
+플레이어 스킬 18행이 모두 32×32 `sprite`이며, 적 전용 3행은 비어 있다 — 적 스킬은 Codex에도
+HUD에도 표시되지 않기 때문이고, `WeaponType`을 적 행에서 비워두는 것과 같은 이유다.
+
+찾는 절차는 §4.5의 투사체와 같다. `CastEffectRuid`로 팩을 역추적한다:
+
+```text
+node scripts/msw_resource_api.cjs packs <CastEffectRuid>
+  → payload.elements 에서 rel_path == "icon" 인 항목의 ruid
+```
+
+같은 팩에 `iconDisabled`·`iconMouseOver`도 들어 있다. 지금은 쓰지 않으며, 필요해지면
+컬럼을 늘리기보다 같은 팩에서 그때 가져온다.
+
+예외는 `arrow_bomb` 하나로 보이지만 실제로는 아니다. 이 스킬은 `wind_shot`에서 이름만
+바뀌었고 리소스는 바람의 시 팩(`skill/310.img/skill/3101005`)을 그대로 쓰므로, 역추적하면
+자연히 바람의 시 아이콘이 나온다. 별도 지정이 필요 없다.
+
+#### 표시 경로
+
+아이콘을 읽는 곳은 두 군데다.
+
+| 표시 위치 | 경로 |
+|---|---|
+| Codex 스킬 목록 | `SkillCodexProvider`가 서버에서 `definition.IconRuid`를 읽어 `EntrySnapshot`에 넣는다 |
+| 머리 위 예약 큐 HUD | `BattleSessionComponent.SkillIconSnapshot`(`@Sync`)을 클라가 파싱해서 쓴다 |
+
+HUD가 정의를 직접 읽지 못하는 이유는 스킬 DataSet이 전부 `serveronly`이기 때문이다.
+`SkillSlotNames`가 표시 이름을 서버에서 풀어 넘기는 것과 같은 방식으로,
+`SkillIconSnapshot`은 `skillId~iconRuid|...` 형태로 **보유 스킬 전체**를 넘긴다. 뽑힌 슬롯
+3개가 아니라 전체인 이유는 큐가 슬롯이 아니라 보유 여부로 등록을 허용하기 때문이다.
+
+양쪽 모두 값이 비면 기본 스프라이트(`1705e3c5b2c146ac9a699f96fb067408`)로 떨어진다.
+이 컬럼이 생기기 전에는 HUD가 `spear_pulling`·`brandish`·`divine_swing` 세 개만 SkillId로
+분기하는 하드코딩 표를 갖고 있었다. 그중 `spear_pulling`에 걸려 있던 RUID는 실제로는 웨폰
+마스터리 스킬의 `iconMouseOver`였다. 분기는 제거했다.
 
 ## 5. SkillEffectSteps
 

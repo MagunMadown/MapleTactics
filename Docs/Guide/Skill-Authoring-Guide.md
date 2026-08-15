@@ -71,6 +71,7 @@ TryQueueTile
 | `ProjectileSpeed` | number | `14` | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 |
 | `ProjectileScale` | number | `0.9` | 투사체 배율. 비우면 `1` |
 | `ProjectileLaunchDelay` | number | `0` | 발사를 늦출 초. `0`이면 시전과 동시 발사 |
+| `IconRuid` | string | 32자리 hex | 스킬 아이콘 sprite. 비우면 기본 스프라이트로 대체 |
 
 ## WeaponType과 무기 카탈로그
 
@@ -139,11 +140,25 @@ SkillDefinition.WeaponType
 전체 목록과 엔티티 구성은
 [`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.5를 본다.
 
+## 아이콘
+
+`IconRuid`도 그 스킬 리소스 팩에서 가져온다. 투사체와 같은 절차로 `CastEffectRuid`를
+역추적한 뒤 `rel_path: "icon"`인 엘리먼트를 쓴다. 플레이어 스킬 18행이 모두 32×32
+`sprite`이고, 적 전용 3행은 비워둔다 — 적 스킬은 Codex에도 HUD에도 나오지 않는다.
+
+- 이미 아이콘용 sprite이므로 `thumbnail://` 접두사를 붙이지 않는다.
+- 아이콘은 Codex와 머리 위 예약 큐 HUD 두 곳에서 읽는다. HUD 쪽은 스킬 DataSet이
+  `serveronly`라 정의를 직접 못 읽고, `BattleSessionComponent.SkillIconSnapshot`(`@Sync`)을
+  거친다. **새 스킬을 추가하면서 아이콘이 HUD에 안 나오면 이 스냅샷부터 본다.**
+- 비어 있으면 양쪽 다 기본 스프라이트로 떨어진다. 즉 아이콘을 안 채워도 스킬은 동작한다.
+
+자세한 표시 경로는 [`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.6에 있다.
+
 현재 실제 Dataset Definition은 다음과 같다.
 
 ```csv
-SchemaVersion,SkillId,DisplayName,SkillTags,TargetingType,Range,TargetOffsets,CooldownTurns,CostType,CostValue,MotionProfileId,EffectSetId,RequiredJobTag,ActionDuration,FreePlay,CastEffectRuid,HitEffectRuid,EffectScale,WeaponType
-1,brandish,브랜디쉬,attack|warrior|maple,RANGE_OFFSETS,2,1|2,1,,0,heavy_slash,brandish_effects,warrior,0.60,false,8b26a0cdb63d455e82d1ca0fddf5e139,38e9351c34b843ddbcc191c762e7464c,0.9,ONE_HANDED_SWORD
+SchemaVersion,SkillId,DisplayName,SkillTags,TargetingType,Range,TargetOffsets,CooldownTurns,CostType,CostValue,MotionProfileId,EffectSetId,RequiredJobTag,ActionDuration,FreePlay,CastEffectRuid,HitEffectRuid,EffectScale,WeaponType,ProjectileRuid,ProjectileSpeed,ProjectileScale,ProjectileLaunchDelay,IconRuid
+1,brandish,브랜디쉬,attack|warrior|maple,RANGE_OFFSETS,2,1|2,1,,0,heavy_slash,brandish_effects,warrior,0.60,false,8b26a0cdb63d455e82d1ca0fddf5e139,38e9351c34b843ddbcc191c762e7464c,0.9,ONE_HANDED_SWORD,,0,1,0,429228115d56462ab0f65e7294a51609
 ```
 
 행 전체는 코드 대신 실제 CSV를 본다. 스킬은 직업별 테이블로 나뉘어 있으며 어느 파일에
