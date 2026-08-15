@@ -113,6 +113,9 @@
 | HitEffectRuid | string | - | 피격 대상에게 재생할 animationclip RUID. 비우면 피격 이펙트 없음 |
 | EffectScale | number | - | 두 이펙트에 공통 적용할 배율. 비우면 `1` |
 | WeaponType | string | - | §4.4 `WeaponDefinitions.WeaponType` 참조. 비우면 현재 장착 무기를 유지 |
+| ProjectileRuid | string | - | 날아가는 투사체 animationclip RUID. 비우면 비행 단계 없음 |
+| ProjectileSpeed | number | 조건부 | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 (1배속 기준) |
+| ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -193,7 +196,8 @@ SkillId는 예외 없이 `UNKNOWN_SKILL`이다.
 3. `JobStartingSkillEntries.csv`에 필요하면 슬롯을 추가한다.
 4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다.
 5. `WeaponType`을 §4.4 목록에서 고른다. 무기를 바꾸지 않는 스킬이면 비운다.
-6. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
+6. 원거리 스킬이면 `ProjectileRuid`/`ProjectileSpeed`/`ProjectileScale`을 §4.5 규칙대로 채운다.
+7. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
 
 ### 4.2 HUD 스킬 슬롯 배정
 
@@ -280,6 +284,73 @@ SkillDefinition.WeaponType
 - 적 유닛에는 `CostumeManagerComponent`가 없다. 그래서 `EnemySkillDefinitions` 3행은
   `WeaponType`이 모두 비어 있고, 적 스킬에 값을 넣는 것은 데이터 실수다.
 - 무기는 스킬이 바꾸기 전까지 유지된다. 턴이나 전투가 끝나도 되돌리지 않는다.
+
+### 4.5 투사체 (IMPLEMENTED)
+
+`ProjectileRuid`가 채워진 스킬은 시전자 셀에서 목표 셀까지 실제로 날아가는 엔티티를 만든다.
+이 게임의 피해는 `AttackComponent`/`HitComponent`가 아니라 §5 Effect Step이 셀 기준으로
+계산하므로, 투사체는 **판정을 갖지 않는 순수 표현**이다. 대신 임팩트 시점을 뒤로 민다.
+
+#### 실행 경로
+
+```text
+SkillDefinition.ProjectileRuid
+→ BattleSessionComponent.LaunchSkillProjectile   (ImpactDelay 뒤 발사 예약, 비행시간 반환)
+→ BattleSessionComponent.SpawnSkillProjectile    (SpawnByModelId + AddComponent)
+→ SkillProjectileComponent.Launch / OnUpdate     (Translate 이동, 도착 시 Destroy)
+→ ImpactDelay + 비행시간 뒤 SkillExecutionLogic.ExecuteEffectSteps
+```
+
+#### 타이밍
+
+| 시점 | 일 |
+|---|---|
+| 0 | 모션 재생 시작, 시전 이펙트 |
+| `ImpactDelay` | 투사체 발사 (활을 놓는 프레임) |
+| `ImpactDelay + 비행시간` | Effect Step 실행 = 피해·밀치기·피격 이펙트 |
+
+- **비행시간은 저작값이 아니라 실제 거리에서 나온다**: `거리 / (ProjectileSpeed × 배속)`.
+  1칸 앞 적은 빠르게, 5칸 밖 적은 오래 걸린다.
+- `ProjectileSpeed`도 §4.3 배속의 영향을 받는다. 다른 연출과 함께 빨라진다.
+- `GetSkillActionDuration`은 큐 슬롯이 피해보다 먼저 끝나지 않도록
+  `max(ActionDuration, ImpactDelay + 최대사거리 비행시간)`으로 보정한다. 최대 사거리를 쓰는
+  이유는 큐 시간을 계산하는 시점에 실제 대상 거리를 알 수 없기 때문이다.
+- 조준 셀은 `SkillTargetResolverLogic:Resolve`의 `TargetCellIndices` 마지막 값이다.
+  타기팅 규칙을 여기서 다시 구현하지 않는다. `FIRST_ENEMY_FORWARD`는 막아선 적의 칸,
+  `RANGE_OFFSETS`는 가장 바깥 칸이 된다.
+- 적이 없어도 투사체는 사거리 끝까지 날아가고 사라진다. Effect Step은 그대로 `NO_TARGET`이다.
+- `TargetingType=SELF`에는 투사체를 쓸 수 없다. 잡을 셀이 없어 Validator가 막는다.
+
+#### 엔티티
+
+`RootDesk/MyDesk/Models/Particles/SkillProjectile.model` — `TransformComponent` +
+`SpriteRendererComponent`만 가진 **Body 없는** 모델이다. 전투 맵은 `TileMapMode=0`
+(MapleTile, 중력 있음)이므로 Body를 붙이면 투사체가 바닥으로 떨어진다. 이동은 Body 속도가
+아니라 `TransformComponent:Translate`로 한다.
+
+`SkillProjectileComponent`는 `.model`에 넣지 않고 스폰 직후 `AddComponent`로 붙인다.
+`.codeblock`이 없을 때 모델의 스크립트 컴포넌트가 조용히 누락되는 경로를 피하기 위해서다.
+
+현재 투사체를 쓰는 스킬 9종이다.
+
+| SkillId | 투사체 출처 | Speed | Scale |
+|---|---|:--:|:--:|
+| `piercing` | 피어싱 팩 `ball` | 14 | 0.4 |
+| `wind_shot` | 바람의 시 팩 `ball` | 14 | 0.9 |
+| `cardinal_discharge` | 애로우 블로우 강화 팩 `ball` | 14 | 0.7 |
+| `flame_orb` | 플레임 오브 팩 `ball` | 12 | 0.7 |
+| `holy_arrow` | 에너지 볼트 팩 `ball` | 12 | 1 |
+| `thunder_bolt` | 썬더 스피어 팩 `ball/0` | 16 | 0.2 |
+| `magnum_shot` | 슬러그 샷 팩 `ball` | 16 | 1 |
+| `slug_shot` | 슬러그 샷 팩 `ball` | 16 | 1 |
+| `enemy_ranged_shot` | 에너지 볼트 팩 `ball` | 10 | 1 |
+
+`ball`은 §4.0의 `effect`(시전)·`hit`(피격)과 같은 리소스 팩 안의 엘리먼트이며 날아가는
+물체에 해당한다. 팩에 `ball`이 없는 스킬(카디널 디스차지·홀리 애로우·썬더 볼트·매그넘 샷)은
+같은 계열 스킬의 `ball`을 재사용한다.
+
+`ProjectileScale`은 클립 원본 픽셀 크기를 셀 간격(1.12 월드 유닛 = 112px)에 맞춘 값이다.
+예: 피어싱 `ball`은 285px이라 배율 1이면 2.5칸을 덮으므로 0.4로 줄인다.
 
 ## 5. SkillEffectSteps
 
@@ -938,6 +1009,8 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | UNSUPPORTED_WEAPON_EQUIP_SLOT | WeaponDefinitions의 EquipSlot이 ONE_HANDED/TWO_HANDED가 아님 | O |
 | WEAPON_RUID_MISSING | WeaponDefinitions의 WeaponRuid가 비어 있음 | O |
 | WEAPON_DISABLED | 활성 스킬이 Enabled=false인 무기를 참조 | O |
+| INVALID_PROJECTILE_SPEED | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 | O |
+| PROJECTILE_ON_SELF_TARGETING | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 | O |
 
 로그 예시:
 
