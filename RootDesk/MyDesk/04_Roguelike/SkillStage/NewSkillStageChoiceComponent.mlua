@@ -1,0 +1,170 @@
+@Component
+script NewSkillStageChoiceComponent extends Component
+
+	property integer ChoiceIndex = 1
+	property string LabelEntityPath = ""
+	property Vector3 TargetPosition = Vector3(0, 0, 0)
+	property string OfferedSkillId = ""
+	property string OfferedDisplayName = ""
+	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
+	property string SpearPullingIconRuid = "bb70484eb6eb41f181ff21d336e78ea0"
+	property string BrandishIconRuid = "ad4304f4d5654158aca63c8c142d5035"
+	property string DivineSwingIconRuid = "01f0134411804cd7aaa13065ca3b5ab7"
+	property string TargetMapName = ""
+	property boolean SelectionLocked = false
+	property any touchHandler = nil
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Requests this slot's authoritative job skill offer and wires world touch input.
+		self.SelectionLocked = false
+		self.touchHandler = self.Entity:ConnectEvent(TouchEvent, self.OnTouched)
+		_StageTransitionManagerLogic:RequestNextStageMapName()
+		self:RequestOffer(self.ChoiceIndex)
+		log("[NewSkillStage] offer requested slot=" .. self.ChoiceIndex)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Releases the world touch handler when the selection map unloads.
+		if self.touchHandler ~= nil then
+			self.Entity:DisconnectEvent(TouchEvent, self.touchHandler)
+			self.touchHandler = nil
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestOffer(integer choiceIndex)
+		-- Resolves a deterministic offer from the requesting player's selected job.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local offer = self:ResolveOffer(playerEntity, choiceIndex)
+		if offer.Success == false then
+			log_warning("[NewSkillStage] offer rejected user=" .. senderUserId .. " slot=" .. choiceIndex .. " reason=" .. offer.Reason)
+			self:ReceiveOffer("", "", "", offer.Reason, senderUserId)
+			return
+		end
+		log("[NewSkillStage] offer ready user=" .. senderUserId .. " job=" .. offer.JobId .. " slot=" .. choiceIndex .. " skill=" .. offer.SkillId)
+		self:ReceiveOffer(offer.SkillId, offer.DisplayName, offer.IconRuid, "OK", senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveOffer(Entity playerEntity, integer choiceIndex)
+		-- Selects a stable, non-duplicated slot from the job-specific skill dataset.
+		if isvalid(playerEntity) == false then
+			return { Success = false, Reason = "INVALID_PLAYER" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil or runState.SelectedJobId == "" then
+			return { Success = false, Reason = "JOB_NOT_SELECTED" }
+		end
+		local catalog = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(runState.SelectedJobId)
+		if catalog.Success == false then
+			return catalog
+		end
+		local normalizedChoiceIndex = math.max(1, math.floor(choiceIndex or 1))
+		local rotation = math.abs(runState.RunSeed + runState.CompletedStageCount * 17)
+		local skillIndex = ((rotation + normalizedChoiceIndex - 1) % #catalog.Skills) + 1
+		local definition = catalog.Skills[skillIndex]
+		return {
+			Success = true,
+			Reason = "OK",
+			JobId = runState.SelectedJobId,
+			SkillId = definition.SkillId,
+			DisplayName = definition.DisplayName,
+			IconRuid = self:GetSkillIconRuid(definition.SkillId)
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetSkillIconRuid(string skillId)
+		-- Returns dedicated static skill artwork without reusing cast or hit effect frames.
+		if skillId == "spear_pulling" then
+			return self.SpearPullingIconRuid
+		elseif skillId == "brandish" then
+			return self.BrandishIconRuid
+		elseif skillId == "divine_swing" then
+			return self.DivineSwingIconRuid
+		end
+		return self.DefaultSkillIconRuid
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveOffer(string skillId, string displayName, string iconRuid, string reason)
+		-- Applies the server-approved static skill icon and label on the local client.
+		if reason ~= "OK" or skillId == "" then
+			log_warning("[NewSkillStage] offer unavailable slot=" .. self.ChoiceIndex .. " reason=" .. reason)
+			return
+		end
+		self.OfferedSkillId = skillId
+		self.OfferedDisplayName = displayName
+		if iconRuid ~= "" and self.Entity.SpriteRendererComponent ~= nil then
+			self.Entity.SpriteRendererComponent.SpriteRUID = iconRuid
+		end
+		local labelEntity = _EntityService:GetEntityByPath(self.LabelEntityPath)
+		if isvalid(labelEntity) and labelEntity.NameTagComponent ~= nil then
+			labelEntity.NameTagComponent.Name = displayName
+			labelEntity.NameTagComponent.Enable = true
+		end
+		log("[NewSkillStage] offer displayed slot=" .. self.ChoiceIndex .. " skill=" .. skillId .. " name=" .. displayName .. " icon=" .. iconRuid)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnTouched(TouchEvent event)
+		-- Submits the displayed offer once and ignores repeated local touches.
+		if self.SelectionLocked == true or self.OfferedSkillId == "" then
+			return
+		end
+		self.SelectionLocked = true
+		self:RequestSelectOffer(self.ChoiceIndex, self.OfferedSkillId)
+		log("[NewSkillStage] selection requested slot=" .. self.ChoiceIndex .. " skill=" .. self.OfferedSkillId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestSelectOffer(integer choiceIndex, string skillId)
+		-- Recomputes the offer server-side, grants it once, and rejects forged or repeated choices.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local offer = self:ResolveOffer(playerEntity, choiceIndex)
+		if offer.Success == false or offer.SkillId ~= skillId then
+			local reason = offer.Success == false and offer.Reason or "OFFER_MISMATCH"
+			log_warning("[NewSkillStage] selection rejected user=" .. senderUserId .. " slot=" .. choiceIndex .. " reason=" .. reason)
+			self:ReceiveSelectionResult(false, reason, skillId, senderUserId)
+			return
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local rewardKey = "new_skill_stage:" .. tostring(runState.RunSequence) .. ":" .. tostring(runState.CompletedStageCount)
+		local result = _RunManagerLogic:GrantRunSkill(playerEntity, skillId, 1, rewardKey)
+		if result.Success == false or result.GrantedAmount ~= 1 then
+			local reason = result.Success == false and result.Reason or "SKILL_ALREADY_SELECTED"
+			log_warning("[NewSkillStage] grant rejected user=" .. senderUserId .. " skill=" .. skillId .. " reason=" .. reason)
+			self:ReceiveSelectionResult(false, reason, skillId, senderUserId)
+			return
+		end
+		log("[NewSkillStage] grant applied user=" .. senderUserId .. " job=" .. offer.JobId .. " skill=" .. skillId .. " key=" .. rewardKey)
+		self:ReceiveSelectionResult(true, "APPLIED", skillId, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveSelectionResult(boolean success, string reason, string skillId)
+		-- Teleports only after the server confirms that this stage granted exactly one skill.
+		if success == false then
+			self.SelectionLocked = false
+			log_warning("[NewSkillStage] selection failed skill=" .. skillId .. " reason=" .. reason)
+			return
+		end
+		local playerEntity = _UserService.LocalPlayer
+		if isvalid(playerEntity) then
+			local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+			if runState ~= nil then
+				self.TargetMapName = runState.PendingNextStageMapName or ""
+			end
+		end
+		if self.TargetMapName == "" then
+			self.SelectionLocked = false
+			log_warning("[NewSkillStage] selection applied but next map is unavailable skill=" .. skillId)
+			return
+		end
+		log("[NewSkillStage] selection complete skill=" .. skillId .. " targetMap=" .. self.TargetMapName)
+		_MapTeleportManager:RequestTeleportFromClient(self.TargetMapName, self.TargetPosition)
+	end
+
+end
