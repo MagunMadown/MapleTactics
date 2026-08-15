@@ -70,6 +70,7 @@ TryQueueTile
 | `ProjectileRuid` | string | 32자리 hex | 날아가는 투사체 animationclip. 비우면 비행 단계 없음 |
 | `ProjectileSpeed` | number | `14` | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 |
 | `ProjectileScale` | number | `0.9` | 투사체 배율. 비우면 `1` |
+| `ProjectileLaunchDelay` | number | `0` | 발사를 늦출 초. `0`이면 시전과 동시 발사 |
 
 ## WeaponType과 무기 카탈로그
 
@@ -112,20 +113,22 @@ SkillDefinition.WeaponType
 판정은 갖지 않으며(피해는 Effect Step이 소유) 대신 **임팩트 시점을 비행시간만큼 뒤로 민다**.
 
 ```text
-0                모션 시작 + 시전 이펙트
-ImpactDelay      투사체 발사
+0                모션 시작 + 시전 이펙트 + 투사체 발사
 + 비행시간        Effect Step 실행 = 피해 · 밀치기 · 피격 이펙트
 ```
 
+- **투사체는 시전 이펙트와 동시에 나가는 것이 기본이다.** 근접 스킬의 피해 시점인 모션
+  `ImpactDelay`에 묶지 않는다. 늦춰야 하는 스킬만 `ProjectileLaunchDelay`에 양수를 적는다.
 - 비행시간은 저작값이 아니라 `거리 / (ProjectileSpeed × 배속)`이다. 가까운 적은 빨리,
   먼 적은 늦게 맞는다.
-- 큐 슬롯 시간은 `max(ActionDuration, ImpactDelay + 최대사거리 비행시간)`으로 자동 보정되므로
+- 큐 슬롯 시간은 `max(ActionDuration, 발사지연 + 최대사거리 비행시간)`으로 자동 보정되므로
   `ActionDuration`을 직접 늘리지 않아도 피해보다 먼저 끝나지 않는다.
 - 조준 셀은 Target Resolver가 돌려준 마지막 대상 칸이다. 적이 없으면 사거리 끝까지 날아가고
   사라지며 Effect Step은 그대로 `NO_TARGET`이 된다.
 - `TargetingType=SELF`에는 쓸 수 없다.
-- 투사체 이미지는 스킬 리소스 팩의 `ball` 엘리먼트를 쓴다(`effect`=시전, `hit`=피격과 같은 팩).
-  팩에 `ball`이 없으면 같은 계열 스킬의 것을 재사용한다.
+- **투사체 이미지는 그 스킬 리소스 팩에 실제로 날아가는 물체(`ball` 등)가 있을 때만 쓴다**
+  (`effect`=시전, `hit`=피격과 같은 팩). 팩에 없다고 다른 스킬 것을 빌려오면 서로 같은
+  그림이 되어 구분이 사라지므로, 그런 스킬은 투사체 없이 즉발로 둔다.
 - `ProjectileScale`은 클립 픽셀 크기를 셀 간격(1.12 유닛 = 112px)에 맞추는 값이다.
 
 전체 목록과 엔티티 구성은
@@ -235,6 +238,7 @@ Motion Profile Repository를 공통 계약으로 확장한다.
 | `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_WEAPON_REFERENCE` | WeaponType이 비어있지 않은데 `WeaponDefinitions`에서 유효하지 않음 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_SPEED` | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 |
 | `CONTENT_VALIDATION_FAILED` | `PROJECTILE_ON_SELF_TARGETING` | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_LAUNCH_DELAY` | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 |
 | `CONTENT_VALIDATION_FAILED` | `EFFECT_STEPS_EMPTY` | 연결된 Effect Step이 하나도 없음 |
 | `CONTENT_VALIDATION_FAILED` | `UNSUPPORTED_EFFECT_SCHEMA` | Effect Step의 SchemaVersion이 스킬과 다름 |
 | `CONTENT_VALIDATION_FAILED` | `EFFECT_SET_MISMATCH` | Effect Step의 EffectSetId가 스킬 정의와 다름 |
@@ -252,7 +256,7 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 ## Dataset 상태
 
 플레이어 스킬 18행(직업별 5개 테이블), 적 전용 3행, Effect Step 23행, 무기 12행이
-실제 Dataset으로 올라가 있다. `AllowPrototypeCompatibilityFallback=false`이며 production
+실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은 5행이다. `AllowPrototypeCompatibilityFallback=false`이며 production
 Skill 하드코딩을 다시 추가하지 않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를
 복제하지 않는다.
 

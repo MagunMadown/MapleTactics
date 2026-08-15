@@ -2199,9 +2199,9 @@ script BattleSessionComponent extends Component
 		-- A projectile skill resolves only after the shot lands, so the queue slot must outlive the
 		-- worst-case flight. Actual flight uses the real target distance; the clamp uses full range
 		-- because the target is not known until the shot is scheduled.
-		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
+		local launchDelay = self:GetProjectileLaunchDelay(definition)
 		local worstFlight = (definition.Range * self.CellSpacing) / (definition.ProjectileSpeed * speed)
-		local minimumDuration = math.max(0, motionProfile.ImpactDelay) + worstFlight
+		local minimumDuration = launchDelay + worstFlight
 		return math.max(0.1, authored, minimumDuration)
 	end
 
@@ -3296,16 +3296,24 @@ script BattleSessionComponent extends Component
 		end
 
 		self:ClearSkillImpactTimers()
-		-- A projectile skill splits the impact in two: the shot leaves at the motion's release frame,
-		-- and the effects resolve only once it has crossed the board to the target cell.
-		local flightSeconds = self:LaunchSkillProjectile(sourceUnitId, definition, safeImpactDelay)
-		local totalImpactDelay = safeImpactDelay + flightSeconds
+		-- A projectile skill splits the impact in two: the shot leaves at its launch delay, and the
+		-- effects resolve only once it has crossed the board to the target cell.
+		local launchDelay = safeImpactDelay
+		local flightSeconds = 0
+		local totalImpactDelay = safeImpactDelay
+		if self:HasSkillProjectile(definition) then
+			launchDelay = self:GetProjectileLaunchDelay(definition)
+			flightSeconds = self:LaunchSkillProjectile(sourceUnitId, definition, launchDelay)
+			if flightSeconds > 0 then
+				totalImpactDelay = launchDelay + flightSeconds
+			end
+		end
 		if totalImpactDelay <= 0 then
 			return _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
 		end
 
 		self.ImpactTimerId = _TimerService:SetTimerOnce(resolveEffects, totalImpactDelay)
-		log("[SkillExecution] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " steps=" .. #effectSteps .. " delay=" .. safeImpactDelay .. " flight=" .. flightSeconds)
+		log("[SkillExecution] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " steps=" .. #effectSteps .. " delay=" .. launchDelay .. " flight=" .. flightSeconds)
 		return {
 			Success = true,
 			Reason = "IMPACT_PENDING",
@@ -3339,6 +3347,20 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ProjectileTimerId)
 			self.ProjectileTimerId = 0
 		end
+	end
+
+	method number GetProjectileLaunchDelay(table definition)
+		-- The shot leaves with the cast effect by default, so a ranged skill reads as "fire on cast"
+		-- rather than waiting for a melee swing's impact frame. ProjectileLaunchDelay only holds it
+		-- back, and is scaled like every other duration so it tracks the battle speed multiplier.
+		if definition == nil then
+			return 0
+		end
+		local authored = definition.ProjectileLaunchDelay or 0
+		if authored <= 0 then
+			return 0
+		end
+		return authored / self:GetSkillSpeedMultiplier()
 	end
 
 	method boolean HasSkillProjectile(table definition)

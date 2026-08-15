@@ -82,7 +82,7 @@
 |---|:---:|---|
 | warrior_start | 3 | `brandish`, `divine_swing`, `spear_pulling` |
 | mage_start | 6 | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
-| archer_start | 3 | `piercing`, `wind_shot`, `cardinal_discharge` |
+| archer_start | 3 | `piercing`, `arrow_bomb`, `cardinal_discharge` |
 | thief_start | 3 | `shuriken_burst`, `savage_blow`, `fatal_blow` |
 | pirate_start | 3 | `magnum_shot`, `slug_shot`, `shock_wave` |
 
@@ -116,6 +116,7 @@
 | ProjectileRuid | string | - | 날아가는 투사체 animationclip RUID. 비우면 비행 단계 없음 |
 | ProjectileSpeed | number | 조건부 | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 (1배속 기준) |
 | ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
+| ProjectileLaunchDelay | number | - | 발사를 늦출 초 (1배속 기준). 비우거나 `0`이면 시전과 동시 발사 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -148,7 +149,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
-| 궁수 | `ArcherSkillDefinitions` | `piercing`, `wind_shot`, `cardinal_discharge` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack` |
@@ -295,26 +296,33 @@ SkillDefinition.WeaponType
 
 ```text
 SkillDefinition.ProjectileRuid
-→ BattleSessionComponent.LaunchSkillProjectile   (ImpactDelay 뒤 발사 예약, 비행시간 반환)
+→ BattleSessionComponent.LaunchSkillProjectile   (ProjectileLaunchDelay 뒤 발사 예약, 비행시간 반환)
 → BattleSessionComponent.SpawnSkillProjectile    (SpawnByModelId + AddComponent)
 → SkillProjectileComponent.Launch / OnUpdate     (Translate 이동, 도착 시 Destroy)
-→ ImpactDelay + 비행시간 뒤 SkillExecutionLogic.ExecuteEffectSteps
+→ 발사지연 + 비행시간 뒤 SkillExecutionLogic.ExecuteEffectSteps
 ```
 
 #### 타이밍
 
 | 시점 | 일 |
 |---|---|
-| 0 | 모션 재생 시작, 시전 이펙트 |
-| `ImpactDelay` | 투사체 발사 (활을 놓는 프레임) |
-| `ImpactDelay + 비행시간` | Effect Step 실행 = 피해·밀치기·피격 이펙트 |
+| 0 | 모션 재생 시작, 시전 이펙트, **투사체 발사** |
+| `ProjectileLaunchDelay` | 발사를 늦추고 싶을 때만 사용. 기본 `0` |
+| `발사지연 + 비행시간` | Effect Step 실행 = 피해·밀치기·피격 이펙트 |
 
+- **투사체는 시전 이펙트와 동시에 나가는 것이 기본이다.** 근접 스킬의 피해 시점인
+  모션 프로필 `ImpactDelay`에 묶지 않는다. 원거리 스킬은 "쏘는 순간 날아간다"가 자연스럽고,
+  `ImpactDelay`는 근접 스킬과 공유하는 값이라 그쪽까지 같이 흔들리기 때문이다.
+- 발사를 늦춰야 하는 스킬만 `ProjectileLaunchDelay`에 양수를 적는다. 이 값도 §4.3 배속으로
+  나눠 적용된다.
 - **비행시간은 저작값이 아니라 실제 거리에서 나온다**: `거리 / (ProjectileSpeed × 배속)`.
   1칸 앞 적은 빠르게, 5칸 밖 적은 오래 걸린다.
 - `ProjectileSpeed`도 §4.3 배속의 영향을 받는다. 다른 연출과 함께 빨라진다.
 - `GetSkillActionDuration`은 큐 슬롯이 피해보다 먼저 끝나지 않도록
-  `max(ActionDuration, ImpactDelay + 최대사거리 비행시간)`으로 보정한다. 최대 사거리를 쓰는
+  `max(ActionDuration, 발사지연 + 최대사거리 비행시간)`으로 보정한다. 최대 사거리를 쓰는
   이유는 큐 시간을 계산하는 시점에 실제 대상 거리를 알 수 없기 때문이다.
+- 투사체가 없는 스킬은 이 경로를 타지 않는다. 기존대로 `ImpactDelay` 하나짜리 타이머로
+  피해가 해결된다.
 - 조준 셀은 `SkillTargetResolverLogic:Resolve`의 `TargetCellIndices` 마지막 값이다.
   타기팅 규칙을 여기서 다시 구현하지 않는다. `FIRST_ENEMY_FORWARD`는 막아선 적의 칸,
   `RANGE_OFFSETS`는 가장 바깥 칸이 된다.
@@ -331,26 +339,36 @@ SkillDefinition.ProjectileRuid
 `SkillProjectileComponent`는 `.model`에 넣지 않고 스폰 직후 `AddComponent`로 붙인다.
 `.codeblock`이 없을 때 모델의 스크립트 컴포넌트가 조용히 누락되는 경로를 피하기 위해서다.
 
-현재 투사체를 쓰는 스킬 9종이다.
+현재 투사체를 쓰는 스킬 5종이다. 모두 `ProjectileLaunchDelay=0`이다.
 
-| SkillId | 투사체 출처 | Speed | Scale |
-|---|---|:--:|:--:|
-| `piercing` | 피어싱 팩 `ball` | 14 | 0.4 |
-| `wind_shot` | 바람의 시 팩 `ball` | 14 | 0.9 |
-| `cardinal_discharge` | 애로우 블로우 강화 팩 `ball` | 14 | 0.7 |
-| `flame_orb` | 플레임 오브 팩 `ball` | 12 | 0.7 |
-| `holy_arrow` | 에너지 볼트 팩 `ball` | 12 | 1 |
-| `thunder_bolt` | 썬더 스피어 팩 `ball/0` | 16 | 0.2 |
-| `magnum_shot` | 슬러그 샷 팩 `ball` | 16 | 1 |
-| `slug_shot` | 슬러그 샷 팩 `ball` | 16 | 1 |
-| `enemy_ranged_shot` | 에너지 볼트 팩 `ball` | 10 | 1 |
+| SkillId | 직업 | 투사체 출처 | Speed | Scale |
+|---|---|---|:--:|:--:|
+| `piercing` | 궁수 | 피어싱 팩 `ball` | 14 | 0.55 |
+| `arrow_bomb` | 궁수 | 바람의 시 팩 `ball` | 14 | 0.9 |
+| `cardinal_discharge` | 궁수 | 카디널 블래스트 팩 `shootobj/layerList/b1` | 14 | 0.28 |
+| `flame_orb` | 마법사 | 플레임 오브 팩 `ball` | 12 | 0.7 |
+| `slug_shot` | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 |
 
 `ball`은 §4.0의 `effect`(시전)·`hit`(피격)과 같은 리소스 팩 안의 엘리먼트이며 날아가는
-물체에 해당한다. 팩에 `ball`이 없는 스킬(카디널 디스차지·홀리 애로우·썬더 볼트·매그넘 샷)은
-같은 계열 스킬의 `ball`을 재사용한다.
+물체에 해당한다.
+
+#### 투사체를 붙이는 기준
+
+**원본 리소스 팩에 날아가는 물체(`ball` 또는 그에 준하는 엘리먼트)가 실제로 있는 스킬만
+투사체를 쓴다.** 팩에 없다고 다른 스킬 것을 빌려오면 서로 같은 그림이 되어 구분이 사라진다.
+
+이 기준으로 초기 9종 중 4종에서 투사체를 뺐다 — `holy_arrow`, `thunder_bolt`,
+`magnum_shot`, `enemy_ranged_shot`. 넷 다 자기 팩에 `ball`이 없어 남의 것을 쓰고 있었다.
+이들은 투사체 없이 즉발로 해결되며, 전사·도적은 원래 투사체 스킬이 없다.
+
+예외는 `cardinal_discharge` 하나다. 자기 팩에는 `ball`이 없지만 같은 직업군(패스파인더)
+스킬인 카디널 블래스트의 발사체를 의도적으로 가져왔다. 카디널 블래스트 팩은 `ball` 대신
+`shootobj/layerList/b1`(발사체 몸체)과 `e1`(착탄)을 갖는다. 팩이 4종(330 / 331 강화 / 332 /
+334 VI) 있고 디자인은 같으나 해상도가 176×80과 420×208로 갈리는데, 축소는 화질 손실이
+적고 확대는 뭉개지므로 고해상도 쪽을 쓴다.
 
 `ProjectileScale`은 클립 원본 픽셀 크기를 셀 간격(1.12 월드 유닛 = 112px)에 맞춘 값이다.
-예: 피어싱 `ball`은 285px이라 배율 1이면 2.5칸을 덮으므로 0.4로 줄인다.
+예: 피어싱 `ball`은 285px이라 배율 1이면 2.5칸을 덮으므로 0.55로 줄여 약 1.4칸에 맞춘다.
 
 ## 5. SkillEffectSteps
 
@@ -1011,6 +1029,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | WEAPON_DISABLED | 활성 스킬이 Enabled=false인 무기를 참조 | O |
 | INVALID_PROJECTILE_SPEED | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 | O |
 | PROJECTILE_ON_SELF_TARGETING | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 | O |
+| INVALID_PROJECTILE_LAUNCH_DELAY | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 | O |
 
 로그 예시:
 
