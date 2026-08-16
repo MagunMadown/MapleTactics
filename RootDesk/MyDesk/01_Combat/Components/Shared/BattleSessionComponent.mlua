@@ -55,6 +55,9 @@ script BattleSessionComponent extends Component
 	@Sync property string SelectedJobStartingSkillIds = ""
 	@Sync property string SkillSlotIds = ""
 	@Sync property string SkillSlotNames = ""
+	-- "skillId~iconRuid|..." for every skill the player owns, not just the drawn slots: the queue accepts
+	-- any owned skill, and the skill DataSets are server-only so the HUD has no other way to read icons.
+	@Sync property string SkillIconSnapshot = ""
 	property string SkillSlotSourceSnapshot = ""
 	property integer SkillSlotCount = 3
 	-- One knob for how fast every skill plays. Above 1 speeds the swing, the effects, the impact frame,
@@ -145,6 +148,10 @@ script BattleSessionComponent extends Component
 	property any DropRuntime = nil
 	property integer ActionTimerId = 0
 	property integer ImpactTimerId = 0
+	property integer ProjectileTimerId = 0
+	property integer ProjectileSpawnCount = 0
+	property string ProjectileModelId = "skillprojectile"
+	property integer ProjectileOrderInLayer = 25
 	property integer LastEnemySpawnOrder = 0
 	property integer CurrentPlayerActionKillCount = 0
 	property integer ConsumableRequestSequence = 0
@@ -259,10 +266,7 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
 		end
-		if self.ImpactTimerId > 0 then
-			_TimerService:ClearTimer(self.ImpactTimerId)
-			self.ImpactTimerId = 0
-		end
+		self:ClearSkillImpactTimers()
 		if self.TurnState ~= nil then
 			self.TurnState:ResetTurnState(self.TileQueueCapacity, "SESSION_END")
 			self:PublishTurnStateSnapshot("SESSION_END")
@@ -2186,7 +2190,20 @@ script BattleSessionComponent extends Component
 		if validation.Success == false then
 			return 0.1
 		end
-		return math.max(0.1, validation.Data.Definition.ActionDuration / self:GetSkillSpeedMultiplier())
+		local definition = validation.Data.Definition
+		local speed = self:GetSkillSpeedMultiplier()
+		local authored = definition.ActionDuration / speed
+		if self:HasSkillProjectile(definition) == false then
+			return math.max(0.1, authored)
+		end
+
+		-- A projectile skill resolves only after the shot lands, so the queue slot must outlive the
+		-- worst-case flight. Actual flight uses the real target distance; the clamp uses full range
+		-- because the target is not known until the shot is scheduled.
+		local launchDelay = self:GetProjectileLaunchDelay(definition)
+		local worstFlight = (definition.Range * self.CellSpacing) / (definition.ProjectileSpeed * speed)
+		local minimumDuration = launchDelay + worstFlight
+		return math.max(0.1, authored, minimumDuration)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2350,6 +2367,15 @@ script BattleSessionComponent extends Component
 			candidates[swap] = held
 		end
 
+		-- Icons cover every candidate, not just the drawn slots, because the queue accepts any owned skill.
+		local iconRecords = {}
+		for _, skillId in ipairs(candidates) do
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+			if definition.Success == true and definition.IconRuid ~= nil and definition.IconRuid ~= "" then
+				table.insert(iconRecords, skillId .. "~" .. definition.IconRuid)
+			end
+		end
+
 		local slotIds = {}
 		local slotNames = {}
 		local slotCount = math.min(self.SkillSlotCount, #candidates)
@@ -2364,7 +2390,8 @@ script BattleSessionComponent extends Component
 
 		self.SkillSlotIds = table.concat(slotIds, "|")
 		self.SkillSlotNames = table.concat(slotNames, "|")
-		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " slots=" .. self.SkillSlotIds .. " names=" .. self.SkillSlotNames)
+		self.SkillIconSnapshot = table.concat(iconRecords, "|")
+		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " slots=" .. self.SkillSlotIds .. " names=" .. self.SkillSlotNames .. " icons=" .. tostring(#iconRecords))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3017,10 +3044,7 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
 		end
-		if self.ImpactTimerId > 0 then
-			_TimerService:ClearTimer(self.ImpactTimerId)
-			self.ImpactTimerId = 0
-		end
+		self:ClearSkillImpactTimers()
 		self.WaveRuntime:ClearAllTimers(reason)
 
 		local queuedBeforeReset = self.TurnState.QueuedTileIds
@@ -3256,6 +3280,8 @@ script BattleSessionComponent extends Component
 		runtimeState:StartCooldown(skillId, definition.CooldownTurns)
 
 		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		-- Swap the avatar weapon before the motion starts so the swing shows the skill's own weapon.
+		self:ApplySkillWeapon(sourceUnitId, sourceEntity, definition)
 		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
 		if sourcePresentation ~= nil and sourceEntity.PlayerControllerComponent ~= nil then
@@ -3278,16 +3304,26 @@ script BattleSessionComponent extends Component
 				log_warning("[SkillExecution] failed skill=" .. skillId .. " source=" .. sourceUnitId .. " reason=" .. effectResult.Reason)
 			end
 		end
-		if safeImpactDelay <= 0 then
+
+		self:ClearSkillImpactTimers()
+		-- A projectile skill splits the impact in two: the shot leaves at its launch delay, and the
+		-- effects resolve only once it has crossed the board to the target cell.
+		local launchDelay = safeImpactDelay
+		local flightSeconds = 0
+		local totalImpactDelay = safeImpactDelay
+		if self:HasSkillProjectile(definition) then
+			launchDelay = self:GetProjectileLaunchDelay(definition)
+			flightSeconds = self:LaunchSkillProjectile(sourceUnitId, definition, launchDelay)
+			if flightSeconds > 0 then
+				totalImpactDelay = launchDelay + flightSeconds
+			end
+		end
+		if totalImpactDelay <= 0 then
 			return _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
 		end
-		if self.ImpactTimerId > 0 then
-			_TimerService:ClearTimer(self.ImpactTimerId)
-			self.ImpactTimerId = 0
-		end
 
-		self.ImpactTimerId = _TimerService:SetTimerOnce(resolveEffects, safeImpactDelay)
-		log("[SkillExecution] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " steps=" .. #effectSteps .. " delay=" .. safeImpactDelay)
+		self.ImpactTimerId = _TimerService:SetTimerOnce(resolveEffects, totalImpactDelay)
+		log("[SkillExecution] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " steps=" .. #effectSteps .. " delay=" .. launchDelay .. " flight=" .. flightSeconds)
 		return {
 			Success = true,
 			Reason = "IMPACT_PENDING",
@@ -3295,6 +3331,159 @@ script BattleSessionComponent extends Component
 			SkillId = skillId,
 			StepCount = #effectSteps
 		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplySkillWeapon(string sourceUnitId, Entity sourceEntity, table definition)
+		-- Presentation-only hop into the weapon catalog. Never gates execution: a data or costume
+		-- problem downgrades to a log line and the skill still resolves.
+		if isvalid(sourceEntity) == false then
+			return
+		end
+		local weaponResult = _SkillWeaponEquipLogic:ApplyWeaponForSkill(sourceEntity, definition)
+		if weaponResult.Success == false then
+			log_warning("[SkillWeapon] skill=" .. (definition.SkillId or "") .. " unit=" .. sourceUnitId .. " reason=" .. weaponResult.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearSkillImpactTimers()
+		-- One battle action resolves at a time, so a new cast always supersedes any pending impact.
+		if self.ImpactTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactTimerId)
+			self.ImpactTimerId = 0
+		end
+		if self.ProjectileTimerId > 0 then
+			_TimerService:ClearTimer(self.ProjectileTimerId)
+			self.ProjectileTimerId = 0
+		end
+	end
+
+	method number GetProjectileLaunchDelay(table definition)
+		-- The shot leaves with the cast effect by default, so a ranged skill reads as "fire on cast"
+		-- rather than waiting for a melee swing's impact frame. ProjectileLaunchDelay only holds it
+		-- back, and is scaled like every other duration so it tracks the battle speed multiplier.
+		if definition == nil then
+			return 0
+		end
+		local authored = definition.ProjectileLaunchDelay or 0
+		if authored <= 0 then
+			return 0
+		end
+		return authored / self:GetSkillSpeedMultiplier()
+	end
+
+	method boolean HasSkillProjectile(table definition)
+		-- Both columns are required together; the Validator rejects a RUID with no speed, and this
+		-- guard keeps a half-authored row from stalling the impact instead of just skipping the visual.
+		if definition == nil then
+			return false
+		end
+		local ruid = definition.ProjectileRuid or ""
+		local speed = definition.ProjectileSpeed or 0
+		return ruid ~= "" and speed > 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetProjectileAimCell(string sourceUnitId, table definition)
+		-- The Target Resolver owns every targeting rule, so the aim point is read from its cell list
+		-- rather than re-derived here. Its last entry is the farthest cell the skill reaches: the
+		-- blocking enemy for FIRST_ENEMY_FORWARD, the outermost offset for RANGE_OFFSETS.
+		local resolved = _SkillTargetResolverLogic:Resolve(self, sourceUnitId, definition)
+		if resolved.Success == false then
+			return -1
+		end
+		local cells = resolved.TargetCellIndices
+		if cells == nil or #cells == 0 then
+			return -1
+		end
+		return cells[#cells]
+	end
+
+	@ExecSpace("ServerOnly")
+	method number LaunchSkillProjectile(string sourceUnitId, table definition, number launchDelay)
+		-- Schedules the shot for the motion's release frame and returns how long it will be in flight,
+		-- so the caller can delay the impact by exactly that much. Returns 0 for every non-projectile
+		-- skill, which leaves the original single-timer impact path untouched.
+		if self:HasSkillProjectile(definition) == false then
+			return 0
+		end
+
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			log_warning("[SkillProjectile] skipped skill=" .. (definition.SkillId or "") .. " reason=SOURCE_NOT_FOUND")
+			return 0
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			log_warning("[SkillProjectile] skipped skill=" .. (definition.SkillId or "") .. " reason=SOURCE_COMPONENT_MISSING")
+			return 0
+		end
+
+		local aimCell = self:GetProjectileAimCell(sourceUnitId, definition)
+		if aimCell < 0 then
+			log_warning("[SkillProjectile] skipped skill=" .. (definition.SkillId or "") .. " reason=NO_AIM_CELL")
+			return 0
+		end
+
+		local startPosition = self:GetCellPosition(sourceUnit.CellIndex)
+		local targetPosition = self:GetCellPosition(aimCell)
+		local speed = definition.ProjectileSpeed * self:GetSkillSpeedMultiplier()
+		local distance = math.abs(targetPosition.x - startPosition.x)
+		if distance <= 0 or speed <= 0 then
+			return 0
+		end
+
+		local skillId = definition.SkillId or ""
+		local projectileRuid = definition.ProjectileRuid
+		local projectileScale = definition.ProjectileScale or 1
+		local flipX = sourceUnit.Facing == "Right"
+		self.ProjectileSpawnCount = self.ProjectileSpawnCount + 1
+		local projectileName = "SkillProjectile_" .. tostring(self.ProjectileSpawnCount)
+
+		local spawnProjectile = function()
+			self.ProjectileTimerId = 0
+			self:SpawnSkillProjectile(skillId, projectileName, startPosition, targetPosition, speed, projectileRuid, projectileScale, flipX)
+		end
+		if launchDelay <= 0 then
+			spawnProjectile()
+		else
+			self.ProjectileTimerId = _TimerService:SetTimerOnce(spawnProjectile, launchDelay)
+		end
+
+		local flightSeconds = distance / speed
+		log("[SkillProjectile] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " fromCell=" .. sourceUnit.CellIndex .. " aimCell=" .. aimCell .. " distance=" .. distance .. " speed=" .. speed .. " flight=" .. flightSeconds .. " launchDelay=" .. launchDelay)
+		return flightSeconds
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnSkillProjectile(string skillId, string projectileName, Vector2 startPosition, Vector2 targetPosition, number speed, string projectileRuid, number projectileScale, boolean flipX)
+		-- The model stays native-only and the mover is attached here, so a missing .codeblock can never
+		-- silently drop the component out of the spawned entity.
+		local mapEntity = self.Entity.CurrentMap
+		if mapEntity == nil then
+			log_warning("[SkillProjectile] spawn failed skill=" .. skillId .. " reason=MAP_MISSING")
+			return
+		end
+
+		local projectile = _SpawnService:SpawnByModelId(
+			self.ProjectileModelId,
+			projectileName,
+			Vector3(startPosition.x, startPosition.y, 0),
+			mapEntity
+		)
+		if isvalid(projectile) == false then
+			log_warning("[SkillProjectile] spawn failed skill=" .. skillId .. " model=" .. self.ProjectileModelId .. " reason=SPAWN_RETURNED_NIL")
+			return
+		end
+
+		local mover = projectile:AddComponent("SkillProjectileComponent")
+		if mover == nil then
+			log_warning("[SkillProjectile] spawn failed skill=" .. skillId .. " reason=COMPONENT_ATTACH_FAILED")
+			projectile:Destroy()
+			return
+		end
+		mover:Launch(startPosition, targetPosition, speed, projectileRuid, projectileScale, flipX, self.ProjectileOrderInLayer)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3717,10 +3906,7 @@ script BattleSessionComponent extends Component
 			end
 		end
 		self:ClearForcedSpawnSchedule("ALL_ENEMIES_DEFEATED")
-		if self.ImpactTimerId > 0 then
-			_TimerService:ClearTimer(self.ImpactTimerId)
-			self.ImpactTimerId = 0
-		end
+		self:ClearSkillImpactTimers()
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
