@@ -82,7 +82,7 @@
 |---|:---:|---|
 | warrior_start | 3 | `brandish`, `divine_swing`, `spear_pulling` |
 | mage_start | 6 | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
-| archer_start | 3 | `piercing`, `wind_shot`, `cardinal_discharge` |
+| archer_start | 3 | `piercing`, `arrow_bomb`, `cardinal_discharge` |
 | thief_start | 3 | `shuriken_burst`, `savage_blow`, `fatal_blow` |
 | pirate_start | 3 | `magnum_shot`, `slug_shot`, `shock_wave` |
 
@@ -112,6 +112,12 @@
 | CastEffectRuid | string | - | 시전자에게 재생할 animationclip RUID. 비우면 시전 이펙트 없음 |
 | HitEffectRuid | string | - | 피격 대상에게 재생할 animationclip RUID. 비우면 피격 이펙트 없음 |
 | EffectScale | number | - | 두 이펙트에 공통 적용할 배율. 비우면 `1` |
+| WeaponType | string | - | §4.4 `WeaponDefinitions.WeaponType` 참조. 비우면 현재 장착 무기를 유지 |
+| ProjectileRuid | string | - | 날아가는 투사체 animationclip RUID. 비우면 비행 단계 없음 |
+| ProjectileSpeed | number | 조건부 | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 (1배속 기준) |
+| ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
+| ProjectileLaunchDelay | number | - | 발사를 늦출 초 (1배속 기준). 비우거나 `0`이면 시전과 동시 발사 |
+| IconRuid | string | - | §4.6 스킬 아이콘 sprite RUID. 비우면 표시 측에서 기본 스프라이트로 대체 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -141,9 +147,10 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 구분 | 테이블 이름 (runtime name) | 수록 SkillId |
 |---|---|---|
 | 공용 | `SkillDefinitions` | (없음 — 헤더만) |
+| 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
-| 궁수 | `ArcherSkillDefinitions` | `piercing`, `wind_shot`, `cardinal_discharge` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack` |
@@ -190,7 +197,9 @@ SkillId는 예외 없이 `UNKNOWN_SKILL`이다.
 2. `SkillEffectSteps.csv`에 `EffectSetId` 행을 추가한다.
 3. `JobStartingSkillEntries.csv`에 필요하면 슬롯을 추가한다.
 4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다.
-5. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
+5. `WeaponType`을 §4.4 목록에서 고른다. 무기를 바꾸지 않는 스킬이면 비운다.
+6. 원거리 스킬이면 `ProjectileRuid`/`ProjectileSpeed`/`ProjectileScale`을 §4.5 규칙대로 채운다.
+7. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
 
 ### 4.2 HUD 스킬 슬롯 배정
 
@@ -231,6 +240,187 @@ CSV와 모션 프로필의 값은 **1배속 기준 원본 그대로** 두고, �
 `basic_slash`(1배속 0.18초), `heavy_slash`(0.38초), `push`(0.18초) 세 가지이며 같은 프로필을
 쓰는 스킬은 임팩트 시점을 공유한다. 스킬마다 다른 임팩트가 필요해지면 `SkillDefinitions`에
 `ImpactDelay` 열을 추가하는 것이 다음 단계다.
+
+### 4.4 WeaponDefinitions (IMPLEMENTED)
+
+런타임 이름 `WeaponDefinitions`. `SkillDefinitions.WeaponType`이 참조하는 무기 카탈로그다.
+스킬 행에는 토큰만 두고 실제 아바타 RUID와 장착 슬롯은 이 표가 소유하므로, 무기 아트를
+교체할 때 스킬 행을 건드리지 않는다.
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
+| WeaponType | string | O | 무기 종류 ID. `UPPER_SNAKE_CASE` |
+| DisplayName | string | O | 도감 표시 이름 |
+| EquipSlot | enum | O | `ONE_HANDED` 또는 `TWO_HANDED` |
+| WeaponRuid | string | O | `avataritem` RUID |
+| Enabled | boolean | O | `false`면 참조하는 스킬이 검증에서 탈락 |
+
+기본 키: `WeaponType` 유일. 현재 12행이 등록되어 있다.
+
+| EquipSlot | WeaponType |
+|---|---|
+| ONE_HANDED | `ONE_HANDED_SWORD`, `WAND`, `DAGGER`, `CLAW`, `GUN`, `KNUCKLE` |
+| TWO_HANDED | `TWO_HANDED_SWORD`, `SPEAR`, `POLEARM`, `BOW`, `CROSSBOW`, `STAFF` |
+
+`POLEARM`은 아직 참조하는 스킬이 없는 예약 행이다.
+
+#### 실행 경로
+
+```text
+SkillDefinition.WeaponType
+→ BattleSessionComponent.ApplySkillWeapon
+→ SkillWeaponEquipLogic.ApplyWeaponForSkill
+→ WeaponDefinitionRepositoryLogic.GetWeaponDefinition
+→ CostumeManagerComponent.SetEquip
+```
+
+- 장착은 **모션 재생 직전**에 일어나므로 스윙 모션이 해당 무기로 보인다.
+- 순수 표현이며 전투를 막지 않는다. 실패는 전부 `log_warning`으로 끝나고 스킬은 그대로
+  해결된다. 반환 Reason은 `OK`, `ALREADY_EQUIPPED`, `NO_WEAPON_REQUIRED`,
+  `UNKNOWN_WEAPON_TYPE`, `WEAPON_DISABLED`, `WEAPON_RUID_MISSING`,
+  `UNSUPPORTED_WEAPON_EQUIP_SLOT`, `COSTUME_MANAGER_MISSING`, `UNIT_UNAVAILABLE`이다.
+- 같은 무기를 이미 들고 있으면 재장착을 건너뛴다(`ALREADY_EQUIPPED`). 불필요한 코스튬
+  재구성과 그에 따른 깜빡임을 막기 위한 것이다.
+- `TWO_HANDED`는 1H·보조무기 슬롯을 함께 쓰므로 장착 전에 두 슬롯을 모두 비운다.
+- 적 유닛에는 `CostumeManagerComponent`가 없다. 그래서 `EnemySkillDefinitions` 3행은
+  `WeaponType`이 모두 비어 있고, 적 스킬에 값을 넣는 것은 데이터 실수다.
+- 무기는 스킬이 바꾸기 전까지 유지된다. 턴이나 전투가 끝나도 되돌리지 않는다.
+
+### 4.5 투사체 (IMPLEMENTED)
+
+`ProjectileRuid`가 채워진 스킬은 시전자 셀에서 목표 셀까지 실제로 날아가는 엔티티를 만든다.
+이 게임의 피해는 `AttackComponent`/`HitComponent`가 아니라 §5 Effect Step이 셀 기준으로
+계산하므로, 투사체는 **판정을 갖지 않는 순수 표현**이다. 대신 임팩트 시점을 뒤로 민다.
+
+#### 실행 경로
+
+```text
+SkillDefinition.ProjectileRuid
+→ BattleSessionComponent.LaunchSkillProjectile   (ProjectileLaunchDelay 뒤 발사 예약, 비행시간 반환)
+→ BattleSessionComponent.SpawnSkillProjectile    (SpawnByModelId + AddComponent)
+→ SkillProjectileComponent.Launch / OnUpdate     (Translate 이동, 도착 시 Destroy)
+→ 발사지연 + 비행시간 뒤 SkillExecutionLogic.ExecuteEffectSteps
+```
+
+#### 타이밍
+
+| 시점 | 일 |
+|---|---|
+| 0 | 모션 재생 시작, 시전 이펙트, **투사체 발사** |
+| `ProjectileLaunchDelay` | 발사를 늦추고 싶을 때만 사용. 기본 `0` |
+| `발사지연 + 비행시간` | Effect Step 실행 = 피해·밀치기·피격 이펙트 |
+
+- **투사체는 시전 이펙트와 동시에 나가는 것이 기본이다.** 근접 스킬의 피해 시점인
+  모션 프로필 `ImpactDelay`에 묶지 않는다. 원거리 스킬은 "쏘는 순간 날아간다"가 자연스럽고,
+  `ImpactDelay`는 근접 스킬과 공유하는 값이라 그쪽까지 같이 흔들리기 때문이다.
+- 발사를 늦춰야 하는 스킬만 `ProjectileLaunchDelay`에 양수를 적는다. 이 값도 §4.3 배속으로
+  나눠 적용된다.
+- **비행시간은 저작값이 아니라 실제 거리에서 나온다**: `거리 / (ProjectileSpeed × 배속)`.
+  1칸 앞 적은 빠르게, 5칸 밖 적은 오래 걸린다.
+- `ProjectileSpeed`도 §4.3 배속의 영향을 받는다. 다른 연출과 함께 빨라진다.
+- `GetSkillActionDuration`은 큐 슬롯이 피해보다 먼저 끝나지 않도록
+  `max(ActionDuration, 발사지연 + 최대사거리 비행시간)`으로 보정한다. 최대 사거리를 쓰는
+  이유는 큐 시간을 계산하는 시점에 실제 대상 거리를 알 수 없기 때문이다.
+- 투사체가 없는 스킬은 이 경로를 타지 않는다. 기존대로 `ImpactDelay` 하나짜리 타이머로
+  피해가 해결된다.
+- 조준 셀은 `SkillTargetResolverLogic:Resolve`의 `TargetCellIndices` 마지막 값이다.
+  타기팅 규칙을 여기서 다시 구현하지 않는다. `FIRST_ENEMY_FORWARD`는 막아선 적의 칸,
+  `RANGE_OFFSETS`는 가장 바깥 칸이 된다.
+- 적이 없어도 투사체는 사거리 끝까지 날아가고 사라진다. Effect Step은 그대로 `NO_TARGET`이다.
+- `TargetingType=SELF`에는 투사체를 쓸 수 없다. 잡을 셀이 없어 Validator가 막는다.
+
+#### 엔티티
+
+`RootDesk/MyDesk/Models/Particles/SkillProjectile.model` — `TransformComponent` +
+`SpriteRendererComponent`만 가진 **Body 없는** 모델이다. 전투 맵은 `TileMapMode=0`
+(MapleTile, 중력 있음)이므로 Body를 붙이면 투사체가 바닥으로 떨어진다. 이동은 Body 속도가
+아니라 `TransformComponent:Translate`로 한다.
+
+`SkillProjectileComponent`는 `.model`에 넣지 않고 스폰 직후 `AddComponent`로 붙인다.
+`.codeblock`이 없을 때 모델의 스크립트 컴포넌트가 조용히 누락되는 경로를 피하기 위해서다.
+
+현재 투사체를 쓰는 스킬 6종이다.
+
+| SkillId | 직업 | 투사체 출처 | Speed | Scale | LaunchDelay |
+|---|---|---|:--:|:--:|:--:|
+| `piercing` | 궁수 | 피어싱 팩 `ball` | 14 | 0.55 | 0 |
+| `arrow_bomb` | 궁수 | 바람의 시 팩 `ball` | 14 | 0.9 | 0 |
+| `cardinal_discharge` | 궁수 | 카디널 블래스트 팩 `shootobj/layerList/b1` | 14 | 0.28 | 0 |
+| `flame_orb` | 마법사 | 플레임 오브 팩 `ball` | 12 | 0.7 | 0 |
+| `poison_breath` | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
+| `slug_shot` | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
+
+`poison_breath`만 발사 지연이 있다. 플레이 확인에서 0초 동시 발사가 이르게 보인다는
+피드백을 받아 0.15 → 0.25로 두 번 조정한 결과다(배속 적용 후 0.2초). 피해도 그만큼 밀려
+`0.2 + 0.224 = 0.424초`가 되지만 `ActionDuration` 0.65초 안이라 큐 슬롯 길이는 변하지 않는다.
+
+`ball`은 §4.0의 `effect`(시전)·`hit`(피격)과 같은 리소스 팩 안의 엘리먼트이며 날아가는
+물체에 해당한다.
+
+#### 투사체를 붙이는 기준
+
+**원본 리소스 팩에 날아가는 물체(`ball` 또는 그에 준하는 엘리먼트)가 실제로 있는 스킬만
+투사체를 쓴다.** 팩에 없다고 다른 스킬 것을 빌려오면 서로 같은 그림이 되어 구분이 사라진다.
+
+이 기준으로 초기 9종 중 4종에서 투사체를 뺐다 — `holy_arrow`, `thunder_bolt`,
+`magnum_shot`, `enemy_ranged_shot`. 넷 다 자기 팩에 `ball`이 없어 남의 것을 쓰고 있었다.
+이들은 투사체 없이 즉발로 해결되며, 전사·도적은 원래 투사체 스킬이 없다.
+
+반대로 `poison_breath`는 나중에 추가했다. 자기 팩(`skill/210.img/skill/2101005`)에
+`ball`이 실제로 들어 있어 기준을 그대로 만족한다. 남은 무투사체 스킬들을 다시 확인할 때는
+같은 절차를 쓴다 — `CastEffectRuid`로 팩을 역추적(`packs`)해 `ball` 유무를 본다.
+
+예외는 `cardinal_discharge` 하나다. 자기 팩에는 `ball`이 없지만 같은 직업군(패스파인더)
+스킬인 카디널 블래스트의 발사체를 의도적으로 가져왔다. 카디널 블래스트 팩은 `ball` 대신
+`shootobj/layerList/b1`(발사체 몸체)과 `e1`(착탄)을 갖는다. 팩이 4종(330 / 331 강화 / 332 /
+334 VI) 있고 디자인은 같으나 해상도가 176×80과 420×208로 갈리는데, 축소는 화질 손실이
+적고 확대는 뭉개지므로 고해상도 쪽을 쓴다.
+
+`ProjectileScale`은 클립 원본 픽셀 크기를 셀 간격(1.12 월드 유닛 = 112px)에 맞춘 값이다.
+예: 피어싱 `ball`은 285px이라 배율 1이면 2.5칸을 덮으므로 0.55로 줄여 약 1.4칸에 맞춘다.
+포이즌 브레스 `ball`은 96px이라 배율 1에서 약 0.86칸으로, 같은 마법사 스킬인 플레임 오브
+(137px × 0.7 ≈ 96px)와 화면상 크기가 맞는다.
+
+### 4.6 스킬 아이콘 (IMPLEMENTED)
+
+`IconRuid`는 그 스킬 리소스 팩의 `icon` 엘리먼트다. §4.0의 `effect`(시전)·`hit`(피격),
+§4.5의 `ball`(투사체)과 같은 팩에서 나오므로 스킬 하나의 표현이 한 출처로 묶인다.
+플레이어 스킬 18행이 모두 32×32 `sprite`이며, 적 전용 3행은 비어 있다 — 적 스킬은 Codex에도
+HUD에도 표시되지 않기 때문이고, `WeaponType`을 적 행에서 비워두는 것과 같은 이유다.
+
+찾는 절차는 §4.5의 투사체와 같다. `CastEffectRuid`로 팩을 역추적한다:
+
+```text
+node scripts/msw_resource_api.cjs packs <CastEffectRuid>
+  → payload.elements 에서 rel_path == "icon" 인 항목의 ruid
+```
+
+같은 팩에 `iconDisabled`·`iconMouseOver`도 들어 있다. 지금은 쓰지 않으며, 필요해지면
+컬럼을 늘리기보다 같은 팩에서 그때 가져온다.
+
+예외는 `arrow_bomb` 하나로 보이지만 실제로는 아니다. 이 스킬은 `wind_shot`에서 이름만
+바뀌었고 리소스는 바람의 시 팩(`skill/310.img/skill/3101005`)을 그대로 쓰므로, 역추적하면
+자연히 바람의 시 아이콘이 나온다. 별도 지정이 필요 없다.
+
+#### 표시 경로
+
+아이콘을 읽는 곳은 두 군데다.
+
+| 표시 위치 | 경로 |
+|---|---|
+| Codex 스킬 목록 | `SkillCodexProvider`가 서버에서 `definition.IconRuid`를 읽어 `EntrySnapshot`에 넣는다 |
+| 머리 위 예약 큐 HUD | `BattleSessionComponent.SkillIconSnapshot`(`@Sync`)을 클라가 파싱해서 쓴다 |
+
+HUD가 정의를 직접 읽지 못하는 이유는 스킬 DataSet이 전부 `serveronly`이기 때문이다.
+`SkillSlotNames`가 표시 이름을 서버에서 풀어 넘기는 것과 같은 방식으로,
+`SkillIconSnapshot`은 `skillId~iconRuid|...` 형태로 **보유 스킬 전체**를 넘긴다. 뽑힌 슬롯
+3개가 아니라 전체인 이유는 큐가 슬롯이 아니라 보유 여부로 등록을 허용하기 때문이다.
+
+양쪽 모두 값이 비면 기본 스프라이트(`1705e3c5b2c146ac9a699f96fb067408`)로 떨어진다.
+이 컬럼이 생기기 전에는 HUD가 `spear_pulling`·`brandish`·`divine_swing` 세 개만 SkillId로
+분기하는 하드코딩 표를 갖고 있었다. 그중 `spear_pulling`에 걸려 있던 RUID는 실제로는 웨폰
+마스터리 스킬의 `iconMouseOver`였다. 분기는 제거했다.
 
 ## 5. SkillEffectSteps
 
@@ -884,6 +1074,13 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | DATA_INVALID_DROP_REFERENCE | EnemyDropDefinitions의 EnemyDefinitionId 또는 DropRefId 참조가 잘못됨 | O |
 | DATA_INVALID_DROP_RANGE | ChancePermille 또는 MinAmount/MaxAmount 범위가 잘못됨 | O |
 | DATA_UNUSED_ROW | 어디에서도 참조되지 않는 활성 행 | X, 경고 |
+| INVALID_SKILL_WEAPON_REFERENCE | SkillDefinitions의 WeaponType이 비어 있지 않은데 §4.4에서 유효하지 않음 | O |
+| UNSUPPORTED_WEAPON_EQUIP_SLOT | WeaponDefinitions의 EquipSlot이 ONE_HANDED/TWO_HANDED가 아님 | O |
+| WEAPON_RUID_MISSING | WeaponDefinitions의 WeaponRuid가 비어 있음 | O |
+| WEAPON_DISABLED | 활성 스킬이 Enabled=false인 무기를 참조 | O |
+| INVALID_PROJECTILE_SPEED | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 | O |
+| PROJECTILE_ON_SELF_TARGETING | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 | O |
+| INVALID_PROJECTILE_LAUNCH_DELAY | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 | O |
 
 로그 예시:
 

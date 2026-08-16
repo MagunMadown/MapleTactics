@@ -7,7 +7,7 @@
 
 - Stage Definition과 다음 Stage 참조
 - Skill Definition과 Effect Step 묶음
-- Job, Augment, Node Graph, Enemy Pattern의 전용 Validator
+- Weapon, Job, Augment, Node Graph, Enemy Pattern의 전용 Validator
 - Enemy Drop 전체 데이터
 - Stage Reward와 Stage·런 재화·소모품 참조
 - Shop Definition/Entry와 SHOP Node·스킬·소모품·런 재화 참조
