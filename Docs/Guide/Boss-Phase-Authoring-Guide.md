@@ -56,6 +56,26 @@ StageDefinitions(StageType=BOSS)
 Phase가 바뀌어도 현재 고정 행동의 PatternId는 옛 Pattern일 수 있다. 이는 오류가 아니라
 플레이어가 이미 확인한 적 Queue를 바꾸지 않기 위한 규칙이다.
 
+## Region 01 Stage 1-4 머쉬맘 예시
+
+`region_01_stage_04`는 이 규격을 사용하는 첫 실제 보스 스테이지다.
+
+| 구분 | 설정 |
+|---|---|
+| Stage | `region_01_stage_04`, `StageType=BOSS`, 1 Wave |
+| Enemy | `region_01_guardian_boss`, HP 18, `IsBoss=true` |
+| Model | `region01mushmomboss` |
+| Phase 1 | `OPENING`, `region_01_boss_phase_01` |
+| Phase 2 | HP 50% 이하 `ENRAGED`, `region_01_boss_phase_02` |
+| 기본 공격 | `boss_basic_strike`, 전방 1칸, 피해 2 |
+| 점프 착지 | `boss_jump_slam`, 전방 1~2칸, 피해 3, 쿨타임 2턴 |
+| 밀치기 | `boss_push_strike`, 전방 1칸, 피해 2 + 1칸 밀치기 |
+| 처치 드롭 | 골드 5~7, 소형 회복 물약 1개 |
+
+모션·이펙트·Queue 아이콘은 `EnemySkillDefinitions`에서 교체한다. 디자인 담당자는 전투 코드를 수정하지 않고 각 RUID와 크기·재생 속도만 바꿀 수 있다.
+
+현재 `boss_jump_slam`은 기존 `RANGE_OFFSETS`와 적 Queue 규격을 재사용하여 공격 실행 시점의 전방 1~2칸을 판정한다. 예고 시 선택한 특정 셀을 끝까지 잠그고 보스 Entity 자체가 그 셀로 점프하는 연출은 별도 Target Lock/Jump 이동 Action이 추가될 때 확장한다.
+
 ## 검증 체크리스트
 
 1. 전체 Validator에서 `bossPhaseOwners`가 증가한다.

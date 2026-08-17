@@ -140,8 +140,23 @@ UI는 동기화 필드를 직접 변경하지 않고 기존 `Request...` API만 
 - 모든 적의 Prepared Command 동시 공개 — 구현
 - 플레이어 행동 전 전체 계획 동결, 적 실행 중 재판정 금지 — 구현
 - `HEAVY` 강제 이동 면역, `DOUBLE_STRIKE` 복수 행동 Queue — 구현
-- `QUICK` 실행 준비 지연 정책 — 구현, 원작형 타일 등록 즉시 발동은 후속 세부화
+- 일반 적 공격 Tile의 등록 턴과 다음 턴 실행 분리 — 구현·Maker 회귀 완료
+- `QUICK`의 원작형 Tile 등록 즉시 실행 — 구현
+- 적 Queue 준비도 UI DTO(`QueueTurnsRequired/Elapsed`, `IsQueueReady`) — 구현
 - `EXPLOSIVE`, `REACTIVE_SHIELD` 실행기 — 후속
+
+### Slice 6 — 사거리 추적형 공격 큐 교정
+
+- ⬜ 공격 타일 등록을 사거리 판정보다 먼저 수행
+- ⬜ 타일 보유 상태와 임시 회전·추적 Command 상태 분리
+- ⬜ `INSERTING → TRACKING → ATTACK_READY → EXECUTING` 상태와 Snapshot 추가
+- ⬜ Skill Target 규칙을 재사용하는 무상태 Readiness 판정
+- ⬜ `ATTACK_READY` 후 플레이어 대응 Command 1회와 고정 실행·Miss
+- ⬜ QUICK의 사거리 안 동일 행동 준비와 사거리 밖 추적
+- ⬜ Orange Mushroom·Spore 데이터 적용과 다중 적/강제 증원 회귀
+
+세부 객체 책임, UI DTO와 Maker 회귀는
+`Docs/Guide/Enemy-Range-Aware-Queue-Migration-Plan.md`를 따른다.
 
 ## 7. 회귀 시나리오
 
@@ -155,6 +170,12 @@ UI는 동기화 필드를 직접 변경하지 않고 기존 `Request...` API만 
 8. 실행 중 재입력과 중복 Client Request가 거절되는지 확인한다.
 9. 전투 Reset·Victory·Defeat에서 큐가 초기화되는지 확인한다.
 10. 다음 Wave 진입 전후 등록 큐가 같은 순서와 개수로 보존되는지 확인한다.
+11. 근접 적이 사거리 밖에서 공격 타일을 등록하고 접근 중에도 보존하는지 확인한다.
+12. 추적 중 상태와 공격 예고 상태가 UI DTO에서 구분되는지 확인한다.
+13. 공격 예고 후 플레이어가 벗어나도 적이 재추적하지 않고 Miss를 실행하는지 확인한다.
+14. Spore가 거리 2에서 예고하고, 예고 후 거리 3으로 벗어나면 빗나가는지 확인한다.
+15. QUICK이 사거리 안에서만 등록과 준비를 같은 적 행동에 처리하는지 확인한다.
+16. 강제 증원 전후 적별 공격 QueueState와 TileId가 유지되는지 확인한다.
 
 ## 8. 완료 조건
 
