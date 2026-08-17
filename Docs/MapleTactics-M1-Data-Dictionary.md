@@ -153,7 +153,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
-| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge` / `enhanced_piercing`, `arrow_platter`, `cardinal_discharge_ii` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge` / `enhanced_piercing`, `arrow_stream`, `cardinal_discharge_ii` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` / `triple_throw`, `edge_carnival`, `bloody_storm` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
@@ -369,7 +369,7 @@ SkillDefinition.ProjectileRuid
 | `poison_breath` | 1 | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
 | `slug_shot` | 1 | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
 | `enhanced_piercing` | 2 | 궁수 | 인핸스 피어싱 팩 `shootobj/layerList/b1` | 14 | 0.5 | 0 |
-| `arrow_platter` | 2 | 궁수 | 애로우 플래터 팩 `ball` | 14 | 0.85 | 0 |
+| `arrow_stream` | 2 | 궁수 | 폭풍의 시 팩 `ball` | 14 | 1.8 | 0 |
 | `triple_throw` | 2 | 도적 | 트리플 스로우 팩 `ball` | 14 | 1.2 | 0 |
 | `cannon_spike` | 2 | 해적 | 캐논 스파이크 팩 `ball` | 16 | 0.85 | 0 |
 
@@ -427,7 +427,7 @@ y = lerp(startY, targetY, t) + ArcHeight * 27/4 * t * (1 - t)^2
   곡선은 순수 표현이고 비행시간은 여전히 `거리 / (속도 × 배속)`이다.
 - 투사체가 없는 행에 값을 넣으면 아무 일도 일어나지 않으므로 Validator가
   `PROJECTILE_ARC_WITHOUT_PROJECTILE`로 거절한다.
-- 현재 사용하는 스킬은 `arrow_platter`(값 `0.2`) 하나다. 화살을 흩뿌리는 연출이라 직선보다
+- 현재 사용하는 스킬은 `arrow_stream`(값 `0.2`) 하나다. 화살을 쏟아붓는 연출이라 직선보다
   곡사가 맞는다. 나머지 8종은 `0`(직선)이다.
 - `SkillProjectileComponent`는 이 때문에 `Translate` 누적이 아니라 **매 프레임 절대 위치를
   계산**한다. 직선도 같은 식을 쓰므로 경로 코드가 하나로 유지된다.
@@ -563,7 +563,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
   `screw_punch` — 피해 + 밀치기 1).
 - **이펙트·아이콘은 그 스킬 자기 리소스 팩에서만 가져온다.** 팩에 `effect`/`hit/0`가 없으면
   같은 팩의 대체 엘리먼트를 쓴다 — `divine_charge`는 `effect/1`, `explosion`은 `special/1`,
-  `poison_mist`는 `mob`, `screw_punch`는 `hit`, `arrow_platter`는 `prepare`를 시전 이펙트로
+  `poison_mist`는 `mob`, `screw_punch`는 `hit`, `arrow_stream`은 `prepare`를 시전 이펙트로
   쓴다. 다른 스킬 팩에서 빌려오지 않는다(§4.5 투사체 기준과 같은 원칙).
 
 > 아직 **획득 경로는 단계를 구분하지 않는다.** `GetJobSkillDefinitions`는 `RequiredJobTag`로만
