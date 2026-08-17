@@ -117,6 +117,7 @@
 | ProjectileSpeed | number | 조건부 | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 (1배속 기준) |
 | ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
 | ProjectileLaunchDelay | number | - | 발사를 늦출 초 (1배속 기준). 비우거나 `0`이면 시전과 동시 발사 |
+| ProjectileArcHeight | number | - | 투사체 포물선의 정점 높이(월드 유닛). `0`이면 직선. §4.5 참조 |
 | IconRuid | string | - | §4.6 스킬 아이콘 sprite RUID. 비우면 표시 측에서 기본 스프라이트로 대체 |
 | SkillTier | integer | O | §4.7 스킬 정의의 정적 강화 단계. 1 이상, 기본 `1` |
 | BaseSkillId | string | 조건부 | §4.7 이 스킬이 강화되어 나온 원본 SkillId. 1단계는 비우고 2단계부터 필수 |
@@ -258,10 +259,23 @@ CSV와 모션 프로필의 값은 **1배속 기준 원본 그대로** 두고, �
 | WeaponType | string | O | 무기 종류 ID. `UPPER_SNAKE_CASE` |
 | DisplayName | string | O | 도감 표시 이름 |
 | EquipSlot | enum | O | `ONE_HANDED` 또는 `TWO_HANDED` |
-| WeaponRuid | string | O | `avataritem` RUID |
+| WeaponRuid | string | O | `avataritem` RUID. 주 손에 드는 무기 |
 | Enabled | boolean | O | `false`면 참조하는 스킬이 검증에서 탈락 |
+| SubWeaponRuid | string | - | 보조무기 슬롯(`CustomSubWeaponEquip`)에 함께 드는 `avataritem` RUID. 단일 무기는 비움 |
 
-기본 키: `WeaponType` 유일. 현재 12행이 등록되어 있다.
+기본 키: `WeaponType` 유일. 현재 14행이 등록되어 있다.
+
+#### 이도류 (SubWeaponRuid)
+
+`SubWeaponRuid`를 채우면 주 손 무기와 보조무기를 **동시에** 장착한다. 현재 유일한 사례는
+`DUAL_BLADE`(단검 + 블레이드)이고 도적의 `fatal_blow`·`bloody_storm`이 쓴다.
+
+- **`EquipSlot=ONE_HANDED`일 때만 유효하다.** 두손무기는 이미 보조무기 슬롯을 점유하므로
+  같이 지정하면 조용히 무시된다 — Validator가 `SUB_WEAPON_ON_TWO_HANDED`로 거절한다.
+- `SkillWeaponEquipLogic`은 장착 전에 **1H·2H·보조 세 슬롯을 모두 비운다.** 보조무기를
+  비우지 않으면 다음 스킬이 한손검을 들어도 블레이드가 손에 남는다.
+- 재장착 생략(`ALREADY_EQUIPPED`) 판정도 **주 손과 보조를 함께** 본다. 주 손만 비교하면
+  `DAGGER`(단검만)와 `DUAL_BLADE`(단검+블레이드) 사이 전환이 건너뛰어진다.
 
 | EquipSlot | WeaponType |
 |---|---|
@@ -392,6 +406,26 @@ SkillDefinition.ProjectileRuid
 `ball` 대신 `shootobj/layerList/b1`(발사체 몸체)과 `e1`(착탄)을 갖는다는 점, 팩이 4종
 (330 / 331 강화 / 332 / 334 VI)이고 디자인은 같으나 해상도가 176×80과 420×208로 갈리므로
 축소가 유리한 고해상도 쪽을 쓴다는 점을 참고한다.
+
+#### 곡사 (ProjectileArcHeight)
+
+`ProjectileArcHeight`가 `0`보다 크면 투사체가 직선이 아니라 **포물선**으로 날아간다. 값은
+시전자–목표를 잇는 직선 위로 솟는 **정점 높이(월드 유닛)** 다.
+
+```text
+y = lerp(startY, targetY, t) + ArcHeight * 4 * t * (1 - t)
+```
+
+`4h·t·(1-t)`는 `t=0.5`에서 정확히 `ArcHeight`가 되고 양 끝(`t=0`, `t=1`)에서 0이므로,
+비행시간이 얼마든 **출발점과 착탄점은 직선일 때와 같다.** 임팩트 시점도 바뀌지 않는다 —
+곡선은 순수 표현이고 비행시간은 여전히 `거리 / (속도 × 배속)`이다.
+
+- 투사체가 없는 행에 값을 넣으면 아무 일도 일어나지 않으므로 Validator가
+  `PROJECTILE_ARC_WITHOUT_PROJECTILE`로 거절한다.
+- 현재 사용하는 스킬은 `arrow_platter`(값 `1`) 하나다. 화살을 흩뿌리는 연출이라 직선보다
+  곡사가 맞는다. 나머지 8종은 `0`(직선)이다.
+- `SkillProjectileComponent`는 이 때문에 `Translate` 누적이 아니라 **매 프레임 절대 위치를
+  계산**한다. 직선도 같은 식을 쓰므로 경로 코드가 하나로 유지된다.
 
 `ProjectileScale`은 클립 원본 픽셀 크기를 셀 간격(1.12 월드 유닛 = 112px)에 맞춘 값이다.
 예: 피어싱 `ball`은 285px이라 배율 1이면 2.5칸을 덮으므로 0.55로 줄여 약 1.4칸에 맞춘다.
@@ -1174,6 +1208,8 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | UNSUPPORTED_WEAPON_EQUIP_SLOT | WeaponDefinitions의 EquipSlot이 ONE_HANDED/TWO_HANDED가 아님 | O |
 | WEAPON_RUID_MISSING | WeaponDefinitions의 WeaponRuid가 비어 있음 | O |
 | WEAPON_DISABLED | 활성 스킬이 Enabled=false인 무기를 참조 | O |
+| SUB_WEAPON_ON_TWO_HANDED | EquipSlot=TWO_HANDED인 무기에 SubWeaponRuid를 지정 (§4.4) | O |
+| PROJECTILE_ARC_WITHOUT_PROJECTILE | ProjectileRuid가 비어 있는데 ProjectileArcHeight가 0 초과 (§4.5) | O |
 | INVALID_PROJECTILE_SPEED | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 | O |
 | PROJECTILE_ON_SELF_TARGETING | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 | O |
 | INVALID_PROJECTILE_LAUNCH_DELAY | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 | O |

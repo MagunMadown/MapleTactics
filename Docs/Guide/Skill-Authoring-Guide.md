@@ -71,6 +71,7 @@ TryQueueTile
 | `ProjectileSpeed` | number | `14` | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 |
 | `ProjectileScale` | number | `0.9` | 투사체 배율. 비우면 `1` |
 | `ProjectileLaunchDelay` | number | `0` | 발사를 늦출 초. `0`이면 시전과 동시 발사 |
+| `ProjectileArcHeight` | number | `0` | 포물선 정점 높이(월드 유닛). `0`이면 직선. 투사체가 없으면 지정 금지 |
 | `IconRuid` | string | 32자리 hex | 스킬 아이콘 sprite. 비우면 기본 스프라이트로 대체 |
 | `SkillTier` | integer | `1` | 스킬 정의의 정적 강화 단계. 1 이상. 아래 "스킬 강화 단계" 참조 |
 | `BaseSkillId` | string | 빈 문자열 | 이 스킬이 강화되어 나온 원본 `SkillId`. 1단계는 비우고 2단계부터 필수 |
@@ -87,11 +88,16 @@ TryQueueTile
 | `WeaponType` | string | `BOW` | 고유 `UPPER_SNAKE_CASE` ID |
 | `DisplayName` | string | `활` | 도감 표시용. 빈 문자열 금지 |
 | `EquipSlot` | string | `TWO_HANDED` | `ONE_HANDED` 또는 `TWO_HANDED` |
-| `WeaponRuid` | string | 32자리 hex | `avataritem` RUID. 빈 문자열 금지 |
+| `WeaponRuid` | string | 32자리 hex | 주 손 `avataritem` RUID. 빈 문자열 금지 |
 | `Enabled` | boolean | `true` | `false`면 참조하는 스킬이 검증에서 탈락 |
+| `SubWeaponRuid` | string | 빈 문자열 | 보조무기 슬롯에 함께 드는 `avataritem` RUID. 이도류 전용 |
 
-현재 등록된 12종: `ONE_HANDED_SWORD`, `TWO_HANDED_SWORD`, `SPEAR`, `POLEARM`, `BOW`,
-`CROSSBOW`, `WAND`, `STAFF`, `DAGGER`, `CLAW`, `GUN`, `KNUCKLE`.
+현재 등록된 14종: `ONE_HANDED_SWORD`, `TWO_HANDED_SWORD`, `SPEAR`, `POLEARM`, `BOW`,
+`CROSSBOW`, `WAND`, `STAFF`, `DAGGER`, `CLAW`, `GUN`, `KNUCKLE`, `CANNON`, `DUAL_BLADE`.
+
+`SubWeaponRuid`는 **`EquipSlot=ONE_HANDED`일 때만** 유효하다. 두손무기는 이미 보조무기
+슬롯을 점유하므로 함께 지정하면 `SUB_WEAPON_ON_TWO_HANDED`로 거절된다. 자세한 내용은
+[`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.4를 본다.
 
 런타임 경로는 다음과 같다.
 
@@ -237,7 +243,7 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 1. 해당 직업의 `{Job}SkillDefinitions.csv`에 고유 `SkillId` 행을 추가한다.
 2. 고유 `EffectSetId`를 정하고 `SkillEffectSteps`에 Step 1을 추가한다.
 3. 현재 지원하는 Targeting과 EffectType인지 확인한다.
-4. `WeaponType`을 `WeaponDefinitions`의 12종 중에서 고른다. 무기를 바꾸지 않으면 비운다.
+4. `WeaponType`을 `WeaponDefinitions`의 14종 중에서 고른다. 무기를 바꾸지 않으면 비운다.
 5. `SkillTier`를 채운다. 새 기본 스킬이면 `1`에 `BaseSkillId`를 비우고, 기존 스킬의 상위
    단계면 부모의 단계 + 1과 부모 `SkillId`를 적는다.
 6. 큐 또는 서버 테스트에서 `TryQueueTile(SkillId)`를 호출한다.
@@ -293,6 +299,8 @@ Motion Profile Repository를 공통 계약으로 확장한다.
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_SPEED` | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 |
 | `CONTENT_VALIDATION_FAILED` | `PROJECTILE_ON_SELF_TARGETING` | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_LAUNCH_DELAY` | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 |
+| `CONTENT_VALIDATION_FAILED` | `PROJECTILE_ARC_WITHOUT_PROJECTILE` | ProjectileRuid가 비어 있는데 ProjectileArcHeight가 0 초과 |
+| `CONTENT_VALIDATION_FAILED` | `SUB_WEAPON_ON_TWO_HANDED` | EquipSlot=TWO_HANDED인 무기에 SubWeaponRuid를 지정 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_TIER` | SkillTier가 없거나 1 미만 |
 | `CONTENT_VALIDATION_FAILED` | `TIER_1_BASE_SKILL_PRESENT` | SkillTier=1인데 BaseSkillId가 채워져 있음 |
 | `CONTENT_VALIDATION_FAILED` | `BASE_SKILL_ID_MISSING` | SkillTier가 2 이상인데 BaseSkillId가 비어 있음 |
