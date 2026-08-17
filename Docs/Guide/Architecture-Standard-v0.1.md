@@ -721,7 +721,7 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 | `PatternId` | 패턴 ID |
 | `StepIndex` | 실행 순서 |
 | `ConditionType` | `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE` |
-| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE` |
+| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE` |
 | `TileId` | 예고·실행할 스킬 타일 ID |
 | `TelegraphTurns` | `TELEGRAPH_TILE` 예고 턴 수, 1 이상 |
 | `ParamA/B/C` | 조건·행동별 인자 |
@@ -734,6 +734,8 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 `BattleSessionComponent`는 준비·실행·완료 순서와 실제 보드 명령만 조정한다.
 
 UI는 Pattern 조건을 다시 계산하지 않고 Prepared Intent Snapshot만 표시한다.
+보스 점프의 공중 여부와 고정 착지 칸은 보스의 `BattleUnitComponent`가 소유하며,
+`BoardStateComponent`는 공중 보스를 Cell 점유·공격 대상으로 노출하지 않는다.
 
 ---
 
