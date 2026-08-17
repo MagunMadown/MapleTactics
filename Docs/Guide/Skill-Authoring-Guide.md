@@ -276,7 +276,7 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 ## Dataset 상태
 
 플레이어 스킬 18행(직업별 5개 테이블), 적 전용 3행, Effect Step 23행, 무기 12행이
-실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은 6행이다. `AllowPrototypeCompatibilityFallback=false`이며 production
+실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은 5행이다. `AllowPrototypeCompatibilityFallback=false`이며 production
 Skill 하드코딩을 다시 추가하지 않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를
 복제하지 않는다.
 
