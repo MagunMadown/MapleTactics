@@ -466,7 +466,12 @@ script BattleSessionComponent extends Component
 		end
 		self:PublishTurnStateSnapshot("WAVE_SPAWN")
 		self.LastEnemySpawnOrder = 0
-		self:ClearPreparedEnemyIntent("WAVE_SPAWN")
+		if waveNumber == 1 then
+			self:ClearPreparedEnemyIntent("WAVE_SPAWN")
+		else
+			-- Forced reinforcements must not erase Tiles already queued by surviving enemies.
+			self:ResetEnemyIntentCursor("WAVE_REINFORCEMENT_SPAWN")
+		end
 		local firstSpawnDefinition = spawnDefinitions[1]
 		self.EnemyModelId = firstSpawnDefinition.EnemyModelId
 		self.CurrentEnemyDefinitionId = firstSpawnDefinition.EnemyDefinitionId
@@ -835,6 +840,8 @@ script BattleSessionComponent extends Component
 						patternId = current.PatternId
 						stepIndex = current.StepIndex
 					end
+					local queuedTileNames = self:GetEnemyQueueDisplayNames(plan.PlannedActionSnapshot)
+					local queuedIconRuids = self:GetEnemyQueueIconRuids(plan.PlannedActionSnapshot)
 					table.insert(entries, table.concat({
 						unit.UnitId,
 						tostring(unit.SpawnOrder),
@@ -852,7 +859,16 @@ script BattleSessionComponent extends Component
 						plan.PlannedActionSnapshot ~= "" and plan.PlannedActionSnapshot or "-",
 						bossPhaseId ~= "" and bossPhaseId or "-",
 						tostring(bossPhaseIndex),
-						tostring(bossPhaseRevision)
+						tostring(bossPhaseRevision),
+						tostring(plan.QueueTurnsRequired),
+						tostring(plan.QueueTurnsElapsed),
+						plan.ReadinessReason ~= "" and plan.ReadinessReason or "-",
+						plan.NextCommandType ~= "" and plan.NextCommandType or "-",
+						plan.TargetCellSnapshot ~= "" and plan.TargetCellSnapshot or "-",
+						tostring(plan.NextCommandDirection),
+						enemyEntity.Name ~= "" and enemyEntity.Name or "-",
+						queuedTileNames ~= "" and queuedTileNames or "-",
+						queuedIconRuids ~= "" and queuedIconRuids or "-"
 					}, ","))
 				end
 			end
@@ -861,6 +877,56 @@ script BattleSessionComponent extends Component
 		self.EnemyPlanCount = #entries
 		self.EnemyPlanRevision = self.EnemyPlanRevision + 1
 		log("[EnemyRoundPlan] publish reason=" .. reason .. " count=" .. self.EnemyPlanCount .. " revision=" .. self.EnemyPlanRevision .. " snapshot=" .. self.EnemyPlanSnapshot)
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueDisplayNames(string actionSnapshot)
+		-- Resolves authoring DisplayName values on the server so UI never reads server-only DataSets.
+		local names = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local actionFields = {}
+			for actionField in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(actionFields, actionField)
+			end
+			local tileId = ""
+			if #actionFields >= 3 then
+				tileId = actionFields[3]
+				if tileId == "-" then
+					tileId = ""
+				end
+			end
+			if tileId ~= "" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(tileId)
+				local displayName = tileId
+				if definition.Success == true and definition.DisplayName ~= nil and definition.DisplayName ~= "" then
+					displayName = definition.DisplayName
+				end
+				table.insert(names, displayName)
+			end
+		end
+		return table.concat(names, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueIconRuids(string actionSnapshot)
+		-- Presentation data is authored beside the Skill row and published for client-only HUDs.
+		local iconRuids = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local actionFields = {}
+			for actionField in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(actionFields, actionField)
+			end
+			local tileId = #actionFields >= 3 and actionFields[3] or ""
+			if tileId ~= "" and tileId ~= "-" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(tileId)
+				local iconRuid = ""
+				if definition.Success == true then
+					iconRuid = definition.HudIconRuid or ""
+				end
+				table.insert(iconRuids, iconRuid ~= "" and iconRuid or "-")
+			end
+		end
+		return table.concat(iconRuids, "|")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1189,15 +1255,29 @@ script BattleSessionComponent extends Component
 			preparedIntent = self:GetPreparedEnemyIntent()
 		end
 
-		self.TurnState:BeginEnemyTurn("ENEMY_" .. preparedIntent.ActionType, preparedIntent.Direction, "PREPARED_INTENT")
+		local enemyEntity = self:FindUnitEntity(preparedIntent.EnemyId)
+		local enemyPlan = nil
+		if isvalid(enemyEntity) then
+			enemyPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+		end
+		self:AdvanceEnemySkillCooldowns(preparedIntent.EnemyId, "ENEMY_ACTION_BEGIN")
+		local isQueueingAttack = enemyPlan ~= nil and enemyPlan.PlanState == "INSERTING"
+		local enemyCommand = "ENEMY_" .. preparedIntent.ActionType
+		if isQueueingAttack then
+			enemyCommand = "ENEMY_QUEUE_TILE"
+		end
+		self.TurnState:BeginEnemyTurn(enemyCommand, preparedIntent.Direction, isQueueingAttack and "ATTACK_TILE_QUEUEING" or "PREPARED_INTENT")
 		self:PublishTurnStateSnapshot("ENEMY_TURN_BEGIN")
 		log("[BattleEnemyIntent] hold enemy=" .. preparedIntent.EnemyId .. " pattern=" .. preparedIntent.PatternId .. " step=" .. preparedIntent.StepIndex .. " action=" .. preparedIntent.ActionType .. " tile=" .. preparedIntent.TileId .. " telegraphRemaining=" .. preparedIntent.TelegraphTurnsRemaining .. " turn=" .. preparedIntent.PreparedTurn)
 		log("[BattleTurnFlow] phase=EnemyTurn turn=" .. self.TurnNumber)
 
 		local execute = function()
+			if isQueueingAttack then
+				self:AdvancePreparedEnemyQueue()
+				return
+			end
 			self:ExecutePreparedEnemyIntent()
 		end
-		local enemyEntity = self:FindUnitEntity(preparedIntent.EnemyId)
 		local traitIds = ""
 		if isvalid(enemyEntity) then
 			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
@@ -1206,6 +1286,44 @@ script BattleSessionComponent extends Component
 			end
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(execute, _EnemyTraitRouterLogic:GetEnemyThinkDuration(traitIds, self.EnemyThinkDuration))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvancePreparedEnemyQueue()
+		-- Consumes this foe's turn by adding its attack Tile; readiness is evaluated on the following player turn.
+		self.ActionTimerId = 0
+		local intent = self:GetPreparedEnemyIntent()
+		if intent.State ~= "PREPARED" then
+			self:CompleteEnemyTurn("QUEUE_TILE", false, "INTENT_NOT_PREPARED")
+			return
+		end
+		local enemyEntity = self:FindUnitEntity(intent.EnemyId)
+		local enemyPlan = nil
+		local enemyUnit = nil
+		if isvalid(enemyEntity) then
+			enemyPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+			enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+		end
+		if enemyPlan == nil then
+			self:CompleteEnemyTurn("QUEUE_TILE", false, "ENEMY_PLAN_COMPONENT_MISSING")
+			return
+		end
+		local queueResult = enemyPlan:AdvanceQueueTurn()
+		if enemyUnit ~= nil then
+			self.LastEnemySpawnOrder = enemyUnit.SpawnOrder
+		end
+		if self.EnemyIntentRuntime ~= nil then
+			self.EnemyIntentRuntime:ResetIntent("ATTACK_TILE_QUEUE_TURN_COMPLETED")
+		end
+		self:PublishEnemyIntentSnapshot("ATTACK_TILE_QUEUE_TURN_COMPLETED")
+		self:PublishEnemyPlanSnapshot("ATTACK_TILE_QUEUE_TURN_COMPLETED")
+		log("[BattleEnemyQueue] advanced enemy=" .. intent.EnemyId .. " tile=" .. intent.TileId .. " success=" .. tostring(queueResult.Success) .. " ready=" .. tostring(queueResult.Ready) .. " queue=" .. tostring(queueResult.QueueTurnsElapsed or 0) .. "/" .. tostring(queueResult.QueueTurnsRequired or 0))
+		local nextResult = self:PrepareNextEnemyIntent()
+		if nextResult.Success == true then
+			self:BeginEnemyTurn()
+			return
+		end
+		self:CompleteEnemyTurn("QUEUE_TILE", queueResult.Success == true, queueResult.Reason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1252,19 +1370,12 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table BuildEnemyCellFreeSnapshot(string enemyUnitId, integer enemyCellIndex, string enemyFacing, integer playerCellIndex)
 		-- Converts live BoardState occupancy into immutable selector booleans for the stateless Resolver.
-		local facingDirection = -1
-		if enemyFacing == "Right" then
-			facingDirection = 1
-		end
-		local playerDirection = 1
-		if playerCellIndex < enemyCellIndex then
-			playerDirection = -1
-		end
+		local directions = _EnemyIntentResolverLogic:ResolveRelativeDirections(enemyCellIndex, enemyFacing, playerCellIndex)
 		return {
-			FRONT = self:IsPatternCellFree(enemyCellIndex + facingDirection, enemyUnitId),
-			BACK = self:IsPatternCellFree(enemyCellIndex - facingDirection, enemyUnitId),
-			TOWARD_PLAYER = self:IsPatternCellFree(enemyCellIndex + playerDirection, enemyUnitId),
-			AWAY_FROM_PLAYER = self:IsPatternCellFree(enemyCellIndex - playerDirection, enemyUnitId)
+			FRONT = self:IsPatternCellFree(enemyCellIndex + directions.FacingDirection, enemyUnitId),
+			BACK = self:IsPatternCellFree(enemyCellIndex - directions.FacingDirection, enemyUnitId),
+			TOWARD_PLAYER = self:IsPatternCellFree(enemyCellIndex + directions.PlayerDirection, enemyUnitId),
+			AWAY_FROM_PLAYER = self:IsPatternCellFree(enemyCellIndex - directions.PlayerDirection, enemyUnitId)
 		}
 	end
 
@@ -1281,7 +1392,7 @@ script BattleSessionComponent extends Component
 	method table PrepareEnemyIntent()
 		-- Freezes every living enemy plan while the board still represents the same player decision point.
 		self.LastEnemySpawnOrder = 0
-		self:ClearPreparedEnemyIntent("PLAN_ALL_ENEMIES")
+		self:ResetEnemyIntentCursor("PLAN_ALL_ENEMIES")
 		if self.BoardState == nil then
 			return { Success = false, Reason = "REGISTRY_MISSING" }
 		end
@@ -1289,8 +1400,18 @@ script BattleSessionComponent extends Component
 		local preparedCount = 0
 		for _, enemyEntity in ipairs(livingEnemies) do
 			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
-			if enemyUnit ~= nil then
-				local planResult = self:PrepareEnemyIntentForUnit(enemyUnit.UnitId)
+			local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+			if enemyUnit ~= nil and actionPlan ~= nil then
+				if actionPlan.PlanState == "COMPLETED" then
+					actionPlan:ResetPlan("NEXT_ENEMY_DECISION")
+				end
+				local planResult = { Success = true, Reason = "EXISTING_PLAN_PRESERVED" }
+				if actionPlan.PlanState == "EMPTY" then
+					planResult = self:PrepareEnemyIntentForUnit(enemyUnit.UnitId)
+				elseif actionPlan.PlanState == "TRACKING" then
+					-- Freeze every queued enemy's readiness before the player commits a Command.
+					planResult = self:RefreshQueuedAttackReadiness(enemyUnit.UnitId)
+				end
 				if planResult.Success == true then
 					preparedCount = preparedCount + 1
 				else
@@ -1331,7 +1452,9 @@ script BattleSessionComponent extends Component
 		for _, enemyEntity in ipairs(livingEnemies) do
 			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
 			local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
-			if enemyUnit ~= nil and actionPlan ~= nil and actionPlan.PlanState == "PREPARED" and enemyUnit.SpawnOrder > self.LastEnemySpawnOrder then
+			if enemyUnit ~= nil and actionPlan ~= nil
+				and (actionPlan.PlanState == "INSERTING" or actionPlan.PlanState == "TRACKING" or actionPlan.PlanState == "ATTACK_READY" or actionPlan.PlanState == "PREPARED")
+				and enemyUnit.SpawnOrder > self.LastEnemySpawnOrder then
 				selectedUnitId = enemyUnit.UnitId
 				break
 			end
@@ -1384,14 +1507,125 @@ script BattleSessionComponent extends Component
 			if markResult.Success == false then
 				return markResult
 			end
-			result = actionPlan:ReplacePlan(enemyUnitId, traitPlan.Actions, self.TurnNumber, preparedEnemyUnit.EnemyTraitIds, intent.Reason)
+			local queueTurnsRequired = 0
+			if intent.ActionType == "EXECUTE_TILE" and intent.TileId ~= "" then
+				local skillDefinition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(intent.TileId)
+				if skillDefinition.Success == true then
+					queueTurnsRequired = math.max(0, math.floor(tonumber(skillDefinition.EnemyQueueTurns) or 0))
+				end
+				if _EnemyTraitRouterLogic:HasTrait(preparedEnemyUnit.EnemyTraitIds, "QUICK") then
+					queueTurnsRequired = 0
+				end
+			end
+			result = actionPlan:ReplacePlan(enemyUnitId, traitPlan.Actions, self.TurnNumber, preparedEnemyUnit.EnemyTraitIds, intent.Reason, queueTurnsRequired)
 			if result.Success == false then
 				patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, result.Reason)
 				return result
 			end
+			if actionPlan.PlanState == "TRACKING" then
+				local readiness = self:RefreshQueuedAttackReadiness(enemyUnitId)
+				if readiness.Success == false then
+					patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, readiness.Reason)
+					actionPlan:ResetPlan(readiness.Reason)
+					return readiness
+				end
+			end
 		end
 		log("[BattleEnemyIntent] plan enemy=" .. enemyUnitId .. " pattern=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " action=" .. intent.ActionType .. " tile=" .. intent.TileId .. " telegraphRemaining=" .. (intent.TelegraphTurnsRemaining or 0) .. " direction=" .. intent.Direction .. " turn=" .. self.TurnNumber .. " policy=" .. preparedMovementPolicy .. " reason=" .. intent.Reason)
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResetEnemyIntentCursor(string reason)
+		-- Clears only the map-scoped selection cursor. Enemy-owned queued Tiles survive into later turns.
+		local intentRuntime = self.EnemyIntentRuntime
+		if intentRuntime == nil then
+			intentRuntime = self:EnsureEnemyIntentComponent()
+		end
+		if intentRuntime ~= nil then
+			intentRuntime:ResetIntent(reason)
+		end
+		self:PublishEnemyIntentSnapshot(reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RefreshQueuedAttackReadiness(string enemyUnitId)
+		-- Converts the queued attack Tile into a turn, move, wait, or committed attack without changing Pattern Step.
+		local enemyEntity = self:FindUnitEntity(enemyUnitId)
+		local playerEntity = self:FindUnitEntity("player_01")
+		if isvalid(enemyEntity) == false or isvalid(playerEntity) == false then
+			return { Success = false, Reason = "READINESS_UNIT_MISSING" }
+		end
+		local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+		local playerUnit = playerEntity:GetComponent("script.BattleUnitComponent")
+		local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+		if enemyUnit == nil or playerUnit == nil or actionPlan == nil then
+			return { Success = false, Reason = "READINESS_COMPONENT_MISSING" }
+		end
+		if actionPlan.PlanState ~= "TRACKING" then
+			return { Success = false, Reason = "PLAN_NOT_TRACKING" }
+		end
+		local action = actionPlan:GetCurrentAction()
+		if action.Success == false or action.ActionType ~= "EXECUTE_TILE" or action.TileId == "" then
+			return { Success = false, Reason = "QUEUED_ATTACK_ACTION_MISSING" }
+		end
+		local definitionResult = _SkillDefinitionRepositoryLogic:GetSkillDefinition(action.TileId)
+		if definitionResult.Success == false then
+			return definitionResult
+		end
+		local runtimeState = self:GetSkillRuntimeState(enemyUnitId)
+		if runtimeState ~= nil then
+			local cooldownResult = runtimeState:CanUseSkill(action.TileId)
+			if cooldownResult.Success == false then
+				local trackingResult = actionPlan:SetTrackingState("SKILL_COOLDOWN", "WAIT", 0, "")
+				if trackingResult.Success == false then
+					return trackingResult
+				end
+				return {
+					Success = true,
+					Reason = "SKILL_COOLDOWN",
+					Readiness = "COOLDOWN",
+					NextCommandType = "WAIT",
+					Direction = 0,
+					TargetCellSnapshot = "",
+					RemainingTurns = cooldownResult.RemainingTurns,
+					PatternId = action.PatternId,
+					StepIndex = action.StepIndex,
+					PatternStepCount = action.PatternStepCount,
+					TileId = action.TileId,
+					PreparedTurn = action.PreparedTurn,
+					TelegraphTurnsRemaining = action.TelegraphTurnsRemaining
+				}
+			end
+		end
+		local relative = _EnemyIntentResolverLogic:ResolveRelativeDirections(enemyUnit.CellIndex, enemyUnit.Facing, playerUnit.CellIndex)
+		local readiness = _EnemyIntentResolverLogic:ResolveQueuedAttackReadiness({
+			EnemyCellIndex = enemyUnit.CellIndex,
+			EnemyFacing = enemyUnit.Facing,
+			PlayerCellIndex = playerUnit.CellIndex,
+			TowardPlayerCellFree = self:IsPatternCellFree(enemyUnit.CellIndex + relative.PlayerDirection, enemyUnitId)
+		}, definitionResult)
+		if readiness.Success == false then
+			return readiness
+		end
+		if readiness.Readiness == "READY" then
+			local readyResult = actionPlan:MarkAttackReady(readiness.Reason, readiness.TargetCellSnapshot)
+			if readyResult.Success == false then
+				return readyResult
+			end
+		else
+			local trackingResult = actionPlan:SetTrackingState(readiness.Reason, readiness.NextCommandType, readiness.Direction, readiness.TargetCellSnapshot)
+			if trackingResult.Success == false then
+				return trackingResult
+			end
+		end
+		readiness.PatternId = action.PatternId
+		readiness.StepIndex = action.StepIndex
+		readiness.PatternStepCount = action.PatternStepCount
+		readiness.TileId = action.TileId
+		readiness.PreparedTurn = action.PreparedTurn
+		readiness.TelegraphTurnsRemaining = action.TelegraphTurnsRemaining
+		return readiness
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1408,6 +1642,14 @@ script BattleSessionComponent extends Component
 		if action.Success == false then
 			return action
 		end
+		local compatibilityActionType = action.ActionType
+		local compatibilityDirection = action.Direction
+		local compatibilityReason = action.ActionReason
+		if actionPlan.PlanState == "TRACKING" then
+			compatibilityActionType = actionPlan.NextCommandType ~= "" and actionPlan.NextCommandType or "WAIT"
+			compatibilityDirection = actionPlan.NextCommandDirection
+			compatibilityReason = actionPlan.ReadinessReason ~= "" and actionPlan.ReadinessReason or "TRACKING"
+		end
 		local intentRuntime = self:EnsureEnemyIntentComponent()
 		if intentRuntime == nil then
 			return { Success = false, Reason = "INTENT_STATE_MISSING" }
@@ -1415,7 +1657,7 @@ script BattleSessionComponent extends Component
 		if intentRuntime.IntentState ~= "EMPTY" then
 			intentRuntime:ResetIntent("COMPATIBILITY_CURSOR_ADVANCE")
 		end
-		local result = intentRuntime:TryPrepare(enemyUnitId, action.PatternId, action.StepIndex, action.ActionType, action.TileId, action.TelegraphTurnsRemaining, action.Direction, action.PreparedTurn, action.ActionReason)
+		local result = intentRuntime:TryPrepare(enemyUnitId, action.PatternId, action.StepIndex, compatibilityActionType, action.TileId, action.TelegraphTurnsRemaining, compatibilityDirection, action.PreparedTurn, compatibilityReason)
 		self:PublishEnemyIntentSnapshot("PLAN_CURSOR_SELECTED")
 		self:PublishEnemyPlanSnapshot("PLAN_CURSOR_SELECTED")
 		return result
@@ -1461,11 +1703,15 @@ script BattleSessionComponent extends Component
 			self:CompleteEnemyTurn("WAIT", false, "ENEMY_PLAN_COMPONENT_MISSING")
 			return
 		end
-		local planBegin = executingPlan:TryBeginCurrentAction()
-		if planBegin.Success == false then
-			log_error("[BattleEnemyIntent] plan execute rejected reason=" .. planBegin.Reason .. " enemy=" .. intent.EnemyId)
-			self:CompleteEnemyTurn("WAIT", false, planBegin.Reason)
-			return
+		local isTrackingCommand = executingPlan.PlanState == "TRACKING"
+			and (intent.ActionType == "TURN_TO_PLAYER" or intent.ActionType == "MOVE_TOWARD" or intent.ActionType == "WAIT")
+		if isTrackingCommand == false then
+			local planBegin = executingPlan:TryBeginCurrentAction()
+			if planBegin.Success == false then
+				log_error("[BattleEnemyIntent] plan execute rejected reason=" .. planBegin.Reason .. " enemy=" .. intent.EnemyId)
+				self:CompleteEnemyTurn("WAIT", false, planBegin.Reason)
+				return
+			end
 		end
 		self:PublishEnemyIntentSnapshot("EXECUTING")
 		self:PublishEnemyPlanSnapshot("ACTION_EXECUTING")
@@ -1502,9 +1748,39 @@ script BattleSessionComponent extends Component
 
 		local duration = self:GetEnemyActionDuration(intent.ActionType, intent.TileId)
 		local complete = function()
+			if isTrackingCommand then
+				self:CompleteQueuedAttackTrackingCommand(intent.EnemyId, intent.ActionType, success, reason)
+				return
+			end
 			self:CompletePreparedEnemyIntent(intent.EnemyId, intent.PatternId, intent.StepIndex, intent.ActionType, intent.TileId, intent.TelegraphTurnsRemaining, success, reason)
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompleteQueuedAttackTrackingCommand(string enemyId, string actionType, boolean success, string reason)
+		-- A tracking command consumes one enemy action but never completes the queued attack's Pattern Step.
+		log("[BattleEnemyQueue] tracking complete enemy=" .. enemyId .. " action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
+		local enemyEntity = self:FindUnitEntity(enemyId)
+		if isvalid(enemyEntity) then
+			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+			if enemyUnit ~= nil then
+				self.LastEnemySpawnOrder = enemyUnit.SpawnOrder
+			end
+		end
+		if self.EnemyIntentRuntime ~= nil then
+			self.EnemyIntentRuntime:ResetIntent("QUEUED_ATTACK_TRACKING_COMPLETED")
+		end
+		self:PublishEnemyIntentSnapshot("QUEUED_ATTACK_TRACKING_COMPLETED")
+		self:PublishEnemyPlanSnapshot("QUEUED_ATTACK_TRACKING_COMPLETED")
+		if self.BattleResult == "" then
+			local nextResult = self:PrepareNextEnemyIntent()
+			if nextResult.Success == true then
+				self:BeginEnemyTurn()
+				return
+			end
+		end
+		self:CompleteEnemyTurn(actionType, success, reason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2543,27 +2819,62 @@ script BattleSessionComponent extends Component
 				local bossPhaseId = ""
 				local bossPhaseIndex = 0
 				local bossPhaseRevision = 0
+				local queueTurnsRequired = 0
+				local queueTurnsElapsed = 0
+				local readinessReason = ""
+				local nextCommandType = ""
+				local targetCellSnapshot = ""
+				local nextCommandDirection = 0
+				local entityName = ""
+				local queuedTileNames = ""
+				local queuedIconRuids = ""
 				if #fields >= 17 then
 					bossPhaseId = self:DecodeEnemyPlanField(fields[15])
 					bossPhaseIndex = math.floor(tonumber(fields[16]) or 0)
 					bossPhaseRevision = math.floor(tonumber(fields[17]) or 0)
 				end
+				if #fields >= 19 then
+					queueTurnsRequired = math.floor(tonumber(fields[18]) or 0)
+					queueTurnsElapsed = math.floor(tonumber(fields[19]) or 0)
+				end
+				if #fields >= 22 then
+					readinessReason = self:DecodeEnemyPlanField(fields[20])
+					nextCommandType = self:DecodeEnemyPlanField(fields[21])
+					targetCellSnapshot = self:DecodeEnemyPlanField(fields[22])
+				end
+				if #fields >= 23 then
+					nextCommandDirection = math.floor(tonumber(fields[23]) or 0)
+				end
+				if #fields >= 25 then
+					entityName = self:DecodeEnemyPlanField(fields[24])
+					queuedTileNames = self:DecodeEnemyPlanField(fields[25])
+				end
+				if #fields >= 26 then
+					queuedIconRuids = self:DecodeEnemyPlanField(fields[26])
+				end
 				local queuedTileIds = ""
-				for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
-					local actionFields = {}
-					for actionField in string.gmatch(actionEntry, "([^~]+)") do
-						table.insert(actionFields, actionField)
-					end
-					local queuedTileId = ""
-					if #actionFields >= 3 then
-						queuedTileId = self:DecodeEnemyPlanField(actionFields[3])
-					end
-					if queuedTileId ~= "" then
-						if queuedTileIds ~= "" then
-							queuedTileIds = queuedTileIds .. "|"
+				local hasInsertedQueue = fields[3] ~= "INSERTING"
+				if hasInsertedQueue then
+					for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+						local actionFields = {}
+						for actionField in string.gmatch(actionEntry, "([^~]+)") do
+							table.insert(actionFields, actionField)
 						end
-						queuedTileIds = queuedTileIds .. queuedTileId
+						local queuedTileId = ""
+						if #actionFields >= 3 then
+							queuedTileId = self:DecodeEnemyPlanField(actionFields[3])
+						end
+						if queuedTileId ~= "" then
+							if queuedTileIds ~= "" then
+								queuedTileIds = queuedTileIds .. "|"
+							end
+							queuedTileIds = queuedTileIds .. queuedTileId
+						end
 					end
+				else
+					-- INSERTING is a selected future action, not an item already owned by the enemy queue.
+					queuedTileNames = ""
+					queuedIconRuids = ""
 				end
 				table.insert(plans, {
 					UnitId = unitId,
@@ -2583,7 +2894,18 @@ script BattleSessionComponent extends Component
 					QueuedTileIds = queuedTileIds,
 					BossPhaseId = bossPhaseId,
 					BossPhaseIndex = bossPhaseIndex,
-					BossPhaseRevision = bossPhaseRevision
+					BossPhaseRevision = bossPhaseRevision,
+					QueueTurnsRequired = queueTurnsRequired,
+					QueueTurnsElapsed = queueTurnsElapsed,
+					ReadinessReason = readinessReason,
+					NextCommandType = nextCommandType,
+					NextCommandDirection = nextCommandDirection,
+					TargetCells = targetCellSnapshot,
+					EntityName = entityName,
+					QueuedTileNames = queuedTileNames,
+					QueuedIconRuids = queuedIconRuids,
+					IsAttackReady = fields[3] == "ATTACK_READY",
+					IsQueueReady = hasInsertedQueue
 				})
 			end
 		end
@@ -2811,7 +3133,7 @@ script BattleSessionComponent extends Component
 				ModifierSnapshot = turnState.QueueCapacityModifierSnapshot,
 				Revision = turnState.QueueCapacityRevision
 			},
-			EnemyIntentMode = "PER_ENEMY_FROZEN_PLAN_V1",
+			EnemyIntentMode = "PER_ENEMY_RANGE_AWARE_QUEUE_V2",
 			EnemyPlanRevision = self.EnemyPlanRevision,
 			EnemyPlanCount = self.EnemyPlanCount,
 			EnemyIntents = enemyIntents,
@@ -3261,14 +3583,24 @@ script BattleSessionComponent extends Component
 		local sourceEntity = self:FindUnitEntity(sourceUnitId)
 		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if sourcePresentation ~= nil and sourceEntity.PlayerControllerComponent ~= nil then
-			sourcePresentation:PlayCombatMotion(
-				sourceUnitId,
-				motionProfile.MotionKey,
-				motionProfile.ActionName,
-				motionProfile.PlayRate,
-				motionProfile.Duration
-			)
+		if sourcePresentation ~= nil then
+			if sourceEntity.PlayerControllerComponent ~= nil then
+				sourcePresentation:PlayCombatMotion(
+					sourceUnitId,
+					motionProfile.MotionKey,
+					motionProfile.ActionName,
+					motionProfile.PlayRate,
+					motionProfile.Duration
+				)
+			else
+				local speed = self:GetSkillSpeedMultiplier()
+				sourcePresentation:PlaySpriteMotion(
+					sourceUnitId,
+					definition.CasterMotionRuid or "",
+					(definition.CasterMotionPlayRate or 1) * speed,
+					(definition.CasterMotionDuration or definition.ActionDuration or 0.1) / speed
+				)
+			end
 		end
 		self:BeginSkillEffectPresentation(sourceUnitId, definition)
 
@@ -4118,6 +4450,16 @@ script BattleSessionComponent extends Component
 		local runtimeState = self:GetSkillRuntimeState("player_01")
 		if runtimeState == nil then
 			log_warning("[BattleCooldown] advance skipped reason=SKILL_RUNTIME_STATE_MISSING turn=" .. self.TurnNumber)
+			return
+		end
+		runtimeState:AdvanceCooldowns(1, reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceEnemySkillCooldowns(string enemyUnitId, string reason)
+		-- Enemy cooldowns advance on that enemy's own action, independent of player queue size.
+		local runtimeState = self:GetSkillRuntimeState(enemyUnitId)
+		if runtimeState == nil then
 			return
 		end
 		runtimeState:AdvanceCooldowns(1, reason)

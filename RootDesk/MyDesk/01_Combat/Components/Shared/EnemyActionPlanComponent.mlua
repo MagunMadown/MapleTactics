@@ -6,6 +6,12 @@ script EnemyActionPlanComponent extends Component
 	@Sync property integer PlannedTurn = 0
 	@Sync property integer CurrentActionIndex = 0
 	@Sync property integer PlannedActionCount = 0
+	@Sync property integer QueueTurnsRequired = 0
+	@Sync property integer QueueTurnsElapsed = 0
+	@Sync property string ReadinessReason = ""
+	@Sync property string NextCommandType = ""
+	@Sync property integer NextCommandDirection = 0
+	@Sync property string TargetCellSnapshot = ""
 	@Sync property string PlannedActionSnapshot = ""
 	@Sync property string TraitIds = ""
 	@Sync property string PlanReason = ""
@@ -15,7 +21,7 @@ script EnemyActionPlanComponent extends Component
 	property boolean AggregateSuccess = true
 
 	@ExecSpace("ServerOnly")
-	method table ReplacePlan(string ownerUnitId, table actions, integer plannedTurn, string traitIds, string reason)
+	method table ReplacePlan(string ownerUnitId, table actions, integer plannedTurn, string traitIds, string reason, integer queueTurnsRequired)
 		-- One enemy owns one immutable round plan. The session coordinates plans but never owns their queues.
 		if ownerUnitId == nil or ownerUnitId == "" then
 			return { Success = false, Reason = "INVALID_OWNER_UNIT_ID" }
@@ -45,23 +51,34 @@ script EnemyActionPlanComponent extends Component
 			})
 		end
 
+		self.QueueTurnsRequired = math.max(0, math.floor(tonumber(queueTurnsRequired) or 0))
+		self.QueueTurnsElapsed = 0
 		self.PlanState = "PREPARED"
+		if self.PlannedActions[1].ActionType == "EXECUTE_TILE" and self.QueueTurnsRequired > 0 then
+			self.PlanState = "INSERTING"
+		elseif self.PlannedActions[1].ActionType == "EXECUTE_TILE" then
+			self.PlanState = "TRACKING"
+		end
 		self.OwnerUnitId = ownerUnitId
 		self.PlannedTurn = math.max(0, plannedTurn)
 		self.CurrentActionIndex = 1
 		self.PlannedActionCount = #self.PlannedActions
 		self.TraitIds = traitIds or ""
 		self.PlanReason = reason or "PLANNED"
+		self.ReadinessReason = self.PlanState == "INSERTING" and "ATTACK_TILE_INSERTING" or ""
+		self.NextCommandType = self.PlanState == "INSERTING" and "QUEUE_TILE" or ""
+		self.NextCommandDirection = 0
+		self.TargetCellSnapshot = ""
 		self.AggregateSuccess = true
 		self.PlanRevision = self.PlanRevision + 1
 		self:PublishSnapshot()
-		log("[EnemyActionPlan] prepared enemy=" .. self.OwnerUnitId .. " turn=" .. self.PlannedTurn .. " actions=" .. self.PlannedActionCount .. " traits=" .. self.TraitIds .. " revision=" .. self.PlanRevision)
-		return { Success = true, Reason = "PLAN_PREPARED", ActionCount = self.PlannedActionCount, Revision = self.PlanRevision }
+		log("[EnemyActionPlan] prepared enemy=" .. self.OwnerUnitId .. " turn=" .. self.PlannedTurn .. " state=" .. self.PlanState .. " queue=" .. self.QueueTurnsElapsed .. "/" .. self.QueueTurnsRequired .. " actions=" .. self.PlannedActionCount .. " traits=" .. self.TraitIds .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = self.PlanState == "INSERTING" and "PLAN_INSERTING" or self.PlanState == "TRACKING" and "PLAN_TRACKING" or "PLAN_PREPARED", State = self.PlanState, ActionCount = self.PlannedActionCount, Revision = self.PlanRevision }
 	end
 
 	@ExecSpace("ServerOnly")
 	method table GetCurrentAction()
-		if self.PlanState ~= "PREPARED" and self.PlanState ~= "EXECUTING" then
+		if self.PlanState ~= "INSERTING" and self.PlanState ~= "TRACKING" and self.PlanState ~= "ATTACK_READY" and self.PlanState ~= "PREPARED" and self.PlanState ~= "EXECUTING" then
 			return { Success = false, Reason = "PLAN_NOT_PREPARED" }
 		end
 		if self.PlannedActions == nil then
@@ -92,8 +109,66 @@ script EnemyActionPlanComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table AdvanceQueueTurn()
+		-- Normal foes spend an enemy turn placing their attack Tile into the queue.
+		if self.PlanState ~= "INSERTING" then
+			return { Success = false, Reason = "PLAN_NOT_INSERTING", Ready = self.PlanState == "TRACKING" or self.PlanState == "ATTACK_READY" }
+		end
+		self.QueueTurnsElapsed = math.min(self.QueueTurnsRequired, self.QueueTurnsElapsed + 1)
+		local isReady = self.QueueTurnsElapsed >= self.QueueTurnsRequired
+		if isReady then
+			self.PlanState = "TRACKING"
+			self.PlanReason = "ATTACK_TILE_QUEUED"
+			self.ReadinessReason = "READINESS_PENDING"
+			self.NextCommandType = ""
+			self.NextCommandDirection = 0
+		else
+			self.PlanReason = "ATTACK_TILE_QUEUEING"
+			self.ReadinessReason = "ATTACK_TILE_INSERTING"
+			self.NextCommandType = "QUEUE_TILE"
+		end
+		self.PlanRevision = self.PlanRevision + 1
+		self:PublishSnapshot()
+		log("[EnemyActionPlan] queue advanced enemy=" .. self.OwnerUnitId .. " state=" .. self.PlanState .. " queue=" .. self.QueueTurnsElapsed .. "/" .. self.QueueTurnsRequired .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = self.PlanReason, Ready = isReady, QueueTurnsElapsed = self.QueueTurnsElapsed, QueueTurnsRequired = self.QueueTurnsRequired, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SetTrackingState(string readinessReason, string nextCommandType, integer nextCommandDirection, string targetCellSnapshot)
+		if self.PlanState ~= "TRACKING" then
+			return { Success = false, Reason = "PLAN_NOT_TRACKING" }
+		end
+		self.ReadinessReason = readinessReason or "TRACKING"
+		self.NextCommandType = nextCommandType or "WAIT"
+		self.NextCommandDirection = math.floor(tonumber(nextCommandDirection) or 0)
+		self.TargetCellSnapshot = targetCellSnapshot or ""
+		self.PlanReason = self.ReadinessReason
+		self.PlanRevision = self.PlanRevision + 1
+		self:PublishSnapshot()
+		log("[EnemyActionPlan] tracking enemy=" .. self.OwnerUnitId .. " readiness=" .. self.ReadinessReason .. " next=" .. self.NextCommandType .. " cells=" .. self.TargetCellSnapshot .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = self.ReadinessReason, State = self.PlanState, NextCommandType = self.NextCommandType, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table MarkAttackReady(string readinessReason, string targetCellSnapshot)
+		if self.PlanState ~= "TRACKING" then
+			return { Success = false, Reason = "PLAN_NOT_TRACKING" }
+		end
+		self.PlanState = "ATTACK_READY"
+		self.ReadinessReason = readinessReason or "READY"
+		self.NextCommandType = "EXECUTE_TILE"
+		self.NextCommandDirection = 0
+		self.TargetCellSnapshot = targetCellSnapshot or ""
+		self.PlanReason = "ATTACK_READY"
+		self.PlanRevision = self.PlanRevision + 1
+		self:PublishSnapshot()
+		log("[EnemyActionPlan] attack ready enemy=" .. self.OwnerUnitId .. " tile=" .. (self.PlannedActions ~= nil and self.PlannedActions[1] ~= nil and self.PlannedActions[1].TileId or "") .. " cells=" .. self.TargetCellSnapshot .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = "ATTACK_READY", State = self.PlanState, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
 	method table TryBeginCurrentAction()
-		if self.PlanState ~= "PREPARED" then
+		if self.PlanState ~= "PREPARED" and self.PlanState ~= "ATTACK_READY" then
 			return { Success = false, Reason = "PLAN_NOT_PREPARED" }
 		end
 		local current = self:GetCurrentAction()
@@ -135,6 +210,12 @@ script EnemyActionPlanComponent extends Component
 		self.PlannedTurn = 0
 		self.CurrentActionIndex = 0
 		self.PlannedActionCount = 0
+		self.QueueTurnsRequired = 0
+		self.QueueTurnsElapsed = 0
+		self.ReadinessReason = ""
+		self.NextCommandType = ""
+		self.NextCommandDirection = 0
+		self.TargetCellSnapshot = ""
 		self.PlannedActionSnapshot = ""
 		self.PlanReason = reason or "RESET"
 		self.PlannedActions = nil
@@ -150,6 +231,12 @@ script EnemyActionPlanComponent extends Component
 			PlannedTurn = self.PlannedTurn,
 			CurrentActionIndex = self.CurrentActionIndex,
 			ActionCount = self.PlannedActionCount,
+			QueueTurnsRequired = self.QueueTurnsRequired,
+			QueueTurnsElapsed = self.QueueTurnsElapsed,
+			ReadinessReason = self.ReadinessReason,
+			NextCommandType = self.NextCommandType,
+			NextCommandDirection = self.NextCommandDirection,
+			TargetCellSnapshot = self.TargetCellSnapshot,
 			ActionSnapshot = self.PlannedActionSnapshot,
 			TraitIds = self.TraitIds,
 			Reason = self.PlanReason,
