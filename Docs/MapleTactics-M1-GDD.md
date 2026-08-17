@@ -29,9 +29,10 @@ Milestone: M1 playable vertical slice
 - 일반 타일을 등록해 적 턴을 보낸 뒤에도 큐는 유지되며, 다음 플레이어 턴에 이동·회전·추가 등록 후 별도 실행 명령으로 한 번에 해소한다.
 - 턴과 큐 항목은 1:1이 아니다. FreePlay 등록·제거·순서 변경은 턴을 넘기지 않고 여러 번 수행할 수 있으며, 일반 등록과 전체 큐 실행만 각각 하나의 턴 소비 Command다.
 - 큐 실행 중 각 타일은 현재 보드에서 타깃을 다시 계산한다.
-- 적의 다음 행동은 플레이어에게 미리 표시된다.
-- 적 Intent는 플레이어 턴 전에 준비되어 ActionType/TileId가 고정되며, 플레이어가 위치를 바꿔도 실행 직전에 다른 행동으로 재선택하지 않는다.
-- 준비된 공격은 TargetId를 저장하지 않고 실행 시점의 현재 CellIndex/Facing과 타일 Target 규칙으로 명중 셀을 계산한다.
+- 적의 공격 타일 보유 상태와 공격 예고 상태를 분리한다. 적은 공격 타일을 먼저 등록하고, 사거리·방향이 맞지 않으면 타일을 유지한 채 회전·추적한다.
+- 공격 조건이 맞아 `ATTACK_READY`가 된 다음 행동만 플레이어에게 공격으로 미리 표시하며, 그 사이 플레이어 대응 Command 1회를 허용한다.
+- `ATTACK_READY` Intent는 ActionType/TileId가 고정되며, 플레이어가 위치를 바꿔도 실행 직전에 추적이나 다른 행동으로 재선택하지 않는다.
+- 예고된 공격은 TargetId를 저장하지 않고 실행 시점의 현재 CellIndex/Facing과 타일 Target 규칙으로 명중 셀을 계산하므로 피하면 빗나갈 수 있다.
 - 전투 월드 위치와 논리 CellIndex를 분리한다.
 - 적은 플레이어 좌우 어느 빈 칸에도 배치될 수 있어, 방향 전환은 전투 내내 반복적으로 필요한 핵심 조작이다.
 
@@ -68,8 +69,10 @@ M1 직업 슬롯:
 ## 6. 적과 스테이지 원칙
 
 - 일반 적은 `EnemyPatternSteps`의 순차 패턴으로 행동한다.
-- `EnemyPatternRunnerComponent`는 표의 다음 Step을 `PreparedIntent` 런타임 Snapshot으로 만들고 `Prepare → Hold → Execute → Complete` 상태를 관리한다.
-- 밀치기나 이동은 준비된 ActionType/TileId를 바꾸지 않는다. 위치가 달라져 사거리가 맞지 않으면 예고 공격이 빗나간다.
+- `EnemyActionPlanComponent`는 공격 타일의 `INSERTING → TRACKING → ATTACK_READY → EXECUTING` 상태를 적별로 소유한다.
+- `EnemyPatternRunnerComponent`는 공격 주기 중 StepIndex를 유지하며, 추적 이동이 아니라 공격 실행이 끝난 뒤에만 다음 Step으로 전진한다.
+- `ATTACK_READY` 뒤의 밀치기나 이동은 준비된 ActionType/TileId를 바꾸지 않는다. 위치가 달라져 사거리가 맞지 않으면 예고 공격이 빗나간다.
+- `QUICK`은 현재 사거리·방향이 맞을 때만 타일 등록과 `ATTACK_READY`를 같은 적 행동에서 처리한다.
 - 보스는 HP 조건에 따라 PatternId를 바꾼다.
 - BT는 PatternStep으로 표현하기 어려운 요구가 확인된 후에만 도입한다.
 - 적의 초기 `Facing`은 생성 순간 한 번 결정한다. 기본 정책은 `FACE_PLAYER`이며, 특수 적이나 연출은 `FIXED_LEFT`/`FIXED_RIGHT` 또는 스테이지 배치의 `FacingOverride`를 사용한다.
@@ -104,6 +107,7 @@ M1 직업 슬롯:
 | 전투 세션 | 맵 엔티티 `BattleSessionComponent` |
 | 보드 점유와 다중 유닛 | 맵 엔티티 `BoardStateComponent` |
 | 개별 적 패턴 상태 | 적 엔티티 `EnemyPatternRunnerComponent` |
+| 개별 적 공격 큐 상태 | 적 엔티티 `EnemyActionPlanComponent` |
 | 적 Intent 읽기 모델 | 서버 `PreparedIntent` Snapshot + Client용 읽기 전용 DTO/Event |
 | 스테이지/웨이브 진행 | 맵 엔티티 `StageFlowComponent` |
 | 전투 격리 | 플레이어당 Instance Room/Instance Map |
@@ -176,3 +180,4 @@ M1 직업 슬롯:
 | 2026-08-01 | 수정 | 일반 타일 등록과 큐 실행을 분리하고, 등록 후 적 턴에도 큐를 유지하는 쇼군식 흐름 및 기본+Modifier 큐 용량 계약을 확정 | 큐를 쌓는 동안 위치·방향을 조정한 뒤 별도 실행 키로 전체 큐를 해소하는 핵심 플레이를 구현하기 위함 | BattleTurn/BattleSession, BattleQueueHUD, UI 상태 DTO, Queue Modifier API |
 | 2026-08-01 | 수정 | 직업 시작 스킬과 직업 고유 메커니즘을 분리하고 구 TileDefinitions 명칭을 실제 SkillDefinitions 규격으로 통합 | 쇼군식 공격 타일과 캐릭터 고유 이동·전투 규칙은 실행 수명과 턴/쿨타임 계약이 다르므로 독립 확장점이 필요함 | JobDefinitions, JobStartingSkillEntries, JobMechanic Router, Data Dictionary §2~5 |
 | 2026-08-03 | 수정 | 구현 상태 표기와 상점 책임을 정리하고, 증강 허용값·StackPolicy·EnemyDrop 장 번호를 실제 코드에 맞춤 | 표 기반 제작자가 미구현 값을 지원 값으로 오해하거나 런 상점과 Meta/World Shop 데이터를 혼용하지 않도록 하기 위함 | Data-Dictionary §1/§14/§15/§20~23, GDD §7/§10, 관련 제작 가이드 |
+| 2026-08-15 | 수정 | 적 공격 타일 등록과 공격 예고를 분리하고, 타일을 보유한 채 사거리까지 추적한 뒤 대응 턴 후 고정 실행하는 흐름으로 확장 | 사거리 진입 뒤에야 큐를 만드는 현재 동작을 참고작의 읽을 수 있는 적 공격 주기에 맞추고, 회피·밀치기로 예고 공격을 빗나가게 하는 전술을 보존하기 위함 | GDD §3/§6/§8, Phase 1 Slice 10.6, Shogun Queue Plan Slice 6, 전용 수정 계획 |

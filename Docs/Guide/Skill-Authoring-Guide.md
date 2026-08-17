@@ -49,8 +49,8 @@ TryQueueTile
 | 열 | 타입 | 예시 | 규칙 |
 |---|---|---|---|
 | `SchemaVersion` | integer | `1` | 현재 지원 버전은 1 |
-| `SkillId` | string | `basic_slash` | 고유 `lower_snake_case` ID |
-| `DisplayName` | string | `기본 베기` | 빈 문자열 금지 |
+| `SkillId` | string | `enemy_ranged_shot` | 고유 `lower_snake_case` ID |
+| `DisplayName` | string | `포자탄` | 빈 문자열 금지 |
 | `SkillTags` | string | `attack|starter` | `|`로 구분 |
 | `TargetingType` | string | `FRONT_CELL` | `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS` |
 | `Range` | integer | `1` | 1 이상, Cell 기준 최대 사거리 |
@@ -63,28 +63,45 @@ TryQueueTile
 | `RequiredJobTag` | string | 빈 문자열 | 제한이 없으면 비움 |
 | `ActionDuration` | number | `0.45` | 큐에서 다음 스킬로 넘어가기까지의 시간 |
 | `FreePlay` | boolean | `false` | `false`면 등록 자체가 턴을 소비하고, `true`면 등록 후 플레이어 턴 유지 |
+| `CastEffectRuid` | string | animationclip RUID | 시전자 위치에서 재생할 이펙트. 없으면 비움 |
+| `HitEffectRuid` | string | animationclip RUID | 대상 위치에서 재생할 이펙트. 없으면 비움 |
+| `EffectScale` | number | `0.55` | 시전·피격 이펙트 공통 배율. 비우면 `1` |
+| `CasterMotionRuid` | string | animationclip RUID | Sprite 기반 적의 공격 모션. 플레이어는 비움 |
+| `CasterMotionPlayRate` | number | `1.6` | 공격 모션 배속. 모션 RUID 사용 시 0 초과 |
+| `CasterMotionDuration` | number | `0.35` | 공격 모션 유지 시간. 비우면 `ActionDuration` |
+| `EnemyQueueTurns` | integer | `1` | 적 공격 Tile 준비에 소비할 적 턴. 플레이어 스킬은 비움/0 |
+| `HudIconRuid` | string | sprite/animationclip RUID | 머리 위 Queue와 HUD에 표시할 아이콘. animationclip도 정적 썸네일로 중앙 정렬됨 |
 
 현재 실제 Dataset Definition은 다음과 같다.
 
 ```csv
-SchemaVersion,SkillId,DisplayName,SkillTags,TargetingType,Range,TargetOffsets,CooldownTurns,CostType,CostValue,MotionProfileId,EffectSetId,RequiredJobTag,ActionDuration,FreePlay
-1,basic_slash,기본 베기,attack|starter,FRONT_CELL,1,,0,,0,basic_slash,basic_slash_effects,,0.45,false
-1,quick_slash,빠른 베기,attack|starter|freeplay,FRONT_CELL,1,,0,,0,basic_slash,basic_slash_effects,,0.35,true
-1,heavy_slash,강한 베기,attack|heavy,FRONT_CELL,1,,1,,0,heavy_slash,heavy_slash_effects,,0.70,false
-1,push,밀치기,control|displacement,FRONT_CELL,1,,1,,0,push,push_effects,,0.40,false
-1,slash_push_combo,베고 밀치기,attack|control|combo,FRONT_CELL,1,,2,,0,basic_slash,slash_push_combo_effects,,0.55,false
-1,prototype_line_slash,전방 참격,attack|prototype,FIRST_ENEMY_FORWARD,3,,0,,0,basic_slash,line_slash_effects,,0.45,false
-1,prototype_sweep,휩쓸기,attack|prototype,RANGE_OFFSETS,2,1|2,0,,0,heavy_slash,sweep_effects,,0.60,false
+SchemaVersion,SkillId,DisplayName,SkillTags,TargetingType,Range,TargetOffsets,CooldownTurns,CostType,CostValue,MotionProfileId,EffectSetId,RequiredJobTag,ActionDuration,FreePlay,CastEffectRuid,HitEffectRuid,EffectScale,CasterMotionRuid,CasterMotionPlayRate,CasterMotionDuration,EnemyQueueTurns,HudIconRuid
+1,enemy_ranged_shot,포자탄,attack|enemy|ranged|spore,FIRST_ENEMY_FORWARD,2,,5,,0,enemy_basic_attack,enemy_basic_attack_effects,,0.45,false,ee74ad8d798c489d957a32cf3c375490,46d455727f6f45638af0a0a84c413bf2,0.55,4a0350be4a734dffac3f0f14d20caaf6,1.6,0.35,1,ee74ad8d798c489d957a32cf3c375490
 ```
 
 `FreePlay`는 효과 타입에서 자동 추론하지 않는다. 같은 `DAMAGE` 스킬이라도 Definition의
 값에 따라 턴 소비 여부가 달라진다. CSV 셀은 문자열로 읽히므로 `true`/`1`/`yes`를
-참으로 해석하며, 그 외 값과 빈 셀은 `false`로 취급한다. 현재 `quick_slash`는 이 흐름을
-검증하기 위한 실제 Definition이며 기본 베기의 모션·효과를 재사용한다.
+참으로 해석하며, 그 외 값과 빈 셀은 `false`로 취급한다.
 
-2026-08-01 Maker 회귀에서 `quick_slash` 등록은 `ConsumesTurn=false`로 같은
-PlayerTurn을 유지했고, 뒤이어 일반 `basic_slash`를 등록했을 때만 적 라운드와 Turn 증가가
-발생했다. 두 스킬의 큐 순서는 적 라운드 뒤에도 유지되고 전체 실행 후 정상적으로 비워졌다.
+플레이어 아바타 공격은 `MotionProfileId`를 사용하고 마지막 `CasterMotion*` 세 열은 비운다.
+Sprite 기반 적은 `CasterMotionRuid`로 공격 중 사용할 animationclip을 지정할 수 있다. 런타임은
+해당 클립을 재생한 뒤 모델에 저장된 기본 대기 클립으로 자동 복구한다. 일곱 Skill Definition
+CSV는 같은 열 스키마를 유지해야 하므로, 새 열을 추가할 때는 헤더만 있는 공용 표까지 함께 갱신한다.
+
+`EnemyQueueTurns=1`인 적 공격은 Queue 추가와 실행 사이에 플레이어 턴이 한 번 열린다.
+즉시 공격형 적은 CSV를 0으로 설정하기보다 `EnemyDefinitions.TraitIds=QUICK`을 사용한다.
+적의 `CooldownTurns`는 그 적이 행동할 때마다 1씩 감소한다. 쿨타임이 남은 공격 Tile은
+Queue에서 제거하지 않고 `TRACKING + WAIT` 상태로 유지하므로 HUD에서도 다음 공격을 계속 확인할 수 있다.
+
+디자인 교체는 Skill 행의 네 영역만 수정한다.
+
+- Queue 아이콘: `HudIconRuid`
+- 시전자·피격 이펙트: `CastEffectRuid`, `HitEffectRuid`, `EffectScale`
+- Sprite 적 공격 모션: `CasterMotionRuid`, `CasterMotionPlayRate`, `CasterMotionDuration`
+- Avatar 플레이어 모션: `MotionProfileId`
+
+`EnemyIntentHudComponent`의 `QueueOffsetX/Y`, `QueueSlotSpacing`, `SkillIconOffsetX/Y`,
+`SkillIconSize`는 Maker Inspector에서 전체 적 HUD의 위치와 크기를 보정하는 공통 디자인 값이다.
 
 ## SkillEffectSteps
 

@@ -112,6 +112,11 @@
 | CastEffectRuid | string | - | 시전자에게 재생할 animationclip RUID. 비우면 시전 이펙트 없음 |
 | HitEffectRuid | string | - | 피격 대상에게 재생할 animationclip RUID. 비우면 피격 이펙트 없음 |
 | EffectScale | number | - | 두 이펙트에 공통 적용할 배율. 비우면 `1` |
+| CasterMotionRuid | string | - | Sprite 기반 비플레이어 시전자의 공격 animationclip RUID. 비우면 모델 기본 SpriteRUID 유지 |
+| CasterMotionPlayRate | number | 조건부 | `CasterMotionRuid` 사용 시 재생 배속. 비우면 `1`, 0 초과 |
+| CasterMotionDuration | number | 조건부 | 공격 클립 유지 시간. 비우면 `ActionDuration`, 0 초과 |
+| EnemyQueueTurns | integer | - | 적이 공격 Tile을 Queue에 추가하는 데 소비할 적 턴 수. 플레이어 스킬은 `0`, 일반 적 공격은 `1` 이상 |
+| HudIconRuid | string | - | Queue/HUD 아이콘용 sprite 또는 animationclip RUID. 비우면 UI 기본 아이콘 사용 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -133,6 +138,21 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 `EffectScale`은 클립 원본 크기가 셀 간격(약 1.12 월드 유닛) 대비 과도할 때만 낮춘다.
 현재 대부분 `0.9`이고, 폭이 넓은 피어싱만 `0.7`이다.
 
+`CasterMotionRuid`도 `animationclip` RUID다. Sprite 기반 적은 실행 시 이 값으로
+`SpriteRendererComponent.SpriteRUID`를 잠시 교체하고 `CasterMotionDuration` 뒤 모델의 기본
+클립으로 복구한다. 플레이어 아바타는 기존 `MotionProfileId` 경로를 사용하므로 이 세 열을
+비워 둔다. Validator는 `CasterMotionRuid`가 있을 때 배속과 지속 시간이 모두 0보다 큰지 검사한다.
+
+`HudIconRuid`는 표현 데이터이며 전투 판정에는 영향을 주지 않는다. animationclip을 넣어도
+적 머리 위 Queue에서는 `thumbnail://` 정적 이미지로 변환해 슬롯 중앙에 표시한다.
+
+적 `EXECUTE_TILE`은 `EnemyQueueTurns`가 1이면 첫 적 턴에 Tile을 Queue에 추가한다. 이후
+`INSERTING → TRACKING → ATTACK_READY → EXECUTING` 순서로 진행하며, `TRACKING` 중에는 Tile을
+유지한 채 방향 전환·접근을 수행한다. `ATTACK_READY`가 된 뒤 플레이어 대응 Command 1회를
+거쳐 고정 실행하므로 플레이어가 벗어나면 빗나갈 수 있다. 증원 Spawn 뒤에도 생존 적의 Queue는
+유지된다. `QUICK` Trait는 Tile 등록 턴만 0으로 바꾸며, 사거리 안에서는 즉시 `ATTACK_READY`,
+사거리 밖에서는 `TRACKING`이 된다. `TELEGRAPH_TILE`의 별도 지연과 이 기본 대응 턴은 합치지 않는다.
+
 ### 4.1 스킬 테이블 분리
 
 스킬 행은 **같은 열 스키마를 가진 7개 테이블**에 나뉘어 있다. 각각
@@ -146,7 +166,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 궁수 | `ArcherSkillDefinitions` | `piercing`, `wind_shot`, `cardinal_discharge` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` |
-| 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack` |
+| 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` |
 
 공용 `SkillDefinitions`는 현재 **행이 하나도 없다**. 이전의 범용 프로토타입 타일
 (`basic_slash`, `quick_slash`, `heavy_slash`, `push`, `slash_push_combo`, `prototype_*`,
@@ -189,7 +209,7 @@ SkillId는 예외 없이 `UNKNOWN_SKILL`이다.
 1. 그 직업의 `{Job}SkillDefinitions.csv`에 행을 추가한다 (공용 `SkillDefinitions`에는 넣지 않는다).
 2. `SkillEffectSteps.csv`에 `EffectSetId` 행을 추가한다.
 3. `JobStartingSkillEntries.csv`에 필요하면 슬롯을 추가한다.
-4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다.
+4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다. Sprite 기반 적이라면 `CasterMotion*`도 함께 지정한다.
 5. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
 
 ### 4.2 HUD 스킬 슬롯 배정
@@ -314,7 +334,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 허용 ConditionType M1: `ALWAYS`, `DISTANCE_EQ`, `DISTANCE_LE`, `HP_RATIO_LE`, `CELL_FREE`.
 
 현재 수직 슬라이스는 `prototype_tracker` 4행, `prototype_fixed` 3행,
-`prototype_retreat` 2행, `prototype_telegraph` 3행, `region_01_ranged_basic` 4행을
+`prototype_retreat` 2행, `prototype_telegraph` 3행, `region_01_spore_ranged` 4행을
 실제 `EnemyPatternSteps` Dataset으로 제공한다.
 Repository는 `PatternId → StepIndex`로 정렬하고,
 전용 Validator는 SchemaVersion, 연속 StepIndex, Action/Condition enum, TileId와 거리 인자를

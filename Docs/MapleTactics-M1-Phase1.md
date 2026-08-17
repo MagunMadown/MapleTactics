@@ -290,6 +290,34 @@
   - HUD 표시 ActionType/TileId와 실제 실행 값이 일치
   - `Prepare → Hold → Execute → Complete` positive log 순서가 한 번씩만 출력
 
+### Slice 10.6 - 공격 타일 보유 상태와 사거리 추적 분리
+
+- ✅ 상태: Tested — Maker에서 근접 등록·접근·예고·회피 Miss, 반대 방향 `NEEDS_TURN`, 2칸 Spore 접근·동시 예고·회피 Miss, QUICK 원거리 추적/사거리 내 즉시 준비, 다중 적·강제 증원·Client DTO를 검증
+- 화면 결과: 적은 공격 타일을 먼저 보유하고 접근하며, 공격 가능한 위치에서만 위험 범위를 예고한다. 예고 후 플레이어가 피하면 적은 다시 추적하지 않고 예고 공격을 실행해 빗나간다.
+- 목적:
+  - 현재 `사거리 확인 → 공격 타일 등록` 순서를 `공격 타일 등록 → 사거리 추적 → 공격 예고 → 고정 실행`으로 교정
+  - 공격 큐 보유 상태와 플레이어가 대응해야 하는 `ATTACK_READY` 상태를 분리
+  - 근접 Orange Mushroom과 2칸 원거리 Spore가 같은 런타임 규격을 사용하도록 구성
+- 최소 상태:
+  - `INSERTING`: 기존 `EnemyQueueTurns`만큼 공격 타일 등록 진행
+  - `TRACKING`: 타일을 보유한 채 사거리·방향을 맞추는 중
+  - `ATTACK_READY`: 공격 예고 완료, 플레이어 대응 Command 뒤 실행
+  - `EXECUTING`: 예고한 타일을 현재 Cell/Facing 기준으로 실행
+- 최소 인터페이스:
+  - `EnemyActionPlanComponent`의 타일 보유 상태와 임시 추적 Command 분리
+  - 무상태 Readiness 판정 `READY/NEEDS_TURN/NEEDS_MOVE/BLOCKED`
+  - UI DTO `QueueState`, `QueuedTileId`, `ReadinessReason`, `NextCommandType`, `TargetCells`
+- 데이터 원칙:
+  - 첫 구현에서는 새 CSV 컬럼을 추가하지 않는다.
+  - 사거리는 기존 Skill Target 규칙, 등록 시간은 `EnemyQueueTurns`, 빠른 준비는 `QUICK`을 재사용한다.
+  - 공격 추적 중에는 Pattern Step을 완료하지 않고, 실제 공격 완료 뒤에만 StepIndex를 전진한다.
+- 완료 기준:
+  - 근접 적과 Spore가 사거리 밖에서 공격 타일을 잃지 않고 추적한다.
+  - 사거리 진입 시 즉시 피해 없이 `ATTACK_READY`가 표시된다.
+  - 플레이어가 예고 뒤 벗어나도 적은 재추적하지 않고 공격해 Miss가 발생한다.
+  - QUICK은 사거리 안에서만 등록과 준비를 같은 적 행동에 처리한다.
+  - 강제 증원·다중 적·Wave·Victory/Defeat/Reset 회귀를 통과한다.
+
 ### Slice 11 - 단일 적의 추적 이동과 고정 방향 이동 분리
 
 - ✅ 상태: Tested — 추적 방향 전환, 고정 방향 이동, 경계·점유 WAIT를 Maker 런타임에서 검증 완료

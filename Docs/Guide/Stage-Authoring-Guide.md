@@ -79,10 +79,14 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 
 | Stage | Wave 수 | 기본 구성 |
 |---|---:|---|
-| `region_01_stage_01` | 2 | 근접 1 → 원거리 1 |
-| `region_01_stage_02` | 2 | 근접/원거리 혼합, 최대 동시 2 |
-| `region_01_stage_03` | 3 | 혼합 비중 증가, 마지막 Wave 2 |
+| `region_01_stage_01` | 3 | 총 3마리. 근접 적만 등장해 기본 전투를 학습 |
+| `region_01_stage_02` | 3 | 총 5마리. 근접 중심, 스포아 가중치 1/4, 최대 동시 2 |
+| `region_01_stage_03` | 4 | 총 6마리. 스포아 가중치 1/3, 후반 Wave는 2마리 |
 | `region_01_stage_04` | 1 | 보스 1, `StageType=BOSS`, 2 Phase |
+
+스포아는 1-2부터 `region_01_spore_ranged` Enemy Definition으로 등장한다. 사거리는 2칸,
+기본 피해는 1, HP는 2다. 모든 직업의 기본 시작 공격 피해가 2 이상이므로 초반에는 스킬
+한 번으로 처치할 수 있다. `EnemySpawnPools.Weight`를 낮게 두어 원거리 압박이 과해지지 않게 한다.
 
 Node/REST 연결은 별도 제작 영역이다. Stage 행을 추가하는 작업에서 다른 팀이 소유한
 `NodeDefinitions.NextNodeIds`나 REST/상점 Node를 임의로 변경하지 않는다.
