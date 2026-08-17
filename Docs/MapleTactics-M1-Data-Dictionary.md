@@ -117,7 +117,7 @@
 | ProjectileSpeed | number | 조건부 | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 (1배속 기준) |
 | ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
 | ProjectileLaunchDelay | number | - | 발사를 늦출 초 (1배속 기준). 비우거나 `0`이면 시전과 동시 발사 |
-| ProjectileArcHeight | number | - | 투사체 포물선의 정점 높이(월드 유닛). `0`이면 직선. §4.5 참조 |
+| ProjectileHeight | number | - | 투사체가 셀보다 얼마나 위로 날지(월드 유닛). `0`이면 셀 높이. §4.5 참조 |
 | ProjectileCount | integer | - | 한 번 시전에 날리는 투사체 수. 1 이상, 기본 `1`. §4.5 참조 |
 | ProjectileInterval | number | 조건부 | 연발 간 간격(초, 1배속 기준). `ProjectileCount`가 2 이상이면 0 초과 필수 |
 | IconRuid | string | - | §4.6 스킬 아이콘 sprite RUID. 비우면 표시 측에서 기본 스프라이트로 대체 |
@@ -409,31 +409,21 @@ SkillDefinition.ProjectileRuid
 (330 / 331 강화 / 332 / 334 VI)이고 디자인은 같으나 해상도가 176×80과 420×208로 갈리므로
 축소가 유리한 고해상도 쪽을 쓴다는 점을 참고한다.
 
-#### 곡사 (ProjectileArcHeight)
+#### 비행 높이 (ProjectileHeight)
 
-`ProjectileArcHeight`가 `0`보다 크면 투사체가 직선이 아니라 **곡선**으로 날아간다. 값은
-시전자–목표를 잇는 직선 위로 솟는 **정점 높이(월드 유닛)** 다.
+셀 좌표는 유닛의 원점에 있어서, 그대로 쏘면 투사체가 **바닥을 스치듯 지나간다.**
+`ProjectileHeight`는 비행 직선 전체를 그만큼 위로 올려 무기를 든 높이에서 날아가게 한다.
 
-```text
-y = lerp(startY, targetY, t) + ArcHeight * 27/4 * t * (1 - t)^2
-```
-
-`t=1`에서 **중근**을 갖는 3차 곡선이라, 착탄 순간의 기울기가 정확히 `0`이다. 즉 화살이
-수평으로 미끄러져 들어간다. 계수 `27/4`는 정점을 정확히 `ArcHeight`로 맞추기 위한 값이고
-(`t(1-t)²`의 최댓값은 `t=1/3`에서 `4/27`), 정점 위치도 그래서 중앙이 아니라 **앞쪽 1/3**이다.
-
-- **좌우대칭 포물선(`4h·t(1-t)`)을 쓰지 않는 이유**가 여기 있다. 대칭 곡선은 올라간 각도
-  그대로 내려오므로 착탄 순간에도 하강각이 최대이고, 화살이 바닥에 꽂히는 것처럼 보인다.
-  실제로 정점 `0.2`·3칸 비행 기준 착탄각이 대칭식에서는 `13°`였고 현재 식에서는 `0°`다.
-- 양 끝은 여전히 직선 위에 정확히 놓이므로 **출발점·착탄점·임팩트 시점이 직선일 때와 같다.**
-  곡선은 순수 표현이고 비행시간은 여전히 `거리 / (속도 × 배속)`이다.
+- 출발점과 착탄점을 **같이** 올리므로 거리와 비행시간은 변하지 않는다. 임팩트 시점도 그대로다.
 - 투사체가 없는 행에 값을 넣으면 아무 일도 일어나지 않으므로 Validator가
-  `PROJECTILE_ARC_WITHOUT_PROJECTILE`로 거절한다.
-- **현재 이 값을 쓰는 스킬은 없다.** 투사체 9종이 모두 `0`(직선)이다. `arrow_stream`이
-  한동안 `0.2`로 곡사였지만, 연발로 바꾸면서 곧게 뻗는 연사가 더 맞는다고 판단해 직선으로
-  되돌렸다. 기능은 남겨 두었으니 곡사가 필요한 스킬이 생기면 값만 채우면 된다.
-- `SkillProjectileComponent`는 이 때문에 `Translate` 누적이 아니라 **매 프레임 절대 위치를
-  계산**한다. 직선도 같은 식을 쓰므로 경로 코드가 하나로 유지된다.
+  `PROJECTILE_HEIGHT_WITHOUT_PROJECTILE`로 거절한다.
+- 현재 사용하는 스킬은 `arrow_stream`(`0.5`) 하나다. 나머지 8종은 `0`이라 예전 그대로 셀
+  높이에서 날아간다 — 필요해지면 그 행만 채우면 된다.
+
+> 한때 `ProjectileArcHeight`로 포물선 곡사와 궤적 접선 회전을 지원했으나, 폭풍의 시를 직선
+> 연사로 확정하면서 **쓰는 스킬이 하나도 남지 않아 걷어냈다.** 다시 필요해지면 이력에서
+> 꺼내 쓴다 — 곡선은 `h·27/4·t·(1-t)²`(착탄 기울기 0)였고 회전은 그 도함수로 각도를 구해
+> 왼쪽 기준 `180°`를 뺀 뒤 `(-180, 180]`으로 정규화하는 방식이었다.
 
 #### 연발 (ProjectileCount / ProjectileInterval)
 
@@ -455,20 +445,9 @@ y = lerp(startY, targetY, t) + ArcHeight * 27/4 * t * (1 - t)^2
   지운다. 마지막 하나만 지우면 대체된 시전이 다음 액션까지 화살을 계속 뱉는다.
 - 현재 사용하는 스킬은 `arrow_stream`(4발 / 0.06초) 하나다. 나머지 8종은 `1` / `0`이다.
 
-#### 화살 방향 (접선 회전)
-
-`ArcHeight > 0`인 투사체는 매 프레임 **궤적의 접선 방향으로 회전**한다
-(`TransformComponent.ZRotation`). 올라갈 때 고개를 들고 착탄할 때 수평이 된다.
-
-- 기울기는 `ArcOffset`의 도함수 `h · 27/4 · (1-t)(1-3t)`에서 얻는다. `t=1/3`(정점)과
-  `t=1`(착탄)에서 0이 된다.
-- 원본 아트가 **왼쪽을 향하므로**(§4.5 투사체 아트 규칙), `FlipX`가 꺼진 상태의 기준 각도는
-  `180°`다. 그래서 접선 각도에서 `180°`를 뺀 값을 회전으로 쓴다.
-- 각도는 `(-180, 180]`으로 정규화한다. 정규화하지 않으면 `-355°`처럼 누적된 값이 인스펙터와
-  로그에 남아 의도한 작은 기울기와 대조하기 어렵다.
-- **직선 투사체는 회전하지 않는다.** 접선이 항상 수평이라 계산할 이유가 없고, 기존 연출을
-  건드리지 않기 위해 `ArcHeight > 0`일 때만 적용한다. 따라서 모든 투사체가 직선인 현재는
-  이 회전도 실제로는 동작하지 않는다 — 곡사를 쓰는 스킬이 생기면 함께 살아난다.
+`SkillProjectileComponent`는 `Translate` 누적이 아니라 **매 프레임 직선 위의 절대 위치를
+계산**한다. 프레임마다 이동량을 더하면 긴 비행에서 오차가 쌓이기 때문이다. 투사체는 회전하지
+않는다 — 전부 직선이라 아트가 향한 방향이 곧 진행 방향이다.
 
 `ProjectileScale`은 클립 원본 픽셀 크기를 셀 간격(1.12 월드 유닛 = 112px)에 맞춘 값이다.
 예: 피어싱 `ball`은 285px이라 배율 1이면 2.5칸을 덮으므로 0.55로 줄여 약 1.4칸에 맞춘다.
@@ -1252,7 +1231,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | WEAPON_RUID_MISSING | WeaponDefinitions의 WeaponRuid가 비어 있음 | O |
 | WEAPON_DISABLED | 활성 스킬이 Enabled=false인 무기를 참조 | O |
 | SUB_WEAPON_ON_TWO_HANDED | EquipSlot=TWO_HANDED인 무기에 SubWeaponRuid를 지정 (§4.4) | O |
-| PROJECTILE_ARC_WITHOUT_PROJECTILE | ProjectileRuid가 비어 있는데 ProjectileArcHeight가 0 초과 (§4.5) | O |
+| PROJECTILE_HEIGHT_WITHOUT_PROJECTILE | ProjectileRuid가 비어 있는데 ProjectileHeight가 0 초과 (§4.5) | O |
 | INVALID_PROJECTILE_COUNT | ProjectileRuid가 있는데 ProjectileCount가 1 미만 (§4.5) | O |
 | PROJECTILE_VOLLEY_WITHOUT_INTERVAL | ProjectileCount가 2 이상인데 ProjectileInterval이 0 이하 (§4.5) | O |
 | PROJECTILE_VOLLEY_WITHOUT_PROJECTILE | ProjectileRuid가 비어 있는데 연발 컬럼이 채워짐 (§4.5) | O |

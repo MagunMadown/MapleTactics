@@ -71,12 +71,9 @@ TryQueueTile
 | `ProjectileSpeed` | number | `14` | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 |
 | `ProjectileScale` | number | `0.9` | 투사체 배율. 비우면 `1` |
 | `ProjectileLaunchDelay` | number | `0` | 발사를 늦출 초. `0`이면 시전과 동시 발사 |
-| `ProjectileArcHeight` | number | `0` | 곡사 정점 높이(월드 유닛). `0`이면 직선. 투사체가 없으면 지정 금지 |
+| `ProjectileHeight` | number | `0` | 투사체가 셀보다 위로 날 높이(월드 유닛). `0`이면 바닥을 스친다 |
 | `ProjectileCount` | integer | `1` | 한 번 시전에 날리는 투사체 수. 2 이상이면 `ProjectileInterval` 필수 |
 | `ProjectileInterval` | number | `0` | 연발 간 간격(초). 0이면 겹쳐 나가 한 발처럼 보인다 |
-
-곡사는 착탄 기울기가 0이 되는 3차 곡선이며, 화살은 궤적 접선을 따라 회전한다. 공식과
-아트 방향 규칙은 [`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.5를 본다.
 | `IconRuid` | string | 32자리 hex | 스킬 아이콘 sprite. 비우면 기본 스프라이트로 대체 |
 | `SkillTier` | integer | `1` | 스킬 정의의 정적 강화 단계. 1 이상. 아래 "스킬 강화 단계" 참조 |
 | `BaseSkillId` | string | 빈 문자열 | 이 스킬이 강화되어 나온 원본 `SkillId`. 1단계는 비우고 2단계부터 필수 |
@@ -304,7 +301,7 @@ Motion Profile Repository를 공통 계약으로 확장한다.
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_SPEED` | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 |
 | `CONTENT_VALIDATION_FAILED` | `PROJECTILE_ON_SELF_TARGETING` | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_LAUNCH_DELAY` | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 |
-| `CONTENT_VALIDATION_FAILED` | `PROJECTILE_ARC_WITHOUT_PROJECTILE` | ProjectileRuid가 비어 있는데 ProjectileArcHeight가 0 초과 |
+| `CONTENT_VALIDATION_FAILED` | `PROJECTILE_HEIGHT_WITHOUT_PROJECTILE` | ProjectileRuid가 비어 있는데 ProjectileHeight가 0 초과 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_COUNT` | ProjectileRuid가 있는데 ProjectileCount가 1 미만 |
 | `CONTENT_VALIDATION_FAILED` | `PROJECTILE_VOLLEY_WITHOUT_INTERVAL` | ProjectileCount가 2 이상인데 ProjectileInterval이 0 이하 |
 | `CONTENT_VALIDATION_FAILED` | `PROJECTILE_VOLLEY_WITHOUT_PROJECTILE` | ProjectileRuid가 비어 있는데 연발 컬럼이 채워짐 |
