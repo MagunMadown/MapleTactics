@@ -479,6 +479,20 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 부모는 `GetSkillDefinition`으로 **읽기만** 하고 다시 검증하지는 않는다. 3단계 체인에서
 검증이 재귀로 빠지는 것을 막기 위해서다.
 
+#### 시작 스킬은 1단계만
+
+런은 항상 기본형으로 시작한다. 상위 단계는 런 도중에 얻는 것이지 처음부터 쥐여주지 않는다.
+`JobContentValidatorLogic.ValidateBundle`이 `JobStartingSkillEntries`의 각 항목을 검사해
+`SkillTier ~= 1`이면 `STARTING_SKILL_NOT_TIER_1`로 거절한다.
+
+시작 스킬은 §4.1 `StartingSkillSetId` → `JobStartingSkillEntries` 경로로만 지급되며
+(`PlayerRunStateComponent.ApplyJob` → `PlayerRunInventoryComponent.InitializeStartingSkills`),
+직업 카탈로그(`GetJobSkillDefinitions`)를 거치지 않는다. 즉 2단계 행이 늘어나도 시작 스킬에는
+섞이지 않는다. 이 검증 규칙은 그 성질을 **데이터 우연이 아니라 계약으로** 고정해 둔 것이다.
+
+> 실제 지급 개수는 `PlayerRunStateComponent.StartingSkillSlotCount`(현재 `2`)로 잘린다.
+> 그래서 시작 슬롯이 3행인 직업도 앞의 2개만 들고 시작한다. 단계와는 무관한 별개 제한이다.
+
 #### 현재 상태
 
 플레이어 스킬은 1단계 18행 + 2단계 16행 = 34행이고, 적 전용 3행은 모두 1단계다.
@@ -1170,6 +1184,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | BASE_SKILL_NOT_FOUND | BaseSkillId가 어느 스킬 테이블에도 없음 | O |
 | BASE_SKILL_TIER_MISMATCH | BaseSkillId가 가리키는 스킬의 SkillTier가 자신보다 정확히 1 작지 않음 | O |
 | BASE_SKILL_JOB_MISMATCH | BaseSkillId가 가리키는 스킬의 RequiredJobTag가 자신과 다름 | O |
+| STARTING_SKILL_NOT_TIER_1 | JobStartingSkillEntries가 SkillTier≠1인 스킬을 참조 (§4.7) | O |
 
 로그 예시:
 
