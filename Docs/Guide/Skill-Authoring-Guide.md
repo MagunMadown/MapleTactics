@@ -173,6 +173,11 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 - 적 스킬은 강화 대상이 아니지만 `ConvertSkillRow`가 모든 스킬 테이블에 공용이라 스키마를
   맞추기 위해 같은 두 컬럼을 갖는다. 전부 `SkillTier=1`, `BaseSkillId` 비움이다.
 
+현재 올라간 2단계 16행은 **전투 형태(타기팅·사거리·쿨다운·모션·무기·ActionDuration)를
+원본에서 그대로 물려받고 피해만 +2** 한 구성이다. 이펙트와 아이콘은 그 스킬 자기 리소스
+팩에서만 가져온다. 자세한 규칙과 예외는
+[`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.7에 있다.
+
 > ⚠️ **강화 스테이지가 UI에 보내는 "레벨"과 다른 값이다.** 그쪽(`UpgradeSkillStageLogic`의
 > `skillLevels`)은 `PlayerRunInventoryComponent.OwnedAmount` — 같은 스킬을 런 중에 중첩
 > 획득한 누적 수치이고 런이 끝나면 사라진다. `SkillTier`는 데이터 고정값이라 런과 무관하다.
@@ -311,9 +316,10 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 
 ## Dataset 상태
 
-플레이어 스킬 18행(직업별 5개 테이블), 적 전용 3행, Effect Step 23행, 무기 12행이
-실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은 5행이고, 21행 전부
-`SkillTier=1`(2단계 행 없음)이다. `AllowPrototypeCompatibilityFallback=false`이며 production
+플레이어 스킬 34행(직업별 5개 테이블 — 1단계 18행 + 2단계 16행), 적 전용 3행,
+Effect Step 41행, 무기 12행이 실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은
+9행이다. `thunder_bolt`와 `heal`만 아직 상위 단계가 없다.
+`AllowPrototypeCompatibilityFallback=false`이며 production
 Skill 하드코딩을 다시 추가하지 않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를
 복제하지 않는다.
 

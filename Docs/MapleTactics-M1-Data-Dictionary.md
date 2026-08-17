@@ -146,16 +146,19 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 스킬 행은 **같은 열 스키마를 가진 7개 테이블**에 나뉘어 있다. 각각
 `RootDesk/MyDesk/03_Data/`에 `.userdataset`+`.csv` 쌍으로 존재한다.
 
-| 구분 | 테이블 이름 (runtime name) | 수록 SkillId |
+| 구분 | 테이블 이름 (runtime name) | 수록 SkillId (1단계 / 2단계) |
 |---|---|---|
 | 공용 | `SkillDefinitions` | (없음 — 헤더만) |
 | 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
-| 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling` |
-| 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
-| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge` |
-| 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` |
-| 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` |
-| 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack` |
+| 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
+| 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge` / `enhanced_piercing`, `arrow_platter`, `cardinal_discharge_ii` |
+| 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` / `triple_throw`, `edge_carnival`, `bloody_storm` |
+| 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
+| 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
+
+2단계 스킬의 원본 연결은 §4.7 `BaseSkillId`가 소유한다. `thunder_bolt`와 `heal`은
+아직 2단계가 없다.
 
 공용 `SkillDefinitions`는 현재 **행이 하나도 없다**. 이전의 범용 프로토타입 타일
 (`basic_slash`, `quick_slash`, `heavy_slash`, `push`, `slash_push_combo`, `prototype_*`,
@@ -342,15 +345,25 @@ SkillDefinition.ProjectileRuid
 `SkillProjectileComponent`는 `.model`에 넣지 않고 스폰 직후 `AddComponent`로 붙인다.
 `.codeblock`이 없을 때 모델의 스크립트 컴포넌트가 조용히 누락되는 경로를 피하기 위해서다.
 
-현재 투사체를 쓰는 스킬 5종이다.
+현재 투사체를 쓰는 스킬 9종이다.
 
-| SkillId | 직업 | 투사체 출처 | Speed | Scale | LaunchDelay |
-|---|---|---|:--:|:--:|:--:|
-| `piercing` | 궁수 | 피어싱 팩 `ball` | 14 | 0.55 | 0 |
-| `arrow_bomb` | 궁수 | 바람의 시 팩 `ball` | 14 | 0.9 | 0 |
-| `flame_orb` | 마법사 | 플레임 오브 팩 `ball` | 12 | 0.7 | 0 |
-| `poison_breath` | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
-| `slug_shot` | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
+| SkillId | 단계 | 직업 | 투사체 출처 | Speed | Scale | LaunchDelay |
+|---|:--:|---|---|:--:|:--:|:--:|
+| `piercing` | 1 | 궁수 | 피어싱 팩 `ball` | 14 | 0.55 | 0 |
+| `arrow_bomb` | 1 | 궁수 | 바람의 시 팩 `ball` | 14 | 0.9 | 0 |
+| `flame_orb` | 1 | 마법사 | 플레임 오브 팩 `ball` | 12 | 0.7 | 0 |
+| `poison_breath` | 1 | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
+| `slug_shot` | 1 | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
+| `enhanced_piercing` | 2 | 궁수 | 인핸스 피어싱 팩 `shootobj/layerList/b1` | 14 | 0.5 | 0 |
+| `arrow_platter` | 2 | 궁수 | 애로우 플래터 팩 `ball` | 14 | 0.85 | 0 |
+| `triple_throw` | 2 | 도적 | 트리플 스로우 팩 `ball` | 14 | 1.2 | 0 |
+| `cannon_spike` | 2 | 해적 | 캐논 스파이크 팩 `ball` | 16 | 0.85 | 0 |
+
+2단계 4종은 모두 **자기 팩에 실제로 날아가는 물체가 있어서** 붙였다. 반대로 상위 단계인데
+투사체가 없는 경우도 있다 — `explosion`(원본 `flame_orb`는 투사체 있음)과
+`poison_mist`(원본 `poison_breath`는 투사체 있음)는 자기 팩에 `ball`이 없어 즉발로 뒀다.
+기준은 단계가 아니라 팩 내용이다. `triple_throw`는 반대 방향으로, 원본 `shuriken_burst`에는
+없던 투사체가 자기 팩에는 있어서 새로 생겼다.
 
 `poison_breath`만 발사 지연이 있다. 플레이 확인에서 0초 동시 발사가 이르게 보인다는
 피드백을 받아 0.15 → 0.25로 두 번 조정한 결과다(배속 적용 후 0.2초). 피해도 그만큼 밀려
@@ -468,9 +481,23 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 
 #### 현재 상태
 
-플레이어 스킬 18행과 적 전용 3행이 모두 `SkillTier=1`, `BaseSkillId` 비어 있음이다.
-2단계 행은 아직 없다. 적 스킬은 강화 대상이 아니지만 `ConvertSkillRow`가 모든 스킬
-테이블에 공용이라 스키마를 맞추기 위해 같은 두 컬럼을 갖는다.
+플레이어 스킬은 1단계 18행 + 2단계 16행 = 34행이고, 적 전용 3행은 모두 1단계다.
+`thunder_bolt`와 `heal`만 아직 상위 단계가 없다. 적 스킬은 강화 대상이 아니지만
+`ConvertSkillRow`가 모든 스킬 테이블에 공용이라 스키마를 맞추기 위해 같은 두 컬럼을 갖는다.
+
+2단계 16행의 저작 규칙은 다음과 같다.
+
+- **전투 형태는 원본을 그대로 물려받는다** — `TargetingType` / `Range` / `TargetOffsets` /
+  `CooldownTurns` / `MotionProfileId` / `WeaponType` / `ActionDuration`. 상위 단계라고 사거리나
+  타격 범위를 바꾸지 않았으므로, 원본과 다르게 굴리고 싶으면 그 행만 고치면 된다.
+- **피해는 원본 +2 고정**이다. 배율이 아니라 고정값이라 원래 2였던 광역기는 4로 두 배가 되고
+  6이었던 `fatal_blow` 계열은 8로 33% 오른다. 밸런스를 만지게 되면 여기부터 본다.
+- **`PUSH`를 함께 갖던 해적 2종은 그 구성을 유지한다**(`double_barrel_shot`,
+  `screw_punch` — 피해 + 밀치기 1).
+- **이펙트·아이콘은 그 스킬 자기 리소스 팩에서만 가져온다.** 팩에 `effect`/`hit/0`가 없으면
+  같은 팩의 대체 엘리먼트를 쓴다 — `divine_charge`는 `effect/1`, `explosion`은 `special/1`,
+  `poison_mist`는 `mob`, `screw_punch`는 `hit`, `arrow_platter`는 `prepare`를 시전 이펙트로
+  쓴다. 다른 스킬 팩에서 빌려오지 않는다(§4.5 투사체 기준과 같은 원칙).
 
 > 아직 **획득 경로는 단계를 구분하지 않는다.** `GetJobSkillDefinitions`는 `RequiredJobTag`로만
 > 거르므로, 2단계 행을 넣는 순간 신규 스킬 선택(`NewSkillStageChoiceComponent`)·강화
