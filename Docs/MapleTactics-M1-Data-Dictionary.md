@@ -118,6 +118,11 @@
 | ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
 | ProjectileLaunchDelay | number | - | 발사를 늦출 초 (1배속 기준). 비우거나 `0`이면 시전과 동시 발사 |
 | IconRuid | string | - | §4.6 스킬 아이콘 sprite RUID. 비우면 표시 측에서 기본 스프라이트로 대체 |
+| CasterMotionRuid | string | - | Sprite 기반 적 시전자의 공격 animationclip RUID |
+| CasterMotionPlayRate | number | 조건부 | CasterMotionRuid 사용 시 0 초과 |
+| CasterMotionDuration | number | 조건부 | 공격 클립 유지 시간. 비우면 ActionDuration |
+| EnemyQueueTurns | integer | - | 적 공격 Tile 준비에 필요한 적 턴 수. 플레이어 스킬은 0 |
+| HudIconRuid | string | - | 적 머리 위 Queue/HUD 아이콘 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -196,7 +201,7 @@ SkillId는 예외 없이 `UNKNOWN_SKILL`이다.
 1. 그 직업의 `{Job}SkillDefinitions.csv`에 행을 추가한다 (공용 `SkillDefinitions`에는 넣지 않는다).
 2. `SkillEffectSteps.csv`에 `EffectSetId` 행을 추가한다.
 3. `JobStartingSkillEntries.csv`에 필요하면 슬롯을 추가한다.
-4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다.
+4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다. Sprite 기반 적은 `CasterMotion*`와 `EnemyQueueTurns`도 채운다.
 5. `WeaponType`을 §4.4 목록에서 고른다. 무기를 바꾸지 않는 스킬이면 비운다.
 6. 원거리 스킬이면 `ProjectileRuid`/`ProjectileSpeed`/`ProjectileScale`을 §4.5 규칙대로 채운다.
 7. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
@@ -283,7 +288,7 @@ SkillDefinition.WeaponType
 - 같은 무기를 이미 들고 있으면 재장착을 건너뛴다(`ALREADY_EQUIPPED`). 불필요한 코스튬
   재구성과 그에 따른 깜빡임을 막기 위한 것이다.
 - `TWO_HANDED`는 1H·보조무기 슬롯을 함께 쓰므로 장착 전에 두 슬롯을 모두 비운다.
-- 적 유닛에는 `CostumeManagerComponent`가 없다. 그래서 `EnemySkillDefinitions` 3행은
+- 적 유닛에는 `CostumeManagerComponent`가 없다. 그래서 `EnemySkillDefinitions` 행은
   `WeaponType`이 모두 비어 있고, 적 스킬에 값을 넣는 것은 데이터 실수다.
 - 무기는 스킬이 바꾸기 전까지 유지된다. 턴이나 전투가 끝나도 되돌리지 않는다.
 
@@ -386,8 +391,8 @@ SkillDefinition.ProjectileRuid
 
 `IconRuid`는 그 스킬 리소스 팩의 `icon` 엘리먼트다. §4.0의 `effect`(시전)·`hit`(피격),
 §4.5의 `ball`(투사체)과 같은 팩에서 나오므로 스킬 하나의 표현이 한 출처로 묶인다.
-플레이어 스킬 18행이 모두 32×32 `sprite`이며, 적 전용 3행은 비어 있다 — 적 스킬은 Codex에도
-HUD에도 표시되지 않기 때문이고, `WeaponType`을 적 행에서 비워두는 것과 같은 이유다.
+플레이어 스킬 18행은 `IconRuid`를 사용한다. 적 전용 스킬은 플레이어 Codex용 `IconRuid` 대신
+`HudIconRuid`를 사용해 적 머리 위 Queue와 전투 디버그 HUD에 표시한다.
 
 찾는 절차는 §4.5의 투사체와 같다. `CastEffectRuid`로 팩을 역추적한다:
 

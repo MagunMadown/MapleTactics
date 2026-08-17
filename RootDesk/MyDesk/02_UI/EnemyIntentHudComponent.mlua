@@ -1,0 +1,324 @@
+@Component
+script EnemyIntentHudComponent extends Component
+
+	property Entity EnemyIntentTemplate = "d5f09cd1-452c-4674-9c59-0f7a503abd7f"
+	property Entity TelegraphTemplate = "53397448-0a56-4d0f-a79d-50798e6e9e62"
+	property number RefreshInterval = 0.05
+	property number RefreshElapsed = 0
+	property integer LastPlanRevision = -1
+	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
+	property string BasicAttackIconRuid = "ad4304f4d5654158aca63c8c142d5035"
+	property string RangedAttackIconRuid = "ee74ad8d798c489d957a32cf3c375490"
+	property boolean UseStaticSkillThumbnail = true
+	property number QueueOffsetX = 0
+	property number QueueOffsetY = 112
+	property number QueueSlotSpacing = 84
+	property number SkillIconOffsetX = 0
+	property number SkillIconOffsetY = 0
+	property number SkillIconSize = 56
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self._T.EnemyViews = {}
+		self._T.TelegraphViews = {}
+		self._T.ActiveEnemyIds = {}
+		self._T.ActiveTelegraphKeys = {}
+		if self.EnemyIntentTemplate ~= nil then
+			self.EnemyIntentTemplate.Enable = false
+		end
+		if self.TelegraphTemplate ~= nil then
+			self.TelegraphTemplate.Enable = false
+		end
+		log("[EnemyIntentHUD] ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		local player = _UserService.LocalPlayer
+		local session = self:GetBattleSession(player)
+		if session == nil then
+			self:HideAllViews("NOT_IN_BATTLE")
+			return
+		end
+
+		self:UpdateViewPositions(session)
+		self.RefreshElapsed = self.RefreshElapsed + delta
+		if self.RefreshElapsed < self.RefreshInterval then
+			return
+		end
+		self.RefreshElapsed = 0
+
+		local uiState = session:GetBattleUiState()
+		if uiState == nil or uiState.Success == false then
+			self:HideAllViews("SNAPSHOT_UNAVAILABLE")
+			return
+		end
+		self:RefreshIntentViews(player.CurrentMap, session, uiState)
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetBattleSession(Entity player)
+		if isvalid(player) == false or player.CurrentMap == nil then
+			return nil
+		end
+		return player.CurrentMap:GetComponent("script.BattleSessionComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshIntentViews(Entity currentMap, any session, table uiState)
+		self._T.ActiveEnemyIds = {}
+		self._T.ActiveTelegraphKeys = {}
+		local cellOccupantCounts = {}
+		for _, intent in ipairs(uiState.EnemyIntents or {}) do
+			local enemyEntity = self:ResolveEnemyEntity(currentMap, intent)
+			if isvalid(enemyEntity) then
+				local view = self:GetOrCreateEnemyView(intent.UnitId, enemyEntity)
+				if isvalid(view) then
+					self._T.ActiveEnemyIds[intent.UnitId] = true
+					self:ApplyEnemyIntent(view, intent)
+				end
+			end
+			if intent.IsAttackReady == true then
+				for cellToken in string.gmatch(intent.TargetCells or "", "([^|]+)") do
+					local cellIndex = math.floor(tonumber(cellToken) or -1)
+					if cellIndex >= 0 then
+						cellOccupantCounts[cellIndex] = (cellOccupantCounts[cellIndex] or 0) + 1
+						self:ShowTelegraph(session, intent, cellIndex, cellOccupantCounts[cellIndex])
+					end
+				end
+			end
+		end
+		self:HideInactiveEnemyViews()
+		self:HideInactiveTelegraphs()
+		self.LastPlanRevision = uiState.EnemyPlanRevision or self.LastPlanRevision
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity ResolveEnemyEntity(Entity currentMap, table intent)
+		if isvalid(currentMap) == false then
+			return nil
+		end
+		local entityName = intent.EntityName or ""
+		if entityName == "" then
+			return nil
+		end
+		return currentMap:GetChildByName(entityName, false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetOrCreateEnemyView(string unitId, Entity enemyEntity)
+		local record = self._T.EnemyViews[unitId]
+		if record ~= nil and isvalid(record.View) then
+			record.Enemy = enemyEntity
+			return record.View
+		end
+		if isvalid(self.EnemyIntentTemplate) == false then
+			return nil
+		end
+		local view = self.EnemyIntentTemplate:Clone("EnemyIntent_" .. unitId)
+		view.Enable = true
+		self._T.EnemyViews[unitId] = { View = view, Enemy = enemyEntity }
+		return view
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyEnemyIntent(Entity view, table intent)
+		view.Enable = true
+		local queuedIds = self:SplitTokens(intent.QueuedTileIds or "")
+		local queuedIconRuids = self:SplitTokens(intent.QueuedIconRuids or "")
+		for slotIndex = 1, 3 do
+			local slot = view:GetChildByName("QueueSlot0" .. tostring(slotIndex))
+			local tileId = queuedIds[slotIndex] or ""
+			if isvalid(slot) then
+				slot.Enable = tileId ~= ""
+				slot.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, self.QueueOffsetY + (slotIndex - 1) * self.QueueSlotSpacing)
+				self:ApplyQueueSlotColor(slot, intent.State)
+				local icon = slot:GetChildByName("SkillIcon")
+				if isvalid(icon) and icon.SpriteGUIRendererComponent ~= nil and tileId ~= "" then
+					local iconRuid = queuedIconRuids[slotIndex] or ""
+					if iconRuid == "" or iconRuid == "-" then
+						iconRuid = self:GetEnemySkillFallbackIconRuid(tileId)
+					end
+					icon.UITransformComponent.anchoredPosition = Vector2(self.SkillIconOffsetX, self.SkillIconOffsetY)
+					icon.UITransformComponent.RectSize = Vector2(self.SkillIconSize, self.SkillIconSize)
+					icon.SpriteGUIRendererComponent.ImageRUID = DataRef(self:NormalizeHudIconRuid(iconRuid))
+				end
+			end
+		end
+
+		local readyBadge = view:GetChildByName("ReadyBadge")
+		local readyLabel = view:GetChildByName("ReadyLabel")
+		if isvalid(readyBadge) then
+			readyBadge.Enable = intent.IsAttackReady == true
+			readyBadge.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, self.QueueOffsetY + 54 + math.max(0, #queuedIds - 1) * self.QueueSlotSpacing)
+		end
+		if isvalid(readyLabel) then
+			readyLabel.Enable = intent.IsAttackReady == true
+			readyLabel.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, self.QueueOffsetY + 54 + math.max(0, #queuedIds - 1) * self.QueueSlotSpacing)
+		end
+		local moveArrow = view:GetChildByName("MoveArrow")
+		if isvalid(moveArrow) and moveArrow.TextGUIRendererComponent ~= nil then
+			local marker = self:GetMovementMarker(intent)
+			moveArrow.Enable = marker ~= ""
+			moveArrow.TextGUIRendererComponent.Text = marker
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyQueueSlotColor(Entity slot, string state)
+		local background = slot:GetChildByName("Background")
+		if isvalid(background) == false or background.SpriteGUIRendererComponent == nil then
+			return
+		end
+		if state == "INSERTING" then
+			background.SpriteGUIRendererComponent.Color = Color(0.38, 0.43, 0.50, 0.92)
+		elseif state == "TRACKING" then
+			background.SpriteGUIRendererComponent.Color = Color(0.92, 0.66, 0.26, 1)
+		elseif state == "ATTACK_READY" then
+			background.SpriteGUIRendererComponent.Color = Color(0.88, 0.16, 0.14, 1)
+		elseif state == "EXECUTING" then
+			background.SpriteGUIRendererComponent.Color = Color(0.95, 0.88, 0.42, 1)
+		else
+			background.SpriteGUIRendererComponent.Color = Color(0.20, 0.24, 0.29, 0.92)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetEnemySkillFallbackIconRuid(string tileId)
+		if tileId == "enemy_basic_attack" or tileId == "boss_sweeping_strike" then
+			return self.BasicAttackIconRuid
+		elseif tileId == "enemy_ranged_shot" then
+			return self.RangedAttackIconRuid
+		end
+		return self.DefaultSkillIconRuid
+	end
+
+	@ExecSpace("ClientOnly")
+	method string NormalizeHudIconRuid(string iconRuid)
+		local normalized = iconRuid or ""
+		if normalized == "" then
+			normalized = self.DefaultSkillIconRuid
+		end
+		if self.UseStaticSkillThumbnail == true and string.sub(normalized, 1, 12) ~= "thumbnail://" then
+			return "thumbnail://" .. normalized
+		end
+		return normalized
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetMovementMarker(table intent)
+		if intent.State ~= "TRACKING" then
+			return ""
+		end
+		local commandType = intent.NextCommandType or ""
+		local direction = intent.NextCommandDirection or 0
+		if commandType == "MOVE_TOWARD" or commandType == "MOVE_AWAY" or commandType == "MOVE_FIXED_FACING" then
+			if direction < 0 then
+				return "◀"
+			elseif direction > 0 then
+				return "▶"
+			end
+		elseif commandType == "TURN_TO_PLAYER" then
+			if direction < 0 then
+				return "↶"
+			end
+			return "↷"
+		elseif commandType == "WAIT" then
+			return "·"
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowTelegraph(any session, table intent, integer cellIndex, integer overlapIndex)
+		local key = intent.UnitId .. ":" .. tostring(cellIndex)
+		local view = self._T.TelegraphViews[key]
+		if isvalid(view) == false then
+			if isvalid(self.TelegraphTemplate) == false then
+				return
+			end
+			view = self.TelegraphTemplate:Clone("Telegraph_" .. intent.UnitId .. "_" .. tostring(cellIndex))
+			self._T.TelegraphViews[key] = view
+		end
+		view.Enable = true
+		self._T.ActiveTelegraphKeys[key] = true
+		local cellPosition = session:GetCellPosition(cellIndex)
+		local screenPosition = _UILogic:WorldToScreenPosition(cellPosition)
+		local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
+		view.UITransformComponent.anchoredPosition = Vector2(uiPosition.x + (overlapIndex - 1) * 8, uiPosition.y - 42)
+		local label = view:GetChildByName("Label")
+		if isvalid(label) and label.TextGUIRendererComponent ~= nil then
+			label.TextGUIRendererComponent.Text = "!"
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateViewPositions(any session)
+		for _, record in pairs(self._T.EnemyViews or {}) do
+			if record ~= nil and isvalid(record.View) and isvalid(record.Enemy) and record.Enemy.TransformComponent ~= nil then
+				local worldPosition = record.Enemy.TransformComponent.WorldPosition
+				local screenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y))
+				local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
+				record.View.UITransformComponent.anchoredPosition = uiPosition
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method table SplitTokens(string serialized)
+		local tokens = {}
+		for token in string.gmatch(serialized or "", "([^|]+)") do
+			table.insert(tokens, token)
+		end
+		return tokens
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideInactiveEnemyViews()
+		for unitId, record in pairs(self._T.EnemyViews or {}) do
+			if record ~= nil and isvalid(record.View) then
+				record.View.Enable = self._T.ActiveEnemyIds[unitId] == true
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideInactiveTelegraphs()
+		for key, view in pairs(self._T.TelegraphViews or {}) do
+			if isvalid(view) then
+				view.Enable = self._T.ActiveTelegraphKeys[key] == true
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideAllViews(string reason)
+		for _, record in pairs(self._T.EnemyViews or {}) do
+			if record ~= nil and isvalid(record.View) then
+				record.View.Enable = false
+			end
+		end
+		for _, view in pairs(self._T.TelegraphViews or {}) do
+			if isvalid(view) then
+				view.Enable = false
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		for _, record in pairs(self._T.EnemyViews or {}) do
+			if record ~= nil and isvalid(record.View) then
+				record.View:Destroy()
+			end
+		end
+		for _, view in pairs(self._T.TelegraphViews or {}) do
+			if isvalid(view) then
+				view:Destroy()
+			end
+		end
+		self._T.EnemyViews = {}
+		self._T.TelegraphViews = {}
+	end
+
+end
