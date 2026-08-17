@@ -118,6 +118,8 @@
 | ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
 | ProjectileLaunchDelay | number | - | 발사를 늦출 초 (1배속 기준). 비우거나 `0`이면 시전과 동시 발사 |
 | ProjectileArcHeight | number | - | 투사체 포물선의 정점 높이(월드 유닛). `0`이면 직선. §4.5 참조 |
+| ProjectileCount | integer | - | 한 번 시전에 날리는 투사체 수. 1 이상, 기본 `1`. §4.5 참조 |
+| ProjectileInterval | number | 조건부 | 연발 간 간격(초, 1배속 기준). `ProjectileCount`가 2 이상이면 0 초과 필수 |
 | IconRuid | string | - | §4.6 스킬 아이콘 sprite RUID. 비우면 표시 측에서 기본 스프라이트로 대체 |
 | SkillTier | integer | O | §4.7 스킬 정의의 정적 강화 단계. 1 이상, 기본 `1` |
 | BaseSkillId | string | 조건부 | §4.7 이 스킬이 강화되어 나온 원본 SkillId. 1단계는 비우고 2단계부터 필수 |
@@ -431,6 +433,26 @@ y = lerp(startY, targetY, t) + ArcHeight * 27/4 * t * (1 - t)^2
   곡사가 맞는다. 나머지 8종은 `0`(직선)이다.
 - `SkillProjectileComponent`는 이 때문에 `Translate` 누적이 아니라 **매 프레임 절대 위치를
   계산**한다. 직선도 같은 식을 쓰므로 경로 코드가 하나로 유지된다.
+
+#### 연발 (ProjectileCount / ProjectileInterval)
+
+`ProjectileCount`를 2 이상으로 두면 **같은 경로로 같은 투사체를 여러 번** 쏜다. 조준 셀·속도·
+배율·곡선은 모두 공유하고, `ProjectileInterval`(초, 1배속 기준)만큼 시차를 두고 발사한다.
+
+- **간격이 0이면 전부 같은 프레임에 겹쳐 나가 한 발처럼 보인다.** 그래서 `ProjectileCount`가
+  2 이상인데 간격이 없으면 Validator가 `PROJECTILE_VOLLEY_WITHOUT_INTERVAL`로 거절한다.
+  투사체가 없는 행에 연발 값을 넣으면 `PROJECTILE_VOLLEY_WITHOUT_PROJECTILE`이다.
+- 간격은 다른 저작 시간값과 마찬가지로 **배속으로 나눈다.** `0.06`은 배속 1.25에서 `0.048`이
+  되어 연사가 배속에 맞춰 촘촘해진다.
+- **임팩트는 마지막 화살이 도착할 때 해결된다** — 아직 화살이 날아가는 중에 피해가 들어가면
+  어색하기 때문이다. 총 지연은 `발사지연 + 간격 × (발수-1) + 비행시간`이다. 큐 슬롯 길이
+  계산(`GetSkillActionDuration`)도 같은 식으로 연발 구간을 포함한다.
+- **피해는 발수와 무관하게 Effect Step이 한 번 해결한다.** 연발은 순수 표현이므로 4발을
+  쏘아도 피해는 그 스킬의 Effect Step 값 그대로 한 번이다. 발수만큼 때리고 싶으면 Effect
+  Step을 늘리는 것이지 이 컬럼이 하는 일이 아니다.
+- 취소 처리도 발수만큼 필요하다. `ClearSkillImpactTimers`는 예약된 **모든** 발사 타이머를
+  지운다. 마지막 하나만 지우면 대체된 시전이 다음 액션까지 화살을 계속 뱉는다.
+- 현재 사용하는 스킬은 `arrow_stream`(4발 / 0.06초) 하나다. 나머지 8종은 `1` / `0`이다.
 
 #### 화살 방향 (접선 회전)
 
@@ -1229,6 +1251,9 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | WEAPON_DISABLED | 활성 스킬이 Enabled=false인 무기를 참조 | O |
 | SUB_WEAPON_ON_TWO_HANDED | EquipSlot=TWO_HANDED인 무기에 SubWeaponRuid를 지정 (§4.4) | O |
 | PROJECTILE_ARC_WITHOUT_PROJECTILE | ProjectileRuid가 비어 있는데 ProjectileArcHeight가 0 초과 (§4.5) | O |
+| INVALID_PROJECTILE_COUNT | ProjectileRuid가 있는데 ProjectileCount가 1 미만 (§4.5) | O |
+| PROJECTILE_VOLLEY_WITHOUT_INTERVAL | ProjectileCount가 2 이상인데 ProjectileInterval이 0 이하 (§4.5) | O |
+| PROJECTILE_VOLLEY_WITHOUT_PROJECTILE | ProjectileRuid가 비어 있는데 연발 컬럼이 채워짐 (§4.5) | O |
 | INVALID_PROJECTILE_SPEED | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 | O |
 | PROJECTILE_ON_SELF_TARGETING | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 | O |
 | INVALID_PROJECTILE_LAUNCH_DELAY | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 | O |

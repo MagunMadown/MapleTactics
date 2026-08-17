@@ -72,6 +72,8 @@ TryQueueTile
 | `ProjectileScale` | number | `0.9` | 투사체 배율. 비우면 `1` |
 | `ProjectileLaunchDelay` | number | `0` | 발사를 늦출 초. `0`이면 시전과 동시 발사 |
 | `ProjectileArcHeight` | number | `0` | 곡사 정점 높이(월드 유닛). `0`이면 직선. 투사체가 없으면 지정 금지 |
+| `ProjectileCount` | integer | `1` | 한 번 시전에 날리는 투사체 수. 2 이상이면 `ProjectileInterval` 필수 |
+| `ProjectileInterval` | number | `0` | 연발 간 간격(초). 0이면 겹쳐 나가 한 발처럼 보인다 |
 
 곡사는 착탄 기울기가 0이 되는 3차 곡선이며, 화살은 궤적 접선을 따라 회전한다. 공식과
 아트 방향 규칙은 [`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.5를 본다.
@@ -303,6 +305,9 @@ Motion Profile Repository를 공통 계약으로 확장한다.
 | `CONTENT_VALIDATION_FAILED` | `PROJECTILE_ON_SELF_TARGETING` | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_LAUNCH_DELAY` | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 |
 | `CONTENT_VALIDATION_FAILED` | `PROJECTILE_ARC_WITHOUT_PROJECTILE` | ProjectileRuid가 비어 있는데 ProjectileArcHeight가 0 초과 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_COUNT` | ProjectileRuid가 있는데 ProjectileCount가 1 미만 |
+| `CONTENT_VALIDATION_FAILED` | `PROJECTILE_VOLLEY_WITHOUT_INTERVAL` | ProjectileCount가 2 이상인데 ProjectileInterval이 0 이하 |
+| `CONTENT_VALIDATION_FAILED` | `PROJECTILE_VOLLEY_WITHOUT_PROJECTILE` | ProjectileRuid가 비어 있는데 연발 컬럼이 채워짐 |
 | `CONTENT_VALIDATION_FAILED` | `SUB_WEAPON_ON_TWO_HANDED` | EquipSlot=TWO_HANDED인 무기에 SubWeaponRuid를 지정 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_TIER` | SkillTier가 없거나 1 미만 |
 | `CONTENT_VALIDATION_FAILED` | `TIER_1_BASE_SKILL_PRESENT` | SkillTier=1인데 BaseSkillId가 채워져 있음 |

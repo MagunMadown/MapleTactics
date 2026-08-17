@@ -148,7 +148,6 @@ script BattleSessionComponent extends Component
 	property any DropRuntime = nil
 	property integer ActionTimerId = 0
 	property integer ImpactTimerId = 0
-	property integer ProjectileTimerId = 0
 	property integer ProjectileSpawnCount = 0
 	property string ProjectileModelId = "skillprojectile"
 	property integer ProjectileOrderInLayer = 25
@@ -2202,7 +2201,9 @@ script BattleSessionComponent extends Component
 		-- because the target is not known until the shot is scheduled.
 		local launchDelay = self:GetProjectileLaunchDelay(definition)
 		local worstFlight = (definition.Range * self.CellSpacing) / (definition.ProjectileSpeed * speed)
-		local minimumDuration = launchDelay + worstFlight
+		-- A volley finishes on its last shot, so the slot has to cover the whole stream, not one arrow.
+		local volleySpan = math.max(0, definition.ProjectileInterval or 0) / speed * (math.max(1, definition.ProjectileCount or 1) - 1)
+		local minimumDuration = launchDelay + volleySpan + worstFlight
 		return math.max(0.1, authored, minimumDuration)
 	end
 
@@ -3353,10 +3354,17 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ImpactTimerId)
 			self.ImpactTimerId = 0
 		end
-		if self.ProjectileTimerId > 0 then
-			_TimerService:ClearTimer(self.ProjectileTimerId)
-			self.ProjectileTimerId = 0
+		-- A volley schedules one timer per shot, so every pending launch has to be dropped — not just
+		-- the most recent one, or the superseded cast keeps firing arrows into the next action.
+		local pendingShots = self._T.projectileTimerIds
+		if pendingShots ~= nil then
+			for _, timerId in ipairs(pendingShots) do
+				if timerId > 0 then
+					_TimerService:ClearTimer(timerId)
+				end
+			end
 		end
+		self._T.projectileTimerIds = {}
 	end
 
 	method number GetProjectileLaunchDelay(table definition)
@@ -3439,22 +3447,33 @@ script BattleSessionComponent extends Component
 		local projectileScale = definition.ProjectileScale or 1
 		local projectileArcHeight = definition.ProjectileArcHeight or 0
 		local flipX = sourceUnit.Facing == "Right"
-		self.ProjectileSpawnCount = self.ProjectileSpawnCount + 1
-		local projectileName = "SkillProjectile_" .. tostring(self.ProjectileSpawnCount)
 
-		local spawnProjectile = function()
-			self.ProjectileTimerId = 0
-			self:SpawnSkillProjectile(skillId, projectileName, startPosition, targetPosition, speed, projectileRuid, projectileScale, flipX, projectileArcHeight)
-		end
-		if launchDelay <= 0 then
-			spawnProjectile()
-		else
-			self.ProjectileTimerId = _TimerService:SetTimerOnce(spawnProjectile, launchDelay)
+		-- A volley sends the same shot down the same path several times, spaced out in time. The gap is
+		-- scaled like every other authored duration so the stream tightens with the battle speed.
+		local shotCount = math.max(1, definition.ProjectileCount or 1)
+		local interval = math.max(0, definition.ProjectileInterval or 0) / self:GetSkillSpeedMultiplier()
+
+		self._T.projectileTimerIds = {}
+		for shotIndex = 0, shotCount - 1 do
+			self.ProjectileSpawnCount = self.ProjectileSpawnCount + 1
+			local projectileName = "SkillProjectile_" .. tostring(self.ProjectileSpawnCount)
+			local shotDelay = launchDelay + interval * shotIndex
+			local spawnProjectile = function()
+				self:SpawnSkillProjectile(skillId, projectileName, startPosition, targetPosition, speed, projectileRuid, projectileScale, flipX, projectileArcHeight)
+			end
+			if shotDelay <= 0 then
+				spawnProjectile()
+			else
+				table.insert(self._T.projectileTimerIds, _TimerService:SetTimerOnce(spawnProjectile, shotDelay))
+			end
 		end
 
+		-- The impact waits for the *last* arrow, so the damage never lands while shots are still in the
+		-- air. A single shot reduces to the original "flight time" answer.
 		local flightSeconds = distance / speed
-		log("[SkillProjectile] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " fromCell=" .. sourceUnit.CellIndex .. " aimCell=" .. aimCell .. " distance=" .. distance .. " speed=" .. speed .. " flight=" .. flightSeconds .. " launchDelay=" .. launchDelay)
-		return flightSeconds
+		local lastArrival = interval * (shotCount - 1) + flightSeconds
+		log("[SkillProjectile] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " fromCell=" .. sourceUnit.CellIndex .. " aimCell=" .. aimCell .. " distance=" .. distance .. " speed=" .. speed .. " flight=" .. flightSeconds .. " shots=" .. shotCount .. " interval=" .. interval .. " lastArrival=" .. lastArrival .. " launchDelay=" .. launchDelay)
+		return lastArrival
 	end
 
 	@ExecSpace("ServerOnly")
