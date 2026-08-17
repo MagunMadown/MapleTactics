@@ -46,6 +46,8 @@ UI는 Pattern 조건이나 Trait 결과를 다시 계산하지 않는다. `Prepa
 EnemyDefinitionId,...,TraitIds,IsBoss
 guard_mushroom,...,HEAVY,false
 elite_swordsman,...,QUICK|DOUBLE_STRIKE,false
+aggressive_swordsman,...,AGGRO,false
+ranged_turret,...,HOLD_POSITION,false
 ```
 
 지원 ID:
@@ -57,8 +59,10 @@ elite_swordsman,...,QUICK|DOUBLE_STRIKE,false
 | `DOUBLE_STRIKE` | `EXECUTE_TILE` 계획을 동일 타일 2회 Queue로 장식한다. Pattern Step은 Queue 전체 뒤 한 번만 진행한다. |
 | `EXPLOSIVE` | ID와 Validator 예약 완료. 사망 효과 Executor는 후속 구현 대상이다. |
 | `REACTIVE_SHIELD` | ID와 Validator 예약 완료. 피격 반응 Executor는 후속 구현 대상이다. |
+| `AGGRO` | 일반 적의 기본 공격 후 후퇴를 1칸 접근으로 바꾼다. |
+| `HOLD_POSITION` | 공격 후 이동을 생략한다. `AGGRO`와 함께 쓸 수 없다. |
 
-알 수 없는 ID나 중복 ID는 `StageWaveRepositoryLogic`에서 적 정의를 거부한다.
+Trait가 없는 일반 적은 `EXECUTE_TILE` 뒤 1칸 후퇴를 예약하지만 같은 적 턴에 즉시 움직이지 않는다. 플레이어가 다음 행동을 마친 뒤 돌아오는 적 턴에 `MOVE_AWAY`를 실행하며, 방향은 그 실행 시점의 플레이어 위치로 계산한다. `AGGRO`는 같은 타이밍에 `MOVE_TOWARD`, `HOLD_POSITION`은 이동 없음으로 처리한다. 보스는 이 공통 후처리에서 제외하고 Pattern에 이동을 명시한다. 알 수 없는 ID, 중복 ID, `AGGRO|HOLD_POSITION` 충돌 조합은 `StageWaveRepositoryLogic`에서 적 정의를 거부한다.
 
 ## 4. 새 Trait 개발 규칙
 
@@ -76,6 +80,10 @@ elite_swordsman,...,QUICK|DOUBLE_STRIKE,false
 - 첫 적 이동 뒤 두 번째 적의 `PatternId`, `StepIndex`, `CommandType`이 다시 선택되지 않는다.
 - `HEAVY` 적 밀치기가 `PUSH_BLOCKED_HEAVY_TRAIT`로 종료되고 Cell이 유지된다.
 - `DOUBLE_STRIKE`는 `ActionCount=2`, `CurrentActionIndex=1→2`로 실행된다.
+- Trait가 없는 일반 적은 `적 공격 → 플레이어 행동 → 다음 적 턴 MOVE_AWAY` 순서로 실행된다.
+- `AGGRO` 일반 적은 다음 적 턴에 `MOVE_TOWARD`, `HOLD_POSITION` 적은 공격만 실행한다.
+- 공격 직후 Plan은 `DeferredUntilTurn`이 현재 턴보다 크며, 같은 적 라운드에서는 선택되지 않는다. 다음 플레이어 턴 HUD는 예약된 이동을 읽기 전용으로 미리 표시할 수 있다.
+- 보스의 명시적 `MOVE_AWAY`와 일반 적 공통 후퇴가 중복되지 않는다.
 - 공격 계획은 `INSERTING 0/1 → TRACKING 1/1 → ATTACK_READY → EXECUTING`으로 전환된다.
 - `INSERTING 0/1`은 아직 실제 Queue가 아니므로 `QueuedTileIds/QueuedIconRuids`는 비어 있다. 첫 적 행동으로 `TRACKING 1/1`이 된 뒤부터 머리 위 Queue에 표시한다.
 - `TRACKING`은 보유 Tile을 유지한 채 `TURN_TO_PLAYER` 또는 `MOVE_TOWARD`를 실행하고 Pattern Step은 전진시키지 않는다.

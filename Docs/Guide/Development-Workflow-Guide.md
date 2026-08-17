@@ -83,6 +83,7 @@
 | 완료 | `TELEGRAPH_TILE` Action | 적별 Runner 카운트다운, 취소 시 미소비, TileId/남은 턴 PreparedIntent 고정 | `prototype_telegraph`의 `2→1→EXECUTE_TILE` 전이와 UI DTO 남은 턴 검증 |
 | 완료 | `MOVE_AWAY` Action | 플레이어 반대 방향 계산, 원자적 Facing·이동, 막힘 시 상태 유지, `prototype_retreat` | Cell `3→4`, Facing `Left→Right`, 점유 실패 시 상태 유지와 Runner `1→2`, 기존 Stage PlayerTurn 2 복귀, 빌드·런타임 Warning/Error 0건 검증 완료 |
 | 완료 | `CELL_FREE` Condition | 네 Selector의 BoardState 점유 Snapshot과 실행 시 TryMove 재검사 | Selector 등록/미등록 값 거부, 빈칸/점유/경계, 명시적 WAIT, 준비 후 점유 변경 `3→4`, 정상 두 적 전투, 빌드·런타임 Warning/Error 0건 검증 완료 |
+| 완료 | 머쉬맘 반대편 점프 패턴 | 예고 실행 후 한 플레이어 턴 동안 공중 상태, 반대편 착지와 중앙 우선 겹침 해소 | Phase 1·2 패턴 검증, 공중 타깃 제외, 겹침 `0→1`, 페이즈 교체 착지 복구, HUD DTO와 착지 후 `WAIT` 전이를 Maker에서 검증 |
 | 완료 | 적별 Pattern Runner | 적 Entity가 Current/Prepared Step을 소유하고 Resolver 실패 분기와 실행 완료·취소 전이를 연결 | 두 적 독립 상태, 성공 `3→1`·`2→1`, 실패 `1→2`, 취소 해제, Current Step 기반 Resolver, 빌드·런타임 Warning/Error 0건 검증 완료 |
 | P1 | `BattleSessionComponent`가 3,300줄 이상 | 이동·공격·Spawn 실행 조정 변경 충돌 가능성이 큼 | 행동 조정·Spawn 책임을 공개 계약 단위로 단계적 분리 |
 | 완료 | 공용 Client 전투 상태 접근 API | `GetBattleUiState()` DTO와 `RevisionKey`로 HUD의 상태 경로 반복을 제거함 | 신규 UI는 DTO만 읽고 서버 Request API만 호출 |
