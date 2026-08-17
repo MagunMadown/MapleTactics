@@ -34,6 +34,13 @@ script StageTransitionManagerLogic extends Logic
 				nextStageMap = nextStageRoute.MapId
 			end
 		end
+		if graphTransition.NextBattleStageId ~= "" then
+			local prepareResult = self:PrepareNextBattleEntry(playerEntity, graphTransition.NextBattleStageId)
+			if prepareResult.Success ~= true then
+				log_warning("[StageTransition] next battle entry prepare failed stage=" .. graphTransition.NextBattleStageId .. " reason=" .. prepareResult.Reason)
+				return
+			end
+		end
 		self:StoreNextStageMapForPlayer(playerEntity, nextStageMap)
 		log("[StageTransition] victory current=" .. clearedStageId .. " rewardNode=" .. graphTransition.RewardNodeId .. " next=" .. graphTransition.NextBattleStageId .. " nextMap=" .. nextStageMap .. " rewardMap=" .. rewardMap)
 		local targetPlayer = playerEntity
@@ -44,6 +51,40 @@ script StageTransitionManagerLogic extends Logic
 				_MapTeleportManager:TeleportPlayer(targetPlayer, targetMap, Vector3(0, 0.5, 0), "VICTORY_REWARD")
 			end
 		end, 1.5)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table PrepareNextBattleEntry(Entity playerEntity, string nextStageId)
+		-- Keeps the exact StageId across reward maps. This is required when multiple
+		-- stages reuse one physical battle map because the map name cannot identify
+		-- which dataset must be loaded on re-entry.
+		if isvalid(playerEntity) == false or nextStageId == nil or nextStageId == "" then
+			return { Success = false, Reason = "INVALID_NEXT_BATTLE_ENTRY" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil or runState.RunState ~= "Active" then
+			return { Success = false, Reason = "ACTIVE_RUN_STATE_UNAVAILABLE" }
+		end
+		local entryState = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		local characterId = ""
+		local loadoutId = ""
+		if entryState ~= nil then
+			characterId = entryState.CharacterId or ""
+			loadoutId = entryState.LoadoutId or ""
+		end
+		local result = _BattleGatewayLogic:PrepareBattleEntry(
+			playerEntity,
+			nextStageId,
+			characterId,
+			runState.SelectedJobId,
+			loadoutId,
+			runState.RunSeed,
+			"CONTINUE_RUN"
+		)
+		if result.Success == true then
+			log("[StageTransition] next battle entry prepared stage=" .. nextStageId .. " request=" .. result.RequestId)
+		end
+		return result
 	end
 
 	@ExecSpace("ServerOnly")
@@ -115,8 +156,12 @@ script StageTransitionManagerLogic extends Logic
 		-- region_01_stage_01 (region_01_stage_01 map) -> always new_skill_stage
 		-- otherwise -> 75% new_upgrade_stage, 25% new_skill_stage
 		if clearedStageId == "region_01_stage_01" then
-			log("[StageTransition] first clear reward fixed stage=" .. clearedStageId .. " -> new_skill_stage")
-			return "new_skill_stage"
+			if self:HasAtLeastUnownedJobSkills(playerEntity, 1) == true then
+				log("[StageTransition] first clear reward fixed stage=" .. clearedStageId .. " -> new_skill_stage")
+				return "new_skill_stage"
+			end
+			log("[StageTransition] first clear new skill unavailable stage=" .. clearedStageId .. " -> new_upgrade_stage")
+			return "new_upgrade_stage"
 		end
 		if self:HasAtLeastUnownedJobSkills(playerEntity, 1) == false then
 			log("[StageTransition] new skill stage skipped reason=INSUFFICIENT_UNOWNED_JOB_SKILLS stage=" .. clearedStageId .. " -> new_upgrade_stage")
@@ -137,7 +182,7 @@ script StageTransitionManagerLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method boolean HasAtLeastUnownedJobSkills(Entity playerEntity, integer requiredCount)
-		-- Prevents entry only when no new job skill remains; a single remaining skill uses one visible choice.
+		-- Counts only unowned tier-1 skills because higher tiers are reserved for the upgrade map.
 		if isvalid(playerEntity) == false then
 			return false
 		end
@@ -154,7 +199,7 @@ script StageTransitionManagerLogic extends Logic
 		local availableCount = 0
 		for _, definition in ipairs(catalog.Skills) do
 			local ownership = inventory:CanUseSkill(definition.SkillId)
-			if ownership.Success == false and ownership.Reason == "SKILL_NOT_OWNED" then
+			if definition.SkillTier == 1 and ownership.Success == false and ownership.Reason == "SKILL_NOT_OWNED" then
 				availableCount = availableCount + 1
 				if availableCount >= needed then
 					log("[StageTransition] new skill stage available job=" .. runState.SelectedJobId .. " available=" .. availableCount .. " required=" .. needed)

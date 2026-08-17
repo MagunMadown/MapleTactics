@@ -77,6 +77,11 @@ TryQueueTile
 | `IconRuid` | string | 32자리 hex | 스킬 아이콘 sprite. 비우면 기본 스프라이트로 대체 |
 | `SkillTier` | integer | `1` | 스킬 정의의 정적 강화 단계. 1 이상. 아래 "스킬 강화 단계" 참조 |
 | `BaseSkillId` | string | 빈 문자열 | 이 스킬이 강화되어 나온 원본 `SkillId`. 1단계는 비우고 2단계부터 필수 |
+| `CasterMotionRuid` | string | animationclip RUID | Sprite 기반 적 공격 모션. Avatar 플레이어는 비움 |
+| `CasterMotionPlayRate` | number | `1.6` | 적 공격 모션 배속. 모션 사용 시 0 초과 |
+| `CasterMotionDuration` | number | `0.35` | 적 공격 모션 유지 시간. 비우면 `ActionDuration` |
+| `EnemyQueueTurns` | integer | `1` | 적이 공격 Tile을 준비하는 데 소비할 적 턴 수 |
+| `HudIconRuid` | string | sprite/animationclip RUID | 적 머리 위 Queue와 전투 HUD용 아이콘 |
 
 ## WeaponType과 무기 카탈로그
 
@@ -194,11 +199,20 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 > 거르므로 2단계 행을 넣는 순간 신규 스킬 선택·강화 스테이지·도감에 그대로 노출된다.
 > 2단계 스킬을 추가할 때 게이팅을 함께 정해야 한다.
 
+## 적 공격 모션과 Queue 아이콘
+
+플레이어 스킬은 `WeaponType`·`Projectile*`·`IconRuid`와 Avatar `MotionProfileId`를 사용한다.
+Sprite 기반 적 스킬은 같은 행의 `CasterMotion*`, `EnemyQueueTurns`, `HudIconRuid`를 추가로 사용한다.
+두 필드군은 하나의 통합 스키마에 공존하며, 사용하지 않는 쪽은 빈 셀로 둔다.
+
+`EnemyIntentHudComponent`의 `QueueOffsetX/Y`, `QueueSlotSpacing`, `SkillIconOffsetX/Y`,
+`SkillIconSize`는 Maker Inspector에서 적 HUD 위치와 크기를 조절하는 공통 디자인 값이다.
+
 현재 실제 Dataset Definition은 다음과 같다.
 
 ```csv
-SchemaVersion,SkillId,DisplayName,SkillTags,TargetingType,Range,TargetOffsets,CooldownTurns,CostType,CostValue,MotionProfileId,EffectSetId,RequiredJobTag,ActionDuration,FreePlay,CastEffectRuid,HitEffectRuid,EffectScale,WeaponType,ProjectileRuid,ProjectileSpeed,ProjectileScale,ProjectileLaunchDelay,IconRuid,SkillTier,BaseSkillId
-1,brandish,브랜디쉬,attack|warrior|maple,RANGE_OFFSETS,2,1|2,1,,0,heavy_slash,brandish_effects,warrior,0.60,false,8b26a0cdb63d455e82d1ca0fddf5e139,38e9351c34b843ddbcc191c762e7464c,0.9,ONE_HANDED_SWORD,,0,1,0,429228115d56462ab0f65e7294a51609,1,
+SchemaVersion,SkillId,...,WeaponType,ProjectileRuid,ProjectileSpeed,ProjectileScale,ProjectileLaunchDelay,IconRuid,SkillTier,BaseSkillId,CasterMotionRuid,CasterMotionPlayRate,CasterMotionDuration,EnemyQueueTurns,HudIconRuid,ProjectileCount,ProjectileInterval,ProjectileHeight
+1,brandish,...,ONE_HANDED_SWORD,,0,1,0,429228115d56462ab0f65e7294a51609,1,,,,,,,1,0,0
 ```
 
 행 전체는 코드 대신 실제 CSV를 본다. 스킬은 직업별 테이블로 나뉘어 있으며 어느 파일에
@@ -313,6 +327,9 @@ Motion Profile Repository를 공통 계약으로 확장한다.
 | `CONTENT_VALIDATION_FAILED` | `BASE_SKILL_NOT_FOUND` | BaseSkillId가 어느 스킬 테이블에도 없음 |
 | `CONTENT_VALIDATION_FAILED` | `BASE_SKILL_TIER_MISMATCH` | BaseSkillId가 가리키는 스킬의 SkillTier가 자신보다 정확히 1 작지 않음 |
 | `CONTENT_VALIDATION_FAILED` | `BASE_SKILL_JOB_MISMATCH` | BaseSkillId가 가리키는 스킬의 RequiredJobTag가 자신과 다름 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_ENEMY_QUEUE_TURNS` | EnemyQueueTurns가 없거나 음수 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_CASTER_MOTION_PLAY_RATE` | 적 모션 RUID가 있는데 배속이 0 이하 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_CASTER_MOTION_DURATION` | 적 모션 RUID가 있는데 유지 시간이 0 이하 |
 | `CONTENT_VALIDATION_FAILED` | `EFFECT_STEPS_EMPTY` | 연결된 Effect Step이 하나도 없음 |
 | `CONTENT_VALIDATION_FAILED` | `UNSUPPORTED_EFFECT_SCHEMA` | Effect Step의 SchemaVersion이 스킬과 다름 |
 | `CONTENT_VALIDATION_FAILED` | `EFFECT_SET_MISMATCH` | Effect Step의 EffectSetId가 스킬 정의와 다름 |
@@ -329,8 +346,8 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 
 ## Dataset 상태
 
-플레이어 스킬 34행(직업별 5개 테이블 — 1단계 18행 + 2단계 16행), 적 전용 3행,
-Effect Step 41행, 무기 12행이 실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은
+플레이어 스킬 34행(직업별 5개 테이블 — 1단계 18행 + 2단계 16행), 적 전용 5행,
+Effect Step 44행, 무기 12행이 실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 플레이어 스킬은
 9행이다. `thunder_bolt`와 `heal`만 아직 상위 단계가 없다.
 `AllowPrototypeCompatibilityFallback=false`이며 production
 Skill 하드코딩을 다시 추가하지 않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를

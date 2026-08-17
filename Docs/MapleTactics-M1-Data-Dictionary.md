@@ -123,6 +123,11 @@
 | IconRuid | string | - | §4.6 스킬 아이콘 sprite RUID. 비우면 표시 측에서 기본 스프라이트로 대체 |
 | SkillTier | integer | O | §4.7 스킬 정의의 정적 강화 단계. 1 이상, 기본 `1` |
 | BaseSkillId | string | 조건부 | §4.7 이 스킬이 강화되어 나온 원본 SkillId. 1단계는 비우고 2단계부터 필수 |
+| CasterMotionRuid | string | - | Sprite 기반 적 시전자의 공격 animationclip RUID |
+| CasterMotionPlayRate | number | 조건부 | CasterMotionRuid 사용 시 0 초과 |
+| CasterMotionDuration | number | 조건부 | 공격 클립 유지 시간. 비우면 ActionDuration |
+| EnemyQueueTurns | integer | - | 적 공격 Tile 준비에 필요한 적 턴 수. 플레이어 스킬은 0 |
+| HudIconRuid | string | - | 적 머리 위 Queue/HUD 아이콘 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -204,7 +209,7 @@ SkillId는 예외 없이 `UNKNOWN_SKILL`이다.
 1. 그 직업의 `{Job}SkillDefinitions.csv`에 행을 추가한다 (공용 `SkillDefinitions`에는 넣지 않는다).
 2. `SkillEffectSteps.csv`에 `EffectSetId` 행을 추가한다.
 3. `JobStartingSkillEntries.csv`에 필요하면 슬롯을 추가한다.
-4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다.
+4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다. Sprite 기반 적은 `CasterMotion*`와 `EnemyQueueTurns`도 채운다.
 5. `WeaponType`을 §4.4 목록에서 고른다. 무기를 바꾸지 않는 스킬이면 비운다.
 6. 원거리 스킬이면 `ProjectileRuid`/`ProjectileSpeed`/`ProjectileScale`을 §4.5 규칙대로 채운다.
 7. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
@@ -304,7 +309,7 @@ SkillDefinition.WeaponType
 - 같은 무기를 이미 들고 있으면 재장착을 건너뛴다(`ALREADY_EQUIPPED`). 불필요한 코스튬
   재구성과 그에 따른 깜빡임을 막기 위한 것이다.
 - `TWO_HANDED`는 1H·보조무기 슬롯을 함께 쓰므로 장착 전에 두 슬롯을 모두 비운다.
-- 적 유닛에는 `CostumeManagerComponent`가 없다. 그래서 `EnemySkillDefinitions` 3행은
+- 적 유닛에는 `CostumeManagerComponent`가 없다. 그래서 `EnemySkillDefinitions` 행은
   `WeaponType`이 모두 비어 있고, 적 스킬에 값을 넣는 것은 데이터 실수다.
 - 무기는 스킬이 바꾸기 전까지 유지된다. 턴이나 전투가 끝나도 되돌리지 않는다.
 
@@ -473,8 +478,8 @@ SkillDefinition.ProjectileRuid
 
 `IconRuid`는 그 스킬 리소스 팩의 `icon` 엘리먼트다. §4.0의 `effect`(시전)·`hit`(피격),
 §4.5의 `ball`(투사체)과 같은 팩에서 나오므로 스킬 하나의 표현이 한 출처로 묶인다.
-플레이어 스킬 18행이 모두 32×32 `sprite`이며, 적 전용 3행은 비어 있다 — 적 스킬은 Codex에도
-HUD에도 표시되지 않기 때문이고, `WeaponType`을 적 행에서 비워두는 것과 같은 이유다.
+플레이어 스킬 18행은 `IconRuid`를 사용한다. 적 전용 스킬은 플레이어 Codex용 `IconRuid` 대신
+`HudIconRuid`를 사용해 적 머리 위 Queue와 전투 디버그 HUD에 표시한다.
 
 찾는 절차는 §4.5의 투사체와 같다. `CastEffectRuid`로 팩을 역추적한다:
 
@@ -628,9 +633,22 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 | PatternId | string | O | EnemyPatternSteps 참조 |
 | MovementPolicy | enum | O | 추적 이동 또는 현재 방향 고정 이동 |
 | InitialFacingPolicy | enum | O | 생성 순간 한 번만 결정되는 초기 방향 |
+| TraitIds | string | - | `|` 구분 Trait 목록. 비어 있는 일반 적은 공격 후 기본 1칸 후퇴 |
 | IsBoss | boolean | O | `true`이면 사망 시 `BOSS_KILL` 드롭 Trigger를 함께 발행 |
 
 허용 MovementPolicy M1: `TRACK_PLAYER`, `FIXED_FACING`.
+
+공격 후 이동 계약:
+
+- 일반 적의 기본값: 성공 여부와 관계없이 `EXECUTE_TILE` 뒤 `MOVE_AWAY` 1회를 다음 적 턴 행동으로 예약한다.
+- `AGGRO`: 기본 후퇴 대신 `MOVE_TOWARD` 1회를 다음 적 턴 행동으로 예약한다.
+- `HOLD_POSITION`: 공격 후 이동을 추가하지 않는다.
+- `AGGRO|HOLD_POSITION` 조합은 의미가 충돌하므로 Validator가 거부한다.
+- `IsBoss=true`: 공통 후처리를 적용하지 않고 `EnemyPatternSteps`에 후퇴·접근·대기를 명시한다. 보스 패턴과 공통 후퇴가 중복 실행되는 것을 막기 위함이다.
+- 후처리 이동 방향은 공격 계획을 만들 때 고정하지 않고, 공격·밀치기 판정이 끝난 실행 시점의 보드에서 다시 계산한다.
+- 목적지가 맵 밖이거나 점유된 경우 기존 이동 계약에 따라 제자리에서 행동을 소모한다.
+- 턴 순서는 `적 턴 N: 공격 → 플레이어 턴 N+1: 회피·이동 가능 → 적 턴 N+1: 예약된 후퇴/접근`이다. `DeferredUntilTurn`은 이 예약 행동이 같은 적 라운드에 연속 실행되는 것을 막고 Client DTO에도 전달된다.
+- `DOUBLE_STRIKE`처럼 Trait가 명시한 연속 공격은 같은 적 턴 안에서 먼저 해소하고, 공격 후 이동만 다음 적 턴으로 미룬다.
 
 허용 InitialFacingPolicy M1: `FACE_PLAYER`(생성 시 플레이어를 바라보는 방향으로 결정), `FIXED_LEFT`(항상 왼쪽), `FIXED_RIGHT`(항상 오른쪽). 기본값은 `FACE_PLAYER`. `MovementPolicy`가 전투 중 계속 갱신되는 이동/추적 규칙인 것과 달리, `InitialFacingPolicy`는 스폰 순간에만 한 번 적용되고 이후에는 Pattern Action(§7)만 방향을 바꾼다. `StageEnemySpawns.FacingOverride`(§11)가 비어 있을 때, 그리고 `StageEnemyWaves`(§13)의 웨이브 스폰 시 이 값을 읽는다.
 
@@ -656,7 +674,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 | NextStepOnFailure | integer | - | 비어 있으면 다음 StepIndex |
 | Enabled | boolean | O | `true`인 행만 Repository가 로드 |
 
-허용 ActionType M1: `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`.
+허용 ActionType M1: `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE`.
 
 - `TURN_TO_PLAYER`: 현재 CellIndex는 유지하고 플레이어 방향으로 `Facing`만 바꾼다.
 - `MOVE_TOWARD`: 플레이어 방향으로 `Facing`을 바꾼 뒤 그 방향으로 1칸 이동한다.
@@ -664,6 +682,8 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 - `MOVE_FIXED_FACING`: 플레이어 위치를 참조하거나 `Facing`을 바꾸지 않고 현재 방향으로 1칸 이동한다.
 - `TELEGRAPH_TILE`: `TileId`를 `TelegraphTurns`회 예고한다. 보드·HP를 바꾸지 않으며 카운트가 끝난 뒤 성공 Step으로 이동한다.
 - `EXECUTE_TILE`: 예고와 분리된 실제 타일 실행이다. 실행 시점의 보드 상태로 대상을 다시 판정한다.
+- `BOSS_JUMP_TELEGRAPH`: 보스 전용. `TileId`가 필수이며, 현재 위치의 반대편 끝 칸을 착지 칸으로 고정하고 공중 상태로 전환한다. 다음 플레이어 턴 동안 보드는 보스를 점유·공격 대상으로 취급하지 않는다.
+- `BOSS_LAND_OPPOSITE`: 보스 전용. `TileId`가 필수이며, 고정된 칸에 착지한 뒤 해당 Skill을 공통 Skill 파이프라인으로 실행한다. 플레이어가 겹치면 중앙 방향 1칸을 우선하고, 막히면 반대 방향 1칸으로 밀어낸 뒤 보스를 배치한다.
 - 이동 목적지가 보드 밖이거나 점유된 경우 위치와 `Facing`을 유지하고 성공 분기는 `WAIT` 결과로 끝낸다. 자동 반전은 허용하지 않는다.
 
 추적형/고정형은 Pattern 전체에 `TURN_TO_PLAYER`가 있는지로 판정하지 않는다. 각 Step의 Action 의미가 독립적이며 하나의 Pattern에서 추적 Action과 고정 방향 Action을 함께 사용할 수 있다.
@@ -676,7 +696,8 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 Repository는 `PatternId → StepIndex`로 정렬하고,
 전용 Validator는 SchemaVersion, 연속 StepIndex, Action/Condition enum, TileId와 거리 인자를
 검사한다. Resolver는 `ALWAYS`, `DISTANCE_EQ`, `DISTANCE_LE`, `HP_RATIO_LE`, `CELL_FREE`와 `WAIT`,
-`TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`을
+`TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`,
+`BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE`를
 실행 가능 타입으로 받는다. `prototype_retreat`는 `MOVE_AWAY`, `prototype_telegraph`는 2턴 예고 뒤
 `enemy_basic_attack` 실행으로 이어지는 재사용 제작 샘플이다.
 
@@ -737,9 +758,10 @@ Facing을 이전 값으로 복구한다.
 
 - Snapshot에는 `TargetId`나 목표 CellIndex를 저장하지 않는다.
 - `EXECUTE_TILE`은 실행 시점의 현재 CellIndex/Facing과 `SkillDefinitions.TargetingType`으로 타깃을 다시 계산한다.
+- 보스 점프의 `PendingLandingCell`과 `IsAirborne`은 해당 `BattleUnitComponent`가 소유한다. PreparedIntent는 착지 위치를 재계산하거나 소유하지 않는다.
 - 밀치기·이동·회전은 Snapshot의 ActionType/TileId를 바꾸거나 다음 Step을 다시 선택하지 않는다.
 - 실행 성공/실패가 확정된 뒤에만 `NextStepOnSuccess`/`NextStepOnFailure`를 적용한다.
-- Client에는 HUD에 필요한 EnemyId/ActionType/TileId/남은 준비 턴만 읽기 전용 DTO/Event로 전달한다.
+- Client에는 HUD에 필요한 EnemyId/ActionType/TileId/남은 준비 턴과 서버가 계산한 `TelegraphKind`, `LandingCell`, `TargetCells`만 읽기 전용 DTO/Event로 전달한다. Client UI는 AI와 피해 범위를 재계산하지 않는다.
 
 ### 7.2 표 기반 협업 규칙
 
