@@ -71,7 +71,10 @@ TryQueueTile
 | `ProjectileSpeed` | number | `14` | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 |
 | `ProjectileScale` | number | `0.9` | 투사체 배율. 비우면 `1` |
 | `ProjectileLaunchDelay` | number | `0` | 발사를 늦출 초. `0`이면 시전과 동시 발사 |
-| `ProjectileArcHeight` | number | `0` | 포물선 정점 높이(월드 유닛). `0`이면 직선. 투사체가 없으면 지정 금지 |
+| `ProjectileArcHeight` | number | `0` | 곡사 정점 높이(월드 유닛). `0`이면 직선. 투사체가 없으면 지정 금지 |
+
+곡사는 착탄 기울기가 0이 되는 3차 곡선이며, 화살은 궤적 접선을 따라 회전한다. 공식과
+아트 방향 규칙은 [`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.5를 본다.
 | `IconRuid` | string | 32자리 hex | 스킬 아이콘 sprite. 비우면 기본 스프라이트로 대체 |
 | `SkillTier` | integer | `1` | 스킬 정의의 정적 강화 단계. 1 이상. 아래 "스킬 강화 단계" 참조 |
 | `BaseSkillId` | string | 빈 문자열 | 이 스킬이 강화되어 나온 원본 `SkillId`. 1단계는 비우고 2단계부터 필수 |
