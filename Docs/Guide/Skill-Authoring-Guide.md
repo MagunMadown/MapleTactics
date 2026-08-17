@@ -130,7 +130,7 @@ SkillDefinition.WeaponType
 
 - **투사체는 시전 이펙트와 동시에 나가는 것이 기본이다.** 근접 스킬의 피해 시점인 모션
   `ImpactDelay`에 묶지 않는다. 늦춰야 하는 스킬만 `ProjectileLaunchDelay`에 양수를 적는다.
-  현재 유일한 사례는 `poison_breath`(`0.25`)다. 값은 이론이 아니라 플레이로 정한다 —
+  현재 사례는 `poison_breath`(`0.25`)와 `arrow_stream`(`0.15`)다. 값은 이론이 아니라 플레이로 정한다 —
   0초로 먼저 확인하고, 이르게 보이면 조금씩 올린다.
 - 비행시간은 저작값이 아니라 `거리 / (ProjectileSpeed × 배속)`이다. 가까운 적은 빨리,
   먼 적은 늦게 맞는다.
