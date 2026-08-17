@@ -118,6 +118,8 @@
 | ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
 | ProjectileLaunchDelay | number | - | 발사를 늦출 초 (1배속 기준). 비우거나 `0`이면 시전과 동시 발사 |
 | IconRuid | string | - | §4.6 스킬 아이콘 sprite RUID. 비우면 표시 측에서 기본 스프라이트로 대체 |
+| SkillTier | integer | O | §4.7 스킬 정의의 정적 강화 단계. 1 이상, 기본 `1` |
+| BaseSkillId | string | 조건부 | §4.7 이 스킬이 강화되어 나온 원본 SkillId. 1단계는 비우고 2단계부터 필수 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -422,6 +424,58 @@ HUD가 정의를 직접 읽지 못하는 이유는 스킬 DataSet이 전부 `ser
 이 컬럼이 생기기 전에는 HUD가 `spear_pulling`·`brandish`·`divine_swing` 세 개만 SkillId로
 분기하는 하드코딩 표를 갖고 있었다. 그중 `spear_pulling`에 걸려 있던 RUID는 실제로는 웨폰
 마스터리 스킬의 `iconMouseOver`였다. 분기는 제거했다.
+
+### 4.7 스킬 강화 단계 (SkillTier / BaseSkillId)
+
+`SkillTier`는 **스킬 정의 자체의 정적 등급**이다. 1단계는 직업이 기본으로 갖는 형태이고,
+N단계 행은 `BaseSkillId`가 가리키는 N-1단계 스킬의 상위 버전이다. 2단계 스킬은 1단계 행을
+고치는 게 아니라 **별도의 행**으로 추가한다.
+
+> ⚠️ **`UpgradeSkillStage`가 UI에 보내는 `skillLevels`와 다른 값이다.** 그쪽은
+> `PlayerRunInventoryComponent.OwnedAmount` — 강화 스테이지에서 같은 스킬을 중첩 획득한
+> **런 중 누적 수치**이고 런이 끝나면 사라진다. `SkillTier`는 데이터에 고정된 값이라 런과
+> 무관하게 변하지 않는다. 두 개념을 같은 이름으로 부르지 않는다.
+
+#### 링크 방향
+
+연결은 **자식(상위 단계) 행이 부모를 가리키는** 한 방향으로만 저장한다.
+
+```text
+brandish            SkillTier=1  BaseSkillId=
+brandish_ii         SkillTier=2  BaseSkillId=brandish
+```
+
+반대 방향(1단계 행에 `UpgradesToSkillId`를 두는 방식)을 쓰지 않는 이유는 두 가지다.
+2단계 스킬 하나를 추가할 때마다 1단계 행까지 같이 고쳐야 해서 두 곳이 어긋날 수 있고,
+아직 존재하지 않는 SkillId를 미리 참조하게 되기 때문이다. 자식이 부모를 가리키면 새 행
+하나만 쓰면 되고, 3단계를 얹을 때도 같은 규칙이 그대로 이어진다.
+
+#### Validator 규칙
+
+`ContentValidatorLogic.ValidateSkillBundle`이 검사한다. 실패 코드는 §22 표에 있다.
+
+| 조건 | 규칙 |
+|---|---|
+| 모든 행 | `SkillTier`는 1 이상 |
+| `SkillTier = 1` | `BaseSkillId`는 반드시 비어 있어야 한다 |
+| `SkillTier >= 2` | `BaseSkillId` 필수, 자기 자신 금지 |
+| `SkillTier >= 2` | `BaseSkillId`가 실제 존재하는 스킬이어야 한다 |
+| `SkillTier >= 2` | 그 스킬의 `SkillTier`가 정확히 자신보다 1 작아야 한다 |
+| `SkillTier >= 2` | 그 스킬의 `RequiredJobTag`가 자신과 같아야 한다 |
+
+부모는 `GetSkillDefinition`으로 **읽기만** 하고 다시 검증하지는 않는다. 3단계 체인에서
+검증이 재귀로 빠지는 것을 막기 위해서다.
+
+#### 현재 상태
+
+플레이어 스킬 18행과 적 전용 3행이 모두 `SkillTier=1`, `BaseSkillId` 비어 있음이다.
+2단계 행은 아직 없다. 적 스킬은 강화 대상이 아니지만 `ConvertSkillRow`가 모든 스킬
+테이블에 공용이라 스키마를 맞추기 위해 같은 두 컬럼을 갖는다.
+
+> 아직 **획득 경로는 단계를 구분하지 않는다.** `GetJobSkillDefinitions`는 `RequiredJobTag`로만
+> 거르므로, 2단계 행을 넣는 순간 신규 스킬 선택(`NewSkillStageChoiceComponent`)·강화
+> 스테이지·도감에 그대로 노출된다. 2단계 스킬을 추가하는 작업에서 이 게이팅을 함께 정해야
+> 한다.
 
 ## 5. SkillEffectSteps
 
@@ -1082,6 +1136,13 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | INVALID_PROJECTILE_SPEED | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 | O |
 | PROJECTILE_ON_SELF_TARGETING | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 | O |
 | INVALID_PROJECTILE_LAUNCH_DELAY | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 | O |
+| INVALID_SKILL_TIER | SkillTier가 없거나 1 미만 | O |
+| TIER_1_BASE_SKILL_PRESENT | SkillTier=1인데 BaseSkillId가 채워져 있음 | O |
+| BASE_SKILL_ID_MISSING | SkillTier가 2 이상인데 BaseSkillId가 비어 있음 | O |
+| BASE_SKILL_SELF_REFERENCE | BaseSkillId가 자기 자신을 가리킴 | O |
+| BASE_SKILL_NOT_FOUND | BaseSkillId가 어느 스킬 테이블에도 없음 | O |
+| BASE_SKILL_TIER_MISMATCH | BaseSkillId가 가리키는 스킬의 SkillTier가 자신보다 정확히 1 작지 않음 | O |
+| BASE_SKILL_JOB_MISMATCH | BaseSkillId가 가리키는 스킬의 RequiredJobTag가 자신과 다름 | O |
 
 로그 예시:
 
