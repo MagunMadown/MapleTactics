@@ -71,7 +71,13 @@ TryQueueTile
 | `ProjectileSpeed` | number | `14` | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 |
 | `ProjectileScale` | number | `0.9` | 투사체 배율. 비우면 `1` |
 | `ProjectileLaunchDelay` | number | `0` | 발사를 늦출 초. `0`이면 시전과 동시 발사 |
+| `ProjectileArcHeight` | number | `0` | 곡사 정점 높이(월드 유닛). `0`이면 직선. 투사체가 없으면 지정 금지 |
+
+곡사는 착탄 기울기가 0이 되는 3차 곡선이며, 화살은 궤적 접선을 따라 회전한다. 공식과
+아트 방향 규칙은 [`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.5를 본다.
 | `IconRuid` | string | 32자리 hex | 스킬 아이콘 sprite. 비우면 기본 스프라이트로 대체 |
+| `SkillTier` | integer | `1` | 스킬 정의의 정적 강화 단계. 1 이상. 아래 "스킬 강화 단계" 참조 |
+| `BaseSkillId` | string | 빈 문자열 | 이 스킬이 강화되어 나온 원본 `SkillId`. 1단계는 비우고 2단계부터 필수 |
 
 ## WeaponType과 무기 카탈로그
 
@@ -85,11 +91,16 @@ TryQueueTile
 | `WeaponType` | string | `BOW` | 고유 `UPPER_SNAKE_CASE` ID |
 | `DisplayName` | string | `활` | 도감 표시용. 빈 문자열 금지 |
 | `EquipSlot` | string | `TWO_HANDED` | `ONE_HANDED` 또는 `TWO_HANDED` |
-| `WeaponRuid` | string | 32자리 hex | `avataritem` RUID. 빈 문자열 금지 |
+| `WeaponRuid` | string | 32자리 hex | 주 손 `avataritem` RUID. 빈 문자열 금지 |
 | `Enabled` | boolean | `true` | `false`면 참조하는 스킬이 검증에서 탈락 |
+| `SubWeaponRuid` | string | 빈 문자열 | 보조무기 슬롯에 함께 드는 `avataritem` RUID. 이도류 전용 |
 
-현재 등록된 12종: `ONE_HANDED_SWORD`, `TWO_HANDED_SWORD`, `SPEAR`, `POLEARM`, `BOW`,
-`CROSSBOW`, `WAND`, `STAFF`, `DAGGER`, `CLAW`, `GUN`, `KNUCKLE`.
+현재 등록된 14종: `ONE_HANDED_SWORD`, `TWO_HANDED_SWORD`, `SPEAR`, `POLEARM`, `BOW`,
+`CROSSBOW`, `WAND`, `STAFF`, `DAGGER`, `CLAW`, `GUN`, `KNUCKLE`, `CANNON`, `DUAL_BLADE`.
+
+`SubWeaponRuid`는 **`EquipSlot=ONE_HANDED`일 때만** 유효하다. 두손무기는 이미 보조무기
+슬롯을 점유하므로 함께 지정하면 `SUB_WEAPON_ON_TWO_HANDED`로 거절된다. 자세한 내용은
+[`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.4를 본다.
 
 런타임 경로는 다음과 같다.
 
@@ -154,11 +165,41 @@ SkillDefinition.WeaponType
 
 자세한 표시 경로는 [`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.6에 있다.
 
+## 스킬 강화 단계
+
+`SkillTier`는 **스킬 정의 자체의 정적 등급**이다. 1단계는 직업이 기본으로 갖는 형태이고,
+N단계 행은 `BaseSkillId`가 가리키는 N-1단계 스킬의 상위 버전이다. 2단계 스킬은 1단계 행을
+고치는 게 아니라 **별도의 행**으로 추가한다.
+
+```text
+brandish            SkillTier=1  BaseSkillId=
+brandish_ii         SkillTier=2  BaseSkillId=brandish
+```
+
+- 링크는 **자식이 부모를 가리키는** 한 방향뿐이다. 새 상위 단계를 추가할 때 원본 행을 건드리지
+  않으므로 두 행이 어긋날 수 없고, 아직 없는 SkillId를 미리 참조하는 일도 없다.
+- 부모는 같은 직업(`RequiredJobTag`)이어야 하고, 단계가 정확히 1 작아야 한다.
+- 적 스킬은 강화 대상이 아니지만 `ConvertSkillRow`가 모든 스킬 테이블에 공용이라 스키마를
+  맞추기 위해 같은 두 컬럼을 갖는다. 전부 `SkillTier=1`, `BaseSkillId` 비움이다.
+
+현재 올라간 2단계 16행은 **전투 형태(타기팅·사거리·쿨다운·모션·무기·ActionDuration)를
+원본에서 그대로 물려받고 피해만 +2** 한 구성이다. 이펙트와 아이콘은 그 스킬 자기 리소스
+팩에서만 가져온다. 자세한 규칙과 예외는
+[`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.7에 있다.
+
+> ⚠️ **강화 스테이지가 UI에 보내는 "레벨"과 다른 값이다.** 그쪽(`UpgradeSkillStageLogic`의
+> `skillLevels`)은 `PlayerRunInventoryComponent.OwnedAmount` — 같은 스킬을 런 중에 중첩
+> 획득한 누적 수치이고 런이 끝나면 사라진다. `SkillTier`는 데이터 고정값이라 런과 무관하다.
+
+> ⚠️ **획득 경로는 아직 단계를 구분하지 않는다.** `GetJobSkillDefinitions`는 `RequiredJobTag`로만
+> 거르므로 2단계 행을 넣는 순간 신규 스킬 선택·강화 스테이지·도감에 그대로 노출된다.
+> 2단계 스킬을 추가할 때 게이팅을 함께 정해야 한다.
+
 현재 실제 Dataset Definition은 다음과 같다.
 
 ```csv
-SchemaVersion,SkillId,DisplayName,SkillTags,TargetingType,Range,TargetOffsets,CooldownTurns,CostType,CostValue,MotionProfileId,EffectSetId,RequiredJobTag,ActionDuration,FreePlay,CastEffectRuid,HitEffectRuid,EffectScale,WeaponType,ProjectileRuid,ProjectileSpeed,ProjectileScale,ProjectileLaunchDelay,IconRuid
-1,brandish,브랜디쉬,attack|warrior|maple,RANGE_OFFSETS,2,1|2,1,,0,heavy_slash,brandish_effects,warrior,0.60,false,8b26a0cdb63d455e82d1ca0fddf5e139,38e9351c34b843ddbcc191c762e7464c,0.9,ONE_HANDED_SWORD,,0,1,0,429228115d56462ab0f65e7294a51609
+SchemaVersion,SkillId,DisplayName,SkillTags,TargetingType,Range,TargetOffsets,CooldownTurns,CostType,CostValue,MotionProfileId,EffectSetId,RequiredJobTag,ActionDuration,FreePlay,CastEffectRuid,HitEffectRuid,EffectScale,WeaponType,ProjectileRuid,ProjectileSpeed,ProjectileScale,ProjectileLaunchDelay,IconRuid,SkillTier,BaseSkillId
+1,brandish,브랜디쉬,attack|warrior|maple,RANGE_OFFSETS,2,1|2,1,,0,heavy_slash,brandish_effects,warrior,0.60,false,8b26a0cdb63d455e82d1ca0fddf5e139,38e9351c34b843ddbcc191c762e7464c,0.9,ONE_HANDED_SWORD,,0,1,0,429228115d56462ab0f65e7294a51609,1,
 ```
 
 행 전체는 코드 대신 실제 CSV를 본다. 스킬은 직업별 테이블로 나뉘어 있으며 어느 파일에
@@ -205,11 +246,13 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 1. 해당 직업의 `{Job}SkillDefinitions.csv`에 고유 `SkillId` 행을 추가한다.
 2. 고유 `EffectSetId`를 정하고 `SkillEffectSteps`에 Step 1을 추가한다.
 3. 현재 지원하는 Targeting과 EffectType인지 확인한다.
-4. `WeaponType`을 `WeaponDefinitions`의 12종 중에서 고른다. 무기를 바꾸지 않으면 비운다.
-5. 큐 또는 서버 테스트에서 `TryQueueTile(SkillId)`를 호출한다.
-6. `[ContentValidation] skill valid ... weapon=`과 `[SkillExecution] started` 로그를 확인한다.
-7. 무기를 지정했다면 `[SkillWeapon] equipped ...` 로그도 함께 확인한다.
-8. 타격 Cell, 피해 또는 밀치기, 모션, 큐 완료 시점을 확인한다.
+4. `WeaponType`을 `WeaponDefinitions`의 14종 중에서 고른다. 무기를 바꾸지 않으면 비운다.
+5. `SkillTier`를 채운다. 새 기본 스킬이면 `1`에 `BaseSkillId`를 비우고, 기존 스킬의 상위
+   단계면 부모의 단계 + 1과 부모 `SkillId`를 적는다.
+6. 큐 또는 서버 테스트에서 `TryQueueTile(SkillId)`를 호출한다.
+7. `[ContentValidation] skill valid ... tier=`와 `[SkillExecution] started` 로그를 확인한다.
+8. 무기를 지정했다면 `[SkillWeapon] equipped ...` 로그도 함께 확인한다.
+9. 타격 Cell, 피해 또는 밀치기, 모션, 큐 완료 시점을 확인한다.
 
 새 스킬을 추가하기 위해 `TryQueueTile`이나 `ExecuteNextQueuedTile`에 SkillId 분기를 넣지 않는다.
 
@@ -259,6 +302,15 @@ Motion Profile Repository를 공통 계약으로 확장한다.
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_SPEED` | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 |
 | `CONTENT_VALIDATION_FAILED` | `PROJECTILE_ON_SELF_TARGETING` | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PROJECTILE_LAUNCH_DELAY` | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 |
+| `CONTENT_VALIDATION_FAILED` | `PROJECTILE_ARC_WITHOUT_PROJECTILE` | ProjectileRuid가 비어 있는데 ProjectileArcHeight가 0 초과 |
+| `CONTENT_VALIDATION_FAILED` | `SUB_WEAPON_ON_TWO_HANDED` | EquipSlot=TWO_HANDED인 무기에 SubWeaponRuid를 지정 |
+| `CONTENT_VALIDATION_FAILED` | `INVALID_SKILL_TIER` | SkillTier가 없거나 1 미만 |
+| `CONTENT_VALIDATION_FAILED` | `TIER_1_BASE_SKILL_PRESENT` | SkillTier=1인데 BaseSkillId가 채워져 있음 |
+| `CONTENT_VALIDATION_FAILED` | `BASE_SKILL_ID_MISSING` | SkillTier가 2 이상인데 BaseSkillId가 비어 있음 |
+| `CONTENT_VALIDATION_FAILED` | `BASE_SKILL_SELF_REFERENCE` | BaseSkillId가 자기 자신을 가리킴 |
+| `CONTENT_VALIDATION_FAILED` | `BASE_SKILL_NOT_FOUND` | BaseSkillId가 어느 스킬 테이블에도 없음 |
+| `CONTENT_VALIDATION_FAILED` | `BASE_SKILL_TIER_MISMATCH` | BaseSkillId가 가리키는 스킬의 SkillTier가 자신보다 정확히 1 작지 않음 |
+| `CONTENT_VALIDATION_FAILED` | `BASE_SKILL_JOB_MISMATCH` | BaseSkillId가 가리키는 스킬의 RequiredJobTag가 자신과 다름 |
 | `CONTENT_VALIDATION_FAILED` | `EFFECT_STEPS_EMPTY` | 연결된 Effect Step이 하나도 없음 |
 | `CONTENT_VALIDATION_FAILED` | `UNSUPPORTED_EFFECT_SCHEMA` | Effect Step의 SchemaVersion이 스킬과 다름 |
 | `CONTENT_VALIDATION_FAILED` | `EFFECT_SET_MISMATCH` | Effect Step의 EffectSetId가 스킬 정의와 다름 |
@@ -275,8 +327,10 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 
 ## Dataset 상태
 
-플레이어 스킬 18행(직업별 5개 테이블), 적 전용 3행, Effect Step 23행, 무기 12행이
-실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은 5행이다. `AllowPrototypeCompatibilityFallback=false`이며 production
+플레이어 스킬 34행(직업별 5개 테이블 — 1단계 18행 + 2단계 16행), 적 전용 3행,
+Effect Step 41행, 무기 12행이 실제 Dataset으로 올라가 있다. 그중 투사체를 쓰는 스킬은
+9행이다. `thunder_bolt`와 `heal`만 아직 상위 단계가 없다.
+`AllowPrototypeCompatibilityFallback=false`이며 production
 Skill 하드코딩을 다시 추가하지 않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를
 복제하지 않는다.
 
