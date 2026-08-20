@@ -1,0 +1,676 @@
+@Component
+script BattleUnitHpHudComponent extends Component
+
+	property boolean ShowHpText = false
+	property boolean ShowBossHpText = true
+	property boolean ShowHpPercent = false
+	property boolean ShowSegments = true
+	property boolean ShowPips = true
+	property string ShowHpTextMode = "SelectedOnly"
+	property string SelectedUnitId = ""
+	property string HoveredUnitId = ""
+	property number HpBarOffsetY = -0.48
+	property number HpPipOffsetY = -0.48
+	property number PlayerHpBarOffsetY = 0.20
+	property number EnemyHpBarOffsetY = 0.06
+	property number PipWidth = 20
+	property number PipHeight = 12
+	property number PipSpacing = 4
+	property integer TargetPipCount = 8
+	property integer MaxVisiblePips = 10
+	property number HpBarWidth = 128
+	property number HpBarHeight = 16
+	property number BossHpBarWidth = 480
+	property number BossHpBarHeight = 22
+	property number SmoothDuration = 0.18
+	property number DangerRatio = 0.30
+	property number RefreshInterval = 0.05
+	property integer SegmentCount = 10
+	property string BossNameOverride = ""
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Caches the authored tactical HUD pool without changing any battle-owned component.
+		self._T.RefreshElapsed = 0
+		self._T.LastContextVisible = false
+		self._T.PlayerView = self:BuildBarView(self.Entity.Parent:GetChildByName("PlayerHpBar", false), false)
+		self._T.EnemyViews = {}
+		for index = 1, 5 do
+			local barName = "EnemyHpBar0" .. tostring(index)
+			table.insert(self._T.EnemyViews, self:BuildBarView(self.Entity.Parent:GetChildByName(barName, false), false))
+		end
+		self._T.BossView = self:BuildBarView(self.Entity.Parent:GetChildByName("BossHpBar", false), true)
+		self:ApplyAuthoredDimensions()
+		self:HideAllBars("INITIALIZE")
+		log("[BattleUnitHpHUD] ready enemyPool=5 targetPips=" .. tostring(self.TargetPipCount) .. " maxPips=" .. tostring(self.MaxVisiblePips) .. " bossSegments=" .. tostring(self.SegmentCount))
+	end
+
+	@ExecSpace("ClientOnly")
+	method table BuildBarView(Entity root, boolean isBoss)
+		-- Resolves one reusable bar's renderers and animation state from its authored child names.
+		local view = {
+			Root = root,
+			IsBoss = isBoss,
+			UnitEntity = nil,
+			UnitId = "",
+			DisplayRatio = 1,
+			StartRatio = 1,
+			TargetRatio = 1,
+			SmoothElapsed = 0,
+			LastHpText = "",
+			LastPipSignature = "",
+			Pips = {},
+			Segments = {}
+		}
+		if isvalid(root) == false then
+			return view
+		end
+		view.Frame = root:GetChildByName("Frame", false)
+		view.Shadow = root:GetChildByName("Shadow", false)
+		view.Empty = root:GetChildByName("Empty", false)
+		view.Fill = root:GetChildByName("Fill", false)
+		view.Highlight = root:GetChildByName("Highlight", false)
+		view.HpText = root:GetChildByName("HpText", false)
+		view.NameText = root:GetChildByName("NameText", false)
+		if isBoss == false then
+			view.PipLayer = root:GetChildByName("Pips", false)
+			if isvalid(view.PipLayer) then
+				for index = 1, math.max(1, self.MaxVisiblePips) do
+					local pipName = "Pip"
+					if index < 10 then
+						pipName = pipName .. "0"
+					end
+					pipName = pipName .. tostring(index)
+					local pip = view.PipLayer:GetChildByName(pipName, false)
+					if isvalid(pip) then
+						table.insert(view.Pips, pip)
+					end
+				end
+			end
+		end
+		local segmentLayer = root:GetChildByName("Segments", false)
+		if isBoss and isvalid(segmentLayer) then
+			-- The authored overlay contains nine dividers, producing ten equal visual cells.
+			for index = 1, 9 do
+				local segmentName = "Segment"
+				if index < 10 then
+					segmentName = segmentName .. "0"
+				end
+				segmentName = segmentName .. tostring(index)
+				local segment = segmentLayer:GetChildByName(segmentName, false)
+				if isvalid(segment) then
+					table.insert(view.Segments, segment)
+				end
+			end
+		end
+		return view
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Tracks battle units every frame and refreshes pool assignment at a small fixed interval.
+		local player = _UserService.LocalPlayer
+		local session = self:GetBattleSession(player)
+		if session == nil then
+			self:HideAllBars("NOT_IN_BATTLE")
+			return
+		end
+		self._T.BattleSession = session
+
+		self._T.RefreshElapsed = (self._T.RefreshElapsed or 0) + delta
+		if self._T.RefreshElapsed >= self.RefreshInterval then
+			self._T.RefreshElapsed = 0
+			self:RefreshAssignments(player)
+		end
+
+		self:UpdateWorldBar(self._T.PlayerView, delta, self.PlayerHpBarOffsetY + self.HpPipOffsetY)
+		for _, view in ipairs(self._T.EnemyViews or {}) do
+			self:UpdateWorldBar(view, delta, self.EnemyHpBarOffsetY + self.HpPipOffsetY)
+		end
+		self:UpdateBossBar(self._T.BossView, delta)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Clears only local UI references when the UI group ends.
+		self:HideAllBars("END_PLAY")
+		self._T.PlayerView = nil
+		self._T.EnemyViews = nil
+		self._T.BossView = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetBattleSession(Entity player)
+		-- Reuses the existing map-scoped battle session as the visibility boundary.
+		if isvalid(player) == false or player.CurrentMap == nil then
+			return nil
+		end
+		return player.CurrentMap:GetComponent("script.BattleSessionComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshAssignments(Entity player)
+		-- Assigns the local player and every synchronized enemy to the fixed reusable HUD pool.
+		local playerUnit = nil
+		if isvalid(player) then
+			playerUnit = player:GetComponent("script.BattleUnitComponent")
+		end
+		if playerUnit ~= nil and playerUnit.Team == "Player" and playerUnit.UnitId ~= "" then
+			self:AssignView(self._T.PlayerView, player, playerUnit)
+		else
+			self:ClearView(self._T.PlayerView)
+		end
+
+		local enemies = {}
+		local map = player.CurrentMap
+		local enemyComponents = map:GetChildComponentsByTypeName("script.BattleUnitComponent", true)
+		for _, unit in pairs(enemyComponents or {}) do
+			if unit ~= nil and unit.Team == "Enemy" and unit.IsDead == false and isvalid(unit.Entity) then
+				table.insert(enemies, unit)
+			end
+		end
+		table.sort(enemies, function(left, right)
+			if left.SpawnOrder ~= right.SpawnOrder then
+				return left.SpawnOrder < right.SpawnOrder
+			end
+			return left.UnitId < right.UnitId
+		end)
+
+		local regularIndex = 0
+		local bossUnit = nil
+		for _, unit in ipairs(enemies) do
+			if unit.IsBoss == true and bossUnit == nil then
+				bossUnit = unit
+			else
+				regularIndex = regularIndex + 1
+				local view = self._T.EnemyViews[regularIndex]
+				if view ~= nil then
+					self:AssignView(view, unit.Entity, unit)
+				end
+			end
+		end
+		for index = regularIndex + 1, #self._T.EnemyViews do
+			self:ClearView(self._T.EnemyViews[index])
+		end
+		if bossUnit ~= nil then
+			self:AssignView(self._T.BossView, bossUnit.Entity, bossUnit)
+		else
+			self:ClearView(self._T.BossView)
+		end
+
+		if self._T.LastContextVisible ~= true then
+			self._T.LastContextVisible = true
+			log("[BattleUnitHpHUD] battle context visible")
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void AssignView(table view, Entity unitEntity, any unit)
+		-- Rebinds a pool view only when its stable UnitId changes and initializes fill without carry-over.
+		if view == nil or isvalid(view.Root) == false then
+			return
+		end
+		local changed = view.UnitId ~= unit.UnitId
+		view.UnitEntity = unitEntity
+		view.UnitId = unit.UnitId
+		if changed then
+			local ratio = self:GetHpRatio(unit.CurrentHp, unit.MaxHp)
+			view.DisplayRatio = ratio
+			view.StartRatio = ratio
+			view.TargetRatio = ratio
+			view.SmoothElapsed = self.SmoothDuration
+			view.LastHpText = ""
+			view.LastPipSignature = ""
+			log("[BattleUnitHpHUD] assigned unit=" .. unit.UnitId .. " team=" .. unit.Team .. " boss=" .. tostring(unit.IsBoss))
+		end
+		view.Root.Enable = unit.IsDead == false
+		self:HideLegacyHpText(unitEntity)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearView(table view)
+		-- Releases one pool slot without destroying its authored UI entities.
+		if view == nil then
+			return
+		end
+		if isvalid(view.Root) then
+			view.Root.Enable = false
+		end
+		view.UnitEntity = nil
+		view.UnitId = ""
+		view.LastHpText = ""
+		view.LastPipSignature = ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideAllBars(string reason)
+		-- Hides this HUD group while leaving all other battle UI groups untouched.
+		self:ClearView(self._T.PlayerView)
+		for _, view in ipairs(self._T.EnemyViews or {}) do
+			self:ClearView(view)
+		end
+		self:ClearView(self._T.BossView)
+		if self._T.LastContextVisible == true then
+			log("[BattleUnitHpHUD] battle context hidden reason=" .. reason)
+		end
+		self._T.LastContextVisible = false
+		self._T.RefreshElapsed = 0
+		self._T.BattleSession = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateWorldBar(table view, number delta, number offsetY)
+		-- Moves a non-boss bar under its unit and renders synchronized HP through a short visual tween.
+		if view == nil or isvalid(view.Root) == false or isvalid(view.UnitEntity) == false then
+			return
+		end
+		local unit = view.UnitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead == true or unit.IsBoss == true then
+			self:ClearView(view)
+			return
+		end
+		local transform = view.UnitEntity.TransformComponent
+		if transform == nil or view.Root.UITransformComponent == nil then
+			return
+		end
+		local worldPosition = transform.WorldPosition
+		local screenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y + offsetY))
+		local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
+		view.Root.UITransformComponent.anchoredPosition = uiPosition
+		self:RefreshViewVisual(view, unit, delta)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateBossBar(table view, number delta)
+		-- Renders a boss only in the authored top-center bar instead of under the world entity.
+		if view == nil or isvalid(view.Root) == false or isvalid(view.UnitEntity) == false then
+			return
+		end
+		local unit = view.UnitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead == true or unit.IsBoss == false then
+			self:ClearView(view)
+			return
+		end
+		self:RefreshViewVisual(view, unit, delta)
+		if isvalid(view.NameText) and view.NameText.TextGUIRendererComponent ~= nil then
+			local bossName = self.BossNameOverride
+			if bossName == "" then
+				bossName = self:GetEnemyDisplayName(unit.EnemyDefinitionId)
+			end
+			view.NameText.TextGUIRendererComponent.Text = bossName
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshViewVisual(table view, any unit, number delta)
+		-- Normal units use discrete pips; player HP prefers the stable map-owned synchronized snapshot.
+		local currentHp = unit.CurrentHp
+		local maxHp = unit.MaxHp
+		local session = self._T.BattleSession
+		if unit.Team == "Player" and session ~= nil and session.PlayerMaxHp > 0 then
+			currentHp = session.PlayerCurrentHp
+			maxHp = session.PlayerMaxHp
+		end
+		local targetRatio = self:GetHpRatio(currentHp, maxHp)
+		if math.abs(targetRatio - view.TargetRatio) > 0.0001 then
+			view.StartRatio = view.DisplayRatio
+			view.TargetRatio = targetRatio
+			view.SmoothElapsed = 0
+			log("[BattleUnitHpHUD] hp target unit=" .. unit.UnitId .. " hp=" .. tostring(currentHp) .. "/" .. tostring(maxHp) .. " ratio=" .. tostring(targetRatio))
+		end
+		if view.IsBoss then
+			local duration = math.max(0.01, self.SmoothDuration)
+			view.SmoothElapsed = math.min(duration, view.SmoothElapsed + delta)
+			local progress = view.SmoothElapsed / duration
+			view.DisplayRatio = view.StartRatio + (view.TargetRatio - view.StartRatio) * progress
+			if view.SmoothElapsed >= duration then
+				view.DisplayRatio = view.TargetRatio
+			end
+			self:ApplyFillWidth(view, view.DisplayRatio)
+			self:ApplyUnitColor(view, unit.Team, targetRatio)
+		else
+			view.DisplayRatio = targetRatio
+			view.TargetRatio = targetRatio
+			self:RefreshPips(view, currentHp, maxHp, unit.Team)
+		end
+		self:RefreshHpText(view, currentHp, maxHp)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshPips(table view, number currentHp, number maxHp, string team)
+		-- Converts final synchronized HP into a compact pool of independent filled or empty sprite blocks.
+		if view == nil or view.IsBoss or isvalid(view.PipLayer) == false then
+			return
+		end
+		local availablePips = math.min(#view.Pips, math.max(1, self.MaxVisiblePips))
+		if availablePips <= 0 then
+			return
+		end
+		local normalizedMaxHp = math.max(1, maxHp)
+		local isPlayer = team == "Player"
+		-- Players use the fixed 10-slot 5-by-2 HUD. Regular monsters use their own MaxHp.
+		local maxPips = math.min(availablePips, math.max(1, math.ceil(normalizedMaxHp)))
+		if isPlayer then
+			maxPips = math.min(availablePips, 10)
+		end
+		local filledPips = 0
+		if currentHp > 0 then
+			local hpRatio = math.max(0, math.min(1, currentHp / normalizedMaxHp))
+			if isPlayer and currentHp >= normalizedMaxHp then
+				filledPips = maxPips
+			elseif isPlayer then
+				-- Floor makes the first point of damage immediately turn at least one slot gray.
+				filledPips = math.max(1, math.min(maxPips - 1, math.floor(hpRatio * maxPips)))
+			elseif normalizedMaxHp <= availablePips then
+				-- Regular monsters map one visible pip to one point of their own HP.
+				filledPips = math.min(maxPips, math.ceil(currentHp))
+			else
+				filledPips = math.max(1, math.min(maxPips, math.ceil(hpRatio * maxPips)))
+			end
+		end
+		local gridColumns = maxPips
+		if isPlayer then
+			gridColumns = math.min(5, maxPips)
+		end
+		local gridRows = math.max(1, math.ceil(maxPips / gridColumns))
+		local rowWidth = gridColumns * self.PipWidth + math.max(0, gridColumns - 1) * self.PipSpacing
+		local gridHeight = gridRows * self.PipHeight + math.max(0, gridRows - 1) * self.PipSpacing
+		view.PipLayer.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight)
+		if isvalid(view.Root) and view.Root.UITransformComponent ~= nil then
+			view.Root.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight + 44)
+		end
+		if isvalid(view.HpText) and view.HpText.UITransformComponent ~= nil then
+			view.HpText.UITransformComponent.anchoredPosition = Vector2(0, -gridHeight * 0.5 - 12)
+		end
+		local filledColor = Color(1.00, 0.34, 0.18, 1)
+		if team == "Player" then
+			-- Keep remaining player HP red like the reference pip row.
+			filledColor = Color(0.82, 0.16, 0.13, 1)
+		end
+		-- Depleted HP stays visible as a neutral gray slot instead of disappearing.
+		local emptyColor = Color(0.27, 0.27, 0.27, 1)
+		for index, pip in ipairs(view.Pips) do
+			local visible = self.ShowPips and index <= maxPips
+			pip.Enable = visible
+			if pip.UITransformComponent ~= nil then
+				local columnIndex = (index - 1) % gridColumns
+				local rowIndex = math.floor((index - 1) / gridColumns)
+				local x = -rowWidth * 0.5 + self.PipWidth * 0.5 + columnIndex * (self.PipWidth + self.PipSpacing)
+				local y = gridHeight * 0.5 - self.PipHeight * 0.5 - rowIndex * (self.PipHeight + self.PipSpacing)
+				pip.UITransformComponent.anchoredPosition = Vector2(x, y)
+				pip.UITransformComponent.RectSize = Vector2(self.PipWidth, self.PipHeight)
+			end
+			if pip.SpriteGUIRendererComponent ~= nil then
+				pip.SpriteGUIRendererComponent.Enable = visible
+				if index <= filledPips then
+					pip.SpriteGUIRendererComponent.Color = filledColor
+				else
+					pip.SpriteGUIRendererComponent.Color = emptyColor
+				end
+			end
+		end
+		local signature = tostring(math.floor(normalizedMaxHp)) .. ":" .. tostring(maxPips) .. ":" .. tostring(filledPips)
+		if signature ~= view.LastPipSignature then
+			view.LastPipSignature = signature
+			log("[BattleUnitHpHUD] pips unit=" .. view.UnitId .. " hp=" .. tostring(currentHp) .. "/" .. tostring(maxHp) .. " filled=" .. tostring(filledPips) .. "/" .. tostring(maxPips))
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetHpRatio(number currentHp, number maxHp)
+		-- Clamps synchronized battle HP into a renderer-safe zero-to-one ratio.
+		if maxHp <= 0 then
+			return 0
+		end
+		return math.max(0, math.min(1, currentHp / maxHp))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyFillWidth(table view, number ratio)
+		-- Resizes the thick left-pivot fill while keeping the reference image's dark empty track visible.
+		if isvalid(view.Fill) == false or view.Fill.UITransformComponent == nil then
+			return
+		end
+		local fullWidth = view.IsBoss and math.max(1, self.BossHpBarWidth - 14) or math.max(1, self.HpBarWidth - 10)
+		local fillHeight = view.IsBoss and self.BossHpBarHeight or self.HpBarHeight
+		local width = fullWidth * math.max(0, math.min(1, ratio))
+		view.Fill.UITransformComponent.RectSize = Vector2(math.max(0.1, width), fillHeight)
+		view.Fill.Enable = ratio > 0
+		if isvalid(view.Highlight) and view.Highlight.UITransformComponent ~= nil then
+			view.Highlight.UITransformComponent.RectSize = Vector2(math.max(0.1, width - 4), math.max(2, fillHeight * 0.22))
+			view.Highlight.Enable = ratio > 0.02
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyUnitColor(table view, string team, number targetRatio)
+		-- Applies the reference image's saturated two-tone unit colors and player danger override.
+		if isvalid(view.Fill) == false or view.Fill.SpriteGUIRendererComponent == nil then
+			return
+		end
+		local fillColor = Color(0.95, 0.30, 0.16, 1)
+		if team == "Player" then
+			fillColor = Color(0.22, 0.78, 0.76, 1)
+			if targetRatio <= self.DangerRatio then
+				fillColor = Color(0.96, 0.23, 0.17, 1)
+			end
+		elseif view.IsBoss then
+			fillColor = Color(0.92, 0.20, 0.10, 1)
+		end
+		view.Fill.SpriteGUIRendererComponent.Color = fillColor
+		if isvalid(view.Highlight) and view.Highlight.SpriteGUIRendererComponent ~= nil then
+			view.Highlight.SpriteGUIRendererComponent.Color = Color(1, 0.82, 0.58, team == "Player" and 0.34 or 0.52)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshHpText(table view, number currentHp, number maxHp)
+		-- Shows compact exact values only when the matching Inspector option is enabled.
+		if isvalid(view.HpText) == false or view.HpText.TextGUIRendererComponent == nil then
+			return
+		end
+		local showExactValue = self:ShouldShowGeneralHpText(view)
+		if view.IsBoss then
+			showExactValue = self.ShowBossHpText
+		end
+		local visible = showExactValue
+		view.HpText.Enable = visible
+		view.HpText.TextGUIRendererComponent.Enable = visible
+		if visible == false then
+			return
+		end
+		local text = ""
+		if showExactValue then
+			text = tostring(math.floor(currentHp)) .. " / " .. tostring(math.floor(maxHp))
+		end
+		if self.ShowHpPercent then
+			local percentText = tostring(math.floor(self:GetHpRatio(currentHp, maxHp) * 100 + 0.5)) .. "%"
+			if text == "" then
+				text = percentText
+			else
+				text = text .. "  " .. percentText
+			end
+		end
+		if view.LastHpText ~= text then
+			view.HpText.TextGUIRendererComponent.Text = text
+			view.LastHpText = text
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ShouldShowGeneralHpText(table view)
+		-- Keeps normal bars number-free unless an existing target snapshot or UI-owned state selects the unit.
+		if view == nil or view.IsBoss == true or view.UnitId == "" then
+			return false
+		end
+		if self.ShowHpText then
+			return true
+		end
+		local mode = string.upper(self.ShowHpTextMode or "NEVER")
+		if mode == "ALWAYS" then
+			return true
+		elseif mode == "HOVERONLY" then
+			return self.HoveredUnitId ~= "" and self.HoveredUnitId == view.UnitId
+		elseif mode == "SELECTEDONLY" then
+			if self.SelectedUnitId ~= "" and self.SelectedUnitId == view.UnitId then
+				return true
+			end
+			local session = self._T.BattleSession
+			if session ~= nil then
+				return self:ContainsSerializedUnitId(session.LastSkillTargetUnitIds, view.UnitId)
+			end
+		end
+		return false
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ContainsSerializedUnitId(string serializedUnitIds, string unitId)
+		-- Matches a whole token in the battle session's existing pipe-delimited target snapshot.
+		if serializedUnitIds == nil or serializedUnitIds == "" or unitId == nil or unitId == "" then
+			return false
+		end
+		local haystack = "|" .. serializedUnitIds .. "|"
+		local needle = "|" .. unitId .. "|"
+		return string.find(haystack, needle, 1, true) ~= nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetHpTextSelectedUnit(string unitId)
+		-- Lets an existing or future selection presenter opt into SelectedOnly without owning HP data.
+		self.SelectedUnitId = unitId or ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetHpTextHoveredUnit(string unitId)
+		-- Accepts hover state from another UI owner without adding input capture to the world bar itself.
+		self.HoveredUnitId = unitId or ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyAuthoredDimensions()
+		-- Applies Inspector width and height values to every pooled bar and its ten visual segments.
+		self:ApplyViewDimensions(self._T.PlayerView)
+		for _, view in ipairs(self._T.EnemyViews or {}) do
+			self:ApplyViewDimensions(view)
+		end
+		self:ApplyViewDimensions(self._T.BossView)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyViewDimensions(table view)
+		-- Configures discrete world pips separately from the retained top-screen boss fill bar.
+		if view == nil or isvalid(view.Root) == false then
+			return
+		end
+		if view.IsBoss == false then
+			local pipCount = math.max(1, math.min(#view.Pips, math.min(self.MaxVisiblePips, 10)))
+			local gridColumns = math.min(5, pipCount)
+			local gridRows = math.max(1, math.ceil(pipCount / gridColumns))
+			local rowWidth = gridColumns * self.PipWidth + math.max(0, gridColumns - 1) * self.PipSpacing
+			local gridHeight = gridRows * self.PipHeight + math.max(0, gridRows - 1) * self.PipSpacing
+			view.Root.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight + 44)
+			if isvalid(view.Frame) then
+				view.Frame.Enable = false
+			end
+			if isvalid(view.Shadow) then
+				view.Shadow.Enable = false
+			end
+			if isvalid(view.Empty) then
+				view.Empty.Enable = false
+			end
+			if isvalid(view.Fill) then
+				view.Fill.Enable = false
+			end
+			if isvalid(view.Highlight) then
+				view.Highlight.Enable = false
+			end
+			if isvalid(view.PipLayer) and view.PipLayer.UITransformComponent ~= nil then
+				view.PipLayer.Enable = true
+				view.PipLayer.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight)
+			end
+			for index, pip in ipairs(view.Pips) do
+				pip.Enable = false
+				if pip.UITransformComponent ~= nil then
+					local columnIndex = (index - 1) % gridColumns
+					local rowIndex = math.floor((index - 1) / gridColumns)
+					local x = -rowWidth * 0.5 + self.PipWidth * 0.5 + columnIndex * (self.PipWidth + self.PipSpacing)
+					local y = gridHeight * 0.5 - self.PipHeight * 0.5 - rowIndex * (self.PipHeight + self.PipSpacing)
+					pip.UITransformComponent.anchoredPosition = Vector2(x, y)
+					pip.UITransformComponent.RectSize = Vector2(self.PipWidth, self.PipHeight)
+				end
+			end
+			if isvalid(view.HpText) and view.HpText.UITransformComponent ~= nil then
+				view.HpText.UITransformComponent.anchoredPosition = Vector2(0, -gridHeight * 0.5 - 12)
+			end
+			return
+		end
+
+		local width = self.BossHpBarWidth
+		local height = self.BossHpBarHeight
+		local frameHeight = height + 10
+		local innerWidth = width - 14
+		view.Root.UITransformComponent.RectSize = Vector2(width, frameHeight + 66)
+		if isvalid(view.Frame) and view.Frame.UITransformComponent ~= nil then
+			view.Frame.UITransformComponent.RectSize = Vector2(width, frameHeight)
+		end
+		if isvalid(view.Shadow) and view.Shadow.UITransformComponent ~= nil then
+			view.Shadow.UITransformComponent.RectSize = Vector2(width, frameHeight)
+		end
+		if isvalid(view.Empty) and view.Empty.UITransformComponent ~= nil then
+			view.Empty.UITransformComponent.RectSize = Vector2(innerWidth, height)
+		end
+		if isvalid(view.Fill) and view.Fill.UITransformComponent ~= nil then
+			view.Fill.UITransformComponent.anchoredPosition = Vector2(-innerWidth * 0.5, 0)
+		end
+		if isvalid(view.Highlight) and view.Highlight.UITransformComponent ~= nil then
+			view.Highlight.UITransformComponent.anchoredPosition = Vector2(-innerWidth * 0.5 + 2, height * 0.25)
+		end
+		-- Clamp to the authored ten-cell overlay so every active divider remains evenly spaced.
+		local segmentCount = math.max(2, math.min(10, self.SegmentCount))
+		for index, segment in ipairs(view.Segments) do
+			local segmentVisible = self.ShowSegments and index < segmentCount
+			segment.Enable = segmentVisible
+			if segment.SpriteGUIRendererComponent ~= nil then
+				segment.SpriteGUIRendererComponent.Enable = segmentVisible
+			end
+			if segment.UITransformComponent ~= nil then
+				local x = -innerWidth * 0.5 + innerWidth * index / segmentCount
+				segment.UITransformComponent.anchoredPosition = Vector2(x, 0)
+				segment.UITransformComponent.RectSize = Vector2(2, height)
+			end
+		end
+		self:ApplyFillWidth(view, view.DisplayRatio)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideLegacyHpText(Entity unitEntity)
+		-- Suppresses the old enemy-only numeric world label so the new bar is the single HP presentation.
+		if isvalid(unitEntity) == false then
+			return
+		end
+		local legacy = unitEntity:GetChildByName("BattleHpText", false)
+		if isvalid(legacy) and legacy.TextRendererComponent ~= nil then
+			legacy.TextRendererComponent.Enable = false
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetEnemyDisplayName(string enemyDefinitionId)
+		-- Mirrors current EnemyDefinitions display labels for the boss title without querying server-only DataService.
+		if enemyDefinitionId == "region_01_guardian_boss" then
+			return "지역 수호자"
+		elseif enemyDefinitionId == "early_mushroom" then
+			return "초급 주황버섯"
+		elseif enemyDefinitionId == "guard_mushroom" then
+			return "수비형 주황버섯"
+		elseif enemyDefinitionId == "csv_retreat_mushroom" then
+			return "후퇴형 주황버섯"
+		elseif enemyDefinitionId == "csv_telegraph_mushroom" then
+			return "예고형 주황버섯"
+		elseif enemyDefinitionId == "region_01_ranged_mushroom" then
+			return "초급 원거리 버섯"
+		end
+		return enemyDefinitionId ~= "" and enemyDefinitionId or "BOSS"
+	end
+
+end

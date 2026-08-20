@@ -480,7 +480,6 @@ UI 표시 문구는 Reason ID와 분리한다. 서버 Reason을 그대로 사용
 | `PlayerStartCell` | integer | O | Player 시작 Cell |
 | `QueueCapacity` | integer | O | 기본 타일 큐 용량 |
 | `WaveTableId` | string | O | Wave 묶음 ID |
-| `NextStageId` | string |  | 마지막이면 빈 문자열 |
 | `StageRuleId` | string |  | 특수 규칙 Handler ID |
 
 Map Entity에는 가능하면 `StageId`만 설정하고 세부 값은 Repository에서 읽는다.
@@ -722,7 +721,7 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 | `PatternId` | 패턴 ID |
 | `StepIndex` | 실행 순서 |
 | `ConditionType` | `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE` |
-| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE` |
+| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE` |
 | `TileId` | 예고·실행할 스킬 타일 ID |
 | `TelegraphTurns` | `TELEGRAPH_TILE` 예고 턴 수, 1 이상 |
 | `ParamA/B/C` | 조건·행동별 인자 |
@@ -735,6 +734,8 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 `BattleSessionComponent`는 준비·실행·완료 순서와 실제 보드 명령만 조정한다.
 
 UI는 Pattern 조건을 다시 계산하지 않고 Prepared Intent Snapshot만 표시한다.
+보스 점프의 공중 여부와 고정 착지 칸은 보스의 `BattleUnitComponent`가 소유하며,
+`BoardStateComponent`는 공중 보스를 Cell 점유·공격 대상으로 노출하지 않는다.
 
 ---
 

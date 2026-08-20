@@ -64,6 +64,50 @@ script BattleGatewayLogic
 		)
 	end
 
+	@ExecSpace("ServerOnly")
+	method table PrepareLobbyStageEntry(Entity playerEntity, string requestedStageId)
+		-- Validates a world-map stage selection against the authoritative lobby run context.
+		local context = _RunManagerLogic:GetLobbyBattleEntryContext(playerEntity)
+		if context.Success == false then
+			return { Success = false, Reason = context.Reason, RequestId = 0 }
+		end
+		if requestedStageId == nil or requestedStageId == "" then
+			return { Success = false, Reason = "INVALID_STAGE_ID", RequestId = 0 }
+		end
+		if context.StageId ~= requestedStageId then
+			log_warning("[BattleGateway] world map stage rejected requested=" .. requestedStageId .. " expected=" .. context.StageId)
+			return { Success = false, Reason = "STAGE_NOT_AVAILABLE", RequestId = 0 }
+		end
+		return self:PrepareBattleEntry(
+			playerEntity,
+			context.StageId,
+			context.CharacterId,
+			context.JobId,
+			context.LoadoutId,
+			context.RunSeed,
+			context.EntryMode
+		)
+	end
+
+	@ExecSpace("Server")
+	method void RequestPrepareLobbyStageEntry(string requestedStageId)
+		-- Prepares and transfers the stage selected from the lobby world map.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:PrepareLobbyStageEntry(playerEntity, requestedStageId)
+		if result.Success == false then
+			log_warning("[BattleGateway] world map prepare rejected user=" .. senderUserId .. " stage=" .. requestedStageId .. " reason=" .. result.Reason)
+			self:NotifyLobbyBattleEntryResult(false, result.Reason, senderUserId)
+			return
+		end
+		local transferResult = self:TransferPreparedLobbyBattleEntry(playerEntity, result.RequestId)
+		if transferResult.Success == false then
+			log_warning("[BattleGateway] world map transfer rejected user=" .. senderUserId .. " stage=" .. requestedStageId .. " reason=" .. transferResult.Reason)
+			self:NotifyLobbyBattleEntryResult(false, transferResult.Reason, senderUserId)
+			return
+		end
+		self:NotifyLobbyBattleEntryResult(true, transferResult.Reason, senderUserId)
+	end
+
 	@ExecSpace("Server")
 	method void RequestPrepareLobbyBattleEntry()
 		-- Prepares and transfers one lobby entry, then reports the result to the requesting client's button.
@@ -97,6 +141,13 @@ script BattleGatewayLogic
 			return
 		end
 		startButton:HandleBattleEntryResult(success, reason)
+		local stageNode = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/Region01Stage01Btn")
+		if isvalid(stageNode) then
+			local stageButton = stageNode:GetComponent("script.WorldMapStageButtonComponent")
+			if stageButton ~= nil then
+				stageButton:HandleEntryResult(success, reason)
+			end
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -153,7 +204,17 @@ script BattleGatewayLogic
 		local spawnX = route.SpawnX or 0
 		local spawnY = route.SpawnY or 0
 		log("[BattleGateway] transferring player mapId=" .. route.MapId .. " spawn=(" .. tostring(spawnX) .. "," .. tostring(spawnY) .. ") request=" .. requestId)
-		playerEntity.PlayerComponent:MoveToMapPosition(route.MapId, Vector2(spawnX, spawnY))
+		local navigationResult = _MapTeleportManager:TeleportPlayer(
+			playerEntity,
+			route.MapId,
+			Vector3(spawnX, spawnY, 0),
+			"LOBBY_BATTLE_ENTRY"
+		)
+		if navigationResult.Success == false then
+			result.Reason = navigationResult.Reason
+			log_warning("[BattleGateway] transfer dispatch failed stageId=" .. entryState.StageId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			return result
+		end
 		result.Success = true
 		result.Reason = "TRANSFER_REQUESTED"
 		result.StageId = entryState.StageId

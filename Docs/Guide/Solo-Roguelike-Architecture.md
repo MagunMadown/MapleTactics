@@ -132,7 +132,7 @@ Stage별 분기를 넣지 않는다.
 map02 예시:
 
 ```csv
-SchemaVersion,StageId,DisplayName,CellCount,CellStartX,CellSpacing,UnitY,PlayerStartCell,QueueCapacity,WaveTableId,NextStageId,StageRuleId
+SchemaVersion,StageId,DisplayName,CellCount,CellStartX,CellSpacing,UnitY,PlayerStartCell,QueueCapacity,WaveTableId,StageRuleId
 1,stage02,Stage 2,8,-3.92,1.12,0.12,0,3,stage02,,default
 ```
 

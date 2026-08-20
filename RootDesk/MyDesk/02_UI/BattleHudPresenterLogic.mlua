@@ -7,11 +7,19 @@ script BattleHudPresenterLogic extends Logic
 	property integer LastCommandRevision = -1
 	property string LastSignature = ""
 	property table CurrentState = nil
+	property string PendingLocalCommand = ""
+	property integer PendingLocalCommandTimerId = 0
+	property number PendingLocalCommandTimeout = 0.40
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		log("[BattleHudPresenter] ready")
 		self:RefreshState(true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		self:ReleasePendingLocalCommand("", "PRESENTER_END")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -40,6 +48,79 @@ script BattleHudPresenterLogic extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method boolean TryBeginLocalCommand(string commandType)
+		-- Closes the client/server sync gap while BattleTurnComponent remains the authoritative lock owner.
+		if self.PendingLocalCommand ~= "" then
+			self:PublishCommandResult(commandType, false, "LOCAL_INPUT_PENDING", 0)
+			log("[BattleInputFeedback] blocked command=" .. commandType .. " pending=" .. self.PendingLocalCommand)
+			return false
+		end
+
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishCommandResult(commandType, false, "SESSION_MISSING", 0)
+			return false
+		end
+
+		local uiState = session:GetBattleUiState()
+		if uiState == nil or uiState.Success == false then
+			self:PublishCommandResult(commandType, false, uiState == nil and "UI_STATE_MISSING" or uiState.Reason, 0)
+			return false
+		end
+
+		local allowed = false
+		if commandType == "MOVE" then
+			allowed = uiState.Commands.CanMove
+		elseif commandType == "TURN" then
+			allowed = uiState.Commands.CanTurn
+		elseif commandType == "QUEUE_TILE" then
+			allowed = uiState.Commands.CanQueue
+		elseif commandType == "EXECUTE_QUEUE" then
+			allowed = uiState.Commands.CanExecute
+		end
+
+		if allowed == false then
+			local reason = "INPUT_LOCKED_" .. tostring(uiState.PlayerActionState)
+			if commandType == "EXECUTE_QUEUE" and uiState.PlayerQueue.Count <= 0 then
+				reason = "QUEUE_EMPTY"
+			end
+			self:PublishCommandResult(commandType, false, reason, 0)
+			log("[BattleInputFeedback] rejected command=" .. commandType .. " state=" .. tostring(uiState.PlayerActionState) .. " reason=" .. reason)
+			return false
+		end
+
+		self.PendingLocalCommand = commandType
+		self:PublishCommandResult(commandType, true, "INPUT_RECEIVED", 0)
+		local expectedCommand = commandType
+		local timeout = function()
+			if self.PendingLocalCommand == expectedCommand then
+				self:ReleasePendingLocalCommand(expectedCommand, "LOCAL_TIMEOUT")
+			end
+		end
+		self.PendingLocalCommandTimerId = _TimerService:SetTimerOnce(timeout, math.max(0.20, self.PendingLocalCommandTimeout))
+		log("[BattleInputFeedback] accepted command=" .. commandType .. " state=" .. tostring(uiState.PlayerActionState))
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReleasePendingLocalCommand(string commandType, string reason)
+		if self.PendingLocalCommand == "" then
+			return
+		end
+		if commandType ~= "" and self.PendingLocalCommand ~= commandType then
+			return
+		end
+
+		local releasedCommand = self.PendingLocalCommand
+		self.PendingLocalCommand = ""
+		if self.PendingLocalCommandTimerId > 0 then
+			_TimerService:ClearTimer(self.PendingLocalCommandTimerId)
+			self.PendingLocalCommandTimerId = 0
+		end
+		log("[BattleInputFeedback] released command=" .. releasedCommand .. " reason=" .. tostring(reason))
+	end
+
+	@ExecSpace("ClientOnly")
 	method void RefreshState(boolean force)
 		local session = self:GetBattleSession()
 		if session == nil then
@@ -51,6 +132,9 @@ script BattleHudPresenterLogic extends Logic
 		if uiState == nil or uiState.Success == false then
 			self:PublishUnavailableState(uiState == nil and "UI_STATE_MISSING" or uiState.Reason, force)
 			return
+		end
+		if self.PendingLocalCommand ~= "" and uiState.PlayerActionState ~= "READY" and uiState.PlayerActionState ~= "PREPARING_ATTACK" then
+			self:ReleasePendingLocalCommand("", "AUTHORITATIVE_STATE_" .. tostring(uiState.PlayerActionState))
 		end
 
 		local waveState = self:GetBattleWaveState()
@@ -65,7 +149,7 @@ script BattleHudPresenterLogic extends Logic
 			runFlowRevision = runFlowUi.RevisionKey
 		end
 
-		local signature = tostring(session.StageNumber) .. ":" .. tostring(session.StageTurnNumber) .. ":" .. uiState.RevisionKey .. ":" .. tostring(waveState.CurrentWaveSpawnMode) .. ":" .. tostring(waveState.ForceAfterTurns) .. ":" .. tostring(waveState.WaveSpawnStageTurn) .. ":" .. tostring(waveState.ForceSpawnPending) .. ":" .. tostring(waveState.ForceSpawnPendingReason) .. ":" .. tostring(uiState.Drops.Revision) .. ":" .. tostring(uiState.RunInventory.Revision) .. ":" .. runFlowRevision .. ":" .. tostring(session.SkillSlotIds) .. ":" .. tostring(session.SkillSlotNames)
+		local signature = tostring(session.StageId) .. ":" .. tostring(session.StageNumber) .. ":" .. tostring(session.StageTurnNumber) .. ":" .. uiState.RevisionKey .. ":" .. tostring(waveState.CurrentWaveSpawnMode) .. ":" .. tostring(waveState.ForceAfterTurns) .. ":" .. tostring(waveState.WaveSpawnStageTurn) .. ":" .. tostring(waveState.ForceSpawnPending) .. ":" .. tostring(waveState.ForceSpawnPendingReason) .. ":" .. tostring(uiState.Drops.Revision) .. ":" .. tostring(uiState.RunInventory.Revision) .. ":" .. runFlowRevision .. ":" .. tostring(session.SkillSlotIds) .. ":" .. tostring(session.SkillSlotNames) .. ":" .. tostring(session.SkillIconSnapshot)
 		if force == false and self.LastSignature == signature then
 			return
 		end
@@ -79,6 +163,7 @@ script BattleHudPresenterLogic extends Logic
 			Revision = self.StateRevision,
 			RevisionKey = signature,
 			Session = {
+				StageId = session.StageId,
 				StageNumber = session.StageNumber,
 				StageTurnNumber = session.StageTurnNumber,
 				PreparedEnemyIntentState = session.PreparedEnemyIntentState,
@@ -88,7 +173,8 @@ script BattleHudPresenterLogic extends Logic
 				PreparedEnemyTurn = session.PreparedEnemyTurn,
 				BattleResult = session.BattleResult,
 				SkillSlotIds = session.SkillSlotIds,
-				SkillSlotNames = session.SkillSlotNames
+				SkillSlotNames = session.SkillSlotNames,
+				SkillIconSnapshot = session.SkillIconSnapshot
 			},
 			Turn = {
 				BattlePhase = uiState.Phase,
@@ -99,7 +185,8 @@ script BattleHudPresenterLogic extends Logic
 				QueuedTileCount = uiState.PlayerQueue.Count,
 				TileQueueCapacity = uiState.PlayerQueue.EffectiveCapacity,
 				QueuedActionType = uiState.LastCommand.Type,
-				IsActionProcessing = uiState.IsProcessing
+				IsActionProcessing = uiState.IsProcessing,
+				PlayerActionState = uiState.PlayerActionState
 			},
 			Wave = {
 				CurrentWave = uiState.Wave.Current,
@@ -160,6 +247,7 @@ script BattleHudPresenterLogic extends Logic
 		end
 
 		self.LastCommandRevision = lastCommand.Revision
+		self:ReleasePendingLocalCommand(lastCommand.Type, "AUTHORITATIVE_RESULT_" .. tostring(lastCommand.Reason))
 		self:PublishCommandResult(lastCommand.Type, lastCommand.Success, lastCommand.Reason, lastCommand.Revision)
 	end
 
@@ -176,8 +264,12 @@ script BattleHudPresenterLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void RequestQueueTile(string tileId)
+		if self:TryBeginLocalCommand("QUEUE_TILE") == false then
+			return
+		end
 		local session = self:GetBattleSession()
 		if session == nil then
+			self:ReleasePendingLocalCommand("QUEUE_TILE", "SESSION_MISSING")
 			self:PublishCommandResult("QUEUE_TILE", false, "SESSION_MISSING", 0)
 			return
 		end
@@ -186,8 +278,12 @@ script BattleHudPresenterLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void RequestExecuteQueue()
+		if self:TryBeginLocalCommand("EXECUTE_QUEUE") == false then
+			return
+		end
 		local session = self:GetBattleSession()
 		if session == nil then
+			self:ReleasePendingLocalCommand("EXECUTE_QUEUE", "SESSION_MISSING")
 			self:PublishCommandResult("EXECUTE_QUEUE", false, "SESSION_MISSING", 0)
 			return
 		end

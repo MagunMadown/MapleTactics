@@ -1,7 +1,7 @@
 @Logic
 script ContentValidatorLogic extends Logic
 
-	property integer SupportedStageSchemaVersion = 2
+	property integer SupportedStageSchemaVersion = 3
 	property integer SupportedSkillSchemaVersion = 1
 
 	@ExecSpace("ServerOnly")
@@ -69,12 +69,6 @@ script ContentValidatorLogic extends Logic
 		if definition.WaveTableId == nil or definition.WaveTableId == "" then
 			return self:RejectStage(result, "WAVE_TABLE_ID_MISSING")
 		end
-		if definition.NextStageId ~= nil
-			and definition.NextStageId ~= ""
-			and definition.NextStageId == definition.StageId then
-			return self:RejectStage(result, "NEXT_STAGE_SELF_REFERENCE")
-		end
-
 		local totalWaves = _StageWaveRepositoryLogic:GetTotalWaveCount(definition.WaveTableId)
 		if totalWaves <= 0 then
 			return self:RejectStage(result, "WAVE_TABLE_NOT_FOUND")
@@ -154,6 +148,88 @@ script ContentValidatorLogic extends Logic
 		if definition.ActionDuration == nil or definition.ActionDuration <= 0 then
 			return self:RejectSkill(result, "INVALID_ACTION_DURATION")
 		end
+		-- An empty WeaponType is legal: enemy skills have no avatar, and a player skill may
+		-- deliberately keep whatever weapon is already equipped. A non-empty value must resolve.
+		if definition.WeaponType ~= nil and definition.WeaponType ~= "" then
+			local weaponValidation = self:ValidateWeaponById(definition.WeaponType)
+			if weaponValidation.Success == false then
+				return self:RejectSkill(result, "INVALID_SKILL_WEAPON_REFERENCE")
+			end
+		end
+		-- A projectile needs a speed to reach its target; without one the impact would never land.
+		-- An empty ProjectileRuid is the normal case and leaves the other two columns unread.
+		if definition.ProjectileRuid ~= nil and definition.ProjectileRuid ~= "" then
+			if definition.ProjectileSpeed == nil or definition.ProjectileSpeed <= 0 then
+				return self:RejectSkill(result, "INVALID_PROJECTILE_SPEED")
+			end
+			if definition.TargetingType == "SELF" then
+				return self:RejectSkill(result, "PROJECTILE_ON_SELF_TARGETING")
+			end
+			-- 0 is the normal case: it defers the launch to the motion profile's impact frame.
+			if definition.ProjectileLaunchDelay == nil or definition.ProjectileLaunchDelay < 0 then
+				return self:RejectSkill(result, "INVALID_PROJECTILE_LAUNCH_DELAY")
+			end
+			if definition.ProjectileCount == nil or definition.ProjectileCount < 1 then
+				return self:RejectSkill(result, "INVALID_PROJECTILE_COUNT")
+			end
+			-- Without a gap the extra shots spawn on the same frame along the same path, so the row
+			-- claims a volley but plays as a single arrow.
+			if definition.ProjectileCount > 1
+				and (definition.ProjectileInterval == nil or definition.ProjectileInterval <= 0) then
+				return self:RejectSkill(result, "PROJECTILE_VOLLEY_WITHOUT_INTERVAL")
+			end
+		elseif definition.ProjectileHeight ~= nil and definition.ProjectileHeight > 0 then
+			-- A flight height only means something for a flying object, so setting it with no
+			-- projectile is a row that silently does nothing rather than an authoring choice.
+			return self:RejectSkill(result, "PROJECTILE_HEIGHT_WITHOUT_PROJECTILE")
+		elseif (definition.ProjectileCount ~= nil and definition.ProjectileCount > 1)
+			or (definition.ProjectileInterval ~= nil and definition.ProjectileInterval > 0) then
+			-- Same reasoning as the arc: volley columns with nothing to fire are dead authoring.
+			return self:RejectSkill(result, "PROJECTILE_VOLLEY_WITHOUT_PROJECTILE")
+		end
+		if definition.EnemyQueueTurns == nil or definition.EnemyQueueTurns < 0 then
+			return self:RejectSkill(result, "INVALID_ENEMY_QUEUE_TURNS")
+		end
+		if definition.CasterMotionRuid ~= nil and definition.CasterMotionRuid ~= "" then
+			if definition.CasterMotionPlayRate == nil or definition.CasterMotionPlayRate <= 0 then
+				return self:RejectSkill(result, "INVALID_CASTER_MOTION_PLAY_RATE")
+			end
+			if definition.CasterMotionDuration == nil or definition.CasterMotionDuration <= 0 then
+				return self:RejectSkill(result, "INVALID_CASTER_MOTION_DURATION")
+			end
+		end
+		-- Tier 1 is the base form a job starts with; tier N is the upgraded form of the tier N-1 skill
+		-- named by BaseSkillId. Keeping the link on the child means a new upgrade never edits the row it
+		-- upgrades from, so the two rows cannot drift apart.
+		if definition.SkillTier == nil or definition.SkillTier < 1 then
+			return self:RejectSkill(result, "INVALID_SKILL_TIER")
+		end
+		local baseSkillId = definition.BaseSkillId or ""
+		if definition.SkillTier == 1 then
+			if baseSkillId ~= "" then
+				return self:RejectSkill(result, "TIER_1_BASE_SKILL_PRESENT")
+			end
+		else
+			if baseSkillId == "" then
+				return self:RejectSkill(result, "BASE_SKILL_ID_MISSING")
+			end
+			if baseSkillId == definition.SkillId then
+				return self:RejectSkill(result, "BASE_SKILL_SELF_REFERENCE")
+			end
+			-- Read the base row instead of validating it, so a tier 3 chain cannot recurse through here.
+			local baseDefinition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(baseSkillId)
+			if baseDefinition.Success == false then
+				return self:RejectSkill(result, "BASE_SKILL_NOT_FOUND")
+			end
+			if baseDefinition.SkillTier ~= definition.SkillTier - 1 then
+				return self:RejectSkill(result, "BASE_SKILL_TIER_MISMATCH")
+			end
+			-- An upgrade belongs to the same job as the skill it replaces; a cross-job link would let a
+			-- job's upgrade stage surface another job's skill.
+			if baseDefinition.RequiredJobTag ~= definition.RequiredJobTag then
+				return self:RejectSkill(result, "BASE_SKILL_JOB_MISMATCH")
+			end
+		end
 		if steps == nil or #steps == 0 then
 			return self:RejectSkill(result, "EFFECT_STEPS_EMPTY")
 		end
@@ -183,7 +259,7 @@ script ContentValidatorLogic extends Logic
 
 		result.Success = true
 		result.Reason = "OK"
-		log("[ContentValidation] skill valid skill=" .. result.SkillId .. " effectSet=" .. definition.EffectSetId .. " steps=" .. #steps .. " cooldown=" .. definition.CooldownTurns)
+		log("[ContentValidation] skill valid skill=" .. result.SkillId .. " tier=" .. definition.SkillTier .. " base=" .. (definition.BaseSkillId or "") .. " effectSet=" .. definition.EffectSetId .. " steps=" .. #steps .. " cooldown=" .. definition.CooldownTurns .. " enemyQueueTurns=" .. definition.EnemyQueueTurns .. " weapon=" .. (definition.WeaponType or "") .. " projectile=" .. (definition.ProjectileRuid or "") .. " icon=" .. (definition.IconRuid or "") .. " hudIcon=" .. (definition.HudIconRuid or ""))
 		return result
 	end
 
@@ -255,6 +331,12 @@ script ContentValidatorLogic extends Logic
 	@ExecSpace("ServerOnly")
 	method table ValidateRegionById(string regionId)
 		return _RegionContentValidatorLogic:ValidateById(regionId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateWeaponById(string weaponType)
+		-- Facade entry point. Weapon row rules and the avatar RUID stay in their dedicated validator object.
+		return _WeaponContentValidatorLogic:ValidateById(weaponType)
 	end
 
 	@ExecSpace("ServerOnly")

@@ -9,8 +9,10 @@ script ContentIntegrityValidatorLogic extends Logic
 			Reason = "CONTENT_INTEGRITY_FAILED",
 			CheckedRegionCount = 0,
 			CheckedStageCount = 0,
+			CheckedStageMapRouteCount = 0,
 			CheckedSkillCount = 0,
 			CheckedEffectStepCount = 0,
+			CheckedWeaponCount = 0,
 			CheckedJobCount = 0,
 			CheckedAugmentCount = 0,
 			CheckedNodeGraphCount = 0,
@@ -25,6 +27,7 @@ script ContentIntegrityValidatorLogic extends Logic
 		}
 		local regionData = _DataService:GetTable(_RegionDefinitionRepositoryLogic.DataSetName)
 		local stageData = _DataService:GetTable(_StageDefinitionRepositoryLogic.DataSetName)
+		local stageMapRouteData = _DataService:GetTable(_StageMapRouteRepositoryLogic.DataSetName)
 		local skillDataSets = self:CollectSkillDataSets(result)
 		local effectData = _DataService:GetTable(_SkillDefinitionRepositoryLogic.EffectStepDataSetName)
 		if regionData == nil then
@@ -36,6 +39,11 @@ script ContentIntegrityValidatorLogic extends Logic
 			self:AddError(result, "StageDefinitions", 0, "", "DATASET_NOT_FOUND")
 		else
 			self:ValidateStages(stageData, result)
+		end
+		if stageMapRouteData == nil then
+			self:AddError(result, "StageMapRoutes", 0, "", "DATASET_NOT_FOUND")
+		else
+			self:ValidateStageMapRoutes(stageMapRouteData, result)
 		end
 		if effectData == nil then
 			self:AddError(result, "SkillEffectSteps", 0, "", "DATASET_NOT_FOUND")
@@ -50,11 +58,38 @@ script ContentIntegrityValidatorLogic extends Logic
 		if result.ErrorCount == 0 then
 			result.Success = true
 			result.Reason = "OK"
-			log("[ContentIntegrity] valid regions=" .. result.CheckedRegionCount .. " stages=" .. result.CheckedStageCount .. " skills=" .. result.CheckedSkillCount .. " effectSteps=" .. result.CheckedEffectStepCount .. " jobs=" .. result.CheckedJobCount .. " augments=" .. result.CheckedAugmentCount .. " nodeGraphs=" .. result.CheckedNodeGraphCount .. " enemyPatterns=" .. result.CheckedEnemyPatternCount .. " bossPhaseOwners=" .. result.CheckedBossPhaseOwnerCount .. " stageRewards=" .. result.CheckedStageRewardCount .. " shops=" .. result.CheckedShopCount .. " shopEntries=" .. result.CheckedShopEntryCount)
+			log("[ContentIntegrity] valid regions=" .. result.CheckedRegionCount .. " stages=" .. result.CheckedStageCount .. " stageMapRoutes=" .. result.CheckedStageMapRouteCount .. " skills=" .. result.CheckedSkillCount .. " effectSteps=" .. result.CheckedEffectStepCount .. " weapons=" .. result.CheckedWeaponCount .. " jobs=" .. result.CheckedJobCount .. " augments=" .. result.CheckedAugmentCount .. " nodeGraphs=" .. result.CheckedNodeGraphCount .. " enemyPatterns=" .. result.CheckedEnemyPatternCount .. " bossPhaseOwners=" .. result.CheckedBossPhaseOwnerCount .. " stageRewards=" .. result.CheckedStageRewardCount .. " shops=" .. result.CheckedShopCount .. " shopEntries=" .. result.CheckedShopEntryCount)
 		else
 			log_error("[ContentIntegrity] rejected errors=" .. result.ErrorCount .. " details=" .. result.ErrorSnapshot)
 		end
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ValidateStageMapRoutes(any dataSet, table result)
+		-- Ensures every declared route uniquely references an existing Stage and passes route validation.
+		local seenStageIds = {}
+		for rowIndex = 1, dataSet:GetRowCount() do
+			result.CheckedStageMapRouteCount = result.CheckedStageMapRouteCount + 1
+			local stageId = dataSet:GetCell(rowIndex, "StageId") or ""
+			if stageId == "" then
+				self:AddError(result, "StageMapRoutes", rowIndex, stageId, "INVALID_STAGE_ID")
+			elseif seenStageIds[stageId] == true then
+				self:AddError(result, "StageMapRoutes", rowIndex, stageId, "DUPLICATE_STAGE_MAP_ROUTE")
+			else
+				seenStageIds[stageId] = true
+				local stageDefinition = _StageDefinitionRepositoryLogic:GetStageDefinition(stageId)
+				if stageDefinition.Success == false then
+					self:AddError(result, "StageMapRoutes", rowIndex, stageId, "STAGE_MAP_ROUTE_STAGE_REFERENCE_MISSING")
+				else
+					local route = _StageMapRouteRepositoryLogic:GetMapRoute(stageId)
+					if route == nil or route.Success ~= true then
+						local reason = route == nil and "STAGE_MAP_ROUTE_RESULT_MISSING" or (route.DetailReason or route.Reason)
+						self:AddError(result, "StageMapRoutes", rowIndex, stageId, reason)
+					end
+				end
+			end
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -88,6 +123,7 @@ script ContentIntegrityValidatorLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method void ValidateRegisteredDomains(table result)
+		self:ValidateDomainIds("WeaponDefinitions", "WeaponType", "WEAPON", result)
 		self:ValidateDomainIds("JobDefinitions", "JobId", "JOB", result)
 		self:ValidateDomainIds("AugmentDefinitions", "AugmentId", "AUGMENT", result)
 		self:ValidateDomainIds("NodeDefinitions", "NodeGraphId", "NODE_GRAPH", result)
@@ -127,7 +163,10 @@ script ContentIntegrityValidatorLogic extends Logic
 			elseif seen[contentId] ~= true then
 				seen[contentId] = true
 				local validation = nil
-				if domainType == "JOB" then
+				if domainType == "WEAPON" then
+					result.CheckedWeaponCount = result.CheckedWeaponCount + 1
+					validation = _ContentValidatorLogic:ValidateWeaponById(contentId)
+				elseif domainType == "JOB" then
 					result.CheckedJobCount = result.CheckedJobCount + 1
 					validation = _ContentValidatorLogic:ValidateJobById(contentId)
 				elseif domainType == "AUGMENT" then
@@ -179,13 +218,6 @@ script ContentIntegrityValidatorLogic extends Logic
 				else
 					seenRegionStageIndices[regionStageKey] = true
 				end
-			end
-		end
-		for rowIndex = 1, dataSet:GetRowCount() do
-			local stageId = dataSet:GetCell(rowIndex, "StageId") or ""
-			local nextStageId = dataSet:GetCell(rowIndex, "NextStageId") or ""
-			if nextStageId ~= "" and nextStageId ~= stageId and seen[nextStageId] ~= true then
-				self:AddError(result, "StageDefinitions", rowIndex, stageId, "NEXT_STAGE_NOT_FOUND:" .. nextStageId)
 			end
 		end
 	end
