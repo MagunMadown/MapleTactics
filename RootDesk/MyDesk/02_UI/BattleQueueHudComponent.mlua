@@ -61,6 +61,14 @@ script BattleQueueHudComponent extends Component
 	property string InputFeedbackText = ""
 	property integer InputFeedbackTimerId = 0
 	property number InputFeedbackDuration = 0.30
+	property number QueueFeedbackDuration = 0.10
+	property number SkillPunchScale = 1.10
+	property number QueuePopStartScale = 0.84
+	property number QueuePopPeakScale = 1.12
+	property string QueueConfirmSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+	property number QueueConfirmSoundVolume = 0.35
+	property boolean HasQueueFeedbackSnapshot = false
+	property string LastQueuedTileIds = ""
 	property any SkillSlot1ClickHandler = nil
 	property any SkillSlot2ClickHandler = nil
 	property any SkillSlot3ClickHandler = nil
@@ -77,6 +85,7 @@ script BattleQueueHudComponent extends Component
 	method void OnBeginPlay()
 		-- The view binds UI controls and consumes presentation state without reading battle components directly.
 		log("[BattleQueueHUD] ready")
+		self._T.SkillIconFeedbackTimers = {}
 		self:SetHudContextVisible(false, "INITIALIZING")
 		self.PresenterStateChangedHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudStateChangedEvent, self.OnPresenterStateChanged)
 		self.PresenterCommandResultHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudCommandResultEvent, self.OnPresenterCommandResult)
@@ -95,6 +104,9 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
 		-- Disconnects button callbacks so UI reloads cannot duplicate tile requests.
+		for slotIndex = 1, 6 do
+			self:StopSkillIconFeedback(slotIndex)
+		end
 		if self.InputFeedbackTimerId > 0 then
 			_TimerService:ClearTimer(self.InputFeedbackTimerId)
 			self.InputFeedbackTimerId = 0
@@ -152,6 +164,8 @@ script BattleQueueHudComponent extends Component
 		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
 		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
 			local reason = presenterState == nil and "PRESENTER_STATE_MISSING" or presenterState.ContextReason
+			self.HasQueueFeedbackSnapshot = false
+			self.LastQueuedTileIds = ""
 			self:SetHudContextVisible(false, reason)
 			self:SetUnavailableState("전투 상태 없음")
 			return
@@ -222,7 +236,14 @@ script BattleQueueHudComponent extends Component
 		local ownedSkills = uiState.RunInventory.SkillSnapshot
 		self.SlotSkillIds = session.SkillSlotIds
 		self.SlotSkillNames = session.SkillSlotNames
+		local queuedSkillForPop = self:CaptureQueuedSkillForFeedback(queueState.QueuedTileIds)
 		self:RefreshSkillSlots(canChooseTile, ownedSkills, cooldownSnapshot, slotQueueIds)
+		if queuedSkillForPop ~= "" then
+			local queuedSlotIndex = self:FindSkillSlotIndex(queuedSkillForPop)
+			if queuedSlotIndex > 0 then
+				self:PlayQueueIconPop(queuedSlotIndex, queuedSkillForPop)
+			end
+		end
 		self.ExecuteButton.Enable = canUseQueuedTile
 		self.ClearButton.Enable = uiState.Commands.CanClear
 		if visibleQueue == "" then
@@ -490,6 +511,133 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method integer FindSkillSlotIndex(string skillId)
+		for slotIndex = 1, 6 do
+			if self:GetSlotSkillId(slotIndex) == skillId then
+				return slotIndex
+			end
+		end
+		return 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method string CaptureQueuedSkillForFeedback(string queuedTileIds)
+		-- Only an authoritative Queue growth produces the confirmation pop; initial hydration and clears stay silent.
+		local currentQueue = queuedTileIds or ""
+		if self.HasQueueFeedbackSnapshot == false then
+			self.HasQueueFeedbackSnapshot = true
+			self.LastQueuedTileIds = currentQueue
+			return ""
+		end
+
+		local previousCount = self:GetTileCount(self.LastQueuedTileIds)
+		local currentCount = self:GetTileCount(currentQueue)
+		self.LastQueuedTileIds = currentQueue
+		if currentCount <= previousCount then
+			return ""
+		end
+
+		local index = 0
+		local queuedSkillId = ""
+		for skillId in string.gmatch(currentQueue, "([^|]+)") do
+			index = index + 1
+			if index == currentCount then
+				queuedSkillId = skillId
+			end
+		end
+		return queuedSkillId
+	end
+
+	@ExecSpace("ClientOnly")
+	method SpriteGUIRendererComponent GetSkillIcon(integer slotIndex)
+		if slotIndex == 1 then
+			return self.SkillSlot1Icon
+		elseif slotIndex == 2 then
+			return self.SkillSlot2Icon
+		elseif slotIndex == 3 then
+			return self.SkillSlot3Icon
+		elseif slotIndex == 4 then
+			return self.SkillSlot4Icon
+		elseif slotIndex == 5 then
+			return self.SkillSlot5Icon
+		elseif slotIndex == 6 then
+			return self.SkillSlot6Icon
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopSkillIconFeedback(integer slotIndex)
+		local timerRecords = self._T.SkillIconFeedbackTimers
+		if timerRecords == nil then
+			return
+		end
+		local record = timerRecords[slotIndex]
+		if record == nil then
+			return
+		end
+		if record.MidTimerId ~= nil and record.MidTimerId > 0 then
+			_TimerService:ClearTimer(record.MidTimerId)
+		end
+		if record.RestoreTimerId ~= nil and record.RestoreTimerId > 0 then
+			_TimerService:ClearTimer(record.RestoreTimerId)
+		end
+		local icon = self:GetSkillIcon(slotIndex)
+		if icon ~= nil and isvalid(icon.Entity) and icon.Entity.UITransformComponent ~= nil then
+			icon.Entity.UITransformComponent.RectSize = record.BaseSize
+		end
+		timerRecords[slotIndex] = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlaySkillIconScaleSequence(integer slotIndex, number immediateScale, number middleScale)
+		-- RectSize scaling is visual-only and runs independently from the command/turn pipeline.
+		self:StopSkillIconFeedback(slotIndex)
+		local icon = self:GetSkillIcon(slotIndex)
+		if icon == nil or isvalid(icon.Entity) == false or icon.Entity.UITransformComponent == nil then
+			return
+		end
+		local duration = math.max(0.08, math.min(0.12, self.QueueFeedbackDuration))
+		local iconEntity = icon.Entity
+		local baseSize = iconEntity.UITransformComponent.RectSize
+		local timerRecords = self._T.SkillIconFeedbackTimers
+		if timerRecords == nil then
+			timerRecords = {}
+			self._T.SkillIconFeedbackTimers = timerRecords
+		end
+		local record = { BaseSize = baseSize, MidTimerId = 0, RestoreTimerId = 0 }
+		timerRecords[slotIndex] = record
+		iconEntity.UITransformComponent.RectSize = Vector2(baseSize.x * immediateScale, baseSize.y * immediateScale)
+		record.MidTimerId = _TimerService:SetTimerOnce(function()
+			if isvalid(iconEntity) and iconEntity.UITransformComponent ~= nil then
+				iconEntity.UITransformComponent.RectSize = Vector2(baseSize.x * middleScale, baseSize.y * middleScale)
+			end
+		end, duration * 0.42)
+		record.RestoreTimerId = _TimerService:SetTimerOnce(function()
+			if isvalid(iconEntity) and iconEntity.UITransformComponent ~= nil then
+				iconEntity.UITransformComponent.RectSize = baseSize
+			end
+			if self._T.SkillIconFeedbackTimers ~= nil then
+				self._T.SkillIconFeedbackTimers[slotIndex] = nil
+			end
+		end, duration)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlaySkillIconPunch(integer slotIndex)
+		self:PlaySkillIconScaleSequence(slotIndex, self.SkillPunchScale, 0.97)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayQueueIconPop(integer slotIndex, string skillId)
+		self:PlaySkillIconScaleSequence(slotIndex, self.QueuePopStartScale, self.QueuePopPeakScale)
+		if self.QueueConfirmSoundRUID ~= "" then
+			_SoundService:PlaySound(self.QueueConfirmSoundRUID, self.QueueConfirmSoundVolume)
+		end
+		log("[BattleQueueHUD] queue feedback slot=" .. tostring(slotIndex) .. " skill=" .. skillId .. " duration=" .. tostring(self.QueueFeedbackDuration))
+	end
+
+	@ExecSpace("ClientOnly")
 	method string GetSlotSkillName(integer slotIndex)
 		local index = 0
 		for token in string.gmatch(self.SlotSkillNames or "", "([^|]+)") do
@@ -692,6 +840,7 @@ script BattleQueueHudComponent extends Component
 			return
 		end
 
+		self:PlaySkillIconPunch(slotIndex)
 		log("[BattleQueueHUD] register clicked slot=" .. slotIndex .. " tile=" .. skillId)
 		_BattleHudPresenterLogic:RequestQueueTile(skillId)
 	end
