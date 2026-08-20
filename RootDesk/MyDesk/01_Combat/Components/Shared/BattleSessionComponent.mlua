@@ -130,6 +130,7 @@ script BattleSessionComponent extends Component
 	@Sync property number MoveActionDuration = 0.12
 	@Sync property string MoveCurve = "QUAD_EASE_OUT"
 	@Sync property number MoveSnapThreshold = 0.01
+	property number MoveCompletionFallbackGrace = 0.05
 	@Sync property boolean EnablePlayerHopVisual = true
 	@Sync property number PlayerHopDuration = 0.13
 	@Sync property number PlayerHopHeight = 0.09
@@ -153,8 +154,8 @@ script BattleSessionComponent extends Component
 	@Sync property number EnemyHopPeakProgress = 0.50
 	@Sync property string EnemyHopAnimationRuid = "6df12df0c9ce4caea61385606a4d40d3"
 	@Sync property number EnemyHopAnimationPlayRate = 1.8
-	@Sync property number PlayerToEnemyBeatDuration = 0.12
-	@Sync property number EnemyToPlayerBeatDuration = 0.08
+	@Sync property number PlayerToEnemyBeatDuration = 0.05
+	@Sync property number EnemyToPlayerBeatDuration = 0.04
 	@Sync property number QueuePopDuration = 0.10
 	@Sync property number NormalHitStopDuration = 0.04
 	@Sync property number StrongHitStopDuration = 0.065
@@ -169,7 +170,8 @@ script BattleSessionComponent extends Component
 	property number BasicAttackActionDuration = 0.45
 	property number HeavySlashActionDuration = 0.70
 	property number PushActionDuration = 0.40
-	property number EnemyThinkDuration = 0.25
+	-- Enemy intents are prepared before execution; this is only the visual beat between consecutive enemies.
+	property number EnemyThinkDuration = 0.06
 	property number EnemyMoveActionDuration = 0.12
 	property number EnemyAttackActionDuration = 0.30
 	property string EnemyModelId = "battledummyenemy"
@@ -1416,6 +1418,13 @@ script BattleSessionComponent extends Component
 		local complete = function()
 			self:CompleteQueuedAction(actionType, true, actionResult.Reason)
 		end
+		if actionType == "MOVE" and actionResult.PresentationStarted == true and self._T.playerGridMove ~= nil then
+			-- The visual snap is the primary completion signal. This slightly-late timer is only a
+			-- fail-safe so a lost presentation update can never leave the authoritative turn locked.
+			self._T.playerGridMove.CompletionReason = actionResult.Reason
+			self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration + math.max(0.02, self.MoveCompletionFallbackGrace))
+			return
+		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
 	end
 
@@ -1435,6 +1444,10 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void CompleteQueuedAction(string actionType, boolean success, string reason)
 		-- A valid player action hands control to the enemy; invalid actions release input immediately.
+		if self.TurnState == nil or self.TurnState.QueuedActionType ~= actionType then
+			log_warning("[BattleTurnTempo] duplicate immediate completion blocked action=" .. actionType .. " reason=" .. reason)
+			return
+		end
 		if actionType == "MOVE" then
 			self:FinishPlayerGridMovePresentation("ACTION_COMPLETE")
 		end
@@ -1508,9 +1521,11 @@ script BattleSessionComponent extends Component
 				traitIds = enemyUnit.EnemyTraitIds
 			end
 		end
+		-- The intent has already been selected and frozen. This value is presentation cadence only;
+		-- no AI result is applied until the callback actually executes the prepared intent.
 		local executeDelay = _EnemyTraitRouterLogic:GetEnemyThinkDuration(traitIds, self.EnemyThinkDuration)
 		if usePlayerTransitionBeat == true then
-			executeDelay = math.max(0.08, math.min(0.18, self.PlayerToEnemyBeatDuration))
+			executeDelay = math.max(0.03, math.min(0.08, self.PlayerToEnemyBeatDuration))
 			log("[BattleTurnTempo] enemy action queued after player beat=" .. tostring(executeDelay) .. " enemy=" .. preparedIntent.EnemyId)
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(execute, executeDelay)
@@ -2353,7 +2368,7 @@ script BattleSessionComponent extends Component
 			return
 		end
 
-		local beatDuration = math.max(0.05, math.min(0.12, self.EnemyToPlayerBeatDuration))
+		local beatDuration = math.max(0.02, math.min(0.06, self.EnemyToPlayerBeatDuration))
 		local finishTransition = function()
 			self:FinishEnemyToPlayerTransition(actionType, success, reason)
 		end
@@ -5106,6 +5121,7 @@ script BattleSessionComponent extends Component
 		local position = self:GetCellPosition(result.ToCell)
 		if unit.Team == "Player" and unit.UnitId == "player_01" then
 			local started = self:StartPlayerGridMovePresentation(unitEntity, result.FromCell, result.ToCell)
+			result.PresentationStarted = started
 			if started == false then
 				self:PlaceEntity(unitEntity, position)
 			end
@@ -5501,6 +5517,19 @@ script BattleSessionComponent extends Component
 			.. " reason=" .. tostring(reason)
 			.. " snappedX=" .. tostring(targetPosition.x)
 			.. " snappedY=" .. tostring(targetPosition.y))
+
+		if reason == "VISUAL_COMPLETE"
+			and self.TurnState ~= nil
+			and self.TurnState.QueuedActionType == "MOVE"
+			and self.TurnState.IsActionProcessing == true then
+			if self.ActionTimerId > 0 then
+				_TimerService:ClearTimer(self.ActionTimerId)
+				self.ActionTimerId = 0
+			end
+			local completionReason = movement.CompletionReason or "MOVE_VISUAL_COMPLETE"
+			log("[BattleTurnTempo] player move completed by visual snap reason=" .. completionReason)
+			self:CompleteQueuedAction("MOVE", true, completionReason)
+		end
 	end
 
 	@ExecSpace("ServerOnly")
