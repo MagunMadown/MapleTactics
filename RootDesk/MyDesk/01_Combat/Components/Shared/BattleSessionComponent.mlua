@@ -12,6 +12,10 @@ script BattleSessionComponent extends Component
 	@Sync property integer ExecutingTileIndex = 0
 	@Sync property integer TileQueueCapacity = 3
 	@Sync property string BattleResult = ""
+	-- Stable map-owned HP snapshot for client HUDs. Player battle components are attached at runtime.
+	@Sync property number PlayerCurrentHp = 0
+	@Sync property number PlayerMaxHp = 0
+	@Sync property integer PlayerHpRevision = 0
 	@Sync property string PreparedEnemyIntentState = "EMPTY"
 	@Sync property string PreparedEnemyId = ""
 	@Sync property string PreparedEnemyPatternId = ""
@@ -298,6 +302,7 @@ script BattleSessionComponent extends Component
 			end
 			return
 		end
+		self:RefreshPlayerHpSnapshot("")
 		-- Battle map entities persist after the player visits a reward map. Observe the
 		-- exit first, then consume a newly prepared request when the player returns.
 		-- This prevents a same-map Stage route from inheriting the cleared session.
@@ -322,6 +327,29 @@ script BattleSessionComponent extends Component
 
 		if self.BattlePhase == "Setup" then
 			self:TryStartBattle()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshPlayerHpSnapshot(string reason)
+		-- Mirrors runtime-owned player HP onto the placed battle session for reliable client UI sync.
+		if isvalid(self.PlayerEntity) == false then
+			return
+		end
+		local playerUnit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if playerUnit == nil or playerUnit.Team ~= "Player" then
+			return
+		end
+		local currentHp = math.max(0, playerUnit.CurrentHp)
+		local maxHp = math.max(1, playerUnit.MaxHp)
+		if self.PlayerCurrentHp == currentHp and self.PlayerMaxHp == maxHp then
+			return
+		end
+		self.PlayerCurrentHp = currentHp
+		self.PlayerMaxHp = maxHp
+		self.PlayerHpRevision = self.PlayerHpRevision + 1
+		if reason ~= nil and reason ~= "" then
+			log("[BattlePlayerHp] synced reason=" .. reason .. " hp=" .. tostring(currentHp) .. "/" .. tostring(maxHp) .. " revision=" .. tostring(self.PlayerHpRevision))
 		end
 	end
 
@@ -447,7 +475,8 @@ script BattleSessionComponent extends Component
 		if self:CanSpawnWave(definition.SpawnCount, definition.MaxConcurrent) == false then
 			self.WaveRuntime:MarkSpawnPending(waveNumber, "CAPACITY_WAIT")
 			self:PublishWaveStateSnapshot("CAPACITY_WAIT")
-			log_warning("[BattleWave] pending stage=" .. self.StageId .. " wave=" .. waveNumber .. " reason=CAPACITY_WAIT count=" .. definition.SpawnCount .. " maxConcurrent=" .. definition.MaxConcurrent)
+			-- Capacity wait is normal back-pressure while the configured live-enemy cap is full.
+			log("[BattleWave] pending stage=" .. self.StageId .. " wave=" .. waveNumber .. " reason=CAPACITY_WAIT count=" .. definition.SpawnCount .. " maxConcurrent=" .. definition.MaxConcurrent)
 			return
 		end
 		local spawnDefinitions = {}
@@ -739,10 +768,31 @@ script BattleSessionComponent extends Component
 			playerMaxHp = 100
 		end
 		self:ConfigureUnit(player, "player_01", "Player", self.PlayerStartCell, "Right", playerMaxHp, 1)
+		self:RestorePlayerRunHp(player, runState, "PLAYER_REGISTERED")
+		self:RefreshPlayerHpSnapshot("PLAYER_REGISTERED")
 		if self.CurrentWave > 0 and previousRunSeed ~= self.RunSeed then
 			log("[BattleRun] rebuilding for restored seed previous=" .. previousRunSeed .. " current=" .. self.RunSeed)
 			self:RebuildBattleState("RUN_CONTEXT_SYNC")
 		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RestorePlayerRunHp(Entity playerEntity, any runState, string reason)
+		-- Restores the player-owned run HP after battle-unit initialization on every map entry or rebuild.
+		if isvalid(playerEntity) == false or runState == nil then
+			return { Success = false, Reason = "RUN_HP_CONTEXT_MISSING" }
+		end
+		local playerUnit = playerEntity:GetComponent("script.BattleUnitComponent")
+		if playerUnit == nil then
+			return { Success = false, Reason = "PLAYER_UNIT_MISSING" }
+		end
+		local hpSnapshot = runState:EnsureRunHpInitialized(playerUnit.MaxHp, reason)
+		if hpSnapshot.Success == false then
+			return hpSnapshot
+		end
+		local restoreResult = playerUnit:RestoreCurrentHp(hpSnapshot.CurrentHp)
+		log("[RunHp] restored stage=" .. self.StageId .. " hp=" .. restoreResult.HpAfter .. "/" .. restoreResult.MaxHp .. " reason=" .. (reason or ""))
+		return restoreResult
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1416,6 +1466,17 @@ script BattleSessionComponent extends Component
 			log_error("[BattleEnemyIntent] pattern runner missing enemy=" .. enemyUnitId)
 			return { ActionType = "WAIT", TileId = "", Direction = 0, Reason = "PATTERN_RUNNER_MISSING", PatternId = enemy.EnemyPatternId, StepIndex = 1, PatternStepCount = 0 }
 		end
+		if patternRunner.PatternId ~= enemy.EnemyPatternId then
+			-- Reset/rebuild can replace an enemy definition while reusing its stable UnitId.
+			-- The BattleUnit definition is authoritative; a step index from the previous pattern cannot be carried over safely.
+			local previousPatternId = patternRunner.PatternId
+			local alignment = patternRunner:InitializePattern(enemy.EnemyPatternId, 1)
+			if alignment.Success == false then
+				log_error("[BattleEnemyIntent] pattern runner resync failed enemy=" .. enemyUnitId .. " unitPattern=" .. enemy.EnemyPatternId .. " runnerPattern=" .. previousPatternId .. " reason=" .. alignment.Reason)
+				return { ActionType = "WAIT", TileId = "", Direction = 0, Reason = "PATTERN_RUNNER_RESYNC_FAILED_" .. alignment.Reason, PatternId = enemy.EnemyPatternId, StepIndex = 1, PatternStepCount = 0 }
+			end
+			log_warning("[BattleEnemyIntent] pattern runner resynced enemy=" .. enemyUnitId .. " previous=" .. previousPatternId .. " current=" .. enemy.EnemyPatternId)
+		end
 
 		local patternValidation = _EnemyPatternContentValidatorLogic:ValidateById(enemy.EnemyPatternId)
 		if patternValidation.Success == false then
@@ -1553,6 +1614,11 @@ script BattleSessionComponent extends Component
 			return result
 		end
 		local intent = self:BuildEnemyIntent(enemyUnitId)
+		if intent.PatternId == nil or intent.PatternId == "" then
+			-- Preserve the actual planning failure (for example UNIT_UNAVAILABLE after a zero-HP reset)
+			-- instead of passing an empty id to the runner and reporting a misleading mismatch.
+			return { Success = false, Reason = intent.Reason or "ENEMY_INTENT_UNAVAILABLE" }
+		end
 		local preparedMovementPolicy = ""
 		local preparedEnemyEntity = self:FindUnitEntity(enemyUnitId)
 		if isvalid(preparedEnemyEntity) == false then
@@ -1578,6 +1644,17 @@ script BattleSessionComponent extends Component
 				return traitPlan
 			end
 			local markResult = patternRunner:TryMarkPrepared(intent.PatternId, intent.StepIndex, intent.PatternStepCount or 0, intent.ActionType, intent.TelegraphTurnsRemaining or 0)
+			if markResult.Success == false and markResult.Reason == "PATTERN_ID_MISMATCH" then
+				-- Recover once at the mutation boundary in case reset/rebuild swapped runtime state after intent resolution.
+				local previousPatternId = patternRunner.PatternId
+				local recovery = patternRunner:InitializePattern(intent.PatternId, intent.StepIndex)
+				if recovery.Success == true then
+					markResult = patternRunner:TryMarkPrepared(intent.PatternId, intent.StepIndex, intent.PatternStepCount or 0, intent.ActionType, intent.TelegraphTurnsRemaining or 0)
+					log_warning("[BattleEnemyIntent] pattern mismatch recovered enemy=" .. enemyUnitId .. " previous=" .. previousPatternId .. " current=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " success=" .. tostring(markResult.Success))
+				else
+					return { Success = false, Reason = "PATTERN_MISMATCH_RECOVERY_FAILED_" .. recovery.Reason }
+				end
+			end
 			if markResult.Success == false then
 				return markResult
 			end
@@ -3589,7 +3666,14 @@ script BattleSessionComponent extends Component
 		end
 		self:CleanupRegisteredEnemies(reason)
 		self.PlayerEntity = playerEntity
-		self:ConfigureUnit(playerEntity, "player_01", "Player", self.PlayerStartCell, "Right", 100, 1)
+		local runState = _RunManagerLogic:EnsureRunState(playerEntity, self.RunSeed)
+		local playerMaxHp = self.SelectedJobBaseMaxHp
+		if playerMaxHp <= 0 then
+			playerMaxHp = 100
+		end
+		self:ConfigureUnit(playerEntity, "player_01", "Player", self.PlayerStartCell, "Right", playerMaxHp, 1)
+		self:RestorePlayerRunHp(playerEntity, runState, "BATTLE_REBUILD_" .. reason)
+		self:RefreshPlayerHpSnapshot("BATTLE_REBUILD_" .. reason)
 		self:StartStageById(self.StageId)
 
 		result.Success = true
@@ -4385,6 +4469,9 @@ script BattleSessionComponent extends Component
 		result.HpBefore = damageResult.HpBefore
 		result.HpAfter = damageResult.HpAfter
 		result.AppliedAmount = damageResult.AppliedAmount
+		if targetUnit.Team == "Player" then
+			self:RefreshPlayerHpSnapshot("DAMAGE_APPLIED")
+		end
 		if damageResult.ReachedZero == true then
 			self:HandleUnitDiedFromSource(targetUnitId, "DAMAGE", sourceUnitId)
 		end

@@ -303,13 +303,20 @@ script BattleUnitHpHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void RefreshViewVisual(table view, any unit, number delta)
-		-- Normal units use discrete pips; only bosses retain the smooth top-screen fill bar.
-		local targetRatio = self:GetHpRatio(unit.CurrentHp, unit.MaxHp)
+		-- Normal units use discrete pips; player HP prefers the stable map-owned synchronized snapshot.
+		local currentHp = unit.CurrentHp
+		local maxHp = unit.MaxHp
+		local session = self._T.BattleSession
+		if unit.Team == "Player" and session ~= nil and session.PlayerMaxHp > 0 then
+			currentHp = session.PlayerCurrentHp
+			maxHp = session.PlayerMaxHp
+		end
+		local targetRatio = self:GetHpRatio(currentHp, maxHp)
 		if math.abs(targetRatio - view.TargetRatio) > 0.0001 then
 			view.StartRatio = view.DisplayRatio
 			view.TargetRatio = targetRatio
 			view.SmoothElapsed = 0
-			log("[BattleUnitHpHUD] hp target unit=" .. unit.UnitId .. " hp=" .. tostring(unit.CurrentHp) .. "/" .. tostring(unit.MaxHp) .. " ratio=" .. tostring(targetRatio))
+			log("[BattleUnitHpHUD] hp target unit=" .. unit.UnitId .. " hp=" .. tostring(currentHp) .. "/" .. tostring(maxHp) .. " ratio=" .. tostring(targetRatio))
 		end
 		if view.IsBoss then
 			local duration = math.max(0.01, self.SmoothDuration)
@@ -324,9 +331,9 @@ script BattleUnitHpHudComponent extends Component
 		else
 			view.DisplayRatio = targetRatio
 			view.TargetRatio = targetRatio
-			self:RefreshPips(view, unit.CurrentHp, unit.MaxHp, unit.Team)
+			self:RefreshPips(view, currentHp, maxHp, unit.Team)
 		end
-		self:RefreshHpText(view, unit.CurrentHp, unit.MaxHp)
+		self:RefreshHpText(view, currentHp, maxHp)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -340,34 +347,57 @@ script BattleUnitHpHudComponent extends Component
 			return
 		end
 		local normalizedMaxHp = math.max(1, maxHp)
-		local targetPips = math.max(1, math.min(availablePips, self.TargetPipCount))
-		local hpPerPip = 1
+		local isPlayer = team == "Player"
+		-- Players use the fixed 10-slot 5-by-2 HUD. Regular monsters use their own MaxHp.
 		local maxPips = math.min(availablePips, math.max(1, math.ceil(normalizedMaxHp)))
-		if normalizedMaxHp > availablePips then
-			hpPerPip = math.max(1, math.ceil(normalizedMaxHp / targetPips))
-			maxPips = math.min(availablePips, math.max(1, math.ceil(normalizedMaxHp / hpPerPip)))
+		if isPlayer then
+			maxPips = math.min(availablePips, 10)
 		end
 		local filledPips = 0
 		if currentHp > 0 then
-			filledPips = math.min(maxPips, math.ceil(currentHp / hpPerPip))
-		end
-		local rowWidth = maxPips * self.PipWidth + math.max(0, maxPips - 1) * self.PipSpacing
-		view.PipLayer.UITransformComponent.RectSize = Vector2(rowWidth, self.PipHeight)
-		local ratio = self:GetHpRatio(currentHp, maxHp)
-		local filledColor = Color(1.00, 0.34, 0.18, 1)
-		if team == "Player" then
-			filledColor = Color(0.27, 0.88, 0.86, 1)
-			if ratio <= self.DangerRatio then
-				filledColor = Color(1.00, 0.20, 0.13, 1)
+			local hpRatio = math.max(0, math.min(1, currentHp / normalizedMaxHp))
+			if isPlayer and currentHp >= normalizedMaxHp then
+				filledPips = maxPips
+			elseif isPlayer then
+				-- Floor makes the first point of damage immediately turn at least one slot gray.
+				filledPips = math.max(1, math.min(maxPips - 1, math.floor(hpRatio * maxPips)))
+			elseif normalizedMaxHp <= availablePips then
+				-- Regular monsters map one visible pip to one point of their own HP.
+				filledPips = math.min(maxPips, math.ceil(currentHp))
+			else
+				filledPips = math.max(1, math.min(maxPips, math.ceil(hpRatio * maxPips)))
 			end
 		end
-		local emptyColor = Color(0.08, 0.11, 0.16, 1)
+		local gridColumns = maxPips
+		if isPlayer then
+			gridColumns = math.min(5, maxPips)
+		end
+		local gridRows = math.max(1, math.ceil(maxPips / gridColumns))
+		local rowWidth = gridColumns * self.PipWidth + math.max(0, gridColumns - 1) * self.PipSpacing
+		local gridHeight = gridRows * self.PipHeight + math.max(0, gridRows - 1) * self.PipSpacing
+		view.PipLayer.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight)
+		if isvalid(view.Root) and view.Root.UITransformComponent ~= nil then
+			view.Root.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight + 44)
+		end
+		if isvalid(view.HpText) and view.HpText.UITransformComponent ~= nil then
+			view.HpText.UITransformComponent.anchoredPosition = Vector2(0, -gridHeight * 0.5 - 12)
+		end
+		local filledColor = Color(1.00, 0.34, 0.18, 1)
+		if team == "Player" then
+			-- Keep remaining player HP red like the reference pip row.
+			filledColor = Color(0.82, 0.16, 0.13, 1)
+		end
+		-- Depleted HP stays visible as a neutral gray slot instead of disappearing.
+		local emptyColor = Color(0.27, 0.27, 0.27, 1)
 		for index, pip in ipairs(view.Pips) do
 			local visible = self.ShowPips and index <= maxPips
 			pip.Enable = visible
 			if pip.UITransformComponent ~= nil then
-				local x = -rowWidth * 0.5 + self.PipWidth * 0.5 + (index - 1) * (self.PipWidth + self.PipSpacing)
-				pip.UITransformComponent.anchoredPosition = Vector2(x, 0)
+				local columnIndex = (index - 1) % gridColumns
+				local rowIndex = math.floor((index - 1) / gridColumns)
+				local x = -rowWidth * 0.5 + self.PipWidth * 0.5 + columnIndex * (self.PipWidth + self.PipSpacing)
+				local y = gridHeight * 0.5 - self.PipHeight * 0.5 - rowIndex * (self.PipHeight + self.PipSpacing)
+				pip.UITransformComponent.anchoredPosition = Vector2(x, y)
 				pip.UITransformComponent.RectSize = Vector2(self.PipWidth, self.PipHeight)
 			end
 			if pip.SpriteGUIRendererComponent ~= nil then
@@ -379,10 +409,10 @@ script BattleUnitHpHudComponent extends Component
 				end
 			end
 		end
-		local signature = tostring(math.floor(normalizedMaxHp)) .. ":" .. tostring(hpPerPip) .. ":" .. tostring(maxPips) .. ":" .. tostring(filledPips)
+		local signature = tostring(math.floor(normalizedMaxHp)) .. ":" .. tostring(maxPips) .. ":" .. tostring(filledPips)
 		if signature ~= view.LastPipSignature then
 			view.LastPipSignature = signature
-			log("[BattleUnitHpHUD] pips unit=" .. view.UnitId .. " hp=" .. tostring(currentHp) .. "/" .. tostring(maxHp) .. " perPip=" .. tostring(hpPerPip) .. " filled=" .. tostring(filledPips) .. "/" .. tostring(maxPips))
+			log("[BattleUnitHpHUD] pips unit=" .. view.UnitId .. " hp=" .. tostring(currentHp) .. "/" .. tostring(maxHp) .. " filled=" .. tostring(filledPips) .. "/" .. tostring(maxPips))
 		end
 	end
 
@@ -533,9 +563,12 @@ script BattleUnitHpHudComponent extends Component
 			return
 		end
 		if view.IsBoss == false then
-			local pipCount = math.max(1, math.min(#view.Pips, self.MaxVisiblePips))
-			local rowWidth = pipCount * self.PipWidth + math.max(0, pipCount - 1) * self.PipSpacing
-			view.Root.UITransformComponent.RectSize = Vector2(rowWidth, self.PipHeight + 44)
+			local pipCount = math.max(1, math.min(#view.Pips, math.min(self.MaxVisiblePips, 10)))
+			local gridColumns = math.min(5, pipCount)
+			local gridRows = math.max(1, math.ceil(pipCount / gridColumns))
+			local rowWidth = gridColumns * self.PipWidth + math.max(0, gridColumns - 1) * self.PipSpacing
+			local gridHeight = gridRows * self.PipHeight + math.max(0, gridRows - 1) * self.PipSpacing
+			view.Root.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight + 44)
 			if isvalid(view.Frame) then
 				view.Frame.Enable = false
 			end
@@ -553,18 +586,21 @@ script BattleUnitHpHudComponent extends Component
 			end
 			if isvalid(view.PipLayer) and view.PipLayer.UITransformComponent ~= nil then
 				view.PipLayer.Enable = true
-				view.PipLayer.UITransformComponent.RectSize = Vector2(rowWidth, self.PipHeight)
+				view.PipLayer.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight)
 			end
 			for index, pip in ipairs(view.Pips) do
 				pip.Enable = false
 				if pip.UITransformComponent ~= nil then
-					local x = -rowWidth * 0.5 + self.PipWidth * 0.5 + (index - 1) * (self.PipWidth + self.PipSpacing)
-					pip.UITransformComponent.anchoredPosition = Vector2(x, 0)
+					local columnIndex = (index - 1) % gridColumns
+					local rowIndex = math.floor((index - 1) / gridColumns)
+					local x = -rowWidth * 0.5 + self.PipWidth * 0.5 + columnIndex * (self.PipWidth + self.PipSpacing)
+					local y = gridHeight * 0.5 - self.PipHeight * 0.5 - rowIndex * (self.PipHeight + self.PipSpacing)
+					pip.UITransformComponent.anchoredPosition = Vector2(x, y)
 					pip.UITransformComponent.RectSize = Vector2(self.PipWidth, self.PipHeight)
 				end
 			end
 			if isvalid(view.HpText) and view.HpText.UITransformComponent ~= nil then
-				view.HpText.UITransformComponent.anchoredPosition = Vector2(0, -self.PipHeight * 0.5 - 12)
+				view.HpText.UITransformComponent.anchoredPosition = Vector2(0, -gridHeight * 0.5 - 12)
 			end
 			return
 		end
