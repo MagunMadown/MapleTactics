@@ -252,6 +252,7 @@ Effect Step은 데이터 순서대로 실행된다. 앞선 DAMAGE Step에서 전
 | 넉백 위치 변경 | `BattleSessionComponent.ResolvePushImpactOnTarget` |
 | 사망 시작 | `BattleSessionComponent.ApplyDamage`의 `HandleUnitDiedFromSource` 호출 |
 | 입력 Lock | 즉시 행동: `TryReserveImmediateAction`; Execute: `TryFreezeSkillQueue`; 적 턴: `BeginEnemyTurn` |
+| 행동 종료 직후 임시 Release | 이동: `CompleteImmediateAction`; Execute: `CompleteSkillQueue`가 `IsActionProcessing = false`를 Publish한 직후 같은 서버 흐름에서 `BeginEnemyTurn`으로 다시 Lock |
 | 서버 입력 Unlock | `BattleTurnComponent.OpenPlayerTurn` |
 | HUD 입력 Unlock | 동기화 후 `BattleHudPresenterLogic` Poll 및 `BattleQueueHudComponent.RefreshHud` |
 
@@ -280,16 +281,21 @@ Effect Step은 데이터 순서대로 실행된다. 앞선 DAMAGE Step에서 전
    - 서버 Unlock 뒤 네트워크 동기화 + 최대 0.05초 Presenter Poll이 필요하다.
    - 체감상 버튼이 한 박자 늦게 풀릴 수 있다.
 
-5. 스킬 Queue 진행 시간과 실제 Impact 시간은 별도 Timer다.
+5. 플레이어 행동 종료와 적 턴 시작 사이에 임시 Release Snapshot이 발행된다.
+   - 이동은 `IMMEDIATE_ACTION_COMPLETED`, Execute는 `SKILL_QUEUE_COMPLETED`를 `IsActionProcessing = false`인 PlayerTurn 상태로 Publish한 뒤 즉시 `BeginEnemyTurn`을 호출한다.
+   - 서버 함수 안에서는 연속 실행되지만, 두 Revision이 클라이언트에 따로 보이면 HUD가 잠깐 활성화됐다 다시 잠기는 깜빡임이나 헛입력 체감이 생길 수 있다.
+   - 후속 Play Test에서 Revision 로그와 버튼 상태를 함께 확인해야 하며, Phase 규칙을 바꾸지 않고 Snapshot 노출 순서만 다룰 수 있는 후보 지점이다.
+
+6. 스킬 Queue 진행 시간과 실제 Impact 시간은 별도 Timer다.
    - Queue는 `ActionTimerId`, 명중은 `ImpactTimerId`를 사용한다.
    - 현재 투사체는 `GetSkillActionDuration`이 최대 Range/Volley 시간을 포함해 이전 Impact가 다음 Cast에 의해 취소되지 않도록 방어한다.
    - 반대로 가까운 대상에도 최악 비행 시간을 기다리므로 실제 명중 뒤 남는 Idle Tail이 생길 수 있다. 후속 Play Test에서 근거리/원거리/Volley 각각을 측정할 필요가 있다.
 
-6. 스킬 준비 한 번마다 적 라운드가 돈다.
+7. 스킬 준비 한 번마다 적 라운드가 돈다.
    - 현재 의도된 턴 규칙이므로 삭제하거나 우회하면 안 된다.
    - 다만 Queue 등록 확인 효과와 적 행동 시작 연결이 약하면 “클릭이 늦게 먹고 바로 적에게 넘어간다”는 체감이 생길 수 있다.
 
-7. Miss나 조기 사망에도 authored ActionDuration은 유지된다.
+8. Miss나 조기 사망에도 authored ActionDuration은 유지된다.
    - 전투 연출 일관성에는 유리하지만, 빈 타격이나 마지막 적 처치 직전에는 잔여 대기처럼 느껴질 수 있다.
    - 후속 단계에서는 전투 결과와 Presentation 완료 관계를 Play Test로 먼저 확인해야 한다.
 
