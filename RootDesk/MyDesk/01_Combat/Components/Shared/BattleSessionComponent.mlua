@@ -127,6 +127,8 @@ script BattleSessionComponent extends Component
 	property number ActiveEffectScale = 1
 	property boolean ActiveEffectFlipX = false
 	property number MoveActionDuration = 0.12
+	property string MoveCurve = "QUAD_EASE_OUT"
+	property number MoveSnapThreshold = 0.01
 	property number TurnActionDuration = 0.12
 	property number BasicAttackActionDuration = 0.45
 	property number HeavySlashActionDuration = 0.70
@@ -266,6 +268,7 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void OnEndPlay()
 		-- Prevents a pending action callback from surviving this map-scoped battle session.
+		self:FinishPlayerGridMovePresentation("SESSION_END")
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
@@ -302,6 +305,7 @@ script BattleSessionComponent extends Component
 			end
 			return
 		end
+		self:UpdatePlayerGridMove(delta)
 		self:RefreshPlayerHpSnapshot("")
 		-- Battle map entities persist after the player visits a reward map. Observe the
 		-- exit first, then consume a newly prepared request when the player returns.
@@ -1334,7 +1338,7 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method number GetActionDuration(string actionType)
 		if actionType == "MOVE" then
-			return math.max(0.05, self.MoveActionDuration)
+			return self:GetPlayerMoveDuration()
 		elseif actionType == "TURN" then
 			return math.max(0.05, self.TurnActionDuration)
 		elseif actionType == "PUSH" then
@@ -1347,6 +1351,9 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void CompleteQueuedAction(string actionType, boolean success, string reason)
 		-- A valid player action hands control to the enemy; invalid actions release input immediately.
+		if actionType == "MOVE" then
+			self:FinishPlayerGridMovePresentation("ACTION_COMPLETE")
+		end
 		self.ActionTimerId = 0
 		self.TurnState:CompleteImmediateAction(reason)
 		self:PublishTurnStateSnapshot("IMMEDIATE_ACTION_COMPLETED")
@@ -3642,6 +3649,7 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
+		self:FinishPlayerGridMovePresentation("REBUILD_" .. reason)
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
@@ -4903,7 +4911,14 @@ script BattleSessionComponent extends Component
 			return result
 		end
 		local position = self:GetCellPosition(result.ToCell)
-		self:PlaceEntity(unitEntity, position)
+		if unit.Team == "Player" and unit.UnitId == "player_01" then
+			local started = self:StartPlayerGridMovePresentation(unitEntity, result.FromCell, result.ToCell)
+			if started == false then
+				self:PlaceEntity(unitEntity, position)
+			end
+		else
+			self:PlaceEntity(unitEntity, position)
+		end
 		local pickupResult = self:CollectDropsForMovedUnit(unit, result.ToCell)
 		result.PickedUpDropCount = pickupResult.CollectedCount or 0
 
@@ -5053,6 +5068,127 @@ script BattleSessionComponent extends Component
 
 		local current = targetEntity.TransformComponent.Position
 		targetEntity.TransformComponent.Position = Vector3(position.x, position.y, current.z)
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetPlayerMoveDuration()
+		-- Keeps the movement feel tunable without allowing it outside the STEP 2 timing budget.
+		return math.max(0.10, math.min(0.16, self.MoveActionDuration))
+	end
+
+	@ExecSpace("ServerOnly")
+	method number EvaluatePlayerMoveCurve(number progress)
+		local t = math.max(0, math.min(1, progress))
+		local curve = string.upper(self.MoveCurve or "")
+
+		if curve == "LINEAR" then
+			return t
+		end
+
+		if curve == "SMOOTH_STEP" then
+			return t * t * (3 - (2 * t))
+		end
+
+		if curve == "QUAD_EASE_IN_OUT" then
+			if t < 0.5 then
+				return 2 * t * t
+			end
+
+			local inverse = -2 * t + 2
+			return 1 - ((inverse * inverse) / 2)
+		end
+
+		-- QUAD_EASE_OUT is also the safe fallback: movement reacts quickly, then settles near the cell.
+		local remaining = 1 - t
+		return 1 - (remaining * remaining)
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean StartPlayerGridMovePresentation(Entity targetEntity, integer fromCell, integer toCell)
+		if targetEntity == nil or isvalid(targetEntity) == false then
+			log_warning("[BattleMoveVisual] start skipped because player entity is invalid")
+			return false
+		end
+
+		-- This is defensive only. The existing immediate-action lock prevents a second valid move.
+		self:FinishPlayerGridMovePresentation("REPLACED")
+
+		local startPosition = self:GetCellPosition(fromCell)
+		local targetPosition = self:GetCellPosition(toCell)
+		self:PlaceEntity(targetEntity, startPosition)
+		self._T.playerGridMove = {
+			Entity = targetEntity,
+			StartPosition = startPosition,
+			TargetPosition = targetPosition,
+			Elapsed = 0,
+			Duration = self:GetPlayerMoveDuration(),
+			FromCell = fromCell,
+			ToCell = toCell
+		}
+
+		log("[BattleMoveVisual] started from=" .. tostring(fromCell)
+			.. " to=" .. tostring(toCell)
+			.. " duration=" .. tostring(self._T.playerGridMove.Duration)
+			.. " curve=" .. tostring(self.MoveCurve)
+			.. " snap=" .. tostring(self.MoveSnapThreshold))
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdatePlayerGridMove(number delta)
+		local movement = self._T.playerGridMove
+		if movement == nil then
+			return
+		end
+
+		local targetEntity = movement.Entity
+		if targetEntity == nil or isvalid(targetEntity) == false then
+			self._T.playerGridMove = nil
+			log_warning("[BattleMoveVisual] cancelled because player entity became invalid")
+			return
+		end
+
+		movement.Elapsed = movement.Elapsed + math.max(0, delta)
+		local progress = math.min(1, movement.Elapsed / math.max(0.001, movement.Duration))
+		local eased = self:EvaluatePlayerMoveCurve(progress)
+		local startPosition = movement.StartPosition
+		local targetPosition = movement.TargetPosition
+		local position = Vector2(
+			startPosition.x + ((targetPosition.x - startPosition.x) * eased),
+			startPosition.y + ((targetPosition.y - startPosition.y) * eased)
+		)
+
+		local threshold = math.max(0, self.MoveSnapThreshold)
+		local remainingX = math.abs(targetPosition.x - position.x)
+		local remainingY = math.abs(targetPosition.y - position.y)
+		if progress >= 1 or (remainingX <= threshold and remainingY <= threshold) then
+			self:FinishPlayerGridMovePresentation("VISUAL_COMPLETE")
+			return
+		end
+
+		self:PlaceEntity(targetEntity, position)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishPlayerGridMovePresentation(string reason)
+		local movement = self._T.playerGridMove
+		if movement == nil then
+			return
+		end
+
+		self._T.playerGridMove = nil
+		local targetEntity = movement.Entity
+		if targetEntity == nil or isvalid(targetEntity) == false then
+			return
+		end
+
+		local targetPosition = movement.TargetPosition
+		self:PlaceEntity(targetEntity, targetPosition)
+		log("[BattleMoveVisual] completed from=" .. tostring(movement.FromCell)
+			.. " to=" .. tostring(movement.ToCell)
+			.. " reason=" .. tostring(reason)
+			.. " snappedX=" .. tostring(targetPosition.x)
+			.. " snappedY=" .. tostring(targetPosition.y))
 	end
 
 	@ExecSpace("ServerOnly")
