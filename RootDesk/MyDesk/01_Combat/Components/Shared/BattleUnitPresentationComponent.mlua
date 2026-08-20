@@ -20,6 +20,16 @@ script BattleUnitPresentationComponent extends Component
 	-- Override this only when a custom monster model is authored facing right.
 	property boolean SpriteFacesLeftByDefault = true
 
+	-- Optional per-character move-hop profile. When disabled, BattleSession team defaults are used.
+	@Sync property boolean UseCustomMoveHopProfile = false
+	@Sync property boolean CustomMoveHopEnabled = true
+	@Sync property number CustomMoveHopDuration = 0.14
+	@Sync property number CustomMoveHopHeight = 0.12
+	@Sync property number CustomMoveHopTakeoffDuration = 0.03
+	@Sync property number CustomMoveHopLandingDuration = 0.04
+	@Sync property Vector2 CustomMoveHopSquashScale = Vector2(1.05, 0.95)
+	@Sync property Vector2 CustomMoveHopLandingScale = Vector2(1.06, 0.94)
+
 	-- MapleStory skill clips are authored with their pivot already on the caster/target anchor
 	-- (measured: hit clips center at ~0, piercing's cast pivot sits at the forward edge), so the
 	-- default nudge is zero. Only override this for a clip that visibly needs repositioning.
@@ -135,13 +145,17 @@ script BattleUnitPresentationComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method Entity GetMoveVisualEntity()
-		-- Returns a movable visual child so cosmetic offsets never change the battle unit Root position.
+		-- Avatar units use their visual child. Sprite units animate only their client replica;
+		-- authoritative CellIndex and the server Transform are never changed by PlayMoveHop.
 		local avatarRenderer = self.Entity.AvatarRendererComponent
 		if avatarRenderer ~= nil then
 			local avatarRoot = avatarRenderer:GetAvatarRootEntity()
 			if isvalid(avatarRoot) then
 				return avatarRoot
 			end
+		end
+		if self.Entity.SpriteRendererComponent ~= nil then
+			return self.Entity
 		end
 		return nil
 	end
@@ -162,23 +176,42 @@ script BattleUnitPresentationComponent extends Component
 
 		local visualEntity = state.VisualEntity
 		if visualEntity ~= nil and isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
-			visualEntity.TransformComponent.Position = state.BasePosition
+			if state.PreserveHorizontalPosition then
+				local currentPosition = visualEntity.TransformComponent.Position
+				visualEntity.TransformComponent.Position = Vector3(currentPosition.x, state.BasePosition.y, currentPosition.z)
+			else
+				visualEntity.TransformComponent.Position = state.BasePosition
+			end
 			visualEntity.TransformComponent.Scale = state.BaseScale
 		end
-		log("[PlayerHopVisual] restored unit=" .. tostring(state.UnitId) .. " reason=" .. tostring(reason))
+		log("[CharacterHopVisual] restored unit=" .. tostring(state.UnitId) .. " reason=" .. tostring(reason))
 	end
 
 	@ExecSpace("Client")
-	method void PlayMoveHop(string unitId, number duration, number height, number takeoffDuration, number landingDuration, number squashXScale, number squashYScale)
-		-- Animates only the avatar visual child; BattleUnit CellIndex and the player Root Y remain untouched.
+	method void PlayMoveHop(string unitId, number duration, number height, number takeoffDuration, number landingDuration, number squashXScale, number squashYScale, number landingXScale, number landingYScale)
+		-- Shared cosmetic path for avatar and sprite units. It never mutates BattleUnit CellIndex.
 		self:StopMoveHopVisual("REPLACED")
+		if self.UseCustomMoveHopProfile then
+			if self.CustomMoveHopEnabled == false then
+				log("[CharacterHopVisual] skipped unit=" .. unitId .. " reason=CUSTOM_PROFILE_DISABLED")
+				return
+			end
+			duration = self.CustomMoveHopDuration
+			height = self.CustomMoveHopHeight
+			takeoffDuration = self.CustomMoveHopTakeoffDuration
+			landingDuration = self.CustomMoveHopLandingDuration
+			squashXScale = self.CustomMoveHopSquashScale.x
+			squashYScale = self.CustomMoveHopSquashScale.y
+			landingXScale = self.CustomMoveHopLandingScale.x
+			landingYScale = self.CustomMoveHopLandingScale.y
+		end
 		local visualEntity = self:GetMoveVisualEntity()
 		if visualEntity == nil or isvalid(visualEntity) == false or visualEntity.TransformComponent == nil then
-			log_warning("[PlayerHopVisual] skipped unit=" .. unitId .. " reason=VISUAL_ROOT_UNAVAILABLE")
+			log_warning("[CharacterHopVisual] skipped unit=" .. unitId .. " reason=VISUAL_ROOT_UNAVAILABLE")
 			return
 		end
 
-		local totalDuration = math.max(0.12, math.min(0.18, duration))
+		local totalDuration = math.max(0.10, math.min(0.20, duration))
 		local hopHeight = math.max(0, height)
 		local takeoff = math.max(0.02, math.min(0.04, takeoffDuration))
 		local landing = math.max(0.03, math.min(0.05, landingDuration))
@@ -188,11 +221,13 @@ script BattleUnitPresentationComponent extends Component
 		local transform = visualEntity.TransformComponent
 		local basePosition = transform.Position
 		local baseScale = transform.Scale
+		local preserveHorizontalPosition = visualEntity == self.Entity and self.Entity.SpriteRendererComponent ~= nil
 		local state = {
 			UnitId = unitId,
 			VisualEntity = visualEntity,
 			BasePosition = basePosition,
 			BaseScale = baseScale,
+			PreserveHorizontalPosition = preserveHorizontalPosition,
 			Tweener = nil,
 			Cancelled = false
 		}
@@ -214,18 +249,24 @@ script BattleUnitPresentationComponent extends Component
 			end
 			local yOffset = math.sin(math.pi * hopProgress) * hopHeight
 
-			local squashWeight = 0
+			local takeoffWeight = 0
+			local landingWeight = 0
 			if clampedProgress < takeoffFraction then
 				local takeoffProgress = clampedProgress / math.max(0.001, takeoffFraction)
-				squashWeight = math.sin(math.pi * takeoffProgress)
+				takeoffWeight = math.sin(math.pi * takeoffProgress)
 			elseif clampedProgress > 1 - landingFraction then
 				local landingProgress = (clampedProgress - (1 - landingFraction)) / math.max(0.001, landingFraction)
-				squashWeight = math.sin(math.pi * landingProgress)
+				landingWeight = math.sin(math.pi * landingProgress)
 			end
 
-			local scaleX = baseScale.x * (1 + ((squashXScale - 1) * squashWeight))
-			local scaleY = baseScale.y * (1 + ((squashYScale - 1) * squashWeight))
-			visualEntity.TransformComponent.Position = Vector3(basePosition.x, basePosition.y + yOffset, basePosition.z)
+			local scaleXMultiplier = 1 + ((squashXScale - 1) * takeoffWeight) + ((landingXScale - 1) * landingWeight)
+			local scaleYMultiplier = 1 + ((squashYScale - 1) * takeoffWeight) + ((landingYScale - 1) * landingWeight)
+			local scaleX = baseScale.x * scaleXMultiplier
+			local scaleY = baseScale.y * scaleYMultiplier
+			local currentPosition = visualEntity.TransformComponent.Position
+			local visualX = preserveHorizontalPosition and currentPosition.x or basePosition.x
+			local visualZ = preserveHorizontalPosition and currentPosition.z or basePosition.z
+			visualEntity.TransformComponent.Position = Vector3(visualX, basePosition.y + yOffset, visualZ)
 			visualEntity.TransformComponent.Scale = Vector3(scaleX, scaleY, baseScale.z)
 		end)
 		state.Tweener = tweener
@@ -234,20 +275,26 @@ script BattleUnitPresentationComponent extends Component
 				return
 			end
 			if visualEntity ~= nil and isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
-				visualEntity.TransformComponent.Position = basePosition
+				if preserveHorizontalPosition then
+					local currentPosition = visualEntity.TransformComponent.Position
+					visualEntity.TransformComponent.Position = Vector3(currentPosition.x, basePosition.y, currentPosition.z)
+				else
+					visualEntity.TransformComponent.Position = basePosition
+				end
 				visualEntity.TransformComponent.Scale = baseScale
 			end
 			if self._T.moveHopVisual == state then
 				self._T.moveHopVisual = nil
 			end
-			log("[PlayerHopVisual] completed unit=" .. unitId .. " duration=" .. tostring(totalDuration) .. " height=" .. tostring(hopHeight))
+			log("[CharacterHopVisual] completed unit=" .. unitId .. " duration=" .. tostring(totalDuration) .. " height=" .. tostring(hopHeight))
 		end)
 
-		log("[PlayerHopVisual] started unit=" .. unitId
+		log("[CharacterHopVisual] started unit=" .. unitId
 			.. " duration=" .. tostring(totalDuration)
 			.. " height=" .. tostring(hopHeight)
 			.. " takeoff=" .. tostring(takeoff)
-			.. " landing=" .. tostring(landing))
+			.. " landing=" .. tostring(landing)
+			.. " target=" .. (preserveHorizontalPosition and "SPRITE_ROOT" or "VISUAL_CHILD"))
 	end
 
 	@ExecSpace("ClientOnly")
