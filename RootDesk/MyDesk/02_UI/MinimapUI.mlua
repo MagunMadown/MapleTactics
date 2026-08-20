@@ -1,16 +1,34 @@
 @Component
 script MinimapUI extends Component
 
-	property number TooltipWidth = 240
+	property number TooltipWidth = 393
 
-	property number TooltipHeight = 64
+	property number TooltipHeight = 105
 
-	property number TooltipEdgeMargin = 16
+	property number TooltipEdgeMargin = 26
+
+	property number TravelDuration = 1.15
+
+	property integer TravelTimerId = 0
+
+	property number TravelProgress = 0
+
+	property Vector2 TravelStartPosition = Vector2(-733, 29)
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Initializes the persistent world-map controller through its stable UI path.
+		local travelAvatar = self:GetTravelAvatar()
+		if isvalid(travelAvatar) and isvalid(travelAvatar.UITransformComponent) then
+			self.TravelStartPosition = travelAvatar.UITransformComponent.anchoredPosition
+		end
 		log("[WorldMap] controller ready popup=" .. tostring(isvalid(self:GetWorldMapPopup())))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Releases the travel animation timer when the UI controller is destroyed.
+		self:StopTravelAnimation(true)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -22,12 +40,26 @@ script MinimapUI extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Closes a stale popup if the local player has already left the lobby.
+		local popup = self:GetWorldMapPopup()
+		if isvalid(popup) == false or popup.Enable == false or popup.Visible == false then
+			return
+		end
+		local player = _UserService.LocalPlayer
+		if isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name ~= "loby" then
+			self:CloseWorldMapForTransfer(player.CurrentMap.Name)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
 	method boolean OpenWorldMap(string source)
 		-- Opens the shared world map through one reusable client-side boundary.
 		if self:SetWorldMapVisible(true) == false then
 			log_warning("[WorldMap] open failed source=" .. source .. " reason=UI_MISSING")
 			return false
 		end
+		self:ShowTravelAvatarAtStart()
 		log("[WorldMap] opened source=" .. source)
 		return true
 	end
@@ -73,6 +105,7 @@ script MinimapUI extends Component
 		popup.Enable = visible
 		popup.Visible = visible
 		if visible == false then
+			self:StopTravelAnimation(true)
 			self:HideTooltip()
 		end
 		return true
@@ -82,6 +115,139 @@ script MinimapUI extends Component
 	method any GetWorldMapPopup()
 		-- Resolves the shared popup from one stable path instead of a duplicated UUID binding.
 		return _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup")
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetTravelAvatar()
+		-- Resolves the local-player avatar used by the start-to-Henesys route effect.
+		return _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/TravelAvatar")
+	end
+
+	@ExecSpace("ClientOnly")
+	method Vector2 GetHenesysTravelPosition()
+		-- Reads the current Henesys button position so layout edits automatically update the route.
+		local henesysButton = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/HenesysCityBranchBtn")
+		if isvalid(henesysButton) == false then
+			henesysButton = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/Region01Stage01Btn")
+		end
+		if isvalid(henesysButton) and isvalid(henesysButton.UITransformComponent) then
+			return henesysButton.UITransformComponent.anchoredPosition
+		end
+		log_warning("[WorldMap] Henesys travel target missing")
+		return self.TravelStartPosition
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowTravelAvatarAtStart()
+		-- Shows the local player's avatar standing at the start arrow before selection.
+		self:StopTravelAnimation(false)
+		local avatar = self:GetTravelAvatar()
+		if isvalid(avatar) == false or isvalid(avatar.UITransformComponent) == false then
+			log_warning("[WorldMap] standing avatar failed reason=AVATAR_MISSING")
+			return
+		end
+
+		avatar.Enable = true
+		avatar.Visible = true
+		avatar.UITransformComponent.anchoredPosition = self.TravelStartPosition
+		local renderer = avatar.AvatarGUIRendererComponent
+		if isvalid(renderer) then
+			renderer.FlipX = true
+			renderer.PlayRate = 1
+			local avatarRoot = renderer:GetAvatarRootEntity()
+			if isvalid(avatarRoot) then
+				avatarRoot:SendEvent(BodyActionStateChangeEvent(true, MapleAvatarBodyActionState.Stand, 0, 2147483647, 1))
+			end
+		end
+		log("[WorldMap] standing avatar shown at start")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayTravelAnimation()
+		-- Moves the local player's UI avatar from the start arrow toward Henesys.
+		self:StopTravelAnimation(false)
+		local avatar = self:GetTravelAvatar()
+		if isvalid(avatar) == false or isvalid(avatar.UITransformComponent) == false then
+			log_warning("[WorldMap] travel avatar failed reason=AVATAR_MISSING")
+			return
+		end
+
+		local startPosition = self.TravelStartPosition
+		local endPosition = self:GetHenesysTravelPosition()
+		avatar.Enable = true
+		avatar.Visible = true
+		avatar.UITransformComponent.anchoredPosition = startPosition
+		self.TravelProgress = 0
+
+		local renderer = avatar.AvatarGUIRendererComponent
+		if isvalid(renderer) then
+			renderer.FlipX = true
+			renderer.PlayRate = 1.25
+			local avatarRoot = renderer:GetAvatarRootEntity()
+			if isvalid(avatarRoot) then
+				avatarRoot:SendEvent(BodyActionStateChangeEvent(true, MapleAvatarBodyActionState.Walk, 0, 2147483647, 1.25))
+			end
+		end
+
+		local tickInterval = 1 / 60
+		local moveTick = function()
+			if isvalid(avatar) == false or isvalid(avatar.UITransformComponent) == false then
+				self:StopTravelAnimation(false)
+				return
+			end
+
+			self.TravelProgress = math.min(1, self.TravelProgress + tickInterval / self.TravelDuration)
+			local progress = self.TravelProgress
+			local eased = progress * progress * (3 - 2 * progress)
+			local x = startPosition.x + (endPosition.x - startPosition.x) * eased
+			local baseY = startPosition.y + (endPosition.y - startPosition.y) * eased
+			local y = baseY + math.sin(progress * math.pi * 4) * 2
+			avatar.UITransformComponent.anchoredPosition = Vector2(x, y)
+
+			if progress >= 1 then
+				self:StopTravelAnimation(false)
+				avatar.UITransformComponent.anchoredPosition = endPosition
+				log("[WorldMap] travel avatar arrived at Henesys")
+			end
+		end
+
+		self.TravelTimerId = _TimerService:SetTimerRepeat(moveTick, tickInterval)
+		if self.TravelTimerId == 0 then
+			log_warning("[WorldMap] travel avatar failed reason=TIMER_RESERVATION")
+			self:StopTravelAnimation(false)
+			avatar.UITransformComponent.anchoredPosition = endPosition
+			return
+		end
+		log("[WorldMap] travel avatar started")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopTravelAnimation(boolean hideAvatar)
+		-- Stops route movement, returns the avatar to stand, and optionally hides it.
+		if self.TravelTimerId > 0 then
+			_TimerService:ClearTimer(self.TravelTimerId)
+			self.TravelTimerId = 0
+		end
+
+		local avatar = self:GetTravelAvatar()
+		if isvalid(avatar) == false then
+			return
+		end
+		local renderer = avatar.AvatarGUIRendererComponent
+		if isvalid(renderer) then
+			local avatarRoot = renderer:GetAvatarRootEntity()
+			if isvalid(avatarRoot) then
+				avatarRoot:SendEvent(BodyActionStateChangeEvent(true, MapleAvatarBodyActionState.Stand, 0, 2147483647, 1))
+			end
+			renderer.PlayRate = 1
+		end
+		if hideAvatar then
+			avatar.Enable = false
+			avatar.Visible = false
+			if isvalid(avatar.UITransformComponent) then
+				avatar.UITransformComponent.anchoredPosition = self.TravelStartPosition
+			end
+		end
 	end
 
 	@ExecSpace("ClientOnly")

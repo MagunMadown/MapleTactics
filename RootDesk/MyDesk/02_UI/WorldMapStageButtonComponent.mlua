@@ -7,6 +7,9 @@ script WorldMapStageButtonComponent extends Component
 	property string ClickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
 	property number SoundVolume = 1
 	property boolean IsRequestingEntry = false
+	property integer EntryDelayTimerId = 0
+	property number TravelCompletionPadding = 0.5
+	property number MapTransferDelay = 0.3
 	property ButtonComponent StageButton = nil
 	property any ClickHandler = nil
 	property any HoverEnterHandler = nil
@@ -29,6 +32,10 @@ script WorldMapStageButtonComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
 		-- Disconnects every UI event owned by this stage node.
+		if self.EntryDelayTimerId > 0 then
+			_TimerService:ClearTimer(self.EntryDelayTimerId)
+			self.EntryDelayTimerId = 0
+		end
 		if self.ClickHandler ~= nil then
 			self.Entity:DisconnectEvent(ButtonClickEvent, self.ClickHandler)
 		end
@@ -45,7 +52,7 @@ script WorldMapStageButtonComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnStageClicked()
-		-- Locks duplicate input and requests the selected stage through the server gateway.
+		-- Locks duplicate input and plays the route animation before requesting the stage.
 		if self.IsRequestingEntry then
 			log("[WorldMap] stage click ignored stage=" .. self.TargetStageId .. " reason=REQUEST_IN_PROGRESS")
 			return
@@ -58,15 +65,73 @@ script WorldMapStageButtonComponent extends Component
 		self.IsRequestingEntry = true
 		self.StageButton.Enable = false
 		_SoundService:PlaySound(self.ClickSoundRUID, self.SoundVolume)
-		log("[WorldMap] stage entry requested stage=" .. self.TargetStageId)
+
+		local minimapUI = self:GetMinimapUI()
+		if minimapUI == nil then
+			log_warning("[WorldMap] travel skipped stage=" .. self.TargetStageId .. " reason=MINIMAP_UI_MISSING")
+			self:RequestStageEntry()
+			return
+		end
+
+		minimapUI:PlayTravelAnimation()
+		local closeAfterTravel = function()
+			self.EntryDelayTimerId = 0
+			self:CloseWorldMapAndScheduleEntry()
+		end
+		self.EntryDelayTimerId = _TimerService:SetTimerOnce(
+			closeAfterTravel,
+			minimapUI.TravelDuration + self.TravelCompletionPadding
+		)
+		if self.EntryDelayTimerId == 0 then
+			log_warning("[WorldMap] travel delay failed stage=" .. self.TargetStageId .. " reason=TIMER_RESERVATION")
+			self:CloseWorldMapAndScheduleEntry()
+			return
+		end
+		log("[WorldMap] travel started after click stage=" .. self.TargetStageId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseWorldMapAndScheduleEntry()
+		-- Closes the world map first, then requests transfer after the UI state is applied.
+		local minimapUI = self:GetMinimapUI()
+		if minimapUI ~= nil then
+			minimapUI:CloseWorldMapForTransfer(self.TargetStageId)
+		end
+
+		local requestAfterClose = function()
+			self.EntryDelayTimerId = 0
+			self:RequestStageEntry()
+		end
+		self.EntryDelayTimerId = _TimerService:SetTimerOnce(requestAfterClose, self.MapTransferDelay)
+		if self.EntryDelayTimerId == 0 then
+			log_warning("[WorldMap] post-close delay failed stage=" .. self.TargetStageId .. " reason=TIMER_RESERVATION")
+			self:RequestStageEntry()
+			return
+		end
+		log("[WorldMap] closed before stage request stage=" .. self.TargetStageId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestStageEntry()
+		-- Requests the selected stage after the route animation has finished.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or isvalid(player.CurrentMap) == false or player.CurrentMap.Name ~= "loby" then
+			self.IsRequestingEntry = false
+			if self.StageButton ~= nil then
+				self.StageButton.Enable = true
+			end
+			log_warning("[WorldMap] delayed stage request rejected stage=" .. self.TargetStageId .. " reason=NOT_IN_LOBBY")
+			return
+		end
+		log("[WorldMap] stage entry requested after travel stage=" .. self.TargetStageId)
 		_BattleGatewayLogic:RequestPrepareLobbyStageEntry(self.TargetStageId)
 	end
 
 	@ExecSpace("ClientOnly")
 	method void HandleEntryResult(boolean success, string reason)
 		-- Restores the node after rejection and keeps it locked during a successful transfer.
+		local minimapUI = self:GetMinimapUI()
 		if success then
-			local minimapUI = self:GetMinimapUI()
 			if minimapUI ~= nil then
 				minimapUI:CloseWorldMapForTransfer(self.TargetStageId)
 			end
@@ -76,6 +141,9 @@ script WorldMapStageButtonComponent extends Component
 		self.IsRequestingEntry = false
 		if self.StageButton ~= nil then
 			self.StageButton.Enable = true
+		end
+		if minimapUI ~= nil then
+			minimapUI:OpenWorldMap("stage_entry_failed")
 		end
 		log_warning("[WorldMap] stage entry failed stage=" .. self.TargetStageId .. " reason=" .. reason)
 	end
@@ -87,7 +155,7 @@ script WorldMapStageButtonComponent extends Component
 		local minimapUI = self:GetMinimapUI()
 		if minimapUI ~= nil then
 			local pos = self.Entity.UITransformComponent.anchoredPosition
-			minimapUI:ShowTooltip(self.StageDisplayName, Vector2(pos.x, pos.y + 70))
+			minimapUI:ShowTooltip(self.StageDisplayName, Vector2(pos.x, pos.y + 115))
 		end
 	end
 
