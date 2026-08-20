@@ -134,6 +134,8 @@ script BattleSessionComponent extends Component
 	property number HeavySlashActionDuration = 0.70
 	property number PushActionDuration = 0.40
 	property number EnemyThinkDuration = 0.25
+	property number PlayerToEnemyBeatDuration = 0.12
+	property number EnemyToPlayerBeatDuration = 0.08
 	property number EnemyMoveActionDuration = 0.12
 	property number EnemyAttackActionDuration = 0.30
 	property number StrongHitDamageThreshold = 5
@@ -157,6 +159,8 @@ script BattleSessionComponent extends Component
 	property any WaveRuntime = nil
 	property any DropRuntime = nil
 	property integer ActionTimerId = 0
+	property integer TurnTransitionTimerId = 0
+	property boolean PlayerToEnemyBeatPending = false
 	property integer ImpactTimerId = 0
 	property integer ImpactCameraShakeMidTimerId = 0
 	property integer ImpactCameraShakeLateTimerId = 0
@@ -318,6 +322,7 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
 		end
+		self:ClearTurnTransitionTimer("SESSION_END")
 		self:ClearSkillImpactTimers()
 		if self.TurnState ~= nil then
 			self.TurnState:ResetTurnState(self.TileQueueCapacity, "SESSION_END")
@@ -1412,15 +1417,26 @@ script BattleSessionComponent extends Component
 		end
 
 		if success == true then
-			self:BeginEnemyTurn()
+			self:BeginEnemyTurnFromPlayerAction("IMMEDIATE_ACTION_COMPLETED")
 			return
 		end
 
 	end
 
 	@ExecSpace("ServerOnly")
+	method void BeginEnemyTurnFromPlayerAction(string completionReason)
+		-- The authoritative action completion has already happened. Lock the enemy phase now,
+		-- then use a short presentation-only beat before the first enemy actually acts.
+		self.PlayerToEnemyBeatPending = true
+		log("[BattleTurnTempo] player action completed reason=" .. completionReason .. " beat=" .. tostring(self.PlayerToEnemyBeatDuration))
+		self:BeginEnemyTurn()
+	end
+
+	@ExecSpace("ServerOnly")
 	method void BeginEnemyTurn()
 		-- Executes only actions that were frozen for every enemy before the player committed this turn.
+		local usePlayerTransitionBeat = self.PlayerToEnemyBeatPending
+		self.PlayerToEnemyBeatPending = false
 		local preparedIntent = self:GetPreparedEnemyIntent()
 		if preparedIntent.State ~= "PREPARED" then
 			log_warning("[BattleEnemyIntent] compatibility cursor missing; selecting frozen plan turn=" .. self.TurnNumber)
@@ -1462,7 +1478,12 @@ script BattleSessionComponent extends Component
 				traitIds = enemyUnit.EnemyTraitIds
 			end
 		end
-		self.ActionTimerId = _TimerService:SetTimerOnce(execute, _EnemyTraitRouterLogic:GetEnemyThinkDuration(traitIds, self.EnemyThinkDuration))
+		local executeDelay = _EnemyTraitRouterLogic:GetEnemyThinkDuration(traitIds, self.EnemyThinkDuration)
+		if usePlayerTransitionBeat == true then
+			executeDelay = math.max(0.08, math.min(0.18, self.PlayerToEnemyBeatDuration))
+			log("[BattleTurnTempo] enemy action queued after player beat=" .. tostring(executeDelay) .. " enemy=" .. preparedIntent.EnemyId)
+		end
+		self.ActionTimerId = _TimerService:SetTimerOnce(execute, executeDelay)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2287,12 +2308,38 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CompleteEnemyTurn(string actionType, boolean success, string reason)
-		-- Ends the full ordered enemy round and reopens the next player turn.
+		-- The ordered enemy round is complete. Keep the enemy phase locked for a short visual beat,
+		-- then reopen the player turn without changing the authoritative completion result.
 		self.ActionTimerId = 0
 		if self.BattleResult ~= "" then
 			self.TurnState:ClearTransientState("BATTLE_ENDED")
 			self:PublishTurnStateSnapshot("BATTLE_ENDED")
 			log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason .. " result=" .. self.BattleResult)
+			return
+		end
+
+		if self.TurnTransitionTimerId > 0 then
+			log_warning("[BattleTurnTempo] duplicate enemy-to-player transition blocked action=" .. actionType .. " reason=" .. reason)
+			return
+		end
+
+		local beatDuration = math.max(0.05, math.min(0.12, self.EnemyToPlayerBeatDuration))
+		local finishTransition = function()
+			self:FinishEnemyToPlayerTransition(actionType, success, reason)
+		end
+		self.TurnTransitionTimerId = _TimerService:SetTimerOnce(finishTransition, beatDuration)
+		log("[BattleTurnTempo] enemy round completed action=" .. actionType .. " reason=" .. reason .. " playerReadyBeat=" .. tostring(beatDuration))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishEnemyToPlayerTransition(string actionType, boolean success, string reason)
+		-- Called only after CompleteEnemyTurn confirmed the enemy round was finished.
+		-- This timer controls presentation tempo, never whether the round succeeded.
+		self.TurnTransitionTimerId = 0
+		if self.BattleResult ~= "" then
+			self.TurnState:ClearTransientState("BATTLE_ENDED")
+			self:PublishTurnStateSnapshot("BATTLE_ENDED")
+			log("[BattleEnemy] transition ended action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason .. " result=" .. self.BattleResult)
 			return
 		end
 
@@ -2306,6 +2353,16 @@ script BattleSessionComponent extends Component
 		log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
 		log("[BattleTurnFlow] phase=PlayerTurn turn=" .. self.TurnNumber .. " stageTurn=" .. self.StageTurnNumber .. " wave=" .. self.CurrentWave)
 		self:PrepareEnemyIntent()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearTurnTransitionTimer(string reason)
+		if self.TurnTransitionTimerId > 0 then
+			_TimerService:ClearTimer(self.TurnTransitionTimerId)
+			self.TurnTransitionTimerId = 0
+			log("[BattleTurnTempo] transition timer cleared reason=" .. reason)
+		end
+		self.PlayerToEnemyBeatPending = false
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2640,7 +2697,7 @@ script BattleSessionComponent extends Component
 		self:PublishTurnStateSnapshot("SKILL_QUEUED")
 		log("[BattleTileQueue] registered tile=" .. tileId .. " index=" .. result.QueueIndex .. " count=" .. result.QueueCount .. "/" .. capacity .. " turn=" .. self.TurnNumber .. " consumesTurn=" .. tostring(result.ConsumesTurn))
 		if result.ConsumesTurn == true and self.BattleResult == "" then
-			self:BeginEnemyTurn()
+			self:BeginEnemyTurnFromPlayerAction("SKILL_QUEUED")
 		else
 			log("[BattleTurnFlow] freeplay queue retained tile=" .. tileId .. " turn=" .. self.TurnNumber)
 		end
@@ -2724,7 +2781,7 @@ script BattleSessionComponent extends Component
 			return
 		end
 		if success then
-			self:BeginEnemyTurn()
+			self:BeginEnemyTurnFromPlayerAction("SKILL_QUEUE_COMPLETED")
 			return
 		end
 	end
@@ -3639,7 +3696,7 @@ script BattleSessionComponent extends Component
 		result.ConsumesTurn = definition.ConsumesTurn == true
 		log("[BattleConsumable] used ref=" .. consumableId .. " effect=" .. definition.EffectType .. " applied=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter .. " consumesTurn=" .. tostring(result.ConsumesTurn) .. " key=" .. useKey)
 		if result.ConsumesTurn == true and self.BattleResult == "" then
-			self:BeginEnemyTurn()
+			self:BeginEnemyTurnFromPlayerAction("CONSUMABLE_USED")
 		end
 		return result
 	end
@@ -3732,6 +3789,7 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
 		end
+		self:ClearTurnTransitionTimer("REBUILD_" .. reason)
 		self:ClearSkillImpactTimers()
 		self.WaveRuntime:ClearAllTimers(reason)
 
@@ -4644,6 +4702,7 @@ script BattleSessionComponent extends Component
 			end
 		end
 		self:ClearForcedSpawnSchedule("ALL_ENEMIES_DEFEATED")
+		self:ClearTurnTransitionTimer("ALL_ENEMIES_DEFEATED")
 		self:ClearSkillImpactTimers()
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
