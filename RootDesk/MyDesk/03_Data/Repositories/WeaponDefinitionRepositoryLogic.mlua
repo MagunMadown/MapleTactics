@@ -1,0 +1,100 @@
+@Logic
+script WeaponDefinitionRepositoryLogic extends Logic
+
+	property string WeaponDataSetName = "WeaponDefinitions"
+
+	@ExecSpace("ServerOnly")
+	method table GetWeaponDefinition(string weaponType)
+		-- Single source of truth for "which avatar item does this WeaponType equip".
+		-- Skill rows only carry the WeaponType token; the RUID and the equip slot live here so a
+		-- weapon art swap never touches a skill CSV.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN_WEAPON_TYPE",
+			WeaponType = weaponType or ""
+		}
+		if weaponType == nil or weaponType == "" then
+			result.Reason = "INVALID_WEAPON_TYPE"
+			return result
+		end
+
+		local dataSet = _DataService:GetTable(self.WeaponDataSetName)
+		if dataSet == nil then
+			result.Reason = "WEAPON_DATASET_MISSING"
+			return result
+		end
+
+		local matchCount = 0
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "WeaponType") == weaponType then
+				matchCount = matchCount + 1
+				if result.Success == false then
+					result = self:ConvertWeaponRow(dataSet, rowIndex)
+				end
+			end
+		end
+		if result.Success == false then
+			log_warning("[WeaponDefinition] missing weaponType=" .. weaponType .. " dataset=" .. self.WeaponDataSetName)
+			return result
+		end
+
+		result.MatchCount = matchCount
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetWeaponTypeIds()
+		-- Enumerates every authored WeaponType so the integrity validator can audit the table.
+		local weaponTypes = {}
+		local dataSet = _DataService:GetTable(self.WeaponDataSetName)
+		if dataSet == nil then
+			return weaponTypes
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local weaponType = dataSet:GetCell(rowIndex, "WeaponType") or ""
+			if weaponType ~= "" then
+				table.insert(weaponTypes, weaponType)
+			end
+		end
+		return weaponTypes
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConvertWeaponRow(any dataSet, integer rowIndex)
+		-- Reads one authored weapon row. Cells arrive as strings, so every numeric or boolean
+		-- column is normalized here and never re-parsed by callers.
+		local weaponType = dataSet:GetCell(rowIndex, "WeaponType") or ""
+		local result = {
+			Success = true,
+			Reason = "OK",
+			SchemaVersion = math.floor(tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")) or 0),
+			WeaponType = weaponType,
+			DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or weaponType,
+			EquipSlot = dataSet:GetCell(rowIndex, "EquipSlot") or "",
+			WeaponRuid = dataSet:GetCell(rowIndex, "WeaponRuid") or "",
+			-- Optional second item worn in the sub-weapon slot alongside a one-handed main weapon,
+			-- which is how a dual-wield look (dagger + blade) is authored. Empty for every single
+			-- weapon. A TWO_HANDED row must leave this empty: that slot is already consumed.
+			SubWeaponRuid = dataSet:GetCell(rowIndex, "SubWeaponRuid") or "",
+			Enabled = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")),
+			Source = "DATASET"
+		}
+		log("[WeaponDefinition] loaded weaponType=" .. result.WeaponType .. " slot=" .. result.EquipSlot .. " ruid=" .. result.WeaponRuid .. " sub=" .. result.SubWeaponRuid .. " source=" .. result.Source)
+		return result
+	end
+
+	method boolean IsSupportedEquipSlot(string equipSlot)
+		-- Only the two avatar weapon slots MSW exposes; SubWeapon/Shield are out of scope for skills.
+		return equipSlot == "ONE_HANDED" or equipSlot == "TWO_HANDED"
+	end
+
+	method boolean ParseBooleanCell(any cellValue)
+		-- Accepts native booleans and the string values emitted by CSV-backed UserDataSets.
+		if cellValue == true then
+			return true
+		end
+		local normalized = string.lower(tostring(cellValue or ""))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+end

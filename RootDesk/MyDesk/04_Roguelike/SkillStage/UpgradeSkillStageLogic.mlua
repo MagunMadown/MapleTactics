@@ -1,0 +1,177 @@
+@Logic
+script UpgradeSkillStageLogic extends Logic
+
+	property string UpgradeMapName = "new_upgrade_stage"
+	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Reports that the authoritative upgrade-stage adapter is available.
+		log("[UpgradeSkillStage] logic ready")
+	end
+
+	@ExecSpace("Server")
+	method void RequestUpgradeState()
+		-- Returns only the requesting player's currently owned job skills.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local state = self:BuildUpgradeState(playerEntity)
+		if state.Success == false then
+			log_warning("[UpgradeSkillStage] state rejected user=" .. senderUserId .. " reason=" .. state.Reason)
+			self:ReceiveUpgradeState("", "", "", "", "", "", "", "", state.Reason, senderUserId)
+			return
+		end
+		log("[UpgradeSkillStage] state ready user=" .. senderUserId .. " bases=" .. state.SkillIds .. " upgrades=" .. state.UpgradeSkillIds)
+		self:ReceiveUpgradeState(state.SkillIds, state.SkillNames, state.SkillIcons, state.SkillTiers, state.UpgradeSkillIds, state.UpgradeSkillNames, state.UpgradeSkillIcons, state.UpgradeSkillTiers, "OK", senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildUpgradeState(Entity playerEntity)
+		-- Builds a stable, catalog-ordered selection DTO from the run-owned snapshot.
+		if isvalid(playerEntity) == false then
+			return { Success = false, Reason = "INVALID_PLAYER" }
+		end
+		if playerEntity.CurrentMap == nil or playerEntity.CurrentMap.Name ~= self.UpgradeMapName then
+			return { Success = false, Reason = "NOT_IN_UPGRADE_STAGE" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if runState == nil or runState.SelectedJobId == "" then
+			return { Success = false, Reason = "JOB_NOT_SELECTED" }
+		end
+		if inventory == nil or inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" }
+		end
+		local catalog = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(runState.SelectedJobId)
+		if catalog.Success == false then
+			return catalog
+		end
+
+		local skillIds = {}
+		local skillNames = {}
+		local skillIcons = {}
+		local skillTiers = {}
+		local upgradeSkillIds = {}
+		local upgradeSkillNames = {}
+		local upgradeSkillIcons = {}
+		local upgradeSkillTiers = {}
+		for _, definition in ipairs(catalog.Skills) do
+			local ownership = inventory:CanUseSkill(definition.SkillId)
+			if ownership.Success == true and #skillIds < 6 then
+				local upgradePath = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(runState.SelectedJobId, definition.SkillId)
+				if upgradePath.Success == true then
+					local upgradeDefinition = upgradePath.UpgradeDefinition
+					table.insert(skillIds, definition.SkillId)
+					table.insert(skillNames, definition.DisplayName)
+					table.insert(skillIcons, self:GetSkillIconRuid(definition))
+					table.insert(skillTiers, tostring(definition.SkillTier))
+					table.insert(upgradeSkillIds, upgradeDefinition.SkillId)
+					table.insert(upgradeSkillNames, upgradeDefinition.DisplayName)
+					table.insert(upgradeSkillIcons, self:GetSkillIconRuid(upgradeDefinition))
+					table.insert(upgradeSkillTiers, tostring(upgradeDefinition.SkillTier))
+				end
+			end
+		end
+		if #skillIds == 0 then
+			return { Success = false, Reason = "OWNED_SKILLS_NOT_UPGRADEABLE" }
+		end
+		return {
+			Success = true,
+			Reason = "OK",
+			SkillIds = table.concat(skillIds, "|"),
+			SkillNames = table.concat(skillNames, "|"),
+			SkillIcons = table.concat(skillIcons, "|"),
+			SkillTiers = table.concat(skillTiers, "|"),
+			UpgradeSkillIds = table.concat(upgradeSkillIds, "|"),
+			UpgradeSkillNames = table.concat(upgradeSkillNames, "|"),
+			UpgradeSkillIcons = table.concat(upgradeSkillIcons, "|"),
+			UpgradeSkillTiers = table.concat(upgradeSkillTiers, "|")
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetSkillIconRuid(any definition)
+		-- Uses the same authored icon source as the owned-skill HUD and new-skill choices.
+		local iconRuid = definition.IconRuid or ""
+		if iconRuid ~= "" then
+			return iconRuid
+		end
+		local sourceRuid = definition.CastEffectRuid or ""
+		if sourceRuid == "" then
+			sourceRuid = definition.HitEffectRuid or ""
+		end
+		if sourceRuid ~= "" then
+			return "thumbnail://" .. sourceRuid
+		end
+		return self.DefaultSkillIconRuid
+	end
+
+	@ExecSpace("Server")
+	method void RequestApplyUpgrade(string skillId)
+		-- Validates the equipped skill, applies one temporary level increment, and resolves the next stage.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local state = self:BuildUpgradeState(playerEntity)
+		if state.Success == false then
+			self:ReceiveApplyResult(false, state.Reason, skillId, "", 0, "", senderUserId)
+			return
+		end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local ownership = inventory:CanUseSkill(skillId)
+		if ownership.Success == false then
+			log_warning("[UpgradeSkillStage] apply rejected user=" .. senderUserId .. " skill=" .. skillId .. " reason=" .. ownership.Reason)
+			self:ReceiveApplyResult(false, ownership.Reason, skillId, "", 0, "", senderUserId)
+			return
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local upgradePath = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(runState.SelectedJobId, skillId)
+		if upgradePath.Success == false then
+			log_warning("[UpgradeSkillStage] path rejected user=" .. senderUserId .. " skill=" .. skillId .. " reason=" .. upgradePath.Reason)
+			self:ReceiveApplyResult(false, upgradePath.Reason, skillId, "", 0, "", senderUserId)
+			return
+		end
+		local upgradeDefinition = upgradePath.UpgradeDefinition
+		local nextStageMapName = _StageTransitionManagerLogic:GetNextStageMapNameForPlayer(playerEntity)
+		if nextStageMapName == "" then
+			log_warning("[UpgradeSkillStage] apply rejected before mutation user=" .. senderUserId .. " skill=" .. skillId .. " reason=NEXT_STAGE_MAP_UNAVAILABLE")
+			self:ReceiveApplyResult(false, "NEXT_STAGE_MAP_UNAVAILABLE", skillId, upgradeDefinition.SkillId, upgradeDefinition.SkillTier, "", senderUserId)
+			return
+		end
+		local rewardKey = "upgrade_skill_stage:" .. tostring(runState.RunSequence) .. ":" .. tostring(runState.CompletedStageCount)
+		local result = inventory:UpgradeSkill(skillId, upgradeDefinition.SkillId, rewardKey)
+		if result.Success == false or result.ReplacedAmount ~= 1 then
+			local reason = result.Success == false and result.Reason or "UPGRADE_ALREADY_APPLIED"
+			log_warning("[UpgradeSkillStage] apply rejected user=" .. senderUserId .. " skill=" .. skillId .. " reason=" .. reason)
+			self:ReceiveApplyResult(false, reason, skillId, upgradeDefinition.SkillId, upgradeDefinition.SkillTier, "", senderUserId)
+			return
+		end
+		log("[UpgradeSkillStage] applied user=" .. senderUserId .. " base=" .. skillId .. " upgrade=" .. upgradeDefinition.SkillId .. " tier=" .. upgradeDefinition.SkillTier .. " key=" .. rewardKey .. " nextMap=" .. nextStageMapName)
+		self:ReceiveApplyResult(true, "APPLIED", skillId, upgradeDefinition.SkillId, upgradeDefinition.SkillTier, nextStageMapName, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveUpgradeState(string skillIds, string skillNames, string skillIcons, string skillTiers, string upgradeSkillIds, string upgradeSkillNames, string upgradeSkillIcons, string upgradeSkillTiers, string reason)
+		-- Forwards the server-approved selection DTO to the client-only UI controller.
+		local controllerEntity = _EntityService:GetEntityByPath("/ui/UpgradeSkillStageUI/Controller")
+		if isvalid(controllerEntity) == false then
+			log_warning("[UpgradeSkillStage] UI controller entity unavailable reason=" .. reason)
+			return
+		end
+		local controller = controllerEntity:GetComponent("script.UpgradeSkillStageUIComponent")
+		if controller ~= nil then
+			controller:ReceiveState(skillIds, skillNames, skillIcons, skillTiers, upgradeSkillIds, upgradeSkillNames, upgradeSkillIcons, upgradeSkillTiers, reason)
+		end
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveApplyResult(boolean success, string reason, string baseSkillId, string upgradeSkillId, integer upgradeTier, string nextStageMapName)
+		-- Forwards the authoritative apply result to the UI before map transition.
+		local controllerEntity = _EntityService:GetEntityByPath("/ui/UpgradeSkillStageUI/Controller")
+		if isvalid(controllerEntity) == false then
+			return
+		end
+		local controller = controllerEntity:GetComponent("script.UpgradeSkillStageUIComponent")
+		if controller ~= nil then
+			controller:ReceiveApplyResult(success, reason, baseSkillId, upgradeSkillId, upgradeTier, nextStageMapName)
+		end
+	end
+
+end

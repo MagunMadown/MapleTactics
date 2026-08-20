@@ -82,7 +82,7 @@
 |---|:---:|---|
 | warrior_start | 3 | `brandish`, `divine_swing`, `spear_pulling` |
 | mage_start | 6 | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
-| archer_start | 3 | `piercing`, `wind_shot`, `cardinal_discharge` |
+| archer_start | 3 | `piercing`, `arrow_bomb`, `cardinal_discharge` |
 | thief_start | 3 | `shuriken_burst`, `savage_blow`, `fatal_blow` |
 | pirate_start | 3 | `magnum_shot`, `slug_shot`, `shock_wave` |
 
@@ -112,6 +112,22 @@
 | CastEffectRuid | string | - | 시전자에게 재생할 animationclip RUID. 비우면 시전 이펙트 없음 |
 | HitEffectRuid | string | - | 피격 대상에게 재생할 animationclip RUID. 비우면 피격 이펙트 없음 |
 | EffectScale | number | - | 두 이펙트에 공통 적용할 배율. 비우면 `1` |
+| WeaponType | string | - | §4.4 `WeaponDefinitions.WeaponType` 참조. 비우면 현재 장착 무기를 유지 |
+| ProjectileRuid | string | - | 날아가는 투사체 animationclip RUID. 비우면 비행 단계 없음 |
+| ProjectileSpeed | number | 조건부 | `ProjectileRuid`가 있으면 필수, 0 초과. 월드 유닛/초 (1배속 기준) |
+| ProjectileScale | number | - | 투사체 배율. 비우면 `1`, 0.05 미만은 0.05로 보정 |
+| ProjectileLaunchDelay | number | - | 발사를 늦출 초 (1배속 기준). 비우거나 `0`이면 시전과 동시 발사 |
+| ProjectileHeight | number | - | 투사체가 셀보다 얼마나 위로 날지(월드 유닛). `0`이면 셀 높이. §4.5 참조 |
+| ProjectileCount | integer | - | 한 번 시전에 날리는 투사체 수. 1 이상, 기본 `1`. §4.5 참조 |
+| ProjectileInterval | number | 조건부 | 연발 간 간격(초, 1배속 기준). `ProjectileCount`가 2 이상이면 0 초과 필수 |
+| IconRuid | string | - | §4.6 스킬 아이콘 sprite RUID. 비우면 표시 측에서 기본 스프라이트로 대체 |
+| SkillTier | integer | O | §4.7 스킬 정의의 정적 강화 단계. 1 이상, 기본 `1` |
+| BaseSkillId | string | 조건부 | §4.7 이 스킬이 강화되어 나온 원본 SkillId. 1단계는 비우고 2단계부터 필수 |
+| CasterMotionRuid | string | - | Sprite 기반 적 시전자의 공격 animationclip RUID |
+| CasterMotionPlayRate | number | 조건부 | CasterMotionRuid 사용 시 0 초과 |
+| CasterMotionDuration | number | 조건부 | 공격 클립 유지 시간. 비우면 ActionDuration |
+| EnemyQueueTurns | integer | - | 적 공격 Tile 준비에 필요한 적 턴 수. 플레이어 스킬은 0 |
+| HudIconRuid | string | - | 적 머리 위 Queue/HUD 아이콘 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -138,15 +154,19 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 스킬 행은 **같은 열 스키마를 가진 7개 테이블**에 나뉘어 있다. 각각
 `RootDesk/MyDesk/03_Data/`에 `.userdataset`+`.csv` 쌍으로 존재한다.
 
-| 구분 | 테이블 이름 (runtime name) | 수록 SkillId |
+| 구분 | 테이블 이름 (runtime name) | 수록 SkillId (1단계 / 2단계) |
 |---|---|---|
 | 공용 | `SkillDefinitions` | (없음 — 헤더만) |
-| 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling` |
-| 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` |
-| 궁수 | `ArcherSkillDefinitions` | `piercing`, `wind_shot`, `cardinal_discharge` |
-| 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` |
-| 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` |
-| 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack` |
+| 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
+| 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
+| 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge` / `enhanced_piercing`, `arrow_stream`, `cardinal_discharge_ii` |
+| 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` / `triple_throw`, `edge_carnival`, `bloody_storm` |
+| 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
+| 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
+
+2단계 스킬의 원본 연결은 §4.7 `BaseSkillId`가 소유한다. `thunder_bolt`와 `heal`은
+아직 2단계가 없다.
 
 공용 `SkillDefinitions`는 현재 **행이 하나도 없다**. 이전의 범용 프로토타입 타일
 (`basic_slash`, `quick_slash`, `heavy_slash`, `push`, `slash_push_combo`, `prototype_*`,
@@ -189,8 +209,10 @@ SkillId는 예외 없이 `UNKNOWN_SKILL`이다.
 1. 그 직업의 `{Job}SkillDefinitions.csv`에 행을 추가한다 (공용 `SkillDefinitions`에는 넣지 않는다).
 2. `SkillEffectSteps.csv`에 `EffectSetId` 행을 추가한다.
 3. `JobStartingSkillEntries.csv`에 필요하면 슬롯을 추가한다.
-4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다.
-5. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
+4. `CastEffectRuid`/`HitEffectRuid`를 §4.0 규칙대로 채운다. Sprite 기반 적은 `CasterMotion*`와 `EnemyQueueTurns`도 채운다.
+5. `WeaponType`을 §4.4 목록에서 고른다. 무기를 바꾸지 않는 스킬이면 비운다.
+6. 원거리 스킬이면 `ProjectileRuid`/`ProjectileSpeed`/`ProjectileScale`을 §4.5 규칙대로 채운다.
+7. `_ContentValidatorLogic:ValidateAllContent()`가 통과하는지 확인한다.
 
 ### 4.2 HUD 스킬 슬롯 배정
 
@@ -232,6 +254,346 @@ CSV와 모션 프로필의 값은 **1배속 기준 원본 그대로** 두고, �
 쓰는 스킬은 임팩트 시점을 공유한다. 스킬마다 다른 임팩트가 필요해지면 `SkillDefinitions`에
 `ImpactDelay` 열을 추가하는 것이 다음 단계다.
 
+### 4.4 WeaponDefinitions (IMPLEMENTED)
+
+런타임 이름 `WeaponDefinitions`. `SkillDefinitions.WeaponType`이 참조하는 무기 카탈로그다.
+스킬 행에는 토큰만 두고 실제 아바타 RUID와 장착 슬롯은 이 표가 소유하므로, 무기 아트를
+교체할 때 스킬 행을 건드리지 않는다.
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
+| WeaponType | string | O | 무기 종류 ID. `UPPER_SNAKE_CASE` |
+| DisplayName | string | O | 도감 표시 이름 |
+| EquipSlot | enum | O | `ONE_HANDED` 또는 `TWO_HANDED` |
+| WeaponRuid | string | O | `avataritem` RUID. 주 손에 드는 무기 |
+| Enabled | boolean | O | `false`면 참조하는 스킬이 검증에서 탈락 |
+| SubWeaponRuid | string | - | 보조무기 슬롯(`CustomSubWeaponEquip`)에 함께 드는 `avataritem` RUID. 단일 무기는 비움 |
+
+기본 키: `WeaponType` 유일. 현재 14행이 등록되어 있다.
+
+#### 이도류 (SubWeaponRuid)
+
+`SubWeaponRuid`를 채우면 주 손 무기와 보조무기를 **동시에** 장착한다. 현재 유일한 사례는
+`DUAL_BLADE`(단검 + 블레이드)이고 도적의 `fatal_blow`·`bloody_storm`이 쓴다.
+
+- **`EquipSlot=ONE_HANDED`일 때만 유효하다.** 두손무기는 이미 보조무기 슬롯을 점유하므로
+  같이 지정하면 조용히 무시된다 — Validator가 `SUB_WEAPON_ON_TWO_HANDED`로 거절한다.
+- `SkillWeaponEquipLogic`은 장착 전에 **1H·2H·보조 세 슬롯을 모두 비운다.** 보조무기를
+  비우지 않으면 다음 스킬이 한손검을 들어도 블레이드가 손에 남는다.
+- 재장착 생략(`ALREADY_EQUIPPED`) 판정도 **주 손과 보조를 함께** 본다. 주 손만 비교하면
+  `DAGGER`(단검만)와 `DUAL_BLADE`(단검+블레이드) 사이 전환이 건너뛰어진다.
+
+| EquipSlot | WeaponType |
+|---|---|
+| ONE_HANDED | `ONE_HANDED_SWORD`, `WAND`, `DAGGER`, `CLAW`, `GUN`, `KNUCKLE` |
+| TWO_HANDED | `TWO_HANDED_SWORD`, `SPEAR`, `POLEARM`, `BOW`, `CROSSBOW`, `STAFF` |
+
+`POLEARM`은 아직 참조하는 스킬이 없는 예약 행이다.
+
+#### 실행 경로
+
+```text
+SkillDefinition.WeaponType
+→ BattleSessionComponent.ApplySkillWeapon
+→ SkillWeaponEquipLogic.ApplyWeaponForSkill
+→ WeaponDefinitionRepositoryLogic.GetWeaponDefinition
+→ CostumeManagerComponent.SetEquip
+```
+
+- 장착은 **모션 재생 직전**에 일어나므로 스윙 모션이 해당 무기로 보인다.
+- 순수 표현이며 전투를 막지 않는다. 실패는 전부 `log_warning`으로 끝나고 스킬은 그대로
+  해결된다. 반환 Reason은 `OK`, `ALREADY_EQUIPPED`, `NO_WEAPON_REQUIRED`,
+  `UNKNOWN_WEAPON_TYPE`, `WEAPON_DISABLED`, `WEAPON_RUID_MISSING`,
+  `UNSUPPORTED_WEAPON_EQUIP_SLOT`, `COSTUME_MANAGER_MISSING`, `UNIT_UNAVAILABLE`이다.
+- 같은 무기를 이미 들고 있으면 재장착을 건너뛴다(`ALREADY_EQUIPPED`). 불필요한 코스튬
+  재구성과 그에 따른 깜빡임을 막기 위한 것이다.
+- `TWO_HANDED`는 1H·보조무기 슬롯을 함께 쓰므로 장착 전에 두 슬롯을 모두 비운다.
+- 적 유닛에는 `CostumeManagerComponent`가 없다. 그래서 `EnemySkillDefinitions` 행은
+  `WeaponType`이 모두 비어 있고, 적 스킬에 값을 넣는 것은 데이터 실수다.
+- 무기는 스킬이 바꾸기 전까지 유지된다. 턴이나 전투가 끝나도 되돌리지 않는다.
+
+### 4.5 투사체 (IMPLEMENTED)
+
+`ProjectileRuid`가 채워진 스킬은 시전자 셀에서 목표 셀까지 실제로 날아가는 엔티티를 만든다.
+이 게임의 피해는 `AttackComponent`/`HitComponent`가 아니라 §5 Effect Step이 셀 기준으로
+계산하므로, 투사체는 **판정을 갖지 않는 순수 표현**이다. 대신 임팩트 시점을 뒤로 민다.
+
+#### 실행 경로
+
+```text
+SkillDefinition.ProjectileRuid
+→ BattleSessionComponent.LaunchSkillProjectile   (ProjectileLaunchDelay 뒤 발사 예약, 비행시간 반환)
+→ BattleSessionComponent.SpawnSkillProjectile    (SpawnByModelId + AddComponent)
+→ SkillProjectileComponent.Launch / OnUpdate     (Translate 이동, 도착 시 Destroy)
+→ 발사지연 + 비행시간 뒤 SkillExecutionLogic.ExecuteEffectSteps
+```
+
+#### 타이밍
+
+| 시점 | 일 |
+|---|---|
+| 0 | 모션 재생 시작, 시전 이펙트, **투사체 발사** |
+| `ProjectileLaunchDelay` | 발사를 늦추고 싶을 때만 사용. 기본 `0` |
+| `발사지연 + 비행시간` | Effect Step 실행 = 피해·밀치기·피격 이펙트 |
+
+- **투사체는 시전 이펙트와 동시에 나가는 것이 기본이다.** 근접 스킬의 피해 시점인
+  모션 프로필 `ImpactDelay`에 묶지 않는다. 원거리 스킬은 "쏘는 순간 날아간다"가 자연스럽고,
+  `ImpactDelay`는 근접 스킬과 공유하는 값이라 그쪽까지 같이 흔들리기 때문이다.
+- 발사를 늦춰야 하는 스킬만 `ProjectileLaunchDelay`에 양수를 적는다. 이 값도 §4.3 배속으로
+  나눠 적용된다.
+- **비행시간은 저작값이 아니라 실제 거리에서 나온다**: `거리 / (ProjectileSpeed × 배속)`.
+  1칸 앞 적은 빠르게, 5칸 밖 적은 오래 걸린다.
+- `ProjectileSpeed`도 §4.3 배속의 영향을 받는다. 다른 연출과 함께 빨라진다.
+- `GetSkillActionDuration`은 큐 슬롯이 피해보다 먼저 끝나지 않도록
+  `max(ActionDuration, 발사지연 + 최대사거리 비행시간)`으로 보정한다. 최대 사거리를 쓰는
+  이유는 큐 시간을 계산하는 시점에 실제 대상 거리를 알 수 없기 때문이다.
+- 투사체가 없는 스킬은 이 경로를 타지 않는다. 기존대로 `ImpactDelay` 하나짜리 타이머로
+  피해가 해결된다.
+- 조준 셀은 `SkillTargetResolverLogic:Resolve`의 `TargetCellIndices` 마지막 값이다.
+  타기팅 규칙을 여기서 다시 구현하지 않는다. `FIRST_ENEMY_FORWARD`는 막아선 적의 칸,
+  `RANGE_OFFSETS`는 가장 바깥 칸이 된다.
+- 적이 없어도 투사체는 사거리 끝까지 날아가고 사라진다. Effect Step은 그대로 `NO_TARGET`이다.
+- `TargetingType=SELF`에는 투사체를 쓸 수 없다. 잡을 셀이 없어 Validator가 막는다.
+
+#### 엔티티
+
+`RootDesk/MyDesk/Models/Particles/SkillProjectile.model` — `TransformComponent` +
+`SpriteRendererComponent`만 가진 **Body 없는** 모델이다. 전투 맵은 `TileMapMode=0`
+(MapleTile, 중력 있음)이므로 Body를 붙이면 투사체가 바닥으로 떨어진다. 이동은 Body 속도가
+아니라 `TransformComponent:Translate`로 한다.
+
+`SkillProjectileComponent`는 `.model`에 넣지 않고 스폰 직후 `AddComponent`로 붙인다.
+`.codeblock`이 없을 때 모델의 스크립트 컴포넌트가 조용히 누락되는 경로를 피하기 위해서다.
+
+현재 투사체를 쓰는 스킬 9종이다.
+
+| SkillId | 단계 | 직업 | 투사체 출처 | Speed | Scale | LaunchDelay |
+|---|:--:|---|---|:--:|:--:|:--:|
+| `piercing` | 1 | 궁수 | 피어싱 팩 `ball` | 14 | 0.55 | 0 |
+| `arrow_bomb` | 1 | 궁수 | 바람의 시 팩 `ball` | 14 | 0.9 | 0 |
+| `flame_orb` | 1 | 마법사 | 플레임 오브 팩 `ball` | 12 | 0.7 | 0 |
+| `poison_breath` | 1 | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
+| `slug_shot` | 1 | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
+| `enhanced_piercing` | 2 | 궁수 | 인핸스 피어싱 팩 `shootobj/layerList/b1` | 14 | 0.5 | 0 |
+| `arrow_stream` | 2 | 궁수 | 폭풍의 시 팩 `ball` | 14 | 1.8 | 0.15 |
+| `triple_throw` | 2 | 도적 | 트리플 스로우 팩 `ball` | 14 | 1.2 | 0 |
+| `cannon_spike` | 2 | 해적 | 캐논 스파이크 팩 `ball` | 16 | 0.85 | 0 |
+
+2단계 4종은 모두 **자기 팩에 실제로 날아가는 물체가 있어서** 붙였다. 반대로 상위 단계인데
+투사체가 없는 경우도 있다 — `explosion`(원본 `flame_orb`는 투사체 있음)과
+`poison_mist`(원본 `poison_breath`는 투사체 있음)는 자기 팩에 `ball`이 없어 즉발로 뒀다.
+기준은 단계가 아니라 팩 내용이다. `triple_throw`는 반대 방향으로, 원본 `shuriken_burst`에는
+없던 투사체가 자기 팩에는 있어서 새로 생겼다.
+
+발사 지연은 `poison_breath`(`0.25`)와 `arrow_stream`(`0.15`) 둘뿐이다. 둘 다 **플레이 확인에서
+"시전 이펙트보다 투사체가 먼저 튀어나온다"는 피드백**을 받아 넣은 값이며, 이론이 아니라
+눈으로 정했다.
+
+- `poison_breath`: 0.15 → 0.25로 두 번 조정(배속 적용 후 0.2초). 피해가 밀려
+  `0.2 + 0.224 = 0.424초`가 되지만 `ActionDuration` 0.65초 안이라 큐 슬롯은 그대로다.
+- `arrow_stream`: `0.15`(배속 적용 후 0.12초). 연발이라 총 지연이
+  `0.12 + 0.144(연발) + 0.192(비행) = 0.456초`이고, 이건 `ActionDuration`을 배속으로 나눈
+  `0.55 / 1.25 = 0.44초`를 **넘긴다.** 그래서 큐 슬롯이 `0.44 → 0.456`으로 0.016초 늘어난다
+  (`GetSkillActionDuration`이 둘 중 큰 값을 쓴다). 체감되지 않는 차이라 그대로 뒀다.
+
+> ⚠️ **예산 비교 대상은 원본 `ActionDuration`이 아니라 `ActionDuration / 배속`이다.**
+> `GetSkillActionDuration`은 저작값도 배속으로 나눈 뒤 투사체 예산과 비교하므로, 0.55초를
+> 기준으로 계산하면 여유가 있는 것처럼 보이지만 실제 기준은 0.44초다. **연발 스킬은 특히
+> 주의한다** — 발사 지연·연발 구간·비행시간이 함께 쌓여 이 선을 쉽게 넘고, 넘으면 큐 슬롯이
+> 자동으로 늘어나 그 스킬의 행동이 길어진다.
+
+`ball`은 §4.0의 `effect`(시전)·`hit`(피격)과 같은 리소스 팩 안의 엘리먼트이며 날아가는
+물체에 해당한다.
+
+#### 투사체를 붙이는 기준
+
+**원본 리소스 팩에 날아가는 물체(`ball` 또는 그에 준하는 엘리먼트)가 실제로 있는 스킬만
+투사체를 쓴다.** 팩에 없다고 다른 스킬 것을 빌려오면 서로 같은 그림이 되어 구분이 사라진다.
+
+이 기준으로 초기 9종 중 4종에서 투사체를 뺐다 — `holy_arrow`, `thunder_bolt`,
+`magnum_shot`, `enemy_ranged_shot`. 넷 다 자기 팩에 `ball`이 없어 남의 것을 쓰고 있었다.
+이들은 투사체 없이 즉발로 해결되며, 전사·도적은 원래 투사체 스킬이 없다.
+
+반대로 `poison_breath`는 나중에 추가했다. 자기 팩(`skill/210.img/skill/2101005`)에
+`ball`이 실제로 들어 있어 기준을 그대로 만족한다. 남은 무투사체 스킬들을 다시 확인할 때는
+같은 절차를 쓴다 — `CastEffectRuid`로 팩을 역추적(`packs`)해 `ball` 유무를 본다.
+
+`cardinal_discharge`는 한동안 이 기준의 유일한 예외였다. 자기 팩에는 `ball`이 없지만 같은
+직업군(패스파인더) 스킬인 카디널 블래스트의 발사체(`shootobj/layerList/b1`)를 의도적으로
+가져다 썼다. 이후 예외를 없애고 투사체를 뺐다 — 기준을 스킬마다 다르게 적용할 이유가
+없었고, 지금은 위 4종과 같이 투사체 없이 즉발로 해결된다. 되돌릴 때는 카디널 블래스트 팩이
+`ball` 대신 `shootobj/layerList/b1`(발사체 몸체)과 `e1`(착탄)을 갖는다는 점, 팩이 4종
+(330 / 331 강화 / 332 / 334 VI)이고 디자인은 같으나 해상도가 176×80과 420×208로 갈리므로
+축소가 유리한 고해상도 쪽을 쓴다는 점을 참고한다.
+
+#### 비행 높이 (ProjectileHeight)
+
+셀 좌표는 유닛의 원점에 있어서, 그대로 쏘면 투사체가 **바닥을 스치듯 지나간다.**
+`ProjectileHeight`는 비행 직선 전체를 그만큼 위로 올려 무기를 든 높이에서 날아가게 한다.
+
+- 출발점과 착탄점을 **같이** 올리므로 거리와 비행시간은 변하지 않는다. 임팩트 시점도 그대로다.
+- 투사체가 없는 행에 값을 넣으면 아무 일도 일어나지 않으므로 Validator가
+  `PROJECTILE_HEIGHT_WITHOUT_PROJECTILE`로 거절한다.
+- 현재 사용하는 스킬은 `arrow_stream`(`0.25`) 하나다. 나머지 8종은 `0`이라 예전 그대로 셀
+  높이에서 날아간다 — 필요해지면 그 행만 채우면 된다.
+- 값 감각: 캐릭터 키가 대략 1유닛이다. `0`은 발밑, `0.5`는 어깨 위로 떠 보였고 그 중간인
+  `0.25`가 활을 든 높이에 맞았다.
+
+> 한때 `ProjectileArcHeight`로 포물선 곡사와 궤적 접선 회전을 지원했으나, 폭풍의 시를 직선
+> 연사로 확정하면서 **쓰는 스킬이 하나도 남지 않아 걷어냈다.** 다시 필요해지면 이력에서
+> 꺼내 쓴다 — 곡선은 `h·27/4·t·(1-t)²`(착탄 기울기 0)였고 회전은 그 도함수로 각도를 구해
+> 왼쪽 기준 `180°`를 뺀 뒤 `(-180, 180]`으로 정규화하는 방식이었다.
+
+#### 연발 (ProjectileCount / ProjectileInterval)
+
+`ProjectileCount`를 2 이상으로 두면 **같은 경로로 같은 투사체를 여러 번** 쏜다. 조준 셀·속도·
+배율·곡선은 모두 공유하고, `ProjectileInterval`(초, 1배속 기준)만큼 시차를 두고 발사한다.
+
+- **간격이 0이면 전부 같은 프레임에 겹쳐 나가 한 발처럼 보인다.** 그래서 `ProjectileCount`가
+  2 이상인데 간격이 없으면 Validator가 `PROJECTILE_VOLLEY_WITHOUT_INTERVAL`로 거절한다.
+  투사체가 없는 행에 연발 값을 넣으면 `PROJECTILE_VOLLEY_WITHOUT_PROJECTILE`이다.
+- 간격은 다른 저작 시간값과 마찬가지로 **배속으로 나눈다.** `0.06`은 배속 1.25에서 `0.048`이
+  되어 연사가 배속에 맞춰 촘촘해진다.
+- **임팩트는 마지막 화살이 도착할 때 해결된다** — 아직 화살이 날아가는 중에 피해가 들어가면
+  어색하기 때문이다. 총 지연은 `발사지연 + 간격 × (발수-1) + 비행시간`이다. 큐 슬롯 길이
+  계산(`GetSkillActionDuration`)도 같은 식으로 연발 구간을 포함한다.
+- **피해는 발수와 무관하게 Effect Step이 한 번 해결한다.** 연발은 순수 표현이므로 4발을
+  쏘아도 피해는 그 스킬의 Effect Step 값 그대로 한 번이다. 발수만큼 때리고 싶으면 Effect
+  Step을 늘리는 것이지 이 컬럼이 하는 일이 아니다.
+- 취소 처리도 발수만큼 필요하다. `ClearSkillImpactTimers`는 예약된 **모든** 발사 타이머를
+  지운다. 마지막 하나만 지우면 대체된 시전이 다음 액션까지 화살을 계속 뱉는다.
+- 현재 사용하는 스킬은 `arrow_stream`(4발 / 0.06초) 하나다. 나머지 8종은 `1` / `0`이다.
+
+`SkillProjectileComponent`는 `Translate` 누적이 아니라 **매 프레임 직선 위의 절대 위치를
+계산**한다. 프레임마다 이동량을 더하면 긴 비행에서 오차가 쌓이기 때문이다. 투사체는 회전하지
+않는다 — 전부 직선이라 아트가 향한 방향이 곧 진행 방향이다.
+
+`ProjectileScale`은 클립 원본 픽셀 크기를 셀 간격(1.12 월드 유닛 = 112px)에 맞춘 값이다.
+예: 피어싱 `ball`은 285px이라 배율 1이면 2.5칸을 덮으므로 0.55로 줄여 약 1.4칸에 맞춘다.
+포이즌 브레스 `ball`은 96px이라 배율 1에서 약 0.86칸으로, 같은 마법사 스킬인 플레임 오브
+(137px × 0.7 ≈ 96px)와 화면상 크기가 맞는다.
+
+### 4.6 스킬 아이콘 (IMPLEMENTED)
+
+`IconRuid`는 그 스킬 리소스 팩의 `icon` 엘리먼트다. §4.0의 `effect`(시전)·`hit`(피격),
+§4.5의 `ball`(투사체)과 같은 팩에서 나오므로 스킬 하나의 표현이 한 출처로 묶인다.
+플레이어 스킬 18행은 `IconRuid`를 사용한다. 적 전용 스킬은 플레이어 Codex용 `IconRuid` 대신
+`HudIconRuid`를 사용해 적 머리 위 Queue와 전투 디버그 HUD에 표시한다.
+
+찾는 절차는 §4.5의 투사체와 같다. `CastEffectRuid`로 팩을 역추적한다:
+
+```text
+node scripts/msw_resource_api.cjs packs <CastEffectRuid>
+  → payload.elements 에서 rel_path == "icon" 인 항목의 ruid
+```
+
+같은 팩에 `iconDisabled`·`iconMouseOver`도 들어 있다. 지금은 쓰지 않으며, 필요해지면
+컬럼을 늘리기보다 같은 팩에서 그때 가져온다.
+
+예외는 `arrow_bomb` 하나로 보이지만 실제로는 아니다. 이 스킬은 `wind_shot`에서 이름만
+바뀌었고 리소스는 바람의 시 팩(`skill/310.img/skill/3101005`)을 그대로 쓰므로, 역추적하면
+자연히 바람의 시 아이콘이 나온다. 별도 지정이 필요 없다.
+
+#### 표시 경로
+
+아이콘을 읽는 곳은 두 군데다.
+
+| 표시 위치 | 경로 |
+|---|---|
+| Codex 스킬 목록 | `SkillCodexProvider`가 서버에서 `definition.IconRuid`를 읽어 `EntrySnapshot`에 넣는다 |
+| 머리 위 예약 큐 HUD | `BattleSessionComponent.SkillIconSnapshot`(`@Sync`)을 클라가 파싱해서 쓴다 |
+
+HUD가 정의를 직접 읽지 못하는 이유는 스킬 DataSet이 전부 `serveronly`이기 때문이다.
+`SkillSlotNames`가 표시 이름을 서버에서 풀어 넘기는 것과 같은 방식으로,
+`SkillIconSnapshot`은 `skillId~iconRuid|...` 형태로 **보유 스킬 전체**를 넘긴다. 뽑힌 슬롯
+3개가 아니라 전체인 이유는 큐가 슬롯이 아니라 보유 여부로 등록을 허용하기 때문이다.
+
+양쪽 모두 값이 비면 기본 스프라이트(`1705e3c5b2c146ac9a699f96fb067408`)로 떨어진다.
+이 컬럼이 생기기 전에는 HUD가 `spear_pulling`·`brandish`·`divine_swing` 세 개만 SkillId로
+분기하는 하드코딩 표를 갖고 있었다. 그중 `spear_pulling`에 걸려 있던 RUID는 실제로는 웨폰
+마스터리 스킬의 `iconMouseOver`였다. 분기는 제거했다.
+
+### 4.7 스킬 강화 단계 (SkillTier / BaseSkillId)
+
+`SkillTier`는 **스킬 정의 자체의 정적 등급**이다. 1단계는 직업이 기본으로 갖는 형태이고,
+N단계 행은 `BaseSkillId`가 가리키는 N-1단계 스킬의 상위 버전이다. 2단계 스킬은 1단계 행을
+고치는 게 아니라 **별도의 행**으로 추가한다.
+
+> ⚠️ **`UpgradeSkillStage`가 UI에 보내는 `skillLevels`와 다른 값이다.** 그쪽은
+> `PlayerRunInventoryComponent.OwnedAmount` — 강화 스테이지에서 같은 스킬을 중첩 획득한
+> **런 중 누적 수치**이고 런이 끝나면 사라진다. `SkillTier`는 데이터에 고정된 값이라 런과
+> 무관하게 변하지 않는다. 두 개념을 같은 이름으로 부르지 않는다.
+
+#### 링크 방향
+
+연결은 **자식(상위 단계) 행이 부모를 가리키는** 한 방향으로만 저장한다.
+
+```text
+brandish            SkillTier=1  BaseSkillId=
+brandish_ii         SkillTier=2  BaseSkillId=brandish
+```
+
+반대 방향(1단계 행에 `UpgradesToSkillId`를 두는 방식)을 쓰지 않는 이유는 두 가지다.
+2단계 스킬 하나를 추가할 때마다 1단계 행까지 같이 고쳐야 해서 두 곳이 어긋날 수 있고,
+아직 존재하지 않는 SkillId를 미리 참조하게 되기 때문이다. 자식이 부모를 가리키면 새 행
+하나만 쓰면 되고, 3단계를 얹을 때도 같은 규칙이 그대로 이어진다.
+
+#### Validator 규칙
+
+`ContentValidatorLogic.ValidateSkillBundle`이 검사한다. 실패 코드는 §22 표에 있다.
+
+| 조건 | 규칙 |
+|---|---|
+| 모든 행 | `SkillTier`는 1 이상 |
+| `SkillTier = 1` | `BaseSkillId`는 반드시 비어 있어야 한다 |
+| `SkillTier >= 2` | `BaseSkillId` 필수, 자기 자신 금지 |
+| `SkillTier >= 2` | `BaseSkillId`가 실제 존재하는 스킬이어야 한다 |
+| `SkillTier >= 2` | 그 스킬의 `SkillTier`가 정확히 자신보다 1 작아야 한다 |
+| `SkillTier >= 2` | 그 스킬의 `RequiredJobTag`가 자신과 같아야 한다 |
+
+부모는 `GetSkillDefinition`으로 **읽기만** 하고 다시 검증하지는 않는다. 3단계 체인에서
+검증이 재귀로 빠지는 것을 막기 위해서다.
+
+#### 시작 스킬은 1단계만
+
+런은 항상 기본형으로 시작한다. 상위 단계는 런 도중에 얻는 것이지 처음부터 쥐여주지 않는다.
+`JobContentValidatorLogic.ValidateBundle`이 `JobStartingSkillEntries`의 각 항목을 검사해
+`SkillTier ~= 1`이면 `STARTING_SKILL_NOT_TIER_1`로 거절한다.
+
+시작 스킬은 §4.1 `StartingSkillSetId` → `JobStartingSkillEntries` 경로로만 지급되며
+(`PlayerRunStateComponent.ApplyJob` → `PlayerRunInventoryComponent.InitializeStartingSkills`),
+직업 카탈로그(`GetJobSkillDefinitions`)를 거치지 않는다. 즉 2단계 행이 늘어나도 시작 스킬에는
+섞이지 않는다. 이 검증 규칙은 그 성질을 **데이터 우연이 아니라 계약으로** 고정해 둔 것이다.
+
+> 실제 지급 개수는 `PlayerRunStateComponent.StartingSkillSlotCount`(현재 `2`)로 잘린다.
+> 그래서 시작 슬롯이 3행인 직업도 앞의 2개만 들고 시작한다. 단계와는 무관한 별개 제한이다.
+
+#### 현재 상태
+
+플레이어 스킬은 1단계 18행 + 2단계 16행 = 34행이고, 적 전용 3행은 모두 1단계다.
+`thunder_bolt`와 `heal`만 아직 상위 단계가 없다. 적 스킬은 강화 대상이 아니지만
+`ConvertSkillRow`가 모든 스킬 테이블에 공용이라 스키마를 맞추기 위해 같은 두 컬럼을 갖는다.
+
+2단계 16행의 저작 규칙은 다음과 같다.
+
+- **전투 형태는 원본을 그대로 물려받는다** — `TargetingType` / `Range` / `TargetOffsets` /
+  `CooldownTurns` / `MotionProfileId` / `WeaponType` / `ActionDuration`. 상위 단계라고 사거리나
+  타격 범위를 바꾸지 않았으므로, 원본과 다르게 굴리고 싶으면 그 행만 고치면 된다.
+- **피해는 원본 +2 고정**이다. 배율이 아니라 고정값이라 원래 2였던 광역기는 4로 두 배가 되고
+  6이었던 `fatal_blow` 계열은 8로 33% 오른다. 밸런스를 만지게 되면 여기부터 본다.
+- **`PUSH`를 함께 갖던 해적 2종은 그 구성을 유지한다**(`double_barrel_shot`,
+  `screw_punch` — 피해 + 밀치기 1).
+- **이펙트·아이콘은 그 스킬 자기 리소스 팩에서만 가져온다.** 팩에 `effect`/`hit/0`가 없으면
+  같은 팩의 대체 엘리먼트를 쓴다 — `divine_charge`는 `effect/1`, `explosion`은 `special/1`,
+  `poison_mist`는 `mob`, `screw_punch`는 `hit`, `arrow_stream`은 `prepare`를 시전 이펙트로
+  쓴다. 다른 스킬 팩에서 빌려오지 않는다(§4.5 투사체 기준과 같은 원칙).
+
+> 아직 **획득 경로는 단계를 구분하지 않는다.** `GetJobSkillDefinitions`는 `RequiredJobTag`로만
+> 거르므로, 2단계 행을 넣는 순간 신규 스킬 선택(`NewSkillStageChoiceComponent`)·강화
+> 스테이지·도감에 그대로 노출된다. 2단계 스킬을 추가하는 작업에서 이 게이팅을 함께 정해야
+> 한다.
+
 ## 5. SkillEffectSteps
 
 | 열 | 타입 | 필수 | 설명 |
@@ -271,9 +633,22 @@ CSV와 모션 프로필의 값은 **1배속 기준 원본 그대로** 두고, �
 | PatternId | string | O | EnemyPatternSteps 참조 |
 | MovementPolicy | enum | O | 추적 이동 또는 현재 방향 고정 이동 |
 | InitialFacingPolicy | enum | O | 생성 순간 한 번만 결정되는 초기 방향 |
+| TraitIds | string | - | `|` 구분 Trait 목록. 비어 있는 일반 적은 공격 후 기본 1칸 후퇴 |
 | IsBoss | boolean | O | `true`이면 사망 시 `BOSS_KILL` 드롭 Trigger를 함께 발행 |
 
 허용 MovementPolicy M1: `TRACK_PLAYER`, `FIXED_FACING`.
+
+공격 후 이동 계약:
+
+- 일반 적의 기본값: 성공 여부와 관계없이 `EXECUTE_TILE` 뒤 `MOVE_AWAY` 1회를 다음 적 턴 행동으로 예약한다.
+- `AGGRO`: 기본 후퇴 대신 `MOVE_TOWARD` 1회를 다음 적 턴 행동으로 예약한다.
+- `HOLD_POSITION`: 공격 후 이동을 추가하지 않는다.
+- `AGGRO|HOLD_POSITION` 조합은 의미가 충돌하므로 Validator가 거부한다.
+- `IsBoss=true`: 공통 후처리를 적용하지 않고 `EnemyPatternSteps`에 후퇴·접근·대기를 명시한다. 보스 패턴과 공통 후퇴가 중복 실행되는 것을 막기 위함이다.
+- 후처리 이동 방향은 공격 계획을 만들 때 고정하지 않고, 공격·밀치기 판정이 끝난 실행 시점의 보드에서 다시 계산한다.
+- 목적지가 맵 밖이거나 점유된 경우 기존 이동 계약에 따라 제자리에서 행동을 소모한다.
+- 턴 순서는 `적 턴 N: 공격 → 플레이어 턴 N+1: 회피·이동 가능 → 적 턴 N+1: 예약된 후퇴/접근`이다. `DeferredUntilTurn`은 이 예약 행동이 같은 적 라운드에 연속 실행되는 것을 막고 Client DTO에도 전달된다.
+- `DOUBLE_STRIKE`처럼 Trait가 명시한 연속 공격은 같은 적 턴 안에서 먼저 해소하고, 공격 후 이동만 다음 적 턴으로 미룬다.
 
 허용 InitialFacingPolicy M1: `FACE_PLAYER`(생성 시 플레이어를 바라보는 방향으로 결정), `FIXED_LEFT`(항상 왼쪽), `FIXED_RIGHT`(항상 오른쪽). 기본값은 `FACE_PLAYER`. `MovementPolicy`가 전투 중 계속 갱신되는 이동/추적 규칙인 것과 달리, `InitialFacingPolicy`는 스폰 순간에만 한 번 적용되고 이후에는 Pattern Action(§7)만 방향을 바꾼다. `StageEnemySpawns.FacingOverride`(§11)가 비어 있을 때, 그리고 `StageEnemyWaves`(§13)의 웨이브 스폰 시 이 값을 읽는다.
 
@@ -299,7 +674,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 | NextStepOnFailure | integer | - | 비어 있으면 다음 StepIndex |
 | Enabled | boolean | O | `true`인 행만 Repository가 로드 |
 
-허용 ActionType M1: `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`.
+허용 ActionType M1: `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE`.
 
 - `TURN_TO_PLAYER`: 현재 CellIndex는 유지하고 플레이어 방향으로 `Facing`만 바꾼다.
 - `MOVE_TOWARD`: 플레이어 방향으로 `Facing`을 바꾼 뒤 그 방향으로 1칸 이동한다.
@@ -307,6 +682,8 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 - `MOVE_FIXED_FACING`: 플레이어 위치를 참조하거나 `Facing`을 바꾸지 않고 현재 방향으로 1칸 이동한다.
 - `TELEGRAPH_TILE`: `TileId`를 `TelegraphTurns`회 예고한다. 보드·HP를 바꾸지 않으며 카운트가 끝난 뒤 성공 Step으로 이동한다.
 - `EXECUTE_TILE`: 예고와 분리된 실제 타일 실행이다. 실행 시점의 보드 상태로 대상을 다시 판정한다.
+- `BOSS_JUMP_TELEGRAPH`: 보스 전용. `TileId`가 필수이며, 현재 위치의 반대편 끝 칸을 착지 칸으로 고정하고 공중 상태로 전환한다. 다음 플레이어 턴 동안 보드는 보스를 점유·공격 대상으로 취급하지 않는다.
+- `BOSS_LAND_OPPOSITE`: 보스 전용. `TileId`가 필수이며, 고정된 칸에 착지한 뒤 해당 Skill을 공통 Skill 파이프라인으로 실행한다. 플레이어가 겹치면 중앙 방향 1칸을 우선하고, 막히면 반대 방향 1칸으로 밀어낸 뒤 보스를 배치한다.
 - 이동 목적지가 보드 밖이거나 점유된 경우 위치와 `Facing`을 유지하고 성공 분기는 `WAIT` 결과로 끝낸다. 자동 반전은 허용하지 않는다.
 
 추적형/고정형은 Pattern 전체에 `TURN_TO_PLAYER`가 있는지로 판정하지 않는다. 각 Step의 Action 의미가 독립적이며 하나의 Pattern에서 추적 Action과 고정 방향 Action을 함께 사용할 수 있다.
@@ -319,7 +696,8 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 Repository는 `PatternId → StepIndex`로 정렬하고,
 전용 Validator는 SchemaVersion, 연속 StepIndex, Action/Condition enum, TileId와 거리 인자를
 검사한다. Resolver는 `ALWAYS`, `DISTANCE_EQ`, `DISTANCE_LE`, `HP_RATIO_LE`, `CELL_FREE`와 `WAIT`,
-`TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`을
+`TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`,
+`BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE`를
 실행 가능 타입으로 받는다. `prototype_retreat`는 `MOVE_AWAY`, `prototype_telegraph`는 2턴 예고 뒤
 `enemy_basic_attack` 실행으로 이어지는 재사용 제작 샘플이다.
 
@@ -380,9 +758,10 @@ Facing을 이전 값으로 복구한다.
 
 - Snapshot에는 `TargetId`나 목표 CellIndex를 저장하지 않는다.
 - `EXECUTE_TILE`은 실행 시점의 현재 CellIndex/Facing과 `SkillDefinitions.TargetingType`으로 타깃을 다시 계산한다.
+- 보스 점프의 `PendingLandingCell`과 `IsAirborne`은 해당 `BattleUnitComponent`가 소유한다. PreparedIntent는 착지 위치를 재계산하거나 소유하지 않는다.
 - 밀치기·이동·회전은 Snapshot의 ActionType/TileId를 바꾸거나 다음 Step을 다시 선택하지 않는다.
 - 실행 성공/실패가 확정된 뒤에만 `NextStepOnSuccess`/`NextStepOnFailure`를 적용한다.
-- Client에는 HUD에 필요한 EnemyId/ActionType/TileId/남은 준비 턴만 읽기 전용 DTO/Event로 전달한다.
+- Client에는 HUD에 필요한 EnemyId/ActionType/TileId/남은 준비 턴과 서버가 계산한 `TelegraphKind`, `LandingCell`, `TargetCells`만 읽기 전용 DTO/Event로 전달한다. Client UI는 AI와 피해 범위를 재계산하지 않는다.
 
 ### 7.2 표 기반 협업 규칙
 
@@ -414,7 +793,7 @@ Phase 전환은 이미 고정된 적 Queue를 바꾸지 않으며, 다음 라운
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
-| SchemaVersion | integer | O | 현재 `2` |
+| SchemaVersion | integer | O | 현재 `3` |
 | StageId | string | O | 고유 스테이지 ID |
 | RegionId | string | O | `RegionDefinitions.RegionId` 참조 |
 | StageIndex | integer | O | Region 안 전투 순서, 1 이상 |
@@ -427,7 +806,6 @@ Phase 전환은 이미 고정된 적 Queue를 바꾸지 않으며, 다음 라운
 | PlayerStartCell | integer | O | 0 이상 `CellCount` 미만 |
 | QueueCapacity | integer | O | 기본 큐 용량, 1 이상 |
 | WaveTableId | string | O | `StageEnemyWaves.WaveTableId` 참조 |
-| NextStageId | string | - | 초기 호환 열. 실제 다음 콘텐츠는 NodeDefinitions가 결정 |
 | StageRuleId | string | - | 특수 Stage 규칙 ID |
 
 `CellStartX/UnitY/CellSpacing`은 월드 좌표 표현용이며 논리 판정은 CellIndex를 사용한다.
@@ -476,8 +854,8 @@ Region은 소속과 표시 순서만 소유한다. Node Graph, 공통 적 Pool, 
 
 기본 키: `(NodeGraphId, NodeId)` 유일. 같은 NodeGraphId 안에 `IsStartNode=true`가 정확히 1개여야 한다. `NextNodeIds`가 참조하는 NodeId는 같은 NodeGraphId 안에 존재해야 한다.
 
-`StageDefinitions.NextStageId`는 초기 호환 열이며 Run의 실제 다음 콘텐츠를 결정하지 않는다.
-전투 종료 뒤 이동 가능한 대상은 `NodeDefinitions.NextNodeIds`만 원본으로 사용한다.
+StageDefinitions에는 진행 관계를 저장하지 않는다. 전투 종료 뒤 이동 가능한 대상은
+`NodeDefinitions.NextNodeIds`만 원본으로 사용한다.
 런타임은 각 다음 노드를 다음 공통 DTO로 정규화한다.
 
 ```text
@@ -494,9 +872,9 @@ NextContentIds      BATTLE/BOSS는 StageId, 그 외는 NodeId
 현재 실제 `NodeDefinitions.userdataset/.csv`에는 `prototype_run` 그래프의
 `stage01_battle(BATTLE) → shop_after_stage01(SHOP)` 두 행이 등록되어 있다.
 `NodeContentValidatorLogic`은 시작 노드가 정확히 1개인지, NodeId 중복·다음 노드·Stage 참조·
-시작점에서 도달 불가능한 노드가 없는지를 그래프 단위로 검증한다. Maker에서 두 행의
-`Source=DATASET`, `StartNodeId=stage01_battle`, 승리 후 `NextContentTypes=SHOP`을 확인했으며
-Repository의 prototype fallback은 비활성 상태다.
+시작점에서 도달 불가능한 노드가 없는지를 그래프 단위로 검증한다. 현재 prototype_run은
+Region 1의 세 전투 뒤에 REST 보상 노드를 두며 세 번째 보상은 현재 종단 노드다. Repository의 prototype fallback은
+비활성 상태다.
 
 예시(`henesys_graph`, 회의 문서의 "헤네시스 1-1/1-2/1-3" 배치를 노드 3개로 표현):
 
@@ -885,6 +1263,26 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | DATA_INVALID_DROP_REFERENCE | EnemyDropDefinitions의 EnemyDefinitionId 또는 DropRefId 참조가 잘못됨 | O |
 | DATA_INVALID_DROP_RANGE | ChancePermille 또는 MinAmount/MaxAmount 범위가 잘못됨 | O |
 | DATA_UNUSED_ROW | 어디에서도 참조되지 않는 활성 행 | X, 경고 |
+| INVALID_SKILL_WEAPON_REFERENCE | SkillDefinitions의 WeaponType이 비어 있지 않은데 §4.4에서 유효하지 않음 | O |
+| UNSUPPORTED_WEAPON_EQUIP_SLOT | WeaponDefinitions의 EquipSlot이 ONE_HANDED/TWO_HANDED가 아님 | O |
+| WEAPON_RUID_MISSING | WeaponDefinitions의 WeaponRuid가 비어 있음 | O |
+| WEAPON_DISABLED | 활성 스킬이 Enabled=false인 무기를 참조 | O |
+| SUB_WEAPON_ON_TWO_HANDED | EquipSlot=TWO_HANDED인 무기에 SubWeaponRuid를 지정 (§4.4) | O |
+| PROJECTILE_HEIGHT_WITHOUT_PROJECTILE | ProjectileRuid가 비어 있는데 ProjectileHeight가 0 초과 (§4.5) | O |
+| INVALID_PROJECTILE_COUNT | ProjectileRuid가 있는데 ProjectileCount가 1 미만 (§4.5) | O |
+| PROJECTILE_VOLLEY_WITHOUT_INTERVAL | ProjectileCount가 2 이상인데 ProjectileInterval이 0 이하 (§4.5) | O |
+| PROJECTILE_VOLLEY_WITHOUT_PROJECTILE | ProjectileRuid가 비어 있는데 연발 컬럼이 채워짐 (§4.5) | O |
+| INVALID_PROJECTILE_SPEED | ProjectileRuid가 있는데 ProjectileSpeed가 없거나 0 이하 | O |
+| PROJECTILE_ON_SELF_TARGETING | TargetingType=SELF인 스킬에 ProjectileRuid를 지정 | O |
+| INVALID_PROJECTILE_LAUNCH_DELAY | ProjectileRuid가 있는데 ProjectileLaunchDelay가 음수 | O |
+| INVALID_SKILL_TIER | SkillTier가 없거나 1 미만 | O |
+| TIER_1_BASE_SKILL_PRESENT | SkillTier=1인데 BaseSkillId가 채워져 있음 | O |
+| BASE_SKILL_ID_MISSING | SkillTier가 2 이상인데 BaseSkillId가 비어 있음 | O |
+| BASE_SKILL_SELF_REFERENCE | BaseSkillId가 자기 자신을 가리킴 | O |
+| BASE_SKILL_NOT_FOUND | BaseSkillId가 어느 스킬 테이블에도 없음 | O |
+| BASE_SKILL_TIER_MISMATCH | BaseSkillId가 가리키는 스킬의 SkillTier가 자신보다 정확히 1 작지 않음 | O |
+| BASE_SKILL_JOB_MISMATCH | BaseSkillId가 가리키는 스킬의 RequiredJobTag가 자신과 다름 | O |
+| STARTING_SKILL_NOT_TIER_1 | JobStartingSkillEntries가 SkillTier≠1인 스킬을 참조 (§4.7) | O |
 
 로그 예시:
 

@@ -22,7 +22,7 @@ script EnemyIntentResolverLogic extends Logic
 			return intent
 		end
 		local cellDelta = playerCell - enemyCell
-		if cellDelta == 0 then
+		if cellDelta == 0 and context.EnemyIsAirborne ~= true then
 			intent.Reason = "SAME_CELL"
 			return intent
 		end
@@ -50,7 +50,7 @@ script EnemyIntentResolverLogic extends Logic
 				return intent
 			end
 			if self:IsConditionSatisfied(context, step, distance) == true
-				and self:IsActionApplicable(step.ActionType, enemyCell, playerCell, playerDirection, facingDirection) == true then
+				and self:IsActionApplicable(context, step.ActionType, step.ConditionType, enemyCell, playerCell, playerDirection, facingDirection) == true then
 				return self:CreateIntentFromStep(context, step, playerDirection, facingDirection, #steps)
 			end
 			visited[currentStepIndex] = true
@@ -71,6 +71,85 @@ script EnemyIntentResolverLogic extends Logic
 
 		intent.Reason = "NO_APPLICABLE_PATTERN_STEP"
 		return intent
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveQueuedAttackReadiness(table context, table skillDefinition)
+		-- Reuses the existing tactical direction resolver while SkillTargetResolver remains the only owner of range offsets.
+		local result = {
+			Success = false,
+			Reason = "INVALID_QUEUED_ATTACK_CONTEXT",
+			Readiness = "BLOCKED",
+			NextCommandType = "WAIT",
+			Direction = 0,
+			TargetCellSnapshot = ""
+		}
+		if context == nil or skillDefinition == nil then
+			return result
+		end
+		local enemyCell = math.floor(tonumber(context.EnemyCellIndex) or -1)
+		local playerCell = math.floor(tonumber(context.PlayerCellIndex) or -1)
+		if enemyCell < 0 or playerCell < 0 or enemyCell == playerCell then
+			result.Reason = "INVALID_RELATIVE_CELLS"
+			return result
+		end
+
+		local directions = self:ResolveRelativeDirections(enemyCell, context.EnemyFacing, playerCell)
+		local offsets = _SkillTargetResolverLogic:BuildOffsets(skillDefinition.TargetingType, skillDefinition.Range, skillDefinition.TargetOffsets)
+		if offsets.Success == false then
+			result.Reason = offsets.Reason
+			return result
+		end
+		local targetCells = {}
+		for _, offset in ipairs(offsets.Values) do
+			table.insert(targetCells, enemyCell + directions.FacingDirection * offset)
+		end
+		result.TargetCellSnapshot = self:SerializeIntegers(targetCells)
+		result.Direction = directions.PlayerDirection
+		result.Success = true
+
+		if directions.FacingDirection ~= directions.PlayerDirection then
+			result.Reason = "NEEDS_TURN"
+			result.Readiness = "NEEDS_TURN"
+			result.NextCommandType = "TURN_TO_PLAYER"
+			result.TargetCellSnapshot = ""
+			return result
+		end
+
+		local distance = math.abs(playerCell - enemyCell)
+		local playerInTargetOffsets = skillDefinition.TargetingType == "SELF"
+		for _, offset in ipairs(offsets.Values) do
+			if offset == distance then
+				playerInTargetOffsets = true
+				break
+			end
+		end
+		if playerInTargetOffsets then
+			result.Reason = "READY"
+			result.Readiness = "READY"
+			result.NextCommandType = "EXECUTE_TILE"
+			return result
+		end
+
+		if context.TowardPlayerCellFree == true then
+			result.Reason = "NEEDS_MOVE"
+			result.Readiness = "NEEDS_MOVE"
+			result.NextCommandType = "MOVE_TOWARD"
+			result.TargetCellSnapshot = ""
+			return result
+		end
+
+		result.Reason = "BLOCKED"
+		result.Readiness = "BLOCKED"
+		result.NextCommandType = "WAIT"
+		result.TargetCellSnapshot = ""
+		return result
+	end
+
+	method table ResolveRelativeDirections(integer enemyCell, string enemyFacing, integer playerCell)
+		local playerDirection = playerCell >= enemyCell and 1 or -1
+		local facingDirection = enemyFacing == "Right" and 1 or -1
+		return { PlayerDirection = playerDirection, FacingDirection = facingDirection }
 	end
 
 	method boolean IsConditionSatisfied(table context, table step, integer distance)
@@ -97,14 +176,17 @@ script EnemyIntentResolverLogic extends Logic
 		return false
 	end
 
-	method boolean IsActionApplicable(string actionType, integer enemyCell, integer playerCell, integer playerDirection, integer facingDirection)
+	method boolean IsActionApplicable(table context, string actionType, string conditionType, integer enemyCell, integer playerCell, integer playerDirection, integer facingDirection)
 		-- Action applicability prevents no-op TURN rows and attacks through the enemy's back side.
 		if actionType == "TURN_TO_PLAYER" then
 			return facingDirection ~= playerDirection
 		elseif actionType == "EXECUTE_TILE" then
-			-- The Pattern condition owns distance and the Skill definition owns target range.
-			-- This applicability check only prevents an attack through the enemy's back side.
-			return facingDirection == playerDirection
+			-- ALWAYS opts into the range-aware queued cycle; legacy distance-gated patterns keep their old facing branch.
+			return conditionType == "ALWAYS" or facingDirection == playerDirection
+		elseif actionType == "BOSS_JUMP_TELEGRAPH" then
+			return context.EnemyIsBoss == true and context.EnemyIsAirborne ~= true
+		elseif actionType == "BOSS_LAND_OPPOSITE" then
+			return context.EnemyIsBoss == true and context.EnemyIsAirborne == true
 		end
 		return true
 	end
@@ -148,6 +230,14 @@ script EnemyIntentResolverLogic extends Logic
 			PatternStepCount = 0,
 			TelegraphTurnsRemaining = 0
 		}
+	end
+
+	method string SerializeIntegers(table values)
+		local parts = {}
+		for _, value in ipairs(values or {}) do
+			table.insert(parts, tostring(math.floor(value)))
+		end
+		return table.concat(parts, "|")
 	end
 
 end

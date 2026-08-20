@@ -44,6 +44,111 @@ script SkillDefinitionRepositoryLogic extends Logic
 	end
 
 	@ExecSpace("ServerOnly")
+	method table GetJobSkillDefinitions(string jobId)
+		-- Loads the selected job's dedicated skill dataset and returns its converted definitions.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN_JOB",
+			JobId = jobId or "",
+			Skills = {}
+		}
+		if jobId == nil or jobId == "" then
+			result.Reason = "INVALID_JOB_ID"
+			return result
+		end
+
+		local dataSetNamesByJobId = {
+			warrior = "WarriorSkillDefinitions",
+			mage = "MageSkillDefinitions",
+			archer = "ArcherSkillDefinitions",
+			thief = "ThiefSkillDefinitions",
+			pirate = "PirateSkillDefinitions"
+		}
+		local dataSetName = dataSetNamesByJobId[jobId]
+		if dataSetName == nil then
+			log_warning("[SkillDefinition] unknown job catalog job=" .. jobId)
+			return result
+		end
+
+		local dataSet = _DataService:GetTable(dataSetName)
+		if dataSet == nil then
+			result.Reason = "JOB_SKILL_DATASET_MISSING"
+			log_warning("[SkillDefinition] missing job dataset job=" .. jobId .. " dataset=" .. dataSetName)
+			return result
+		end
+
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local definition = self:ConvertSkillRow(dataSet, rowIndex)
+			if definition.SkillId ~= "" and definition.RequiredJobTag == jobId then
+				table.insert(result.Skills, definition)
+			end
+		end
+		if #result.Skills == 0 then
+			result.Reason = "JOB_SKILLS_NOT_FOUND"
+			log_warning("[SkillDefinition] empty job catalog job=" .. jobId .. " dataset=" .. dataSetName)
+			return result
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		result.DataSetName = dataSetName
+		log("[SkillDefinition] job catalog loaded job=" .. jobId .. " dataset=" .. dataSetName .. " skills=" .. #result.Skills)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetNextSkillUpgrade(string jobId, string baseSkillId)
+		-- Resolves exactly one same-job child whose BaseSkillId points at the owned skill.
+		if jobId == nil or jobId == "" then
+			return { Success = false, Reason = "INVALID_JOB_ID", BaseSkillId = baseSkillId or "" }
+		end
+		if baseSkillId == nil or baseSkillId == "" then
+			return { Success = false, Reason = "INVALID_BASE_SKILL_ID", BaseSkillId = baseSkillId or "" }
+		end
+		local catalog = self:GetJobSkillDefinitions(jobId)
+		if catalog.Success == false then
+			return { Success = false, Reason = catalog.Reason, BaseSkillId = baseSkillId }
+		end
+		local baseDefinition = nil
+		local upgradeDefinition = nil
+		local upgradeCount = 0
+		for _, definition in ipairs(catalog.Skills) do
+			if definition.SkillId == baseSkillId then
+				baseDefinition = definition
+			end
+			if definition.BaseSkillId == baseSkillId then
+				upgradeCount = upgradeCount + 1
+				if upgradeDefinition == nil then
+					upgradeDefinition = definition
+				end
+			end
+		end
+		if baseDefinition == nil then
+			return { Success = false, Reason = "BASE_SKILL_NOT_IN_JOB_CATALOG", BaseSkillId = baseSkillId }
+		end
+		if upgradeCount == 0 then
+			return { Success = false, Reason = "NO_UPGRADE_PATH", BaseSkillId = baseSkillId, BaseDefinition = baseDefinition }
+		end
+		if upgradeCount > 1 then
+			log_error("[SkillUpgradePath] ambiguous job=" .. jobId .. " base=" .. baseSkillId .. " children=" .. upgradeCount)
+			return { Success = false, Reason = "AMBIGUOUS_UPGRADE_PATH", BaseSkillId = baseSkillId, BaseDefinition = baseDefinition }
+		end
+		if upgradeDefinition.SkillTier ~= baseDefinition.SkillTier + 1 then
+			log_error("[SkillUpgradePath] tier mismatch base=" .. baseSkillId .. " tier=" .. baseDefinition.SkillTier .. " upgrade=" .. upgradeDefinition.SkillId .. " tier=" .. upgradeDefinition.SkillTier)
+			return { Success = false, Reason = "UPGRADE_TIER_MISMATCH", BaseSkillId = baseSkillId, BaseDefinition = baseDefinition, UpgradeDefinition = upgradeDefinition }
+		end
+		log("[SkillUpgradePath] resolved job=" .. jobId .. " base=" .. baseSkillId .. " tier=" .. baseDefinition.SkillTier .. " upgrade=" .. upgradeDefinition.SkillId .. " tier=" .. upgradeDefinition.SkillTier)
+		return {
+			Success = true,
+			Reason = "OK",
+			BaseSkillId = baseSkillId,
+			UpgradeSkillId = upgradeDefinition.SkillId,
+			BaseDefinition = baseDefinition,
+			UpgradeDefinition = upgradeDefinition
+		}
+	end
+
+	@ExecSpace("ServerOnly")
 	method table GetSkillDefinition(string skillId)
 		local result = {
 			Success = false,
@@ -148,6 +253,7 @@ script SkillDefinitionRepositoryLogic extends Logic
 	@ExecSpace("ServerOnly")
 	method table ConvertSkillRow(any dataSet, integer rowIndex)
 		local skillId = dataSet:GetCell(rowIndex, "SkillId") or ""
+		local actionDuration = math.max(0.1, tonumber(dataSet:GetCell(rowIndex, "ActionDuration")) or 0.1)
 		local result = {
 			Success = true,
 			Reason = "OK",
@@ -165,13 +271,49 @@ script SkillDefinitionRepositoryLogic extends Logic
 			EffectSetId = dataSet:GetCell(rowIndex, "EffectSetId") or "",
 			RequiredJobTag = dataSet:GetCell(rowIndex, "RequiredJobTag") or "",
 			FreePlay = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "FreePlay")),
-			ActionDuration = math.max(0.1, tonumber(dataSet:GetCell(rowIndex, "ActionDuration")) or 0.1),
+			ActionDuration = actionDuration,
 			CastEffectRuid = dataSet:GetCell(rowIndex, "CastEffectRuid") or "",
 			HitEffectRuid = dataSet:GetCell(rowIndex, "HitEffectRuid") or "",
 			EffectScale = math.max(0.05, tonumber(dataSet:GetCell(rowIndex, "EffectScale")) or 1),
+			-- Which avatar weapon this skill is swung with. Empty means "keep whatever is equipped",
+			-- which is what every enemy row uses since enemies carry no avatar.
+			WeaponType = dataSet:GetCell(rowIndex, "WeaponType") or "",
+			-- Travelling projectile visual. Empty ProjectileRuid means the skill resolves with no
+			-- flight phase at all, which is the case for every melee and area skill.
+			ProjectileRuid = dataSet:GetCell(rowIndex, "ProjectileRuid") or "",
+			ProjectileSpeed = tonumber(dataSet:GetCell(rowIndex, "ProjectileSpeed")) or 0,
+			ProjectileScale = math.max(0.05, tonumber(dataSet:GetCell(rowIndex, "ProjectileScale")) or 1),
+			-- Holds the shot back after the cast. 0 fires it together with the cast effect, which is
+			-- what a ranged skill should read as; a positive value delays the launch.
+			ProjectileLaunchDelay = math.max(0, tonumber(dataSet:GetCell(rowIndex, "ProjectileLaunchDelay")) or 0),
+			-- How far above the cell the shot travels, in world units. Cell positions sit at the unit's
+			-- own origin, so 0 skims the floor; a positive value lifts the flight line to weapon height.
+			ProjectileHeight = math.max(0, tonumber(dataSet:GetCell(rowIndex, "ProjectileHeight")) or 0),
+			-- How many shots one cast sends down the same path. 1 is the single-shot default.
+			ProjectileCount = math.max(1, math.floor(tonumber(dataSet:GetCell(rowIndex, "ProjectileCount")) or 1)),
+			-- Seconds between consecutive shots of a multi-shot volley (1x speed). Without a gap the
+			-- shots overlap perfectly and read as one projectile, so a count above 1 needs this set.
+			ProjectileInterval = math.max(0, tonumber(dataSet:GetCell(rowIndex, "ProjectileInterval")) or 0),
+			-- 32x32 icon sprite taken from the skill's own resource pack. Empty is legal and falls back
+			-- to the placeholder at the presentation layer, which is what every enemy row relies on.
+			IconRuid = dataSet:GetCell(rowIndex, "IconRuid") or "",
+			-- Static upgrade tier of the definition itself: 1 is the base form a job starts from, and a
+			-- tier N row is the upgraded form of the tier N-1 row named by BaseSkillId. This is NOT the
+			-- per-run stack count the upgrade stage shows as "level" — that one is owned by
+			-- PlayerRunInventoryComponent.OwnedAmount and changes during a run, while this never does.
+			SkillTier = math.max(1, math.floor(tonumber(dataSet:GetCell(rowIndex, "SkillTier")) or 1)),
+			-- Which skill this row upgrades from. Empty on every tier 1 row, required from tier 2 up.
+			-- The link lives on the child so adding an upgrade never edits the row it upgrades from.
+			BaseSkillId = dataSet:GetCell(rowIndex, "BaseSkillId") or "",
+			-- Sprite-based enemies use their own attack clip while avatar players keep MotionProfileId.
+			CasterMotionRuid = dataSet:GetCell(rowIndex, "CasterMotionRuid") or "",
+			CasterMotionPlayRate = tonumber(dataSet:GetCell(rowIndex, "CasterMotionPlayRate")) or 1,
+			CasterMotionDuration = tonumber(dataSet:GetCell(rowIndex, "CasterMotionDuration")) or actionDuration,
+			EnemyQueueTurns = math.max(0, math.floor(tonumber(dataSet:GetCell(rowIndex, "EnemyQueueTurns")) or 0)),
+			HudIconRuid = dataSet:GetCell(rowIndex, "HudIconRuid") or "",
 			Source = "DATASET"
 		}
-		log("[SkillDefinition] loaded skill=" .. result.SkillId .. " target=" .. result.TargetingType .. " effects=" .. result.EffectSetId .. " cooldown=" .. result.CooldownTurns .. " cast=" .. result.CastEffectRuid .. " hit=" .. result.HitEffectRuid .. " source=" .. result.Source)
+		log("[SkillDefinition] loaded skill=" .. result.SkillId .. " tier=" .. result.SkillTier .. " base=" .. result.BaseSkillId .. " target=" .. result.TargetingType .. " effects=" .. result.EffectSetId .. " cooldown=" .. result.CooldownTurns .. " enemyQueueTurns=" .. result.EnemyQueueTurns .. " hudIcon=" .. result.HudIconRuid .. " motion=" .. result.CasterMotionRuid .. " cast=" .. result.CastEffectRuid .. " hit=" .. result.HitEffectRuid .. " weapon=" .. result.WeaponType .. " projectile=" .. result.ProjectileRuid .. " projectileSpeed=" .. result.ProjectileSpeed .. " icon=" .. result.IconRuid .. " source=" .. result.Source)
 		return result
 	end
 
@@ -201,4 +343,3 @@ script SkillDefinitionRepositoryLogic extends Logic
 	end
 
 end
-

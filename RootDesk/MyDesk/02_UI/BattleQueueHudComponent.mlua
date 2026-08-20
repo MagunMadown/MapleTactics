@@ -44,6 +44,8 @@ script BattleQueueHudComponent extends Component
 	property TextGUIRendererComponent SkillSlot5CooldownText = "44ecb3d9-03ba-443e-a91b-93eebdc54afc"
 	property TextGUIRendererComponent SkillSlot6CooldownText = "5f0db106-9c5e-4ae7-b806-44849ecb919b"
 	property string EmptySlotLabel = ""
+	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
+	property string IconSnapshot = ""
 	property ButtonComponent ExecuteButton = "564a6e86-cad3-49f8-a18f-927f1bb729c3"
 	property ButtonComponent ClearButton = "e46286f2-7013-4c7a-8c03-fd7ca3e887c8"
 	property SpriteGUIRendererComponent ResultPanelSprite = "6f0764a9-6582-48bb-8163-cb30159fcf81"
@@ -197,12 +199,14 @@ script BattleQueueHudComponent extends Component
 		local reinforcementLabel = self:GetReinforcementLabel(session.StageTurnNumber, waveState)
 		local cooldownSnapshot = uiState.CooldownSnapshot
 		local cooldownLabel = self:GetCooldownLabel(cooldownSnapshot)
-		local signature = presenterState.RevisionKey .. ":" .. runFlowRevision
+		local iconSnapshot = session.SkillIconSnapshot or ""
+		local signature = presenterState.RevisionKey .. ":" .. runFlowRevision .. ":" .. iconSnapshot
 		if force == false and self.LastSignature == signature then
 			return
 		end
 
 		self.LastSignature = signature
+		self:SyncIconSnapshot(iconSnapshot)
 		self.TurnText.Text = "TURN " .. uiState.TurnNumber
 		self.QueueText.Text = queueLabel
 		local consumableLabel = uiState.RunInventory.ConsumableSnapshot == "" and "없음" or uiState.RunInventory.ConsumableSnapshot
@@ -226,7 +230,7 @@ script BattleQueueHudComponent extends Component
 		else
 			self.QueueSlotSprite.Color = Color(0.38, 0.30, 0.12, 1)
 		end
-		self:SetResultVisibility(uiState.BattleResult)
+		self:SetResultVisibility(uiState.BattleResult, session.StageId)
 
 		log("[BattleQueueHUD] refreshed stage=" .. session.StageNumber .. " wave=" .. waveState.CurrentWave .. "/" .. waveState.TotalWaves .. " waveState=" .. waveState.WaveState .. " reinforcement=" .. reinforcementLabel .. " phase=" .. turnState.BattlePhase .. " turn=" .. turnState.TurnNumber .. " queued=" .. turnState.QueuedTileIds .. " executing=" .. turnState.ExecutingTileIds .. " index=" .. turnState.ExecutingTileIndex .. " count=" .. turnState.QueuedTileCount .. "/" .. turnState.TileQueueCapacity .. " action=" .. turnState.QueuedActionType .. " processing=" .. tostring(turnState.IsActionProcessing) .. " cooldowns=" .. cooldownSnapshot .. " intentState=" .. session.PreparedEnemyIntentState .. " intentAction=" .. session.PreparedEnemyActionType .. " intentTile=" .. session.PreparedEnemyTileId .. " intentTelegraphRemaining=" .. session.PreparedEnemyTelegraphTurnsRemaining .. " intentTurn=" .. session.PreparedEnemyTurn .. " result=" .. session.BattleResult)
 	end
@@ -280,14 +284,14 @@ script BattleQueueHudComponent extends Component
 		self:HideAllSkillCooldownTexts()
 		self.ExecuteButton.Enable = false
 		self.ClearButton.Enable = false
-		self:SetResultVisibility("")
+		self:SetResultVisibility("", "")
 		log("[BattleQueueHUD] unavailable reason=" .. reason)
 	end
 
 	@ExecSpace("ClientOnly")
-	method void SetResultVisibility(string battleResult)
-		-- Shows the compact result panel only after the synchronized battle result is final.
-		local visible = self.IsHudContextVisible and battleResult ~= ""
+	method void SetResultVisibility(string battleResult, string stageId)
+		-- Shows retry only after defeat because victories continue through the run transition flow.
+		local visible = self.IsHudContextVisible and battleResult == "Defeat"
 		if self.ResultPanelEntity ~= nil then
 			self.ResultPanelEntity.Enable = visible
 		end
@@ -297,7 +301,10 @@ script BattleQueueHudComponent extends Component
 		self.ResetButtonSprite.Enable = visible
 		self.ResetButtonText.Enable = visible
 		if visible then
-			self.ResultText.Text = battleResult == "Victory" and "VICTORY" or "DEFEAT"
+			self.ResultText.Text = "DEFEAT"
+		end
+		if battleResult ~= "" then
+			log("[BattleQueueHUD] result visibility stage=" .. tostring(stageId) .. " result=" .. battleResult .. " retryVisible=" .. tostring(visible))
 		end
 	end
 
@@ -425,6 +432,37 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void SyncIconSnapshot(string snapshot)
+		-- Parses the server-synced skill icon records only when their serialized value changes.
+		if snapshot == self.IconSnapshot and self._T.IconMap ~= nil then
+			return
+		end
+		self.IconSnapshot = snapshot
+		local iconMap = {}
+		local count = 0
+		for record in string.gmatch(snapshot or "", "([^|]+)") do
+			local skillId = string.match(record, "^([^~]+)")
+			local iconRuid = string.match(record, "~(.+)$")
+			if skillId ~= nil and iconRuid ~= nil and iconRuid ~= "" then
+				iconMap[skillId] = iconRuid
+				count = count + 1
+			end
+		end
+		self._T.IconMap = iconMap
+		log("[BattleQueueHUD] icon snapshot parsed count=" .. tostring(count))
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetSkillIconRuid(string skillId)
+		-- Returns the authored icon for this skill or the shared placeholder when the snapshot has no record.
+		local iconMap = self._T.IconMap
+		if iconMap ~= nil and iconMap[skillId] ~= nil then
+			return iconMap[skillId]
+		end
+		return self.DefaultSkillIconRuid
+	end
+
+	@ExecSpace("ClientOnly")
 	method void RefreshSkillSlots(boolean canChooseTile, string ownedSkills, string cooldownSnapshot, string queuedTileIds)
 		-- The bar has six display slots while the reservation queue keeps its independent three-entry capacity.
 		local buttons = {
@@ -523,6 +561,10 @@ script BattleQueueHudComponent extends Component
 		if displayName == "" then
 			displayName = skillId
 		end
+		local iconRuid = self:GetSkillIconRuid(skillId)
+		icon.ImageRUID = DataRef(iconRuid)
+		icon.Type = ImageType.Simple
+		icon.DropShadow = false
 		-- Keep the bottom bar visually focused on six large, readable slot keys.
 		-- Skill identity and reservation order remain visible through the overhead icon queue.
 		label.Text = tostring(slotIndex)
@@ -568,7 +610,7 @@ script BattleQueueHudComponent extends Component
 			and self:IsSkillOwned(ownedSkills, skillId)
 			and remainingCooldown <= 0
 			and queueOrder <= 0
-		log("[BattleQueueHUD] slot visual slot=" .. tostring(slotIndex) .. " skill=" .. skillId .. " state=" .. visualState .. " cooldown=" .. tostring(remainingCooldown) .. " queueOrder=" .. tostring(queueOrder) .. " iconVisible=" .. tostring(icon.Enable))
+		log("[BattleQueueHUD] slot visual slot=" .. tostring(slotIndex) .. " skill=" .. skillId .. " state=" .. visualState .. " cooldown=" .. tostring(remainingCooldown) .. " queueOrder=" .. tostring(queueOrder) .. " iconVisible=" .. tostring(icon.Enable) .. " ruid=" .. iconRuid)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -719,20 +761,30 @@ script BattleQueueHudComponent extends Component
 		end
 		local labels = {}
 		for _, intent in ipairs(uiState.EnemyIntents) do
-			local label = intent.CommandType
-			if intent.CommandType == "EXECUTE_TILE" then
+			local commandType = intent.CommandType or "WAIT"
+			local label = commandType
+			if commandType == "EXECUTE_TILE" then
 				label = self:GetTileLabel(intent.TileId)
-			elseif intent.CommandType == "TELEGRAPH_TILE" then
-				label = self:GetTileLabel(intent.TileId) .. " 예고 " .. intent.TelegraphTurnsRemaining .. "턴"
-			elseif intent.CommandType == "MOVE_TOWARD" then
+				if intent.State == "INSERTING" then
+					label = label .. " 큐 추가 " .. tostring(intent.QueueTurnsElapsed) .. "/" .. tostring(intent.QueueTurnsRequired)
+				elseif intent.State == "ATTACK_READY" then
+					label = label .. " 공격 예고"
+				end
+			elseif commandType == "TELEGRAPH_TILE" then
+				label = self:GetTileLabel(intent.TileId or "") .. " 예고 " .. tostring(intent.TelegraphTurnsRemaining or 0) .. "턴"
+			elseif commandType == "BOSS_JUMP_TELEGRAPH" then
+				label = "반대편 점프 예고"
+			elseif commandType == "BOSS_LAND_OPPOSITE" then
+				label = "반대편 착지"
+			elseif commandType == "MOVE_TOWARD" then
 				label = "추적 접근"
-			elseif intent.CommandType == "MOVE_AWAY" then
+			elseif commandType == "MOVE_AWAY" then
 				label = "후퇴"
-			elseif intent.CommandType == "MOVE_FIXED_FACING" then
+			elseif commandType == "MOVE_FIXED_FACING" then
 				label = "고정 방향 전진"
-			elseif intent.CommandType == "TURN_TO_PLAYER" then
+			elseif commandType == "TURN_TO_PLAYER" then
 				label = "플레이어 방향 전환"
-			elseif intent.CommandType == "WAIT" then
+			elseif commandType == "WAIT" then
 				label = "대기"
 			elseif intent.State == "COMPLETED" then
 				label = "행동 완료"
@@ -740,12 +792,27 @@ script BattleQueueHudComponent extends Component
 			local prefix = "#" .. tostring(intent.SpawnOrder)
 			if intent.State == "EXECUTING" then
 				prefix = prefix .. " 실행"
+			elseif intent.State == "INSERTING" then
+				prefix = prefix .. " 준비"
+			elseif intent.State == "TRACKING" then
+				prefix = prefix .. " 추적"
+				if intent.NextCommandType == "TURN_TO_PLAYER" then
+					label = self:GetTileLabel(intent.TileId) .. " 보유 · 방향 전환"
+				elseif intent.NextCommandType == "MOVE_TOWARD" then
+					label = self:GetTileLabel(intent.TileId) .. " 보유 · 접근"
+				elseif intent.NextCommandType == "WAIT" then
+					label = self:GetTileLabel(intent.TileId) .. " 보유 · 대기"
+				end
+			elseif intent.State == "ATTACK_READY" then
+				prefix = prefix .. " 경고"
 			end
-			if intent.ActionCount > 1 then
-				label = label .. " " .. intent.CurrentActionIndex .. "/" .. intent.ActionCount
+			local actionCount = math.max(0, math.floor(tonumber(intent.ActionCount) or 0))
+			if actionCount > 1 then
+				label = label .. " " .. tostring(intent.CurrentActionIndex or 0) .. "/" .. tostring(actionCount)
 			end
-			if intent.TraitIds ~= "" then
-				label = label .. " [" .. intent.TraitIds .. "]"
+			local traitIds = intent.TraitIds or ""
+			if traitIds ~= "" then
+				label = label .. " [" .. traitIds .. "]"
 			end
 			table.insert(labels, prefix .. " " .. label)
 		end
@@ -797,6 +864,10 @@ script BattleQueueHudComponent extends Component
 			return "적 방향 전환"
 		elseif actionType == "ENEMY_EXECUTE_TILE" then
 			return "적 기본 공격"
+		elseif actionType == "ENEMY_BOSS_JUMP_TELEGRAPH" then
+			return "보스 반대편 점프"
+		elseif actionType == "ENEMY_BOSS_LAND_OPPOSITE" then
+			return "보스 반대편 착지"
 		elseif actionType == "ENEMY_WAIT" then
 			return "적 대기"
 		end

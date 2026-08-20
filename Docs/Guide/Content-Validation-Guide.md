@@ -7,7 +7,7 @@
 
 - Stage Definition과 다음 Stage 참조
 - Skill Definition과 Effect Step 묶음
-- Job, Augment, Node Graph, Enemy Pattern의 전용 Validator
+- Weapon, Job, Augment, Node Graph, Enemy Pattern의 전용 Validator
 - Enemy Drop 전체 데이터
 - Stage Reward와 Stage·런 재화·소모품 참조
 - Shop Definition/Entry와 SHOP Node·스킬·소모품·런 재화 참조
@@ -50,14 +50,12 @@ local result = _ContentValidatorLogic:ValidateAllContent()
 비개발자도 어떤 표의 몇 번째 행을 고쳐야 하는지 확인할 수 있다.
 
 ```text
-StageDefinitions[1]stage01=NEXT_STAGE_NOT_FOUND:missing_stage
 SkillEffectSteps[2]orphan_effects#1=ORPHAN_EFFECT_SET
 ```
 
 ## 현재 전체 연결 검사
 
 - 중복 `StageId`, `SkillId`, `EffectSetId + StepIndex`
-- 존재하지 않는 `NextStageId`
 - Skill이 참조하지 않는 고아 Effect Set
 - 누락 Dataset과 빈 주요 ID
 - 각 전용 Validator의 schema, enum, 범위, 참조 규칙

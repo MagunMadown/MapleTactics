@@ -36,7 +36,7 @@ Refresh 후 `source=DATASET`, Wave 참조, 시작·Victory를 검증한다. `.us
 
 | 열 | 타입 | 예시 | 규칙 |
 |---|---|---|---|
-| `SchemaVersion` | integer | `2` | 현재 지원 버전은 2 |
+| `SchemaVersion` | integer | `3` | 현재 지원 버전은 3 |
 | `StageId` | string | `region_01_stage_01` | 변경하지 않는 고유 조회 ID |
 | `RegionId` | string | `region_01` | `RegionDefinitions.RegionId` 참조 |
 | `StageIndex` | integer | `1` | Region 안의 전투 순서, 1 이상 |
@@ -49,14 +49,13 @@ Refresh 후 `source=DATASET`, Wave 참조, 시작·Victory를 검증한다. `.us
 | `PlayerStartCell` | integer | `2` | 0 이상, `CellCount` 미만 |
 | `QueueCapacity` | integer | `3` | 1 이상 |
 | `WaveTableId` | string | `region_01_stage_01_waves` | `StageEnemyWaves.WaveTableId`와 연결 |
-| `NextStageId` | string | 빈 문자열 | 호환 열. 신규 Stage는 비우고 Node Graph를 사용 |
 | `StageRuleId` | string | 빈 문자열 | 공용 규칙이면 비움 |
 
 현재 Stage 1 기준 행은 다음 값과 같다.
 
 ```csv
-SchemaVersion,StageId,RegionId,StageIndex,StageType,DisplayName,CellCount,CellStartX,CellSpacing,UnitY,PlayerStartCell,QueueCapacity,WaveTableId,NextStageId,StageRuleId
-2,region_01_stage_01,region_01,1,NORMAL,1-1,6,-2.8,1.12,0.12,2,3,region_01_stage_01_waves,,
+SchemaVersion,StageId,RegionId,StageIndex,StageType,DisplayName,CellCount,CellStartX,CellSpacing,UnitY,PlayerStartCell,QueueCapacity,WaveTableId,StageRuleId
+3,region_01_stage_01,region_01,1,NORMAL,1-1,6,-2.8,1.12,0.12,2,3,region_01_stage_01_waves,
 ```
 
 MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값을 그대로 입력하지 않는다.
@@ -79,13 +78,21 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 
 | Stage | Wave 수 | 기본 구성 |
 |---|---:|---|
-| `region_01_stage_01` | 2 | 근접 1 → 원거리 1 |
-| `region_01_stage_02` | 2 | 근접/원거리 혼합, 최대 동시 2 |
-| `region_01_stage_03` | 3 | 혼합 비중 증가, 마지막 Wave 2 |
+| `region_01_stage_01` | 3 | 총 3마리. 근접 적만 등장해 기본 전투를 학습 |
+| `region_01_stage_02` | 3 | 총 5마리. 근접 중심, 스포아 가중치 1/4, 최대 동시 2 |
+| `region_01_stage_03` | 4 | 총 6마리. 스포아 가중치 1/3, 후반 Wave는 2마리 |
 | `region_01_stage_04` | 1 | 보스 1, `StageType=BOSS`, 2 Phase |
+
+스포아는 1-2부터 `region_01_spore_ranged` Enemy Definition으로 등장한다. 사거리는 2칸,
+기본 피해는 1, HP는 2다. 모든 직업의 기본 시작 공격 피해가 2 이상이므로 초반에는 스킬
+한 번으로 처치할 수 있다. `EnemySpawnPools.Weight`를 낮게 두어 원거리 압박이 과해지지 않게 한다.
 
 Node/REST 연결은 별도 제작 영역이다. Stage 행을 추가하는 작업에서 다른 팀이 소유한
 `NodeDefinitions.NextNodeIds`나 REST/상점 Node를 임의로 변경하지 않는다.
+
+현재 통합 흐름은 `1-1 → REST → 1-2 → REST → 1-3 → REST → 1-4 BOSS → REST`다.
+`region_01_stage_04`는 별도 맵 복제 없이 `StageMapRoutes`에서
+`region_01_stage_03` 전투 맵을 재사용하며, Battle Gateway가 전달한 StageId로 머쉬맘 데이터를 시작한다.
 
 보스 Stage 제작 규칙은 [Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)를 따른다.
 
@@ -105,7 +112,6 @@ Node/REST 연결은 별도 제작 영역이다. Stage 행을 추가하는 작업
 | `CONTENT_VALIDATION_FAILED` | `INVALID_PLAYER_START_CELL` | 시작 Cell이 보드 범위 밖 |
 | `CONTENT_VALIDATION_FAILED` | `INVALID_QUEUE_CAPACITY` | 큐 용량이 1 미만 |
 | `CONTENT_VALIDATION_FAILED` | `WAVE_TABLE_NOT_FOUND` | 연결된 Wave가 없음 |
-| `CONTENT_VALIDATION_FAILED` | `NEXT_STAGE_SELF_REFERENCE` | 다음 Stage가 자기 자신 |
 | `CONTENT_VALIDATION_FAILED` | `DATA_DUPLICATE_STAGE_ID` | 같은 StageId가 여러 행에 존재 |
 
 UI는 `DetailReason`을 그대로 사용자 문구로 표시하지 않고 별도의 현지화 문구로 변환한다.
