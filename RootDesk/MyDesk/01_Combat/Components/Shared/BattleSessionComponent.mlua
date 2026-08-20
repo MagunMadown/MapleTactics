@@ -169,6 +169,10 @@ script BattleSessionComponent extends Component
 	handler HandleMoveKeyDown(KeyDownEvent event)
 		-- Converts one movement/turn/attack key press into a server-authoritative request.
 		if event.key == KeyboardKey.Space then
+			if _BattleHudPresenterLogic:TryBeginLocalCommand("TURN") == false then
+				return
+			end
+			self:PreviewLocalTurnFacing()
 			log("[BattleInput] turn requested")
 			self:RequestTurn()
 			return
@@ -189,9 +193,41 @@ script BattleSessionComponent extends Component
 		end
 
 		if direction ~= 0 then
+			if _BattleHudPresenterLogic:TryBeginLocalCommand("MOVE") == false then
+				return
+			end
 			log("[BattleInput] move requested direction=" .. direction)
 			self:RequestMove(direction)
 		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PreviewLocalTurnFacing()
+		-- Gives Space an immediate visual response without mutating authoritative BattleUnit facing.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.PlayerControllerComponent == nil then
+			return
+		end
+
+		local currentDirection = player.PlayerControllerComponent.LookDirectionX
+		if currentDirection >= 0 then
+			player.PlayerControllerComponent.LookDirectionX = -1
+		else
+			player.PlayerControllerComponent.LookDirectionX = 1
+		end
+		log("[BattleInputFeedback] local turn preview direction=" .. tostring(player.PlayerControllerComponent.LookDirectionX))
+	end
+
+	@ExecSpace("Client")
+	method void ConfirmLocalPlayerFacing(string facing)
+		-- Confirms or rolls back the optimistic visual from the server-authoritative facing value.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.PlayerControllerComponent == nil then
+			return
+		end
+
+		player.PlayerControllerComponent.LookDirectionX = facing == "Right" and 1 or -1
+		log("[BattleInputFeedback] authoritative facing=" .. tostring(facing))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1270,6 +1306,10 @@ script BattleSessionComponent extends Component
 
 		local result = self:TryQueuePlayerAction("TURN", 0)
 		self:PublishPlayerCommandResult("TURN", result)
+		local playerUnit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if playerUnit ~= nil then
+			self:ConfirmLocalPlayerFacing(playerUnit.Facing)
+		end
 		if result.Success == false then
 			log_warning("[BattleQueue] rejected action=TURN reason=" .. result.Reason)
 		end
@@ -3305,6 +3345,7 @@ script BattleSessionComponent extends Component
 			dropRevision = dropRuntime.DropRevision
 		end
 
+		local playerActionState = self:ResolvePlayerActionState(turnState)
 		local isIdlePlayerTurn = self.ContentValidationState == "VALID" and self.BattleResult == "" and turnState.BattlePhase == "PlayerTurn" and turnState.IsActionProcessing == false
 		local queueCount = turnState.QueuedTileCount
 		local effectiveCapacity = turnState.TileQueueCapacity
@@ -3361,6 +3402,7 @@ script BattleSessionComponent extends Component
 		return {
 			Success = true,
 			Reason = "OK",
+			PlayerActionState = playerActionState,
 			RevisionKey = tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. self.BattleResult,
 			Phase = turnState.BattlePhase,
 			TurnNumber = turnState.TurnNumber,
@@ -3472,6 +3514,33 @@ script BattleSessionComponent extends Component
 				ForceSpawnPendingReason = waveState.ForceSpawnPendingReason
 			}
 		}
+	end
+
+	@ExecSpace("ClientOnly")
+	method string ResolvePlayerActionState(any turnState)
+		-- Derives presentation state from the existing authoritative turn state; it owns no rules or transitions.
+		if self.BattleResult ~= "" or self.ContentValidationState ~= "VALID" then
+			return "LOCKED"
+		end
+		if turnState == nil or turnState.BattlePhase ~= "PlayerTurn" then
+			return "WAITING_ENEMY_TURN"
+		end
+		if turnState.IsActionProcessing == true then
+			if turnState.QueuedActionType == "MOVE" then
+				return "MOVING"
+			end
+			if turnState.QueuedActionType == "TURN" then
+				return "TURNING"
+			end
+			if turnState.ExecutingTileIds ~= "" then
+				return "EXECUTING_ATTACK"
+			end
+			return "LOCKED"
+		end
+		if turnState.QueuedTileCount > 0 then
+			return "PREPARING_ATTACK"
+		end
+		return "READY"
 	end
 
 	@ExecSpace("Server")
@@ -4686,7 +4755,9 @@ script BattleSessionComponent extends Component
 		end
 
 		if self.BattlePhase ~= "PlayerTurn" then
-			-- Silently ignore movement input when battle has ended or during wave transitions
+			local rejected = { Success = false, Reason = "INVALID_PHASE" }
+			self:PublishPlayerCommandResult("MOVE", rejected)
+			log_warning("[BattleMove] rejected direction=" .. tostring(direction) .. " reason=INVALID_PHASE phase=" .. tostring(self.BattlePhase))
 			return
 		end
 
