@@ -29,6 +29,9 @@ script BattleUnitPresentationComponent extends Component
 	@Sync property number CustomMoveHopLandingDuration = 0.04
 	@Sync property Vector2 CustomMoveHopSquashScale = Vector2(1.03, 0.97)
 	@Sync property Vector2 CustomMoveHopLandingScale = Vector2(1.05, 0.95)
+	@Sync property number CustomMoveHopPeakProgress = 0.50
+	@Sync property string CustomMoveHopAnimationRuid = ""
+	@Sync property number CustomMoveHopAnimationPlayRate = 1.0
 
 	-- MapleStory skill clips are authored with their pivot already on the caster/target anchor
 	-- (measured: hit clips center at ~0, piercing's cast pivot sits at the forward edge), so the
@@ -161,6 +164,80 @@ script BattleUnitPresentationComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void StartMoveHopAnimation(table state, string animationRuid, number animationPlayRate)
+		-- Starts the existing avatar Fall action or the configured enemy jump clip without physics/state mutation.
+		local safePlayRate = math.max(0.1, animationPlayRate)
+		local avatarRenderer = self.Entity.AvatarRendererComponent
+		if avatarRenderer ~= nil then
+			local jumpEvent = BodyActionStateChangeEvent()
+			jumpEvent.ActionState = MapleAvatarBodyActionState.Fall
+			jumpEvent.needResetAction = true
+			jumpEvent.playRate = safePlayRate
+			self.Entity:SendEvent(jumpEvent)
+			state.AnimationKind = "AVATAR"
+			state.AnimationRuid = ""
+			log("[MoveHopAnimation] started unit=" .. tostring(state.UnitId)
+				.. " kind=AVATAR action=Fall rate=" .. tostring(safePlayRate))
+			return
+		end
+
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer == nil or animationRuid == "" then
+			state.AnimationKind = "NONE"
+			log("[MoveHopAnimation] skipped unit=" .. tostring(state.UnitId) .. " reason=ANIMATION_UNAVAILABLE")
+			return
+		end
+
+		state.AnimationKind = "SPRITE"
+		state.AnimationRuid = animationRuid
+		state.SpriteRenderer = renderer
+		state.BaseSpriteRuid = renderer.SpriteRUID
+		state.BaseSpritePlayRate = renderer.PlayRate
+		renderer.SpriteRUID = animationRuid
+		renderer.PlayRate = safePlayRate
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then
+			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+		end
+		log("[MoveHopAnimation] started unit=" .. tostring(state.UnitId)
+			.. " kind=SPRITE ruid=" .. animationRuid
+			.. " rate=" .. tostring(safePlayRate))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreMoveHopAnimation(table state, string reason)
+		-- Restores only the movement animation still owned by this hop instance.
+		if state == nil or state.AnimationKind == nil or state.AnimationKind == "NONE" then
+			return
+		end
+
+		if state.AnimationKind == "AVATAR" then
+			if isvalid(self.Entity) and self.Entity.AvatarRendererComponent ~= nil then
+				local standEvent = BodyActionStateChangeEvent()
+				standEvent.ActionState = MapleAvatarBodyActionState.Stand
+				standEvent.needResetAction = true
+				self.Entity:SendEvent(standEvent)
+				log("[MoveHopAnimation] restored unit=" .. tostring(state.UnitId)
+					.. " kind=AVATAR action=Stand reason=" .. tostring(reason))
+			end
+			return
+		end
+
+		local renderer = state.SpriteRenderer
+		if isvalid(self.Entity) and renderer ~= nil and renderer.SpriteRUID == state.AnimationRuid then
+			renderer.SpriteRUID = state.BaseSpriteRuid
+			renderer.PlayRate = state.BaseSpritePlayRate
+			local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then
+				self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+			end
+			log("[MoveHopAnimation] restored unit=" .. tostring(state.UnitId)
+				.. " kind=SPRITE ruid=" .. tostring(state.BaseSpriteRuid)
+				.. " reason=" .. tostring(reason))
+		end
+	end
+
+	@ExecSpace("ClientOnly")
 	method void StopMoveHopVisual(string reason)
 		-- Cancels an overlapping cosmetic hop and restores the visual child's exact local transform.
 		local state = self._T.moveHopVisual
@@ -185,11 +262,12 @@ script BattleUnitPresentationComponent extends Component
 			visualEntity.TransformComponent.Scale = state.BaseScale
 			visualEntity.TransformComponent.Rotation = state.BaseRotation
 		end
+		self:RestoreMoveHopAnimation(state, reason)
 		log("[CharacterHopVisual] restored unit=" .. tostring(state.UnitId) .. " reason=" .. tostring(reason))
 	end
 
 	@ExecSpace("Client")
-	method void PlayMoveHop(string unitId, number duration, number height, number takeoffDuration, number landingDuration, number squashXScale, number squashYScale, number landingXScale, number landingYScale)
+	method void PlayMoveHop(string unitId, number duration, number height, number takeoffDuration, number landingDuration, number squashXScale, number squashYScale, number landingXScale, number landingYScale, number peakProgress, string animationRuid, number animationPlayRate)
 		-- Shared cosmetic path for avatar and sprite units. It never mutates BattleUnit CellIndex.
 		self:StopMoveHopVisual("REPLACED")
 		if self.UseCustomMoveHopProfile then
@@ -205,6 +283,11 @@ script BattleUnitPresentationComponent extends Component
 			squashYScale = self.CustomMoveHopSquashScale.y
 			landingXScale = self.CustomMoveHopLandingScale.x
 			landingYScale = self.CustomMoveHopLandingScale.y
+			peakProgress = self.CustomMoveHopPeakProgress
+			if self.CustomMoveHopAnimationRuid ~= "" then
+				animationRuid = self.CustomMoveHopAnimationRuid
+				animationPlayRate = self.CustomMoveHopAnimationPlayRate
+			end
 		end
 		local visualEntity = self:GetMoveVisualEntity()
 		if visualEntity == nil or isvalid(visualEntity) == false or visualEntity.TransformComponent == nil then
@@ -212,8 +295,9 @@ script BattleUnitPresentationComponent extends Component
 			return
 		end
 
-		local totalDuration = math.max(0.10, math.min(0.20, duration))
+		local totalDuration = math.max(0.12, math.min(0.16, duration))
 		local hopHeight = math.max(0, height)
+		local hopPeakProgress = math.max(0.45, math.min(0.55, peakProgress))
 		local takeoff = math.max(0.02, math.min(0.04, takeoffDuration))
 		local landing = math.max(0.03, math.min(0.05, landingDuration))
 		local takeoffFraction = math.min(0.45, takeoff / totalDuration)
@@ -234,6 +318,7 @@ script BattleUnitPresentationComponent extends Component
 			Cancelled = false
 		}
 		self._T.moveHopVisual = state
+		self:StartMoveHopAnimation(state, animationRuid, animationPlayRate)
 
 		local tweener = _TweenLogic:PlayTween(0, 1, totalDuration, EaseType.Linear, function(progress)
 			if state.Cancelled then
@@ -245,8 +330,15 @@ script BattleUnitPresentationComponent extends Component
 			end
 
 			local clampedProgress = math.max(0, math.min(1, progress))
-			-- The arc reacts on the first tween frame; takeoff squash no longer creates a pause.
-			local yOffset = math.sin(math.pi * clampedProgress) * hopHeight
+			-- Two half-sine segments keep the peak configurable while reacting on the first tween frame.
+			local yOffset = 0
+			if clampedProgress <= hopPeakProgress then
+				local riseProgress = clampedProgress / math.max(0.001, hopPeakProgress)
+				yOffset = math.sin(riseProgress * math.pi * 0.5) * hopHeight
+			else
+				local fallProgress = (clampedProgress - hopPeakProgress) / math.max(0.001, 1 - hopPeakProgress)
+				yOffset = math.cos(fallProgress * math.pi * 0.5) * hopHeight
+			end
 
 			local takeoffWeight = 0
 			local landingWeight = 0
@@ -283,6 +375,7 @@ script BattleUnitPresentationComponent extends Component
 				visualEntity.TransformComponent.Scale = baseScale
 				visualEntity.TransformComponent.Rotation = baseRotation
 			end
+			self:RestoreMoveHopAnimation(state, "COMPLETED")
 			if self._T.moveHopVisual == state then
 				self._T.moveHopVisual = nil
 			end
@@ -292,6 +385,7 @@ script BattleUnitPresentationComponent extends Component
 		log("[CharacterHopVisual] started unit=" .. unitId
 			.. " duration=" .. tostring(totalDuration)
 			.. " height=" .. tostring(hopHeight)
+			.. " peak=" .. tostring(hopPeakProgress)
 			.. " takeoff=" .. tostring(takeoff)
 			.. " landing=" .. tostring(landing)
 			.. " target=" .. (preserveHorizontalPosition and "SPRITE_ROOT" or "VISUAL_CHILD"))
@@ -491,6 +585,7 @@ script BattleUnitPresentationComponent extends Component
 			log_warning("[BattleMotion] skipped unit=" .. unitId .. " reason=MOTION_KEY_EMPTY")
 			return
 		end
+		self:StopMoveHopVisual("COMBAT_MOTION_STARTED")
 
 		if self.MotionTimerId > 0 then
 			_TimerService:ClearTimer(self.MotionTimerId)
@@ -553,6 +648,7 @@ script BattleUnitPresentationComponent extends Component
 		if motionRuid == "" then
 			return
 		end
+		self:StopMoveHopVisual("SPRITE_MOTION_STARTED")
 
 		if self.HasOriginalSpriteMotion == false then
 			self.OriginalSpriteRuid = renderer.SpriteRUID
