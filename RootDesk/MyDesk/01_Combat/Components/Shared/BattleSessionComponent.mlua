@@ -136,6 +136,10 @@ script BattleSessionComponent extends Component
 	property number EnemyThinkDuration = 0.25
 	property number EnemyMoveActionDuration = 0.12
 	property number EnemyAttackActionDuration = 0.30
+	property number StrongHitDamageThreshold = 5
+	property number NormalCameraShakeAmplitude = 0.025
+	property number StrongCameraShakeAmplitude = 0.045
+	property number ImpactCameraShakeDuration = 0.08
 	property string EnemyModelId = "battledummyenemy"
 	property string CurrentEnemyDefinitionId = ""
 	property number CurrentEnemyBasicAttackDamage = 0
@@ -154,6 +158,11 @@ script BattleSessionComponent extends Component
 	property any DropRuntime = nil
 	property integer ActionTimerId = 0
 	property integer ImpactTimerId = 0
+	property integer ImpactCameraShakeMidTimerId = 0
+	property integer ImpactCameraShakeLateTimerId = 0
+	property integer ImpactCameraShakeRestoreTimerId = 0
+	property boolean HasImpactCameraBaseOffset = false
+	property Vector2 ImpactCameraBaseOffset = Vector2(0, 0)
 	property integer ProjectileSpawnCount = 0
 	property string ProjectileModelId = "skillprojectile"
 	property integer ProjectileOrderInLayer = 25
@@ -4546,16 +4555,21 @@ script BattleSessionComponent extends Component
 		result.HpBefore = damageResult.HpBefore
 		result.HpAfter = damageResult.HpAfter
 		result.AppliedAmount = damageResult.AppliedAmount
+		local strongHit = amount >= math.max(0.01, self.StrongHitDamageThreshold)
+		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourcePresentation ~= nil then
+			sourcePresentation:PlayHitStop(sourceUnitId, strongHit)
+		end
+		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if targetPresentation ~= nil then
+			targetPresentation:PlayHitImpact(targetUnitId, strongHit)
+		end
+		self:PlayImpactCameraShake(strongHit)
 		if targetUnit.Team == "Player" then
 			self:RefreshPlayerHpSnapshot("DAMAGE_APPLIED")
 		end
 		if damageResult.ReachedZero == true then
 			self:HandleUnitDiedFromSource(targetUnitId, "DAMAGE", sourceUnitId)
-		end
-
-		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if presentation ~= nil and targetEntity.SpriteRendererComponent ~= nil then
-			presentation:PlayHitFlash(targetUnitId)
 		end
 
 		result.Success = true
@@ -5111,6 +5125,64 @@ script BattleSessionComponent extends Component
 		_CameraService.TransitionBlendTime = 0
 		_CameraService:SwitchCameraTo(boardCamera)
 		log("[BattleCamera] fixed anchor active centerX=" .. boardCenterX .. " anchorX=" .. anchorX .. " offsetX=" .. boardCamera.CameraOffset.x)
+	end
+
+	@ExecSpace("Client")
+	method void StopImpactCameraShake()
+		if self.ImpactCameraShakeMidTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactCameraShakeMidTimerId)
+			self.ImpactCameraShakeMidTimerId = 0
+		end
+		if self.ImpactCameraShakeLateTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactCameraShakeLateTimerId)
+			self.ImpactCameraShakeLateTimerId = 0
+		end
+		if self.ImpactCameraShakeRestoreTimerId > 0 then
+			_TimerService:ClearTimer(self.ImpactCameraShakeRestoreTimerId)
+			self.ImpactCameraShakeRestoreTimerId = 0
+		end
+		local anchor = self.Entity:GetChildByName("BattleCameraAnchor", false)
+		if self.HasImpactCameraBaseOffset and isvalid(anchor) and anchor.CameraComponent ~= nil then
+			anchor.CameraComponent.CameraOffset = self.ImpactCameraBaseOffset
+		end
+		self.HasImpactCameraBaseOffset = false
+	end
+
+	@ExecSpace("Client")
+	method void PlayImpactCameraShake(boolean strongHit)
+		-- Reuses the fixed board camera and restores its exact offset; no camera controller is replaced.
+		self:StopImpactCameraShake()
+		local anchor = self.Entity:GetChildByName("BattleCameraAnchor", false)
+		if isvalid(anchor) == false or anchor.CameraComponent == nil then
+			return
+		end
+		local boardCamera = anchor.CameraComponent
+		local baseOffset = boardCamera.CameraOffset
+		local amplitude = strongHit and self.StrongCameraShakeAmplitude or self.NormalCameraShakeAmplitude
+		local duration = math.max(0.05, math.min(0.10, self.ImpactCameraShakeDuration))
+		self.ImpactCameraBaseOffset = baseOffset
+		self.HasImpactCameraBaseOffset = true
+		boardCamera.CameraOffset = Vector2(baseOffset.x + amplitude, baseOffset.y + amplitude * 0.35)
+		self.ImpactCameraShakeMidTimerId = _TimerService:SetTimerOnce(function()
+			if boardCamera ~= nil and isvalid(boardCamera.Entity) then
+				boardCamera.CameraOffset = Vector2(baseOffset.x - amplitude * 0.65, baseOffset.y - amplitude * 0.25)
+			end
+			self.ImpactCameraShakeMidTimerId = 0
+		end, duration * 0.34)
+		self.ImpactCameraShakeLateTimerId = _TimerService:SetTimerOnce(function()
+			if boardCamera ~= nil and isvalid(boardCamera.Entity) then
+				boardCamera.CameraOffset = Vector2(baseOffset.x + amplitude * 0.25, baseOffset.y)
+			end
+			self.ImpactCameraShakeLateTimerId = 0
+		end, duration * 0.68)
+		self.ImpactCameraShakeRestoreTimerId = _TimerService:SetTimerOnce(function()
+			if boardCamera ~= nil and isvalid(boardCamera.Entity) then
+				boardCamera.CameraOffset = baseOffset
+			end
+			self.ImpactCameraShakeRestoreTimerId = 0
+			self.HasImpactCameraBaseOffset = false
+		end, duration)
+		log("[BattleCamera] impact shake strong=" .. tostring(strongHit) .. " amplitude=" .. tostring(amplitude) .. " duration=" .. tostring(duration))
 	end
 
 	method boolean IsValidCell(integer cellIndex)
