@@ -13,8 +13,12 @@ script BattleUnitPresentationComponent extends Component
 	property number HpTextOutlineWidth = 0.18
 
 	property Color HitFlashColor = Color(1, 0.35, 0.35, 1)
-	property number HitFlashDuration = 0.18
+	property Vector2 NormalHitSquashScale = Vector2(1.07, 0.93)
+	property Vector2 StrongHitSquashScale = Vector2(1.13, 0.87)
 	property string CombatMotionReturnState = "IDLE"
+	-- Maple monster sprite and animation resources face left in their unflipped state.
+	-- Override this only when a custom monster model is authored facing right.
+	property boolean SpriteFacesLeftByDefault = true
 
 	-- MapleStory skill clips are authored with their pivot already on the caster/target anchor
 	-- (measured: hit clips center at ~0, piercing's cast pivot sits at the forward edge), so the
@@ -25,10 +29,17 @@ script BattleUnitPresentationComponent extends Component
 
 	property string LastDisplayedHp = ""
 	property integer HitFlashTimerId = 0
+	property integer HitStopTimerId = 0
+	property integer HitReactionMidTimerId = 0
+	property integer HitReactionRestoreTimerId = 0
 	property integer MotionTimerId = 0
 	property integer SpriteMotionTimerId = 0
 	property boolean HasOriginalSpriteColor = false
 	property Color OriginalSpriteColor = Color(1, 1, 1, 1)
+	property boolean HasOriginalImpactPlayRate = false
+	property number OriginalImpactPlayRate = 1
+	property boolean HasOriginalVisualScale = false
+	property Vector3 OriginalVisualScale = Vector3(1, 1, 1)
 	property boolean HasOriginalSpriteMotion = false
 	property string OriginalSpriteRuid = ""
 	property number OriginalSpritePlayRate = 1
@@ -36,7 +47,31 @@ script BattleUnitPresentationComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Presentation settings are local-only and never mutate logical battle state.
-		log("[BattlePresentation] ready entity=" .. self.Entity.Name .. " flashDuration=" .. self.HitFlashDuration)
+		log("[BattlePresentation] ready entity=" .. self.Entity.Name .. " tuningSource=BattleSessionComponent")
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then
+			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplySpriteFacing(string unitId, string facing)
+		-- Mirrors only sprite-based units. Player avatars continue to use LookDirectionX on the server.
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer == nil then
+			return
+		end
+		if facing ~= "Left" and facing ~= "Right" then
+			log_warning("[BattleFacing] sprite facing skipped unit=" .. unitId .. " reason=INVALID_FACING facing=" .. facing)
+			return
+		end
+
+		local shouldFlip = facing == "Right"
+		if self.SpriteFacesLeftByDefault == false then
+			shouldFlip = facing == "Left"
+		end
+		renderer.FlipX = shouldFlip
+		log("[BattleFacing] sprite applied unit=" .. unitId .. " facing=" .. facing .. " flipX=" .. tostring(shouldFlip))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -44,6 +79,31 @@ script BattleUnitPresentationComponent extends Component
 		if self.HitFlashTimerId > 0 then
 			_TimerService:ClearTimer(self.HitFlashTimerId)
 			self.HitFlashTimerId = 0
+		end
+		if self.HitStopTimerId > 0 then
+			_TimerService:ClearTimer(self.HitStopTimerId)
+			self.HitStopTimerId = 0
+		end
+		if self.HitReactionMidTimerId > 0 then
+			_TimerService:ClearTimer(self.HitReactionMidTimerId)
+			self.HitReactionMidTimerId = 0
+		end
+		if self.HitReactionRestoreTimerId > 0 then
+			_TimerService:ClearTimer(self.HitReactionRestoreTimerId)
+			self.HitReactionRestoreTimerId = 0
+		end
+		local impactRenderer = self:GetImpactSpriteRenderer()
+		if impactRenderer ~= nil then
+			if self.HasOriginalSpriteColor then
+				impactRenderer.Color = self.OriginalSpriteColor
+			end
+			if self.HasOriginalImpactPlayRate then
+				impactRenderer.PlayRate = self.OriginalImpactPlayRate
+			end
+		end
+		local visualEntity = self:GetImpactVisualEntity()
+		if self.HasOriginalVisualScale and isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+			visualEntity.TransformComponent.Scale = self.OriginalVisualScale
 		end
 		if self.MotionTimerId > 0 then
 			_TimerService:ClearTimer(self.MotionTimerId)
@@ -53,6 +113,31 @@ script BattleUnitPresentationComponent extends Component
 			_TimerService:ClearTimer(self.SpriteMotionTimerId)
 			self.SpriteMotionTimerId = 0
 		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetImpactVisualEntity()
+		-- Avatar feedback targets the rendered body child; sprite enemies use their own visual entity.
+		if self.Entity.SpriteRendererComponent ~= nil then
+			return self.Entity
+		end
+		local avatarRenderer = self.Entity.AvatarRendererComponent
+		if avatarRenderer ~= nil then
+			local body = avatarRenderer:GetBodyEntity()
+			if isvalid(body) then
+				return body
+			end
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetImpactSpriteRenderer()
+		local visualEntity = self:GetImpactVisualEntity()
+		if isvalid(visualEntity) and visualEntity.SpriteRendererComponent ~= nil then
+			return visualEntity.SpriteRendererComponent
+		end
+		return nil
 	end
 
 	@ExecSpace("ClientOnly")
@@ -112,9 +197,9 @@ script BattleUnitPresentationComponent extends Component
 	end
 
 	@ExecSpace("Client")
-	method void PlayHitFlash(string unitId)
+	method void PlayHitFlash(string unitId, number hitFlashDuration)
 		-- Restarts one configurable sprite tint flash without changing combat state.
-		local renderer = self.Entity.SpriteRendererComponent
+		local renderer = self:GetImpactSpriteRenderer()
 		if renderer == nil then
 			log_warning("[BattlePresentation] hit flash skipped unit=" .. unitId .. " reason=SPRITE_RENDERER_MISSING")
 			return
@@ -131,19 +216,100 @@ script BattleUnitPresentationComponent extends Component
 		end
 
 		renderer.Color = self.HitFlashColor
-		log("[BattlePresentation] hit flash started unit=" .. unitId .. " duration=" .. self.HitFlashDuration)
+		log("[BattlePresentation] hit flash started unit=" .. unitId .. " duration=" .. tostring(hitFlashDuration))
 
 		local restore = function()
-			if isvalid(self.Entity) and self.Entity.SpriteRendererComponent ~= nil then
-				self.Entity.SpriteRendererComponent.Color = self.OriginalSpriteColor
+			if renderer ~= nil and isvalid(renderer.Entity) then
+				renderer.Color = self.OriginalSpriteColor
 			end
 			self.HitFlashTimerId = 0
 			self.HasOriginalSpriteColor = false
 			log("[BattlePresentation] hit flash restored unit=" .. unitId)
 		end
 
-		local duration = math.max(0.05, self.HitFlashDuration)
+		local duration = math.max(0.05, math.min(0.08, hitFlashDuration))
 		self.HitFlashTimerId = _TimerService:SetTimerOnce(restore, duration)
+	end
+
+	@ExecSpace("Client")
+	method void PlayHitStop(string unitId, boolean strongHit, number normalHitStopDuration, number strongHitStopDuration)
+		-- Freezes only the impacted presentation clip; global time and turn timers keep running.
+		local renderer = self:GetImpactSpriteRenderer()
+		if renderer == nil then
+			return
+		end
+		if self.HasOriginalImpactPlayRate == false then
+			self.OriginalImpactPlayRate = renderer.PlayRate
+			self.HasOriginalImpactPlayRate = true
+		end
+		if self.HitStopTimerId > 0 then
+			_TimerService:ClearTimer(self.HitStopTimerId)
+			self.HitStopTimerId = 0
+		end
+		local duration = math.max(0.03, math.min(0.05, normalHitStopDuration))
+		if strongHit then
+			duration = math.max(0.05, math.min(0.08, strongHitStopDuration))
+		end
+		renderer.PlayRate = 0
+		self.HitStopTimerId = _TimerService:SetTimerOnce(function()
+			if renderer ~= nil and isvalid(renderer.Entity) then
+				renderer.PlayRate = self.OriginalImpactPlayRate
+			end
+			self.HitStopTimerId = 0
+			self.HasOriginalImpactPlayRate = false
+			log("[BattlePresentation] hit stop restored unit=" .. unitId)
+		end, duration)
+		log("[BattlePresentation] hit stop started unit=" .. unitId .. " strong=" .. tostring(strongHit) .. " duration=" .. tostring(duration))
+	end
+
+	@ExecSpace("Client")
+	method void PlayHitReaction(string unitId, boolean strongHit, number hitReactionDuration)
+		-- Squash/stretch never changes Position or the logical BoardState cell.
+		local visualEntity = self:GetImpactVisualEntity()
+		if isvalid(visualEntity) == false or visualEntity.TransformComponent == nil then
+			return
+		end
+		if self.HasOriginalVisualScale == false then
+			self.OriginalVisualScale = visualEntity.TransformComponent.Scale
+			self.HasOriginalVisualScale = true
+		end
+		if self.HitReactionMidTimerId > 0 then
+			_TimerService:ClearTimer(self.HitReactionMidTimerId)
+			self.HitReactionMidTimerId = 0
+		end
+		if self.HitReactionRestoreTimerId > 0 then
+			_TimerService:ClearTimer(self.HitReactionRestoreTimerId)
+			self.HitReactionRestoreTimerId = 0
+		end
+		local duration = math.max(0.06, math.min(0.10, hitReactionDuration))
+		local squash = strongHit and self.StrongHitSquashScale or self.NormalHitSquashScale
+		local original = self.OriginalVisualScale
+		visualEntity.TransformComponent.Scale = Vector3(original.x * squash.x, original.y * squash.y, original.z)
+		self.HitReactionMidTimerId = _TimerService:SetTimerOnce(function()
+			if isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+				local stretchX = strongHit and 0.94 or 0.97
+				local stretchY = strongHit and 1.06 or 1.03
+				visualEntity.TransformComponent.Scale = Vector3(original.x * stretchX, original.y * stretchY, original.z)
+			end
+			self.HitReactionMidTimerId = 0
+		end, duration * 0.45)
+		self.HitReactionRestoreTimerId = _TimerService:SetTimerOnce(function()
+			if isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+				visualEntity.TransformComponent.Scale = original
+			end
+			self.HitReactionRestoreTimerId = 0
+			self.HasOriginalVisualScale = false
+			log("[BattlePresentation] hit reaction restored unit=" .. unitId)
+		end, duration)
+		log("[BattlePresentation] hit reaction started unit=" .. unitId .. " strong=" .. tostring(strongHit) .. " duration=" .. tostring(duration))
+	end
+
+	@ExecSpace("Client")
+	method void PlayHitImpact(string unitId, boolean strongHit, number normalHitStopDuration, number strongHitStopDuration, number hitReactionDuration, number hitFlashDuration)
+		-- One accepted damage impact fans out to presentation-only feedback exactly once.
+		self:PlayHitStop(unitId, strongHit, normalHitStopDuration, strongHitStopDuration)
+		self:PlayHitReaction(unitId, strongHit, hitReactionDuration)
+		self:PlayHitFlash(unitId, hitFlashDuration)
 	end
 
 	@ExecSpace("Client")
@@ -236,12 +402,20 @@ script BattleUnitPresentationComponent extends Component
 		local safeDuration = math.max(0.1, duration)
 		renderer.SpriteRUID = motionRuid
 		renderer.PlayRate = safePlayRate
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then
+			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+		end
 		log("[BattleSpriteMotion] started unit=" .. unitId .. " ruid=" .. motionRuid .. " rate=" .. safePlayRate .. " duration=" .. safeDuration)
 
 		local restore = function()
 			if isvalid(self.Entity) and self.Entity.SpriteRendererComponent ~= nil then
 				self.Entity.SpriteRendererComponent.SpriteRUID = self.OriginalSpriteRuid
 				self.Entity.SpriteRendererComponent.PlayRate = self.OriginalSpritePlayRate
+				local restoredUnit = self.Entity:GetComponent("script.BattleUnitComponent")
+				if restoredUnit ~= nil then
+					self:ApplySpriteFacing(restoredUnit.UnitId, restoredUnit.Facing)
+				end
 				log("[BattleSpriteMotion] restored unit=" .. unitId .. " ruid=" .. self.OriginalSpriteRuid)
 			end
 			self.SpriteMotionTimerId = 0

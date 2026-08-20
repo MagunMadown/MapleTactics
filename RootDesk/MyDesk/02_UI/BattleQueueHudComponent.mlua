@@ -58,6 +58,16 @@ script BattleQueueHudComponent extends Component
 	property boolean IsHudContextVisible = false
 	property any PresenterStateChangedHandler = nil
 	property any PresenterCommandResultHandler = nil
+	property string InputFeedbackText = ""
+	property integer InputFeedbackTimerId = 0
+	property number InputFeedbackDuration = 0.30
+	property number SkillPunchScale = 1.10
+	property number QueuePopStartScale = 0.84
+	property number QueuePopPeakScale = 1.12
+	property string QueueConfirmSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+	property number QueueConfirmSoundVolume = 0.35
+	property boolean HasQueueFeedbackSnapshot = false
+	property string LastQueuedTileIds = ""
 	property any SkillSlot1ClickHandler = nil
 	property any SkillSlot2ClickHandler = nil
 	property any SkillSlot3ClickHandler = nil
@@ -74,6 +84,7 @@ script BattleQueueHudComponent extends Component
 	method void OnBeginPlay()
 		-- The view binds UI controls and consumes presentation state without reading battle components directly.
 		log("[BattleQueueHUD] ready")
+		self._T.SkillIconFeedbackTimers = {}
 		self:SetHudContextVisible(false, "INITIALIZING")
 		self.PresenterStateChangedHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudStateChangedEvent, self.OnPresenterStateChanged)
 		self.PresenterCommandResultHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudCommandResultEvent, self.OnPresenterCommandResult)
@@ -92,6 +103,14 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
 		-- Disconnects button callbacks so UI reloads cannot duplicate tile requests.
+		for slotIndex = 1, 6 do
+			self:StopSkillIconFeedback(slotIndex)
+		end
+		if self.InputFeedbackTimerId > 0 then
+			_TimerService:ClearTimer(self.InputFeedbackTimerId)
+			self.InputFeedbackTimerId = 0
+		end
+		self.InputFeedbackText = ""
 		if self.PresenterStateChangedHandler ~= nil then
 			_BattleHudPresenterLogic:DisconnectEvent(BattleHudStateChangedEvent, self.PresenterStateChangedHandler)
 			self.PresenterStateChangedHandler = nil
@@ -144,6 +163,8 @@ script BattleQueueHudComponent extends Component
 		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
 		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
 			local reason = presenterState == nil and "PRESENTER_STATE_MISSING" or presenterState.ContextReason
+			self.HasQueueFeedbackSnapshot = false
+			self.LastQueuedTileIds = ""
 			self:SetHudContextVisible(false, reason)
 			self:SetUnavailableState("전투 상태 없음")
 			return
@@ -172,16 +193,7 @@ script BattleQueueHudComponent extends Component
 			slotQueueIds = self:GetQueueFromIndex(queueState.ExecutingTileIds, activeIndex)
 		end
 		local queueLabel = self:GetQueueLabel(visibleQueue, activeIndex, queueState.EffectiveCapacity)
-		local inputLabel = "타일 선택"
-		if uiState.IsProcessing then
-			if activeIndex > 0 then
-				inputLabel = "큐 실행 중 " .. activeIndex .. "/" .. self:GetTileCount(visibleQueue)
-			else
-				inputLabel = "처리 중"
-			end
-		elseif queueState.Count > 0 then
-			inputLabel = queueState.Count .. "/" .. queueState.EffectiveCapacity .. " · 실행 대기"
-		end
+		local inputLabel = self:GetPlayerActionStateLabel(uiState.PlayerActionState, activeIndex, visibleQueue, queueState)
 		if uiState.Phase == "WaveTransition" then
 			inputLabel = "다음 웨이브 준비"
 		end
@@ -214,13 +226,23 @@ script BattleQueueHudComponent extends Component
 		if transitionLabel ~= "" then
 			self.StateText.Text = "이동 이벤트  ·  " .. transitionLabel
 		end
+		if self.InputFeedbackText ~= "" then
+			self.StateText.Text = self.InputFeedbackText
+		end
 
 		local canChooseTile = uiState.Commands.CanQueue
 		local canUseQueuedTile = uiState.Commands.CanExecute
 		local ownedSkills = uiState.RunInventory.SkillSnapshot
 		self.SlotSkillIds = session.SkillSlotIds
 		self.SlotSkillNames = session.SkillSlotNames
+		local queuedSkillForPop = self:CaptureQueuedSkillForFeedback(queueState.QueuedTileIds)
 		self:RefreshSkillSlots(canChooseTile, ownedSkills, cooldownSnapshot, slotQueueIds)
+		if queuedSkillForPop ~= "" then
+			local queuedSlotIndex = self:FindSkillSlotIndex(queuedSkillForPop)
+			if queuedSlotIndex > 0 then
+				self:PlayQueueIconPop(queuedSlotIndex, queuedSkillForPop)
+			end
+		end
 		self.ExecuteButton.Enable = canUseQueuedTile
 		self.ClearButton.Enable = uiState.Commands.CanClear
 		if visibleQueue == "" then
@@ -243,6 +265,74 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnPresenterCommandResult(BattleHudCommandResultEvent commandResultEvent)
 		log("[BattleQueueHUD] command result type=" .. commandResultEvent.CommandType .. " success=" .. tostring(commandResultEvent.Success) .. " reason=" .. commandResultEvent.Reason .. " revision=" .. tostring(commandResultEvent.Revision))
+		self:ShowInputFeedback(commandResultEvent.CommandType, commandResultEvent.Success, commandResultEvent.Reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetPlayerActionStateLabel(string playerActionState, integer activeIndex, string visibleQueue, table queueState)
+		if playerActionState == "MOVING" then
+			return "이동 중"
+		elseif playerActionState == "TURNING" then
+			return "방향 전환 중"
+		elseif playerActionState == "EXECUTING_ATTACK" then
+			return "공격 실행 중 " .. activeIndex .. "/" .. self:GetTileCount(visibleQueue)
+		elseif playerActionState == "WAITING_ENEMY_TURN" then
+			return "적 행동 대기"
+		elseif playerActionState == "PREPARING_ATTACK" then
+			return queueState.Count .. "/" .. queueState.EffectiveCapacity .. " · 공격 준비"
+		elseif playerActionState == "READY" then
+			return "입력 가능"
+		end
+		return "행동 잠금"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowInputFeedback(string commandType, boolean success, string reason)
+		if self.InputFeedbackTimerId > 0 then
+			_TimerService:ClearTimer(self.InputFeedbackTimerId)
+			self.InputFeedbackTimerId = 0
+		end
+
+		local commandLabel = commandType
+		if commandType == "MOVE" then
+			commandLabel = "이동"
+		elseif commandType == "TURN" then
+			commandLabel = "방향 전환"
+		elseif commandType == "QUEUE_TILE" then
+			commandLabel = "공격 준비"
+		elseif commandType == "EXECUTE_QUEUE" then
+			commandLabel = "공격 실행"
+		end
+
+		if success == true and reason == "INPUT_RECEIVED" then
+			self.InputFeedbackText = "입력 확인  ·  " .. commandLabel
+			self.SkillSlot1Button.Enable = false
+			self.SkillSlot2Button.Enable = false
+			self.SkillSlot3Button.Enable = false
+			self.SkillSlot4Button.Enable = false
+			self.SkillSlot5Button.Enable = false
+			self.SkillSlot6Button.Enable = false
+			self.ExecuteButton.Enable = false
+			self.ClearButton.Enable = false
+		elseif success == true then
+			self.InputFeedbackText = "처리 확인  ·  " .. commandLabel
+		elseif reason == "LOCAL_INPUT_PENDING" then
+			self.InputFeedbackText = "행동 처리 중  ·  추가 입력 차단"
+		elseif string.find(reason or "", "WAITING_ENEMY_TURN", 1, true) ~= nil then
+			self.InputFeedbackText = "적 행동 중  ·  입력 차단"
+		elseif reason == "QUEUE_EMPTY" then
+			self.InputFeedbackText = "실행할 공격이 없습니다"
+		else
+			self.InputFeedbackText = "입력 거절  ·  " .. tostring(reason)
+		end
+
+		self.StateText.Text = self.InputFeedbackText
+		local clearFeedback = function()
+			self.InputFeedbackTimerId = 0
+			self.InputFeedbackText = ""
+			self:RefreshHud(true)
+		end
+		self.InputFeedbackTimerId = _TimerService:SetTimerOnce(clearFeedback, math.max(0.20, self.InputFeedbackDuration))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -417,6 +507,146 @@ script BattleQueueHudComponent extends Component
 			end
 		end
 		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer FindSkillSlotIndex(string skillId)
+		for slotIndex = 1, 6 do
+			if self:GetSlotSkillId(slotIndex) == skillId then
+				return slotIndex
+			end
+		end
+		return 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method string CaptureQueuedSkillForFeedback(string queuedTileIds)
+		-- Only an authoritative Queue growth produces the confirmation pop; initial hydration and clears stay silent.
+		local currentQueue = queuedTileIds or ""
+		if self.HasQueueFeedbackSnapshot == false then
+			self.HasQueueFeedbackSnapshot = true
+			self.LastQueuedTileIds = currentQueue
+			return ""
+		end
+
+		local previousCount = self:GetTileCount(self.LastQueuedTileIds)
+		local currentCount = self:GetTileCount(currentQueue)
+		self.LastQueuedTileIds = currentQueue
+		if currentCount <= previousCount then
+			return ""
+		end
+
+		local index = 0
+		local queuedSkillId = ""
+		for skillId in string.gmatch(currentQueue, "([^|]+)") do
+			index = index + 1
+			if index == currentCount then
+				queuedSkillId = skillId
+			end
+		end
+		return queuedSkillId
+	end
+
+	@ExecSpace("ClientOnly")
+	method SpriteGUIRendererComponent GetSkillIcon(integer slotIndex)
+		if slotIndex == 1 then
+			return self.SkillSlot1Icon
+		elseif slotIndex == 2 then
+			return self.SkillSlot2Icon
+		elseif slotIndex == 3 then
+			return self.SkillSlot3Icon
+		elseif slotIndex == 4 then
+			return self.SkillSlot4Icon
+		elseif slotIndex == 5 then
+			return self.SkillSlot5Icon
+		elseif slotIndex == 6 then
+			return self.SkillSlot6Icon
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopSkillIconFeedback(integer slotIndex)
+		local timerRecords = self._T.SkillIconFeedbackTimers
+		if timerRecords == nil then
+			return
+		end
+		local record = timerRecords[slotIndex]
+		if record == nil then
+			return
+		end
+		if record.MidTimerId ~= nil and record.MidTimerId > 0 then
+			_TimerService:ClearTimer(record.MidTimerId)
+		end
+		if record.RestoreTimerId ~= nil and record.RestoreTimerId > 0 then
+			_TimerService:ClearTimer(record.RestoreTimerId)
+		end
+		local icon = self:GetSkillIcon(slotIndex)
+		if icon ~= nil and isvalid(icon.Entity) and icon.Entity.UITransformComponent ~= nil then
+			icon.Entity.UITransformComponent.RectSize = record.BaseSize
+		end
+		timerRecords[slotIndex] = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method number ResolveQueuePopDuration()
+		-- The Presenter remains the UI boundary; the tuning value originates from BattleSessionComponent.
+		local state = _BattleHudPresenterLogic:GetCurrentState()
+		if state == nil or state.UiState == nil or state.UiState.CombatFeel == nil then
+			return 0
+		end
+		return math.max(0.08, math.min(0.12, state.UiState.CombatFeel.QueuePopDuration))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlaySkillIconScaleSequence(integer slotIndex, number immediateScale, number middleScale)
+		-- RectSize scaling is visual-only and runs independently from the command/turn pipeline.
+		self:StopSkillIconFeedback(slotIndex)
+		local icon = self:GetSkillIcon(slotIndex)
+		if icon == nil or isvalid(icon.Entity) == false or icon.Entity.UITransformComponent == nil then
+			return
+		end
+		local duration = self:ResolveQueuePopDuration()
+		if duration <= 0 then
+			return
+		end
+		local iconEntity = icon.Entity
+		local baseSize = iconEntity.UITransformComponent.RectSize
+		local timerRecords = self._T.SkillIconFeedbackTimers
+		if timerRecords == nil then
+			timerRecords = {}
+			self._T.SkillIconFeedbackTimers = timerRecords
+		end
+		local record = { BaseSize = baseSize, MidTimerId = 0, RestoreTimerId = 0 }
+		timerRecords[slotIndex] = record
+		iconEntity.UITransformComponent.RectSize = Vector2(baseSize.x * immediateScale, baseSize.y * immediateScale)
+		record.MidTimerId = _TimerService:SetTimerOnce(function()
+			if isvalid(iconEntity) and iconEntity.UITransformComponent ~= nil then
+				iconEntity.UITransformComponent.RectSize = Vector2(baseSize.x * middleScale, baseSize.y * middleScale)
+			end
+		end, duration * 0.42)
+		record.RestoreTimerId = _TimerService:SetTimerOnce(function()
+			if isvalid(iconEntity) and iconEntity.UITransformComponent ~= nil then
+				iconEntity.UITransformComponent.RectSize = baseSize
+			end
+			if self._T.SkillIconFeedbackTimers ~= nil then
+				self._T.SkillIconFeedbackTimers[slotIndex] = nil
+			end
+		end, duration)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlaySkillIconPunch(integer slotIndex)
+		self:PlaySkillIconScaleSequence(slotIndex, self.SkillPunchScale, 0.97)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayQueueIconPop(integer slotIndex, string skillId)
+		self:PlaySkillIconScaleSequence(slotIndex, self.QueuePopStartScale, self.QueuePopPeakScale)
+		if self.QueueConfirmSoundRUID ~= "" then
+			_SoundService:PlaySound(self.QueueConfirmSoundRUID, self.QueueConfirmSoundVolume)
+		end
+		log("[BattleQueueHUD] queue feedback slot=" .. tostring(slotIndex) .. " skill=" .. skillId .. " duration=" .. tostring(self:ResolveQueuePopDuration()))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -622,6 +852,7 @@ script BattleQueueHudComponent extends Component
 			return
 		end
 
+		self:PlaySkillIconPunch(slotIndex)
 		log("[BattleQueueHUD] register clicked slot=" .. slotIndex .. " tile=" .. skillId)
 		_BattleHudPresenterLogic:RequestQueueTile(skillId)
 	end
