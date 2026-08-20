@@ -76,6 +76,8 @@ script BattleUnitPresentationComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		-- Restores every short-lived presentation override owned by this unit.
+		self:StopMoveHopVisual("END_PLAY")
 		if self.HitFlashTimerId > 0 then
 			_TimerService:ClearTimer(self.HitFlashTimerId)
 			self.HitFlashTimerId = 0
@@ -129,6 +131,123 @@ script BattleUnitPresentationComponent extends Component
 			end
 		end
 		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetMoveVisualEntity()
+		-- Returns a movable visual child so cosmetic offsets never change the battle unit Root position.
+		local avatarRenderer = self.Entity.AvatarRendererComponent
+		if avatarRenderer ~= nil then
+			local avatarRoot = avatarRenderer:GetAvatarRootEntity()
+			if isvalid(avatarRoot) then
+				return avatarRoot
+			end
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopMoveHopVisual(string reason)
+		-- Cancels an overlapping cosmetic hop and restores the visual child's exact local transform.
+		local state = self._T.moveHopVisual
+		if state == nil then
+			return
+		end
+
+		self._T.moveHopVisual = nil
+		state.Cancelled = true
+		if state.Tweener ~= nil then
+			state.Tweener:Destroy()
+		end
+
+		local visualEntity = state.VisualEntity
+		if visualEntity ~= nil and isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+			visualEntity.TransformComponent.Position = state.BasePosition
+			visualEntity.TransformComponent.Scale = state.BaseScale
+		end
+		log("[PlayerHopVisual] restored unit=" .. tostring(state.UnitId) .. " reason=" .. tostring(reason))
+	end
+
+	@ExecSpace("Client")
+	method void PlayMoveHop(string unitId, number duration, number height, number takeoffDuration, number landingDuration, number squashXScale, number squashYScale)
+		-- Animates only the avatar visual child; BattleUnit CellIndex and the player Root Y remain untouched.
+		self:StopMoveHopVisual("REPLACED")
+		local visualEntity = self:GetMoveVisualEntity()
+		if visualEntity == nil or isvalid(visualEntity) == false or visualEntity.TransformComponent == nil then
+			log_warning("[PlayerHopVisual] skipped unit=" .. unitId .. " reason=VISUAL_ROOT_UNAVAILABLE")
+			return
+		end
+
+		local totalDuration = math.max(0.12, math.min(0.18, duration))
+		local hopHeight = math.max(0, height)
+		local takeoff = math.max(0.02, math.min(0.04, takeoffDuration))
+		local landing = math.max(0.03, math.min(0.05, landingDuration))
+		local takeoffFraction = math.min(0.45, takeoff / totalDuration)
+		local landingFraction = math.min(0.45, landing / totalDuration)
+		local hopStart = takeoffFraction * 0.5
+		local transform = visualEntity.TransformComponent
+		local basePosition = transform.Position
+		local baseScale = transform.Scale
+		local state = {
+			UnitId = unitId,
+			VisualEntity = visualEntity,
+			BasePosition = basePosition,
+			BaseScale = baseScale,
+			Tweener = nil,
+			Cancelled = false
+		}
+		self._T.moveHopVisual = state
+
+		local tweener = _TweenLogic:PlayTween(0, 1, totalDuration, EaseType.Linear, function(progress)
+			if state.Cancelled then
+				return
+			end
+			if visualEntity == nil or isvalid(visualEntity) == false or visualEntity.TransformComponent == nil then
+				state.Cancelled = true
+				return
+			end
+
+			local clampedProgress = math.max(0, math.min(1, progress))
+			local hopProgress = 0
+			if clampedProgress > hopStart then
+				hopProgress = math.min(1, (clampedProgress - hopStart) / math.max(0.001, 1 - hopStart))
+			end
+			local yOffset = math.sin(math.pi * hopProgress) * hopHeight
+
+			local squashWeight = 0
+			if clampedProgress < takeoffFraction then
+				local takeoffProgress = clampedProgress / math.max(0.001, takeoffFraction)
+				squashWeight = math.sin(math.pi * takeoffProgress)
+			elseif clampedProgress > 1 - landingFraction then
+				local landingProgress = (clampedProgress - (1 - landingFraction)) / math.max(0.001, landingFraction)
+				squashWeight = math.sin(math.pi * landingProgress)
+			end
+
+			local scaleX = baseScale.x * (1 + ((squashXScale - 1) * squashWeight))
+			local scaleY = baseScale.y * (1 + ((squashYScale - 1) * squashWeight))
+			visualEntity.TransformComponent.Position = Vector3(basePosition.x, basePosition.y + yOffset, basePosition.z)
+			visualEntity.TransformComponent.Scale = Vector3(scaleX, scaleY, baseScale.z)
+		end)
+		state.Tweener = tweener
+		tweener:SetOnEndCallback(function()
+			if state.Cancelled then
+				return
+			end
+			if visualEntity ~= nil and isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+				visualEntity.TransformComponent.Position = basePosition
+				visualEntity.TransformComponent.Scale = baseScale
+			end
+			if self._T.moveHopVisual == state then
+				self._T.moveHopVisual = nil
+			end
+			log("[PlayerHopVisual] completed unit=" .. unitId .. " duration=" .. tostring(totalDuration) .. " height=" .. tostring(hopHeight))
+		end)
+
+		log("[PlayerHopVisual] started unit=" .. unitId
+			.. " duration=" .. tostring(totalDuration)
+			.. " height=" .. tostring(hopHeight)
+			.. " takeoff=" .. tostring(takeoff)
+			.. " landing=" .. tostring(landing))
 	end
 
 	@ExecSpace("ClientOnly")
