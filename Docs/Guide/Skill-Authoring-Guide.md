@@ -249,6 +249,12 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 현재 지원 `EffectType`은 `DAMAGE`, `PUSH`, `HEAL` 세 가지다. 전체 행은
 `RootDesk/MyDesk/03_Data/SkillEffectSteps.csv`를 직접 본다.
 
+직업별 유틸리티 스킬은 이 테이블이 아니라 공용 `UtilitySkillDefinitions` /
+`UtilitySkillEffectSteps` 페어가 소유한다. 두 테이블은 같은 스키마를 쓰지만 아직 Repository에
+등록되지 않은 데이터 전용 상태이며, 요구하는 `GUARD`·`MOVE_SELF`·`PUSH_DISTANCE` EffectType은
+미구현이다. 규격과 배선 순서는
+[`Utility-Skill-Authoring-Guide.md`](./Utility-Skill-Authoring-Guide.md)를 따른다.
+
 `SOURCE_BASIC_ATTACK`은 고정 `Value` 대신 시전자
 `BattleUnitComponent.BasicAttackDamage`를 사용하는 공용 규칙이다.
 

@@ -40,6 +40,7 @@
 | 전투 후 상점·이벤트·다음 전투 전환 | [`Run-Content-Flow-Guide.md`](./Run-Content-Flow-Guide.md) |
 | 런 상점 상품·구매 | [`Run-Shop-Authoring-Guide.md`](./Run-Shop-Authoring-Guide.md) |
 | Skill·Effect Step | [`Skill-Authoring-Guide.md`](./Skill-Authoring-Guide.md) |
+| 직업별 유틸리티 스킬 | [`Utility-Skill-Authoring-Guide.md`](./Utility-Skill-Authoring-Guide.md) |
 | 직업 패시브·증강 | [`Job-Authoring-Guide.md`](./Job-Authoring-Guide.md), [`Augment-Authoring-Guide.md`](./Augment-Authoring-Guide.md) |
 | 새 EffectType | [`Effect-Executor-Guide.md`](./Effect-Executor-Guide.md) |
 | Turn·행동 큐 | [`Battle-Turn-Guide.md`](./Battle-Turn-Guide.md) |
