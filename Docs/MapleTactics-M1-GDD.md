@@ -115,7 +115,7 @@ M1 직업 슬롯:
 | 정적 데이터 | UserDataSet + CSV |
 | UI | `.ui` + UIBuilder + ClientOnly Logic |
 | 적/플레이어 엔티티 | `.model` + ModelBuilder |
-| 맵 배치 | 공용 `region_01_battle.map` + MapBuilder; `StageId`와 물리 `MapId`를 분리하고 CSV로 라우팅 |
+| 맵 배치 | 일반전 공용 `region_01_battle.map` + 보스전 `region_01_boss.map`; `StageId`와 물리 `MapId`를 분리하고 CSV로 라우팅 |
 | 전투 이벤트 | `@Event extends EventType` |
 | 무상태 규칙 | `@Logic` Resolver/Router |
 | 권장 맵 타입 | SideViewRectTile(2) |
@@ -182,3 +182,4 @@ M1 직업 슬롯:
 | 2026-08-03 | 수정 | 구현 상태 표기와 상점 책임을 정리하고, 증강 허용값·StackPolicy·EnemyDrop 장 번호를 실제 코드에 맞춤 | 표 기반 제작자가 미구현 값을 지원 값으로 오해하거나 런 상점과 Meta/World Shop 데이터를 혼용하지 않도록 하기 위함 | Data-Dictionary §1/§14/§15/§20~23, GDD §7/§10, 관련 제작 가이드 |
 | 2026-08-15 | 수정 | 적 공격 타일 등록과 공격 예고를 분리하고, 타일을 보유한 채 사거리까지 추적한 뒤 대응 턴 후 고정 실행하는 흐름으로 확장 | 사거리 진입 뒤에야 큐를 만드는 현재 동작을 참고작의 읽을 수 있는 적 공격 주기에 맞추고, 회피·밀치기로 예고 공격을 빗나가게 하는 전술을 보존하기 위함 | GDD §3/§6/§8, Phase 1 Slice 10.6, Shogun Queue Plan Slice 6, 전용 수정 계획 |
 | 2026-08-22 | 수정 | 모든 전투 StageId를 `region_01_battle` 물리 맵으로 라우팅하고 스테이지 콘텐츠는 CSV의 StageId로만 선택 | 전투 맵을 한 번만 꾸미고 여러 스테이지가 동일한 컴포넌트 구성을 재사용하도록 하기 위함 | StageMapRoutes, BattleSession 맵 설정, SectorConfig, Phase 1 Slice 14; Static Map 운영을 위해 월드 최대 인원 1명으로 제한 |
+| 2026-08-22 | 수정 | 1-1~1-3은 헤네시스 일반전 공용 맵을 유지하고 1-4는 `region_01_boss` 전용 물리 맵으로 분리 | 일반 스테이지 재사용 이점은 유지하면서 머쉬맘 보스전의 배경·전조 가독성과 공간 연출을 독립 조정하기 위함 | StageMapRoutes, 물리 맵 2종, Phase 1 Slice 14~15 |

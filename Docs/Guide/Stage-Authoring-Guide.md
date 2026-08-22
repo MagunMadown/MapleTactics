@@ -76,12 +76,12 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 
 현재 Region 1 전투 Stage는 다음처럼 분리돼 있다.
 
-| Stage | Wave 수 | 기본 구성 |
-|---|---:|---|
-| `region_01_stage_01` | 3 | 총 3마리. 근접 적만 등장해 기본 전투를 학습 |
-| `region_01_stage_02` | 3 | 총 5마리. 근접 중심, 스포아 가중치 1/4, 최대 동시 2 |
-| `region_01_stage_03` | 4 | 총 6마리. 스포아 가중치 1/3, 후반 Wave는 2마리 |
-| `region_01_stage_04` | 1 | 보스 1, `StageType=BOSS`, 2 Phase |
+| Stage | 물리 맵 | Wave 수 | 기본 구성 |
+|---|---|---:|---|
+| `region_01_stage_01` | `region_01_battle` | 3 | 총 3마리. 근접 적만 등장해 기본 전투를 학습 |
+| `region_01_stage_02` | `region_01_battle` | 3 | 총 5마리. 근접 중심, 스포아 가중치 1/4, 최대 동시 2 |
+| `region_01_stage_03` | `region_01_battle` | 4 | 총 6마리. 스포아 가중치 1/3, 후반 Wave는 2마리 |
+| `region_01_stage_04` | `region_01_boss` | 1 | 보스 1, `StageType=BOSS`, 2 Phase |
 
 스포아는 1-2부터 `region_01_spore_ranged` Enemy Definition으로 등장한다. 사거리는 2칸,
 기본 피해는 1, HP는 2다. 모든 직업의 기본 시작 공격 피해가 2 이상이므로 초반에는 스킬
@@ -91,8 +91,23 @@ Node/REST 연결은 별도 제작 영역이다. Stage 행을 추가하는 작업
 `NodeDefinitions.NextNodeIds`나 REST/상점 Node를 임의로 변경하지 않는다.
 
 현재 통합 흐름은 `1-1 → REST → 1-2 → REST → 1-3 → REST → 1-4 BOSS → REST`다.
-`region_01_stage_04`는 별도 맵 복제 없이 `StageMapRoutes`에서
-`region_01_stage_03` 전투 맵을 재사용하며, Battle Gateway가 전달한 StageId로 머쉬맘 데이터를 시작한다.
+`StageMapRoutes`는 1-1~1-3을 일반전 공용 `region_01_battle`로 라우팅하고,
+`region_01_stage_04`만 `region_01_boss`로 라우팅한다. 두 맵은 같은 전투 컴포넌트와
+`BattleCell1~6` 계약을 유지하므로 Battle Gateway는 물리 맵에 분기를 두지 않고 전달한
+StageId로 해당 Stage·Wave 데이터를 시작한다.
+
+## 물리 맵과 장식 교체 규칙
+
+- 일반전 장식은 `region_01_battle.map`, 보스전 장식은 `region_01_boss.map`에서 관리한다.
+- 장식 이미지는 맵 엔티티에 직접 하드코딩하지 않고 `RootDesk/MyDesk/Models/Objects/`의
+  `Henesys*`, `MushmomBossGrove` 모델에서 `SpriteRUID`를 교체한다.
+- 장식은 화면 가장자리와 후경에 두고, 중앙 6칸·유닛·공격 전조·Intent UI 영역은 비운다.
+- 연속된 전투 맵의 길은 이전 맵 출구 쪽과 다음 맵 입구 쪽에 같은 나무 군락·버섯 군락처럼
+  실루엣이 분명한 오브젝트 조합을 좌우 대응시켜 암시한다. 나무 사이에는 좁은 빈 잔디 구간을
+  남겨 길처럼 읽히게 하되, 이동·충돌·Stage 전환 기능은 갖지 않는 시각 요소로 유지한다.
+- 새 보스 맵을 만들 때는 일반전 맵의 전투 컴포넌트 계약을 복제한 뒤 배경·장식만 분리한다.
+- `region_01_boss`는 원작 머쉬맘의 `남의 집`을 참고해 큰 버섯집·꽃 울타리·작은 버섯·무성한 수풀로 구성한다. 다음 Region 후보는 전투 장식에 섞지 않고 클리어 이후 Node/Run Flow UI에서 표시한다.
+- 물리 맵을 추가하거나 이름을 바꾸면 `StageMapRoutes.csv`와 Maker의 Sector 맵 등록을 함께 확인한다.
 
 보스 Stage 제작 규칙은 [Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)를 따른다.
 
