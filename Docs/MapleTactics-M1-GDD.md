@@ -115,7 +115,7 @@ M1 직업 슬롯:
 | 정적 데이터 | UserDataSet + CSV |
 | UI | `.ui` + UIBuilder + ClientOnly Logic |
 | 적/플레이어 엔티티 | `.model` + ModelBuilder |
-| 맵 배치 | `.map` + MapBuilder |
+| 맵 배치 | 공용 `region_01_battle.map` + MapBuilder; `StageId`와 물리 `MapId`를 분리하고 CSV로 라우팅 |
 | 전투 이벤트 | `@Event extends EventType` |
 | 무상태 규칙 | `@Logic` Resolver/Router |
 | 권장 맵 타입 | SideViewRectTile(2) |
@@ -131,7 +131,7 @@ M1 직업 슬롯:
 ## 9. 로드맵
 
 - [ ] Phase 0 — 맵/이동/RPC/데이터/큐 재타깃 기술 검증
-- [ ] Phase 1 — 전투 코어 수직 슬라이스
+- [ ] Phase 1 — 전투 코어 수직 슬라이스 + CSV 기반 단일 전투 맵 재사용
 - [ ] Phase 2 — 데이터 기반 타일과 일반 적
 - [ ] Phase 3 — 스테이지와 보스 패턴
 - [ ] Phase 4 — 직업 4종과 증강
@@ -181,3 +181,4 @@ M1 직업 슬롯:
 | 2026-08-01 | 수정 | 직업 시작 스킬과 직업 고유 메커니즘을 분리하고 구 TileDefinitions 명칭을 실제 SkillDefinitions 규격으로 통합 | 쇼군식 공격 타일과 캐릭터 고유 이동·전투 규칙은 실행 수명과 턴/쿨타임 계약이 다르므로 독립 확장점이 필요함 | JobDefinitions, JobStartingSkillEntries, JobMechanic Router, Data Dictionary §2~5 |
 | 2026-08-03 | 수정 | 구현 상태 표기와 상점 책임을 정리하고, 증강 허용값·StackPolicy·EnemyDrop 장 번호를 실제 코드에 맞춤 | 표 기반 제작자가 미구현 값을 지원 값으로 오해하거나 런 상점과 Meta/World Shop 데이터를 혼용하지 않도록 하기 위함 | Data-Dictionary §1/§14/§15/§20~23, GDD §7/§10, 관련 제작 가이드 |
 | 2026-08-15 | 수정 | 적 공격 타일 등록과 공격 예고를 분리하고, 타일을 보유한 채 사거리까지 추적한 뒤 대응 턴 후 고정 실행하는 흐름으로 확장 | 사거리 진입 뒤에야 큐를 만드는 현재 동작을 참고작의 읽을 수 있는 적 공격 주기에 맞추고, 회피·밀치기로 예고 공격을 빗나가게 하는 전술을 보존하기 위함 | GDD §3/§6/§8, Phase 1 Slice 10.6, Shogun Queue Plan Slice 6, 전용 수정 계획 |
+| 2026-08-22 | 수정 | 모든 전투 StageId를 `region_01_battle` 물리 맵으로 라우팅하고 스테이지 콘텐츠는 CSV의 StageId로만 선택 | 전투 맵을 한 번만 꾸미고 여러 스테이지가 동일한 컴포넌트 구성을 재사용하도록 하기 위함 | StageMapRoutes, BattleSession 맵 설정, SectorConfig, Phase 1 Slice 14; Static Map 운영을 위해 월드 최대 인원 1명으로 제한 |

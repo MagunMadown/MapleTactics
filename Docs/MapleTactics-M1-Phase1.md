@@ -368,6 +368,26 @@
   - 생존 적 두 명의 행동 순서가 매 실행 동일
   - 첫 적 사망 시 Victory가 발생하지 않고 두 번째 적 사망 시 한 번만 발생
 
+### Slice 14 - CSV 기반 단일 전투 맵 재사용
+
+- 🟡 상태: Implemented (untested) — 공용 맵 라우팅·`region_01_battle` 개명·중복 맵 제거·자동 시작 차단·1인 Static 설정 적용, Maker 회귀 검증 pending
+- 화면 결과: 서로 다른 StageId가 모두 같은 `region_01_battle` 물리 맵으로 이동하지만 각 StageDefinitions·Wave 데이터로 독립 초기화된다.
+- 최소 구현:
+  - `StageMapRoutes.csv`의 네 StageId를 `MapId=region_01_battle`로 통일
+  - 월드맵 지연 진입 요청의 현재 맵 검사를 실제 로비 맵명 `lobby`로 통일
+  - 공용 맵의 `BattleSessionComponent.AutoStartPrototypeBattle=false`
+  - Static Map 격리를 위해 `sector01.maxUserNo=1`
+  - 공용 물리 맵을 `region_01_battle`로 개명하고 중복 `region_01_stage_02/03` 맵과 Sector 등록 제거
+- 불변식:
+  - `StageId`는 콘텐츠 식별자이고 `MapId`는 물리 이동 대상이다.
+  - 준비된 BattleEntry가 없는 직접 맵 진입은 전투를 자동 시작하지 않는다.
+  - 공용 맵 재진입마다 Registry·Turn·Wave·Queue·Drop·BattleResult를 새 StageId 기준으로 초기화한다.
+- 완료 기준:
+  - 네 StageId 라우팅이 모두 공용 맵을 반환하고 기존 중복·누락·비활성 검증이 유지됨
+  - Stage 1 클리어 후 보상 맵을 거쳐 같은 물리 맵에 Stage 2로 재진입하며 RequestId와 StageId가 갱신됨
+  - Stage 3과 Stage 4 보스도 삭제된 맵을 참조하지 않고 동일 경로로 진입함
+  - 중복 맵 삭제 후 Sector의 모든 map entry가 실제 파일과 일치하고 build/runtime Error·Warning이 없음
+
 ## 5. 이후 Phase로 넘길 것
 
 Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
