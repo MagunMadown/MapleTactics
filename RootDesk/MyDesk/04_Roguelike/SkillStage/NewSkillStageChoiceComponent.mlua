@@ -6,10 +6,18 @@ script NewSkillStageChoiceComponent extends Component
 	property Vector3 TargetPosition = Vector3(0, 0, 0)
 	property string OfferedSkillId = ""
 	property string OfferedDisplayName = ""
+	property string OfferedDescription = ""
 	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
 	property string SpearPullingIconRuid = "bb70484eb6eb41f181ff21d336e78ea0"
 	property string BrandishIconRuid = "ad4304f4d5654158aca63c8c142d5035"
 	property string DivineSwingIconRuid = "01f0134411804cd7aaa13065ca3b5ab7"
+	property string HoverSoundRUID = "159bf70a74634bfc8e91a29e527a4be5"
+	property string ClickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+	property number SoundVolume = 1
+	property Color NormalIconColor = Color(1, 1, 1, 1)
+	property Color HoverIconColor = Color(0.58, 0.64, 0.76, 1)
+	property Vector2 HoverHalfExtent = Vector2(1.25, 1.25)
+	property boolean IsHovered = false
 	property string TargetMapName = ""
 	property boolean SelectionLocked = false
 	property any touchHandler = nil
@@ -18,9 +26,29 @@ script NewSkillStageChoiceComponent extends Component
 	method void OnBeginPlay()
 		-- Requests this slot's authoritative job skill offer and wires world touch input.
 		self.SelectionLocked = false
+		self.IsHovered = false
 		self.touchHandler = self.Entity:ConnectEvent(TouchEvent, self.OnTouched)
 		self:RequestOffer(self.ChoiceIndex)
 		log("[NewSkillStage] offer requested slot=" .. self.ChoiceIndex)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Detects PC pointer entry over this world-space skill icon and toggles its description tooltip.
+		if Environment:IsPCPlatform() == false or self.SelectionLocked == true or self.OfferedSkillId == "" or self.Entity.Enable == false then
+			self:SetHoverState(false)
+			return
+		end
+		if _InputService:IsPointerOverUI() then
+			self:SetHoverState(false)
+			return
+		end
+		local cursorPosition = _InputService:GetCursorPosition()
+		local cursorWorldPosition = _UILogic:ScreenToWorldPosition(cursorPosition)
+		local entityPosition = self.Entity.TransformComponent.WorldPosition
+		local inside = math.abs(cursorWorldPosition.x - entityPosition.x) <= self.HoverHalfExtent.x
+			and math.abs(cursorWorldPosition.y - entityPosition.y) <= self.HoverHalfExtent.y
+		self:SetHoverState(inside)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -30,6 +58,7 @@ script NewSkillStageChoiceComponent extends Component
 			self.Entity:DisconnectEvent(TouchEvent, self.touchHandler)
 			self.touchHandler = nil
 		end
+		self:SetHoverState(false)
 	end
 
 	@ExecSpace("Server")
@@ -39,11 +68,11 @@ script NewSkillStageChoiceComponent extends Component
 		local offer = self:ResolveOffer(playerEntity, choiceIndex)
 		if offer.Success == false then
 			log_warning("[NewSkillStage] offer rejected user=" .. senderUserId .. " slot=" .. choiceIndex .. " reason=" .. offer.Reason)
-			self:ReceiveOffer("", "", "", offer.Reason, senderUserId)
+			self:ReceiveOffer("", "", "", "", offer.Reason, senderUserId)
 			return
 		end
 		log("[NewSkillStage] offer ready user=" .. senderUserId .. " job=" .. offer.JobId .. " slot=" .. choiceIndex .. " skill=" .. offer.SkillId)
-		self:ReceiveOffer(offer.SkillId, offer.DisplayName, offer.IconRuid, "OK", senderUserId)
+		self:ReceiveOffer(offer.SkillId, offer.DisplayName, offer.IconRuid, offer.Description, "OK", senderUserId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -86,8 +115,55 @@ script NewSkillStageChoiceComponent extends Component
 			JobId = runState.SelectedJobId,
 			SkillId = definition.SkillId,
 			DisplayName = definition.DisplayName,
-			IconRuid = self:GetSkillIconRuid(definition)
+			IconRuid = self:GetSkillIconRuid(definition),
+			Description = self:BuildSkillDescription(definition)
 		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method string BuildSkillDescription(any definition)
+		-- Builds a concise Korean tooltip from the authoritative skill definition fields.
+		local targetLabel = definition.TargetingType or ""
+		if targetLabel == "FRONT_CELL" then
+			targetLabel = "정면 칸"
+		elseif targetLabel == "FIRST_ENEMY_FORWARD" then
+			targetLabel = "전방의 첫 번째 적"
+		elseif targetLabel == "RANGE_OFFSETS" then
+			targetLabel = "지정 범위"
+		elseif targetLabel == "SELF" then
+			targetLabel = "자신"
+		elseif targetLabel == "" then
+			targetLabel = "정보 없음"
+		end
+		local damageValue = self:GetSkillDamageValue(definition)
+		local damageText = damageValue > 0 and tostring(damageValue) or "없음"
+		local description = "피해: " .. damageText
+			.. "\n범위: " .. tostring(definition.Range or 0)
+			.. "\n대상: " .. targetLabel
+			.. "\n재사용 대기: " .. tostring(definition.CooldownTurns or 0) .. "턴"
+		if definition.CostType ~= nil and definition.CostType ~= "" and (definition.CostValue or 0) > 0 then
+			description = description .. "\n비용: " .. definition.CostType .. " " .. tostring(definition.CostValue)
+		end
+		return description
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetSkillDamageValue(any definition)
+		-- Sums every authored DAMAGE step so multi-step skills expose their total tooltip damage.
+		if definition == nil or definition.EffectSetId == nil or definition.EffectSetId == "" then
+			return 0
+		end
+		local effectResult = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId)
+		if effectResult.Success == false then
+			return 0
+		end
+		local totalDamage = 0
+		for _, effectStep in ipairs(effectResult.Steps) do
+			if effectStep.EffectType == "DAMAGE" then
+				totalDamage = totalDamage + (effectStep.Value or 0)
+			end
+		end
+		return totalDamage
 	end
 
 	@ExecSpace("ServerOnly")
@@ -108,11 +184,12 @@ script NewSkillStageChoiceComponent extends Component
 	end
 
 	@ExecSpace("Client")
-	method void ReceiveOffer(string skillId, string displayName, string iconRuid, string reason)
+	method void ReceiveOffer(string skillId, string displayName, string iconRuid, string description, string reason)
 		-- Applies the server-approved static skill icon and label on the local client.
 		if reason ~= "OK" or skillId == "" then
 			self.OfferedSkillId = ""
 			self.OfferedDisplayName = ""
+			self.OfferedDescription = ""
 			local unavailableLabelEntity = _EntityService:GetEntityByPath(self.LabelEntityPath)
 			if isvalid(unavailableLabelEntity) and unavailableLabelEntity.NameTagComponent ~= nil then
 				unavailableLabelEntity.NameTagComponent.Enable = false
@@ -123,8 +200,10 @@ script NewSkillStageChoiceComponent extends Component
 		end
 		self.OfferedSkillId = skillId
 		self.OfferedDisplayName = displayName
+		self.OfferedDescription = description or ""
 		if iconRuid ~= "" and self.Entity.SpriteRendererComponent ~= nil then
 			self.Entity.SpriteRendererComponent.SpriteRUID = iconRuid
+			self.Entity.SpriteRendererComponent.Color = self.NormalIconColor
 		end
 		local labelEntity = _EntityService:GetEntityByPath(self.LabelEntityPath)
 		if isvalid(labelEntity) and labelEntity.NameTagComponent ~= nil then
@@ -135,12 +214,63 @@ script NewSkillStageChoiceComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void SetHoverState(boolean hovered)
+		-- Plays the shared hover SFX once per entry and toggles the mouse-following screen tooltip.
+		if self.IsHovered == hovered then
+			return
+		end
+		self.IsHovered = hovered
+		local iconRenderer = self.Entity.SpriteRendererComponent
+		if iconRenderer ~= nil then
+			iconRenderer.Color = hovered and self.HoverIconColor or self.NormalIconColor
+		end
+		if hovered then
+			_SoundService:PlaySound(self.HoverSoundRUID, self.SoundVolume)
+			local tooltipUI = self:GetTooltipUI()
+			if tooltipUI ~= nil then
+				tooltipUI:Show(self:GetTooltipOwnerKey(), self:GetTooltipText())
+			end
+			log("[NewSkillStage] tooltip shown slot=" .. self.ChoiceIndex .. " skill=" .. self.OfferedSkillId)
+		else
+			local tooltipUI = self:GetTooltipUI()
+			if tooltipUI ~= nil then
+				tooltipUI:Hide(self:GetTooltipOwnerKey())
+			end
+			log("[NewSkillStage] tooltip hidden slot=" .. self.ChoiceIndex .. " skill=" .. self.OfferedSkillId)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetTooltipText()
+		-- Returns the centered multi-line skill description consumed by the shared tooltip.
+		return self.OfferedDisplayName .. "\n" .. self.OfferedDescription
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetTooltipOwnerKey()
+		-- Builds a stable owner key so another hovered choice cannot hide this tooltip.
+		return "new_skill:" .. tostring(self.ChoiceIndex) .. ":" .. self.OfferedSkillId
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetTooltipUI()
+		-- Resolves the shared topmost tooltip component used by every hover consumer.
+		local uiRoot = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
+		if isvalid(uiRoot) then
+			return uiRoot:GetComponent("script.MouseTooltipUIComponent")
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
 	method void OnTouched(TouchEvent event)
 		-- Submits the displayed offer once and ignores repeated local touches.
 		if self.SelectionLocked == true or self.OfferedSkillId == "" then
 			return
 		end
 		self.SelectionLocked = true
+		_SoundService:PlaySound(self.ClickSoundRUID, self.SoundVolume)
+		self:SetHoverState(false)
 		self:RequestSelectOffer(self.ChoiceIndex, self.OfferedSkillId)
 		log("[NewSkillStage] selection requested slot=" .. self.ChoiceIndex .. " skill=" .. self.OfferedSkillId)
 	end
