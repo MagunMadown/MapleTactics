@@ -368,25 +368,39 @@
   - 생존 적 두 명의 행동 순서가 매 실행 동일
   - 첫 적 사망 시 Victory가 발생하지 않고 두 번째 적 사망 시 한 번만 발생
 
-### Slice 14 - CSV 기반 단일 전투 맵 재사용
+### Slice 14 - CSV 기반 일반전 맵 재사용과 보스 맵 분리
 
-- 🟡 상태: Implemented (untested) — 공용 맵 라우팅·`region_01_battle` 개명·중복 맵 제거·자동 시작 차단·1인 Static 설정 적용, Maker 회귀 검증 pending
-- 화면 결과: 서로 다른 StageId가 모두 같은 `region_01_battle` 물리 맵으로 이동하지만 각 StageDefinitions·Wave 데이터로 독립 초기화된다.
+- ✅ 상태: Verified — `region_01_boss` 생성, 1-4 CSV 라우팅, 서버 런타임 맵 전환과 콘텐츠 검증 통과.
+- 화면 결과: 1-1~1-3은 같은 `region_01_battle` 물리 맵을 재사용하고 1-4는 `region_01_boss`로 이동하며, 각 StageDefinitions·Wave 데이터로 독립 초기화된다.
 - 최소 구현:
-  - `StageMapRoutes.csv`의 네 StageId를 `MapId=region_01_battle`로 통일
+  - `StageMapRoutes.csv`의 1-1~1-3은 `MapId=region_01_battle`, 1-4는 `MapId=region_01_boss`로 설정
   - 월드맵 지연 진입 요청의 현재 맵 검사를 실제 로비 맵명 `lobby`로 통일
   - 공용 맵의 `BattleSessionComponent.AutoStartPrototypeBattle=false`
   - Static Map 격리를 위해 `sector01.maxUserNo=1`
-  - 공용 물리 맵을 `region_01_battle`로 개명하고 중복 `region_01_stage_02/03` 맵과 Sector 등록 제거
+  - 일반전 공용 물리 맵 `region_01_battle`을 복제해 전투 컴포넌트 계약이 같은 `region_01_boss` 생성
 - 불변식:
   - `StageId`는 콘텐츠 식별자이고 `MapId`는 물리 이동 대상이다.
   - 준비된 BattleEntry가 없는 직접 맵 진입은 전투를 자동 시작하지 않는다.
   - 공용 맵 재진입마다 Registry·Turn·Wave·Queue·Drop·BattleResult를 새 StageId 기준으로 초기화한다.
 - 완료 기준:
-  - 네 StageId 라우팅이 모두 공용 맵을 반환하고 기존 중복·누락·비활성 검증이 유지됨
+  - 1-1~1-3은 일반전 공용 맵, 1-4는 보스 전용 맵을 반환하고 기존 중복·누락·비활성 검증이 유지됨
   - Stage 1 클리어 후 보상 맵을 거쳐 같은 물리 맵에 Stage 2로 재진입하며 RequestId와 StageId가 갱신됨
-  - Stage 3과 Stage 4 보스도 삭제된 맵을 참조하지 않고 동일 경로로 진입함
+  - Stage 3은 일반전 공용 맵, Stage 4는 보스 전용 맵으로 진입함
   - 중복 맵 삭제 후 Sector의 모든 map entry가 실제 파일과 일치하고 build/runtime Error·Warning이 없음
+
+### Slice 15 - 헤네시스 일반전·머쉬맘 보스전 배경 구성
+
+- ✅ 상태: Verified — 교체 가능한 장식 모델과 일반전·보스전 배치 완료, 두 맵의 플레이 카메라 가독성과 오류·경고 0건 확인.
+- 화면 결과: 일반전은 밝은 헤네시스 외곽 사냥터, 보스전은 같은 지역의 더 울창한 버섯 숲으로 구분되며 6칸 전투 정보는 가려지지 않는다.
+- 최소 구현:
+  - 장식 SpriteRUID를 교체 가능한 `.model`로 분리
+  - 일반전에는 표지판·관목·나무를 가장자리와 후경에 배치하고, 오른쪽에는 보스전 왼쪽과 같은 나무·버섯 군락으로 이어지는 숲길을 암시
+  - 보스전에는 큰 수풀·나무 군락을 배치하고 중앙 전투선과 착지 전조 영역은 비움
+  - 기존 `BattleCell1~6`, 카메라, Foothold, 전투 상태 컴포넌트는 변경하지 않음
+- 완료 기준:
+  - 두 맵 모두 6개 셀·플레이어·적·Intent UI 가독성을 유지함
+  - 장식 모델의 SpriteRUID를 한 곳에서 교체할 수 있음
+  - 1-1과 1-4 진입 화면이 명확히 구분되고 build/runtime Error·Warning이 없음
 
 ## 5. 이후 Phase로 넘길 것
 
