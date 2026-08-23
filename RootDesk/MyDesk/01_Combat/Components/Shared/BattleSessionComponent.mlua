@@ -389,24 +389,26 @@ script BattleSessionComponent extends Component
 		end
 		self:UpdatePlayerGridMove(delta)
 		self:RefreshPlayerHpSnapshot("")
-		-- Battle map entities persist after the player visits a reward map. Observe the
-		-- exit first, then consume a newly prepared request when the player returns.
-		-- This prevents a same-map Stage route from inheriting the cleared session.
-		if self.BattleResult ~= "" then
+		-- Battle map entities persist after the player visits another map. A completed
+		-- battle observes the exit normally, while defeat return explicitly arms the
+		-- same fresh-entry path after clearing BattleResult for the persistent HUD.
+		if self.BattleResult ~= "" or self.PlayerExitObservedAfterBattle == true then
 			local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
-			if users == nil or #users == 0 then
+			if self.PlayerExitObservedAfterBattle == true then
+				if users ~= nil then
+					for _, player in ipairs(users) do
+						local entryState = player:GetComponent("script.BattleEntryStateComponent")
+						if entryState ~= nil and entryState.EntryState == "PREPARED" and entryState.RequestId ~= self.LastInitializedEntryRequestId then
+							log("[BattleSession] prepared re-entry detected request=" .. entryState.RequestId .. " stage=" .. entryState.StageId)
+							self:OnMapEnter(player)
+							break
+						end
+					end
+				end
+			elseif users == nil or #users == 0 then
 				if self.PlayerExitObservedAfterBattle == false then
 					self.PlayerExitObservedAfterBattle = true
 					log("[BattleSession] player exit observed after battle stage=" .. self.StageId)
-				end
-			elseif self.PlayerExitObservedAfterBattle == true then
-				for _, player in ipairs(users) do
-					local entryState = player:GetComponent("script.BattleEntryStateComponent")
-					if entryState ~= nil and entryState.EntryState == "PREPARED" and entryState.RequestId ~= self.LastInitializedEntryRequestId then
-						log("[BattleSession] prepared re-entry detected request=" .. entryState.RequestId .. " stage=" .. entryState.StageId)
-						self:OnMapEnter(player)
-						break
-					end
 				end
 			end
 		end
@@ -2947,69 +2949,53 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
-	method void RequestResetBattle()
-		-- Accepts Reset only from the registered solo player after the battle has ended.
+	method void RequestReturnToLobbyAfterDefeat()
+		-- Accepts the defeat return only from the registered solo player and keeps all mutations on the server.
 		if self:IsValidPlayerRequest(senderUserId) == false then
-			log_warning("[BattleReset] rejected reason=INVALID_SENDER")
+			log_warning("[BattleDefeatReturn] rejected reason=INVALID_SENDER")
 			return
 		end
 
-		local result = self:ResetBattle()
-		self:PublishPlayerCommandResult("RESET_BATTLE", result)
+		local result = self:ReturnToLobbyAfterDefeat()
+		self:PublishPlayerCommandResult("RETURN_TO_LOBBY", result)
 		if result.Success == false then
-			log_warning("[BattleReset] rejected reason=" .. result.Reason)
+			log_warning("[BattleDefeatReturn] rejected reason=" .. result.Reason)
 		end
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ResetBattle()
-		-- Restarts a completed battle with a fresh entry request so its result is recorded independently.
-		local result = {
-			Success = false,
-			Reason = "UNKNOWN"
-		}
-
-		if self.BattleResult == "" then
-			result.Reason = "BATTLE_NOT_ENDED"
-			return result
+	method table ReturnToLobbyAfterDefeat()
+		-- Resets the failed run and its entry payload before requesting the authoritative lobby transfer.
+		if self.BattleResult ~= "Defeat" then
+			return { Success = false, Reason = "BATTLE_NOT_DEFEATED" }
 		end
 		if isvalid(self.PlayerEntity) == false then
-			result.Reason = "PLAYER_MISSING"
-			return result
+			return { Success = false, Reason = "PLAYER_MISSING" }
 		end
-
 		local entryState = _BattleGatewayLogic:GetOrCreateEntryState(self.PlayerEntity)
 		if entryState == nil then
-			result.Reason = "ENTRY_STATE_UNAVAILABLE"
-			return result
-		end
-		local retryEntry = entryState:Prepare(
-			self.StageId,
-			self.SelectedCharacterId,
-			self.SelectedJobId,
-			self.SelectedLoadoutId,
-			self.RunSeed,
-			"CONTINUE_RUN"
-		)
-		if retryEntry.Success == false then
-			result.Reason = retryEntry.Reason
-			return result
+			return { Success = false, Reason = "ENTRY_STATE_UNAVAILABLE" }
 		end
 
-		self.EntryRequestId = retryEntry.RequestId
-		local rebuildResult = self:RebuildBattleState("RESET")
-		if rebuildResult.Success == false then
-			entryState:Cancel("RESET_REBUILD_FAILED")
-			entryState:RecordFailure(rebuildResult.Reason)
-			return rebuildResult
+		local resetResult = _RunManagerLogic:ResetFailedRun(self.PlayerEntity, "BATTLE_DEFEAT_RETURN")
+		if resetResult.Success == false then
+			return resetResult
 		end
-		local startedResult = entryState:MarkStarted()
-		if startedResult.Success == false then
-			result.Reason = startedResult.Reason
-			return result
+		entryState:ResetToIdle("BATTLE_DEFEAT_RETURN")
+		self.BattleResult = ""
+		self.PlayerExitObservedAfterBattle = true
+		log("[BattleDefeatReturn] map session result cleared and fresh entry armed before transfer")
+		local navigationResult = _MapTeleportManager:TeleportPlayer(
+			self.PlayerEntity,
+			"lobby",
+			Vector3(-27.22, -7.92, 0),
+			"BATTLE_DEFEAT_RETURN"
+		)
+		if navigationResult.Success == false then
+			return navigationResult
 		end
-		log("[BattleReset] retry entry started request=" .. self.EntryRequestId .. " stage=" .. self.StageId)
-		return rebuildResult
+		log("[BattleDefeatReturn] completed player=" .. self.PlayerEntity.Name .. " previousSequence=" .. resetResult.RunSequence .. " destination=lobby")
+		return { Success = true, Reason = "LOBBY_TRANSFER_REQUESTED", RunSequence = resetResult.RunSequence }
 	end
 
 	@ExecSpace("ServerOnly")
