@@ -68,6 +68,8 @@ script BattleQueueHudComponent extends Component
 	property number QueueConfirmSoundVolume = 0.35
 	property boolean HasQueueFeedbackSnapshot = false
 	property string LastQueuedTileIds = ""
+	property boolean IsMapTransferPending = false
+	property string MapTransferSourceMapName = ""
 	property any SkillSlot1ClickHandler = nil
 	property any SkillSlot2ClickHandler = nil
 	property any SkillSlot3ClickHandler = nil
@@ -161,6 +163,32 @@ script BattleQueueHudComponent extends Component
 	method void RefreshHud(boolean force)
 		-- Renders the latest Presenter snapshot; this view has no map/session/runtime dependencies.
 		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
+		if self.IsMapTransferPending then
+			local player = _UserService.LocalPlayer
+			local currentMapName = ""
+			if isvalid(player) and isvalid(player.CurrentMap) then
+				currentMapName = player.CurrentMap.Name
+			end
+			local presenterReady = presenterState ~= nil and presenterState.Success == true
+			local destinationReady = false
+			if currentMapName ~= "" and currentMapName ~= self.MapTransferSourceMapName and presenterReady then
+				if presenterState.ContextVisible == false then
+					destinationReady = true
+				elseif presenterState.Session ~= nil
+					and presenterState.Session.Entity == player.CurrentMap
+					and presenterState.UiState ~= nil
+					and presenterState.UiState.BattleResult == "" then
+					destinationReady = true
+				end
+			end
+			if destinationReady == false then
+				self:SetHudContextVisible(false, "MAP_TRANSFER_PENDING")
+				return
+			end
+			self.IsMapTransferPending = false
+			self.MapTransferSourceMapName = ""
+			log("[BattleQueueHUD] map transfer lock released map=" .. currentMapName)
+		end
 		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
 			local reason = presenterState == nil and "PRESENTER_STATE_MISSING" or presenterState.ContextReason
 			self.HasQueueFeedbackSnapshot = false
@@ -354,6 +382,27 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void PrepareForMapTransfer(string source)
+		-- Clears persistent battle HUD state before the local player receives the destination map.
+		local player = _UserService.LocalPlayer
+		self.MapTransferSourceMapName = ""
+		if isvalid(player) and isvalid(player.CurrentMap) then
+			self.MapTransferSourceMapName = player.CurrentMap.Name
+		end
+		self.IsMapTransferPending = true
+		if self.InputFeedbackTimerId > 0 then
+			_TimerService:ClearTimer(self.InputFeedbackTimerId)
+			self.InputFeedbackTimerId = 0
+		end
+		self.InputFeedbackText = ""
+		self.HasQueueFeedbackSnapshot = false
+		self.LastQueuedTileIds = ""
+		self:SetResultVisibility("", "")
+		self:SetHudContextVisible(false, "MAP_TRANSFER_" .. (source or "UNSPECIFIED"))
+		log("[BattleQueueHUD] prepared for map transfer source=" .. (source or "UNSPECIFIED") .. " map=" .. self.MapTransferSourceMapName)
+	end
+
+	@ExecSpace("ClientOnly")
 	method void SetUnavailableState(string reason)
 		-- Shows a safe inactive state until the local player and map session are available.
 		local signature = "Unavailable:" .. reason
@@ -380,7 +429,7 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void SetResultVisibility(string battleResult, string stageId)
-		-- Shows retry only after defeat because victories continue through the run transition flow.
+		-- Shows the starting-village return action only after defeat because victories use the run transition flow.
 		local visible = self.IsHudContextVisible and battleResult == "Defeat"
 		if self.ResultPanelEntity ~= nil then
 			self.ResultPanelEntity.Enable = visible
@@ -392,9 +441,10 @@ script BattleQueueHudComponent extends Component
 		self.ResetButtonText.Enable = visible
 		if visible then
 			self.ResultText.Text = "DEFEAT"
+			self.ResetButtonText.Text = "시작 마을로"
 		end
 		if battleResult ~= "" then
-			log("[BattleQueueHUD] result visibility stage=" .. tostring(stageId) .. " result=" .. battleResult .. " retryVisible=" .. tostring(visible))
+			log("[BattleQueueHUD] result visibility stage=" .. tostring(stageId) .. " result=" .. battleResult .. " lobbyReturnVisible=" .. tostring(visible))
 		end
 	end
 
@@ -901,8 +951,10 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnResetClicked()
-		log("[BattleQueueHUD] reset clicked")
-		_BattleHudPresenterLogic:RequestResetBattle()
+		-- Prevents duplicate local clicks while the server resets the run and transfers the player.
+		self.ResetButton.Enable = false
+		log("[BattleQueueHUD] lobby return clicked")
+		_BattleHudPresenterLogic:RequestReturnToLobbyAfterDefeat()
 	end
 
 	@ExecSpace("ClientOnly")
