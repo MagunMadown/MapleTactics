@@ -1,52 +1,86 @@
 @Logic
-script PrototypeWeaponController
+script PrototypeWeaponController extends Logic
 
-	-- TEMPORARY TEST ADAPTER: remove this Logic and its Lobby confirm call when real job equipment data is connected.
-	property boolean EnablePrototypeWeaponPreview = true
-	property string WarriorSwordRUID = "9edfb2ac8d4948ae9d6d789c99e0b966"
-	property string BowmanBowRUID = "67ce4147813d49f5975917ee86777950"
-	property string MagicianWandRUID = "061712eadf7d4357a6c306dfd5368860"
-	property string ThiefDaggerRUID = "11ccce1ca9224050897b2d59fe14a3bf"
-	property string ThiefClawRUID = "c80eb7c8ad1f45988e6d74b1c95a0b13"
+	property string PreviewWarningKeys = ""
 
+	@ExecSpace("ClientOnly")
 	method table GetJobWeaponPreview(string jobId)
-		-- Reuses the existing prototype weapon data on the isolated AvatarGUI preview only.
-		if jobId == "warrior" then
-			return { Success=true, Category=MapleAvatarItemCategory.OneHandedWeapon, WeaponRUID=self.WarriorSwordRUID }
-		elseif jobId == "archer" then
-			return { Success=true, Category=MapleAvatarItemCategory.TwoHandedWeapon, WeaponRUID=self.BowmanBowRUID }
-		elseif jobId == "mage" then
-			return { Success=true, Category=MapleAvatarItemCategory.OneHandedWeapon, WeaponRUID=self.MagicianWandRUID }
-		elseif jobId == "thief" then
-			return { Success=true, Category=MapleAvatarItemCategory.OneHandedWeapon, WeaponRUID=self.ThiefDaggerRUID }
+		-- Job data carries only the WeaponDefinitions key, never an avatar RUID.
+		local jobEntry = nil
+		local entries = _LobbyJobSelectionProvider:GetEntries()
+		for _, entry in ipairs(entries) do
+			if entry.Id == jobId then
+				jobEntry = entry
+				break
+			end
 		end
-		return { Success=false, Reason="NO_PROTOTYPE_WEAPON", WeaponRUID="" }
+		if jobEntry == nil then
+			if _LobbyJobSelectionProvider.EntrySnapshot == nil or _LobbyJobSelectionProvider.EntrySnapshot == "" then
+				return { Success = false, Reason = "JOB_CACHE_NOT_READY", JobId = jobId or "", Retryable = true }
+			end
+			self:LogPreviewWarningOnce(jobId, "JOB_DEFINITION_MISSING")
+			return { Success = false, Reason = "JOB_DEFINITION_MISSING", JobId = jobId or "" }
+		end
+
+		local previewWeaponId = jobEntry.PreviewWeaponId or ""
+		if previewWeaponId == "" then
+			self:LogPreviewWarningOnce(jobId, "PREVIEW_WEAPON_ID_MISSING")
+			return { Success = false, Reason = "PREVIEW_WEAPON_ID_MISSING", JobId = jobId or "" }
+		end
+
+		local weapon = _WeaponDefinitionRepositoryLogic:GetCachedWeaponDefinition(previewWeaponId)
+		if weapon == nil then
+			self:LogPreviewWarningOnce(jobId, "WEAPON_DEFINITION_RESULT_MISSING")
+			return { Success = false, Reason = "WEAPON_DEFINITION_RESULT_MISSING", JobId = jobId or "", PreviewWeaponId = previewWeaponId }
+		end
+		if weapon.Success == false then
+			if weapon.Retryable then
+				return { Success = false, Reason = weapon.Reason, JobId = jobId or "", PreviewWeaponId = previewWeaponId, Retryable = true }
+			end
+			self:LogPreviewWarningOnce(jobId, weapon.Reason)
+			return { Success = false, Reason = weapon.Reason, JobId = jobId or "", PreviewWeaponId = previewWeaponId }
+		end
+		if weapon.WeaponRuid == nil or weapon.WeaponRuid == "" then
+			self:LogPreviewWarningOnce(jobId, "WEAPON_RUID_MISSING")
+			return { Success = false, Reason = "WEAPON_RUID_MISSING", JobId = jobId or "", PreviewWeaponId = previewWeaponId }
+		end
+
+		local category = self:GetCategoryForEquipSlot(weapon.EquipSlot)
+		if category == nil then
+			self:LogPreviewWarningOnce(jobId, "UNSUPPORTED_EQUIP_SLOT")
+			return { Success = false, Reason = "UNSUPPORTED_EQUIP_SLOT", JobId = jobId or "", PreviewWeaponId = previewWeaponId }
+		end
+		return {
+			Success = true,
+			Reason = "OK",
+			JobId = jobId,
+			PreviewWeaponId = previewWeaponId,
+			WeaponType = weapon.WeaponType,
+			WeaponName = weapon.DisplayName,
+			Category = category,
+			WeaponRUID = weapon.WeaponRuid,
+			SubWeaponRUID = weapon.SubWeaponRuid or ""
+		}
 	end
 
-	@ExecSpace("ServerOnly")
-	method table ApplyJobWeapon(Entity player, string jobId)
-		if self.EnablePrototypeWeaponPreview == false then
-			return { Success = true, Reason = "PROTOTYPE_WEAPON_PREVIEW_DISABLED", JobId = jobId or "" }
+	@ExecSpace("ClientOnly")
+	method void LogPreviewWarningOnce(string jobId, string reason)
+		local warningKey = "|" .. (jobId or "") .. ":" .. (reason or "UNKNOWN") .. "|"
+		if string.find(self.PreviewWarningKeys or "", warningKey, 1, true) ~= nil then
+			return
 		end
-		if isvalid(player) == false then
-			return { Success = false, Reason = "PLAYER_UNAVAILABLE" }
-		end
+		self.PreviewWarningKeys = (self.PreviewWarningKeys or "") .. warningKey
+		log_warning("[LobbyClassSelect] preview weapon data missing job=" .. (jobId or "") .. " reason=" .. (reason or "UNKNOWN"))
+	end
 
-		if jobId == "warrior" or jobId == "prototype_warrior" or jobId == "Warrior" then
-			return self:EquipWeapon(player, MapleAvatarItemCategory.OneHandedWeapon, self.WarriorSwordRUID, "Warrior Sword")
-		elseif jobId == "archer" or jobId == "prototype_bowman" or jobId == "Bowman" then
-			return self:EquipWeapon(player, MapleAvatarItemCategory.TwoHandedWeapon, self.BowmanBowRUID, "Bowman Bow")
-		elseif jobId == "mage" or jobId == "prototype_magician" or jobId == "Magician" then
-			return self:EquipWeapon(player, MapleAvatarItemCategory.OneHandedWeapon, self.MagicianWandRUID, "Magician Wand")
-		elseif jobId == "thief" or jobId == "prototype_thief" or jobId == "Thief" then
-			local state = self:GetOrCreateWeaponState(player)
-			if state == nil or state:SetThiefWeaponMode("Dagger") == false then
-				return { Success = false, Reason = "WEAPON_STATE_UNAVAILABLE" }
-			end
-			return self:EquipWeapon(player, MapleAvatarItemCategory.OneHandedWeapon, self.ThiefDaggerRUID, "Thief Dagger")
+	method any GetCategoryForEquipSlot(string equipSlot)
+		if equipSlot == "ONE_HANDED" then
+			return MapleAvatarItemCategory.OneHandedWeapon
 		end
-
-		return { Success = false, Reason = "UNKNOWN_PROTOTYPE_JOB", JobId = jobId or "" }
+		if equipSlot == "TWO_HANDED" then
+			return MapleAvatarItemCategory.TwoHandedWeapon
+		end
+		return nil
 	end
 
 	@ExecSpace("ServerOnly")
@@ -62,10 +96,12 @@ script PrototypeWeaponController
 		if state == nil or state:SetThiefWeaponMode(mode) == false then
 			return { Success = false, Reason = "WEAPON_STATE_UNAVAILABLE", Mode = mode }
 		end
-		if mode == "Claw" then
-			return self:EquipWeapon(player, MapleAvatarItemCategory.OneHandedWeapon, self.ThiefClawRUID, "Thief Claw")
+		local weaponType = mode == "Claw" and "CLAW" or "DAGGER"
+		local weapon = _WeaponDefinitionRepositoryLogic:GetWeaponDefinition(weaponType)
+		if weapon == nil or weapon.Success == false then
+			return { Success = false, Reason = weapon == nil and "WEAPON_DEFINITION_RESULT_MISSING" or weapon.Reason, Mode = mode }
 		end
-		return self:EquipWeapon(player, MapleAvatarItemCategory.OneHandedWeapon, self.ThiefDaggerRUID, "Thief Dagger")
+		return self:EquipWeaponDefinition(player, weapon)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -81,31 +117,39 @@ script PrototypeWeaponController
 	end
 
 	@ExecSpace("ServerOnly")
-	method table EquipWeapon(Entity player, MapleAvatarItemCategory category, string weaponRUID, string weaponName)
+	method table EquipWeaponDefinition(Entity player, table weapon)
 		local costume = player.CostumeManagerComponent
 		if costume == nil then
 			log_error("[PrototypeWeapon] CostumeManagerComponent missing player=" .. player.Name)
 			return { Success = false, Reason = "COSTUME_MANAGER_MISSING" }
 		end
-		if weaponRUID == nil or weaponRUID == "" then
-			log_error("[PrototypeWeapon] RUID missing weapon=" .. weaponName)
-			return { Success = false, Reason = "WEAPON_RUID_MISSING", WeaponName = weaponName }
+		if weapon == nil or weapon.WeaponRuid == nil or weapon.WeaponRuid == "" then
+			log_error("[PrototypeWeapon] weapon definition RUID missing")
+			return { Success = false, Reason = "WEAPON_RUID_MISSING" }
 		end
 
-		self:ClearCurrentMainWeapon(player)
-		costume:SetEquip(category, weaponRUID)
-		log("[PrototypeWeapon] equipped player=" .. player.Name .. " weapon=" .. weaponName .. " ruid=" .. weaponRUID)
-		return { Success = true, Reason = "OK", WeaponName = weaponName, WeaponRUID = weaponRUID }
+		local category = self:GetCategoryForEquipSlot(weapon.EquipSlot)
+		if category == nil then
+			return { Success = false, Reason = "UNSUPPORTED_EQUIP_SLOT", EquipSlot = weapon.EquipSlot or "" }
+		end
+		self:ClearCurrentWeaponSlots(player)
+		costume:SetEquip(category, weapon.WeaponRuid)
+		if weapon.SubWeaponRuid ~= nil and weapon.SubWeaponRuid ~= "" then
+			costume:SetEquip(MapleAvatarItemCategory.SubWeapon, weapon.SubWeaponRuid)
+		end
+		log("[PrototypeWeapon] equipped player=" .. player.Name .. " weaponType=" .. weapon.WeaponType .. " ruid=" .. weapon.WeaponRuid)
+		return { Success = true, Reason = "OK", WeaponName = weapon.DisplayName, WeaponRUID = weapon.WeaponRuid, WeaponType = weapon.WeaponType }
 	end
 
 	@ExecSpace("ServerOnly")
-	method boolean ClearCurrentMainWeapon(Entity player)
+	method boolean ClearCurrentWeaponSlots(Entity player)
 		if isvalid(player) == false or player.CostumeManagerComponent == nil then
 			return false
 		end
 		local costume = player.CostumeManagerComponent
 		costume:SetEquip(MapleAvatarItemCategory.OneHandedWeapon, "")
 		costume:SetEquip(MapleAvatarItemCategory.TwoHandedWeapon, "")
+		costume:SetEquip(MapleAvatarItemCategory.SubWeapon, "")
 		return true
 	end
 
