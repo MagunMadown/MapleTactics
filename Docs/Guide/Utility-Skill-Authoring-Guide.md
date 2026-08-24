@@ -43,19 +43,26 @@
 
 | SkillId | 직업 | 표시명 | TargetingType | Range | Cooldown | 설명 |
 |---|---|---|---|---|---:|---|
-| `royal_guard` | warrior | 로얄 가드 | `SELF` | 1 | 3 | 다음 플레이어 턴까지 받는 모든 피해를 무효화한다 |
-| `teleport` | mage | 텔레포트 | `SELF` | 1 | 3 | 바라보는 방향의 비어있는 칸 중 가장 먼 칸으로 이동한다 |
-| `fairy_turn` | archer | 페어리 턴 | `FRONT_CELL` | 1 | 3 | 바로 앞 적을 바라보는 방향으로 최대 2칸 민다. 막히면 그 앞까지만 |
-| `rapid_evasion` | thief | 래피드 이베이젼 | `SELF` | 1 | 3 | 전방에서 가장 먼 적의 1칸 뒤로 이동한다. 그 칸이 없거나 점유돼 있으면 실패 |
-| `tidal_wave` | pirate | 파도 | `RANGE_OFFSETS` | 5 | 3 | 전방의 적과 시전자가 벽에 막힐 때까지 같은 거리만큼 함께 밀려난다 |
+| `royal_guard` | warrior | 로얄 가드 | `SELF` | 1 | 4 | 다음 플레이어 턴까지 받는 모든 피해를 무효화한다 |
+| `teleport` | mage | 텔레포트 | `SELF` | 1 | 4 | 바라보는 방향의 비어있는 칸 중 가장 먼 칸으로 이동한다 |
+| `fairy_turn` | archer | 페어리 턴 | `FRONT_CELL` | 1 | 4 | 바로 앞 적을 바라보는 방향으로 최대 2칸 민다. 막히면 그 앞까지만 |
+| `rapid_evasion` | thief | 래피드 이베이젼 | `SELF` | 1 | 4 | 전방에서 가장 먼 적의 1칸 뒤로 이동한다. 그 칸이 없거나 점유돼 있으면 실패 |
+| `tidal_wave` | pirate | 파도 | `RANGE_OFFSETS` | 5 | 4 | 전방의 적과 시전자가 벽에 막힐 때까지 같은 거리만큼 함께 밀려난다 |
 
 `SELF` 행의 `Range=1`은 `heal` 행과 같은 관례다. `SkillTargetResolverLogic.BuildOffsets`가
 `SELF`에서 빈 오프셋을 돌려주므로 Range는 판정에 쓰이지 않지만 Validator가 `Range > 0`을
 요구한다. 실제 스캔 거리 같은 수치는 Range가 아니라 **Effect Step의 `Value`·`ParameterA`가
 소유한다.**
 
-`CooldownTurns=3`은 초기 저작값이며 플레이로 조정한다. `FreePlay=false`로 기존 스킬과 같은
-턴 소비 규칙을 따른다.
+`CooldownTurns=4`는 유틸리티 스킬 전 행 공통값이다. 직업별 스킬은 단계 번호를 그대로 쓰지만
+(1단계 `1`턴 / 2단계 `2`턴) 유틸리티는 전투 형태를 크게 흔드는 대신 다시 쓰기까지 오래
+기다리는 축이라 그 계단 밖에 둔다. 규칙 표는
+[`Skill-Authoring-Guide.md`](./Skill-Authoring-Guide.md) "저작값 규칙"이 소유한다.
+`FreePlay=false`로 기존 스킬과 같은 턴 소비 규칙을 따른다.
+
+> 이 값은 **배선 전까지 아무 코드도 읽지 않는다.** 위 "현재 상태" 절 그대로 두 테이블은
+> 여전히 Repository에 등록되지 않았으므로, `4`턴은 Executor 3종 구현과 함께 배선되는
+> 시점에 실제로 적용된다.
 
 ## Effect Step 계약 (미구현)
 

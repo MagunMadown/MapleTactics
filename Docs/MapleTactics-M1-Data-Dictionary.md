@@ -101,7 +101,7 @@
 | TargetingType | enum | O | `SELF`, `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS` |
 | Range | integer | O | Cell 기준 최대 사거리, 1 이상. `SELF`도 Validator 규칙상 1 이상을 넣는다 |
 | TargetOffsets | string | 조건부 | `RANGE_OFFSETS`일 때 필수. Facing 기준 정수 오프셋을 `|`로 구분 |
-| CooldownTurns | integer | O | 실행 후 쿨다운 턴, 0 이상 |
+| CooldownTurns | integer | O | 실행 후 쿨다운 턴, 0 이상. 저작값은 §4.7 계단(1단계 `1` / 2단계 `2` / 유틸리티 `4`)을 따른다 |
 | CostType | string | - | 비용 종류 |
 | CostValue | number | O | 비용 수치, 0 이상 |
 | MotionProfileId | string | O | 공격 모션 프로필 |
@@ -578,8 +578,13 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 2단계 16행의 저작 규칙은 다음과 같다.
 
 - **전투 형태는 원본을 그대로 물려받는다** — `TargetingType` / `Range` / `TargetOffsets` /
-  `CooldownTurns` / `MotionProfileId` / `WeaponType` / `ActionDuration`. 상위 단계라고 사거리나
+  `MotionProfileId` / `WeaponType` / `ActionDuration`. 상위 단계라고 사거리나
   타격 범위를 바꾸지 않았으므로, 원본과 다르게 굴리고 싶으면 그 행만 고치면 된다.
+- **`CooldownTurns`만 물려받지 않고 단계 번호를 따른다** — 1단계는 `1`, 2단계는 `2`다. 즉
+  직업별 스킬은 `CooldownTurns == SkillTier`이며, 3단계를 얹으면 `3`이 된다. 유틸리티 스킬
+  (`UtilitySkillDefinitions`)은 이 계단과 별개로 전 행 `4`다. 적 전용 행은 자기 행동 주기
+  기준이라 이 규칙 밖에 있다. 규칙 표는
+  [`Skill-Authoring-Guide.md`](./Guide/Skill-Authoring-Guide.md) "저작값 규칙"이 소유한다.
 - **피해는 원본 +2 고정**이다. 배율이 아니라 고정값이라 원래 2였던 광역기는 4로 두 배가 되고
   6이었던 `fatal_blow` 계열은 8로 33% 오른다. 밸런스를 만지게 되면 여기부터 본다.
 - **`PUSH`를 함께 갖던 해적 2종은 그 구성을 유지한다**(`double_barrel_shot`,

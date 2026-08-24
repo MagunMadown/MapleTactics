@@ -40,6 +40,21 @@ TryQueueTile
 - Cooldown은 Session이나 Repository가 아니라 각 전투 유닛이 독립적으로 보관한다.
 - 서버의 `CanUseSkill` 결과가 판정 기준이며 HUD 버튼 비활성화는 안내용이다.
 
+### 저작값 규칙 — 어떤 값을 넣는가
+
+`CooldownTurns`는 스킬의 종류와 단계로 결정한다. 개별 스킬 감각으로 흔들지 않는다.
+
+| 스킬 종류 | `CooldownTurns` |
+|---|---:|
+| 직업별 스킬 1단계 (`{Job}SkillDefinitions`, `SkillTier=1`) | `1` |
+| 직업별 스킬 2단계 (`{Job}SkillDefinitions`, `SkillTier=2`) | `2` |
+| 유틸리티 스킬 (`UtilitySkillDefinitions`) | `4` |
+| 적 전용 스킬 (`EnemySkillDefinitions`) | 이 규칙 밖. 적 행동 주기 기준으로 개별 저작 |
+
+즉 직업별 스킬은 `CooldownTurns == SkillTier`다. 새 단계를 얹으면 그 단계 번호가 그대로
+쿨다운이 된다. `0`은 이제 플레이어 스킬에 쓰지 않는다 — 같은 큐에 같은 스킬을 여러 번 넣는
+구성을 의도적으로 되살릴 때만 쓰고, 그때 이 표를 함께 고친다.
+
 동기화 문자열은 `heavy_slash:1|slash_push_combo:2` 형식이다. UI는
 `CooldownSnapshot`을 읽기만 하고 값을 직접 변경하거나 Cooldown 규칙을 다시 계산하지
 않는다.
@@ -55,7 +70,7 @@ TryQueueTile
 | `TargetingType` | string | `FRONT_CELL` | `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS` |
 | `Range` | integer | `1` | 1 이상, Cell 기준 최대 사거리 |
 | `TargetOffsets` | string | `1|2` | `RANGE_OFFSETS` 전용, Facing 기준 칸 오프셋을 `|`로 구분 |
-| `CooldownTurns` | integer | `0` | 0 이상 |
+| `CooldownTurns` | integer | `1` | 0 이상. 저작값은 위 "저작값 규칙" 표가 소유한다 |
 | `CostType` | string | 빈 문자열 | 비용이 없으면 비움 |
 | `CostValue` | number | `0` | 0 이상 |
 | `MotionProfileId` | string | `basic_slash` | 표현 프로필 ID |
@@ -186,9 +201,10 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 - 적 스킬은 강화 대상이 아니지만 `ConvertSkillRow`가 모든 스킬 테이블에 공용이라 스키마를
   맞추기 위해 같은 두 컬럼을 갖는다. 전부 `SkillTier=1`, `BaseSkillId` 비움이다.
 
-현재 올라간 2단계 16행은 **전투 형태(타기팅·사거리·쿨다운·모션·무기·ActionDuration)를
-원본에서 그대로 물려받고 피해만 +2** 한 구성이다. 이펙트와 아이콘은 그 스킬 자기 리소스
-팩에서만 가져온다. 자세한 규칙과 예외는
+현재 올라간 2단계 16행은 **전투 형태(타기팅·사거리·모션·무기·ActionDuration)를 원본에서
+그대로 물려받고 피해만 +2** 한 구성이다. **쿨다운은 예외로, 물려받지 않고 단계 번호를
+따른다**(1단계 `1`턴 → 2단계 `2`턴, 위 "저작값 규칙" 표). 이펙트와 아이콘은 그 스킬 자기
+리소스 팩에서만 가져온다. 자세한 규칙과 예외는
 [`MapleTactics-M1-Data-Dictionary.md`](../MapleTactics-M1-Data-Dictionary.md) §4.7에 있다.
 
 > ⚠️ **강화 스테이지가 UI에 보내는 "레벨"과 다른 값이다.** 그쪽(`UpgradeSkillStageLogic`의
