@@ -78,6 +78,8 @@ script BattleQueueHudComponent extends Component
 	property any SkillSlot6ClickHandler = nil
 	property string SlotSkillIds = ""
 	property string SlotSkillNames = ""
+	property string SlotSkillCooldownTurns = ""
+	property integer CooldownPipPoolSize = 4
 	property any ExecuteClickHandler = nil
 	property any ClearClickHandler = nil
 	property any ResetClickHandler = nil
@@ -87,6 +89,7 @@ script BattleQueueHudComponent extends Component
 		-- The view binds UI controls and consumes presentation state without reading battle components directly.
 		log("[BattleQueueHUD] ready")
 		self._T.SkillIconFeedbackTimers = {}
+		self:BuildSkillCooldownPipViews()
 		self:SetHudContextVisible(false, "INITIALIZING")
 		self.PresenterStateChangedHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudStateChangedEvent, self.OnPresenterStateChanged)
 		self.PresenterCommandResultHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudCommandResultEvent, self.OnPresenterCommandResult)
@@ -263,6 +266,7 @@ script BattleQueueHudComponent extends Component
 		local ownedSkills = uiState.RunInventory.SkillSnapshot
 		self.SlotSkillIds = session.SkillSlotIds
 		self.SlotSkillNames = session.SkillSlotNames
+		self.SlotSkillCooldownTurns = session.SkillSlotCooldownTurns or ""
 		local queuedSkillForPop = self:CaptureQueuedSkillForFeedback(queueState.QueuedTileIds)
 		self:RefreshSkillSlots(canChooseTile, ownedSkills, cooldownSnapshot, slotQueueIds)
 		if queuedSkillForPop ~= "" then
@@ -421,6 +425,7 @@ script BattleQueueHudComponent extends Component
 		self.SkillSlot5Button.Enable = false
 		self.SkillSlot6Button.Enable = false
 		self:HideAllSkillCooldownTexts()
+		self:HideAllSkillCooldownPips()
 		self.ExecuteButton.Enable = false
 		self.ClearButton.Enable = false
 		self:SetResultVisibility("", "")
@@ -712,6 +717,101 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method integer GetSlotMaxCooldown(integer slotIndex)
+		local index = 0
+		for token in string.gmatch(self.SlotSkillCooldownTurns or "", "([^|]+)") do
+			index = index + 1
+			if index == slotIndex then
+				return math.max(0, math.floor(tonumber(token) or 0))
+			end
+		end
+		return 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BuildSkillCooldownPipViews()
+		-- Cache the authored four-pip pool once. Refreshes only recolor/reposition these entities.
+		self._T.SkillCooldownPipViews = {}
+		local buttons = {
+			self.SkillSlot1Button,
+			self.SkillSlot2Button,
+			self.SkillSlot3Button,
+			self.SkillSlot4Button,
+			self.SkillSlot5Button,
+			self.SkillSlot6Button
+		}
+		for slotIndex = 1, 6 do
+			local view = { Container = nil, Pips = {} }
+			local button = buttons[slotIndex]
+			if button ~= nil and isvalid(button.Entity) then
+				view.Container = button.Entity:GetChildByName("CooldownPipContainer", false)
+				if isvalid(view.Container) then
+					for pipIndex = 1, self.CooldownPipPoolSize do
+						local pip = view.Container:GetChildByName("CooldownPip0" .. tostring(pipIndex), false)
+						if isvalid(pip) then
+							table.insert(view.Pips, pip)
+						end
+					end
+				end
+			end
+			self._T.SkillCooldownPipViews[slotIndex] = view
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideAllSkillCooldownPips()
+		local views = self._T.SkillCooldownPipViews
+		if views == nil then
+			return
+		end
+		for _, view in ipairs(views) do
+			if view ~= nil and isvalid(view.Container) then
+				view.Container.Enable = false
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshSkillCooldownPips(integer slotIndex, boolean hasSkill, integer maxCooldown, integer remainingCooldown)
+		local views = self._T.SkillCooldownPipViews
+		local view = views ~= nil and views[slotIndex] or nil
+		if view == nil or isvalid(view.Container) == false then
+			return
+		end
+		local visibleCount = math.max(0, math.min(self.CooldownPipPoolSize, maxCooldown))
+		if hasSkill == false or visibleCount <= 0 then
+			view.Container.Enable = false
+			return
+		end
+		view.Container.Enable = true
+		local clampedRemaining = math.max(0, math.min(visibleCount, remainingCooldown))
+		local recoveredCount = visibleCount - clampedRemaining
+		local pipWidth = 14
+		local pipHeight = 8
+		local pipSpacing = 3
+		local rowWidth = visibleCount * pipWidth + math.max(0, visibleCount - 1) * pipSpacing
+		local activeColor = Color(1.00, 0.72, 0.18, 1)
+		local inactiveColor = Color(0.48, 0.52, 0.58, 1)
+		for pipIndex, pip in ipairs(view.Pips) do
+			local visible = pipIndex <= visibleCount
+			pip.Enable = visible
+			if pip.UITransformComponent ~= nil then
+				local x = -rowWidth * 0.5 + pipWidth * 0.5 + (pipIndex - 1) * (pipWidth + pipSpacing)
+				pip.UITransformComponent.anchoredPosition = Vector2(x, 0)
+				pip.UITransformComponent.RectSize = Vector2(pipWidth, pipHeight)
+			end
+			if pip.SpriteGUIRendererComponent ~= nil then
+				pip.SpriteGUIRendererComponent.Enable = visible
+				if pipIndex <= recoveredCount then
+					pip.SpriteGUIRendererComponent.Color = activeColor
+				else
+					pip.SpriteGUIRendererComponent.Color = inactiveColor
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
 	method void SyncIconSnapshot(string snapshot)
 		-- Parses the server-synced skill icon records only when their serialized value changes.
 		if snapshot == self.IconSnapshot and self._T.IconMap ~= nil then
@@ -833,6 +933,7 @@ script BattleQueueHudComponent extends Component
 			cooldownText.Text = ""
 			cooldownText.Enable = false
 			cooldownText.Entity.Enable = false
+			self:RefreshSkillCooldownPips(slotIndex, false, 0, 0)
 			button.Enable = false
 			return
 		end
@@ -851,6 +952,8 @@ script BattleQueueHudComponent extends Component
 		icon.Entity.Enable = true
 		icon.Enable = true
 		local remainingCooldown = self:GetCooldownTurns(cooldownSnapshot, skillId)
+		local maxCooldown = self:GetSlotMaxCooldown(slotIndex)
+		self:RefreshSkillCooldownPips(slotIndex, true, maxCooldown, remainingCooldown)
 		local queueOrder = self:GetQueueOrder(queuedTileIds, skillId)
 		local visualState = "READY"
 		if remainingCooldown > 0 then

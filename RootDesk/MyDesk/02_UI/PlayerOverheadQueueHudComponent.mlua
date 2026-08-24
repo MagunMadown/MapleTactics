@@ -24,12 +24,25 @@ script PlayerOverheadQueueHudComponent extends Component
 	property number RefreshInterval = 0.05
 	property number RefreshElapsed = 0
 	property string LastSignature = ""
+	property Entity UtilitySkillHUD = "f42118e7-10a5-428b-a958-77752a8e4b8c"
+	property UITransformComponent UtilitySkillHUDTransform = "f42118e7-10a5-428b-a958-77752a8e4b8c"
+	property SpriteGUIRendererComponent UtilityIcon = "a17311dd-c941-496d-a43c-5d1fbc7242ae"
+	property Entity UtilityCooldownPipContainer = "db94f1e4-293f-4d64-98e0-2b9b18177b8d"
+	property integer UtilityCooldownPipPoolSize = 4
+	property number UtilityHudOffsetX = 94
+	property number UtilityHudOffsetY = -24
+	property string UtilitySkillId = ""
+	property integer UtilityMaxCooldown = 0
+	property integer UtilityRemainingCooldown = 0
+	property boolean UtilityRuntimeAvailable = false
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		self:SetCoveredIconsHidden()
+		self:BuildUtilityCooldownPipView()
+		self:HideUtilityCooldownHud("INITIALIZE")
 		self:SetQueueHidden("INITIALIZE")
-		log("[PlayerOverheadQueueHUD] ready maxSlots=3")
+		log("[PlayerOverheadQueueHUD] ready maxSlots=3 utilityPips=" .. tostring(self.UtilityCooldownPipPoolSize))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -52,6 +65,7 @@ script PlayerOverheadQueueHudComponent extends Component
 		local session = self:GetBattleSession(player)
 		if session == nil then
 			self:SetQueueHidden("NOT_IN_BATTLE")
+			self:HideUtilityCooldownHud("NOT_IN_BATTLE")
 			return
 		end
 
@@ -68,6 +82,7 @@ script PlayerOverheadQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
 		self:SetQueueHidden("END_PLAY")
+		self:HideUtilityCooldownHud("END_PLAY")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -81,14 +96,114 @@ script PlayerOverheadQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void UpdatePlayerTracking(Entity player)
-		if isvalid(player) == false or player.TransformComponent == nil or self.ReservationQueueTransform == nil then
+		if isvalid(player) == false or player.TransformComponent == nil then
 			return
 		end
 
 		local worldPosition = player.TransformComponent.WorldPosition
 		local screenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y + self.PlayerHeadOffsetY))
 		local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
-		self.ReservationQueueTransform.anchoredPosition = Vector2(uiPosition.x, uiPosition.y + self.QueueStackCenterOffsetY)
+		if self.ReservationQueueTransform ~= nil then
+			self.ReservationQueueTransform.anchoredPosition = Vector2(uiPosition.x, uiPosition.y + self.QueueStackCenterOffsetY)
+		end
+		if self.UtilitySkillHUDTransform ~= nil then
+			-- Align beside the lowest reservation slot so the utility HUD never covers the avatar.
+			self.UtilitySkillHUDTransform.anchoredPosition = Vector2(uiPosition.x + self.UtilityHudOffsetX, uiPosition.y + self.UtilityHudOffsetY)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BuildUtilityCooldownPipView()
+		-- Cache the authored four-pip pool once. No utility runtime entity is created by this HUD.
+		self._T.UtilityCooldownPips = {}
+		if isvalid(self.UtilityCooldownPipContainer) == false then
+			return
+		end
+		for pipIndex = 1, self.UtilityCooldownPipPoolSize do
+			local pip = self.UtilityCooldownPipContainer:GetChildByName("UtilityCooldownPip0" .. tostring(pipIndex), false)
+			if isvalid(pip) then
+				table.insert(self._T.UtilityCooldownPips, pip)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetUtilityCooldownState(string utilitySkillId, string iconRuid, integer maxCooldown, integer remainingCooldown, boolean runtimeAvailable)
+		-- Future utility runtime/presenter boundary. This view never starts or decrements cooldowns itself.
+		if runtimeAvailable == false or utilitySkillId == nil or utilitySkillId == "" or maxCooldown <= 0 then
+			self:HideUtilityCooldownHud("RUNTIME_UNAVAILABLE")
+			return
+		end
+		if iconRuid == nil or iconRuid == "" then
+			-- UtilitySkillDefinitions currently author no icon RUID; do not invent a placeholder.
+			self:HideUtilityCooldownHud("ICON_DATA_MISSING")
+			return
+		end
+
+		self.UtilityRuntimeAvailable = true
+		self.UtilitySkillId = utilitySkillId
+		self.UtilityMaxCooldown = math.max(0, math.min(self.UtilityCooldownPipPoolSize, maxCooldown))
+		self.UtilityRemainingCooldown = math.max(0, math.min(self.UtilityMaxCooldown, remainingCooldown))
+		self.UtilityIcon.ImageRUID = DataRef(iconRuid)
+		self.UtilityIcon.Type = ImageType.Simple
+		self.UtilityIcon.DropShadow = false
+		self.UtilityIcon.Color = Color(1, 1, 1, 1)
+		self.UtilityIcon.Entity.Enable = true
+		self.UtilityIcon.Enable = true
+		self.UtilityCooldownPipContainer.Enable = true
+		self.UtilitySkillHUD.Enable = true
+		self:RefreshUtilityCooldownPips(self.UtilityMaxCooldown, self.UtilityRemainingCooldown)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshUtilityCooldownPips(integer maxCooldown, integer remainingCooldown)
+		-- Mirrors the bottom skill bar: recovered pips fill left-to-right, ready means all active.
+		local visibleCount = math.max(0, math.min(self.UtilityCooldownPipPoolSize, maxCooldown))
+		local clampedRemaining = math.max(0, math.min(visibleCount, remainingCooldown))
+		local recoveredCount = visibleCount - clampedRemaining
+		local pipWidth = 10
+		local pipHeight = 6
+		local pipSpacing = 2
+		local rowWidth = visibleCount * pipWidth + math.max(0, visibleCount - 1) * pipSpacing
+		local activeColor = Color(1.00, 0.72, 0.18, 1)
+		local inactiveColor = Color(0.48, 0.52, 0.58, 1)
+		for pipIndex, pip in ipairs(self._T.UtilityCooldownPips or {}) do
+			local visible = pipIndex <= visibleCount
+			pip.Enable = visible
+			if pip.UITransformComponent ~= nil then
+				local x = -rowWidth * 0.5 + pipWidth * 0.5 + (pipIndex - 1) * (pipWidth + pipSpacing)
+				pip.UITransformComponent.anchoredPosition = Vector2(x, 0)
+				pip.UITransformComponent.RectSize = Vector2(pipWidth, pipHeight)
+			end
+			if pip.SpriteGUIRendererComponent ~= nil then
+				pip.SpriteGUIRendererComponent.Enable = visible
+				if pipIndex <= recoveredCount then
+					pip.SpriteGUIRendererComponent.Color = activeColor
+				else
+					pip.SpriteGUIRendererComponent.Color = inactiveColor
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideUtilityCooldownHud(string reason)
+		self.UtilityRuntimeAvailable = false
+		self.UtilitySkillId = ""
+		self.UtilityMaxCooldown = 0
+		self.UtilityRemainingCooldown = 0
+		if self.UtilitySkillHUD ~= nil then
+			self.UtilitySkillHUD.Enable = false
+		end
+		if self.UtilityIcon ~= nil then
+			self.UtilityIcon.Enable = false
+			if self.UtilityIcon.Entity ~= nil then
+				self.UtilityIcon.Entity.Enable = false
+			end
+		end
+		if self.UtilityCooldownPipContainer ~= nil then
+			self.UtilityCooldownPipContainer.Enable = false
+		end
 	end
 
 	@ExecSpace("ClientOnly")
