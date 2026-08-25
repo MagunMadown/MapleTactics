@@ -414,6 +414,45 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 6. 증강 3택
 7. 직업과 콘텐츠 수량 확장
 8. 연출, 저장, 재접속
+9. 6개 마을의 독립 Region/Stage 데이터 추가
+10. 모든 마을 연결 Edge에 공통 상점 노드 추가
+
+### 월드맵 지역 확장 순서
+
+Phase 1의 헤네시스 첫 분기는 이후 지역을 추가하기 위한 기준 구현이다. 후속 콘텐츠는 아래 순서와 계약을 유지한다.
+
+| RegionId | 마을 | 물리 맵 세트 | 연결 |
+|---|---|---|---|
+| `region_01` | 헤네시스 | `region_01_battle`, `region_01_boss` | 시작 |
+| `region_02` | 커닝시티 | `region_02_battle`, `region_02_boss` | `region_01 → region_02 → region_04 → region_06` |
+| `region_03` | 엘리니아 | `region_03_battle`, `region_03_boss` | `region_01 → region_03 → region_05 → region_06` |
+| `region_04` | 페리온 | `region_04_battle`, `region_04_boss` | 위쪽 중간 지역 |
+| `region_05` | 노틸러스 | `region_05_battle`, `region_05_boss` | 아래쪽 중간 지역 |
+| `region_06` | 슬리피우드 | `region_06_battle`, `region_06_boss` | 양쪽 경로 합류 |
+
+```text
+로비
+└─ 헤네시스
+   ├─ 상점(Henesys→Kerning) → 커닝시티 → 상점(Kerning→Perion) → 페리온 → 상점(Perion→Sleepywood) ┐
+   └─ 상점(Henesys→Ellinia) → 엘리니아 → 상점(Ellinia→Nautilus) → 노틸러스 → 상점(Nautilus→Sleepywood) ┘
+                                                                                                      ↓
+                                                                                                  슬리피우드
+```
+
+후속 구현 체크리스트:
+
+- [ ] `RegionDefinitions`에 커닝시티·엘리니아·페리온·노틸러스·슬리피우드 추가
+- [ ] Region마다 `region_XX_battle.map`과 `region_XX_boss.map`을 별도 생성
+- [ ] 같은 Region의 일반 Stage만 해당 `region_XX_battle`을 재사용하고 다른 마을 맵은 공유하지 않음
+- [ ] `StageMapRoutes`의 모든 StageId를 소속 Region의 일반전/보스전 MapId로 연결
+- [ ] `NodeDefinitions`에 도시별 전투/보스 노드와 6개 Edge 상점 노드 추가
+- [ ] 모든 상점 표시와 클릭은 공통 `ShopVisitBtn` 및 Shop Controller 사용
+- [ ] Edge별 `ShopId`, 출발 `RegionId`, 도착 `RegionId`, 해금 조건을 데이터로 정의
+- [ ] 마을 클리어 전에는 다음 상점과 도시를 클릭할 수 없도록 서버 Run Snapshot으로 게이트
+- [ ] 상점 방문 완료 후에만 해당 Edge의 다음 마을을 클릭 가능하게 전환
+- [ ] `UPPER`/`LOWER` 최초 선택을 Run 동안 유지하고 반대 경로를 비활성화
+- [ ] 두 경로가 슬리피우드에서 동일한 진행 상태로 합류하는지 검증
+- [ ] UI 코드에 도시별 `if`를 늘리지 않고 Dataset 행 추가만으로 노드를 확장
 
 ## 6. 사용자와 함께 확인할 화면 체크포인트
 
@@ -901,3 +940,40 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 - 실제 실행: `slash_push_combo`가 Step 1 DAMAGE `HP 6→5`, Step 2 PUSH `Cell 3→4` 순서로 처리
 - Cooldown: 실행 직후 `slash_push_combo:2` 확인
 - Build Warning/Error/Fatal 0; Runtime Warning/Error/Fatal 0
+
+### 2026-08-25 — Slice 16: 도시 경로형 월드맵·클리어 게이트·노란 상점 방문
+
+- 상태: 🟡 Implemented (UIBuilder·정적 계약 검증 완료, Maker 런타임 검증 대기)
+- `PopupGroup.ui`를 양피지형 전체 화면 지도판으로 재배치하고 지정 `sprite/Object` RUID로 통일
+  - 경로·상점: `7e33c3b2fa244e938d425f7b2eef68a1` (`01_yellow_button`)
+  - 잠금 도시 노드: `e4c9511644314491a68cd26eecc0a47f` (`02_purple_button`)
+  - 6개 도시 오브젝트·전용 명패: 헤네시스, 커닝시티, 페리온, 엘리니아, 노틸러스, 슬리피우드
+  - 지도 배경·경로: `01_repaired_base_map_background`, `01_yellow_path_network`
+  - 상점 창·상품 카드·제목판: `menu_bg`, `paper`, `shopslot_bg`, `gauge_titlebg` 등록 자산 재사용
+- 헤네시스 `1-1` 클리어 후 위·아래 노란 상점 버튼을 동시에 해금하고 최초 선택을 서버 Run 상태의 `SelectedWorldMapBranch`에 고정
+- 위쪽 상점 `UPPER`는 커닝시티 `1-2`, 아래쪽 상점 `LOWER`는 엘리니아 `1-2`로 연결하며 선택하지 않은 상점·도시는 비활성
+- 페리온·노틸러스·슬리피우드는 다음 지역용 잠금 도시로 표시
+- 잠금 안내, 헤네시스 `CLEAR` 배지, 진행 가이드 문구를 동기화된 플레이어 Run 상태에서 갱신
+- 공식 `yellow_button` RUID `4d0973b97a1e40f79ecf586592705f76`로 선택 상점 방문 버튼과 닫기 동작 구성
+- 상점 방문 패널은 다음 도시 진입 전 선택 동선이며 진행도나 전투 상태를 소비하지 않음
+- 선택 도시별 이동 아바타 목표 좌표와 Battle Gateway 결과 수신 노드를 분리
+- UIBuilder 계약 검증: 35 Entity, Ellinia gate/StageId/yellow_button/초기 숨김 상태 확인, schema error 0
+- 남은 Verify: Maker Refresh → Build log → lobby Play → 클리어 전 잠금 → 1-1 승리 후 해금 → 상점 열기/닫기 → 엘리니아 클릭 및 전환 로그
+
+### 2026-08-26 — 6개 마을·마을 간 상점 확장 기준
+
+- 상태: 📋 Planned — Phase 1 이후 콘텐츠 확장 계약 확정
+- 현재 Slice 16의 헤네시스 `1-1 → 상점 → 커닝시티/엘리니아` 흐름을 모든 도시 연결의 기준으로 재사용
+- 현재 커닝시티/엘리니아가 헤네시스 전투 Stage를 임시 재사용하는 연결은 프로토타입 전용이며, 지역 콘텐츠 추가 시 각각 `region_02_*`, `region_03_*` 맵과 Stage 데이터로 교체
+- 위쪽 경로: `헤네시스 → 상점 → 커닝시티 → 상점 → 페리온 → 상점 → 슬리피우드`
+- 아래쪽 경로: `헤네시스 → 상점 → 엘리니아 → 상점 → 노틸러스 → 상점 → 슬리피우드`
+- Region/MapId 규칙: 헤네시스 `region_01`, 커닝시티 `region_02`, 엘리니아 `region_03`, 페리온 `region_04`, 노틸러스 `region_05`, 슬리피우드 `region_06`
+- 각 Region은 자체 `region_XX_battle`과 `region_XX_boss` 물리 맵을 가지며 같은 Region 내부 Stage만 일반전 맵을 재사용
+- 각 상점은 독립 `ShopId`를 가지지만 UI는 `ShopVisitBtn`, 로직은 공통 Shop Controller를 사용
+- 각 마을의 최종 전투/보스 클리어가 다음 Edge 상점 해금의 기본 조건이며, 현재 헤네시스 `1-1` 게이트는 프로토타입 예외
+- 선택 경로·상점 방문·다음 도시 해금은 `PlayerRunStateComponent`의 서버 권위 상태로 관리
+- 구현 완료 기준:
+  - 새 도시와 상점이 UI 스크립트의 도시별 분기 추가 없이 데이터 행으로 생성·게이트됨
+  - 각 도시 StageId가 다른 도시의 MapId가 아닌 자신의 `region_XX_battle/boss`로 라우팅됨
+  - 각 마을 클리어 전 상점/다음 도시 클릭 차단, 클리어 후 상점 해금, 상점 방문 후 다음 도시 해금 순서가 유지됨
+  - 반대 경로는 같은 Run에서 계속 잠기며 두 경로 모두 슬리피우드에 정상 합류함

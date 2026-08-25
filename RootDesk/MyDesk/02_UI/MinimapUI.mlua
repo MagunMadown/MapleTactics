@@ -9,6 +9,18 @@ script MinimapUI extends Component
 
 	property Vector2 TravelStartPosition = Vector2(-733, 29)
 
+	property integer LastObservedCompletedStageCount = -1
+
+	property string LastObservedWorldMapBranch = "__UNSET__"
+
+	property any ShopClickHandler = nil
+
+	property any LowerShopClickHandler = nil
+
+	property any ShopCloseHandler = nil
+
+	property any WorldMapCloseHandler = nil
+
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Initializes the persistent world-map controller through its stable UI path.
@@ -16,6 +28,8 @@ script MinimapUI extends Component
 		if isvalid(travelAvatar) and isvalid(travelAvatar.UITransformComponent) then
 			self.TravelStartPosition = travelAvatar.UITransformComponent.anchoredPosition
 		end
+		self:ConnectWorldMapButtons()
+		self:RefreshWorldMapProgress("begin_play")
 		log("[WorldMap] controller ready popup=" .. tostring(isvalid(self:GetWorldMapPopup())))
 	end
 
@@ -23,6 +37,7 @@ script MinimapUI extends Component
 	method void OnEndPlay()
 		-- Releases the travel animation timer when the UI controller is destroyed.
 		self:StopTravelAnimation(true)
+		self:DisconnectWorldMapButtons()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -35,7 +50,7 @@ script MinimapUI extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
-		-- Closes a stale popup if the local player has already left the lobby.
+		-- Refreshes synced progression while visible and closes a stale popup after transfer.
 		local popup = self:GetWorldMapPopup()
 		if isvalid(popup) == false or popup.Enable == false or popup.Visible == false then
 			return
@@ -43,22 +58,23 @@ script MinimapUI extends Component
 		local player = _UserService.LocalPlayer
 		if isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name ~= "lobby" then
 			self:CloseWorldMapForTransfer(player.CurrentMap.Name)
+			return
+		end
+		local completedStageCount = self:GetCompletedStageCount()
+		local selectedBranch = self:GetSelectedWorldMapBranch()
+		if completedStageCount ~= self.LastObservedCompletedStageCount or selectedBranch ~= self.LastObservedWorldMapBranch then
+			self:RefreshWorldMapProgress("sync_changed")
 		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method boolean OpenWorldMap(string source)
-		-- Resets the initial Henesys route before opening the shared world map for a new lobby attempt.
-		local henesysNode = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/HenesysCityBranchBtn")
-		if isvalid(henesysNode) == false then
-			henesysNode = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/Region01Stage01Btn")
+		-- Applies the latest clear gates before the world map becomes interactive.
+		if self.ShopClickHandler == nil or self.LowerShopClickHandler == nil or self.WorldMapCloseHandler == nil then
+			self:DisconnectWorldMapButtons()
+			self:ConnectWorldMapButtons()
 		end
-		if isvalid(henesysNode) then
-			local stageButton = henesysNode:GetComponent("script.WorldMapStageButtonComponent")
-			if stageButton ~= nil then
-				stageButton:ResetForLobby(source)
-			end
-		end
+		self:RefreshWorldMapProgress(source)
 		if self:SetWorldMapVisible(true) == false then
 			log_warning("[WorldMap] open failed source=" .. source .. " reason=UI_MISSING")
 			return false
@@ -66,6 +82,206 @@ script MinimapUI extends Component
 		self:ShowTravelAvatarAtStart()
 		log("[WorldMap] opened source=" .. source)
 		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConnectWorldMapButtons()
+		-- Owns the close and shop overlay events from the persistent UI controller.
+		local shopButton = self:GetWorldMapEntity("ShopVisitBtn")
+		if isvalid(shopButton) then
+			self.ShopClickHandler = shopButton:ConnectEvent(ButtonClickEvent, self.OnShopVisitClicked)
+		end
+		local lowerShopButton = self:GetWorldMapEntity("LowerShopVisitBtn")
+		if isvalid(lowerShopButton) then
+			self.LowerShopClickHandler = lowerShopButton:ConnectEvent(ButtonClickEvent, self.OnLowerShopVisitClicked)
+		end
+		local shopCloseButton = self:GetWorldMapEntity("ShopVisitPanel/ShopCloseBtn")
+		if isvalid(shopCloseButton) then
+			self.ShopCloseHandler = shopCloseButton:ConnectEvent(ButtonClickEvent, self.OnShopCloseClicked)
+		end
+		local worldMapCloseButton = self:GetWorldMapEntity("WorldMapCloseBtn")
+		if isvalid(worldMapCloseButton) then
+			self.WorldMapCloseHandler = worldMapCloseButton:ConnectEvent(ButtonClickEvent, self.OnWorldMapCloseClicked)
+		end
+		log("[WorldMap] interaction handlers connected upperShop=" .. tostring(isvalid(shopButton)) .. " lowerShop=" .. tostring(isvalid(lowerShopButton)))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DisconnectWorldMapButtons()
+		-- Releases UI event handlers without affecting other popup consumers.
+		local shopButton = self:GetWorldMapEntity("ShopVisitBtn")
+		if isvalid(shopButton) and self.ShopClickHandler ~= nil then
+			shopButton:DisconnectEvent(ButtonClickEvent, self.ShopClickHandler)
+		end
+		local lowerShopButton = self:GetWorldMapEntity("LowerShopVisitBtn")
+		if isvalid(lowerShopButton) and self.LowerShopClickHandler ~= nil then
+			lowerShopButton:DisconnectEvent(ButtonClickEvent, self.LowerShopClickHandler)
+		end
+		local shopCloseButton = self:GetWorldMapEntity("ShopVisitPanel/ShopCloseBtn")
+		if isvalid(shopCloseButton) and self.ShopCloseHandler ~= nil then
+			shopCloseButton:DisconnectEvent(ButtonClickEvent, self.ShopCloseHandler)
+		end
+		local worldMapCloseButton = self:GetWorldMapEntity("WorldMapCloseBtn")
+		if isvalid(worldMapCloseButton) and self.WorldMapCloseHandler ~= nil then
+			worldMapCloseButton:DisconnectEvent(ButtonClickEvent, self.WorldMapCloseHandler)
+		end
+		self.ShopClickHandler = nil
+		self.LowerShopClickHandler = nil
+		self.ShopCloseHandler = nil
+		self.WorldMapCloseHandler = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer GetCompletedStageCount()
+		-- Reads the server-synced progression owner without inventing a client-side save value.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false then
+			return 0
+		end
+		local runState = player:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil then
+			return 0
+		end
+		return runState.CompletedStageCount
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetSelectedWorldMapBranch()
+		-- Reads the server-authoritative upper/lower route choice from synced run state.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false then
+			return ""
+		end
+		local runState = player:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil then
+			return ""
+		end
+		return runState.SelectedWorldMapBranch or ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshWorldMapProgress(string reason)
+		-- Unlocks two mutually exclusive shop branches after Henesys: upper Kerning or lower Ellinia.
+		local completedStageCount = self:GetCompletedStageCount()
+		local selectedBranch = self:GetSelectedWorldMapBranch()
+		self.LastObservedCompletedStageCount = completedStageCount
+		self.LastObservedWorldMapBranch = selectedBranch
+		local henesysNode = self:GetWorldMapEntity("HenesysCityBranchBtn")
+		local kerningNode = self:GetWorldMapEntity("KerningCityBranchBtn")
+		local elliniaNode = self:GetWorldMapEntity("ElliniaBranchBtn")
+		for _, node in ipairs({ henesysNode, kerningNode, elliniaNode }) do
+			if isvalid(node) then
+				local stageButton = node:GetComponent("script.WorldMapStageButtonComponent")
+				if stageButton ~= nil then
+					stageButton:ResetForLobby(reason)
+				end
+			end
+		end
+
+		local branchAvailable = completedStageCount >= 1
+		local upperAvailable = branchAvailable and (selectedBranch == "" or selectedBranch == "UPPER")
+		local lowerAvailable = branchAvailable and (selectedBranch == "" or selectedBranch == "LOWER")
+		self:SetWorldMapButtonEnabled("ShopVisitBtn", upperAvailable)
+		self:SetWorldMapButtonEnabled("LowerShopVisitBtn", lowerAvailable)
+		self:SetWorldMapEntityVisible("KerningLockText", completedStageCount < 1 or selectedBranch ~= "UPPER")
+		self:SetWorldMapEntityVisible("ElliniaLock", completedStageCount < 1 or selectedBranch ~= "LOWER")
+		self:SetWorldMapEntityVisible("PerionLockText", true)
+		local clearBadge = self:GetWorldMapEntity("HenesysClearBadge")
+		if isvalid(clearBadge) then
+			clearBadge.Enable = branchAvailable
+			clearBadge.Visible = branchAvailable
+		end
+		local statusText = self:GetWorldMapEntity("ProgressGuideText")
+		if isvalid(statusText) and isvalid(statusText.TextGUIRendererComponent) then
+			if completedStageCount <= 0 then
+				statusText.TextGUIRendererComponent.Text = "헤네시스 1-1을 클리어하면 상점과 커닝시티가 열립니다."
+			elseif selectedBranch == "" then
+				statusText.TextGUIRendererComponent.Text = "위 상점은 커닝시티, 아래 상점은 엘리니아로 이어집니다. 하나를 선택하세요."
+			elseif selectedBranch == "UPPER" then
+				statusText.TextGUIRendererComponent.Text = "위쪽 상점을 선택했습니다. 커닝시티로 이동하세요."
+			elseif selectedBranch == "LOWER" then
+				statusText.TextGUIRendererComponent.Text = "아래쪽 상점을 선택했습니다. 엘리니아로 이동하세요."
+			else
+				statusText.TextGUIRendererComponent.Text = "선택한 경로를 확인하세요."
+			end
+		end
+		log("[WorldMap] progression refreshed completed=" .. completedStageCount .. " branch=" .. selectedBranch .. " upper=" .. tostring(upperAvailable) .. " lower=" .. tostring(lowerAvailable) .. " reason=" .. (reason or ""))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetWorldMapButtonEnabled(string relativePath, boolean enabled)
+		-- Applies one branch button state while leaving its visual entity mounted.
+		local entity = self:GetWorldMapEntity(relativePath)
+		if isvalid(entity) and isvalid(entity.ButtonComponent) then
+			entity.ButtonComponent.Enable = enabled
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetWorldMapEntityVisible(string relativePath, boolean visible)
+		-- Applies one lock-label visibility state without duplicating path checks.
+		local entity = self:GetWorldMapEntity(relativePath)
+		if isvalid(entity) then
+			entity.Enable = visible
+			entity.Visible = visible
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnShopVisitClicked()
+		-- Selects the upper shop route leading to Kerning City.
+		self:OpenBranchShop("UPPER")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnLowerShopVisitClicked()
+		-- Selects the lower shop route leading to Ellinia.
+		self:OpenBranchShop("LOWER")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OpenBranchShop(string branchId)
+		-- Commits one branch through the server and opens the shared shop visit panel.
+		if self:GetCompletedStageCount() < 1 then
+			log_warning("[WorldMap] shop visit rejected reason=HENESYS_NOT_CLEARED")
+			return
+		end
+		local selectedBranch = self:GetSelectedWorldMapBranch()
+		if selectedBranch ~= "" and selectedBranch ~= branchId then
+			log_warning("[WorldMap] shop visit rejected reason=BRANCH_ALREADY_SELECTED selected=" .. selectedBranch .. " requested=" .. branchId)
+			return
+		end
+		local panel = self:GetWorldMapEntity("ShopVisitPanel")
+		if isvalid(panel) == false then
+			log_warning("[WorldMap] shop visit failed reason=PANEL_MISSING")
+			return
+		end
+		_RunManagerLogic:RequestSelectWorldMapBranch(branchId)
+		local title = self:GetWorldMapEntity("ShopVisitPanel/ShopTitle")
+		if isvalid(title) and isvalid(title.TextGUIRendererComponent) then
+			title.TextGUIRendererComponent.Text = branchId == "UPPER" and "커닝시티 방면 상점" or "엘리니아 방면 상점"
+		end
+		panel.Enable = true
+		panel.Visible = true
+		_SoundService:PlaySound("972843e759204d3e9ad84e7d3fa94f83", 1)
+		log("[WorldMap] branch shop visited branch=" .. branchId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnShopCloseClicked()
+		-- Returns to the city route without consuming or changing progression.
+		local panel = self:GetWorldMapEntity("ShopVisitPanel")
+		if isvalid(panel) then
+			panel.Enable = false
+			panel.Visible = false
+		end
+		log("[WorldMap] shop visit closed")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnWorldMapCloseClicked()
+		-- Uses the shared close path so lobby start-button input is restored consistently.
+		self:CloseWorldMap("close_button")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -110,6 +326,11 @@ script MinimapUI extends Component
 		popup.Visible = visible
 		if visible == false then
 			self:StopTravelAnimation(true)
+			local shopPanel = self:GetWorldMapEntity("ShopVisitPanel")
+			if isvalid(shopPanel) then
+				shopPanel.Enable = false
+				shopPanel.Visible = false
+			end
 			local tooltipUI = self:GetTooltipUI()
 			if tooltipUI ~= nil then
 				tooltipUI:Hide("")
@@ -125,22 +346,25 @@ script MinimapUI extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method any GetWorldMapEntity(string relativePath)
+		-- Resolves one descendant beneath the stable world-map popup path.
+		return _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/" .. relativePath)
+	end
+
+	@ExecSpace("ClientOnly")
 	method any GetTravelAvatar()
 		-- Resolves the local-player avatar used by the start-to-Henesys route effect.
 		return _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/TravelAvatar")
 	end
 
 	@ExecSpace("ClientOnly")
-	method Vector2 GetHenesysTravelPosition()
-		-- Reads the current Henesys button position so layout edits automatically update the route.
-		local henesysButton = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/HenesysCityBranchBtn")
-		if isvalid(henesysButton) == false then
-			henesysButton = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/Region01Stage01Btn")
+	method Vector2 GetTravelTargetPosition(string targetCityPath)
+		-- Resolves the selected city directly so two branches may share one StageId.
+		local targetButton = self:GetWorldMapEntity(targetCityPath)
+		if isvalid(targetButton) and isvalid(targetButton.UITransformComponent) then
+			return targetButton.UITransformComponent.anchoredPosition
 		end
-		if isvalid(henesysButton) and isvalid(henesysButton.UITransformComponent) then
-			return henesysButton.UITransformComponent.anchoredPosition
-		end
-		log_warning("[WorldMap] Henesys travel target missing")
+		log_warning("[WorldMap] travel target missing city=" .. (targetCityPath or ""))
 		return self.TravelStartPosition
 	end
 
@@ -170,8 +394,8 @@ script MinimapUI extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method void PlayTravelAnimation()
-		-- Moves the local player's UI avatar from the start arrow toward Henesys.
+	method void PlayTravelAnimation(string targetCityPath)
+		-- Moves the local player's UI avatar from the start arrow toward the selected unlocked city.
 		self:StopTravelAnimation(false)
 		local avatar = self:GetTravelAvatar()
 		if isvalid(avatar) == false or isvalid(avatar.UITransformComponent) == false then
@@ -180,7 +404,7 @@ script MinimapUI extends Component
 		end
 
 		local startPosition = self.TravelStartPosition
-		local endPosition = self:GetHenesysTravelPosition()
+		local endPosition = self:GetTravelTargetPosition(targetCityPath)
 		avatar.Enable = true
 		avatar.Visible = true
 		avatar.UITransformComponent.anchoredPosition = startPosition
@@ -214,7 +438,7 @@ script MinimapUI extends Component
 			if progress >= 1 then
 				self:StopTravelAnimation(false)
 				avatar.UITransformComponent.anchoredPosition = endPosition
-				log("[WorldMap] travel avatar arrived at Henesys")
+				log("[WorldMap] travel avatar arrived city=" .. targetCityPath)
 			end
 		end
 
