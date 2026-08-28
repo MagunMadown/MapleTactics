@@ -3057,11 +3057,20 @@ script BattleSessionComponent extends Component
 		end
 
 		-- Icons cover every candidate, not just the drawn slots, because the queue accepts any owned skill.
+		-- The same pass collects the clips those skills will play, so the client can warm them before the
+		-- first cast instead of loading one mid-flight.
 		local iconRecords = {}
+		local presentationRuids = {}
+		local presentationSeen = {}
 		for _, skillId in ipairs(candidates) do
 			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
-			if definition.Success == true and definition.IconRuid ~= nil and definition.IconRuid ~= "" then
-				table.insert(iconRecords, skillId .. "~" .. definition.IconRuid)
+			if definition.Success == true then
+				if definition.IconRuid ~= nil and definition.IconRuid ~= "" then
+					table.insert(iconRecords, skillId .. "~" .. definition.IconRuid)
+				end
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CastEffectRuid)
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.HitEffectRuid)
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.ProjectileRuid)
 			end
 		end
 
@@ -3083,7 +3092,61 @@ script BattleSessionComponent extends Component
 		self.SkillSlotNames = table.concat(slotNames, "|")
 		self.SkillSlotCooldownTurns = table.concat(slotCooldownTurns, "|")
 		self.SkillIconSnapshot = table.concat(iconRecords, "|")
-		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " slots=" .. self.SkillSlotIds .. " names=" .. self.SkillSlotNames .. " cooldowns=" .. self.SkillSlotCooldownTurns .. " icons=" .. tostring(#iconRecords))
+		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " slots=" .. self.SkillSlotIds .. " names=" .. self.SkillSlotNames .. " cooldowns=" .. self.SkillSlotCooldownTurns .. " icons=" .. tostring(#iconRecords) .. " presentationRuids=" .. tostring(#presentationRuids))
+
+		-- Scope note: this method is only reached from job apply, so the warm covers the skills owned at
+		-- battle start. A skill granted mid-run is not re-warmed here -- it falls back to the renderer being
+		-- held off until its RUID lands, which costs a brief invisible projectile rather than a wrong one.
+		if #presentationRuids > 0 and isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
+			self:PreloadSkillPresentation(table.concat(presentationRuids, "|"), self.PlayerEntity.PlayerComponent.UserId)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CollectPresentationRuid(table collected, table seen, string ruid)
+		-- Appends one distinct non-empty clip RUID. Skills share cast and hit clips across tiers, so the
+		-- seen set keeps the preload list from asking for the same resource several times.
+		if ruid == nil or ruid == "" or seen[ruid] ~= nil then
+			return
+		end
+		seen[ruid] = true
+		table.insert(collected, ruid)
+	end
+
+	@ExecSpace("Client")
+	method void PreloadSkillPresentation(string ruidCsv)
+		-- Warms the client resource cache with this run's cast / hit / projectile clips.
+		-- These RUIDs are only ever assigned at cast time, so on a cold cache the renderer keeps showing
+		-- whatever it had while the clip loads -- long enough to cover a whole projectile flight. Loading
+		-- them up front is what makes the first cast of a skill look like every later one.
+		if ruidCsv == "" then
+			return
+		end
+
+		local ruids = {}
+		for ruid in string.gmatch(ruidCsv, "([^|]+)") do
+			table.insert(ruids, ruid)
+		end
+		if #ruids == 0 then
+			return
+		end
+
+		local requested = #ruids
+		log("[SkillPreload] requested count=" .. tostring(requested))
+		_ResourceService:PreloadAsync(ruids, function(results)
+			local succeeded = 0
+			local failed = 0
+			for _, status in pairs(results or {}) do
+				if status == PreloadResultStatus.Success then
+					succeeded = succeeded + 1
+				else
+					failed = failed + 1
+					log_warning("[SkillPreload] resource rejected status=" .. tostring(status))
+				end
+			end
+			-- Purely an optimisation: a failure here costs the old first-cast flicker, never gameplay.
+			log("[SkillPreload] complete requested=" .. tostring(requested) .. " success=" .. tostring(succeeded) .. " failed=" .. tostring(failed))
+		end)
 	end
 
 	@ExecSpace("ServerOnly")
