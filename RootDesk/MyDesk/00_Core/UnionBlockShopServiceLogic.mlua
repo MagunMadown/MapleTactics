@@ -1,0 +1,133 @@
+@Logic
+script UnionBlockShopServiceLogic extends Logic
+
+    property string UnionCoinIconRuid = "95632823c5e44dab89b9859ff439165b"
+    property integer NextPurchaseTokenCounter = 0
+
+    @ExecSpace("ServerOnly")
+    method table CanPurchaseUnionBlock(Entity userEntity, string blockId)
+        -- Evaluates the current authoritative profile against server-side block and rank definitions.
+        if blockId == nil or blockId == "" then
+            return { Success = false, CanPurchase = false, Reason = "INVALID_BLOCK_ID", BlockId = blockId or "" }
+        end
+        local definition = _UnionBlockDefinitionRepositoryLogic:GetBlock(blockId)
+        if definition.Success == false then
+            return { Success = false, CanPurchase = false, Reason = definition.Reason or "UNKNOWN_UNION_BLOCK", BlockId = blockId }
+        end
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            profileResult.CanPurchase = false
+            return profileResult
+        end
+        local profile = profileResult.Profile
+        local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(profile.LifetimeUnionPoints)
+        if currentRank.Success == false then
+            return { Success = false, CanPurchase = false, Reason = currentRank.Reason, BlockId = blockId, Snapshot = profile }
+        end
+        local requiredRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(definition.RequiredUnionRank)
+        if requiredRank.Success == false then
+            return { Success = false, CanPurchase = false, Reason = "INVALID_REQUIRED_UNION_RANK", BlockId = blockId, Snapshot = profile }
+        end
+        local ownedQuantity = math.max(0, math.floor(tonumber(profile.OwnedUnionBlocks[blockId]) or 0))
+        local result = {
+            Success = true,
+            CanPurchase = true,
+            Reason = "OK",
+            BlockId = blockId,
+            DisplayName = definition.DisplayName,
+            ShapeId = definition.ShapeId,
+            Cost = definition.ShopCost,
+            RequiredUnionRank = definition.RequiredUnionRank,
+            MaxOwned = definition.MaxOwned,
+            OwnedQuantity = ownedQuantity,
+            UnionPoints = profile.UnionPoints,
+            CurrentUnionRank = currentRank.RankId,
+            Snapshot = profile
+        }
+        if currentRank.SortOrder < requiredRank.SortOrder then
+            result.CanPurchase = false
+            result.Reason = "UNION_RANK_LOCKED"
+        elseif ownedQuantity >= definition.MaxOwned then
+            result.CanPurchase = false
+            result.Reason = "MAX_OWNED"
+        elseif profile.UnionPoints < definition.ShopCost then
+            result.CanPurchase = false
+            result.Reason = "INSUFFICIENT_UNION_COIN"
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryPurchaseUnionBlock(Entity userEntity, string blockId, string requestId)
+        -- Accepts intent only; the profile repository re-resolves and atomically commits all authoritative values.
+        local result = _UnionProfileRepositoryLogic:TryCommitUnionBlockPurchase(userEntity, blockId, requestId)
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetUnionBlockShopSnapshot(Entity userEntity)
+        -- Builds the shop view from repositories so shape, price, rank, ownership, and currency are never client-authored.
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        local allBlocks = _UnionBlockDefinitionRepositoryLogic:GetAllBlocks()
+        if allBlocks.Success == false then
+            return allBlocks
+        end
+        local profile = profileResult.Profile
+        local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(profile.LifetimeUnionPoints)
+        if currentRank.Success == false then
+            return currentRank
+        end
+        local result = {
+            Success = true,
+            Reason = "OK",
+            UnionPoints = profile.UnionPoints,
+            LifetimeUnionPoints = profile.LifetimeUnionPoints,
+            CurrentUnionRank = currentRank.RankId,
+            CoinIconRuid = self.UnionCoinIconRuid,
+            PurchaseRequestId = self:CreatePurchaseRequestId(profile),
+            Blocks = {},
+            BlockCount = 0
+        }
+        for _, definition in ipairs(allBlocks.Blocks) do
+            local purchaseState = self:CanPurchaseUnionBlock(userEntity, definition.BlockId)
+            local shapeResult = _UnionBlockShapeDefinitionRepositoryLogic:GetRotatedCells(definition.ShapeId, 0)
+            if shapeResult.Success == false then
+                return { Success = false, Reason = shapeResult.Reason, BlockId = definition.BlockId, ShapeId = definition.ShapeId }
+            end
+            table.insert(result.Blocks, {
+                BlockId = definition.BlockId,
+                DisplayName = definition.DisplayName,
+                ShapeId = definition.ShapeId,
+                ShapeCells = self:SerializeShapeCells(shapeResult.Cells),
+                ShopCost = definition.ShopCost,
+                RequiredUnionRank = definition.RequiredUnionRank,
+                MaxOwned = definition.MaxOwned,
+                OwnedQuantity = purchaseState.OwnedQuantity or 0,
+                CanPurchase = purchaseState.CanPurchase == true,
+                PurchaseReason = purchaseState.Reason or "UNKNOWN"
+            })
+        end
+        result.BlockCount = #result.Blocks
+        return result
+    end
+
+    method string SerializeShapeCells(table cells)
+        -- Serializes only normalized repository output for a lightweight client preview payload.
+        local tokens = {}
+        for _, cell in ipairs(cells or {}) do
+            table.insert(tokens, tostring(cell.X) .. ":" .. tostring(cell.Y))
+        end
+        return table.concat(tokens, "|")
+    end
+
+    method string CreatePurchaseRequestId(table profile)
+        -- Issues an opaque server token; the client only echoes it for persistent idempotency.
+        self.NextPurchaseTokenCounter = self.NextPurchaseTokenCounter + 1
+        local nextReceiptOrder = math.max(1, math.floor(tonumber(profile.NextBlockPurchaseReceiptOrder) or 0) + 1)
+        return "shop:" .. tostring(nextReceiptOrder) .. ":" .. tostring(self.NextPurchaseTokenCounter)
+    end
+
+end

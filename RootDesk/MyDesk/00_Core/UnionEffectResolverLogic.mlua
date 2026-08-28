@@ -1,0 +1,110 @@
+@Logic
+script UnionEffectResolverLogic extends Logic
+
+    @ExecSpace("ServerOnly")
+    method table GetEffectSnapshot(Entity userEntity)
+        -- Resolves every permanent Union effect from the server-owned purchased progression.
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionSnapshot(userEntity)
+        if profileResult.Success == false then return profileResult end
+        return self:ResolveFromProfile(profileResult.Snapshot)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ResolveFromProfile(table profile)
+        -- Uses PurchasedLevels as the sole effective-level source for all future runs.
+        local validation = self:ValidatePurchasedLevels(profile)
+        if validation.Success == false then return validation end
+        local snapshot = self:CreateEmptyEffectSnapshot()
+        snapshot.RankId = validation.RankId
+        snapshot.RankDisplayName = validation.RankDisplayName
+        snapshot.UnlockedBoardTier = validation.UnlockedBoardTier
+        snapshot.RankUnlockDescription = validation.RankUnlockDescription
+        local allDefinitions = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        if allDefinitions.Success == false then return allDefinitions end
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            local effectiveLevel = math.floor(tonumber(profile.PurchasedLevels[definition.UpgradeId]) or 0)
+            if effectiveLevel > 0 then
+                local levelDefinition = _UnionUpgradeDefinitionRepositoryLogic:GetLevelDefinition(definition.UpgradeId, effectiveLevel)
+                if levelDefinition.Success == false or (levelDefinition.MatchCount or 0) ~= 1 then
+                    return { Success = false, Reason = levelDefinition.Reason or "INVALID_UPGRADE_LEVEL_DEFINITION", UpgradeId = definition.UpgradeId, Level = effectiveLevel }
+                end
+                if self:ApplyEffectValue(snapshot, definition.EffectType, levelDefinition.EffectValue) == false then
+                    return { Success = false, Reason = "UNKNOWN_EFFECT_TYPE", UpgradeId = definition.UpgradeId, EffectType = definition.EffectType }
+                end
+            end
+        end
+        return { Success = true, Reason = "OK", EffectSnapshot = snapshot }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidatePurchasedLevels(table profile)
+        -- Validates permanent progression without consulting legacy active or preset fields.
+        if profile == nil or type(profile) ~= "table" then return { Success = false, Reason = "PROFILE_TABLE_MISSING" } end
+        if type(profile.PurchasedLevels) ~= "table" then return { Success = false, Reason = "PURCHASED_LEVEL_TABLE_MISSING" } end
+        local allDefinitions = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        if allDefinitions.Success == false then return allDefinitions end
+        local knownUpgradeIds = {}
+        for _, definition in ipairs(allDefinitions.Definitions) do knownUpgradeIds[definition.UpgradeId] = true end
+        for upgradeId, _ in pairs(profile.PurchasedLevels) do
+            if knownUpgradeIds[upgradeId] ~= true then return { Success = false, Reason = "UNKNOWN_PURCHASED_UPGRADE_ID", UpgradeId = upgradeId } end
+        end
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            local purchasedLevel = tonumber(profile.PurchasedLevels[definition.UpgradeId])
+            if purchasedLevel == nil or purchasedLevel < 0 or purchasedLevel ~= math.floor(purchasedLevel) or purchasedLevel > definition.MaxLevel then
+                return { Success = false, Reason = "INVALID_PURCHASED_LEVEL", UpgradeId = definition.UpgradeId, Level = purchasedLevel or 0 }
+            end
+        end
+        local rank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(math.floor(tonumber(profile.LifetimeUnionPoints) or -1))
+        if rank.Success == false then return rank end
+        return {
+            Success = true,
+            Reason = "OK",
+            RankId = rank.RankId,
+            RankDisplayName = rank.DisplayName,
+            UnlockedBoardTier = rank.UnlockedBoardTier,
+            RankUnlockDescription = rank.UnlockDescription
+        }
+    end
+
+    method table CreateEmptyEffectSnapshot()
+        -- Creates the stable gameplay contract consumed by every STEP 4 integration point.
+        return {
+            MesoGainRate = 0,
+            ItemDropRate = 0,
+            AugmentRerollBonus = 0,
+            UnionPointGainRate = 0,
+            StartingPotionBonus = 0,
+            MaxHPBonus = 0,
+            InventorySlotBonus = 0,
+            StartingSkillBonus = 0,
+            StartingRandomRelicBonus = 0
+        }
+    end
+
+    method boolean ApplyEffectValue(table snapshot, string effectType, number effectValue)
+        -- Maps one validated cumulative level value into the central effect snapshot.
+        if effectType == "MESO_GAIN_RATE" then
+            snapshot.MesoGainRate = snapshot.MesoGainRate + effectValue
+        elseif effectType == "ITEM_DROP_RATE" then
+            snapshot.ItemDropRate = snapshot.ItemDropRate + effectValue
+        elseif effectType == "AUGMENT_REROLL" then
+            snapshot.AugmentRerollBonus = snapshot.AugmentRerollBonus + effectValue
+        elseif effectType == "UNION_POINT_GAIN_RATE" then
+            snapshot.UnionPointGainRate = snapshot.UnionPointGainRate + effectValue
+        elseif effectType == "STARTING_POTION" then
+            snapshot.StartingPotionBonus = snapshot.StartingPotionBonus + effectValue
+        elseif effectType == "MAX_HP" then
+            snapshot.MaxHPBonus = snapshot.MaxHPBonus + effectValue
+        elseif effectType == "INVENTORY_SLOT" then
+            snapshot.InventorySlotBonus = snapshot.InventorySlotBonus + effectValue
+        elseif effectType == "STARTING_SKILL" then
+            snapshot.StartingSkillBonus = snapshot.StartingSkillBonus + effectValue
+        elseif effectType == "STARTING_RANDOM_RELIC" then
+            snapshot.StartingRandomRelicBonus = snapshot.StartingRandomRelicBonus + effectValue
+        else
+            return false
+        end
+        return true
+    end
+
+end

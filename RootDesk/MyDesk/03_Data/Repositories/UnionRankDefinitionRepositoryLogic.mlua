@@ -1,0 +1,168 @@
+@Logic
+script UnionRankDefinitionRepositoryLogic extends Logic
+
+    property string RankDataSetName = "UnionRankDefinitions"
+
+    @ExecSpace("ServerOnly")
+    method table GetDefinition(string rankId)
+        -- Loads one data-driven Union progression rank.
+        local result = { Success = false, Reason = "UNION_RANK_NOT_FOUND", RankId = rankId or "" }
+        if rankId == nil or rankId == "" then
+            result.Reason = "INVALID_RANK_ID"
+            return result
+        end
+        local dataSet = _DataService:GetTable(self.RankDataSetName)
+        if dataSet == nil then
+            result.Reason = "UNION_RANK_DATASET_MISSING"
+            return result
+        end
+        local matchCount = 0
+        for rowIndex = 1, dataSet:GetRowCount() do
+            if dataSet:GetCell(rowIndex, "RankId") == rankId then
+                matchCount = matchCount + 1
+                if result.Success == false then result = self:ConvertRankRow(dataSet, rowIndex) end
+            end
+        end
+        result.MatchCount = matchCount
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllDefinitions()
+        -- Loads all ranks in threshold order without hardcoded progression values.
+        local result = { Success = false, Reason = "UNION_RANK_DATASET_MISSING", Definitions = {}, DefinitionCount = 0 }
+        local dataSet = _DataService:GetTable(self.RankDataSetName)
+        if dataSet == nil then return result end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            table.insert(result.Definitions, self:ConvertRankRow(dataSet, rowIndex))
+        end
+        table.sort(result.Definitions, function(left, right)
+            if left.MinLifetimeUnionPoints == right.MinLifetimeUnionPoints then return left.SortOrder < right.SortOrder end
+            return left.MinLifetimeUnionPoints < right.MinLifetimeUnionPoints
+        end)
+        result.Success = true
+        result.Reason = "OK"
+        result.DefinitionCount = #result.Definitions
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetRankForLifetimePoints(integer lifetimeUnionPoints)
+        -- Selects the highest threshold reached by the authoritative lifetime total.
+        if lifetimeUnionPoints == nil or lifetimeUnionPoints < 0 then
+            return { Success = false, Reason = "INVALID_LIFETIME_UNION_POINTS", LifetimeUnionPoints = lifetimeUnionPoints or 0 }
+        end
+        local allRanks = self:GetAllDefinitions()
+        if allRanks.Success == false then return allRanks end
+        local selected = nil
+        for _, rank in ipairs(allRanks.Definitions) do
+            if lifetimeUnionPoints >= rank.MinLifetimeUnionPoints then selected = rank else break end
+        end
+        if selected == nil then
+            return { Success = false, Reason = "UNION_RANK_THRESHOLD_NOT_FOUND", LifetimeUnionPoints = lifetimeUnionPoints }
+        end
+        selected.LifetimeUnionPoints = lifetimeUnionPoints
+        return selected
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidateDefinitions()
+        -- Validates monotonic thresholds and board-tier unlock progression.
+        local result = { Success = false, Reason = "CONTENT_VALIDATION_FAILED", CheckedRankCount = 0, ErrorCount = 0, Errors = {}, ErrorSnapshot = "" }
+        local dataSet = _DataService:GetTable(self.RankDataSetName)
+        if dataSet == nil then
+            self:AddValidationError(result, 0, "", "DATASET_NOT_FOUND")
+            return self:FinalizeValidation(result)
+        end
+        local seenRankIds = {}
+        local seenSortOrders = {}
+        local seenBoardTiers = {}
+        local previousThreshold = -1
+        local previousBoardTier = 0
+        for rowIndex = 1, dataSet:GetRowCount() do
+            result.CheckedRankCount = result.CheckedRankCount + 1
+            local rank = self:ConvertRankRow(dataSet, rowIndex)
+            if rank.RankId == "" then
+                self:AddValidationError(result, rowIndex, rank.RankId, "INVALID_RANK_ID")
+            elseif seenRankIds[rank.RankId] == true then
+                self:AddValidationError(result, rowIndex, rank.RankId, "DUPLICATE_RANK_ID")
+            else
+                seenRankIds[rank.RankId] = true
+            end
+            if rank.DisplayName == "" then self:AddValidationError(result, rowIndex, rank.RankId, "DISPLAY_NAME_MISSING") end
+            if rank.UnlockDescription == "" then self:AddValidationError(result, rowIndex, rank.RankId, "UNLOCK_DESCRIPTION_MISSING") end
+            if self:IsNonNegativeIntegerCell(dataSet:GetCell(rowIndex, "MinLifetimeUnionPoints")) == false then self:AddValidationError(result, rowIndex, rank.RankId, "INVALID_MIN_LIFETIME_POINTS") end
+            if self:IsPositiveIntegerCell(dataSet:GetCell(rowIndex, "UnlockedBoardTier")) == false then
+                self:AddValidationError(result, rowIndex, rank.RankId, "INVALID_UNLOCKED_BOARD_TIER")
+            elseif seenBoardTiers[rank.UnlockedBoardTier] == true then
+                self:AddValidationError(result, rowIndex, rank.RankId, "DUPLICATE_UNLOCKED_BOARD_TIER")
+            else
+                seenBoardTiers[rank.UnlockedBoardTier] = true
+            end
+            if self:IsPositiveIntegerCell(dataSet:GetCell(rowIndex, "SortOrder")) == false then
+                self:AddValidationError(result, rowIndex, rank.RankId, "INVALID_SORT_ORDER")
+            elseif seenSortOrders[rank.SortOrder] == true then
+                self:AddValidationError(result, rowIndex, rank.RankId, "DUPLICATE_SORT_ORDER")
+            else
+                seenSortOrders[rank.SortOrder] = true
+            end
+            if rowIndex == 1 and rank.MinLifetimeUnionPoints ~= 0 then self:AddValidationError(result, rowIndex, rank.RankId, "FIRST_RANK_MUST_START_AT_ZERO") end
+            if rowIndex > 1 and rank.MinLifetimeUnionPoints <= previousThreshold then self:AddValidationError(result, rowIndex, rank.RankId, "RANK_THRESHOLD_NOT_INCREASING") end
+            if rowIndex > 1 and rank.UnlockedBoardTier <= previousBoardTier then self:AddValidationError(result, rowIndex, rank.RankId, "BOARD_TIER_NOT_INCREASING") end
+            previousThreshold = rank.MinLifetimeUnionPoints
+            previousBoardTier = rank.UnlockedBoardTier
+        end
+        if result.CheckedRankCount == 0 then self:AddValidationError(result, 0, "", "NO_RANK_ROWS") end
+        return self:FinalizeValidation(result)
+    end
+
+    method table ConvertRankRow(any dataSet, integer rowIndex)
+        -- Converts a rank dataset row into the shared server DTO.
+        return {
+            Success = true,
+            Reason = "OK",
+            RankId = dataSet:GetCell(rowIndex, "RankId") or "",
+            DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+            MinLifetimeUnionPoints = math.floor(tonumber(dataSet:GetCell(rowIndex, "MinLifetimeUnionPoints")) or 0),
+            UnlockedBoardTier = math.floor(tonumber(dataSet:GetCell(rowIndex, "UnlockedBoardTier")) or 0),
+            UnlockDescription = dataSet:GetCell(rowIndex, "UnlockDescription") or "",
+            SortOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "SortOrder")) or 0),
+            RowIndex = rowIndex,
+            Source = "DATASET"
+        }
+    end
+
+    method boolean IsPositiveIntegerCell(any cellValue)
+        -- Checks for an integer greater than zero.
+        local numericValue = tonumber(cellValue)
+        return numericValue ~= nil and numericValue > 0 and numericValue == math.floor(numericValue)
+    end
+
+    method boolean IsNonNegativeIntegerCell(any cellValue)
+        -- Checks for a non-negative integer.
+        local numericValue = tonumber(cellValue)
+        return numericValue ~= nil and numericValue >= 0 and numericValue == math.floor(numericValue)
+    end
+
+    method void AddValidationError(table result, integer rowIndex, string rankId, string detailReason)
+        -- Appends one deterministic validation error.
+        table.insert(result.Errors, { DataSetName = self.RankDataSetName, RowIndex = rowIndex, RankId = rankId or "", DetailReason = detailReason or "UNKNOWN" })
+    end
+
+    method table FinalizeValidation(table result)
+        -- Produces one stable PASS/FAIL validation contract.
+        local parts = {}
+        for _, item in ipairs(result.Errors) do table.insert(parts, item.DataSetName .. "[" .. tostring(item.RowIndex) .. "]" .. item.RankId .. "=" .. item.DetailReason) end
+        result.ErrorCount = #result.Errors
+        result.ErrorSnapshot = table.concat(parts, "|")
+        if result.ErrorCount == 0 then
+            result.Success = true
+            result.Reason = "OK"
+            log("[UnionRankValidation] valid ranks=" .. result.CheckedRankCount)
+        else
+            log_error("[UnionRankValidation] rejected errors=" .. result.ErrorCount .. " details=" .. result.ErrorSnapshot)
+        end
+        return result
+    end
+
+end
