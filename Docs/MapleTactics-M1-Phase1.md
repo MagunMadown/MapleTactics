@@ -4,6 +4,16 @@
 목표: 복잡한 프레임워크를 먼저 만들지 않고, Maker 화면에서 직접 확인할 수 있는 작은 전투 기능을 하나씩 완성한다.  
 진행 원칙: 한 Slice를 구현하고 실제 화면과 로그로 검증한 뒤에만 다음 Slice로 넘어간다.
 
+## 2026-08-29 — 헤네시스 이후 분기형 런 상점
+
+- 🟡 상태: Implemented (Maker runtime verification pending)
+- 헤네시스 보스 승리 뒤 월드맵을 `SHOP_CHOICE`로 열고 위·아래 상점 중 하나를 선택한다.
+- `TravelAvatar`의 걷기 연출이 끝난 뒤 서버가 노드를 승인하고, 두 분기가 공유하는 `shop.map`으로 이동한다.
+- NPC 상점은 각 분기의 CSV 상품 16/17종을 표시하고, 1골드 구매 결과를 능력치 없는 `RunItemSnapshot`에 저장한다.
+- 상점 UI의 X는 팝업만 닫고, 맵 출발 버튼은 구매 여부와 무관하게 상점 노드를 완료한다.
+- 완료 뒤 `POST_SHOP_ROUTE` 월드맵에서 선택한 엘리니아 또는 커닝시티 경로만 활성화한다.
+- 완료 기준: 데이터·중복·권한 검증, UIBuilder strict lint, Maker build 오류 0, 위/아래 선택·구매·무구매 퇴장·반대 경로 잠금 positive log.
+
 ## Skills to reference (this Phase)
 
 - `msw-general`: `platform.md`, 확정 맵 타입의 `platform-*.md`, `workspace.md`, `entity.md`, `authoring.md`, `builder-protocol.md`, `model.md`

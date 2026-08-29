@@ -134,6 +134,8 @@ M1 직업 슬롯:
 - 상점 방문 여부, 구매 결과, 선택 경로와 현재 마을은 서버 권위의 플레이어 Run 상태가 소유한다. 월드맵 UI는 이 Snapshot을 표시하고 요청만 전송한다.
 - 각 Edge 상점은 서로 다른 `ShopId`를 사용하되 `ShopVisitBtn` UI와 공통 Shop Controller를 재사용한다.
 - `StageMapRoutes`는 각 StageId를 소속 Region의 `region_XX_battle` 또는 `region_XX_boss`로 라우팅한다. 서로 다른 마을을 하나의 Region 물리 맵으로 합치지 않는다.
+- 헤네시스 보스 뒤에는 위·아래 상점 중 하나를 고르는 배타적 분기가 있다. 서버가 승인한 `SelectedContentId`가 현재 런의 경로 원본이며, 상점 완료 뒤에도 반대 경로는 잠긴다.
+- 두 분기는 같은 `shop` 물리 맵을 재사용하되 각자의 `ShopId`와 CSV 상품 목록을 사용한다. 구매 아이템은 능력치 없이 현재 런에만 보관한다.
 
 ## 7. 증강 원칙
 
@@ -179,6 +181,7 @@ M1 직업 슬롯:
 
 - [ ] Phase 0 — 맵/이동/RPC/데이터/큐 재타깃 기술 검증
 - [ ] Phase 1 — 전투 코어 수직 슬라이스 + CSV 기반 단일 전투 맵 재사용
+  - [ ] 헤네시스 이후 분기형 런 상점 — 월드맵 선택·이동 연출, 33종 CSV 상품, NPC 상점 UI, 무구매 퇴장, 선택 경로 잠금
 - [ ] Phase 2 — 데이터 기반 타일과 일반 적
 - [ ] Phase 3 — 스테이지와 보스 패턴
 - [ ] Phase 4 — 직업 4종과 증강
@@ -202,8 +205,9 @@ M1 이후 콘텐츠 확장 트랙:
 - 새로운 효과를 완전히 무코드로 정의하는 범용 스크립팅 언어는 만들지 않는다.
 - 모든 일반 적을 BT로 제작하지 않는다.
 - 메타 진행, 과금 연동, 랭킹은 M1 코어 루프 이후로 미룬다.
-- M1은 `ShopDefinitions`/`ShopEntries` 기반 RUN_SCOPED 런 상점의 서버 흐름과 디버그 DTO를 포함한다. 최종 상점 UI와 `ShopItemDefinitions` 기반 Meta/World Shop, 영구 구매 상태, 실제 결제 연동은 이후 범위다.
+- M1은 `ShopDefinitions`/`ShopEntries` 기반 RUN_SCOPED 런 상점의 서버 흐름, NPC 상점 UI와 디버그 DTO를 포함한다. `ShopItemDefinitions` 기반 Meta/World Shop, 능력치·장착, 영구 구매 상태, 실제 결제 연동은 이후 범위다.
 - 커닝시티·엘리니아·페리온·노틸러스·슬리피우드의 완성 전투 콘텐츠는 M1 수직 슬라이스 이후 범위다. M1에서는 6개 도시 표시, 첫 분기, 공통 상점 Edge 계약까지만 검증한다.
+- 상점 퇴장 뒤 엘리니아·커닝시티 경로의 잠금 표시는 M1에 포함하지만 실제 목적지 맵과 Stage 연결은 후속 Backlog다.
 - 스테이지 클리어 보상(`StageRewardDefinitions`)으로 `RUN_SCOPED`/`META_PERSISTENT` 재화를 지급하는 흐름은 M1 범위에 포함한다. `PREMIUM_CASH` 재화는 보상으로 지급하지 않는다.
 
 ## 11. 성공 기준
@@ -242,3 +246,4 @@ M1 이후 콘텐츠 확장 트랙:
 | 2026-08-22 | 수정 | 1-1~1-3은 헤네시스 일반전 공용 맵을 유지하고 1-4는 `region_01_boss` 전용 물리 맵으로 분리 | 일반 스테이지 재사용 이점은 유지하면서 머쉬맘 보스전의 배경·전조 가독성과 공간 연출을 독립 조정하기 위함 | StageMapRoutes, 물리 맵 2종, Phase 1 Slice 14~15 |
 | 2026-08-25 | 수정 | 등록 CSV 자산으로 6도시 월드맵을 재구성하고 헤네시스 클리어 후 위·아래 상점 중 하나를 선택하는 분기 추가. 위쪽은 커닝시티, 아래쪽은 엘리니아의 동일 1-2 전투로 연결 | 참고 이미지의 상·하 경로 선택과 다음 전투 전 선택적 상점 동선을 구현하기 위함 | `PopupGroup.ui`, `MinimapUI`, `PlayerRunStateComponent`, `RunManagerLogic`, 월드맵 Stage 버튼, Phase 1 Slice 16 |
 | 2026-08-26 | 수정 | 6개 마을 전체 경로와 모든 마을 사이의 Edge 상점을 확정하고 각 마을을 `region_01`~`region_06` 독립 Region·물리 맵 세트로 분리 | 첫 분기 전용 구현을 반복 가능한 구조로 확장하면서 마을별 배경·몬스터·보스 연출을 독립 제작하기 위함 | GDD 플레이 루프·지역/맵 규칙·MSW 구현 결정·로드맵, Phase 1 후속 확장 순서 |
+| 2026-08-29 | 추가 | 헤네시스 보스 뒤 위·아래 런 상점 분기와 선택 경로 잠금, 33종 무능력치 런 아이템 상점 UI를 M1에 추가 | 보스 뒤 선택·소비·다음 지역 예고까지 하나의 플레이 가능한 런 흐름으로 연결하기 위함 | GDD §6/§9/§10, Phase 1 분기형 런 상점, NodeDefinitions·ShopDefinitions·ShopEntries, 월드맵·shop.map |

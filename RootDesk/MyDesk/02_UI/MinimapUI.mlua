@@ -9,6 +9,12 @@ script MinimapUI extends Component
 
 	property Vector2 TravelStartPosition = Vector2(-733, 29)
 
+	property string CurrentMode = "LOBBY_STAGE"
+
+	property string SelectedRouteId = ""
+
+	property boolean RouteSelectionLocked = false
+
 	property integer LastObservedCompletedStageCount = -1
 
 	property string LastObservedWorldMapBranch = "__UNSET__"
@@ -75,7 +81,7 @@ script MinimapUI extends Component
 	@ExecSpace("ClientOnly")
 	method void OnMapEnter(Entity mapEntity)
 		-- Guarantees the world map is hidden outside the lobby.
-		if isvalid(mapEntity) and mapEntity.Name ~= "lobby" then
+		if self.CurrentMode == "LOBBY_STAGE" and isvalid(mapEntity) and mapEntity.Name ~= "lobby" then
 			self:CloseWorldMapForTransfer(mapEntity.Name)
 		end
 	end
@@ -88,8 +94,11 @@ script MinimapUI extends Component
 			return
 		end
 		local player = _UserService.LocalPlayer
-		if isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name ~= "lobby" then
+		if self.CurrentMode == "LOBBY_STAGE" and isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name ~= "lobby" then
 			self:CloseWorldMapForTransfer(player.CurrentMap.Name)
+			return
+		end
+		if self.CurrentMode ~= "LOBBY_STAGE" then
 			return
 		end
 		local completedStageCount = self:GetCompletedStageCount()
@@ -101,19 +110,98 @@ script MinimapUI extends Component
 
 	@ExecSpace("ClientOnly")
 	method boolean OpenWorldMap(string source)
-		-- Applies the latest clear gates before the world map becomes interactive.
+		return self:OpenWorldMapMode("LOBBY_STAGE", source, "")
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean OpenWorldMapMode(string mode, string source, string selectedRouteId)
+		-- Reuses one world map for lobby entry, shop choice, and the locked post-shop route.
+		self.CurrentMode = mode or "LOBBY_STAGE"
+		self.SelectedRouteId = selectedRouteId or ""
 		if self.ShopClickHandler == nil or self.LowerShopClickHandler == nil or self.WorldMapCloseHandler == nil then
 			self:DisconnectWorldMapButtons()
 			self:ConnectWorldMapButtons()
 		end
-		self:RefreshWorldMapProgress(source)
+		if self.CurrentMode == "LOBBY_STAGE" then
+			self:RefreshWorldMapProgress(source)
+		end
+		self:ConfigureWorldMapMode()
 		if self:SetWorldMapVisible(true) == false then
-			log_warning("[WorldMap] open failed source=" .. source .. " reason=UI_MISSING")
+			log_warning("[WorldMap] open failed mode=" .. self.CurrentMode .. " source=" .. source .. " reason=UI_MISSING")
 			return false
 		end
-		self:ShowTravelAvatarAtStart()
-		log("[WorldMap] opened source=" .. source)
+		if self.CurrentMode == "POST_SHOP_ROUTE" then
+			self:ShowTravelAvatarAtRoute(self.SelectedRouteId)
+		else
+			self:ShowTravelAvatarAtStart()
+		end
+		log("[WorldMap] opened mode=" .. self.CurrentMode .. " source=" .. source .. " route=" .. self.SelectedRouteId)
 		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConfigureWorldMapMode()
+		local henesys = self:GetWorldMapEntity("HenesysCityBranchBtn")
+		local upper = self:GetWorldMapEntity("UpperShopBranchBtn")
+		local lower = self:GetWorldMapEntity("LowerShopBranchBtn")
+		local upperLine = self:GetWorldMapEntity("UpperRouteLine")
+		local lowerLine = self:GetWorldMapEntity("LowerRouteLine")
+		local ellinia = self:GetWorldMapEntity("ElliniaBranchBtn")
+		local kerning = self:GetWorldMapEntity("KerningCityBranchBtn")
+		local upperLock = self:GetWorldMapEntity("UpperRouteLock")
+		local lowerLock = self:GetWorldMapEntity("LowerRouteLock")
+		local legacyUpperShop = self:GetWorldMapEntity("ShopVisitBtn")
+		local legacyLowerShop = self:GetWorldMapEntity("LowerShopVisitBtn")
+		local shopChoice = self.CurrentMode == "SHOP_CHOICE"
+		local postShop = self.CurrentMode == "POST_SHOP_ROUTE"
+		self:SetNodeVisible(henesys, self.CurrentMode == "LOBBY_STAGE")
+		self:SetNodeVisible(upper, shopChoice)
+		self:SetNodeVisible(lower, shopChoice)
+		self:SetNodeVisible(upperLine, shopChoice or (postShop and self.SelectedRouteId == "shop_upper"))
+		self:SetNodeVisible(lowerLine, shopChoice or (postShop and self.SelectedRouteId == "shop_lower"))
+		if shopChoice then
+			self.RouteSelectionLocked = false
+			local upperButton = isvalid(upper) and upper:GetComponent("script.WorldMapRunNodeButtonComponent") or nil
+			local lowerButton = isvalid(lower) and lower:GetComponent("script.WorldMapRunNodeButtonComponent") or nil
+			if upperButton ~= nil then upperButton:ResetForChoice() end
+			if lowerButton ~= nil then lowerButton:ResetForChoice() end
+		end
+		self:SetNodeVisible(ellinia, self.CurrentMode == "LOBBY_STAGE" or postShop)
+		self:SetNodeVisible(kerning, self.CurrentMode == "LOBBY_STAGE" or postShop)
+		self:SetNodeVisible(legacyUpperShop, self.CurrentMode == "LOBBY_STAGE")
+		self:SetNodeVisible(legacyLowerShop, self.CurrentMode == "LOBBY_STAGE")
+		local upperSelected = self.SelectedRouteId == "shop_upper"
+		local lowerSelected = self.SelectedRouteId == "shop_lower"
+		if postShop then
+			self:SetButtonEnabled(kerning, upperSelected)
+			self:SetButtonEnabled(ellinia, lowerSelected)
+		end
+		self:SetNodeVisible(upperLock, postShop and not upperSelected)
+		self:SetNodeVisible(lowerLock, postShop and not lowerSelected)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean TryLockRouteSelection()
+		if self.RouteSelectionLocked then
+			return false
+		end
+		self.RouteSelectionLocked = true
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetNodeVisible(any entity, boolean visible)
+		if isvalid(entity) then
+			entity.Enable = visible
+			entity.Visible = visible
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetButtonEnabled(any entity, boolean enabled)
+		if isvalid(entity) and entity.ButtonComponent ~= nil then
+			entity.ButtonComponent.Enable = enabled
+		end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -636,6 +724,27 @@ script MinimapUI extends Component
 			end
 		end
 		log("[WorldMap] standing avatar shown at start")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowTravelAvatarAtRoute(string routeId)
+		local targetPath = routeId == "shop_upper" and "UpperShopBranchBtn" or "LowerShopBranchBtn"
+		self:ShowTravelAvatarAtStart()
+		local avatar = self:GetTravelAvatar()
+		if isvalid(avatar) and isvalid(avatar.UITransformComponent) then
+			avatar.UITransformComponent.anchoredPosition = self:GetTravelTargetPosition(targetPath)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayTravelAnimationTo(string targetPath, string targetLabel)
+		local relativePath = targetPath or ""
+		local prefix = "/ui/PopupGroup/MapTeleportPopup/"
+		if string.sub(relativePath, 1, string.len(prefix)) == prefix then
+			relativePath = string.sub(relativePath, string.len(prefix) + 1)
+		end
+		log("[WorldMap] route travel requested target=" .. (targetLabel or relativePath))
+		self:PlayTravelAnimation(relativePath)
 	end
 
 	@ExecSpace("ClientOnly")
