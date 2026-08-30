@@ -521,9 +521,62 @@ script RunManagerLogic extends Logic
 		local result = self:SelectNextContent(playerEntity, nodeId, requestId)
 		if result.Success == false then
 			log_warning("[RunContentFlow] selection rejected user=" .. senderUserId .. " node=" .. nodeId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			self:NotifyContentSelectionResult(false, result.Reason, nodeId, senderUserId)
 			return
 		end
 		log("[RunContentFlow] selection accepted user=" .. senderUserId .. " node=" .. nodeId .. " request=" .. requestId .. " action=" .. (result.RouteAction or "") .. " reason=" .. result.Reason)
+		if result.Reason ~= "DUPLICATE_SELECTION_IGNORED" and (result.SelectedContentType == "SHOP" or result.ContentType == "SHOP") then
+			local transfer = _RunContentMapTransitionAdapterLogic:ConsumeSelectedShop(playerEntity)
+			if transfer.Success == false then
+				log_warning("[RunContentFlow] shop transfer rejected user=" .. senderUserId .. " node=" .. nodeId .. " reason=" .. transfer.Reason)
+			end
+		end
+	end
+
+	@ExecSpace("Client")
+	method void NotifyContentSelectionResult(boolean success, string reason, string nodeId)
+		if success or string.find(nodeId or "", "shop_", 1, true) ~= 1 then return end
+		local uiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		local minimap = isvalid(uiRoot) and uiRoot:GetComponent("script.MinimapUI") or nil
+		if minimap ~= nil then minimap:OpenWorldMapMode("SHOP_CHOICE", "SELECTION_REJECTED:" .. reason, "") end
+		log_warning("[WorldMapShop] selection rejected node=" .. nodeId .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SelectWorldMapBranch(Entity playerEntity, string branchId)
+		-- Commits exactly one post-Henesys route so upper and lower shop choices are mutually exclusive.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		if runState.CompletedStageCount < 1 then
+			return { Success = false, Reason = "HENESYS_NOT_CLEARED" }
+		end
+		if branchId ~= "UPPER" and branchId ~= "LOWER" then
+			return { Success = false, Reason = "INVALID_WORLD_MAP_BRANCH" }
+		end
+		if runState.SelectedWorldMapBranch == branchId then
+			return { Success = true, Reason = "DUPLICATE_BRANCH_SELECTION", BranchId = branchId }
+		end
+		if runState.SelectedWorldMapBranch ~= "" then
+			return { Success = false, Reason = "WORLD_MAP_BRANCH_ALREADY_SELECTED", BranchId = runState.SelectedWorldMapBranch }
+		end
+		runState.SelectedWorldMapBranch = branchId
+		runState.RunFlowRevision = runState.RunFlowRevision + 1
+		log("[WorldMap] branch selected player=" .. playerEntity.Name .. " branch=" .. branchId .. " completed=" .. runState.CompletedStageCount)
+		return { Success = true, Reason = "WORLD_MAP_BRANCH_SELECTED", BranchId = branchId }
+	end
+
+	@ExecSpace("Server")
+	method void RequestSelectWorldMapBranch(string branchId)
+		-- Accepts the owning client's upper/lower shop choice through an authenticated RPC boundary.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:SelectWorldMapBranch(playerEntity, branchId)
+		if result.Success == false then
+			log_warning("[WorldMap] branch request rejected user=" .. senderUserId .. " branch=" .. branchId .. " reason=" .. result.Reason)
+			return
+		end
+		log("[WorldMap] branch request accepted user=" .. senderUserId .. " branch=" .. branchId .. " reason=" .. result.Reason)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -548,6 +601,7 @@ script RunManagerLogic extends Logic
 			AvailableNodeIds = runState.AvailableNodeIds,
 			AvailableContentTypes = runState.AvailableContentTypes,
 			AvailableContentIds = runState.AvailableContentIds,
+			SelectedWorldMapBranch = runState.SelectedWorldMapBranch,
 			Transition = {
 				State = runState.ContentTransitionState,
 				SelectedNodeId = runState.SelectedNodeId,
