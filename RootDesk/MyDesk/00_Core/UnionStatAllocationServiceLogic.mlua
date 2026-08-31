@@ -1,0 +1,478 @@
+@Logic
+script UnionStatAllocationServiceLogic extends Logic
+
+    property integer RequestReceiptRetention = 64
+    property table RequestReceiptsByStorageUserKey = {}
+    property table RequestReceiptOrderByStorageUserKey = {}
+    property boolean DefinitionValidationAttempted = false
+    property boolean DefinitionsValid = false
+    property string DefinitionValidationReason = "NOT_VALIDATED"
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        local validation = self:EnsureDefinitionsValid()
+        if validation.Success == true then
+            log("[UnionStatAllocation] service ready")
+        else
+            log_error("[UnionStatAllocation] service unavailable reason=" .. (validation.Reason or "UNKNOWN"))
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetUnionStatAllocationSnapshot(Entity userEntity)
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return self:BuildAllocationSnapshotFromProfile(profileResult.Profile)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table CanIncreaseUnionStat(Entity userEntity, string statId)
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            profileResult.CanIncrease = false
+            return profileResult
+        end
+        local evaluation = self:EvaluateIncreaseFromProfile(profileResult.Profile, statId)
+        local snapshotResult = self:BuildAllocationSnapshotFromProfile(profileResult.Profile)
+        if snapshotResult.Success == true then
+            evaluation.Snapshot = snapshotResult.Snapshot
+        end
+        if evaluation.Success == false and self:IsBusinessRejection(evaluation.Reason) == true then
+            evaluation.Success = true
+        end
+        return evaluation
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryIncreaseUnionStat(Entity userEntity, string statId, string requestId)
+        -- The client supplies intent only. Cost, next level, rank, and available points are resolved twice on the server.
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return self:TryIncreaseUnionStatByStorageKey(profileResult.StorageUserKey, statId, requestId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryIncreaseUnionStatByStorageKey(string storageUserKey, string statId, string requestId)
+        -- Internal storage-key entry point supports isolated synthetic persistence verification without touching a live account.
+        local profile = _UnionProfileRepositoryLogic:GetCachedSnapshot(storageUserKey)
+        if profile == nil then
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", StatId = statId or "", WasApplied = false }
+        end
+        if self:IsValidRequestId(requestId) == false then
+            return { Success = false, Reason = "INVALID_ALLOCATION_REQUEST_ID", StatId = statId or "", WasApplied = false }
+        end
+        local receipt = self:GetMutationReceipt(storageUserKey, requestId, "INCREASE", statId or "")
+        if receipt.Conflict == true then
+            return { Success = false, Reason = "ALLOCATION_REQUEST_ID_CONFLICT", StatId = statId or "", RequestId = requestId, WasApplied = false }
+        end
+        if receipt.Found == true then
+            return self:BuildDuplicateResult(profile, receipt.Receipt, requestId)
+        end
+
+        local preflight = self:EvaluateIncreaseFromProfile(profile, statId)
+        if preflight.Success == false then
+            preflight.RequestId = requestId
+            preflight.WasApplied = false
+            local snapshotResult = self:BuildAllocationSnapshotFromProfile(profile)
+            if snapshotResult.Success == true then preflight.Snapshot = snapshotResult.Snapshot end
+            if self:IsTransientMutationReason(preflight.Reason) == false then
+                self:StoreMutationReceipt(storageUserKey, requestId, "INCREASE", statId or "", preflight)
+            end
+            return preflight
+        end
+
+        local mutation = _UnionProfileRepositoryLogic:TryIncreaseAllocatedUnionStatByStorageKey(storageUserKey, statId)
+        mutation.RequestId = requestId
+        local authoritativeProfile = mutation.Snapshot or profile
+        local snapshotResult = self:BuildAllocationSnapshotFromProfile(authoritativeProfile)
+        if snapshotResult.Success == true then
+            mutation.Snapshot = snapshotResult.Snapshot
+        else
+            mutation.Snapshot = nil
+            if mutation.Success == true then return snapshotResult end
+        end
+        if self:IsTransientMutationReason(mutation.Reason) == false then
+            self:StoreMutationReceipt(storageUserKey, requestId, "INCREASE", statId or "", mutation)
+        end
+        if mutation.Success == true then
+            log("[UnionStatAllocation] increase committed stat=" .. statId .. " level=" .. tostring(mutation.NewLevel) .. " request=" .. requestId)
+        end
+        return mutation
+    end
+
+    @ExecSpace("ServerOnly")
+    method table CanResetUnionStats(Entity userEntity)
+        local snapshotResult = self:GetUnionStatAllocationSnapshot(userEntity)
+        if snapshotResult.Success == false then
+            snapshotResult.CanReset = false
+            return snapshotResult
+        end
+        snapshotResult.CanReset = true
+        snapshotResult.Reason = snapshotResult.Snapshot.SpentUnionStatPoints > 0 and "OK" or "UNION_STATS_ALREADY_RESET"
+        return snapshotResult
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryResetUnionStats(Entity userEntity, string requestId)
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return self:TryResetUnionStatsByStorageKey(profileResult.StorageUserKey, requestId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryResetUnionStatsByStorageKey(string storageUserKey, string requestId)
+        local profile = _UnionProfileRepositoryLogic:GetCachedSnapshot(storageUserKey)
+        if profile == nil then
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", WasReset = false }
+        end
+        if self:IsValidRequestId(requestId) == false then
+            return { Success = false, Reason = "INVALID_ALLOCATION_REQUEST_ID", WasReset = false }
+        end
+        local receipt = self:GetMutationReceipt(storageUserKey, requestId, "RESET", "")
+        if receipt.Conflict == true then
+            return { Success = false, Reason = "ALLOCATION_REQUEST_ID_CONFLICT", RequestId = requestId, WasReset = false }
+        end
+        if receipt.Found == true then
+            return self:BuildDuplicateResult(profile, receipt.Receipt, requestId)
+        end
+        local mutation = _UnionProfileRepositoryLogic:TryResetAllocatedUnionStatsByStorageKey(storageUserKey)
+        mutation.RequestId = requestId
+        local authoritativeProfile = mutation.Snapshot or profile
+        local snapshotResult = self:BuildAllocationSnapshotFromProfile(authoritativeProfile)
+        if snapshotResult.Success == true then
+            mutation.Snapshot = snapshotResult.Snapshot
+        else
+            mutation.Snapshot = nil
+            if mutation.Success == true then return snapshotResult end
+        end
+        if self:IsTransientMutationReason(mutation.Reason) == false then
+            self:StoreMutationReceipt(storageUserKey, requestId, "RESET", "", mutation)
+        end
+        if mutation.Success == true then
+            log("[UnionStatAllocation] free reset committed request=" .. requestId .. " changed=" .. tostring(mutation.WasReset == true))
+        end
+        return mutation
+    end
+
+    @ExecSpace("ServerOnly")
+    method table EvaluateIncreaseFromProfile(table profile, string statId)
+        -- Pure authoritative validation used both before and inside the repository mutation lock.
+        local profileValidation = _UnionProfileRepositoryLogic:ValidateProfileData(profile)
+        if profileValidation.Success == false then
+            return { Success = false, CanIncrease = false, Reason = profileValidation.DetailReason or profileValidation.Reason, StatId = statId or "" }
+        end
+        if statId == nil or statId == "" or type(statId) ~= "string" then
+            return { Success = false, CanIncrease = false, Reason = "INVALID_STAT_ID", StatId = statId or "" }
+        end
+        local definition = _UnionStatDefinitionRepositoryLogic:GetStat(statId)
+        if definition.Success == false then
+            return { Success = false, CanIncrease = false, Reason = definition.Reason, StatId = statId }
+        end
+        if definition.IsImplemented ~= true then
+            return { Success = false, CanIncrease = false, Reason = "STAT_NOT_IMPLEMENTED", StatId = statId }
+        end
+        local currentLevel = math.floor(tonumber(profile.AllocatedUnionStats[statId]) or 0)
+        local nextLevel = currentLevel + 1
+        if nextLevel > definition.MaxLevel then
+            return { Success = false, CanIncrease = false, Reason = "MAX_LEVEL", StatId = statId, CurrentLevel = currentLevel, MaxLevel = definition.MaxLevel }
+        end
+        local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(statId, nextLevel)
+        if levelDefinition.Success == false then
+            return { Success = false, CanIncrease = false, Reason = levelDefinition.Reason, StatId = statId, CurrentLevel = currentLevel, NextLevel = nextLevel }
+        end
+        local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(profile.LifetimeUnionPoints)
+        if currentRank.Success == false then
+            return { Success = false, CanIncrease = false, Reason = currentRank.Reason, StatId = statId }
+        end
+        local requiredRank = self:ResolveHigherRequiredRank(definition.RequiredUnionRank, levelDefinition.RequiredUnionRank)
+        if requiredRank.Success == false then
+            return { Success = false, CanIncrease = false, Reason = requiredRank.Reason, StatId = statId }
+        end
+        if currentRank.SortOrder < requiredRank.SortOrder then
+            return {
+                Success = false,
+                CanIncrease = false,
+                Reason = "RANK_LOCKED",
+                StatId = statId,
+                CurrentLevel = currentLevel,
+                NextLevel = nextLevel,
+                CurrentUnionRank = currentRank.RankId,
+                RequiredUnionRank = requiredRank.RankId
+            }
+        end
+        local pointSummary = self:ResolvePointSummaryFromProfile(profile)
+        if pointSummary.Success == false then
+            pointSummary.CanIncrease = false
+            pointSummary.StatId = statId
+            return pointSummary
+        end
+        if pointSummary.AvailableUnionStatPoints < levelDefinition.PointCost then
+            return {
+                Success = false,
+                CanIncrease = false,
+                Reason = "INSUFFICIENT_UNION_STAT_POINTS",
+                StatId = statId,
+                CurrentLevel = currentLevel,
+                NextLevel = nextLevel,
+                RequiredPointCost = levelDefinition.PointCost,
+                TotalUnionStatPoints = pointSummary.TotalUnionStatPoints,
+                SpentUnionStatPoints = pointSummary.SpentUnionStatPoints,
+                AvailableUnionStatPoints = pointSummary.AvailableUnionStatPoints
+            }
+        end
+        return {
+            Success = true,
+            CanIncrease = true,
+            Reason = "OK",
+            StatId = statId,
+            CurrentLevel = currentLevel,
+            NextLevel = nextLevel,
+            MaxLevel = definition.MaxLevel,
+            RequiredPointCost = levelDefinition.PointCost,
+            CurrentUnionRank = currentRank.RankId,
+            RequiredUnionRank = requiredRank.RankId,
+            TotalUnionStatPoints = pointSummary.TotalUnionStatPoints,
+            SpentUnionStatPoints = pointSummary.SpentUnionStatPoints,
+            AvailableUnionStatPoints = pointSummary.AvailableUnionStatPoints
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table BuildAllocationSnapshotFromProfile(table profile)
+        -- Builds a defensive DTO and never returns mutable profile source tables.
+        local validation = _UnionProfileRepositoryLogic:ValidateProfileData(profile)
+        if validation.Success == false then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = validation.DetailReason or validation.Reason }
+        end
+        local definitions = _UnionStatDefinitionRepositoryLogic:GetAllStats()
+        if definitions.Success == false then return definitions end
+        local pointSummary = self:ResolvePointSummaryFromProfile(profile)
+        if pointSummary.Success == false then return pointSummary end
+        local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(profile.LifetimeUnionPoints)
+        if currentRank.Success == false then return currentRank end
+        local allocations = {}
+        local stats = {}
+        for _, definition in ipairs(definitions.Stats) do
+            local currentLevel = math.floor(tonumber(profile.AllocatedUnionStats[definition.StatId]) or 0)
+            allocations[definition.StatId] = currentLevel
+            local requiredRank = self:ResolveHigherRequiredRank(definition.RequiredUnionRank, definition.RequiredUnionRank)
+            local isRankUnlocked = requiredRank.Success == true and currentRank.SortOrder >= requiredRank.SortOrder
+            local nextLevel = currentLevel + 1
+            local nextPointCost = 0
+            local increaseReason = "MAX_LEVEL"
+            if nextLevel <= definition.MaxLevel then
+                local nextLevelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, nextLevel)
+                if nextLevelDefinition.Success == true then
+                    nextPointCost = nextLevelDefinition.PointCost
+                    requiredRank = self:ResolveHigherRequiredRank(definition.RequiredUnionRank, nextLevelDefinition.RequiredUnionRank)
+                    isRankUnlocked = requiredRank.Success == true and currentRank.SortOrder >= requiredRank.SortOrder
+                    if definition.IsImplemented ~= true then
+                        increaseReason = "STAT_NOT_IMPLEMENTED"
+                    elseif isRankUnlocked == false then
+                        increaseReason = "RANK_LOCKED"
+                    elseif pointSummary.AvailableUnionStatPoints < nextPointCost then
+                        increaseReason = "INSUFFICIENT_UNION_STAT_POINTS"
+                    else
+                        increaseReason = "OK"
+                    end
+                else
+                    increaseReason = nextLevelDefinition.Reason or "UNION_STAT_LEVEL_NOT_FOUND"
+                end
+            end
+            local currentEffectValue = 0
+            if currentLevel > 0 then
+                local currentLevelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, currentLevel)
+                if currentLevelDefinition.Success == true then currentEffectValue = currentLevelDefinition.EffectValue end
+            end
+            table.insert(stats, {
+                StatId = definition.StatId,
+                Category = definition.Category,
+                DisplayName = definition.DisplayName,
+                Description = definition.Description,
+                CurrentLevel = currentLevel,
+                MaxLevel = definition.MaxLevel,
+                CurrentEffectValue = currentEffectValue,
+                IsImplemented = definition.IsImplemented == true,
+                RequiredUnionRank = requiredRank.RankId or definition.RequiredUnionRank,
+                CurrentUnionRank = currentRank.RankId,
+                IsRankUnlocked = isRankUnlocked,
+                NextPointCost = nextPointCost,
+                CanIncrease = increaseReason == "OK",
+                IncreaseReason = increaseReason,
+                SortOrder = definition.SortOrder
+            })
+        end
+        local jobProgress = _UnionProfileRepositoryLogic:CopyLevelMap(profile.JobUnionProgress)
+        local snapshot = {
+            SchemaVersion = profile.SchemaVersion,
+            UnionCoins = profile.UnionPoints,
+            LifetimeUnionGrowth = profile.LifetimeUnionPoints,
+            TotalPoints = pointSummary.TotalUnionStatPoints,
+            SpentPoints = pointSummary.SpentUnionStatPoints,
+            AvailablePoints = pointSummary.AvailableUnionStatPoints,
+            TotalUnionStatPoints = pointSummary.TotalUnionStatPoints,
+            SpentUnionStatPoints = pointSummary.SpentUnionStatPoints,
+            AvailableUnionStatPoints = pointSummary.AvailableUnionStatPoints,
+            Allocations = allocations,
+            JobProgress = jobProgress,
+            JobGrades = pointSummary.JobUnionGrades,
+            CurrentUnionRank = {
+                RankId = currentRank.RankId,
+                DisplayName = currentRank.DisplayName,
+                SortOrder = currentRank.SortOrder,
+                MinLifetimeUnionPoints = currentRank.MinLifetimeUnionPoints
+            },
+            Stats = stats
+        }
+        return { Success = true, Reason = "OK", Snapshot = snapshot }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ResolvePointSummaryFromProfile(table profile)
+        local gradeSummary = _UnionJobProgressionServiceLogic:ResolveGradeSummary(profile.JobUnionProgress)
+        if gradeSummary.Success == false then return gradeSummary end
+        local spentSummary = _UnionJobProgressionServiceLogic:CalculateSpentPoints(profile.AllocatedUnionStats)
+        if spentSummary.Success == false then return spentSummary end
+        local available = gradeSummary.TotalUnionStatPoints - spentSummary.SpentUnionStatPoints
+        if available < 0 then
+            return {
+                Success = false,
+                Reason = "ALLOCATED_UNION_STAT_POINTS_EXCEED_TOTAL",
+                TotalUnionStatPoints = gradeSummary.TotalUnionStatPoints,
+                SpentUnionStatPoints = spentSummary.SpentUnionStatPoints,
+                AvailableUnionStatPoints = available
+            }
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            TotalUnionStatPoints = gradeSummary.TotalUnionStatPoints,
+            SpentUnionStatPoints = spentSummary.SpentUnionStatPoints,
+            AvailableUnionStatPoints = available,
+            JobUnionGrades = gradeSummary.JobUnionGrades
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table EnsureDefinitionsValid()
+        if self.DefinitionValidationAttempted == true then
+            return { Success = self.DefinitionsValid, Reason = self.DefinitionValidationReason }
+        end
+        self.DefinitionValidationAttempted = true
+        local statValidation = _UnionStatDefinitionRepositoryLogic:ValidateDefinitions()
+        local gradeValidation = _UnionJobGradeDefinitionRepositoryLogic:ValidateDefinitions()
+        local rankValidation = _UnionRankDefinitionRepositoryLogic:ValidateDefinitions()
+        self.DefinitionsValid = statValidation.Success == true and gradeValidation.Success == true and rankValidation.Success == true
+        if statValidation.Success == false then
+            self.DefinitionValidationReason = statValidation.ErrorSnapshot or statValidation.Reason
+        elseif gradeValidation.Success == false then
+            self.DefinitionValidationReason = gradeValidation.ErrorSnapshot or gradeValidation.Reason
+        elseif rankValidation.Success == false then
+            self.DefinitionValidationReason = rankValidation.ErrorSnapshot or rankValidation.Reason
+        else
+            self.DefinitionValidationReason = "OK"
+        end
+        return { Success = self.DefinitionsValid, Reason = self.DefinitionValidationReason }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ResolveHigherRequiredRank(string definitionRankId, string levelRankId)
+        local definitionRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(definitionRankId)
+        if definitionRank.Success == false then return definitionRank end
+        local levelRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(levelRankId)
+        if levelRank.Success == false then return levelRank end
+        if levelRank.SortOrder > definitionRank.SortOrder then return levelRank end
+        return definitionRank
+    end
+
+    method boolean IsValidRequestId(string requestId)
+        return requestId ~= nil and type(requestId) == "string" and requestId ~= "" and string.len(requestId) <= 128
+    end
+
+    method table GetMutationReceipt(string storageUserKey, string requestId, string operation, string statId)
+        local receipts = self.RequestReceiptsByStorageUserKey[storageUserKey]
+        local receipt = receipts ~= nil and receipts[requestId] or nil
+        if receipt == nil then return { Found = false, Conflict = false } end
+        if receipt.Operation ~= operation or receipt.StatId ~= statId then
+            return { Found = false, Conflict = true }
+        end
+        return { Found = true, Conflict = false, Receipt = receipt }
+    end
+
+    method void StoreMutationReceipt(string storageUserKey, string requestId, string operation, string statId, table result)
+        local receipts = self.RequestReceiptsByStorageUserKey[storageUserKey]
+        local order = self.RequestReceiptOrderByStorageUserKey[storageUserKey]
+        if receipts == nil then
+            receipts = {}
+            self.RequestReceiptsByStorageUserKey[storageUserKey] = receipts
+        end
+        if order == nil then
+            order = {}
+            self.RequestReceiptOrderByStorageUserKey[storageUserKey] = order
+        end
+        if receipts[requestId] == nil then table.insert(order, requestId) end
+        receipts[requestId] = {
+            Operation = operation,
+            StatId = statId,
+            Success = result.Success == true,
+            Reason = result.Reason or "UNKNOWN",
+            WasApplied = result.WasApplied == true,
+            WasReset = result.WasReset == true,
+            PreviousLevel = result.PreviousLevel or 0,
+            NewLevel = result.NewLevel or 0
+        }
+        while #order > self.RequestReceiptRetention do
+            local expiredRequestId = table.remove(order, 1)
+            receipts[expiredRequestId] = nil
+        end
+    end
+
+    method void ClearRequestReceipts(string storageUserKey)
+        -- Session receipts are bounded and discarded with the matching profile cache.
+        if storageUserKey == nil or storageUserKey == "" then return end
+        self.RequestReceiptsByStorageUserKey[storageUserKey] = nil
+        self.RequestReceiptOrderByStorageUserKey[storageUserKey] = nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method table BuildDuplicateResult(table profile, table receipt, string requestId)
+        local snapshotResult = self:BuildAllocationSnapshotFromProfile(profile)
+        if snapshotResult.Success == false then return snapshotResult end
+        return {
+            Success = receipt.Success == true,
+            Reason = receipt.Reason,
+            RequestId = requestId,
+            StatId = receipt.StatId,
+            WasApplied = false,
+            WasReset = false,
+            WasDuplicate = true,
+            PreviousLevel = receipt.PreviousLevel,
+            NewLevel = receipt.NewLevel,
+            Snapshot = snapshotResult.Snapshot
+        }
+    end
+
+    method boolean IsBusinessRejection(string reason)
+        return reason == "STAT_NOT_IMPLEMENTED"
+            or reason == "MAX_LEVEL"
+            or reason == "RANK_LOCKED"
+            or reason == "INSUFFICIENT_UNION_STAT_POINTS"
+    end
+
+    method boolean IsTransientMutationReason(string reason)
+        return reason == "PROFILE_MUTATION_IN_PROGRESS"
+            or reason == "PROFILE_WRITE_CONFLICT"
+            or reason == "PROFILE_LOAD_IN_PROGRESS"
+            or reason == "PROFILE_CACHE_MISSING"
+            or reason == "PROFILE_SAVE_FAILED"
+            or reason == "USER_DATA_STORAGE_UNAVAILABLE"
+            or reason == "PROFILE_ENCODE_FAILED"
+    end
+
+end

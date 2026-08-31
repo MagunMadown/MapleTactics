@@ -156,3 +156,32 @@ This pass supersedes the earlier floating-node presentation rows. The validated 
 | Official Union selected/hover cell effects | `attackerSetting`, `Union board cell`, `공격대 배치` | — | — | MSW official resource search | MANUAL_RESOURCE_SEARCH_REQUIRED | Current gold outline and muted regional fill are project-native runtime presentation and remain temporary until exact official resources are found. |
 
 No RUID was fabricated in this pass. The UI uses the verified Union Coin and Union Raid backdrop, then falls back to the project’s existing Maple-style frame/cell family for the unavailable management UI resources.
+
+## NEW STEP 6 allocation UI asset verification (2026-08-31)
+
+이 섹션은 위 Territory-board 기록을 대체하는 현재 production UI 자산 감사다. 검증된 msw_resource_api.cjs로 MapleStory blue UI panel, MapleStory UI button을 sprite + etc + topK 3으로 검색했고, 유니온 코인은 RUID 상세 조회를 다시 수행했다.
+
+| Asset Purpose | Search/Source | RUID | Verification | Current Use |
+|---|---|---|---|---|
+| Union Coin | exact detail 유니온 코인, sprite-136452, sprite/item, 28×28 | 95632823c5e44dab89b9859ff439165b | FOUND_IN_MSW | 우측 Union Coin 요약 |
+| Outer frame | existing CollectionUI.ui frame family | 7995ae69d68d431cac74097bc100b4b7 | FOUND_IN_PROJECT | 메인 창 |
+| Header frame | existing CollectionUI.ui frame family | 5d241898526c4415a055b977e3c77fa2 | FOUND_IN_PROJECT | 제목 바 |
+| Section frame | existing CollectionUI.ui frame family | 360816ef52c648b788f50821e360e732 | FOUND_IN_PROJECT | 스탯/직업 패널 |
+| Summary inner frame | existing CollectionUI.ui frame family | c24adedc9faa457daf4e4aae7cd663bb | FOUND_IN_PROJECT | 우측 요약 |
+| Metadata panel | existing CollectionUI.ui frame family | b5f829660fbc4a58aaac8b8f4e22775f | FOUND_IN_PROJECT | Coin/Point/Effect/Future 카드 |
+| Rank frame | existing CollectionUI.ui frame family | a7928ea51274446898d8453eb96ee06f | FOUND_IN_PROJECT | Union Rank |
+| Stat/job card | existing CollectionUI.ui frame family | 89e93d0c2c8049138f3c217ce7c648cb | FOUND_IN_PROJECT | 4×2 스탯과 5직업 카드 |
+| Button frame | existing CollectionUI.ui frame family | e22dca176e7c48b39d5b40554b546e22 | FOUND_IN_PROJECT | 닫기, [+], 무료 초기화 |
+
+### Search candidates not admitted
+
+- d7c38171ece441f7984b39b06b3507e4, b9bc39d744cc4f2b8a342300e55605df: 132×168 sprite/etc 후보지만 이름과 Union 출처가 없어 사용하지 않았다.
+- f084b761427e4f0da59b531274907c99, b760aafccbb143dfbc1775a356fee766: 108×28 sprite/etc 버튼 후보지만 비정상적으로 큰 원본 pivot과 Union 출처 부재로 사용하지 않았다.
+- 7578d43ff51a4ce0a86ed67db56622f1: 232×52 sprite/etc 후보지만 Union 전용 자산임을 검증할 수 없어 사용하지 않았다.
+- style-4-blue 문서의 패널/버튼 RUID들은 transaction-flow 구조 참고용으로만 검토했다. 현재 public batch detail에서 notFound였으므로 이번 UI에 사용하지 않았다.
+
+Battle Map/Union Raid backdrop 83f4c25c940e49aca6f240619ba4ff6c와 96-cell용 generic sprite는 현재 배분 UI에서 제거됐다. 신규 RUID를 추측하거나 제작하지 않았다.
+
+### Maker visual verification
+
+실제 Play 카메라에서 0 진행, 요구된 혼합 직업 상태, MAX_HP 배분 후 상태, Reset 후 상태를 캡처했다. 4×2 Stat grid가 시각적 주 영역이고, 하단 5직업 strip과 우측 Rank/Coin/Point/Effect 요약이 분리되어 보였다. Korean Maple font는 카드명·잠금·준비 중·포인트 요약에서 렌더링됐고, Battle Map/96-cell/Block Shop/Legacy purchase 표현은 화면에 없었다.
