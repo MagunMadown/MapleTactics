@@ -1,0 +1,275 @@
+@Component
+script RunShopUIComponent extends Component
+
+	property table Offers = {}
+	property table RowHandlers = {}
+	property table HoverHandlers = {}
+	property any CloseHandler = nil
+	property any BuyHandler = nil
+	property integer SelectedOfferIndex = 0
+	property integer PurchaseRequestId = 200000
+	property string LastRevisionKey = ""
+	property boolean WaitingForOpen = false
+	property string HoverSoundRUID = "159bf70a74634bfc8e91a29e527a4be5"
+	property string ClickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		local closeButton = self:GetEntity("ShopPopup/CloseButton")
+		local buyButton = self:GetEntity("ShopPopup/DetailPanel/BuyButton")
+		if isvalid(closeButton) then
+			self.CloseHandler = closeButton:ConnectEvent(ButtonClickEvent, self.OnCloseClicked)
+			self.HoverHandlers[18] = closeButton:ConnectEvent(UITouchEnterEvent, self.OnAnyHover)
+		end
+		if isvalid(buyButton) then
+			self.BuyHandler = buyButton:ConnectEvent(ButtonClickEvent, self.OnBuyClicked)
+			self.HoverHandlers[19] = buyButton:ConnectEvent(UITouchEnterEvent, self.OnAnyHover)
+		end
+		for rowIndex = 1, 17 do
+			local row = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex))
+			if isvalid(row) then
+				local capturedIndex = rowIndex
+				self.RowHandlers[rowIndex] = row:ConnectEvent(ButtonClickEvent, function() self:SelectOffer(capturedIndex) end)
+				self.HoverHandlers[rowIndex] = row:ConnectEvent(UITouchEnterEvent, self.OnAnyHover)
+			end
+		end
+		self:SetPopupVisible(false)
+		log("[RunShopUI] controller ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCloseClicked()
+		_SoundService:PlaySound(self.ClickSoundRUID, 1)
+		self:CloseUi()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnAnyHover()
+		_SoundService:PlaySound(self.HoverSoundRUID, 1)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OpenUi()
+		local flow = _RunManagerLogic:GetLocalRunFlowUiState()
+		if flow.Success ~= true or flow.Transition.ContentType ~= "SHOP" or flow.Commands.CanCompleteContent ~= true then
+			self:SetStatus(flow.Reason or "SHOP_NOT_AVAILABLE")
+			return
+		end
+		self.WaitingForOpen = true
+		self:SetPopupVisible(true)
+		self:SetStatus("상점 정보를 불러오는 중입니다.")
+		_RunShopLogic:RequestOpenSelectedShop()
+		log("[RunShopUI] open requested selected=" .. flow.Transition.ContentId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseUi()
+		self.WaitingForOpen = false
+		self:SetPopupVisible(false)
+		log("[RunShopUI] popup hidden without completing shop")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		local popup = self:GetEntity("ShopPopup")
+		if isvalid(popup) == false or popup.Enable == false then return end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success ~= true then
+			self:SetStatus(state.Reason or "SHOP_STATE_UNAVAILABLE")
+			return
+		end
+		if state.RevisionKey == self.LastRevisionKey then return end
+		self.LastRevisionKey = state.RevisionKey
+		if state.ShopState == "OPEN" then self.WaitingForOpen = false end
+		self:RefreshFromState(state)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshFromState(table state)
+		-- Rebuilds the offer list with readable name, category, price, and sold-state labels.
+		self.Offers = self:ParseOffers(state.OfferSnapshot)
+		self:SetText("ShopPopup/Title", state.ShopId == "shop_upper" and "위쪽 장신구 상점" or "아래쪽 장비 상점")
+		self:SetText("ShopPopup/GoldPanel/GoldText", tostring(self:GetSnapshotAmount(state.CurrencySnapshot, "gold")))
+		for rowIndex = 1, 17 do
+			local row = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex))
+			local offer = self.Offers[rowIndex]
+			if isvalid(row) then
+				local visible = offer ~= nil
+				row.Enable = visible
+				row.Visible = visible
+				if visible then
+					local sold = self:ContainsId(state.PurchasedOfferIds, offer.OfferId)
+					row.ButtonComponent.Enable = not sold
+					row.TextGUIRendererComponent.Text = offer.DisplayName
+					self:SetText("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex) .. "/CategoryText", offer.ItemCategory)
+					self:SetText("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex) .. "/PriceText", sold and "판매 완료" or (tostring(offer.Price) .. " 골드"))
+					self:SetImage("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex) .. "/Icon", offer.IconImageRUID)
+				end
+			end
+		end
+		if self.SelectedOfferIndex <= 0 or self.Offers[self.SelectedOfferIndex] == nil then
+			self.SelectedOfferIndex = #self.Offers > 0 and 1 or 0
+		end
+		self:RefreshSelectedOffer(state)
+		if state.LastPurchase.Reason ~= "" and state.LastPurchase.Reason ~= "SHOP_OPENED" then self:SetStatus(state.LastPurchase.Reason) end
+		log("[RunShopUI] refreshed shop=" .. state.ShopId .. " offers=" .. tostring(#self.Offers) .. " items=" .. state.ItemSnapshot)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectOffer(integer rowIndex)
+		if self.Offers[rowIndex] == nil then return end
+		_SoundService:PlaySound(self.ClickSoundRUID, 1)
+		self.SelectedOfferIndex = rowIndex
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success == true then self:RefreshSelectedOffer(state) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshSelectedOffer(table state)
+		-- Updates the detail card and keeps the selected offer visually distinct in the list.
+		local offer = self.Offers[self.SelectedOfferIndex]
+		local buy = self:GetEntity("ShopPopup/DetailPanel/BuyButton")
+		self:RefreshOfferRowVisuals(state)
+		if offer == nil then
+			self:SetText("ShopPopup/DetailPanel/ItemName", "상품을 선택하세요")
+			if isvalid(buy) then buy.ButtonComponent.Enable = false end
+			return
+		end
+		local owned = self:GetSnapshotAmount(state.ItemSnapshot, offer.RewardRefId)
+		local sold = self:ContainsId(state.PurchasedOfferIds, offer.OfferId)
+		self:SetDetailImage(offer.IconImageRUID)
+		self:SetText("ShopPopup/DetailPanel/ItemName", offer.DisplayName)
+		self:SetText("ShopPopup/DetailPanel/CategoryText", "분류  " .. offer.ItemCategory)
+		self:SetText("ShopPopup/DetailPanel/OwnedText", "보유  " .. tostring(owned))
+		self:SetText("ShopPopup/DetailPanel/PriceText", "가격  " .. tostring(offer.Price) .. " 골드")
+		if isvalid(buy) then
+			buy.ButtonComponent.Enable = state.Commands.CanPurchase and not sold
+			buy.TextGUIRendererComponent.Text = sold and "판매 완료" or "구매"
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshOfferRowVisuals(table state)
+		-- Applies normal, selected, and sold colors without hiding item artwork.
+		for rowIndex = 1, 17 do
+			local row = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex))
+			local offer = self.Offers[rowIndex]
+			if isvalid(row) and row.Enable and offer ~= nil then
+				local sold = self:ContainsId(state.PurchasedOfferIds, offer.OfferId)
+				local selected = rowIndex == self.SelectedOfferIndex
+				local selectedBar = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex) .. "/SelectedBar")
+				if isvalid(selectedBar) then selectedBar.Enable = selected and not sold end
+				if row.SpriteGUIRendererComponent ~= nil then
+					if sold then
+						row.SpriteGUIRendererComponent.Color = Color(0.72, 0.69, 0.63, 0.82)
+					elseif selected then
+						row.SpriteGUIRendererComponent.Color = Color(1.0, 0.80, 0.34, 1.0)
+					else
+						row.SpriteGUIRendererComponent.Color = Color(1.0, 0.96, 0.84, 0.96)
+					end
+				end
+			end
+		end
+		log("[RunShopUI] row visuals selected=" .. tostring(self.SelectedOfferIndex))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBuyClicked()
+		local offer = self.Offers[self.SelectedOfferIndex]
+		if offer == nil then return end
+		_SoundService:PlaySound(self.ClickSoundRUID, 1)
+		self.PurchaseRequestId = self.PurchaseRequestId + 1
+		self:SetStatus("구매를 요청했습니다.")
+		_RunShopLogic:RequestPurchaseOffer(offer.OfferId, self.PurchaseRequestId)
+		log("[RunShopUI] purchase requested offer=" .. offer.OfferId .. " request=" .. self.PurchaseRequestId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table ParseOffers(string snapshot)
+		local offers = {}
+		for rawOffer in string.gmatch(snapshot or "", "([^|]+)") do
+			local fields = {}
+			for field in string.gmatch(rawOffer .. "~", "([^~]*)~") do table.insert(fields, field) end
+			if #fields >= 10 then
+				table.insert(offers, { OfferId = fields[1], DisplayName = fields[2], RewardType = fields[3], RewardRefId = fields[4], RewardAmount = tonumber(fields[5]) or 0, CurrencyId = fields[6], Price = tonumber(fields[7]) or 0, Order = tonumber(fields[8]) or 0, IconImageRUID = fields[9], ItemCategory = fields[10] })
+			end
+		end
+		return offers
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer GetSnapshotAmount(string snapshot, string targetId)
+		for entry in string.gmatch(snapshot or "", "([^|]+)") do
+			local separator = string.find(entry, "~", 1, true)
+			if separator ~= nil and string.sub(entry, 1, separator - 1) == targetId then return math.floor(tonumber(string.sub(entry, separator + 1)) or 0) end
+		end
+		return 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ContainsId(string snapshot, string targetId)
+		return string.find("|" .. (snapshot or "") .. "|", "|" .. targetId .. "|", 1, true) ~= nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetPopupVisible(boolean visible)
+		local popup = self:GetEntity("ShopPopup")
+		local dim = self:GetEntity("Dim")
+		if isvalid(popup) then
+			popup.Enable = visible
+			popup.Visible = visible
+		end
+		if isvalid(dim) then
+			dim.Enable = visible
+			dim.Visible = visible
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetStatus(string message)
+		self:SetText("ShopPopup/StatusText", message or "")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetText(string relativePath, string value)
+		local entity = self:GetEntity(relativePath)
+		if isvalid(entity) and entity.TextGUIRendererComponent ~= nil then entity.TextGUIRendererComponent.Text = value or "" end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetImage(string relativePath, string imageRuid)
+		local entity = self:GetEntity(relativePath)
+		if isvalid(entity) and entity.SpriteGUIRendererComponent ~= nil and imageRuid ~= nil and imageRuid ~= "" then entity.SpriteGUIRendererComponent.ImageRUID = DataRef(imageRuid) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetDetailImage(string imageRuid)
+		-- Keeps the enlarged detail icon above its decorative frame and preserves the source colors.
+		local entity = self:GetEntity("ShopPopup/DetailPanel/ItemIcon")
+		if isvalid(entity) == false or entity.SpriteGUIRendererComponent == nil or imageRuid == nil or imageRuid == "" then return end
+		entity.SpriteGUIRendererComponent.ImageRUID = DataRef(imageRuid)
+		entity.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+		_UILogic:SetSiblingIndex(entity.UITransformComponent, 1000000)
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetEntity(string relativePath)
+		return _EntityService:GetEntityByPath("/ui/RunShopUI/" .. relativePath)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		local closeButton = self:GetEntity("ShopPopup/CloseButton")
+		local buyButton = self:GetEntity("ShopPopup/DetailPanel/BuyButton")
+		if isvalid(closeButton) and self.CloseHandler ~= nil then closeButton:DisconnectEvent(ButtonClickEvent, self.CloseHandler) end
+		if isvalid(buyButton) and self.BuyHandler ~= nil then buyButton:DisconnectEvent(ButtonClickEvent, self.BuyHandler) end
+		if isvalid(closeButton) and self.HoverHandlers[18] ~= nil then closeButton:DisconnectEvent(UITouchEnterEvent, self.HoverHandlers[18]) end
+		if isvalid(buyButton) and self.HoverHandlers[19] ~= nil then buyButton:DisconnectEvent(UITouchEnterEvent, self.HoverHandlers[19]) end
+		for rowIndex = 1, 17 do
+			local row = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex))
+			if isvalid(row) and self.RowHandlers[rowIndex] ~= nil then row:DisconnectEvent(ButtonClickEvent, self.RowHandlers[rowIndex]) end
+			if isvalid(row) and self.HoverHandlers[rowIndex] ~= nil then row:DisconnectEvent(UITouchEnterEvent, self.HoverHandlers[rowIndex]) end
+		end
+	end
+
+end
