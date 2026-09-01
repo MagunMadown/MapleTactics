@@ -105,6 +105,135 @@ script UnionStatAllocationServiceLogic extends Logic
     end
 
     @ExecSpace("ServerOnly")
+    method table TryApplyUnionStatAllocation(Entity userEntity, table allocationMap, string requestId)
+        -- Applies one complete allocation intent. The client never supplies totals, costs, or rank eligibility.
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then return profileResult end
+        return self:TryApplyUnionStatAllocationByStorageKey(profileResult.StorageUserKey, allocationMap, requestId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryApplyUnionStatAllocationByStorageKey(string storageUserKey, table allocationMap, string requestId)
+        local profile = _UnionProfileRepositoryLogic:GetCachedSnapshot(storageUserKey)
+        if profile == nil then
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", WasReplaced = false }
+        end
+        if self:IsValidRequestId(requestId) == false then
+            return { Success = false, Reason = "INVALID_ALLOCATION_REQUEST_ID", WasReplaced = false }
+        end
+        local preflight = self:ValidateUnionStatAllocationFromProfile(profile, allocationMap)
+        local signature = preflight.Success == true and self:BuildAllocationSignature(preflight.NormalizedAllocation) or "INVALID"
+        local receipt = self:GetMutationReceipt(storageUserKey, requestId, "APPLY", signature)
+        if receipt.Conflict == true then
+            return { Success = false, Reason = "ALLOCATION_REQUEST_ID_CONFLICT", RequestId = requestId, WasReplaced = false }
+        end
+        if receipt.Found == true then return self:BuildDuplicateResult(profile, receipt.Receipt, requestId) end
+        if preflight.Success == false then
+            preflight.RequestId = requestId
+            preflight.WasReplaced = false
+            local snapshotResult = self:BuildAllocationSnapshotFromProfile(profile)
+            if snapshotResult.Success == true then preflight.Snapshot = snapshotResult.Snapshot end
+            return preflight
+        end
+
+        local mutation = _UnionProfileRepositoryLogic:TryReplaceAllocatedUnionStatsByStorageKey(storageUserKey, preflight.NormalizedAllocation)
+        mutation.RequestId = requestId
+        local authoritativeProfile = mutation.Snapshot or profile
+        local snapshotResult = self:BuildAllocationSnapshotFromProfile(authoritativeProfile)
+        if snapshotResult.Success == true then
+            mutation.Snapshot = snapshotResult.Snapshot
+        elseif mutation.Success == true then
+            return snapshotResult
+        end
+        if self:IsTransientMutationReason(mutation.Reason) == false then
+            self:StoreMutationReceipt(storageUserKey, requestId, "APPLY", signature, mutation)
+        end
+        if mutation.Success == true then
+            log("[UnionStatAllocation] allocation replaced spent=" .. tostring(preflight.SpentUnionStatPoints) .. " request=" .. requestId)
+        end
+        return mutation
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidateUnionStatAllocationFromProfile(table profile, table allocationMap)
+        -- Full authoritative validation for both preflight and the repository's mutation-lock recheck.
+        local profileValidation = _UnionProfileRepositoryLogic:ValidateProfileData(profile)
+        if profileValidation.Success == false then
+            return { Success = false, Reason = profileValidation.DetailReason or profileValidation.Reason }
+        end
+        if type(allocationMap) ~= "table" then return { Success = false, Reason = "INVALID_ALLOCATION_PAYLOAD" } end
+        local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(profile.LifetimeUnionPoints)
+        if currentRank.Success == false then return currentRank end
+        local gradeSummary = _UnionJobProgressionServiceLogic:ResolveGradeSummary(profile.JobUnionProgress)
+        if gradeSummary.Success == false then return gradeSummary end
+
+        local normalized = {}
+        local spent = 0
+        for statId, rawLevel in pairs(allocationMap) do
+            if type(statId) ~= "string" or statId == "" then
+                return { Success = false, Reason = "INVALID_STAT_ID" }
+            end
+            local definition = _UnionStatDefinitionRepositoryLogic:GetStat(statId)
+            if definition.Success == false then
+                return { Success = false, Reason = "UNION_STAT_NOT_FOUND", StatId = statId }
+            end
+            if definition.IsImplemented ~= true then
+                return { Success = false, Reason = "STAT_NOT_IMPLEMENTED", StatId = statId }
+            end
+            local numericLevel = tonumber(rawLevel)
+            if numericLevel == nil or numericLevel < 0 or numericLevel ~= math.floor(numericLevel) then
+                return { Success = false, Reason = "INVALID_UNION_STAT_LEVEL", StatId = statId }
+            end
+            local level = math.floor(numericLevel)
+            if level > definition.MaxLevel then
+                return { Success = false, Reason = "MAX_LEVEL", StatId = statId, MaxLevel = definition.MaxLevel }
+            end
+            if level > 0 then normalized[statId] = level end
+            for allocatedLevel = 1, level do
+                local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(statId, allocatedLevel)
+                if levelDefinition.Success == false then
+                    return { Success = false, Reason = levelDefinition.Reason or "UNION_STAT_LEVEL_NOT_FOUND", StatId = statId, Level = allocatedLevel }
+                end
+                local requiredRank = self:ResolveHigherRequiredRank(definition.RequiredUnionRank, levelDefinition.RequiredUnionRank)
+                if requiredRank.Success == false then return requiredRank end
+                if currentRank.SortOrder < requiredRank.SortOrder then
+                    return { Success = false, Reason = "RANK_LOCKED", StatId = statId, Level = allocatedLevel, RequiredUnionRank = requiredRank.RankId }
+                end
+                spent = spent + math.floor(tonumber(levelDefinition.PointCost) or 0)
+            end
+        end
+        if spent > gradeSummary.TotalUnionStatPoints then
+            return {
+                Success = false,
+                Reason = "INSUFFICIENT_UNION_STAT_POINTS",
+                TotalUnionStatPoints = gradeSummary.TotalUnionStatPoints,
+                SpentUnionStatPoints = spent,
+                AvailableUnionStatPoints = gradeSummary.TotalUnionStatPoints - spent
+            }
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            NormalizedAllocation = normalized,
+            TotalUnionStatPoints = gradeSummary.TotalUnionStatPoints,
+            SpentUnionStatPoints = spent,
+            AvailableUnionStatPoints = gradeSummary.TotalUnionStatPoints - spent
+        }
+    end
+
+    method string BuildAllocationSignature(table allocationMap)
+        local parts = {}
+        local definitions = _UnionStatDefinitionRepositoryLogic:GetAllStats()
+        if definitions.Success == true then
+            for _, definition in ipairs(definitions.Stats) do
+                local level = math.floor(tonumber(allocationMap[definition.StatId]) or 0)
+                if level > 0 then table.insert(parts, definition.StatId .. "=" .. tostring(level)) end
+            end
+        end
+        return table.concat(parts, ";")
+    end
+
+    @ExecSpace("ServerOnly")
     method table CanResetUnionStats(Entity userEntity)
         local snapshotResult = self:GetUnionStatAllocationSnapshot(userEntity)
         if snapshotResult.Success == false then
@@ -290,6 +419,20 @@ script UnionStatAllocationServiceLogic extends Logic
                 local currentLevelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, currentLevel)
                 if currentLevelDefinition.Success == true then currentEffectValue = currentLevelDefinition.EffectValue end
             end
+            local levelPointCosts = {}
+            local levelEffectValues = {}
+            local editableMaxLevel = 0
+            for level = 1, definition.MaxLevel do
+                local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, level)
+                if levelDefinition.Success == true then
+                    table.insert(levelPointCosts, math.floor(tonumber(levelDefinition.PointCost) or 0))
+                    table.insert(levelEffectValues, tonumber(levelDefinition.EffectValue) or 0)
+                    local levelRank = self:ResolveHigherRequiredRank(definition.RequiredUnionRank, levelDefinition.RequiredUnionRank)
+                    if definition.IsImplemented == true and levelRank.Success == true and currentRank.SortOrder >= levelRank.SortOrder then
+                        editableMaxLevel = level
+                    end
+                end
+            end
             table.insert(stats, {
                 StatId = definition.StatId,
                 Category = definition.Category,
@@ -305,7 +448,10 @@ script UnionStatAllocationServiceLogic extends Logic
                 NextPointCost = nextPointCost,
                 CanIncrease = increaseReason == "OK",
                 IncreaseReason = increaseReason,
-                SortOrder = definition.SortOrder
+                SortOrder = definition.SortOrder,
+                EditableMaxLevel = editableMaxLevel,
+                LevelPointCosts = levelPointCosts,
+                LevelEffectValues = levelEffectValues
             })
         end
         local jobProgress = _UnionProfileRepositoryLogic:CopyLevelMap(profile.JobUnionProgress)
@@ -424,6 +570,7 @@ script UnionStatAllocationServiceLogic extends Logic
             Reason = result.Reason or "UNKNOWN",
             WasApplied = result.WasApplied == true,
             WasReset = result.WasReset == true,
+            WasReplaced = result.WasReplaced == true,
             PreviousLevel = result.PreviousLevel or 0,
             NewLevel = result.NewLevel or 0
         }
@@ -451,6 +598,7 @@ script UnionStatAllocationServiceLogic extends Logic
             StatId = receipt.StatId,
             WasApplied = false,
             WasReset = false,
+            WasReplaced = false,
             WasDuplicate = true,
             PreviousLevel = receipt.PreviousLevel,
             NewLevel = receipt.NewLevel,

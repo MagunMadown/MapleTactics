@@ -305,6 +305,63 @@ script UnionProfileRepositoryLogic extends Logic
     end
 
     @ExecSpace("ServerOnly")
+    method table TryReplaceAllocatedUnionStats(Entity userEntity, table allocationMap)
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then return profileResult end
+        return self:TryReplaceAllocatedUnionStatsByStorageKey(profileResult.StorageUserKey, allocationMap)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryReplaceAllocatedUnionStatsByStorageKey(string storageUserKey, table allocationMap)
+        -- Atomically replaces only AllocatedUnionStats after a second full validation under the profile lock.
+        if storageUserKey == nil or storageUserKey == "" then
+            return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING", WasReplaced = false }
+        end
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", WasReplaced = false, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        end
+        local candidate = self:GetCachedSnapshot(storageUserKey)
+        if candidate == nil then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", WasReplaced = false }
+        end
+        local validation = _UnionStatAllocationServiceLogic:ValidateUnionStatAllocationFromProfile(candidate, allocationMap)
+        if validation.Success == false then
+            self:ReleaseMutationLock(storageUserKey)
+            validation.WasReplaced = false
+            validation.Snapshot = candidate
+            return validation
+        end
+        local previousSignature = _UnionStatAllocationServiceLogic:BuildAllocationSignature(candidate.AllocatedUnionStats)
+        local nextSignature = _UnionStatAllocationServiceLogic:BuildAllocationSignature(validation.NormalizedAllocation)
+        if previousSignature == nextSignature then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = true, Reason = "UNION_STATS_UNCHANGED", WasReplaced = false, WasWritten = false, Snapshot = candidate }
+        end
+        candidate.AllocatedUnionStats = self:CopyLevelMap(validation.NormalizedAllocation)
+        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        self:ReleaseMutationLock(storageUserKey)
+        if persisted.Success == false then
+            return {
+                Success = false,
+                Reason = persisted.Reason,
+                DetailReason = persisted.DetailReason or "",
+                ErrorCode = persisted.ErrorCode or 0,
+                WasReplaced = false,
+                Snapshot = self:GetCachedSnapshot(storageUserKey)
+            }
+        end
+        log("[UnionStatAllocation] persisted whole allocation spent=" .. tostring(validation.SpentUnionStatPoints))
+        return {
+            Success = true,
+            Reason = "UNION_STATS_APPLIED",
+            WasReplaced = true,
+            WasWritten = persisted.WasWritten == true,
+            Snapshot = self:CloneProfile(candidate)
+        }
+    end
+
+    @ExecSpace("ServerOnly")
     method table TryResetAllocatedUnionStatsByStorageKey(string storageUserKey)
         -- Reset is free and replaces only AllocatedUnionStats; Union Coin and PurchasedLevels are untouched.
         if storageUserKey == nil or storageUserKey == "" then
