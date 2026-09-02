@@ -11,6 +11,13 @@ script BattleSessionComponent extends Component
 	@Sync property string ExecutingTileIds = ""
 	@Sync property integer ExecutingTileIndex = 0
 	@Sync property integer TileQueueCapacity = 3
+	@Sync property integer QueueReorderReceiptRevision = 0
+	@Sync property integer QueueLastRequestId = 0
+	@Sync property boolean QueueLastRequestSuccess = false
+	@Sync property string QueueLastRequestReason = ""
+	@Sync property integer QueueLastSourceIndex = 0
+	@Sync property integer QueueLastTargetIndex = 0
+	@Sync property integer QueueLastOrderRevision = 0
 	@Sync property string BattleResult = ""
 	@Sync property integer UnionRewardRunId = 0
 	@Sync property integer UnionRewardBasePoints = 0
@@ -84,6 +91,7 @@ script BattleSessionComponent extends Component
 	property integer SkillSlotSourceRunOrderRevision = 0
 	property integer SkillSlotCount = 6
 	property integer LastProcessedSkillSlotReorderRequestId = 0
+	property integer LastProcessedQueueReorderRequestId = 0
 	-- One knob for how fast every skill plays. Above 1 speeds the swing, the effects, the impact frame,
 	-- and the queue slot together, so presentation and pacing never drift apart.
 	@Sync property number SkillSpeedMultiplier = 1.25
@@ -2855,18 +2863,27 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
-	method void RequestMoveQueuedTile(integer fromIndex, integer toIndex)
-		-- Validates the requesting player before reordering the queued tiles for free.
+	method void RequestMoveQueuedTile(integer fromIndex, integer toIndex, integer requestId, integer expectedQueueOrderRevision)
+		-- Future queue drag sends indices and concurrency metadata only. Skill identities remain
+		-- server-owned inside TurnState. No current UI calls this method in STEP 8.
 		if self:IsValidPlayerRequest(senderUserId) == false then
-			log_warning("[BattleTileQueue] move rejected from=" .. fromIndex .. " to=" .. toIndex .. " reason=INVALID_SENDER")
+			log_warning("[BattleQueueReorder] rejected request=" .. tostring(requestId) .. " reason=INVALID_SENDER")
+			return
+		end
+		if requestId <= 0 then
+			log_warning("[BattleQueueReorder] rejected request=" .. tostring(requestId) .. " reason=INVALID_REQUEST_ID")
+			return
+		end
+		if requestId <= self.LastProcessedQueueReorderRequestId then
+			local replayReason = requestId == self.LastProcessedQueueReorderRequestId and "DUPLICATE_REQUEST" or "STALE_REQUEST"
+			log_warning("[BattleQueueReorder] rejected request=" .. tostring(requestId) .. " last=" .. tostring(self.LastProcessedQueueReorderRequestId) .. " reason=" .. replayReason)
 			return
 		end
 
-		local result = self:TryMoveQueuedTile(fromIndex, toIndex)
+		self.LastProcessedQueueReorderRequestId = requestId
+		local result = self:TryReorderQueuedTile(fromIndex, toIndex, expectedQueueOrderRevision)
 		self:PublishPlayerCommandResult("REORDER_QUEUE", result)
-		if result.Success == false then
-			log_warning("[BattleTileQueue] move rejected from=" .. fromIndex .. " to=" .. toIndex .. " reason=" .. result.Reason)
-		end
+		self:PublishQueueReorderReceipt(fromIndex, toIndex, result)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3161,6 +3178,63 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table TryReorderQueuedTile(integer fromIndex, integer toIndex, integer expectedQueueOrderRevision)
+		local currentRevision = self.TurnState ~= nil and self.TurnState.QueueOrderRevision or 0
+		local currentQueue = self.TurnState ~= nil and self.TurnState.QueuedTileIds or ""
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			FromIndex = fromIndex,
+			ToIndex = toIndex,
+			PreviousQueue = currentQueue,
+			QueuedTileIds = currentQueue,
+			QueueOrderRevision = currentRevision
+		}
+		if fromIndex ~= math.floor(fromIndex) or toIndex ~= math.floor(toIndex) then
+			result.Reason = "INVALID_QUEUE_INDEX_TYPE"
+			return result
+		end
+		if expectedQueueOrderRevision ~= math.floor(expectedQueueOrderRevision) then
+			result.Reason = "INVALID_QUEUE_REVISION_TYPE"
+			return result
+		end
+		if self.ContentValidationState ~= "VALID" then
+			result.Reason = "CONTENT_NOT_READY"
+			return result
+		end
+		if self.BattleResult ~= "" then
+			result.Reason = "BATTLE_ALREADY_ENDED"
+			return result
+		end
+		if self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "NOT_PLAYER_DECISION_STATE"
+			return result
+		end
+		if self.TurnState.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+		if self.TurnState.ExecutingTileIds ~= "" then
+			result.Reason = "EXECUTION_SNAPSHOT_ACTIVE"
+			return result
+		end
+		if expectedQueueOrderRevision ~= self.TurnState.QueueOrderRevision then
+			result.Reason = "STALE_QUEUE_REVISION"
+			return result
+		end
+		if self.TurnState.QueuedTileCount < 2 then
+			result.Reason = "QUEUE_REORDER_NOT_NEEDED"
+			return result
+		end
+
+		result = self:TryMoveQueuedTile(fromIndex, toIndex)
+		result.PreviousQueue = currentQueue
+		result.QueuedTileIds = self.TurnState.QueuedTileIds
+		result.QueueOrderRevision = self.TurnState.QueueOrderRevision
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method table TryMoveQueuedTile(integer fromIndex, integer toIndex)
 		-- Reorders the queued tiles without advancing the turn or starting the enemy round.
 		local result = self.TurnState:TryMoveQueuedSkill(fromIndex, toIndex)
@@ -3172,6 +3246,25 @@ script BattleSessionComponent extends Component
 			log("[BattleTileQueue] moved tile=" .. result.MovedSkillId .. " from=" .. fromIndex .. " to=" .. toIndex .. " queue=" .. self.TurnState.QueuedTileIds .. " turn=" .. self.TurnNumber)
 		end
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishQueueReorderReceipt(integer fromIndex, integer toIndex, table result)
+		self.QueueLastRequestId = self.LastProcessedQueueReorderRequestId
+		self.QueueLastRequestSuccess = result ~= nil and result.Success == true
+		self.QueueLastRequestReason = result ~= nil and result.Reason or "UNKNOWN"
+		self.QueueLastSourceIndex = fromIndex
+		self.QueueLastTargetIndex = toIndex
+		self.QueueLastOrderRevision = self.TurnState ~= nil and self.TurnState.QueueOrderRevision or 0
+		self.QueueReorderReceiptRevision = self.QueueReorderReceiptRevision + 1
+		log("[BattleQueueReorder] receipt request=" .. tostring(self.QueueLastRequestId)
+			.. " success=" .. tostring(self.QueueLastRequestSuccess)
+			.. " reason=" .. self.QueueLastRequestReason
+			.. " from=" .. tostring(fromIndex)
+			.. " to=" .. tostring(toIndex)
+			.. " queueRevision=" .. tostring(self.QueueLastOrderRevision)
+			.. " queued=" .. tostring(self.TurnState ~= nil and self.TurnState.QueuedTileIds or "")
+			.. " executing=" .. tostring(self.TurnState ~= nil and self.TurnState.ExecutingTileIds or ""))
 	end
 
 	@ExecSpace("Server")
@@ -3881,7 +3974,7 @@ script BattleSessionComponent extends Component
 				HitFlashDuration = self.HitFlashDuration,
 				HitReactionDuration = self.HitReactionDuration
 			},
-			RevisionKey = tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. tostring(self.UnionRewardRevision) .. ":" .. self.BattleResult,
+			RevisionKey = tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.QueueOrderRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. tostring(self.UnionRewardRevision) .. ":" .. self.BattleResult,
 			Phase = turnState.BattlePhase,
 			TurnNumber = turnState.TurnNumber,
 			IsProcessing = turnState.IsActionProcessing,
@@ -3974,6 +4067,16 @@ script BattleSessionComponent extends Component
 				ExecutingTileIds = turnState.ExecutingTileIds,
 				ExecutingIndex = turnState.ExecutingTileIndex,
 				ModifierSnapshot = turnState.QueueCapacityModifierSnapshot,
+				QueueOrderRevision = turnState.QueueOrderRevision,
+				ReorderReceipt = {
+					Revision = self.QueueReorderReceiptRevision,
+					RequestId = self.QueueLastRequestId,
+					Success = self.QueueLastRequestSuccess,
+					Reason = self.QueueLastRequestReason,
+					SourceIndex = self.QueueLastSourceIndex,
+					TargetIndex = self.QueueLastTargetIndex,
+					QueueOrderRevision = self.QueueLastOrderRevision
+				},
 				Revision = turnState.QueueCapacityRevision
 			},
 			EnemyIntentMode = "PER_ENEMY_RANGE_AWARE_QUEUE_V2",

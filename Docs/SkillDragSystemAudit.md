@@ -844,3 +844,366 @@ The mid-drag transfer deliberately kept pointer-down active while moving from `r
 - Merge readiness: **READY**
 - Push/merge performed: **NO**
 - STEP 6 stop condition: **satisfied**
+
+### STEP 7 Shogun-style Queue Drag Audit
+
+#### Audit-only boundary
+
+This step audits the existing reservation queue for two future gestures only. It does not implement queue drag, alter the Step 1-6 Battle skill-bar reorder, change turn/cooldown behavior, or edit a `.ui` asset.
+
+The intended interaction split is viable, but only if the two gestures keep distinct authoritative mutations:
+
+- **bottom Battle skill -> overhead queue:** propose the same existing reservation command as a normal skill-slot click; a successful reservation keeps its existing turn cost;
+- **queued skill -> another queue position:** reorder only the editable future execution sequence; it must consume no turn and must never enter the reservation or execution paths.
+
+#### 1. Current reservation input and exact authoritative path
+
+The tracked production input is **not a dedicated right-click handler**. `BattleQueueHudComponent:OnBeginPlay` connects all six bottom slots through `ButtonClickEvent`, and `OnSkillSlotNClicked` calls `RequestSlotSkill(slotIndex)`. No `Mouse1`, `Mouse2`, right-click, secondary-click, or alternate reservation handler exists in the project source. The future drag implementation must therefore preserve a generic click reservation path rather than depend on an undocumented right-click assumption.
+
+```text
+BattleQueueHUD slot ButtonClickEvent
+  -> BattleQueueHudComponent:OnSkillSlotNClicked
+  -> BattleQueueHudComponent:RequestSlotSkill(slotIndex)
+       resolves the displayed SkillId
+       suppresses click after a drag
+  -> BattleHudPresenterLogic:RequestQueueTile(skillId)
+  -> BattleHudPresenterLogic:TryBeginLocalCommand("QUEUE_TILE")
+       rejects another local command while one is pending
+       checks UiState.Commands.CanQueue
+  -> BattleSessionComponent:RequestQueueTile(skillId) [Server RPC]
+       validates senderUserId against PlayerEntity
+  -> BattleSessionComponent:TryQueueTile(skillId) [ServerOnly]
+  -> BattleTurnComponent:TryAppendSkill(skillId) [ServerOnly]
+  -> PublishTurnStateSnapshot("SKILL_QUEUED")
+  -> PublishPlayerCommandResult("QUEUE_TILE", result)
+```
+
+There is one production caller of `BattleHudPresenterLogic:RequestQueueTile`: `BattleQueueHudComponent:RequestSlotSkill`. A future bottom-to-queue drop should reuse this exact Presenter boundary with the source slot's current SkillId.
+
+#### 2. Queue UI entities and current input capability
+
+The visible reservation queue is `ui/TacticsPlayerOverheadHUD.ui`, rendered by `PlayerOverheadQueueHudComponent`, not the bottom `BattleQueueHudComponent`.
+
+| Entity | UUID | Position/size | Current input state |
+|---|---|---|---|
+| `ReservationQueue` | `22e2a4fe-44a2-44c3-a14b-aa8d19add365` | 84 x 252 | Container; disabled when no visible queue item exists |
+| `QueueSlot_01` | `e1e8d80a-7f73-4e33-bca7-f2a5a750fda7` | Y -84, 76 x 76 | Static slot entity; no Button/TouchReceive binding |
+| `QueueSlot_02` | `c7a4ea66-58e8-4dc4-9892-73920fe70a0f` | Y 0, 76 x 76 | Static slot entity; no Button/TouchReceive binding |
+| `QueueSlot_03` | `0680cab0-99a6-47c9-9635-5524bb8fb610` | Y 84, 76 x 76 | Static slot entity; no Button/TouchReceive binding |
+
+Each slot owns Background, InnerBackground, SkillIcon, and a hidden SkillNameText child. `PlayerOverheadQueueHudComponent` has no `ConnectEvent`, touch, button, drag-source, or drop-target code. Queue drag therefore has no existing UI input seam even though an authoritative reorder method already exists on the server.
+
+#### 3. Queue storage semantics
+
+`BattleTurnComponent` owns synchronized queue state:
+
+- `QueuedTileIds`: compact pipe-delimited SkillId list, for example `A|B|C`;
+- `QueuedTileCount`: token count; indices are 1-based;
+- `ExecutingTileIds`: frozen execution copy;
+- `ExecutingTileIndex`: current 1-based execution position;
+- capacity: `BaseQueueCapacity`, `QueueCapacityBonus`, `TileQueueCapacity`, minimum 1 and maximum 6;
+- revisions: general `StateRevision` and capacity-only `QueueCapacityRevision`.
+
+There are no empty queue placeholders. Append always adds to the end. Although legacy names say TileId, the values are current production SkillIds and are validated/executed as SkillIds.
+
+#### 4. Visual order to execution order
+
+Storage and execution are direct: `A|B|C` executes index 1, then 2, then 3. `TryFreezeSkillQueue` copies `QueuedTileIds` to `ExecutingTileIds`, clears the editable queue, and sets `ExecutingTileIndex = 1`. `ExecuteNextQueuedTile` reads `GetTileIdAt(ExecutingTileIds, ExecutingTileIndex)` and increments only after the action completes.
+
+The current overhead layout maps:
+
+| Pipe index | UI entity | Screen stack | Execution |
+|---:|---|---|---|
+| 1 | `QueueSlot_01` | bottom | first |
+| 2 | `QueueSlot_02` | middle | second |
+| 3 | `QueueSlot_03` | top | third |
+
+Therefore the present visual execution direction is **bottom -> middle -> top**. During execution, the current `ExecutingIndex` item is again rendered in slot 1 at the bottom, with the remaining items above it.
+
+#### 5. Existing reservation turn cost
+
+After a successful append, `TryQueueTile` sets `ConsumesTurn = definition.FreePlay ~= true`. When true it calls `BeginEnemyTurnFromPlayerAction("SKILL_QUEUED")`, which enters `BeginEnemyTurn`; when false it retains the player turn.
+
+All currently authored Warrior, Mage, Archer, Thief, Pirate, and Utility skills have `FreePlay=false`, so every reachable current reservation consumes the existing player decision/turn. This cost belongs to reservation, not drag itself. Bottom-to-queue drag must call the same reservation path exactly once; it must not append directly and must not add another enemy-turn call.
+
+Cooldown starts at execution through `TryExecuteSkill`, not at reservation. Cooldowns advance when a later player turn opens. Queue reorder must not touch either rule.
+
+#### 6. Capacity behavior and discovered UI mismatch
+
+`BattleTurnComponent:TryAppendSkill` returns `QUEUE_FULL` when `QueuedTileCount >= TileQueueCapacity`. Empty, one-item, two-item, and full states are compact token counts with no gaps.
+
+The architecture does **not** currently have a universal maximum of three:
+
+- default/base capacity is 3;
+- configured minimum/maximum are 1/6;
+- job and modifier systems can change effective capacity;
+- `JobDefinitions.csv` gives Warrior/Mage/Archer/Pirate capacity 3 but **Thief capacity 4**;
+- `PlayerOverheadQueueHudComponent:GetVisibleSkills` and the authored overhead UI hard-cap display at 3.
+
+This is a pre-existing production mismatch: a valid fourth Thief reservation can exist and execute but cannot be displayed or targeted by the current overhead HUD. Step 8 must resolve the capacity/UI contract before claiming complete queue reorder support. It must not silently clamp server capacity to three as part of drag work.
+
+#### 7. Reservation validation and cooldown policy
+
+The server already validates all reservation business rules:
+
+1. request sender matches the registered player;
+2. SkillId passes `_ContentValidatorLogic:ValidateSkillById`;
+3. `_RunManagerLogic:CanUseRunSkill` confirms an active run and ownership;
+4. the player's `SkillRuntimeStateComponent` exists;
+5. `CanUseSkill` rejects active cooldown;
+6. a positive-cooldown skill already in `QueuedTileIds` rejects as `COOLDOWN_RESERVED`;
+7. the phase is `PlayerTurn`;
+8. no action is processing;
+9. effective queue capacity is not full.
+
+The client currently disables any already-queued SkillId, while the server's duplicate-specific rejection applies only when `CooldownTurns > 0`. Future drag eligibility should be presentation guidance only; the server path remains the source of truth and must return the final reason.
+
+#### 8. Bottom drag destination classification
+
+`BattleQueueHudComponent:OnSkillSlotEndDrag` currently resolves only the six bottom slots and either sends the Step 1-6 authoritative bar reorder or cancels. Step 8 should replace this with one mutually exclusive classification before any mutation:
+
+```text
+if release is over an enabled reservation drop zone:
+    RequestQueueTile(sourceSkillId)             -- existing reservation path
+elseif release is over a valid bottom slot:
+    RequestReorderBattleSkillSlot(...)          -- existing Step 1-6 path
+else:
+    cancel gesture                              -- no server mutation
+```
+
+The destination tests must never run as independent commands. Queue-drop classification should win if authored hit areas ever overlap. The existing 10 px activation threshold, click-suppression window, ghost, source treatment, pending receipt cleanup, and bar-reorder validation remain unchanged.
+
+#### 9. Queue drop-target strategy
+
+The current queue is disabled when empty: `RefreshQueue` sets `ReservationQueue.Enable = #visibleSkills > 0`, and `SetSlot` disables every empty slot. Reusing only occupied slot entities would make bottom-to-empty-queue drop impossible.
+
+The safest Step 8 design is one stable, transparent, raycast-enabled reservation drop receiver following the player and covering the complete effective queue footprint, plus per-position receivers/insert zones for queued-item reorder. Author those components through UIBuilder only. The drop receiver must remain available while `CanQueue` is true even when zero items are displayed, while decorative/ghost renderers remain raycast-disabled.
+
+#### 10. Queue drag-source strategy
+
+Queue reorder should be owned by `PlayerOverheadQueueHudComponent`, because it already maps synchronized queue indices to the stable overhead slot entities. Step 8 can add verified UI drag events to those slots after UIBuilder adds the required touch receiver/input components.
+
+At drag begin, snapshot the source queue index, SkillId for display only, dedicated expected queue-order revision, and TouchId. Keep drag state on the component, not the slot entity. The HUD polls every 0.05 seconds and can remap/disable slots after authoritative state changes, so the source index must stay frozen until receipt or cleanup. Releasing outside the queue should cancel only.
+
+#### 11. Recommended authoritative reorder API
+
+There is already a dormant server route:
+
+```text
+BattleSessionComponent:RequestMoveQueuedTile(fromIndex, toIndex)
+  -> TryMoveQueuedTile
+  -> BattleTurnComponent:TryMoveQueuedSkill
+  -> PublishPlayerCommandResult("REORDER_QUEUE", result)
+```
+
+It is not called by any current UI and lacks request/replay and expected-revision protection. Step 8 should harden and expose this existing mutation rather than introduce parallel storage. Recommended contract:
+
+```text
+BattleSessionComponent:RequestReorderQueuedSkill(
+    sourceQueueIndex,
+    targetQueueIndex,
+    requestId,
+    expectedQueueOrderRevision
+)
+  -> sender/replay/revision/state validation
+  -> TryReorderQueuedSkill(...)
+  -> BattleTurnComponent:TryMoveQueuedSkill(...)  -- reuse existing INSERT mutation
+  -> synchronized authoritative receipt
+```
+
+Add a dedicated synchronized `QueueOrderRevision`, because `PlayerQueue.Revision` currently exposes capacity revision only, while general `StateRevision` changes for unrelated turn state and is too broad for optimistic queue-index concurrency. Increment the queue-order revision on every append, remove, clear, successful move, freeze/transfer to execution, and reset that invalidates client queue indices.
+
+#### 12. What turn-free reorder must never call
+
+Queue reorder must not call or emulate any of the following:
+
+- `BattleHudPresenterLogic:RequestQueueTile` or `BattleSessionComponent:TryQueueTile`;
+- `BattleTurnComponent:TryAppendSkill`, remove, clear, or any direct client write to `QueuedTileIds`;
+- `BeginEnemyTurnFromPlayerAction` or `BeginEnemyTurn`;
+- `TryFreezeSkillQueue`, `ExecuteNextQueuedTile`, or `TryExecuteSkill`;
+- cooldown start/advance methods;
+- `ExecutingTileIds` or `ExecutingTileIndex` mutation;
+- Step 1-6 run skill-bar persistence or `RunSkillBarSlotIds` mutation.
+
+A successful reorder changes only the ordering of the existing editable `QueuedTileIds` tokens and its dedicated revision/receipt. Queue count, membership, cooldowns, phase, turn number, and execution state stay unchanged.
+
+#### 13. Queued versus executing transition and editable state
+
+The queue is editable only while it remains in `QueuedTileIds`, `BattlePhase == "PlayerTurn"`, and `IsActionProcessing == false`. Execute freezes the list into `ExecutingTileIds`, clears `QueuedTileIds`, and sets processing true. The current `TryMoveQueuedSkill` already rejects invalid phase, processing state, and out-of-range indices.
+
+The hardened Step 8 server boundary should additionally reject content-not-ready, ended Battle, missing TurnState, nonempty execution state, queues shorter than two, fractional/noninteger indices, stale queue-order revision, stale request ID, and duplicate request ID. It must never reorder the executing snapshot. UI should end/cancel an active queue gesture immediately when the source switches from `QUEUED` to `EXECUTING`.
+
+#### 14. INSERT versus SWAP
+
+The existing authoritative behavior is already **INSERT**, which matches Shogun-style sequence editing:
+
+```text
+A | B | C
+move index 1 to index 3
+=> B | C | A
+```
+
+`TryMoveQueuedSkill` removes the source token and inserts it at the destination index. It does not swap two tokens. Step 8 should preserve this behavior and render an insertion marker between/at queue positions. Do not reuse the bottom bar's occupied-slot SWAP semantics for queue order.
+
+#### 15. Existing cancel and unreserve behavior
+
+The visible cancel control is the bottom HUD Clear button:
+
+```text
+OnClearClicked
+  -> BattleHudPresenterLogic:RequestClearQueue
+  -> BattleSessionComponent:RequestClearQueuedTile
+  -> TryClearQueuedTile / TryClearQueuedSkills
+```
+
+Clear-all is server-authoritative, PlayerTurn-only, processing-locked, and turn-free. An individual turn-free removal API also exists (`RequestRemoveQueuedTile(queueIndex)` -> `TryRemoveQueuedTileAt` -> `TryRemoveQueuedSkillAt`), but no current UI or Presenter caller exposes it.
+
+Therefore Step 8 queue drag release outside the queue should be a **gesture cancel**, not implicit unreserve. Individual unreserve requires an explicit later control/gesture decision so accidental outside releases cannot delete reservations.
+
+#### 16. Existing controls and compatibility
+
+Current controls to preserve:
+
+- six bottom `ButtonClickEvent` reservations;
+- six-slot Step 1-6 bottom-bar drag reorder;
+- Execute button;
+- Clear-all button;
+- current cooldown/reservation enablement and feedback;
+- overhead queue display while queued and while executing.
+
+No project number-key reservation binding was found despite visual 1-6 labels. Queue drag should add a pointer gesture without removing click, execute, or clear. After a real drag activates, both the bottom source and overhead source need click suppression so drag end cannot leak into an existing button click and submit twice.
+
+#### 17. Final interaction table
+
+| Source | Drop destination | Authoritative action | Turn cost | Semantics |
+|---|---|---|---|---|
+| Bottom skill slot | Overhead reservation drop zone | Existing `RequestQueueTile(sourceSkillId)` chain | Existing reservation cost; all current skills consume one decision/turn | Append SkillId after server validation |
+| Bottom skill slot | Another bottom skill slot | Existing Step 1-6 reorder request | None | Occupied SWAP / empty MOVE; persists for current run |
+| Bottom skill slot | Same slot or outside both systems | None | None | Cancel and restore visuals |
+| Queued skill | Another queue position/insert zone | Hardened queue reorder request | None | INSERT existing queued token |
+| Queued skill | Same effective position | No mutation / authoritative `NO_CHANGE` | None | Settle/cancel visual |
+| Queued skill | Outside queue | None | None | Cancel only; do not unreserve |
+| Queued skill | Queue while executing or input locked | Rejected/none | None | Never edit `ExecutingTileIds` |
+| Clear button | Queue | Existing clear-all request | None | Remove all editable reservations |
+| Execute button | Queue | Existing execute/freeze request | Existing execution flow | Freeze `QueuedTileIds` into `ExecutingTileIds` |
+
+#### Risk audit before Step 8
+
+| Severity | Risk | Required mitigation |
+|---|---|---|
+| **CRITICAL** | One bottom drag release triggers both bar reorder and reservation | Resolve exactly one destination before sending any command |
+| **CRITICAL** | A new drag-specific append path skips or doubles reservation turn cost | Reuse the existing Presenter `RequestQueueTile` boundary exactly once |
+| **CRITICAL** | Reorder touches `ExecutingTileIds` or races queue freeze | Server lock to editable queued state; never mutate execution snapshot |
+| **HIGH** | Thief has capacity 4 while overhead UI renders only 3 | Resolve effective-capacity rendering/targeting contract before complete Step 8 support |
+| **HIGH** | Empty queue disables the only possible drop surface | Add a stable queue drop receiver that remains available at count 0 |
+| **HIGH** | Index-only RPC applies a stale drag after append/remove/clear | Add dedicated queue-order revision plus request/replay validation |
+| **HIGH** | Drag end leaks into existing `ButtonClickEvent` and reserves twice | Reuse/extend proven click-suppression and pending-command cleanup |
+| **HIGH** | 0.05-second HUD refresh remaps/disables the active source | Freeze component-owned source state; settle only on receipt/cleanup |
+| **MEDIUM** | Client duplicate policy differs from server cooldown-0 policy | Treat client enablement as guidance; server remains authoritative |
+| **MEDIUM** | Late receipt after map transfer leaves ghost/highlight/pending state | Reuse centralized cleanup on disable, transfer, timeout, reject, and stale receipt |
+| **MEDIUM** | Queue-to-outside is misinterpreted as individual removal | Outside release cancels; keep unreserve behind an explicit control decision |
+| **MEDIUM** | Queue slots lack input components and empty positions are disabled | Author receiver components/insert zones through UIBuilder, never raw JSON |
+| **LOW** | Visual stack direction is read opposite to actual execution | Preserve/clarify bottom-first order and use an unambiguous insertion marker |
+
+#### Step 8 implementation boundary
+
+The minimum safe Step 8 scope is:
+
+1. preserve all Step 1-6 bottom-bar behavior;
+2. route bottom-to-queue through the existing reservation command;
+3. add a stable empty/full-aware overhead queue drop surface;
+4. add queued-item drag source and INSERT destination visuals;
+5. harden the existing server queue-move route with request/replay and dedicated queue-order revision checks;
+6. reject every executing/locked/stale path and centralize cleanup;
+7. explicitly resolve the current 4-capacity Thief versus 3-slot HUD mismatch.
+
+#### Step 7 final state
+
+- Queue drag implementation: **NOT STARTED**
+- Existing queue reorder server seam: **FOUND; dormant and requires hardening**
+- Reservation input assumption: **generic ButtonClickEvent, not dedicated right-click**
+- Reservation turn cost: **unchanged; all currently authored player skills use `FreePlay=false`**
+- Queue reorder semantics: **INSERT, turn-free**
+- Queue capacity contract: **server supports 1-6; Thief currently uses 4; overhead UI renders 3**
+- Existing clear-all control: **FOUND and unchanged**
+- Existing individual remove API: **FOUND; no current UI caller**
+- Production files modified: **NONE**
+- Documentation modified: `Docs/SkillDragSystemAudit.md` only
+- Push/merge performed: **NO**
+- STEP 7 stop condition: **satisfied**
+
+### STEP 8 Queue HUD / Drag Foundation
+
+#### Scope boundary
+
+STEP 8 normalizes the overhead reservation HUD to the existing authoritative 1-6 capacity contract and hardens the dormant queue-reorder server seam. It deliberately does **not** connect bottom-skill-to-queue drag, queue-item drag sources, queue insertion targets, or any new player input. Reservation, execution, cooldown, turn, clear, and Step 1-6 battle-bar behavior remain unchanged.
+
+#### Authoritative capacity and display contract
+
+- Server authority remains `BattleTurnComponent.TileQueueCapacity`.
+- The authored minimum/maximum remain 1/6.
+- Job and modifier systems remain authoritative; the current Thief base capacity remains 4.
+- Client presentation reads synchronized `GetBattleUiState().PlayerQueue.EffectiveCapacity` and clamps only to the already-authorized 1-6 display range.
+- The previous three-slot render clamp was removed. `PlayerOverheadQueueHudComponent:GetVisibleSkills` now renders up to six queued or executing SkillIds.
+
+`ui/TacticsPlayerOverheadHUD.ui` was changed through UIBuilder. `ReservationQueue` now owns six stable slot roots, `QueueSlot_01` through `QueueSlot_06`, in explicit 1-based execution order. Runtime layout activates only the current effective capacity and keeps index 1 as the bottom/first-to-execute item. Slot 4 is therefore available for the real Thief configuration, while slots 5-6 remain ready for validated modifiers up to the existing maximum.
+
+#### Empty queue geometry
+
+A `QueueDropRegion` UITransform-only child now follows the same dynamic stack bounds. It has no renderer, button, touch receiver, raycast component, or event handler, so it cannot intercept normal clicks in STEP 8. Its enabled state and bounds expose stable geometry for a later coordinate-based destination classifier even when the queue is empty and `CanQueue` is true.
+
+Empty in-capacity slot roots also remain stable while their decorative background/icon children are hidden. Out-of-capacity roots are disabled. No placeholder SkillId or client-owned queue content is introduced.
+
+#### Dedicated queue-order concurrency state
+
+`BattleTurnComponent.QueueOrderRevision` is a synchronized revision dedicated to editable queue membership and order. It increments after every successful mutation that invalidates queue indices:
+
+- append;
+- remove one;
+- clear all;
+- successful INSERT move;
+- freeze/transfer from `QueuedTileIds` to `ExecutingTileIds`;
+- transient reset when queued content existed.
+
+Same-index `NO_CHANGE` does not advance it. Capacity-only and unrelated turn changes do not advance it. `GetBattleUiState().RevisionKey` and `PlayerQueue.QueueOrderRevision` expose the value without changing the existing capacity revision field.
+
+#### Hardened dormant reorder seam
+
+The existing `RequestMoveQueuedTile` route now accepts a positive monotonic `requestId` and `expectedQueueOrderRevision`. A fixed-size last-request guard rejects duplicate and older requests without reapplying the mutation. The server validates sender, content readiness, active battle, PlayerTurn, processing lock, absence of an executing snapshot, exact queue revision, minimum two queued entries, and integer indices before calling the existing authoritative move implementation.
+
+The existing semantics remain **INSERT**, not SWAP. The server resolves SkillIds from its own `QueuedTileIds`; the client will never submit identities. A synchronized fixed-size receipt exposes request id, success/reason, source/target indices, and resulting queue revision for the future UI. A successful reorder changes only editable queue order plus its normal revisions/receipt and does not consume a turn or touch cooldown/execution state.
+
+No production UI calls this RPC in STEP 8.
+
+#### Verification
+
+Static verification completed:
+
+- UIBuilder validation: **PASS**;
+- `git diff --check`: **PASS**;
+- authored maximum slots: **6**;
+- explicit runtime QueueIndex mapping: **1-6**;
+- Thief capacity source remains **4**;
+- stable empty drop geometry: **present**;
+- input/touch/button handlers added to overhead queue: **none**;
+- queue mutation audit: every editable content/order mutation advances `QueueOrderRevision`;
+- INSERT implementation: **preserved**;
+- turn/cooldown/execution mutations added to reorder: **none**.
+
+Maker Play verification is **not claimed** in this checkout. The connected Maker instance is open on the separate `union-system-2026-ui-rework` working directory, while STEP 8 is implemented in `.codex-worktrees/skill-drag-step1`. Its runtime log reported the old `maxSlots=3`, proving it did not import this branch. That main working directory also contains unrelated user modifications to the same UI and scripts, so they were not overwritten for a false runtime test. The required capacity 3, real Thief 4, synthetic 6, clear/freeze, duplicate request, and stale revision Play matrix remains pending until Maker opens this worktree.
+
+#### STEP 8 final state
+
+- Capacity contract: **server 1-6 preserved; HUD normalized to 1-6**
+- Real Thief capacity: **4, unchanged**
+- Authored queue slots: **6**
+- Stable empty queue geometry: **implemented, passive/non-intercepting**
+- Dedicated queue-order revision: **implemented**
+- Reorder request/replay foundation: **implemented, bounded fixed-size state**
+- Queue reorder semantics: **existing INSERT preserved**
+- Bottom skill -> queue drag: **NOT IMPLEMENTED**
+- Queue -> queue drag: **NOT IMPLEMENTED**
+- Turn/cooldown/execution behavior changes: **NONE**
+- UI asset authoring: **UIBuilder only**
+- Push/merge performed: **NO**
+- STEP 8 stop condition: **implementation complete; branch-local Maker Play pending**
