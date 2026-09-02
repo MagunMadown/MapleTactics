@@ -515,3 +515,42 @@ No insertion, compaction, dynamic slot creation, or index rebinding occurs. The 
 | Build/runtime | PASS — refreshed build had zero errors and no runtime error stack referenced Step 2 reorder/fixed-slot methods. |
 
 Maker evidence was collected in an actual battle at 1920x1080 simulated resolution. The three pre-existing `INVALID_PLAYER` RunManager/UnionEffect entry errors remain unrelated to the reorder implementation.
+
+### STEP 3 Direct Drag UX Polish
+
+#### Client-only tuning
+
+Step 3 changes only `BattleQueueHudComponent` presentation. The Step 2 request payload, authoritative mutation, fixed six-slot representation, queue/execution snapshots, persistence boundary, skill definitions, and battle rules are unchanged.
+
+- Activation threshold: `12px -> 10px`. Direct clicks still use the existing button path; drag feedback starts only after the threshold.
+- Ghost: existing skill icon at `1.04x`, `86%` alpha, with a small `(+14px, +18px)` pointer offset. Invalid space reduces it to a muted `58%` alpha.
+- Source: the original icon remains in place at a muted cool-gray `34%` alpha, so origin remains readable without duplicating emphasis.
+- Occupied target: existing gold target frame at `90%` alpha, communicating `SWAP`.
+- Empty target: the same gold frame at `58%` alpha, communicating a quieter `MOVE` destination without adding text or assets.
+- Pending: ghost snaps to the resolved target at `62%` alpha while the existing `0.75s` authoritative timeout remains active.
+- Success: source and target icons run a `0.14s` `0.90 -> 1.04 -> 1.00` snap after the authoritative receipt is rendered. Gameplay state is not delayed.
+- Cancel/reject/timeout: ghost returns to the source and fades for `0.12s`; no popup or sound is added.
+- Input transition guard: a successful skill click blocks new drag activation for `0.25s`, closing the short client/server state-update window before noneditable battle state is presented.
+
+#### Step 3 Maker Play matrix
+
+| Test | Maker Play result |
+|---|---|
+| Build | PASS — workspace refresh completed with zero build errors. |
+| Occupied target close-up | PASS — held `1 -> 2` showed muted source, offset `86%` ghost, and the stronger occupied gold frame; authoritative result was `brandish|divine_swing||||`. |
+| Empty target close-up | PASS — held `2 -> 4` showed the quieter empty-frame treatment; authoritative result was `brandish|||divine_swing||`. |
+| Rapid `4 -> 6 -> 4` | PASS — both `40ms`/fast-pointer end positions resolved to their actual fixed targets and produced two successful `MOVE` receipts. |
+| Queue-HUD crossing | PASS — crossing the execute/cancel area produced no slot highlight and a muted invalid ghost; snapping back to slot 6 at release resolved target 6. |
+| Success motion | PASS — each successful receipt logged and ran bounded `0.14s` source/target snap feedback after the refreshed icons were rendered. |
+| Cancel motion and cleanup | PASS — outside drop resolved target 0, returned/faded for `0.12s`, and a new drag begun after `170ms` succeeded, proving no hung visual/input state. |
+| Direct click | PASS — normal click still queued the current slot SkillId and ran the existing queue feedback. |
+| Noneditable transition | PASS — click followed by a drag attempt `40ms` later produced no drag candidate/activation while battle processing changed to true. |
+| Queue stability | PASS — existing queued SkillIds remained unchanged by reorder; no queue/execution method was edited. |
+| Runtime | PASS — Step 3 test window produced zero runtime errors. The separately observed three pre-existing `INVALID_PLAYER` RunManager/UnionEffect entry errors remain unrelated. |
+
+Captured Maker evidence (1920x1080 simulated input space):
+
+- occupied target: `maker_play_20260902_150505_725.png`
+- empty target: `maker_play_20260902_150605_995.png`
+- invalid queue-HUD crossing: `maker_play_20260902_150651_514.png`
+- settled result: `maker_play_20260902_151556_505.png`
