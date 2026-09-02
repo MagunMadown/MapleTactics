@@ -81,6 +81,7 @@ script BattleSessionComponent extends Component
 	-- any owned skill, and the skill DataSets are server-only so the HUD has no other way to read icons.
 	@Sync property string SkillIconSnapshot = ""
 	property string SkillSlotSourceSnapshot = ""
+	property integer SkillSlotSourceRunOrderRevision = 0
 	property integer SkillSlotCount = 6
 	property integer LastProcessedSkillSlotReorderRequestId = 0
 	-- One knob for how fast every skill plays. Above 1 speeds the swing, the effects, the impact frame,
@@ -857,7 +858,7 @@ script BattleSessionComponent extends Component
 			if runState.SelectedJobId == "" then
 				_RunManagerLogic:ApplyJobSelection(player, "")
 			end
-			self:ApplyRunJobConfiguration(runState)
+			self:ApplyRunJobConfiguration(runState, player)
 			if self.TurnState ~= nil and self.SelectedJobBaseQueueCapacity > 0 then
 				self.TurnState:ConfigureQueueCapacity(self.SelectedJobBaseQueueCapacity, self.MinQueueCapacity, self.MaxQueueCapacity, "JOB_REGISTERED")
 				self:PublishTurnStateSnapshot("JOB_REGISTERED")
@@ -2737,9 +2738,25 @@ script BattleSessionComponent extends Component
 			slotCooldownTurns[sourceIndex], slotCooldownTurns[targetIndex] = slotCooldownTurns[targetIndex], slotCooldownTurns[sourceIndex]
 		end
 
-		self.SkillSlotIds = self:SerializeSkillSlotPipe(slotIds)
-		self.SkillSlotNames = self:SerializeSkillSlotPipe(slotNames)
-		self.SkillSlotCooldownTurns = self:SerializeSkillSlotPipe(slotCooldownTurns)
+		local nextSlotIds = self:SerializeSkillSlotPipe(slotIds)
+		local nextSlotNames = self:SerializeSkillSlotPipe(slotNames)
+		local nextSlotCooldownTurns = self:SerializeSkillSlotPipe(slotCooldownTurns)
+		local runInventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if runInventory == nil then
+			result.Reason = "RUN_SKILL_BAR_OWNER_UNAVAILABLE"
+			return result
+		end
+		local runOrderResult = runInventory:CommitRunSkillBarOrder(self.SkillSlotIds, nextSlotIds, "BATTLE_REORDER")
+		if runOrderResult.Success ~= true then
+			result.Reason = runOrderResult.Reason or "RUN_SKILL_BAR_COMMIT_FAILED"
+			return result
+		end
+
+		self.SkillSlotIds = nextSlotIds
+		self.SkillSlotNames = nextSlotNames
+		self.SkillSlotCooldownTurns = nextSlotCooldownTurns
+		self.SkillSlotSourceSnapshot = runInventory.RunSkillSnapshot
+		self.SkillSlotSourceRunOrderRevision = runOrderResult.Revision or self.SkillSlotSourceRunOrderRevision
 		self.SkillSlotRevision = self.SkillSlotRevision + 1
 		result.Success = true
 		result.Reason = "OK"
@@ -2748,7 +2765,8 @@ script BattleSessionComponent extends Component
 		result.Operation = operation
 		result.SlotIds = self.SkillSlotIds
 		result.Revision = self.SkillSlotRevision
-		log("[BattleSkillSlotReorder] success request=" .. tostring(self.LastProcessedSkillSlotReorderRequestId) .. " operation=" .. operation .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " before=" .. result.PreviousSlotIds .. " after=" .. result.SlotIds .. " queued=" .. self.QueuedTileIds .. " executing=" .. self.ExecutingTileIds)
+		result.RunSkillBarRevision = self.SkillSlotSourceRunOrderRevision
+		log("[BattleSkillSlotReorder] success request=" .. tostring(self.LastProcessedSkillSlotReorderRequestId) .. " operation=" .. operation .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " before=" .. result.PreviousSlotIds .. " after=" .. result.SlotIds .. " runOrderRevision=" .. tostring(self.SkillSlotSourceRunOrderRevision) .. " queued=" .. self.QueuedTileIds .. " executing=" .. self.ExecutingTileIds)
 		return result
 	end
 
@@ -3242,10 +3260,14 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method void ApplyRunJobConfiguration(any runState)
+	method void ApplyRunJobConfiguration(any runState, Entity playerEntity)
 		-- Copies the player-owned job snapshot into synchronized map-scoped battle state.
 		if runState == nil then
 			return
+		end
+		local runOwner = playerEntity
+		if isvalid(runOwner) == false then
+			runOwner = self.PlayerEntity
 		end
 		self.SelectedJobId = runState.SelectedJobId
 		self.SelectedJobMechanicId = runState.SelectedJobMechanicId
@@ -3254,7 +3276,7 @@ script BattleSessionComponent extends Component
 		self.SelectedJobBaseMaxHp = runState.JobBaseMaxHp
 		self.SelectedJobBaseQueueCapacity = runState.JobBaseQueueCapacity
 		self.SelectedJobRevision = runState.JobRevision
-		local unionSnapshot = _RunManagerLogic:GetRunUnionEffectSnapshot(self.PlayerEntity)
+		local unionSnapshot = _RunManagerLogic:GetRunUnionEffectSnapshot(runOwner)
 		if unionSnapshot.Success == true then
 			self.UnionItemDropRate = unionSnapshot.ItemDropRate
 		else
@@ -3262,28 +3284,42 @@ script BattleSessionComponent extends Component
 			log_error("[UnionEffect] battle snapshot unavailable reason=" .. (unionSnapshot.Reason or "UNKNOWN"))
 		end
 		log("[BattleJob] configuration applied job=" .. self.SelectedJobId .. " mechanic=" .. self.SelectedJobMechanicId .. " passive=" .. self.SelectedJobPassiveSetId .. " hp=" .. self.SelectedJobBaseMaxHp .. " queue=" .. self.SelectedJobBaseQueueCapacity .. " skills=" .. self.SelectedJobStartingSkillIds .. " revision=" .. self.SelectedJobRevision)
-		self:RefreshSkillSlots("JOB_APPLIED")
+		self:RefreshSkillSlots("JOB_APPLIED", runOwner)
 	end
 
 	@ExecSpace("ServerOnly")
-	method void RefreshSkillSlots(string reason)
-		-- Draws this battle's HUD slots at random from the skills the player actually owns, and resolves
-		-- their display names here because the skill DataSets are server-only and the HUD cannot read them.
-		-- Re-rolls only when the owned set changes, so slots stay stable for the duration of a battle.
+	method void RefreshSkillSlots(string reason, Entity playerEntity)
+		-- Reconciles the player-owned run order and copies it into this map-scoped BattleSession.
 		local ownedSnapshot = ""
-		if isvalid(self.PlayerEntity) then
-			local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local runSlotIds = ""
+		local runOrderRevision = 0
+		local runOrderAvailable = false
+		local inventory = nil
+		if isvalid(playerEntity) then
+			inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
 			if inventory ~= nil then
 				ownedSnapshot = inventory.RunSkillSnapshot
+				local runOrderResult = inventory:GetOrInitializeRunSkillBarOrder()
+				if runOrderResult.Success == true then
+					runSlotIds = runOrderResult.SlotIds or ""
+					runOrderRevision = runOrderResult.Revision or 0
+					runOrderAvailable = runSlotIds ~= ""
+				else
+					log_error("[BattleSkillSlots] run order unavailable reason=" .. (runOrderResult.Reason or "UNKNOWN") .. " refresh=" .. (reason or ""))
+				end
 			end
 		end
 		if ownedSnapshot == "" then
 			ownedSnapshot = self.SelectedJobStartingSkillIds
 		end
-		if ownedSnapshot == self.SkillSlotSourceSnapshot then
+		if runOrderAvailable == true
+			and ownedSnapshot == self.SkillSlotSourceSnapshot
+			and runOrderRevision == self.SkillSlotSourceRunOrderRevision
+			and runSlotIds == self.SkillSlotIds then
 			return
 		end
 		self.SkillSlotSourceSnapshot = ownedSnapshot
+		self.SkillSlotSourceRunOrderRevision = runOrderRevision
 
 		local candidates = {}
 		local seen = {}
@@ -3294,14 +3330,6 @@ script BattleSessionComponent extends Component
 				seen[skillId] = true
 				table.insert(candidates, skillId)
 			end
-		end
-
-		-- Fisher-Yates so every owned skill has an equal chance of reaching a slot.
-		for index = #candidates, 2, -1 do
-			local swap = _UtilLogic:RandomIntegerRange(1, index)
-			local held = candidates[index]
-			candidates[index] = candidates[swap]
-			candidates[swap] = held
 		end
 
 		-- Icons cover every candidate, not just the drawn slots, because the queue accepts any owned skill.
@@ -3325,23 +3353,40 @@ script BattleSessionComponent extends Component
 		local slotIds = {}
 		local slotNames = {}
 		local slotCooldownTurns = {}
-		local slotCount = math.min(self.SkillSlotCount, #candidates)
-		for index = 1, slotCount do
-			local skillId = candidates[index]
-			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
-			if definition.Success == true then
-				table.insert(slotIds, skillId)
-				table.insert(slotNames, definition.DisplayName)
-				table.insert(slotCooldownTurns, tostring(math.max(0, math.floor(definition.CooldownTurns or 0))))
+		if runOrderAvailable == true then
+			slotIds = self:ParseSkillSlotPipe(runSlotIds)
+		else
+			-- Compatibility fallback only; valid runs initialize and persist their random default in the run owner.
+			for index = #candidates, 2, -1 do
+				local swapIndex = _UtilLogic:RandomIntegerRange(1, index)
+				candidates[index], candidates[swapIndex] = candidates[swapIndex], candidates[index]
+			end
+			for index = 1, math.min(self.SkillSlotCount, #candidates) do
+				slotIds[index] = candidates[index]
+			end
+			log_warning("[BattleSkillSlots] using nonpersistent fallback reason=RUN_ORDER_UNAVAILABLE refresh=" .. (reason or ""))
+		end
+		for slotIndex = 1, self.SkillSlotCount do
+			local skillId = slotIds[slotIndex] or ""
+			slotNames[slotIndex] = ""
+			slotCooldownTurns[slotIndex] = ""
+			if skillId ~= "" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+				if definition.Success == true then
+					slotNames[slotIndex] = definition.DisplayName
+					slotCooldownTurns[slotIndex] = tostring(math.max(0, math.floor(definition.CooldownTurns or 0)))
+				else
+					log_error("[BattleSkillSlots] ordered skill definition unavailable skill=" .. skillId .. " reason=" .. (definition.Reason or "UNKNOWN"))
+				end
 			end
 		end
 
-		self.SkillSlotIds = table.concat(slotIds, "|")
-		self.SkillSlotNames = table.concat(slotNames, "|")
-		self.SkillSlotCooldownTurns = table.concat(slotCooldownTurns, "|")
+		self.SkillSlotIds = self:SerializeSkillSlotPipe(slotIds)
+		self.SkillSlotNames = self:SerializeSkillSlotPipe(slotNames)
+		self.SkillSlotCooldownTurns = self:SerializeSkillSlotPipe(slotCooldownTurns)
 		self.SkillSlotRevision = self.SkillSlotRevision + 1
 		self.SkillIconSnapshot = table.concat(iconRecords, "|")
-		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " slots=" .. self.SkillSlotIds .. " names=" .. self.SkillSlotNames .. " cooldowns=" .. self.SkillSlotCooldownTurns .. " icons=" .. tostring(#iconRecords) .. " presentationRuids=" .. tostring(#presentationRuids))
+		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " runOrder=" .. tostring(runOrderAvailable) .. " runOrderRevision=" .. tostring(self.SkillSlotSourceRunOrderRevision) .. " slots=" .. self.SkillSlotIds .. " names=" .. self.SkillSlotNames .. " cooldowns=" .. self.SkillSlotCooldownTurns .. " icons=" .. tostring(#iconRecords) .. " presentationRuids=" .. tostring(#presentationRuids))
 
 		-- Scope note: this method is only reached from job apply, so the warm covers the skills owned at
 		-- battle start. A skill granted mid-run is not re-warmed here -- it falls back to the renderer being
@@ -3418,7 +3463,7 @@ script BattleSessionComponent extends Component
 		if jobResult.Success == false then
 			return jobResult
 		end
-		self:ApplyRunJobConfiguration(runState)
+		self:ApplyRunJobConfiguration(runState, self.PlayerEntity)
 		self.RunSeed = runState.RunSeed
 		log("[BattleRun] new run requested sequence=" .. runState.RunSequence .. " seed=" .. self.RunSeed)
 		return self:RebuildBattleState("NEW_RUN")
@@ -3474,7 +3519,7 @@ script BattleSessionComponent extends Component
 			result.DetailReason = jobResult.DetailReason or ""
 			return result
 		end
-		self:ApplyRunJobConfiguration(runState)
+		self:ApplyRunJobConfiguration(runState, playerEntity)
 
 		local applyResult = self:LoadAndApplyStageDefinition(stageId)
 		if applyResult.Success == false then

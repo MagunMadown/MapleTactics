@@ -669,3 +669,78 @@ If future production content genuinely raises the reachable family count above s
 - Documentation modified: `Docs/SkillDragSystemAudit.md` only
 - Loadout/equip implementation: **NOT STARTED**
 - Step 4 stop condition: **satisfied**
+
+### STEP 5 Run-scoped Skill Bar Order
+
+#### Ownership and lifecycle
+
+`PlayerRunInventoryComponent` now owns a separate server-authoritative, fixed six-position Battle skill-bar order:
+
+- `RunSkillSnapshot` remains the ownership/amount source of truth.
+- `RunSkillBarSlotIds` stores exactly six run-scoped positions, including empty gaps.
+- `RunSkillBarRevision` versions authoritative order mutations.
+- `ResetForRun` clears the order and revision, so a new run receives a fresh arrangement.
+- No DataStorage, account profile, active-loadout model, equip UI, or reservation-queue persistence was added.
+
+The first Battle initialization performs the existing Fisher-Yates default generation once, then commits that result to the run owner. Every later Battle copies the stored order instead of shuffling again.
+
+#### Reconciliation rules
+
+The run owner reconciles order against current ownership without compacting valid positions:
+
+- still-owned unique skills remain in their existing positions;
+- removed skills clear their positions;
+- a newly owned distinct skill enters the first empty position;
+- an upgrade replaces the exact base-skill position with the validated upgrade SkillId;
+- duplicate/corrupt positions are cleared and repaired from the owned set;
+- fixed empty gaps remain fixed and are serialized explicitly;
+- more than six distinct owned skills returns/logs `FUTURE_CONTENT_GUARD`, preserves the existing active six where possible, and reports overflow IDs instead of silently selecting a new random six.
+
+Battle reorder validation still occurs in `BattleSessionComponent`. A successful occupied swap or empty-slot move must first commit the same six-position result through `PlayerRunInventoryComponent:CommitRunSkillBarOrder`; only then does the map-scoped synchronized Battle snapshot publish it. A rejected owner commit leaves the Battle session unchanged.
+
+#### Entry-order correction
+
+`InitializeFromEntry` previously called `ApplyRunJobConfiguration` before `RegisterPlayer`, while that method read `self.PlayerEntity`. On the first entry frame this value was not yet valid, producing the known `INVALID_PLAYER` Union/run errors and a temporary nonpersistent fallback shuffle.
+
+`ApplyRunJobConfiguration` and `RefreshSkillSlots` now receive the validated entry player explicitly. This removes the fallback frame without changing registration order or other Battle lifecycle behavior.
+
+#### Queue and UI boundaries
+
+- `QueuedTileIds`, `ExecutingTileIds`, execution indices, cooldown rules, and queue ordering remain independent SkillId sequences.
+- Existing queued/executing skills are never rewritten by bar reorder.
+- STEP 3 threshold, ghost, source dim, target feedback, success/cancel motion, and click suppression are unchanged.
+- No `.ui` file, slot UUID, slot count, icon source, hotkey behavior, skill definition, or gameplay rule changed.
+
+#### Step 5 Maker Play matrix
+
+| Test | Maker Play result |
+|---|---|
+| Clean build | PASS — refreshed build contained 500 Info, 2 Warning, and 0 Error entries. |
+| First Battle initialization | PASS — one Fisher-Yates result was committed immediately as run order; no `INVALID_PLAYER` or nonpersistent fallback entry occurred after the entry-owner correction. |
+| Actual occupied drag | PASS — actual drag `1 -> 2` committed `brandish|divine_swing|||| -> divine_swing|brandish||||` to both BattleSession and the run owner. |
+| Reorder queue isolation | PASS — the successful reorder receipt logged empty queued/executing snapshots, matching the pre-drag state. |
+| Direct click after reorder | PASS — slot 1 queued its new SkillId through the unchanged click path. |
+| Battle 1 -> 2 -> 3 | PASS — controlled real-session entries for stages 1, 2, and 3 all resolved `divine_swing|brandish||||`; both continuation initializations succeeded. |
+| Different physical map | PASS — transfer from `region_01_battle` to `region_01_boss` initialized stage 4 with the same run order and revision. |
+| New skill | PASS — a granted distinct skill entered the first empty position while existing positions remained fixed. |
+| Upgrade | PASS — `brandish -> brave_slash` retained the exact previous slot. |
+| Removal | PASS — the removed skill's position cleared without compacting later positions. |
+| Duplicate repair | PASS — reconciliation retained one owned occurrence and repaired duplicate/corrupt positions. |
+| Six-skill run | PASS — a six-skill Mage order persisted exactly after an authoritative custom reorder. |
+| Overflow guard | PASS — a controlled seventh distinct skill produced explicit `FUTURE_CONTENT_GUARD` evidence and preserved the existing six. |
+| New run reset | PASS — the previous six-skill/custom order cleared to empty revision 0 before the new run's first initialization. |
+
+Captured Maker evidence used for the final physical-map close-up:
+
+- boss-map persisted order: `maker_play_20260902_162431_093.png`
+
+#### Step 5 final state
+
+- Active loadout/equip system: **NOT ADDED**
+- Persistence scope: **current run only**
+- Authoritative owner: **PlayerRunInventoryComponent**
+- Battle initialization: **stored run order; no per-Battle reshuffle**
+- Reservation queue drag/order changes: **NONE**
+- UI asset changes: **NONE**
+- DataStorage/account persistence: **NONE**
+- STEP 5B stop condition: **satisfied**
