@@ -19,6 +19,13 @@ script BattleQueueHudComponent extends Component
 	property SpriteGUIRendererComponent SkillSlot4Icon = "101f009c-6423-4790-953d-564ed5dd403a"
 	property SpriteGUIRendererComponent SkillSlot5Icon = "1ecc3f70-14e4-443b-9623-dc5bb4648eca"
 	property SpriteGUIRendererComponent SkillSlot6Icon = "3a5b69d0-5971-4de8-91ef-7c68a18a1429"
+	property SpriteGUIRendererComponent SkillDragGhost = "e2c44886-d9d3-4f39-a323-e9fa8b55e431"
+	property SpriteGUIRendererComponent SkillSlot1DragTargetHighlight = "bdce3e6a-6091-4399-809a-b7b8ea6b3627"
+	property SpriteGUIRendererComponent SkillSlot2DragTargetHighlight = "ebedb170-28b0-4102-b69d-ed014192ba97"
+	property SpriteGUIRendererComponent SkillSlot3DragTargetHighlight = "5cf3cde3-7bce-406f-a2d0-34a40608dbb2"
+	property SpriteGUIRendererComponent SkillSlot4DragTargetHighlight = "440bdbff-48a3-48ff-b273-5abbe43d80ff"
+	property SpriteGUIRendererComponent SkillSlot5DragTargetHighlight = "1f204584-5900-4a84-9d00-f75a24809c9f"
+	property SpriteGUIRendererComponent SkillSlot6DragTargetHighlight = "1ff73c42-f10e-48be-ad30-37c32f95c972"
 	property SpriteGUIRendererComponent SkillSlot1QueuedHighlight = "480373b5-5d4b-4f8c-b591-a713cb5ae8f4"
 	property SpriteGUIRendererComponent SkillSlot2QueuedHighlight = "9bc6ce1d-fcb3-48f2-9469-96142f0912d0"
 	property SpriteGUIRendererComponent SkillSlot3QueuedHighlight = "6f45cb48-7edc-4845-8935-85beac41ae34"
@@ -72,6 +79,13 @@ script BattleQueueHudComponent extends Component
 	property string LastQueuedTileIds = ""
 	property boolean IsMapTransferPending = false
 	property string MapTransferSourceMapName = ""
+	property number SkillSlotDragThreshold = 12
+	property number SkillSlotDragClickSuppressionSeconds = 0.25
+	property number SkillSlotSwapPendingTimeout = 0.75
+	property number SuppressSkillClickUntil = 0
+	property integer PendingSkillSlotSwapRequestId = 0
+	property integer PendingSkillSlotSwapReceiptRevision = 0
+	property integer SkillSlotSwapPendingTimerId = 0
 	property any SkillSlot1ClickHandler = nil
 	property any SkillSlot2ClickHandler = nil
 	property any SkillSlot3ClickHandler = nil
@@ -91,6 +105,8 @@ script BattleQueueHudComponent extends Component
 		-- The view binds UI controls and consumes presentation state without reading battle components directly.
 		log("[BattleQueueHUD] ready")
 		self._T.SkillIconFeedbackTimers = {}
+		self._T.SkillSlotDragHandlers = {}
+		self:ResetSkillSlotDragState()
 		self:BuildSkillCooldownPipViews()
 		self:SetHudContextVisible(false, "INITIALIZING")
 		self.PresenterStateChangedHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudStateChangedEvent, self.OnPresenterStateChanged)
@@ -101,6 +117,7 @@ script BattleQueueHudComponent extends Component
 		self.SkillSlot4ClickHandler = self.SkillSlot4Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot4Clicked)
 		self.SkillSlot5ClickHandler = self.SkillSlot5Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot5Clicked)
 		self.SkillSlot6ClickHandler = self.SkillSlot6Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot6Clicked)
+		self:BindSkillSlotDragHandlers()
 		self.ExecuteClickHandler = self.ExecuteButton.Entity:ConnectEvent(ButtonClickEvent, self.OnExecuteClicked)
 		self.ClearClickHandler = self.ClearButton.Entity:ConnectEvent(ButtonClickEvent, self.OnClearClicked)
 		self.ResetClickHandler = self.ResetButton.Entity:ConnectEvent(ButtonClickEvent, self.OnResetClicked)
@@ -118,6 +135,12 @@ script BattleQueueHudComponent extends Component
 			self.InputFeedbackTimerId = 0
 		end
 		self.InputFeedbackText = ""
+		self:DisconnectSkillSlotDragHandlers()
+		self:CleanupSkillSlotDragVisuals(false)
+		if self.SkillSlotSwapPendingTimerId > 0 then
+			_TimerService:ClearTimer(self.SkillSlotSwapPendingTimerId)
+			self.SkillSlotSwapPendingTimerId = 0
+		end
 		if self.PresenterStateChangedHandler ~= nil then
 			_BattleHudPresenterLogic:DisconnectEvent(BattleHudStateChangedEvent, self.PresenterStateChangedHandler)
 			self.PresenterStateChangedHandler = nil
@@ -206,6 +229,7 @@ script BattleQueueHudComponent extends Component
 		local turnState = presenterState.Turn
 		local waveState = presenterState.Wave
 		local uiState = presenterState.UiState
+		self:ConsumeSkillSlotSwapReceipt(session)
 		self:SetHudContextVisible(true, "BATTLE_CONTEXT_READY")
 		local queueState = uiState.PlayerQueue
 		local runFlowUi = presenterState.RunFlowUi
@@ -634,6 +658,342 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method ButtonComponent GetSkillSlotButton(integer slotIndex)
+		if slotIndex == 1 then return self.SkillSlot1Button end
+		if slotIndex == 2 then return self.SkillSlot2Button end
+		if slotIndex == 3 then return self.SkillSlot3Button end
+		if slotIndex == 4 then return self.SkillSlot4Button end
+		if slotIndex == 5 then return self.SkillSlot5Button end
+		if slotIndex == 6 then return self.SkillSlot6Button end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method SpriteGUIRendererComponent GetSkillSlotDragTargetHighlight(integer slotIndex)
+		if slotIndex == 1 then return self.SkillSlot1DragTargetHighlight end
+		if slotIndex == 2 then return self.SkillSlot2DragTargetHighlight end
+		if slotIndex == 3 then return self.SkillSlot3DragTargetHighlight end
+		if slotIndex == 4 then return self.SkillSlot4DragTargetHighlight end
+		if slotIndex == 5 then return self.SkillSlot5DragTargetHighlight end
+		if slotIndex == 6 then return self.SkillSlot6DragTargetHighlight end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer ResolveSkillSlotIndex(Entity slotEntity)
+		if isvalid(slotEntity) == false then
+			return 0
+		end
+		for slotIndex = 1, 6 do
+			local button = self:GetSkillSlotButton(slotIndex)
+			if button ~= nil and button.Entity == slotEntity then
+				return slotIndex
+			end
+		end
+		return 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindSkillSlotDragHandlers()
+		for slotIndex = 1, 6 do
+			local button = self:GetSkillSlotButton(slotIndex)
+			if button ~= nil and isvalid(button.Entity) then
+				local slotEntity = button.Entity
+				table.insert(self._T.SkillSlotDragHandlers, {
+					Entity = slotEntity,
+					BeginDrag = slotEntity:ConnectEvent(UITouchBeginDragEvent, self.OnSkillSlotBeginDrag),
+					Drag = slotEntity:ConnectEvent(UITouchDragEvent, self.OnSkillSlotDrag),
+					EndDrag = slotEntity:ConnectEvent(UITouchEndDragEvent, self.OnSkillSlotEndDrag),
+					Enter = slotEntity:ConnectEvent(UITouchEnterEvent, self.OnSkillSlotDragEnter),
+					Exit = slotEntity:ConnectEvent(UITouchExitEvent, self.OnSkillSlotDragExit)
+				})
+			end
+		end
+		log("[BattleSkillSlotDrag] handlers bound count=" .. tostring(#self._T.SkillSlotDragHandlers))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DisconnectSkillSlotDragHandlers()
+		local handlers = self._T.SkillSlotDragHandlers or {}
+		for index = 1, #handlers do
+			local record = handlers[index]
+			if record ~= nil and isvalid(record.Entity) then
+				if record.BeginDrag ~= nil then record.Entity:DisconnectEvent(UITouchBeginDragEvent, record.BeginDrag) end
+				if record.Drag ~= nil then record.Entity:DisconnectEvent(UITouchDragEvent, record.Drag) end
+				if record.EndDrag ~= nil then record.Entity:DisconnectEvent(UITouchEndDragEvent, record.EndDrag) end
+				if record.Enter ~= nil then record.Entity:DisconnectEvent(UITouchEnterEvent, record.Enter) end
+				if record.Exit ~= nil then record.Entity:DisconnectEvent(UITouchExitEvent, record.Exit) end
+			end
+		end
+		self._T.SkillSlotDragHandlers = {}
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetSkillSlotDragState()
+		self._T.SkillSlotDragCandidate = false
+		self._T.SkillSlotDragActive = false
+		self._T.SkillSlotDragSourceIndex = 0
+		self._T.SkillSlotDragHoverIndex = 0
+		self._T.SkillSlotDragTouchId = 0
+		self._T.SkillSlotDragDistance = 0
+		self._T.SkillSlotDragExpectedRevision = 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CanBeginSkillSlotDrag(integer slotIndex)
+		if self.PendingSkillSlotSwapRequestId > 0 or self:GetSlotSkillId(slotIndex) == "" then
+			return false
+		end
+		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
+		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
+			return false
+		end
+		local uiState = presenterState.UiState
+		return uiState ~= nil and uiState.Commands ~= nil and uiState.Commands.CanMove == true
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer GetCurrentSkillSlotRevision()
+		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
+		if presenterState == nil or presenterState.Session == nil then
+			return 0
+		end
+		return presenterState.Session.SkillSlotRevision or 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSkillSlotBeginDrag(UITouchBeginDragEvent dragEvent)
+		local sourceIndex = self:ResolveSkillSlotIndex(dragEvent.Entity)
+		if sourceIndex <= 0 or (dragEvent.TouchId ~= -1 and dragEvent.TouchId <= 0) or self:CanBeginSkillSlotDrag(sourceIndex) == false then
+			return
+		end
+		self:CleanupSkillSlotDragVisuals(false)
+		self._T.SkillSlotDragCandidate = true
+		self._T.SkillSlotDragSourceIndex = sourceIndex
+		self._T.SkillSlotDragHoverIndex = sourceIndex
+		self._T.SkillSlotDragTouchId = dragEvent.TouchId
+		self._T.SkillSlotDragDistance = 0
+		self._T.SkillSlotDragExpectedRevision = self:GetCurrentSkillSlotRevision()
+		log("[BattleSkillSlotDrag] begin candidate source=" .. tostring(sourceIndex) .. " touch=" .. tostring(dragEvent.TouchId) .. " revision=" .. tostring(self._T.SkillSlotDragExpectedRevision))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSkillSlotDrag(UITouchDragEvent dragEvent)
+		if self._T.SkillSlotDragCandidate ~= true or dragEvent.TouchId ~= self._T.SkillSlotDragTouchId then
+			return
+		end
+		local delta = dragEvent.TouchDelta
+		self._T.SkillSlotDragDistance = self._T.SkillSlotDragDistance + math.sqrt(delta.x * delta.x + delta.y * delta.y)
+		if self._T.SkillSlotDragActive ~= true then
+			if self._T.SkillSlotDragDistance < self.SkillSlotDragThreshold then
+				return
+			end
+			self:ActivateSkillSlotDrag(dragEvent.TouchPoint)
+		end
+		self:UpdateSkillSlotDragGhost(dragEvent.TouchPoint)
+		local targetIndex = self:ResolveSkillSlotAtTouchPoint(dragEvent.TouchPoint)
+		self._T.SkillSlotDragHoverIndex = targetIndex
+		self:SetSkillSlotDragTarget(targetIndex)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ActivateSkillSlotDrag(Vector2 touchPoint)
+		local sourceIndex = self._T.SkillSlotDragSourceIndex
+		if sourceIndex <= 0 or self:CanBeginSkillSlotDrag(sourceIndex) == false then
+			self:CleanupSkillSlotDragVisuals(true)
+			return
+		end
+		self._T.SkillSlotDragActive = true
+		self.SuppressSkillClickUntil = (_UtilLogic.ElapsedSeconds or 0) + self.SkillSlotDragClickSuppressionSeconds
+		local skillId = self:GetSlotSkillId(sourceIndex)
+		local iconRuid = self:GetSkillIconRuid(skillId)
+		if self.SkillDragGhost ~= nil then
+			self.SkillDragGhost.ImageRUID = DataRef(iconRuid)
+			self.SkillDragGhost.Color = Color(1, 1, 1, 0.72)
+			self.SkillDragGhost.Entity.Enable = true
+			self.SkillDragGhost.Enable = true
+		end
+		local sourceIcon = self:GetSkillIcon(sourceIndex)
+		if sourceIcon ~= nil then
+			sourceIcon.Color = Color(0.72, 0.72, 0.72, 0.45)
+		end
+		self:UpdateSkillSlotDragGhost(touchPoint)
+		self:SetSkillSlotDragTarget(self._T.SkillSlotDragHoverIndex)
+		log("[BattleSkillSlotDrag] activated source=" .. tostring(sourceIndex) .. " skill=" .. skillId .. " threshold=" .. tostring(self.SkillSlotDragThreshold))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateSkillSlotDragGhost(Vector2 touchPoint)
+		if self._T.SkillSlotDragActive ~= true or self.SkillDragGhost == nil or self.SkillDragGhost.Entity.UITransformComponent == nil then
+			return
+		end
+		local uiPosition = _UILogic:ScreenToUIPosition(touchPoint)
+		local ghostX = math.max(-924, math.min(924, uiPosition.x))
+		local ghostY = math.max(-504, math.min(504, uiPosition.y))
+		self.SkillDragGhost.Entity.UITransformComponent.anchoredPosition = Vector2(ghostX, ghostY)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSkillSlotDragEnter(UITouchEnterEvent touchEvent)
+		if self._T.SkillSlotDragCandidate ~= true or touchEvent.TouchId ~= self._T.SkillSlotDragTouchId then
+			return
+		end
+		local targetIndex = self:ResolveSkillSlotIndex(touchEvent.Entity)
+		self._T.SkillSlotDragHoverIndex = targetIndex
+		if self._T.SkillSlotDragActive == true then
+			self:SetSkillSlotDragTarget(targetIndex)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSkillSlotDragExit(UITouchExitEvent touchEvent)
+		if self._T.SkillSlotDragCandidate ~= true or touchEvent.TouchId ~= self._T.SkillSlotDragTouchId then
+			return
+		end
+		local targetIndex = self:ResolveSkillSlotIndex(touchEvent.Entity)
+		if self._T.SkillSlotDragHoverIndex == targetIndex then
+			self._T.SkillSlotDragHoverIndex = 0
+			self:SetSkillSlotDragTarget(0)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer ResolveSkillSlotAtTouchPoint(Vector2 touchPoint)
+		local uiPosition = _UILogic:ScreenToUIPosition(touchPoint)
+		local queueTransform = nil
+		if isvalid(self.QueuePanelEntity) then
+			queueTransform = self.QueuePanelEntity.UITransformComponent
+		end
+		if queueTransform == nil then
+			return 0
+		end
+		-- The queue and its six slots are BottomCenter anchored. Compare in the same
+		-- top-level UI coordinate space as ScreenToUIPosition; GetWorldCorners uses
+		-- Maker viewport coordinates and cannot be mixed with simulated screen input.
+		local queueBottom = -(_UILogic.ScreenHeight * 0.5) + queueTransform.anchoredPosition.y
+		local queueCenterX = queueTransform.anchoredPosition.x
+		for slotIndex = 1, 6 do
+			local button = self:GetSkillSlotButton(slotIndex)
+			if button ~= nil and isvalid(button.Entity) and button.Entity.UITransformComponent ~= nil then
+				local slotTransform = button.Entity.UITransformComponent
+				local minX = queueCenterX + slotTransform.anchoredPosition.x - (slotTransform.RectSize.x * slotTransform.Pivot.x)
+				local maxX = minX + slotTransform.RectSize.x
+				local minY = queueBottom + slotTransform.anchoredPosition.y - (slotTransform.RectSize.y * slotTransform.Pivot.y)
+				local maxY = minY + slotTransform.RectSize.y
+				if uiPosition.x >= minX and uiPosition.x <= maxX and uiPosition.y >= minY and uiPosition.y <= maxY then
+					return slotIndex
+				end
+			end
+		end
+		return 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetSkillSlotDragTarget(integer targetIndex)
+		for slotIndex = 1, 6 do
+			local highlight = self:GetSkillSlotDragTargetHighlight(slotIndex)
+			if highlight ~= nil then
+				local isValidTarget = self._T.SkillSlotDragActive == true
+					and slotIndex == targetIndex
+					and slotIndex ~= self._T.SkillSlotDragSourceIndex
+					and self:GetSlotSkillId(slotIndex) ~= ""
+				highlight.Entity.Enable = isValidTarget
+				highlight.Enable = isValidTarget
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSkillSlotEndDrag(UITouchEndDragEvent dragEvent)
+		if self._T.SkillSlotDragCandidate ~= true or dragEvent.TouchId ~= self._T.SkillSlotDragTouchId then
+			return
+		end
+		if self._T.SkillSlotDragActive ~= true then
+			self:CleanupSkillSlotDragVisuals(true)
+			return
+		end
+
+		self.SuppressSkillClickUntil = (_UtilLogic.ElapsedSeconds or 0) + self.SkillSlotDragClickSuppressionSeconds
+		local sourceIndex = self._T.SkillSlotDragSourceIndex
+		local targetIndex = self:ResolveSkillSlotAtTouchPoint(dragEvent.TouchPoint)
+		self._T.SkillSlotDragHoverIndex = targetIndex
+		local expectedRevision = self._T.SkillSlotDragExpectedRevision
+		local validTarget = targetIndex > 0
+			and targetIndex ~= sourceIndex
+			and self:GetSlotSkillId(targetIndex) ~= ""
+			and self:CanBeginSkillSlotDrag(sourceIndex)
+		if validTarget == false then
+			log("[BattleSkillSlotDrag] cancelled source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " reason=INVALID_TARGET")
+			self:CleanupSkillSlotDragVisuals(true)
+			return
+		end
+
+		self:RequestAuthoritativeSkillSlotSwap(sourceIndex, targetIndex, expectedRevision)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestAuthoritativeSkillSlotSwap(integer sourceIndex, integer targetIndex, integer expectedRevision)
+		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
+		local lastRequestId = 0
+		local currentReceiptRevision = 0
+		if presenterState ~= nil and presenterState.Session ~= nil then
+			lastRequestId = presenterState.Session.SkillSlotLastRequestId or 0
+			currentReceiptRevision = presenterState.Session.SkillSlotSwapReceiptRevision or 0
+		end
+		local elapsedRequestId = math.floor((_UtilLogic.ElapsedSeconds or 0) * 1000)
+		local requestId = math.max(lastRequestId + 1, elapsedRequestId)
+		self.PendingSkillSlotSwapRequestId = requestId
+		self.PendingSkillSlotSwapReceiptRevision = currentReceiptRevision + 1
+		_BattleHudPresenterLogic:RequestSwapBattleSkillSlots(sourceIndex, targetIndex, requestId, expectedRevision)
+		if self.SkillSlotSwapPendingTimerId > 0 then
+			_TimerService:ClearTimer(self.SkillSlotSwapPendingTimerId)
+		end
+		local pendingRequestId = requestId
+		local timeout = function()
+			if self.PendingSkillSlotSwapRequestId == pendingRequestId then
+				log_warning("[BattleSkillSlotDrag] pending timeout request=" .. tostring(pendingRequestId))
+				self.PendingSkillSlotSwapRequestId = 0
+				self.PendingSkillSlotSwapReceiptRevision = 0
+				self.SkillSlotSwapPendingTimerId = 0
+				self:CleanupSkillSlotDragVisuals(true)
+			end
+		end
+		self.SkillSlotSwapPendingTimerId = _TimerService:SetTimerOnce(timeout, self.SkillSlotSwapPendingTimeout)
+		log("[BattleSkillSlotDrag] swap pending request=" .. tostring(requestId) .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " revision=" .. tostring(expectedRevision))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConsumeSkillSlotSwapReceipt(any session)
+		if self.PendingSkillSlotSwapRequestId <= 0
+			or session == nil
+			or session.SkillSlotLastRequestId ~= self.PendingSkillSlotSwapRequestId
+			or (session.SkillSlotSwapReceiptRevision or 0) < self.PendingSkillSlotSwapReceiptRevision then
+			return
+		end
+		if self.SkillSlotSwapPendingTimerId > 0 then
+			_TimerService:ClearTimer(self.SkillSlotSwapPendingTimerId)
+			self.SkillSlotSwapPendingTimerId = 0
+		end
+		log("[BattleSkillSlotDrag] authoritative result request=" .. tostring(session.SkillSlotLastRequestId) .. " success=" .. tostring(session.SkillSlotLastRequestSuccess) .. " reason=" .. tostring(session.SkillSlotLastRequestReason) .. " slots=" .. tostring(session.SkillSlotIds))
+		self.PendingSkillSlotSwapRequestId = 0
+		self.PendingSkillSlotSwapReceiptRevision = 0
+		self:CleanupSkillSlotDragVisuals(false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CleanupSkillSlotDragVisuals(boolean refreshHud)
+		if self.SkillDragGhost ~= nil then
+			self.SkillDragGhost.Enable = false
+			self.SkillDragGhost.Entity.Enable = false
+		end
+		self:SetSkillSlotDragTarget(0)
+		self:ResetSkillSlotDragState()
+		if refreshHud == true then
+			self:RefreshHud(true)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
 	method void StopSkillIconFeedback(integer slotIndex)
 		local timerRecords = self._T.SkillIconFeedbackTimers
 		if timerRecords == nil then
@@ -1012,6 +1372,12 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void RequestSlotSkill(integer slotIndex)
 		-- Queues whichever skill currently occupies the slot through the Presenter; the server re-validates ownership.
+		if self._T.SkillSlotDragCandidate == true
+			or self._T.SkillSlotDragActive == true
+			or (_UtilLogic.ElapsedSeconds or 0) < self.SuppressSkillClickUntil then
+			log("[BattleSkillSlotDrag] slot click suppressed slot=" .. tostring(slotIndex))
+			return
+		end
 		local skillId = self:GetSlotSkillId(slotIndex)
 		if skillId == "" then
 			log_warning("[BattleQueueHUD] register click ignored slot=" .. slotIndex .. " reason=SLOT_EMPTY")
