@@ -71,7 +71,7 @@ script BattleSessionComponent extends Component
 	-- Pipe-aligned authored CooldownTurns for the six HUD slots. Runtime remaining turns stay owned by SkillRuntimeStateComponent.
 	@Sync property string SkillSlotCooldownTurns = ""
 	@Sync property integer SkillSlotRevision = 0
-	@Sync property integer SkillSlotSwapReceiptRevision = 0
+	@Sync property integer SkillSlotReorderReceiptRevision = 0
 	@Sync property integer SkillSlotLastRequestId = 0
 	@Sync property boolean SkillSlotLastRequestSuccess = false
 	@Sync property string SkillSlotLastRequestReason = ""
@@ -82,7 +82,7 @@ script BattleSessionComponent extends Component
 	@Sync property string SkillIconSnapshot = ""
 	property string SkillSlotSourceSnapshot = ""
 	property integer SkillSlotCount = 6
-	property integer LastProcessedSkillSlotSwapRequestId = 0
+	property integer LastProcessedSkillSlotReorderRequestId = 0
 	-- One knob for how fast every skill plays. Above 1 speeds the swing, the effects, the impact frame,
 	-- and the queue slot together, so presentation and pacing never drift apart.
 	@Sync property number SkillSpeedMultiplier = 1.25
@@ -2608,29 +2608,29 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
-	method void RequestSwapBattleSkillSlots(integer sourceIndex, integer targetIndex, integer requestId, integer expectedRevision)
+	method void RequestReorderBattleSkillSlot(integer sourceIndex, integer targetIndex, integer requestId, integer expectedRevision)
 		-- The client proposes indices only. Skill identities always come from this authoritative session.
 		if self:IsValidPlayerRequest(senderUserId) == false then
-			log_warning("[BattleSkillSlotSwap] rejected request=" .. tostring(requestId) .. " reason=INVALID_SENDER")
+			log_warning("[BattleSkillSlotReorder] rejected request=" .. tostring(requestId) .. " reason=INVALID_SENDER")
 			return
 		end
 		if requestId <= 0 then
-			log_warning("[BattleSkillSlotSwap] rejected request=" .. tostring(requestId) .. " reason=INVALID_REQUEST_ID")
+			log_warning("[BattleSkillSlotReorder] rejected request=" .. tostring(requestId) .. " reason=INVALID_REQUEST_ID")
 			return
 		end
-		if requestId <= self.LastProcessedSkillSlotSwapRequestId then
-			local replayReason = requestId == self.LastProcessedSkillSlotSwapRequestId and "DUPLICATE_REQUEST" or "STALE_REQUEST"
-			log_warning("[BattleSkillSlotSwap] rejected request=" .. tostring(requestId) .. " last=" .. tostring(self.LastProcessedSkillSlotSwapRequestId) .. " reason=" .. replayReason)
+		if requestId <= self.LastProcessedSkillSlotReorderRequestId then
+			local replayReason = requestId == self.LastProcessedSkillSlotReorderRequestId and "DUPLICATE_REQUEST" or "STALE_REQUEST"
+			log_warning("[BattleSkillSlotReorder] rejected request=" .. tostring(requestId) .. " last=" .. tostring(self.LastProcessedSkillSlotReorderRequestId) .. " reason=" .. replayReason)
 			return
 		end
 
-		self.LastProcessedSkillSlotSwapRequestId = requestId
-		local result = self:TrySwapBattleSkillSlots(sourceIndex, targetIndex, expectedRevision)
-		self:PublishSkillSlotSwapReceipt(sourceIndex, targetIndex, result)
+		self.LastProcessedSkillSlotReorderRequestId = requestId
+		local result = self:TryReorderBattleSkillSlot(sourceIndex, targetIndex, expectedRevision)
+		self:PublishSkillSlotReorderReceipt(sourceIndex, targetIndex, result)
 	end
 
 	@ExecSpace("ServerOnly")
-	method table TrySwapBattleSkillSlots(integer sourceIndex, integer targetIndex, integer expectedRevision)
+	method table TryReorderBattleSkillSlot(integer sourceIndex, integer targetIndex, integer expectedRevision)
 		local result = {
 			Success = false,
 			Reason = "UNKNOWN",
@@ -2681,21 +2681,10 @@ script BattleSessionComponent extends Component
 			result.Reason = "SOURCE_SLOT_EMPTY"
 			return result
 		end
-		if targetSkillId == "" then
-			result.Reason = "TARGET_SLOT_EMPTY"
-			return result
-		end
-
 		local sourceValidation = _ContentValidatorLogic:ValidateSkillById(sourceSkillId)
 		if sourceValidation.Success == false then
 			result.Reason = "SOURCE_SKILL_INVALID"
 			result.DetailReason = sourceValidation.Reason
-			return result
-		end
-		local targetValidation = _ContentValidatorLogic:ValidateSkillById(targetSkillId)
-		if targetValidation.Success == false then
-			result.Reason = "TARGET_SKILL_INVALID"
-			result.DetailReason = targetValidation.Reason
 			return result
 		end
 		local sourceOwnership = _RunManagerLogic:CanUseRunSkill(self.PlayerEntity, sourceSkillId)
@@ -2703,56 +2692,103 @@ script BattleSessionComponent extends Component
 			result.Reason = "SOURCE_SKILL_NOT_OWNED"
 			return result
 		end
-		local targetOwnership = _RunManagerLogic:CanUseRunSkill(self.PlayerEntity, targetSkillId)
-		if targetOwnership.Success == false then
-			result.Reason = "TARGET_SKILL_NOT_OWNED"
-			return result
+		if targetSkillId ~= "" then
+			local targetValidation = _ContentValidatorLogic:ValidateSkillById(targetSkillId)
+			if targetValidation.Success == false then
+				result.Reason = "TARGET_SKILL_INVALID"
+				result.DetailReason = targetValidation.Reason
+				return result
+			end
+			local targetOwnership = _RunManagerLogic:CanUseRunSkill(self.PlayerEntity, targetSkillId)
+			if targetOwnership.Success == false then
+				result.Reason = "TARGET_SKILL_NOT_OWNED"
+				return result
+			end
 		end
 
-		-- Names and authored cooldowns are parallel presentation data for the same two slots.
+		local seenSkillIds = {}
+		for slotIndex = 1, self.SkillSlotCount do
+			local skillId = slotIds[slotIndex] or ""
+			if skillId ~= "" then
+				if seenSkillIds[skillId] == true then
+					result.Reason = "DUPLICATE_SKILL_SLOT"
+					return result
+				end
+				seenSkillIds[skillId] = true
+			end
+		end
+
+		-- Names and authored cooldowns are parallel presentation data for the same fixed six positions.
 		-- QueuedTileIds and ExecutingTileIds deliberately remain untouched because they already store SkillIds.
 		local slotNames = self:ParseSkillSlotPipe(self.SkillSlotNames)
 		local slotCooldownTurns = self:ParseSkillSlotPipe(self.SkillSlotCooldownTurns)
-		slotIds[sourceIndex], slotIds[targetIndex] = slotIds[targetIndex], slotIds[sourceIndex]
-		if slotNames[sourceIndex] ~= nil and slotNames[targetIndex] ~= nil then
+		local operation = "SWAP"
+		if targetSkillId == "" then
+			operation = "MOVE"
+			slotIds[targetIndex] = slotIds[sourceIndex]
+			slotIds[sourceIndex] = ""
+			slotNames[targetIndex] = slotNames[sourceIndex]
+			slotNames[sourceIndex] = ""
+			slotCooldownTurns[targetIndex] = slotCooldownTurns[sourceIndex]
+			slotCooldownTurns[sourceIndex] = ""
+		else
+			slotIds[sourceIndex], slotIds[targetIndex] = slotIds[targetIndex], slotIds[sourceIndex]
 			slotNames[sourceIndex], slotNames[targetIndex] = slotNames[targetIndex], slotNames[sourceIndex]
-		end
-		if slotCooldownTurns[sourceIndex] ~= nil and slotCooldownTurns[targetIndex] ~= nil then
 			slotCooldownTurns[sourceIndex], slotCooldownTurns[targetIndex] = slotCooldownTurns[targetIndex], slotCooldownTurns[sourceIndex]
 		end
 
-		self.SkillSlotIds = table.concat(slotIds, "|")
-		self.SkillSlotNames = table.concat(slotNames, "|")
-		self.SkillSlotCooldownTurns = table.concat(slotCooldownTurns, "|")
+		self.SkillSlotIds = self:SerializeSkillSlotPipe(slotIds)
+		self.SkillSlotNames = self:SerializeSkillSlotPipe(slotNames)
+		self.SkillSlotCooldownTurns = self:SerializeSkillSlotPipe(slotCooldownTurns)
 		self.SkillSlotRevision = self.SkillSlotRevision + 1
 		result.Success = true
 		result.Reason = "OK"
 		result.SourceSkillId = sourceSkillId
 		result.TargetSkillId = targetSkillId
+		result.Operation = operation
 		result.SlotIds = self.SkillSlotIds
 		result.Revision = self.SkillSlotRevision
-		log("[BattleSkillSlotSwap] success request=" .. tostring(self.LastProcessedSkillSlotSwapRequestId) .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " before=" .. result.PreviousSlotIds .. " after=" .. result.SlotIds .. " queued=" .. self.QueuedTileIds .. " executing=" .. self.ExecutingTileIds)
+		log("[BattleSkillSlotReorder] success request=" .. tostring(self.LastProcessedSkillSlotReorderRequestId) .. " operation=" .. operation .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " before=" .. result.PreviousSlotIds .. " after=" .. result.SlotIds .. " queued=" .. self.QueuedTileIds .. " executing=" .. self.ExecutingTileIds)
 		return result
 	end
 
 	@ExecSpace("ServerOnly")
 	method table ParseSkillSlotPipe(string snapshot)
 		local values = {}
-		for token in string.gmatch(snapshot or "", "([^|]+)") do
-			table.insert(values, token)
+		local serialized = snapshot or ""
+		local startIndex = 1
+		for slotIndex = 1, self.SkillSlotCount do
+			local separatorIndex, _ = string.find(serialized, "|", startIndex, true)
+			if separatorIndex == nil then
+				values[slotIndex] = string.sub(serialized, startIndex)
+				startIndex = string.len(serialized) + 1
+			else
+				values[slotIndex] = string.sub(serialized, startIndex, separatorIndex - 1)
+				startIndex = separatorIndex + 1
+			end
 		end
 		return values
 	end
 
 	@ExecSpace("ServerOnly")
-	method void PublishSkillSlotSwapReceipt(integer sourceIndex, integer targetIndex, table result)
-		self.SkillSlotLastRequestId = self.LastProcessedSkillSlotSwapRequestId
+	method string SerializeSkillSlotPipe(table values)
+		local fixedValues = {}
+		for slotIndex = 1, self.SkillSlotCount do
+			fixedValues[slotIndex] = values[slotIndex] or ""
+		end
+		return table.concat(fixedValues, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishSkillSlotReorderReceipt(integer sourceIndex, integer targetIndex, table result)
+		self.SkillSlotLastRequestId = self.LastProcessedSkillSlotReorderRequestId
 		self.SkillSlotLastRequestSuccess = result ~= nil and result.Success == true
 		self.SkillSlotLastRequestReason = result ~= nil and result.Reason or "UNKNOWN"
 		self.SkillSlotLastSourceIndex = sourceIndex
 		self.SkillSlotLastTargetIndex = targetIndex
-		self.SkillSlotSwapReceiptRevision = self.SkillSlotSwapReceiptRevision + 1
-		log("[BattleSkillSlotSwap] receipt request=" .. tostring(self.SkillSlotLastRequestId) .. " success=" .. tostring(self.SkillSlotLastRequestSuccess) .. " reason=" .. self.SkillSlotLastRequestReason .. " revision=" .. tostring(self.SkillSlotRevision) .. " slots=" .. self.SkillSlotIds)
+		self.SkillSlotReorderReceiptRevision = self.SkillSlotReorderReceiptRevision + 1
+		local operation = result ~= nil and result.Operation or "NONE"
+		log("[BattleSkillSlotReorder] receipt request=" .. tostring(self.SkillSlotLastRequestId) .. " success=" .. tostring(self.SkillSlotLastRequestSuccess) .. " reason=" .. self.SkillSlotLastRequestReason .. " operation=" .. tostring(operation) .. " revision=" .. tostring(self.SkillSlotRevision) .. " slots=" .. self.SkillSlotIds)
 	end
 
 	@ExecSpace("Server")

@@ -81,11 +81,11 @@ script BattleQueueHudComponent extends Component
 	property string MapTransferSourceMapName = ""
 	property number SkillSlotDragThreshold = 12
 	property number SkillSlotDragClickSuppressionSeconds = 0.25
-	property number SkillSlotSwapPendingTimeout = 0.75
+	property number SkillSlotReorderPendingTimeout = 0.75
 	property number SuppressSkillClickUntil = 0
-	property integer PendingSkillSlotSwapRequestId = 0
-	property integer PendingSkillSlotSwapReceiptRevision = 0
-	property integer SkillSlotSwapPendingTimerId = 0
+	property integer PendingSkillSlotReorderRequestId = 0
+	property integer PendingSkillSlotReorderReceiptRevision = 0
+	property integer SkillSlotReorderPendingTimerId = 0
 	property any SkillSlot1ClickHandler = nil
 	property any SkillSlot2ClickHandler = nil
 	property any SkillSlot3ClickHandler = nil
@@ -137,9 +137,9 @@ script BattleQueueHudComponent extends Component
 		self.InputFeedbackText = ""
 		self:DisconnectSkillSlotDragHandlers()
 		self:CleanupSkillSlotDragVisuals(false)
-		if self.SkillSlotSwapPendingTimerId > 0 then
-			_TimerService:ClearTimer(self.SkillSlotSwapPendingTimerId)
-			self.SkillSlotSwapPendingTimerId = 0
+		if self.SkillSlotReorderPendingTimerId > 0 then
+			_TimerService:ClearTimer(self.SkillSlotReorderPendingTimerId)
+			self.SkillSlotReorderPendingTimerId = 0
 		end
 		if self.PresenterStateChangedHandler ~= nil then
 			_BattleHudPresenterLogic:DisconnectEvent(BattleHudStateChangedEvent, self.PresenterStateChangedHandler)
@@ -229,7 +229,7 @@ script BattleQueueHudComponent extends Component
 		local turnState = presenterState.Turn
 		local waveState = presenterState.Wave
 		local uiState = presenterState.UiState
-		self:ConsumeSkillSlotSwapReceipt(session)
+		self:ConsumeSkillSlotReorderReceipt(session)
 		self:SetHudContextVisible(true, "BATTLE_CONTEXT_READY")
 		local queueState = uiState.PlayerQueue
 		local runFlowUi = presenterState.RunFlowUi
@@ -589,16 +589,32 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method string GetSlotSkillId(integer slotIndex)
-		-- Slots are assigned server-side from the owned skill set, so the HUD only reads the assignment.
-		local index = 0
-		for token in string.gmatch(self.SlotSkillIds or "", "([^|]+)") do
-			index = index + 1
-			if index == slotIndex then
-				return token
+	method string GetFixedSkillSlotToken(string snapshot, integer slotIndex)
+		if slotIndex < 1 or slotIndex > 6 then
+			return ""
+		end
+		local serialized = snapshot or ""
+		local startIndex = 1
+		for currentIndex = 1, slotIndex do
+			local separatorIndex, _ = string.find(serialized, "|", startIndex, true)
+			if separatorIndex == nil then
+				if currentIndex == slotIndex then
+					return string.sub(serialized, startIndex)
+				end
+				return ""
 			end
+			if currentIndex == slotIndex then
+				return string.sub(serialized, startIndex, separatorIndex - 1)
+			end
+			startIndex = separatorIndex + 1
 		end
 		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetSlotSkillId(integer slotIndex)
+		-- Slots are assigned server-side from the owned skill set, so the HUD only reads the assignment.
+		return self:GetFixedSkillSlotToken(self.SlotSkillIds, slotIndex)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -741,7 +757,7 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method boolean CanBeginSkillSlotDrag(integer slotIndex)
-		if self.PendingSkillSlotSwapRequestId > 0 or self:GetSlotSkillId(slotIndex) == "" then
+		if self.PendingSkillSlotReorderRequestId > 0 or self:GetSlotSkillId(slotIndex) == "" then
 			return false
 		end
 		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
@@ -896,7 +912,6 @@ script BattleQueueHudComponent extends Component
 				local isValidTarget = self._T.SkillSlotDragActive == true
 					and slotIndex == targetIndex
 					and slotIndex ~= self._T.SkillSlotDragSourceIndex
-					and self:GetSlotSkillId(slotIndex) ~= ""
 				highlight.Entity.Enable = isValidTarget
 				highlight.Enable = isValidTarget
 			end
@@ -920,7 +935,6 @@ script BattleQueueHudComponent extends Component
 		local expectedRevision = self._T.SkillSlotDragExpectedRevision
 		local validTarget = targetIndex > 0
 			and targetIndex ~= sourceIndex
-			and self:GetSlotSkillId(targetIndex) ~= ""
 			and self:CanBeginSkillSlotDrag(sourceIndex)
 		if validTarget == false then
 			log("[BattleSkillSlotDrag] cancelled source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " reason=INVALID_TARGET")
@@ -928,55 +942,55 @@ script BattleQueueHudComponent extends Component
 			return
 		end
 
-		self:RequestAuthoritativeSkillSlotSwap(sourceIndex, targetIndex, expectedRevision)
+		self:RequestAuthoritativeSkillSlotReorder(sourceIndex, targetIndex, expectedRevision)
 	end
 
 	@ExecSpace("ClientOnly")
-	method void RequestAuthoritativeSkillSlotSwap(integer sourceIndex, integer targetIndex, integer expectedRevision)
+	method void RequestAuthoritativeSkillSlotReorder(integer sourceIndex, integer targetIndex, integer expectedRevision)
 		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
 		local lastRequestId = 0
 		local currentReceiptRevision = 0
 		if presenterState ~= nil and presenterState.Session ~= nil then
 			lastRequestId = presenterState.Session.SkillSlotLastRequestId or 0
-			currentReceiptRevision = presenterState.Session.SkillSlotSwapReceiptRevision or 0
+			currentReceiptRevision = presenterState.Session.SkillSlotReorderReceiptRevision or 0
 		end
 		local elapsedRequestId = math.floor((_UtilLogic.ElapsedSeconds or 0) * 1000)
 		local requestId = math.max(lastRequestId + 1, elapsedRequestId)
-		self.PendingSkillSlotSwapRequestId = requestId
-		self.PendingSkillSlotSwapReceiptRevision = currentReceiptRevision + 1
-		_BattleHudPresenterLogic:RequestSwapBattleSkillSlots(sourceIndex, targetIndex, requestId, expectedRevision)
-		if self.SkillSlotSwapPendingTimerId > 0 then
-			_TimerService:ClearTimer(self.SkillSlotSwapPendingTimerId)
+		self.PendingSkillSlotReorderRequestId = requestId
+		self.PendingSkillSlotReorderReceiptRevision = currentReceiptRevision + 1
+		_BattleHudPresenterLogic:RequestReorderBattleSkillSlot(sourceIndex, targetIndex, requestId, expectedRevision)
+		if self.SkillSlotReorderPendingTimerId > 0 then
+			_TimerService:ClearTimer(self.SkillSlotReorderPendingTimerId)
 		end
 		local pendingRequestId = requestId
 		local timeout = function()
-			if self.PendingSkillSlotSwapRequestId == pendingRequestId then
+			if self.PendingSkillSlotReorderRequestId == pendingRequestId then
 				log_warning("[BattleSkillSlotDrag] pending timeout request=" .. tostring(pendingRequestId))
-				self.PendingSkillSlotSwapRequestId = 0
-				self.PendingSkillSlotSwapReceiptRevision = 0
-				self.SkillSlotSwapPendingTimerId = 0
+				self.PendingSkillSlotReorderRequestId = 0
+				self.PendingSkillSlotReorderReceiptRevision = 0
+				self.SkillSlotReorderPendingTimerId = 0
 				self:CleanupSkillSlotDragVisuals(true)
 			end
 		end
-		self.SkillSlotSwapPendingTimerId = _TimerService:SetTimerOnce(timeout, self.SkillSlotSwapPendingTimeout)
-		log("[BattleSkillSlotDrag] swap pending request=" .. tostring(requestId) .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " revision=" .. tostring(expectedRevision))
+		self.SkillSlotReorderPendingTimerId = _TimerService:SetTimerOnce(timeout, self.SkillSlotReorderPendingTimeout)
+		log("[BattleSkillSlotDrag] reorder pending request=" .. tostring(requestId) .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " revision=" .. tostring(expectedRevision))
 	end
 
 	@ExecSpace("ClientOnly")
-	method void ConsumeSkillSlotSwapReceipt(any session)
-		if self.PendingSkillSlotSwapRequestId <= 0
+	method void ConsumeSkillSlotReorderReceipt(any session)
+		if self.PendingSkillSlotReorderRequestId <= 0
 			or session == nil
-			or session.SkillSlotLastRequestId ~= self.PendingSkillSlotSwapRequestId
-			or (session.SkillSlotSwapReceiptRevision or 0) < self.PendingSkillSlotSwapReceiptRevision then
+			or session.SkillSlotLastRequestId ~= self.PendingSkillSlotReorderRequestId
+			or (session.SkillSlotReorderReceiptRevision or 0) < self.PendingSkillSlotReorderReceiptRevision then
 			return
 		end
-		if self.SkillSlotSwapPendingTimerId > 0 then
-			_TimerService:ClearTimer(self.SkillSlotSwapPendingTimerId)
-			self.SkillSlotSwapPendingTimerId = 0
+		if self.SkillSlotReorderPendingTimerId > 0 then
+			_TimerService:ClearTimer(self.SkillSlotReorderPendingTimerId)
+			self.SkillSlotReorderPendingTimerId = 0
 		end
 		log("[BattleSkillSlotDrag] authoritative result request=" .. tostring(session.SkillSlotLastRequestId) .. " success=" .. tostring(session.SkillSlotLastRequestSuccess) .. " reason=" .. tostring(session.SkillSlotLastRequestReason) .. " slots=" .. tostring(session.SkillSlotIds))
-		self.PendingSkillSlotSwapRequestId = 0
-		self.PendingSkillSlotSwapReceiptRevision = 0
+		self.PendingSkillSlotReorderRequestId = 0
+		self.PendingSkillSlotReorderReceiptRevision = 0
 		self:CleanupSkillSlotDragVisuals(false)
 	end
 
@@ -1079,26 +1093,13 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method string GetSlotSkillName(integer slotIndex)
-		local index = 0
-		for token in string.gmatch(self.SlotSkillNames or "", "([^|]+)") do
-			index = index + 1
-			if index == slotIndex then
-				return token
-			end
-		end
-		return ""
+		return self:GetFixedSkillSlotToken(self.SlotSkillNames, slotIndex)
 	end
 
 	@ExecSpace("ClientOnly")
 	method integer GetSlotMaxCooldown(integer slotIndex)
-		local index = 0
-		for token in string.gmatch(self.SlotSkillCooldownTurns or "", "([^|]+)") do
-			index = index + 1
-			if index == slotIndex then
-				return math.max(0, math.floor(tonumber(token) or 0))
-			end
-		end
-		return 0
+		local token = self:GetFixedSkillSlotToken(self.SlotSkillCooldownTurns, slotIndex)
+		return math.max(0, math.floor(tonumber(token) or 0))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1505,11 +1506,9 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method string GetTileLabel(string tileId)
 		-- Display names arrive with the slot assignment because the skill DataSets are server-only.
-		local index = 0
-		for token in string.gmatch(self.SlotSkillIds or "", "([^|]+)") do
-			index = index + 1
-			if token == tileId then
-				local name = self:GetSlotSkillName(index)
+		for slotIndex = 1, 6 do
+			if self:GetSlotSkillId(slotIndex) == tileId then
+				local name = self:GetSlotSkillName(slotIndex)
 				if name ~= "" then
 					return name
 				end

@@ -452,3 +452,66 @@ The swap exists only for the current `BattleSessionComponent`. No DataStorage, p
 | Build/runtime errors | PASS for Step 1 — refreshed build contained zero errors and no runtime error stack referenced the new drag/swap methods. |
 
 Maker evidence was collected in Play at 1920x1080 simulated resolution. The pre-existing `INVALID_PLAYER` RunManager/UnionEffect entry logs still occur when entering the controlled test battle and are outside this Step 1 drag-swap change.
+
+### STEP 2 Empty-slot Move / Full Reorder
+
+#### Generalized authoritative mutation
+
+Step 2 replaces the narrow Step 1 swap naming with one reorder path:
+
+```text
+BattleQueueHudComponent:RequestAuthoritativeSkillSlotReorder
+  -> BattleHudPresenterLogic:RequestReorderBattleSkillSlot
+  -> BattleSessionComponent:RequestReorderBattleSkillSlot
+  -> BattleSessionComponent:TryReorderBattleSkillSlot
+```
+
+The request still contains only source/target indices, request ID, and the observed slot revision. The server resolves current SkillIds from the authoritative session. Existing sender, index, replay, stale-revision, content, ownership, and idle-`PlayerTurn` validation remains in force.
+
+#### Fixed six-slot representation
+
+Step 1's nonempty-token parser would compact a snapshot after a move. Step 2 replaces it with fixed-position parsing and serialization for exactly six indices, preserving empty tokens.
+
+Example:
+
+```text
+A|B|C
+source 1 -> empty target 4
+|B|C|A||
+```
+
+No insertion, compaction, dynamic slot creation, or index rebinding occurs. The client uses the same fixed-position token semantics for IDs, names, cooldowns, queue labels, and click lookup.
+
+#### Reorder semantics
+
+- Occupied source -> occupied target: direct `SWAP`.
+- Occupied source -> empty target: direct `MOVE`; source becomes empty and target receives the source ID/name/cooldown.
+- Empty source: cannot enter drag state and sends no request.
+- Same slot or outside/non-slot target: client cancel/no mutation.
+- Empty and occupied targets share the same subtle target-highlight family. Because an empty slot has no icon, its highlighted fixed frame reads as a move destination without new text or colors.
+- The server rejects an already-corrupt authoritative bar containing duplicate nonempty SkillIds with `DUPLICATE_SKILL_SLOT`. A valid reorder is a permutation/move and cannot create a duplicate.
+- There are still no number-key bindings. Slot position remains the click/input position, so a moved SkillId is resolved by its new slot's existing handler.
+
+#### Queue, execution, and persistence boundaries
+
+`QueuedTileIds`, `ExecutingTileIds`, execution indices, the overhead queue, and queue order are not written by the reorder path. They remain stable SkillId sequences. Reorder is still current-`BattleSessionComponent` state only: no DataStorage, loadout profile, reconnect restoration, or initialization change was added.
+
+#### Step 2 Maker Play matrix
+
+| Test | Maker Play result |
+|---|---|
+| Occupied -> empty | PASS — actual drag `1 -> 4` changed `divine_swing|brandish` to `|brandish||divine_swing||`; operation `MOVE`. |
+| Occupied -> occupied | PASS — actual drag `4 -> 2` produced `|divine_swing||brandish||`; operation `SWAP`. |
+| Empty source | PASS — actual drag attempt from empty slot 1 left candidate/active/ghost false and revision unchanged. |
+| Empty target highlight | PASS — runtime drag over empty slot 5 reported target 5, highlight true, ghost true; cleanup returned both false. |
+| Six-index stability | PASS — subsequent actual moves placed `brandish` in slot 1 and `divine_swing` in slot 6 as `brandish|||||divine_swing`. |
+| Same/outside drop | PASS — same-slot target 2 and outside target 0 cancelled; revision and queue were unchanged, visuals cleared. |
+| Normal/post-move click | PASS — after moving `divine_swing` to slot 6, the unchanged slot-6 click handler queued `divine_swing`. |
+| Queued SkillId stability | PASS — moving queued `divine_swing` from slot 2 to slot 5 kept `QueuedTileIds=divine_swing`. |
+| Executing SkillId stability | PASS — controlled `ExecutingTileIds=divine_swing` probe rejected with `ACTION_PROCESSING` and preserved session/turn execution snapshots. |
+| Duplicate protection | PASS — controlled duplicate authoritative snapshot rejected with `DUPLICATE_SKILL_SLOT` and was restored. |
+| Index/same/stale validation | PASS — returned `SLOT_INDEX_OUT_OF_RANGE`, `SAME_SLOT`, and `STALE_SLOT_REVISION` without mutation. |
+| Replay protection | PASS — repeated/latest request returned `DUPLICATE_REQUEST`; lower request returned `STALE_REQUEST`. |
+| Build/runtime | PASS — refreshed build had zero errors and no runtime error stack referenced Step 2 reorder/fixed-slot methods. |
+
+Maker evidence was collected in an actual battle at 1920x1080 simulated resolution. The three pre-existing `INVALID_PLAYER` RunManager/UnionEffect entry errors remain unrelated to the reorder implementation.
