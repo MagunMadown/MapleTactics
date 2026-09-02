@@ -554,3 +554,118 @@ Captured Maker evidence (1920x1080 simulated input space):
 - empty target: `maker_play_20260902_150605_995.png`
 - invalid queue-HUD crossing: `maker_play_20260902_150651_514.png`
 - settled result: `maker_play_20260902_151556_505.png`
+
+### STEP 4 Loadout Necessity Audit
+
+#### Decision
+
+**NEEDS ACTIVE LOADOUT: NO.**
+
+The current production game cannot naturally produce more than six distinct run-owned skills. All reachable owned skills therefore fit in the existing six fixed Battle slots. An Available Skills -> Active 6 Skills equip layer would not create a real choice today; it would add an inventory-management step around a set that is already fully displayable.
+
+The appropriate next boundary, if player-authored order should survive more than one Battle, is a **run-scoped ordered Battle-bar configuration**. It should preserve the Step 1-3 order across Battles without changing which skills are active. No permanent account loadout or DataStorage schema is justified.
+
+#### Every `RunSkillSnapshot` mutation and acquisition path
+
+| Path | Production behavior | Changes distinct count? | Reachable with current data? |
+|---|---|---:|---|
+| Run reset | `PlayerRunInventoryComponent:ResetForRun` clears `RunSkillSnapshot`. | Resets to 0 before initialization | Yes |
+| Starting skills | `RunManagerLogic:ApplyJobSelection` calls `InitializeStartingSkills` when the snapshot is empty. `PlayerRunStateComponent:ApplyJobBundle` takes the first `EffectiveStartingSkillSlotCount` authored entries. | Establishes 2 or 3 distinct skills | Yes |
+| New-skill reward map | `NewSkillStageChoiceComponent` offers only unowned tier-1 families for the selected job, then calls `RunManagerLogic:GrantRunSkill` -> `PlayerRunInventoryComponent:GrantSkill`. | +1 distinct family per successful choice | Yes |
+| Upgrade reward map | `UpgradeSkillStageLogic` validates the authored upgrade path, then calls `PlayerRunInventoryComponent:UpgradeSkill`. The method removes one base copy and adds one upgrade copy atomically. | Normally 0; replacement, not addition | Yes |
+| Stage-clear reward | `RunManagerLogic:GrantRunReward` -> inventory `GrantRunReward` accepts only `CURRENCY` and `CONSUMABLE`. Current `StageRewardDefinitions.csv` contains only gold. | No | Yes, but not for skills |
+| Shop | `ApplyShopPurchase` supports a generic `SKILL` reward and has no six-skill cap. Current `ShopEntries.csv` contains only `ITEM` rewards, so no authored shop offer reaches this branch. | Could add a distinct skill | Logic seam exists; current data does not use it |
+| Union unlock | `ADDITIONAL_SKILL_UNLOCK` is authored with `IsImplemented=false`; the production Union resolver does not expose or apply it. | No current mutation | No |
+| Augment/passive/relic | These mutate their own run-owned augment/item state. No production caller grants a skill through them. | No | No skill path |
+| Public future grant seam | `RunManagerLogic:GrantRunSkill` validates any skill definition and delegates to uncapped `GrantSkill`. Its only current production caller is the new-skill stage. | Could add distinct skills if a future adapter calls it | Not beyond the current new-skill stage |
+
+`RunSkillSnapshot` is an amount snapshot, not an ordered loadout. `AddSnapshotAmount`/`SetSnapshotAmount` rebuild it in lexicographic SkillId order. Acquisition order is therefore not retained.
+
+#### Actual distinct-skill bounds
+
+Current tier-1 family counts are:
+
+| Job | Tier-1 families | Authored starting entries | Reachable family cap |
+|---|---:|---:|---:|
+| Warrior | 3 | 3 | 3 |
+| Mage | 6 | 6 | 6 |
+| Archer | 3 | 3 | 3 |
+| Thief | 3 | 3 | 3 |
+| Pirate | 3 | 3 | 3 |
+
+The base starting count is exactly `StartingSkillSlotCount = 2`. The production Union effect source is `AllocatedUnionStats`; its implemented `STARTING_SKILL` stat has one level worth `+1`. `UnionUpgradeDefinitions.csv` is legacy/non-production for effect resolution, and `ADDITIONAL_SKILL_UNLOCK` is disabled. Thus a run starts with exactly 2 distinct skills, or 3 with the maximum currently implemented Starting Skill bonus.
+
+Each production node graph has three REST reward boundaries. For `region_01_stage_01`, the first reward is a new-skill map when an unowned family exists. Later Region 01 rewards use 75% upgrade / 25% new-skill selection; Kerning rewards use that same 75% / 25% branch from their first REST. A new-skill selection adds one unowned family, while an upgrade keeps the distinct count unchanged.
+
+| Measure | Actual result |
+|---|---|
+| Minimum | **2** distinct skills: base run start; also a possible Kerning completion count when all three reward rolls choose upgrades. |
+| Normal/modal | **3** for the four three-family jobs. In the default Region 01 graph, Mage normally ends with 3 without the Union bonus or 4 with it when the two later 75% branches choose upgrades. Kerning commonly remains in the 2-3/3-4 range depending on Union and the reward rolls. |
+| Maximum | **6**, reachable only by Mage: start with 3 using the implemented `+1` Union bonus, then receive three new-family rewards. Without that bonus, Mage's maximum is 5. Every other job is hard-limited by its three tier-1 families. |
+
+The exact current production answer to the key question is therefore: **`RunSkillSnapshot` has uncapped storage APIs, but production gameplay/data cannot make it contain more than six distinct skills.**
+
+#### What would happen above six today
+
+There is no acquisition-time cap in `GrantSkill` or the shop's `SKILL` branch. If future data or a new caller created seven or more distinct entries, acquisition would succeed and all entries would remain in `RunSkillSnapshot`.
+
+At Battle initialization, however, `BattleSessionComponent:RefreshSkillSlots` would:
+
+1. read `RunSkillSnapshot`, falling back to `SelectedJobStartingSkillIds` only when it is empty;
+2. extract and deduplicate every SkillId;
+3. Fisher-Yates shuffle the complete candidate list;
+4. take `min(6, candidateCount)` into `SkillSlotIds`;
+5. build names/cooldowns for those selected six, while keeping icon/presentation records for all candidates.
+
+So the present hypothetical overflow behavior is **random-six truncation at presentation time**. It is not first-six, acquisition order, job-definition order, overwrite, scroll/paging, an error, or an enforced ownership cap. The omitted skills remain owned but have no normal Battle-bar button, making them effectively inaccessible through the current click UI. This latent behavior should be revisited before any future content raises a job above six families or authors a shop/event skill grant.
+
+#### Battle-to-Battle order
+
+Step 1-3 reorder writes only the current map-scoped `BattleSessionComponent.SkillSlotIds` and its parallel presentation fields. It never writes `RunSkillSnapshot` or another player-owned ordered configuration.
+
+Every Battle entry calls `ApplyRunJobConfiguration` -> `RefreshSkillSlots`. The result across Battles is conditional but not reliably persistent:
+
+- When the reward map changes ownership by adding or upgrading a skill, the new snapshot differs from `SkillSlotSourceSnapshot`; the next Battle reshuffles and rebuilds the bar, discarding the player-authored order.
+- Entering a different physical Battle map (for example Region 01 Battle -> boss map) uses that map's separate session state and rebuilds from an empty source cache.
+- If the same physical Battle map is reused and the owned snapshot is byte-for-byte unchanged, the source-snapshot early return can incidentally retain the existing order. This is an implementation side effect, not a run persistence contract.
+
+A new Battle does **not** restore job/acquisition order. When it rebuilds, it generates another random order. The Step 1-3 arrangement therefore does not safely survive Battle 1 -> Battle 2 for the same run.
+
+#### Model A / B / C evaluation
+
+| Model | Fit for current MapleTactics | Decision |
+|---|---|---|
+| A — all owned run skills active, maximum six, reorder only | Matches every reachable production state. Keeps all build rewards usable, preserves the readable six-slot bar, and adds no between-Battle equip friction. | **Recommended** |
+| B — own more than six, equip an active six | No current run can reach the condition that gives equip meaningful gameplay value. Implementing it now would create schema/UI/validation work without a real seventh-skill decision. | Defer until production content can exceed six |
+| C — own more than six, page/scroll the Battle bar | Also solves a nonexistent current problem and weakens one-glance positional readability during short tactical decisions. It would make direct drag ordering and slot memory less predictable. | Not recommended |
+
+Shogun Showdown is useful here as interaction inspiration: its combat is built around readable attack tiles, deliberate ordering, upgrades, and a short execution queue. MapleTactics should preserve that directness, but it should not copy an inventory/equip structure that its own skill economy does not require. Model A keeps combat decisions quick, leaves roguelike build choice in acquisition/upgrade decisions, keeps six-slot readability, and imposes the least management friction.
+
+References used only for the interaction comparison: [Official Shogun Showdown Tiles wiki](https://shogunshowdown.wiki.gg/wiki/Tiles), [Shogun Showdown on Steam](https://store.steampowered.com/app/2084000/Shogun_Showdown/).
+
+#### Persistence recommendation
+
+| Scope | Benefit | Cost/risk | Recommendation |
+|---|---|---|---|
+| Battle-only | Already implemented; no additional state. | Reorder is lost on ownership change/new Battle map and cannot establish reliable positional memory. | Acceptable prototype, not the desired final Step 1-3 behavior |
+| Run-only | Preserves one ordered six-position bar while the owned set evolves; naturally resets with the run and selected job. | Needs one player-owned, server-authoritative ordered slot field plus reconciliation when a skill is added/upgraded. | **Recommended next scope** |
+| Permanent account | Could remember preferences across runs. | Run skill sets vary by job and rewards; creates stale/missing SkillIds, migration/fallback policy, and DataStorage complexity without current gameplay value. | Do not implement |
+
+For Model A, the minimum future architecture is not an equip system: keep `RunSkillSnapshot` as ownership and add a separate **run-scoped ordered six-position bar configuration** owned by player run state (or a dedicated player-owned run skill-bar component). Battle reorder requests should update that owner after server validation, and Battle initialization should reconcile the saved order against current ownership: retain surviving positions, replace an upgraded SkillId in place, and place a newly acquired SkillId into the first empty position. This remains per-run and must not use DataStorage.
+
+#### UI recommendation
+
+No `보유 스킬` equip UI is needed for Model A. The existing `BattleQueueHUD` is the correct and sufficient place to reorder the six active/owned skills.
+
+If future production content genuinely raises the reachable family count above six and Model B becomes necessary, use the **run inventory UI** as the single `보유 스킬` location. It keeps equipment decisions between Battles, avoids expanding the combat HUD, and is lower-friction than a separate settings overlay. Do not add that UI under current rules.
+
+#### Step 4 final state
+
+- NEEDS ACTIVE LOADOUT: **NO**
+- Recommended model: **Model A**
+- Recommended persistence: **run-only ordered Battle-bar configuration**
+- Recommended current UI: **existing BattleQueueHUD; no owned-skill equip panel**
+- Production files modified: **NONE**
+- Documentation modified: `Docs/SkillDragSystemAudit.md` only
+- Loadout/equip implementation: **NOT STARTED**
+- Step 4 stop condition: **satisfied**
