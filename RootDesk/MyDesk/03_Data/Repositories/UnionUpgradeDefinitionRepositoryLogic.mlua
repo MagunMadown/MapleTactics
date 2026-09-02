@@ -1,0 +1,333 @@
+@Logic
+script UnionUpgradeDefinitionRepositoryLogic extends Logic
+
+    property string DefinitionDataSetName = "UnionUpgradeDefinitions"
+    property string LevelDataSetName = "UnionUpgradeLevels"
+
+    @ExecSpace("ServerOnly")
+    method table GetDefinition(string upgradeId)
+        -- Loads one Union upgrade definition without applying progression or gameplay effects.
+        local result = { Success = false, Reason = "UNION_UPGRADE_NOT_FOUND", UpgradeId = upgradeId or "" }
+        if upgradeId == nil or upgradeId == "" then
+            result.Reason = "INVALID_UPGRADE_ID"
+            return result
+        end
+        local dataSet = _DataService:GetTable(self.DefinitionDataSetName)
+        if dataSet == nil then
+            result.Reason = "UNION_UPGRADE_DATASET_MISSING"
+            return result
+        end
+        local matchCount = 0
+        for rowIndex = 1, dataSet:GetRowCount() do
+            if dataSet:GetCell(rowIndex, "UpgradeId") == upgradeId then
+                matchCount = matchCount + 1
+                if result.Success == false then
+                    result = self:ConvertDefinitionRow(dataSet, rowIndex)
+                end
+            end
+        end
+        if result.Success == true then
+            result.MatchCount = matchCount
+            log("[UnionUpgradeDefinition] loaded id=" .. result.UpgradeId .. " maxLevel=" .. result.MaxLevel .. " effect=" .. result.EffectType)
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetLevelDefinition(string upgradeId, integer level)
+        -- Loads the cumulative effect and tuning costs for one purchased upgrade level.
+        local result = { Success = false, Reason = "UNION_UPGRADE_LEVEL_NOT_FOUND", UpgradeId = upgradeId or "", Level = level }
+        if upgradeId == nil or upgradeId == "" then
+            result.Reason = "INVALID_UPGRADE_ID"
+            return result
+        end
+        if level == nil or level <= 0 then
+            result.Reason = "INVALID_LEVEL"
+            return result
+        end
+        local definition = self:GetDefinition(upgradeId)
+        if definition.Success == false then
+            result.Reason = definition.Reason
+            return result
+        end
+        if level > definition.MaxLevel then
+            result.Reason = "INVALID_LEVEL"
+            return result
+        end
+        local dataSet = _DataService:GetTable(self.LevelDataSetName)
+        if dataSet == nil then
+            result.Reason = "UNION_UPGRADE_LEVEL_DATASET_MISSING"
+            return result
+        end
+        local matchCount = 0
+        for rowIndex = 1, dataSet:GetRowCount() do
+            local rowLevel = math.floor(tonumber(dataSet:GetCell(rowIndex, "Level")) or 0)
+            if dataSet:GetCell(rowIndex, "UpgradeId") == upgradeId and rowLevel == level then
+                matchCount = matchCount + 1
+                if result.Success == false then
+                    result = self:ConvertLevelRow(dataSet, rowIndex)
+                end
+            end
+        end
+        if result.Success == true then
+            result.MatchCount = matchCount
+            log("[UnionUpgradeLevel] loaded id=" .. result.UpgradeId .. " level=" .. result.Level .. " cost=" .. result.Cost .. " value=" .. result.EffectValue)
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllDefinitions()
+        -- Loads every Union upgrade definition in deterministic SortOrder and UpgradeId order.
+        local result = { Success = false, Reason = "UNION_UPGRADE_DATASET_MISSING", Definitions = {}, DefinitionCount = 0 }
+        local dataSet = _DataService:GetTable(self.DefinitionDataSetName)
+        if dataSet == nil then
+            return result
+        end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            table.insert(result.Definitions, self:ConvertDefinitionRow(dataSet, rowIndex))
+        end
+        table.sort(result.Definitions, function(left, right)
+            if left.SortOrder == right.SortOrder then
+                return left.UpgradeId < right.UpgradeId
+            end
+            return left.SortOrder < right.SortOrder
+        end)
+        result.Success = true
+        result.Reason = "OK"
+        result.DefinitionCount = #result.Definitions
+        log("[UnionUpgradeDefinition] loaded all count=" .. result.DefinitionCount)
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidateDefinitions()
+        -- Validates the complete definition and level datasets before any future system consumes them.
+        local result = {
+            Success = false,
+            Reason = "CONTENT_VALIDATION_FAILED",
+            CheckedDefinitionCount = 0,
+            CheckedLevelCount = 0,
+            ErrorCount = 0,
+            Errors = {},
+            ErrorSnapshot = ""
+        }
+        local definitions = _DataService:GetTable(self.DefinitionDataSetName)
+        local levels = _DataService:GetTable(self.LevelDataSetName)
+        if definitions == nil then
+            self:AddValidationError(result, self.DefinitionDataSetName, 0, "", 0, "DATASET_NOT_FOUND")
+        end
+        if levels == nil then
+            self:AddValidationError(result, self.LevelDataSetName, 0, "", 0, "DATASET_NOT_FOUND")
+        end
+        if definitions == nil or levels == nil then
+            return self:FinalizeValidation(result)
+        end
+
+        local definitionsById = {}
+        local definitionOrder = {}
+        local definitionCounts = {}
+        for rowIndex = 1, definitions:GetRowCount() do
+            result.CheckedDefinitionCount = result.CheckedDefinitionCount + 1
+            local upgradeId = definitions:GetCell(rowIndex, "UpgradeId") or ""
+            definitionCounts[upgradeId] = (definitionCounts[upgradeId] or 0) + 1
+            if upgradeId == "" then
+                self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, upgradeId, 0, "INVALID_UPGRADE_ID")
+            elseif definitionCounts[upgradeId] > 1 then
+                self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, upgradeId, 0, "DUPLICATE_UPGRADE_ID")
+            else
+                local definition = self:ConvertDefinitionRow(definitions, rowIndex)
+                definitionsById[upgradeId] = definition
+                table.insert(definitionOrder, upgradeId)
+                if self:IsPositiveIntegerCell(definitions:GetCell(rowIndex, "MaxLevel")) == false then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, upgradeId, 0, "INVALID_MAX_LEVEL")
+                end
+                if self:IsSupportedEffectType(definition.EffectType) == false then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, upgradeId, 0, "UNKNOWN_EFFECT_TYPE")
+                end
+                if definition.Category == "" or definition.DisplayName == "" or definition.Description == "" or definition.BoardRegion == "" then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, upgradeId, 0, "REQUIRED_FIELD_MISSING")
+                end
+                if definition.SortOrder <= 0 then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, upgradeId, 0, "INVALID_SORT_ORDER")
+                end
+            end
+        end
+
+        table.sort(definitionOrder)
+        local seenLevelKeys = {}
+        for rowIndex = 1, levels:GetRowCount() do
+            result.CheckedLevelCount = result.CheckedLevelCount + 1
+            local upgradeId = levels:GetCell(rowIndex, "UpgradeId") or ""
+            local levelCell = levels:GetCell(rowIndex, "Level")
+            local level = math.floor(tonumber(levelCell) or 0)
+            local definition = definitionsById[upgradeId]
+            if self:IsPositiveIntegerCell(levelCell) == false then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "INVALID_LEVEL")
+            elseif definition == nil then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "UNKNOWN_UPGRADE_ID")
+            elseif level > definition.MaxLevel then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "INVALID_LEVEL")
+            else
+                local levelKey = upgradeId .. "#" .. tostring(level)
+                if seenLevelKeys[levelKey] == true then
+                    self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "DUPLICATE_UPGRADE_LEVEL")
+                else
+                    seenLevelKeys[levelKey] = true
+                end
+            end
+
+            local costCell = levels:GetCell(rowIndex, "Cost")
+            local cost = tonumber(costCell)
+            if cost ~= nil and cost < 0 then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "NEGATIVE_COST")
+            elseif self:IsNonNegativeIntegerCell(costCell) == false then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "INVALID_COST")
+            end
+            local effectValue = tonumber(levels:GetCell(rowIndex, "EffectValue"))
+            if effectValue == nil or effectValue < 0 then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "INVALID_EFFECT_VALUE")
+            end
+            local requiredRankId = levels:GetCell(rowIndex, "RequiredUnionRank") or ""
+            local requiredRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(requiredRankId)
+            if requiredRankId == "" or requiredRank.Success == false or (requiredRank.MatchCount or 0) ~= 1 then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "INVALID_REQUIRED_UNION_RANK")
+            end
+            local requiredUpgradeId = levels:GetCell(rowIndex, "RequiredUpgradeId") or ""
+            local requiredUpgradeLevelCell = levels:GetCell(rowIndex, "RequiredUpgradeLevel")
+            local requiredUpgradeLevel = math.floor(tonumber(requiredUpgradeLevelCell) or 0)
+            if requiredUpgradeId == "" then
+                if self:IsNonNegativeIntegerCell(requiredUpgradeLevelCell) == false or requiredUpgradeLevel ~= 0 then
+                    self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "INVALID_EMPTY_PREREQUISITE_LEVEL")
+                end
+            else
+                local requiredDefinition = definitionsById[requiredUpgradeId]
+                if requiredDefinition == nil then
+                    self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "UNKNOWN_REQUIRED_UPGRADE_ID")
+                elseif self:IsPositiveIntegerCell(requiredUpgradeLevelCell) == false or requiredUpgradeLevel > requiredDefinition.MaxLevel then
+                    self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "INVALID_REQUIRED_UPGRADE_LEVEL")
+                elseif requiredUpgradeId == upgradeId and requiredUpgradeLevel >= level then
+                    self:AddValidationError(result, self.LevelDataSetName, rowIndex, upgradeId, level, "SELF_PREREQUISITE_MUST_BE_PRIOR_LEVEL")
+                end
+            end
+        end
+
+        for _, upgradeId in ipairs(definitionOrder) do
+            local definition = definitionsById[upgradeId]
+            if definition.MaxLevel > 0 then
+                for level = 1, definition.MaxLevel do
+                    local levelKey = upgradeId .. "#" .. tostring(level)
+                    if seenLevelKeys[levelKey] ~= true then
+                        self:AddValidationError(result, self.LevelDataSetName, 0, upgradeId, level, "MISSING_LEVEL_ROW")
+                    end
+                end
+            end
+        end
+        return self:FinalizeValidation(result)
+    end
+
+    method table ConvertDefinitionRow(any dataSet, integer rowIndex)
+        -- Converts string cells into one immutable Union upgrade definition DTO.
+        return {
+            Success = true,
+            Reason = "OK",
+            UpgradeId = dataSet:GetCell(rowIndex, "UpgradeId") or "",
+            Category = dataSet:GetCell(rowIndex, "Category") or "",
+            DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+            Description = dataSet:GetCell(rowIndex, "Description") or "",
+            EffectType = dataSet:GetCell(rowIndex, "EffectType") or "",
+            MaxLevel = math.floor(tonumber(dataSet:GetCell(rowIndex, "MaxLevel")) or 0),
+            BoardRegion = dataSet:GetCell(rowIndex, "BoardRegion") or "",
+            IsMajor = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "IsMajor")),
+            SortOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "SortOrder")) or 0),
+            RowIndex = rowIndex,
+            Source = "DATASET"
+        }
+    end
+
+    method table ConvertLevelRow(any dataSet, integer rowIndex)
+        -- Converts one level row whose EffectValue is cumulative through the selected level.
+        return {
+            Success = true,
+            Reason = "OK",
+            UpgradeId = dataSet:GetCell(rowIndex, "UpgradeId") or "",
+            Level = math.floor(tonumber(dataSet:GetCell(rowIndex, "Level")) or 0),
+            Cost = math.floor(tonumber(dataSet:GetCell(rowIndex, "Cost")) or 0),
+            EffectValue = tonumber(dataSet:GetCell(rowIndex, "EffectValue")) or 0,
+            RequiredUnionRank = dataSet:GetCell(rowIndex, "RequiredUnionRank") or "",
+            RequiredUpgradeId = dataSet:GetCell(rowIndex, "RequiredUpgradeId") or "",
+            RequiredUpgradeLevel = math.floor(tonumber(dataSet:GetCell(rowIndex, "RequiredUpgradeLevel")) or 0),
+            RowIndex = rowIndex,
+            Source = "DATASET"
+        }
+    end
+
+    method boolean ParseBooleanCell(any cellValue)
+        -- Converts common dataset boolean spellings into a strict boolean.
+        if cellValue == true then
+            return true
+        end
+        local normalized = string.lower(tostring(cellValue or ""))
+        return normalized == "true" or normalized == "1" or normalized == "yes"
+    end
+
+    method boolean IsPositiveIntegerCell(any cellValue)
+        -- Checks that a dataset cell contains an integer greater than zero.
+        local numericValue = tonumber(cellValue)
+        return numericValue ~= nil and numericValue > 0 and numericValue == math.floor(numericValue)
+    end
+
+    method boolean IsNonNegativeIntegerCell(any cellValue)
+        -- Checks that a dataset cell contains an integer greater than or equal to zero.
+        local numericValue = tonumber(cellValue)
+        return numericValue ~= nil and numericValue >= 0 and numericValue == math.floor(numericValue)
+    end
+
+    method boolean IsSupportedEffectType(string effectType)
+        -- Restricts definitions to the nine effect contracts introduced by Union STEP 1.
+        return effectType == "MESO_GAIN_RATE"
+            or effectType == "ITEM_DROP_RATE"
+            or effectType == "AUGMENT_REROLL"
+            or effectType == "UNION_POINT_GAIN_RATE"
+            or effectType == "STARTING_POTION"
+            or effectType == "MAX_HP"
+            or effectType == "INVENTORY_SLOT"
+            or effectType == "STARTING_SKILL"
+            or effectType == "STARTING_RANDOM_RELIC"
+    end
+
+    method void AddValidationError(table result, string dataSetName, integer rowIndex, string upgradeId, integer level, string detailReason)
+        -- Appends one deterministic validation error without stopping the remaining audit.
+        table.insert(result.Errors, {
+            DataSetName = dataSetName,
+            RowIndex = rowIndex,
+            UpgradeId = upgradeId or "",
+            Level = level,
+            DetailReason = detailReason or "UNKNOWN"
+        })
+    end
+
+    method string SerializeErrors(table errors)
+        -- Serializes validation errors for one compact build or runtime log line.
+        local parts = {}
+        for _, item in ipairs(errors or {}) do
+            table.insert(parts, item.DataSetName .. "[" .. tostring(item.RowIndex) .. "]" .. item.UpgradeId .. "#" .. tostring(item.Level) .. "=" .. item.DetailReason)
+        end
+        return table.concat(parts, "|")
+    end
+
+    method table FinalizeValidation(table result)
+        -- Produces the stable PASS or FAIL result and emits positive evidence when validation passes.
+        result.ErrorCount = #result.Errors
+        result.ErrorSnapshot = self:SerializeErrors(result.Errors)
+        if result.ErrorCount == 0 then
+            result.Success = true
+            result.Reason = "OK"
+            log("[UnionUpgradeValidation] valid definitions=" .. result.CheckedDefinitionCount .. " levels=" .. result.CheckedLevelCount)
+        else
+            log_error("[UnionUpgradeValidation] rejected errors=" .. result.ErrorCount .. " details=" .. result.ErrorSnapshot)
+        end
+        return result
+    end
+
+end

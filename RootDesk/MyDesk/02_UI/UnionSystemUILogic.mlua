@@ -1,0 +1,1026 @@
+@Logic
+script UnionSystemUILogic extends Logic
+
+    property string WindowPath = "/ui/UnionSystemUI/UnionWindow"
+    property string FramePath = "/ui/UnionSystemUI/UnionWindow/UnionFrame"
+    property Entity UnionWindow = nil
+    property Entity StatCardScroll = nil
+    property ButtonComponent CloseButton = nil
+    property ButtonComponent ResetButton = nil
+    property ButtonComponent StatSettingButton = nil
+    property ButtonComponent SaveButton = nil
+    property ButtonComponent CancelButton = nil
+    property TextGUIRendererComponent RankCodeText = nil
+    property TextGUIRendererComponent RankNameText = nil
+    property TextGUIRendererComponent GrowthText = nil
+    property TextGUIRendererComponent NextRankText = nil
+    property TextGUIRendererComponent NextRankValueText = nil
+    property Entity RankProgressTrack = nil
+    property Entity RankProgressFill = nil
+    property TextGUIRendererComponent CoinValueText = nil
+    property TextGUIRendererComponent TotalPointsText = nil
+    property TextGUIRendererComponent SpentPointsText = nil
+    property TextGUIRendererComponent AvailablePointsText = nil
+    property TextGUIRendererComponent EffectsText = nil
+    property TextGUIRendererComponent EffectsValueText = nil
+    property TextGUIRendererComponent EffectsEmptyText = nil
+    property TextGUIRendererComponent PointStripText = nil
+    property TextGUIRendererComponent StatusText = nil
+    property table StatIds = {}
+    property table JobIds = {}
+    property table StatRowsById = {}
+    property table StatCards = {}
+    property table StatLevelTexts = {}
+    property table StatEffectTexts = {}
+    property table StatCostTexts = {}
+    property table StatStatusTexts = {}
+    property table StatCardButtons = {}
+    property table StatCardClickHandlers = {}
+    property table StatCardStateHandlers = {}
+    property table JobGradeTexts = {}
+    property table JobProgressTexts = {}
+    property table JobContributionTexts = {}
+    property table UiHandlers = {}
+    property boolean IsUiConnected = false
+    property boolean IsWindowOpen = false
+    property boolean IsRequestPending = false
+    property boolean IsEditMode = false
+    property boolean IsApplyRequestPending = false
+    property boolean LastApplySucceeded = false
+    property boolean BindingWarningLogged = false
+    property integer SnapshotRequestId = 0
+    property integer MutationSequence = 0
+    property integer CurrentSpentPoints = 0
+    property integer CurrentTotalPoints = 0
+    property integer CurrentAvailablePoints = 0
+    property integer EditDraftSpentPoints = 0
+    property integer EditDraftAvailablePoints = 0
+    property table EditBaseAllocations = {}
+    property table EditDraftAllocations = {}
+    property string LastMutationMessage = ""
+
+    @ExecSpace("ClientOnly")
+    @EventSender("Service", "InputService")
+    handler HandleUnionKeyDown(KeyDownEvent event)
+        if self.IsWindowOpen and event.key == KeyboardKey.Escape then self:CloseWindow() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        self:InitializeIds()
+        self:EnsureUiConnection()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        if self.IsUiConnected and isvalid(self.UnionWindow) == false then self:DisconnectUiEvents() end
+        if self.IsUiConnected == false then self:EnsureUiConnection() end
+        if self.IsWindowOpen and self:IsLocalPlayerInLobby() == false then self:CloseWindow() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        self:DisconnectUiEvents()
+        self.IsWindowOpen = false
+        self.IsRequestPending = false
+    end
+
+    method void InitializeIds()
+        self.StatIds = {
+            "MAX_HP", "MESO_GAIN_RATE", "ITEM_DROP_RATE", "UNION_COIN_GAIN_RATE",
+            "STARTING_POTION", "INVENTORY_SLOT", "AUGMENT_REROLL", "STARTING_SKILL"
+        }
+        self.JobIds = { "warrior", "mage", "archer", "thief", "pirate" }
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SortVisibleStatIdsFromRows()
+        -- Keeps every visible card loop aligned with UnionStatDefinitions: BASIC, EXPANDED, then future categories; SortOrder breaks ties.
+        table.sort(self.StatIds, function(leftId, rightId)
+            local left = self.StatRowsById[leftId]
+            local right = self.StatRowsById[rightId]
+            if left == nil or right == nil then return leftId < rightId end
+            local leftCategory = left.Category == "BASIC" and 0 or (left.Category == "EXPANDED" and 1 or 2)
+            local rightCategory = right.Category == "BASIC" and 0 or (right.Category == "EXPANDED" and 1 or 2)
+            if leftCategory ~= rightCategory then return leftCategory < rightCategory end
+            local leftSort = math.floor(tonumber(left.SortOrder) or 0)
+            local rightSort = math.floor(tonumber(right.SortOrder) or 0)
+            if leftSort ~= rightSort then return leftSort < rightSort end
+            return leftId < rightId
+        end)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ResetStatCardScroll()
+        -- Native ScrollLayout owns wheel, drag, clipping, clamping, and click-vs-drag suppression.
+        if isvalid(self.StatCardScroll) and self.StatCardScroll.ScrollLayoutGroupComponent ~= nil then
+            self.StatCardScroll.ScrollLayoutGroupComponent:ResetScrollPosition(UITransformAxis.Vertical)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean OpenWindow()
+        if self.IsWindowOpen then return false end
+        if self:IsLocalPlayerInLobby() == false or self:IsOtherLobbyPopupOpen() then
+            log("[UnionUI2026] open rejected reason=LOBBY_NAVIGATION_BUSY")
+            return false
+        end
+        if self:EnsureUiConnection() == false then
+            log_error("[UnionUI2026] open failed reason=UI_BINDING_MISSING")
+            return false
+        end
+        self.IsWindowOpen = true
+        self:DiscardEditDraft(false)
+        self:SetWindowEnabled(true)
+        self:ResetStatCardScroll()
+        self:RefreshSnapshot("유니온 정보를 불러오는 중입니다.")
+        log("[UnionUI2026] opened")
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CloseWindow()
+        if self.IsWindowOpen == false then return end
+        if self.IsEditMode then
+            self:DiscardEditDraft(false)
+            log("[UnionUI2026] edit draft discarded reason=CLOSE")
+        end
+        self.IsWindowOpen = false
+        self.IsRequestPending = false
+        self.SnapshotRequestId = self.SnapshotRequestId + 1
+        self:SetWindowEnabled(false)
+        log("[UnionUI2026] closed")
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsOpen()
+        return self.IsWindowOpen
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnCloseButtonClicked()
+        self:CloseWindow()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnResetButtonClicked()
+        if self.IsWindowOpen == false or self.IsRequestPending then return end
+        if self.IsEditMode == false then return end
+        if self.EditDraftSpentPoints <= 0 then
+            self:SetStatus("초기화할 배분 포인트가 없습니다.")
+            return
+        end
+        self.EditDraftAllocations = {}
+        self:RecalculateEditDraft()
+        self:SetStatus("편집 초안을 초기화했습니다. 저장 전에는 반영되지 않습니다.")
+        log("[UnionUI2026] edit draft reset")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnStatCardClicked(string statId)
+        if self.IsWindowOpen == false or self.IsRequestPending then return end
+        if self.IsEditMode == false then return end
+        local row = self.StatRowsById[statId]
+        if row == nil or self:IsStatCardInteractive(statId) == false then
+            self:SetStatus(self:GetDraftIncreaseReason(statId))
+            return
+        end
+        self.EditDraftAllocations[statId] = math.floor(tonumber(self.EditDraftAllocations[statId]) or 0) + 1
+        self:RecalculateEditDraft()
+        self:SetStatus(row.DisplayName .. " 초안을 조정했습니다. 저장 전에는 반영되지 않습니다.")
+        log("[UnionUI2026] draft increment stat=" .. statId .. " level=" .. tostring(self.EditDraftAllocations[statId]))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnStatSettingClicked()
+        if self.IsWindowOpen == false or self.IsRequestPending or self.IsEditMode then return end
+        self.EditBaseAllocations = {}
+        self.EditDraftAllocations = {}
+        for _, statId in ipairs(self.StatIds) do
+            local row = self.StatRowsById[statId]
+            if row == nil then
+                self:SetStatus("스탯 정보를 불러온 뒤 편집할 수 있습니다.")
+                return
+            end
+            local level = math.floor(tonumber(row.CurrentLevel) or 0)
+            if level > 0 then
+                self.EditBaseAllocations[statId] = level
+                self.EditDraftAllocations[statId] = level
+            end
+        end
+        self.IsEditMode = true
+        self:RecalculateEditDraft()
+        self:SetStatus("스탯 설정 편집 중 · 저장 또는 취소를 선택하세요.")
+        log("[UnionUI2026] edit mode entered")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnSaveClicked()
+        if self.IsWindowOpen == false or self.IsRequestPending or self.IsEditMode == false then return end
+        self.MutationSequence = self.MutationSequence + 1
+        self.IsApplyRequestPending = true
+        self.LastApplySucceeded = false
+        self:BeginRequest("스탯 설정을 검증하고 저장하는 중입니다.")
+        self:RequestApplyUnionStats(
+            math.floor(tonumber(self.EditDraftAllocations.MAX_HP) or 0),
+            math.floor(tonumber(self.EditDraftAllocations.MESO_GAIN_RATE) or 0),
+            math.floor(tonumber(self.EditDraftAllocations.ITEM_DROP_RATE) or 0),
+            math.floor(tonumber(self.EditDraftAllocations.UNION_COIN_GAIN_RATE) or 0),
+            math.floor(tonumber(self.EditDraftAllocations.STARTING_POTION) or 0),
+            math.floor(tonumber(self.EditDraftAllocations.INVENTORY_SLOT) or 0),
+            math.floor(tonumber(self.EditDraftAllocations.AUGMENT_REROLL) or 0),
+            math.floor(tonumber(self.EditDraftAllocations.STARTING_SKILL) or 0),
+            self:BuildMutationRequestId("APPLY", ""), self.SnapshotRequestId
+        )
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnCancelClicked()
+        if self.IsWindowOpen == false or self.IsRequestPending or self.IsEditMode == false then return end
+        self:DiscardEditDraft(true)
+        self:SetStatus("편집 내용을 취소했습니다. 저장된 설정은 변경되지 않았습니다.")
+        log("[UnionUI2026] edit draft discarded reason=CANCEL")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnStatCardStateChanged(string statId, ButtonStateChangeEvent event)
+        -- Applies subtle hover and pressed feedback only while the card can allocate.
+        if event == nil or self:IsStatCardInteractive(statId) == false then
+            self:ApplyStatCardInteractionVisual(statId, ButtonState.Normal)
+            return
+        end
+        self:ApplyStatCardInteractionVisual(statId, event.state)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshSnapshot(string statusMessage)
+        if self.IsWindowOpen == false or self.IsRequestPending then return end
+        self:BeginRequest(statusMessage)
+        self:RequestUnionAllocationSnapshot(self.SnapshotRequestId)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BeginRequest(string statusMessage)
+        -- Locks every allocation card until the authoritative response completes.
+        self.IsRequestPending = true
+        self.SnapshotRequestId = self.SnapshotRequestId + 1
+        self.LastMutationMessage = ""
+        self:SetStatus(statusMessage)
+        self:RefreshAllCards()
+    end
+
+    @ExecSpace("ClientOnly")
+    method string BuildMutationRequestId(string operation, string statId)
+        local elapsed = math.floor((_UtilLogic.ElapsedSeconds or 0) * 1000)
+        return "union-ui:" .. operation .. ":" .. (statId or "") .. ":" .. tostring(elapsed) .. ":" .. tostring(self.MutationSequence)
+    end
+
+    @ExecSpace("Server")
+    method void RequestUnionAllocationSnapshot(integer requestId)
+        self:SendAuthoritativeSnapshot(requestId, senderUserId)
+    end
+
+    @ExecSpace("Server")
+    method void RequestIncreaseUnionStat(string statId, string mutationRequestId, integer requestId)
+        local userEntity = _UserService:GetUserEntityByUserId(senderUserId)
+        if isvalid(userEntity) == false or userEntity.PlayerComponent == nil then
+            self:ReceiveMutationResult(requestId, false, "PLAYER_UNAVAILABLE", senderUserId)
+            self:SendAuthoritativeSnapshot(requestId, senderUserId)
+            return
+        end
+        local result = _UnionStatAllocationServiceLogic:TryIncreaseUnionStat(userEntity, statId or "", mutationRequestId or "")
+        self:ReceiveMutationResult(requestId, result.Success == true, result.Reason or "UNKNOWN", senderUserId)
+        self:SendAuthoritativeSnapshot(requestId, senderUserId)
+        log("[UnionUI2026] increase user=" .. senderUserId .. " stat=" .. (statId or "") .. " success=" .. tostring(result.Success) .. " reason=" .. (result.Reason or "UNKNOWN"))
+    end
+
+    @ExecSpace("Server")
+    method void RequestResetUnionStats(string mutationRequestId, integer requestId)
+        local userEntity = _UserService:GetUserEntityByUserId(senderUserId)
+        if isvalid(userEntity) == false or userEntity.PlayerComponent == nil then
+            self:ReceiveMutationResult(requestId, false, "PLAYER_UNAVAILABLE", senderUserId)
+            self:SendAuthoritativeSnapshot(requestId, senderUserId)
+            return
+        end
+        local result = _UnionStatAllocationServiceLogic:TryResetUnionStats(userEntity, mutationRequestId or "")
+        self:ReceiveMutationResult(requestId, result.Success == true, result.Reason or "UNKNOWN", senderUserId)
+        self:SendAuthoritativeSnapshot(requestId, senderUserId)
+        log("[UnionUI2026] reset user=" .. senderUserId .. " success=" .. tostring(result.Success) .. " changed=" .. tostring(result.WasReset == true) .. " reason=" .. (result.Reason or "UNKNOWN"))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SendAuthoritativeSnapshot(integer requestId, string recipientUserId)
+        local userEntity = _UserService:GetUserEntityByUserId(recipientUserId)
+        if isvalid(userEntity) == false or userEntity.PlayerComponent == nil then
+            self:SendSnapshotFailure(requestId, "PLAYER_UNAVAILABLE", recipientUserId)
+            return
+        end
+        local allocationResult = _UnionStatAllocationServiceLogic:GetUnionStatAllocationSnapshot(userEntity)
+        local effectResult = _UnionEffectResolverLogic:GetEffectSnapshot(userEntity)
+        if allocationResult.Success == false or type(allocationResult.Snapshot) ~= "table" then
+            self:SendSnapshotFailure(requestId, allocationResult.Reason or "UNION_ALLOCATION_UNAVAILABLE", recipientUserId)
+            return
+        end
+        if effectResult.Success == false or type(effectResult.EffectSnapshot) ~= "table" then
+            self:SendSnapshotFailure(requestId, effectResult.Reason or "UNION_EFFECT_UNAVAILABLE", recipientUserId)
+            return
+        end
+        local snapshot = allocationResult.Snapshot
+        local rank = snapshot.CurrentUnionRank or {}
+        local currentRankThreshold = 0
+        local nextRankThreshold = 0
+        local nextRankDisplayName = ""
+        local progressAvailable = false
+        local hasNextRank = false
+        local allRanks = _UnionRankDefinitionRepositoryLogic:GetAllDefinitions()
+        if allRanks.Success == true and type(allRanks.Definitions) == "table" then
+            for rankIndex, definition in ipairs(allRanks.Definitions) do
+                if definition.RankId == (rank.RankId or "UNION_I") then
+                    currentRankThreshold = math.floor(tonumber(definition.MinLifetimeUnionPoints) or 0)
+                    progressAvailable = true
+                    local nextDefinition = allRanks.Definitions[rankIndex + 1]
+                    if nextDefinition ~= nil then
+                        hasNextRank = true
+                        nextRankThreshold = math.floor(tonumber(nextDefinition.MinLifetimeUnionPoints) or 0)
+                        nextRankDisplayName = nextDefinition.DisplayName or nextDefinition.RankId or ""
+                    end
+                    break
+                end
+            end
+        end
+        self:ReceiveUnionSummary(
+            requestId, true, "OK", rank.RankId or "UNION_I", rank.DisplayName or "UNION I",
+            math.floor(tonumber(snapshot.UnionCoins) or 0),
+            math.floor(tonumber(snapshot.LifetimeUnionGrowth) or 0),
+            progressAvailable, hasNextRank, currentRankThreshold, nextRankThreshold, nextRankDisplayName,
+            math.floor(tonumber(snapshot.TotalUnionStatPoints) or 0),
+            math.floor(tonumber(snapshot.SpentUnionStatPoints) or 0),
+            math.floor(tonumber(snapshot.AvailableUnionStatPoints) or 0),
+            self:BuildAppliedEffectsText(effectResult.EffectSnapshot),
+            recipientUserId
+        )
+        local statCount = 0
+        for _, row in ipairs(snapshot.Stats or {}) do
+            statCount = statCount + 1
+            self:ReceiveUnionStatRow(
+                requestId, row.StatId or "", row.Category or "", row.DisplayName or row.StatId or "", row.Description or "",
+                math.floor(tonumber(row.CurrentLevel) or 0), math.floor(tonumber(row.MaxLevel) or 0),
+                tonumber(row.CurrentEffectValue) or 0, row.IsImplemented == true,
+                row.RequiredUnionRank or "", row.CurrentUnionRank or rank.RankId or "", row.IsRankUnlocked == true,
+                math.floor(tonumber(row.NextPointCost) or 0), row.CanIncrease == true,
+                row.IncreaseReason or "UNKNOWN", math.floor(tonumber(row.SortOrder) or 0),
+                math.floor(tonumber(row.EditableMaxLevel) or 0),
+                self:EncodeNumberCsv(row.LevelPointCosts), self:EncodeNumberCsv(row.LevelEffectValues),
+                recipientUserId
+            )
+        end
+        local jobCount = 0
+        for _, jobId in ipairs({ "warrior", "mage", "archer", "thief", "pirate" }) do
+            local grade = snapshot.JobGrades ~= nil and snapshot.JobGrades[jobId] or nil
+            if grade ~= nil then
+                jobCount = jobCount + 1
+                self:ReceiveUnionJobRow(
+                    requestId, jobId, math.floor(tonumber(grade.Progress) or 0),
+                    grade.GradeId or "NONE", grade.DisplayName or grade.GradeId or "NONE",
+                    math.floor(tonumber(grade.StatPointContribution) or 0), recipientUserId
+                )
+            end
+        end
+        self:ReceiveUnionSnapshotComplete(requestId, true, "OK", statCount, jobCount, recipientUserId)
+        log("[UnionUI2026] snapshot user=" .. recipientUserId .. " stats=" .. tostring(statCount) .. " jobs=" .. tostring(jobCount))
+    end
+
+    @ExecSpace("ServerOnly")
+    method void SendSnapshotFailure(integer requestId, string reason, string recipientUserId)
+        self:ReceiveUnionSummary(requestId, false, reason or "UNKNOWN", "UNION_I", "유니온 정보 없음", 0, 0, false, false, 0, 0, "", 0, 0, 0, "적용 효과를 불러오지 못했습니다.", recipientUserId)
+        self:ReceiveUnionSnapshotComplete(requestId, false, reason or "UNKNOWN", 0, 0, recipientUserId)
+    end
+
+    @ExecSpace("Server")
+    method void RequestApplyUnionStats(integer maxHpLevel, integer mesoLevel, integer itemDropLevel, integer coinGainLevel, integer potionLevel, integer inventoryLevel, integer augmentLevel, integer skillLevel, string mutationRequestId, integer requestId)
+        local userEntity = _UserService:GetUserEntityByUserId(senderUserId)
+        if isvalid(userEntity) == false or userEntity.PlayerComponent == nil then
+            self:ReceiveMutationResult(requestId, false, "PLAYER_UNAVAILABLE", senderUserId)
+            self:SendAuthoritativeSnapshot(requestId, senderUserId)
+            return
+        end
+        local allocation = {
+            MAX_HP = maxHpLevel,
+            MESO_GAIN_RATE = mesoLevel,
+            ITEM_DROP_RATE = itemDropLevel,
+            UNION_COIN_GAIN_RATE = coinGainLevel,
+            STARTING_POTION = potionLevel,
+            INVENTORY_SLOT = inventoryLevel,
+            AUGMENT_REROLL = augmentLevel,
+            STARTING_SKILL = skillLevel
+        }
+        local result = _UnionStatAllocationServiceLogic:TryApplyUnionStatAllocation(userEntity, allocation, mutationRequestId or "")
+        self:ReceiveMutationResult(requestId, result.Success == true, result.Reason or "UNKNOWN", senderUserId)
+        self:SendAuthoritativeSnapshot(requestId, senderUserId)
+        log("[UnionUI2026] apply user=" .. senderUserId .. " success=" .. tostring(result.Success) .. " reason=" .. (result.Reason or "UNKNOWN"))
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveUnionSummary(integer requestId, boolean success, string reason, string rankId, string rankDisplayName, integer unionCoins, integer lifetimeUnionGrowth, boolean progressAvailable, boolean hasNextRank, integer currentRankThreshold, integer nextRankThreshold, string nextRankDisplayName, integer totalPoints, integer spentPoints, integer availablePoints, string appliedEffects)
+        if self.IsWindowOpen == false or requestId ~= self.SnapshotRequestId then return end
+        if success == false then self:SetStatus(self:LocalizeReason(reason)) return end
+        self.CurrentSpentPoints = math.max(0, spentPoints)
+        self.CurrentTotalPoints = math.max(0, totalPoints)
+        self.CurrentAvailablePoints = math.max(0, availablePoints)
+        self:RenderRankPresentation(rankId, rankDisplayName, lifetimeUnionGrowth, progressAvailable, hasNextRank, currentRankThreshold, nextRankThreshold, nextRankDisplayName)
+        self:SetText(self.CoinValueText, self:FormatInteger(unionCoins))
+        self:SetText(self.TotalPointsText, self:FormatInteger(totalPoints))
+        self:SetText(self.SpentPointsText, self:FormatInteger(spentPoints))
+        self:SetText(self.AvailablePointsText, self:FormatInteger(availablePoints))
+        self:SetText(self.PointStripText, "POINT   " .. self:FormatInteger(spentPoints) .. " / " .. self:FormatInteger(totalPoints))
+        self:RenderAppliedEffectsText(appliedEffects)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveUnionStatRow(integer requestId, string statId, string category, string displayName, string description, integer currentLevel, integer maxLevel, number currentEffectValue, boolean isImplemented, string requiredUnionRank, string currentUnionRank, boolean isRankUnlocked, integer nextPointCost, boolean canIncrease, string increaseReason, integer sortOrder, integer editableMaxLevel, string pointCostsCsv, string effectValuesCsv)
+        if self.IsWindowOpen == false or requestId ~= self.SnapshotRequestId then return end
+        self.StatRowsById[statId] = {
+            StatId = statId, Category = category, DisplayName = displayName, Description = description,
+            CurrentLevel = currentLevel, MaxLevel = maxLevel, CurrentEffectValue = currentEffectValue,
+            IsImplemented = isImplemented, RequiredUnionRank = requiredUnionRank,
+            CurrentUnionRank = currentUnionRank, IsRankUnlocked = isRankUnlocked,
+            NextPointCost = nextPointCost, CanIncrease = canIncrease,
+            IncreaseReason = increaseReason, SortOrder = sortOrder,
+            EditableMaxLevel = editableMaxLevel,
+            LevelPointCosts = self:ParseNumberCsv(pointCostsCsv),
+            LevelEffectValues = self:ParseNumberCsv(effectValuesCsv)
+        }
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveUnionJobRow(integer requestId, string jobId, integer progress, string gradeId, string gradeDisplayName, integer contribution)
+        if self.IsWindowOpen == false or requestId ~= self.SnapshotRequestId then return end
+        local resolvedGradeDisplayName = gradeDisplayName
+        if (jobId == "warrior" or jobId == "mage" or jobId == "archer" or jobId == "thief" or jobId == "pirate") and (resolvedGradeDisplayName == nil or resolvedGradeDisplayName == "" or resolvedGradeDisplayName == "NONE") then
+            resolvedGradeDisplayName = "-"
+        end
+        self:SetText(self.JobGradeTexts[jobId], resolvedGradeDisplayName)
+        self:SetText(self.JobProgressTexts[jobId], "진행 " .. self:FormatInteger(progress))
+        local contributionText = "+" .. self:FormatInteger(contribution) .. "P"
+        self:SetText(self.JobContributionTexts[jobId], contributionText)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveMutationResult(integer requestId, boolean success, string reason)
+        if self.IsWindowOpen == false or requestId ~= self.SnapshotRequestId then return end
+        if self.IsApplyRequestPending then self.LastApplySucceeded = success end
+        self.LastMutationMessage = success and "변경이 저장되고 최신 유니온 정보로 갱신되었습니다." or self:LocalizeReason(reason)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveUnionSnapshotComplete(integer requestId, boolean success, string reason, integer statCount, integer jobCount)
+        -- Re-enables cards only after a complete authoritative snapshot and rejects stale fallback data.
+        if self.IsWindowOpen == false or requestId ~= self.SnapshotRequestId then return end
+        self.IsRequestPending = false
+        if success == false then
+            self.StatRowsById = {}
+            self:RefreshAllCards()
+            self:SetStatus(self:LocalizeReason(reason))
+            return
+        end
+        if self.IsApplyRequestPending then
+            local applied = self.LastApplySucceeded
+            self.IsApplyRequestPending = false
+            self.LastApplySucceeded = false
+            if applied then self:DiscardEditDraft(false) end
+        end
+        self:SortVisibleStatIdsFromRows()
+        self:RefreshAllCards()
+        if self.LastMutationMessage ~= "" then
+            self:SetStatus(self.LastMutationMessage)
+        else
+            self:SetStatus("최신 유니온 정보 · 스탯 " .. tostring(statCount) .. "개 · 직업 " .. tostring(jobCount) .. "개")
+        end
+    end
+
+    method string BuildAppliedEffectsText(table effects)
+        local lines = {}
+        self:AppendPercentEffectLine(lines, "메소 획득량", effects.MesoGainRate)
+        self:AppendPercentEffectLine(lines, "아이템 드롭률", effects.ItemDropRate)
+        self:AppendPercentEffectLine(lines, "유니온 코인 획득량", effects.UnionPointGainRate)
+        self:AppendFlatEffectLine(lines, "최대 체력", effects.MaxHPBonus)
+        self:AppendFlatEffectLine(lines, "시작 물약", effects.StartingPotionBonus)
+        self:AppendFlatEffectLine(lines, "인벤토리 슬롯", effects.InventorySlotBonus)
+        self:AppendFlatEffectLine(lines, "증강 리롤", effects.AugmentRerollBonus)
+        self:AppendFlatEffectLine(lines, "시작 스킬", effects.StartingSkillBonus)
+        if #lines == 0 then return "적용 중인 효과가 없습니다." end
+        return table.concat(lines, "\n")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RenderAppliedEffectsText(string appliedEffects)
+        local resolvedText = appliedEffects or ""
+        local emptyMessage = "적용 중인 효과가 없습니다."
+        local labels = {}
+        local values = {}
+        for line in string.gmatch(resolvedText, "[^\n]+") do
+            local label, value = string.match(line, "^(.-)%s+([+%-].+)$")
+            if label ~= nil and label ~= "" and value ~= nil and value ~= "" then
+                table.insert(labels, label)
+                table.insert(values, value)
+            end
+        end
+        local hasAppliedEffects = #labels > 0
+        self:SetText(self.EffectsText, table.concat(labels, "\n"))
+        self:SetText(self.EffectsValueText, table.concat(values, "\n"))
+        if hasAppliedEffects == false and resolvedText ~= "" and resolvedText ~= emptyMessage then
+            emptyMessage = resolvedText
+        end
+        self:SetText(self.EffectsEmptyText, emptyMessage)
+        if self.EffectsText ~= nil and isvalid(self.EffectsText.Entity) then self.EffectsText.Entity.Enable = hasAppliedEffects end
+        if self.EffectsValueText ~= nil and isvalid(self.EffectsValueText.Entity) then self.EffectsValueText.Entity.Enable = hasAppliedEffects end
+        if self.EffectsEmptyText ~= nil and isvalid(self.EffectsEmptyText.Entity) then self.EffectsEmptyText.Entity.Enable = hasAppliedEffects == false end
+        log("[UnionUI2026] effects presentation rows=" .. tostring(#labels) .. " empty=" .. tostring(hasAppliedEffects == false))
+    end
+
+    method void AppendFlatEffectLine(table lines, string label, number value)
+        local resolved = math.floor(tonumber(value) or 0)
+        if resolved > 0 then table.insert(lines, label .. " +" .. tostring(resolved)) end
+    end
+
+    method void AppendPercentEffectLine(table lines, string label, number value)
+        local resolved = math.floor((tonumber(value) or 0) * 100 + 0.5)
+        if resolved > 0 then table.insert(lines, label .. " +" .. tostring(resolved) .. "%") end
+    end
+
+    method string EncodeNumberCsv(table values)
+        local parts = {}
+        for _, value in ipairs(values or {}) do table.insert(parts, tostring(tonumber(value) or 0)) end
+        return table.concat(parts, ",")
+    end
+
+    method table ParseNumberCsv(string csv)
+        local values = {}
+        for token in string.gmatch(csv or "", "[^,]+") do table.insert(values, tonumber(token) or 0) end
+        return values
+    end
+
+    @ExecSpace("ClientOnly")
+    method string BuildDraftPayload()
+        local parts = {}
+        for _, statId in ipairs(self.StatIds) do
+            local level = math.floor(tonumber(self.EditDraftAllocations[statId]) or 0)
+            if level > 0 then table.insert(parts, statId .. "=" .. tostring(level)) end
+        end
+        return table.concat(parts, ";")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RecalculateEditDraft()
+        local spent = 0
+        for _, statId in ipairs(self.StatIds) do
+            local row = self.StatRowsById[statId]
+            local level = math.floor(tonumber(self.EditDraftAllocations[statId]) or 0)
+            if row ~= nil then
+                for index = 1, level do spent = spent + math.floor(tonumber(row.LevelPointCosts[index]) or 0) end
+            end
+        end
+        self.EditDraftSpentPoints = spent
+        self.EditDraftAvailablePoints = math.max(0, self.CurrentTotalPoints - spent)
+        self:SetText(self.SpentPointsText, self:FormatInteger(spent))
+        self:SetText(self.AvailablePointsText, self:FormatInteger(self.EditDraftAvailablePoints))
+        self:SetText(self.PointStripText, "POINT   " .. self:FormatInteger(spent) .. " / " .. self:FormatInteger(self.CurrentTotalPoints))
+        self:UpdateEditToolbar()
+        self:RefreshAllCards()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DiscardEditDraft(boolean refreshView)
+        self.IsEditMode = false
+        self.EditBaseAllocations = {}
+        self.EditDraftAllocations = {}
+        self.EditDraftSpentPoints = 0
+        self.EditDraftAvailablePoints = self.CurrentAvailablePoints
+        self:UpdateEditToolbar()
+        if refreshView then
+            self:SetText(self.SpentPointsText, self:FormatInteger(self.CurrentSpentPoints))
+            self:SetText(self.AvailablePointsText, self:FormatInteger(self.CurrentAvailablePoints))
+            self:SetText(self.PointStripText, "POINT   " .. self:FormatInteger(self.CurrentSpentPoints) .. " / " .. self:FormatInteger(self.CurrentTotalPoints))
+            self:RefreshAllCards()
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateEditToolbar()
+        self:SetEntityEnabled(self.StatSettingButton ~= nil and self.StatSettingButton.Entity or nil, self.IsEditMode == false)
+        self:SetEntityEnabled(self.SaveButton ~= nil and self.SaveButton.Entity or nil, self.IsEditMode)
+        self:SetEntityEnabled(self.CancelButton ~= nil and self.CancelButton.Entity or nil, self.IsEditMode)
+        self:SetButtonEnabled(self.StatSettingButton, self.IsEditMode == false and self.IsRequestPending == false)
+        self:SetButtonEnabled(self.SaveButton, self.IsEditMode and self.IsRequestPending == false)
+        self:SetButtonEnabled(self.CancelButton, self.IsEditMode and self.IsRequestPending == false)
+    end
+
+    @ExecSpace("ClientOnly")
+    method string GetDraftIncreaseReason(string statId)
+        local row = self.StatRowsById[statId]
+        if row == nil then return "스탯 정보를 불러올 수 없습니다." end
+        if row.IsImplemented ~= true then return "아직 구현되지 않은 유니온 스탯입니다." end
+        local level = math.floor(tonumber(self.EditDraftAllocations[statId]) or 0)
+        if level >= row.MaxLevel then return "이미 최대 레벨입니다." end
+        if level >= row.EditableMaxLevel then return "현재 유니온 등급에서 더 올릴 수 없습니다." end
+        local nextCost = math.floor(tonumber(row.LevelPointCosts[level + 1]) or 0)
+        if nextCost > self.EditDraftAvailablePoints then return "사용 가능한 유니온 포인트가 부족합니다." end
+        return "편집 모드에서만 조정할 수 있습니다."
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshAllCards()
+        -- Re-renders all cards and their interaction eligibility from the latest snapshot.
+        for _, statId in ipairs(self.StatIds) do self:RenderStatCard(statId) end
+        self:SetButtonEnabled(self.ResetButton, self.IsEditMode and self.IsRequestPending == false)
+        self:UpdateEditToolbar()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RenderStatCard(string statId)
+        -- Renders card text and disables interaction for pending, locked, maxed, or unavailable rows.
+        local row = self.StatRowsById[statId]
+        local button = self.StatCardButtons[statId]
+        if row == nil then
+            self:SetText(self.StatLevelTexts[statId], "-  /  -")
+            self:SetText(self.StatEffectTexts[statId], "—")
+            self:SetText(self.StatCostTexts[statId], "다음 -")
+            self:SetText(self.StatStatusTexts[statId], self.IsRequestPending and "처리 중" or "")
+            if self.StatEffectTexts[statId] ~= nil and isvalid(self.StatEffectTexts[statId].Entity) then
+                self.StatEffectTexts[statId].FontSize = 28
+                self.StatEffectTexts[statId].FontStyle = 1
+                self.StatEffectTexts[statId].FontColor = Color(0.95, 0.97, 0.98, 1)
+                self.StatEffectTexts[statId].Underlay = true
+            end
+            self:SetButtonEnabled(button, false)
+            self:ApplyStatCardInteractionVisual(statId, ButtonState.Normal)
+            return
+        end
+
+        local displayLevel = self.IsEditMode and math.floor(tonumber(self.EditDraftAllocations[statId]) or 0) or row.CurrentLevel
+        local isRankLocked = row.IsRankUnlocked ~= true and displayLevel == 0
+        local isMaxLevel = displayLevel >= row.MaxLevel
+        local displayEffectValue = row.CurrentEffectValue
+        if self.IsEditMode then displayEffectValue = displayLevel > 0 and (tonumber(row.LevelEffectValues[displayLevel]) or 0) or 0 end
+        self:SetText(self.StatLevelTexts[statId], tostring(displayLevel) .. "  /  " .. tostring(row.MaxLevel))
+        if isRankLocked then
+            self:SetText(self.StatEffectTexts[statId], string.gsub(row.RequiredUnionRank or "UNION", "_", " ") .. " 필요")
+            if self.StatEffectTexts[statId] ~= nil and isvalid(self.StatEffectTexts[statId].Entity) then
+                self.StatEffectTexts[statId].FontSize = 19
+                self.StatEffectTexts[statId].FontStyle = 1
+                self.StatEffectTexts[statId].FontColor = Color(0.84, 0.89, 0.92, 1)
+                self.StatEffectTexts[statId].Underlay = false
+            end
+        else
+            self:SetText(self.StatEffectTexts[statId], self:FormatEffectValue(statId, displayEffectValue))
+            if self.StatEffectTexts[statId] ~= nil and isvalid(self.StatEffectTexts[statId].Entity) then
+                self.StatEffectTexts[statId].FontSize = 34
+                self.StatEffectTexts[statId].FontStyle = 1
+                self.StatEffectTexts[statId].FontColor = Color(0.96, 0.98, 0.99, 1)
+                self.StatEffectTexts[statId].Underlay = true
+            end
+        end
+        local nextPointCost = math.floor(tonumber(row.LevelPointCosts[displayLevel + 1]) or row.NextPointCost or 0)
+        self:SetText(self.StatCostTexts[statId], isMaxLevel and "다음 MAX" or "다음 " .. tostring(nextPointCost) .. "P")
+        self:SetText(self.StatStatusTexts[statId], self.IsRequestPending and "처리 중" or (isMaxLevel and "MAX" or (row.IsImplemented ~= true and "준비 중" or (self.IsEditMode and "편집 중" or ""))))
+
+        local canIncrease = self:IsStatCardInteractive(statId)
+        self:SetButtonEnabled(button, canIncrease)
+        self:ApplyStatCardInteractionVisual(statId, ButtonState.Normal)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsStatCardInteractive(string statId)
+        if self.IsWindowOpen == false or self.IsRequestPending or self.IsEditMode == false then return false end
+        local row = self.StatRowsById[statId]
+        if row == nil or row.IsImplemented ~= true then return false end
+        local level = math.floor(tonumber(self.EditDraftAllocations[statId]) or 0)
+        if level >= row.MaxLevel or level >= row.EditableMaxLevel then return false end
+        local nextCost = math.floor(tonumber(row.LevelPointCosts[level + 1]) or 0)
+        return nextCost <= self.EditDraftAvailablePoints
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyStatCardInteractionVisual(string statId, ButtonState state)
+        -- Keeps disabled cards readable while adding restrained hover and pressed feedback.
+        local card = self.StatCards[statId]
+        if isvalid(card) == false or card.SpriteGUIRendererComponent == nil then return end
+        local row = self.StatRowsById[statId]
+        local renderer = card.SpriteGUIRendererComponent
+        local canInteract = self:IsStatCardInteractive(statId)
+        local isRankLocked = row ~= nil and (row.IsRankUnlocked ~= true or row.IncreaseReason == "RANK_LOCKED")
+        local displayLevel = row ~= nil and (self.IsEditMode and math.floor(tonumber(self.EditDraftAllocations[statId]) or 0) or row.CurrentLevel) or 0
+        local isMaxLevel = row ~= nil and displayLevel >= row.MaxLevel
+
+        if row == nil or row.IsImplemented ~= true or isRankLocked then
+            renderer.Color = Color(0.16, 0.19, 0.22, 0.99)
+        elseif isMaxLevel then
+            renderer.Color = Color(0.18, 0.225, 0.26, 0.99)
+        elseif canInteract and state == ButtonState.Hover then
+            renderer.Color = Color(0.21, 0.27, 0.32, 0.99)
+        elseif canInteract and state == ButtonState.Pressed then
+            renderer.Color = Color(0.15, 0.18, 0.21, 0.99)
+        else
+            renderer.Color = Color(0.169, 0.216, 0.259, 0.99)
+        end
+
+        renderer.Outline = true
+        if canInteract and state == ButtonState.Hover then
+            renderer.OutlineColor = Color(0.314, 0.553, 0.667, 0.92)
+            renderer.OutlineWidth = 2
+        elseif canInteract and state == ButtonState.Pressed then
+            renderer.OutlineColor = Color(0.188, 0.231, 0.267, 0.96)
+            renderer.OutlineWidth = 2
+        elseif canInteract then
+            renderer.OutlineColor = Color(0.141, 0.169, 0.20, 0.96)
+            renderer.OutlineWidth = 1
+        else
+            renderer.OutlineColor = Color(0.141, 0.169, 0.20, 0.82)
+            renderer.OutlineWidth = 1
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RenderRankPresentation(string rankId, string rankDisplayName, integer lifetimeUnionGrowth, boolean progressAvailable, boolean hasNextRank, integer currentRankThreshold, integer nextRankThreshold, string nextRankDisplayName)
+        -- Keeps A-2 presentation isolated from saved data so synthetic I-V states can be previewed safely.
+        self:SetText(self.RankCodeText, self:BuildRankCode(rankId))
+        self:SetText(self.RankNameText, rankDisplayName)
+        self:SetText(self.GrowthText, self:FormatInteger(lifetimeUnionGrowth))
+
+        if isvalid(self.NextRankText.Entity) then self.NextRankText.Entity.Enable = progressAvailable end
+        if isvalid(self.NextRankValueText.Entity) then self.NextRankValueText.Entity.Enable = progressAvailable end
+        if isvalid(self.RankProgressTrack) then self.RankProgressTrack.Enable = progressAvailable end
+        if progressAvailable == false then return end
+
+        local progressRatio = 0
+        if hasNextRank and nextRankThreshold > currentRankThreshold then
+            local earnedInRank = math.max(0, lifetimeUnionGrowth - currentRankThreshold)
+            local requiredInRank = nextRankThreshold - currentRankThreshold
+            progressRatio = math.min(1, earnedInRank / requiredInRank)
+            self:SetText(self.NextRankText, "다음 " .. (nextRankDisplayName or ""))
+            self:SetText(self.NextRankValueText, self:FormatInteger(lifetimeUnionGrowth) .. " / " .. self:FormatInteger(nextRankThreshold))
+        else
+            progressRatio = 1
+            self:SetText(self.NextRankText, "최고 등급")
+            self:SetText(self.NextRankValueText, self:FormatInteger(lifetimeUnionGrowth))
+        end
+
+        if isvalid(self.RankProgressFill) and self.RankProgressFill.UITransformComponent ~= nil then
+            self.RankProgressFill.UITransformComponent.RectSize = Vector2(math.max(1, 318 * progressRatio), 6)
+        end
+        log("[UnionUI2026] rank presentation rank=" .. (rankId or "") .. " growth=" .. tostring(lifetimeUnionGrowth) .. " progress=" .. tostring(progressRatio))
+    end
+
+    method string GetStatEffectLabel(string statId, string fallbackLabel)
+        if statId == "UNION_COIN_GAIN_RATE" then return "코인 획득량" end
+        if statId == "STARTING_POTION" then return "시작 물약" end
+        if statId == "AUGMENT_REROLL" then return "증강 리롤" end
+        return fallbackLabel or statId
+    end
+
+    method string FormatEffectValue(string statId, number value)
+        if statId == "MESO_GAIN_RATE" or statId == "ITEM_DROP_RATE" or statId == "UNION_COIN_GAIN_RATE" then
+            return "+" .. tostring(math.floor((tonumber(value) or 0) * 100 + 0.5)) .. "%"
+        end
+        return "+" .. tostring(math.floor(tonumber(value) or 0))
+    end
+
+    method string StatStateLabel(table row)
+        if row.IsImplemented ~= true then return "준비 중" end
+        if row.CurrentLevel >= row.MaxLevel then return "최대 레벨" end
+        if row.IsRankUnlocked ~= true or row.IncreaseReason == "RANK_LOCKED" then return "잠김 · " .. (row.RequiredUnionRank or "등급 필요") end
+        if row.IncreaseReason == "INSUFFICIENT_UNION_STAT_POINTS" then return "포인트 부족" end
+        if row.CanIncrease == true then return "+ 배분 가능" end
+        return self:LocalizeReason(row.IncreaseReason)
+    end
+
+    method string BuildRankCode(string rankId)
+        if rankId == "UNION_V" then return "V" end
+        if rankId == "UNION_IV" then return "IV" end
+        if rankId == "UNION_III" then return "III" end
+        if rankId == "UNION_II" then return "II" end
+        return "I"
+    end
+
+    method string LocalizeReason(string reason)
+        if reason == "OK" then return "완료되었습니다." end
+        if reason == "STAT_NOT_IMPLEMENTED" then return "아직 구현되지 않은 유니온 스탯입니다." end
+        if reason == "MAX_LEVEL" then return "이미 최대 레벨입니다." end
+        if reason == "RANK_LOCKED" then return "필요 유니온 등급을 달성하지 못했습니다." end
+        if reason == "INSUFFICIENT_UNION_STAT_POINTS" then return "사용 가능한 유니온 포인트가 부족합니다." end
+        if reason == "UNION_STATS_ALREADY_RESET" then return "이미 모든 배분이 초기화되어 있습니다." end
+        if reason == "INVALID_STAT_ID" or reason == "UNION_STAT_NOT_FOUND" then return "알 수 없는 유니온 스탯입니다." end
+        if reason == "INVALID_ALLOCATION_PAYLOAD" or reason == "INVALID_UNION_STAT_LEVEL" then return "유효하지 않은 스탯 설정입니다." end
+        if reason == "UNION_STATS_UNCHANGED" then return "이미 같은 스탯 설정입니다." end
+        if reason == "UNION_STATS_APPLIED" then return "스탯 설정을 저장했습니다." end
+        if reason == "INVALID_ALLOCATION_REQUEST_ID" or reason == "ALLOCATION_REQUEST_ID_CONFLICT" then return "유효하지 않은 유니온 변경 요청입니다." end
+        if reason == "PROFILE_MUTATION_IN_PROGRESS" or reason == "PROFILE_MUTATION_BUSY" or reason == "PROFILE_WRITE_CONFLICT" then return "다른 유니온 변경을 처리 중입니다." end
+        if reason == "PLAYER_UNAVAILABLE" then return "플레이어 정보를 불러올 수 없습니다." end
+        if reason == "STAT_DATA_UNAVAILABLE" then return "스탯 정보를 불러올 수 없습니다." end
+        return reason or "UNKNOWN"
+    end
+
+    method string FormatInteger(integer value)
+        local text = tostring(math.max(0, math.floor(tonumber(value) or 0)))
+        local length = string.len(text)
+        local parts = {}
+        while length > 3 do
+            table.insert(parts, 1, string.sub(text, length - 2, length))
+            length = length - 3
+        end
+        table.insert(parts, 1, string.sub(text, 1, length))
+        return table.concat(parts, ",")
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean EnsureUiConnection()
+        -- Resolves the whole-card button bindings and connects each StatId exactly once.
+        if self.IsUiConnected then return true end
+        if #self.StatIds == 0 or #self.JobIds == 0 then self:InitializeIds() end
+        self.UnionWindow = _EntityService:GetEntityByPath(self.WindowPath)
+        if isvalid(self.UnionWindow) == false then return self:ReportBindingWait() end
+        self.CloseButton = self:GetButton(self.FramePath .. "/HeaderBar/CloseButton")
+        local summary = self.FramePath .. "/SummaryPanel"
+        self.ResetButton = self:GetButton(summary .. "/ResetButton")
+        local active = self.FramePath .. "/ActiveStatsPanel"
+        self.StatCardScroll = _EntityService:GetEntityByPath(active .. "/StatCardScroll")
+        self.StatSettingButton = self:GetButton(active .. "/StatSettingButton")
+        self.SaveButton = self:GetButton(active .. "/SaveButton")
+        self.CancelButton = self:GetButton(active .. "/CancelButton")
+        self.RankCodeText = self:GetText(summary .. "/RankCard/RankCodeText")
+        self.RankNameText = self:GetText(summary .. "/RankCard/RankNameText")
+        self.GrowthText = self:GetText(summary .. "/RankCard/GrowthText")
+        self.NextRankText = self:GetText(summary .. "/RankCard/NextRankText")
+        self.NextRankValueText = self:GetText(summary .. "/RankCard/NextRankValueText")
+        self.RankProgressTrack = _EntityService:GetEntityByPath(summary .. "/RankCard/RankProgressTrack")
+        self.RankProgressFill = _EntityService:GetEntityByPath(summary .. "/RankCard/RankProgressFill")
+        self.CoinValueText = self:GetText(summary .. "/CoinCard/CoinValueText")
+        self.TotalPointsText = self:GetText(summary .. "/PointCard/TotalPointsText")
+        self.SpentPointsText = self:GetText(summary .. "/PointCard/SpentPointsText")
+        self.AvailablePointsText = self:GetText(summary .. "/PointCard/AvailablePointsText")
+        self.EffectsText = self:GetText(summary .. "/EffectsCard/EffectsText")
+        self.EffectsValueText = self:GetText(summary .. "/EffectsCard/EffectsValueText")
+        self.EffectsEmptyText = self:GetText(summary .. "/EffectsCard/EffectsEmptyText")
+        self.PointStripText = self:GetText(self.FramePath .. "/ActiveStatsPanel/FutureRelicCard/LabelText")
+        self.StatusText = self:GetText(summary .. "/StatusText")
+        if self.CloseButton == nil or self.ResetButton == nil or isvalid(self.StatCardScroll) == false or self.StatCardScroll.ScrollLayoutGroupComponent == nil or self.StatSettingButton == nil or self.SaveButton == nil or self.CancelButton == nil or self.RankCodeText == nil or self.RankNameText == nil or self.GrowthText == nil or self.NextRankText == nil or self.NextRankValueText == nil or isvalid(self.RankProgressTrack) == false or isvalid(self.RankProgressFill) == false or self.CoinValueText == nil or self.TotalPointsText == nil or self.SpentPointsText == nil or self.AvailablePointsText == nil or self.EffectsText == nil or self.EffectsValueText == nil or self.EffectsEmptyText == nil or self.PointStripText == nil or self.StatusText == nil then
+            return self:ReportBindingWait()
+        end
+        self.StatCards = {}
+        self.StatLevelTexts = {}
+        self.StatEffectTexts = {}
+        self.StatCostTexts = {}
+        self.StatStatusTexts = {}
+        self.StatCardButtons = {}
+        self.StatCardClickHandlers = {}
+        self.StatCardStateHandlers = {}
+        for _, statId in ipairs(self.StatIds) do
+            local cardPath = active .. "/" .. statId .. "Card"
+            local card = _EntityService:GetEntityByPath(cardPath)
+            if isvalid(card) and card.Parent ~= self.StatCardScroll then card:AttachTo(self.StatCardScroll) end
+            if isvalid(card) == false then card = _EntityService:GetEntityByPath(active .. "/StatCardScroll/" .. statId .. "Card") end
+            local levelEntity = isvalid(card) and card:GetChildByName("LevelText") or nil
+            local effectEntity = isvalid(card) and card:GetChildByName("EffectText") or nil
+            local costEntity = isvalid(card) and card:GetChildByName("CostText") or nil
+            local statusEntity = isvalid(card) and card:GetChildByName("StatusText") or nil
+            local button = isvalid(card) and card.ButtonComponent or nil
+            local levelText = isvalid(levelEntity) and levelEntity.TextGUIRendererComponent or nil
+            local effectText = isvalid(effectEntity) and effectEntity.TextGUIRendererComponent or nil
+            local costText = isvalid(costEntity) and costEntity.TextGUIRendererComponent or nil
+            local statusText = isvalid(statusEntity) and statusEntity.TextGUIRendererComponent or nil
+            if isvalid(card) == false or button == nil or levelText == nil or effectText == nil or costText == nil or statusText == nil then return self:ReportBindingWait() end
+            self.StatCards[statId] = card
+            self.StatCardButtons[statId] = button
+            self.StatLevelTexts[statId] = levelText
+            self.StatEffectTexts[statId] = effectText
+            self.StatCostTexts[statId] = costText
+            self.StatStatusTexts[statId] = statusText
+            local capturedStatId = statId
+            self.StatCardClickHandlers[statId] = button.Entity:ConnectEvent(ButtonClickEvent, function() self:OnStatCardClicked(capturedStatId) end)
+            self.StatCardStateHandlers[statId] = button.Entity:ConnectEvent(ButtonStateChangeEvent, function(event) self:OnStatCardStateChanged(capturedStatId, event) end)
+        end
+        self.JobGradeTexts = {}
+        self.JobProgressTexts = {}
+        self.JobContributionTexts = {}
+        local jobs = self.FramePath .. "/JobGradePanel"
+        for _, jobId in ipairs(self.JobIds) do
+            local cardPath = jobs .. "/" .. jobId .. "Card"
+            self.JobGradeTexts[jobId] = self:GetText(cardPath .. "/GradeText")
+            self.JobProgressTexts[jobId] = self:GetText(cardPath .. "/ProgressText")
+            self.JobContributionTexts[jobId] = self:GetText(cardPath .. "/ContributionText")
+            if self.JobGradeTexts[jobId] == nil or self.JobProgressTexts[jobId] == nil or self.JobContributionTexts[jobId] == nil then return self:ReportBindingWait() end
+        end
+        self.UiHandlers.Close = self.CloseButton.Entity:ConnectEvent(ButtonClickEvent, self.OnCloseButtonClicked)
+        self.UiHandlers.Reset = self.ResetButton.Entity:ConnectEvent(ButtonClickEvent, self.OnResetButtonClicked)
+        self.UiHandlers.StatSetting = self.StatSettingButton.Entity:ConnectEvent(ButtonClickEvent, self.OnStatSettingClicked)
+        self.UiHandlers.Save = self.SaveButton.Entity:ConnectEvent(ButtonClickEvent, self.OnSaveClicked)
+        self.UiHandlers.Cancel = self.CancelButton.Entity:ConnectEvent(ButtonClickEvent, self.OnCancelClicked)
+        self.IsUiConnected = true
+        self.BindingWarningLogged = false
+        self:SetWindowEnabled(self.IsWindowOpen)
+        self:RefreshAllCards()
+        log("[UnionUI2026] allocation UI ready")
+        return true
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DisconnectUiEvents()
+        -- Disconnects card click/state handlers so UI reloads cannot duplicate allocation requests.
+        self:DisconnectButtonEvent(self.CloseButton, self.UiHandlers.Close)
+        self:DisconnectButtonEvent(self.ResetButton, self.UiHandlers.Reset)
+        self:DisconnectButtonEvent(self.StatSettingButton, self.UiHandlers.StatSetting)
+        self:DisconnectButtonEvent(self.SaveButton, self.UiHandlers.Save)
+        self:DisconnectButtonEvent(self.CancelButton, self.UiHandlers.Cancel)
+        for statId, button in pairs(self.StatCardButtons) do
+            if button ~= nil and isvalid(button.Entity) then
+                local clickHandler = self.StatCardClickHandlers[statId]
+                local stateHandler = self.StatCardStateHandlers[statId]
+                if clickHandler ~= nil then button.Entity:DisconnectEvent(ButtonClickEvent, clickHandler) end
+                if stateHandler ~= nil then button.Entity:DisconnectEvent(ButtonStateChangeEvent, stateHandler) end
+            end
+        end
+        self.UiHandlers = {}
+        self.StatCardClickHandlers = {}
+        self.StatCardStateHandlers = {}
+        self.StatCards = {}
+        self.StatLevelTexts = {}
+        self.StatEffectTexts = {}
+        self.StatCostTexts = {}
+        self.StatStatusTexts = {}
+        self.StatCardButtons = {}
+        self.StatCardScroll = nil
+        self.JobGradeTexts = {}
+        self.JobProgressTexts = {}
+        self.JobContributionTexts = {}
+        self.IsUiConnected = false
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean ReportBindingWait()
+        if self.BindingWarningLogged == false then
+            self.BindingWarningLogged = true
+            log_warning("[UnionUI2026] waiting for allocation UI bindings")
+        end
+        return false
+    end
+
+    @ExecSpace("ClientOnly")
+    method ButtonComponent GetButton(string path)
+        local entity = _EntityService:GetEntityByPath(path)
+        return isvalid(entity) and entity.ButtonComponent or nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method TextGUIRendererComponent GetText(string path)
+        local entity = _EntityService:GetEntityByPath(path)
+        return isvalid(entity) and entity.TextGUIRendererComponent or nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void DisconnectButtonEvent(ButtonComponent button, any handlerId)
+        if button ~= nil and isvalid(button.Entity) and handlerId ~= nil then button.Entity:DisconnectEvent(ButtonClickEvent, handlerId) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetButtonEnabled(ButtonComponent button, boolean enabled)
+        if button ~= nil and isvalid(button.Entity) then button.Enable = enabled end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetEntityEnabled(Entity entity, boolean enabled)
+        if isvalid(entity) then entity.Enable = enabled end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetWindowEnabled(boolean enabled)
+        if isvalid(self.UnionWindow) then self.UnionWindow:SetEnable(enabled) end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetText(TextGUIRendererComponent renderer, string value)
+        if renderer ~= nil and isvalid(renderer.Entity) then renderer.Text = value or "" end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetStatus(string value)
+        self:SetText(self.StatusText, value)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsLocalPlayerInLobby()
+        local player = _UserService.LocalPlayer
+        return isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name == "lobby"
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsOtherLobbyPopupOpen()
+        if _LobbyCharacterSelectionLogic:IsOpen() or _LobbyCodexLogic:IsOpen() then return true end
+        local uiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+        if isvalid(uiRoot) then
+            local minimapUI = uiRoot:GetComponent("script.MinimapUI")
+            if minimapUI ~= nil and minimapUI:IsWorldMapOpen() then return true end
+        end
+        return false
+    end
+
+end

@@ -1,0 +1,305 @@
+@Logic
+script UnionJobProgressionServiceLogic extends Logic
+
+    property boolean DefinitionValidationAttempted = false
+    property boolean DefinitionsValid = false
+    property string DefinitionValidationReason = "NOT_VALIDATED"
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        local validation = self:EnsureDefinitionsValid()
+        if validation.Success == true then
+            log("[UnionJobProgression] service ready milestones=" .. tostring(validation.CheckedMilestoneCount or 0))
+        else
+            log_error("[UnionJobProgression] service unavailable reason=" .. (validation.Reason or "UNKNOWN") .. " detail=" .. (validation.ErrorSnapshot or ""))
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetJobUnionProgress(Entity userEntity, string jobId)
+        return _UnionProfileRepositoryLogic:GetJobUnionProgress(userEntity, jobId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllJobUnionProgress(Entity userEntity)
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            JobUnionProgress = _UnionProfileRepositoryLogic:CopyLevelMap(profileResult.Profile.JobUnionProgress),
+            Snapshot = profileResult.Profile
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetJobUnionGrade(Entity userEntity, string jobId)
+        local progressResult = self:GetJobUnionProgress(userEntity, jobId)
+        if progressResult.Success == false then
+            return progressResult
+        end
+        local grade = _UnionJobGradeDefinitionRepositoryLogic:ResolveGradeByProgress(progressResult.Progress)
+        if grade.Success == false then
+            return grade
+        end
+        grade.JobId = jobId
+        return grade
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllJobUnionGrades(Entity userEntity)
+        local progressResult = self:GetAllJobUnionProgress(userEntity)
+        if progressResult.Success == false then
+            return progressResult
+        end
+        local grades = {}
+        local totalPoints = 0
+        for _, jobId in ipairs(self:GetKnownJobIds()) do
+            local progress = progressResult.JobUnionProgress[jobId] or 0
+            local grade = _UnionJobGradeDefinitionRepositoryLogic:ResolveGradeByProgress(progress)
+            if grade.Success == false then
+                return grade
+            end
+            grades[jobId] = {
+                JobId = jobId,
+                Progress = progress,
+                GradeId = grade.GradeId,
+                DisplayName = grade.DisplayName,
+                StatPointContribution = grade.StatPointContribution
+            }
+            totalPoints = totalPoints + grade.StatPointContribution
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            JobUnionGrades = grades,
+            TotalUnionStatPoints = totalPoints,
+            JobUnionProgress = progressResult.JobUnionProgress
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetTotalUnionStatPoints(Entity userEntity)
+        local grades = self:GetAllJobUnionGrades(userEntity)
+        if grades.Success == false then
+            return grades
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            TotalUnionStatPoints = grades.TotalUnionStatPoints,
+            JobUnionGrades = grades.JobUnionGrades
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetUnionStatPointSummary(Entity userEntity)
+        -- Derives point totals from grade contributions and data-driven allocation costs.
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        local grades = self:ResolveGradeSummary(profileResult.Profile.JobUnionProgress)
+        if grades.Success == false then
+            return grades
+        end
+        local spentResult = self:CalculateSpentPoints(profileResult.Profile.AllocatedUnionStats)
+        if spentResult.Success == false then
+            return spentResult
+        end
+        local availablePoints = grades.TotalUnionStatPoints - spentResult.SpentUnionStatPoints
+        return {
+            Success = true,
+            Reason = "OK",
+            TotalUnionStatPoints = grades.TotalUnionStatPoints,
+            SpentUnionStatPoints = spentResult.SpentUnionStatPoints,
+            AvailableUnionStatPoints = availablePoints,
+            IsOverAllocated = availablePoints < 0,
+            JobUnionGrades = grades.JobUnionGrades,
+            JobUnionProgress = _UnionProfileRepositoryLogic:CopyLevelMap(profileResult.Profile.JobUnionProgress),
+            AllocatedUnionStats = _UnionProfileRepositoryLogic:CopyLevelMap(profileResult.Profile.AllocatedUnionStats)
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryApplyJobUnionMilestone(Entity userEntity, table authoritativeResultContext)
+        -- Accepts no client-selected job, grade, or progress; all values are resolved from current server run state and definitions.
+        local validation = self:EnsureDefinitionsValid()
+        if validation.Success == false then
+            return validation
+        end
+        if isvalid(userEntity) == false or authoritativeResultContext == nil then
+            return { Success = false, Reason = "INVALID_UNION_JOB_RESULT_CONTEXT", WasImproved = false }
+        end
+        if authoritativeResultContext.BattleResult ~= "Victory" then
+            return { Success = true, Reason = "NO_UNION_JOB_MILESTONE_FAILED_RESULT", WasImproved = false }
+        end
+        local runState = _RunManagerLogic:GetOrCreateRunState(userEntity)
+        if runState == nil then
+            return { Success = false, Reason = "RUN_STATE_UNAVAILABLE", WasImproved = false }
+        end
+        local jobId = runState.SelectedJobId or ""
+        if _UnionProfileRepositoryLogic:IsKnownUnionJobId(jobId) == false then
+            return { Success = false, Reason = "AUTHORITATIVE_JOB_ID_INVALID", JobId = jobId, WasImproved = false }
+        end
+        local nodeGraphId = authoritativeResultContext.NodeGraphId or ""
+        local nodeId = authoritativeResultContext.NodeId or ""
+        local stageId = authoritativeResultContext.StageId or ""
+        if nodeGraphId == "" or nodeId == "" or stageId == "" then
+            return { Success = true, Reason = "NO_UNION_JOB_MILESTONE_CONTEXT", JobId = jobId, WasImproved = false }
+        end
+        if runState.CurrentNodeGraphId ~= nodeGraphId or runState.CurrentNodeId ~= nodeId then
+            return { Success = false, Reason = "AUTHORITATIVE_RUN_NODE_CONTEXT_MISMATCH", JobId = jobId, WasImproved = false }
+        end
+        local node = _NodeDefinitionRepositoryLogic:GetNodeDefinition(nodeGraphId, nodeId)
+        if node.Success == false or node.StageId ~= stageId then
+            return { Success = false, Reason = "AUTHORITATIVE_STAGE_CONTEXT_MISMATCH", JobId = jobId, WasImproved = false }
+        end
+        local milestone = _UnionJobMilestoneDefinitionRepositoryLogic:ResolveMilestone(
+            "RUN_NODE_CLEAR",
+            nodeId,
+            nodeGraphId,
+            runState.SelectedWorldMapBranch or ""
+        )
+        if milestone.Success == false then
+            return milestone
+        end
+        if milestone.Reason == "NO_UNION_JOB_MILESTONE" then
+            return {
+                Success = true,
+                Reason = milestone.Reason,
+                JobId = jobId,
+                StageId = stageId,
+                NodeId = nodeId,
+                WasImproved = false
+            }
+        end
+        local mutation = _UnionProfileRepositoryLogic:TryAdvanceJobUnionProgress(
+            userEntity,
+            jobId,
+            milestone.ProgressValue,
+            "MILESTONE:" .. milestone.MilestoneId
+        )
+        if mutation.Success == false then
+            return mutation
+        end
+        local previousGrade = _UnionJobGradeDefinitionRepositoryLogic:ResolveGradeByProgress(mutation.PreviousProgress or 0)
+        local newGrade = _UnionJobGradeDefinitionRepositoryLogic:ResolveGradeByProgress(mutation.NewProgress or 0)
+        if previousGrade.Success == false then return previousGrade end
+        if newGrade.Success == false then return newGrade end
+        mutation.MilestoneId = milestone.MilestoneId
+        mutation.ProgressValue = milestone.ProgressValue
+        mutation.PreviousGradeId = previousGrade.GradeId
+        mutation.NewGradeId = newGrade.GradeId
+        mutation.PreviousContribution = previousGrade.StatPointContribution
+        mutation.NewContribution = newGrade.StatPointContribution
+        mutation.AuthoritativeJobId = jobId
+        mutation.AuthoritativeNodeGraphId = nodeGraphId
+        mutation.AuthoritativeNodeId = nodeId
+        mutation.AuthoritativeStageId = stageId
+        if mutation.WasImproved == true then
+            log("[UnionJobProgression] milestone applied job=" .. jobId .. " milestone=" .. milestone.MilestoneId .. " progress=" .. tostring(mutation.NewProgress) .. " grade=" .. newGrade.GradeId)
+        end
+        return mutation
+    end
+
+    @ExecSpace("ServerOnly")
+    method table EnsureDefinitionsValid()
+        if self.DefinitionValidationAttempted == false then
+            self.DefinitionValidationAttempted = true
+            local gradeValidation = _UnionJobGradeDefinitionRepositoryLogic:ValidateDefinitions()
+            if gradeValidation.Success == false then
+                self.DefinitionsValid = false
+                self.DefinitionValidationReason = gradeValidation.ErrorSnapshot or gradeValidation.Reason
+                return gradeValidation
+            end
+            local milestoneValidation = _UnionJobMilestoneDefinitionRepositoryLogic:ValidateDefinitions()
+            self.DefinitionsValid = milestoneValidation.Success == true
+            self.DefinitionValidationReason = milestoneValidation.ErrorSnapshot or milestoneValidation.Reason or "CONTENT_VALIDATION_FAILED"
+            return milestoneValidation
+        end
+        return { Success = self.DefinitionsValid, Reason = self.DefinitionValidationReason }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ResolveGradeSummary(table jobUnionProgress)
+        if jobUnionProgress == nil then
+            return { Success = false, Reason = "JOB_UNION_PROGRESS_MISSING" }
+        end
+        local grades = {}
+        local totalPoints = 0
+        for _, jobId in ipairs(self:GetKnownJobIds()) do
+            local progress = math.floor(tonumber(jobUnionProgress[jobId]) or 0)
+            local grade = _UnionJobGradeDefinitionRepositoryLogic:ResolveGradeByProgress(progress)
+            if grade.Success == false then
+                return grade
+            end
+            grades[jobId] = {
+                JobId = jobId,
+                Progress = progress,
+                GradeId = grade.GradeId,
+                DisplayName = grade.DisplayName,
+                StatPointContribution = grade.StatPointContribution
+            }
+            totalPoints = totalPoints + grade.StatPointContribution
+        end
+        return { Success = true, Reason = "OK", JobUnionGrades = grades, TotalUnionStatPoints = totalPoints }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table CalculateSpentPoints(table allocatedUnionStats)
+        if allocatedUnionStats == nil then
+            return { Success = false, Reason = "ALLOCATED_UNION_STATS_MISSING", SpentUnionStatPoints = 0 }
+        end
+        local spentPoints = 0
+        for statId, rawLevel in pairs(allocatedUnionStats) do
+            local numericLevel = tonumber(rawLevel)
+            if type(statId) ~= "string" or statId == "" then
+                return { Success = false, Reason = "INVALID_ALLOCATED_UNION_STAT_ID", StatId = tostring(statId), SpentUnionStatPoints = spentPoints }
+            end
+            local definition = _UnionStatDefinitionRepositoryLogic:GetStat(statId)
+            if definition.Success == false then
+                return { Success = false, Reason = definition.Reason, StatId = tostring(statId), SpentUnionStatPoints = spentPoints }
+            end
+            if definition.IsImplemented ~= true then
+                return { Success = false, Reason = "STAT_NOT_IMPLEMENTED", StatId = statId, SpentUnionStatPoints = spentPoints }
+            end
+            if numericLevel == nil or numericLevel < 0 or numericLevel ~= math.floor(numericLevel) then
+                return { Success = false, Reason = "INVALID_ALLOCATED_UNION_STAT_LEVEL", StatId = tostring(statId), SpentUnionStatPoints = spentPoints }
+            end
+            local level = math.floor(numericLevel)
+            if level > definition.MaxLevel then
+                return { Success = false, Reason = "ALLOCATED_UNION_STAT_LEVEL_EXCEEDS_MAX", StatId = statId, Level = level, MaxLevel = definition.MaxLevel, SpentUnionStatPoints = spentPoints }
+            end
+            for currentLevel = 1, level do
+                local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(statId, currentLevel)
+                if levelDefinition.Success == false then
+                    return { Success = false, Reason = levelDefinition.Reason, StatId = tostring(statId), Level = currentLevel, SpentUnionStatPoints = spentPoints }
+                end
+                spentPoints = spentPoints + levelDefinition.PointCost
+            end
+        end
+        return { Success = true, Reason = "OK", SpentUnionStatPoints = spentPoints }
+    end
+
+    method table EvaluateProgressAdvance(integer currentProgress, integer completedProgress)
+        if currentProgress == nil or completedProgress == nil or currentProgress < 0 or completedProgress < 0 then
+            return { Success = false, Reason = "INVALID_JOB_UNION_PROGRESS" }
+        end
+        local newProgress = math.max(currentProgress, completedProgress)
+        return {
+            Success = true,
+            Reason = newProgress > currentProgress and "UNION_JOB_MILESTONE_IMPROVED" or "UNION_JOB_MILESTONE_ALREADY_RECORDED",
+            PreviousProgress = currentProgress,
+            NewProgress = newProgress,
+            WasImproved = newProgress > currentProgress
+        }
+    end
+
+    method table GetKnownJobIds()
+        return { "warrior", "mage", "archer", "thief", "pirate" }
+    end
+
+end
