@@ -744,3 +744,103 @@ Captured Maker evidence used for the final physical-map close-up:
 - UI asset changes: **NONE**
 - DataStorage/account persistence: **NONE**
 - STEP 5B stop condition: **satisfied**
+
+### STEP 6 Final Regression
+
+#### Final production architecture
+
+The production responsibility boundary remains intentionally narrow:
+
+```text
+PlayerRunInventoryComponent
+  RunSkillSnapshot       = run-owned SkillId/amount ownership
+  RunSkillBarSlotIds     = run-owned fixed six-position order
+  RunSkillBarRevision    = authoritative order version
+             |
+             | Battle initialization copies; validated drag commits here first
+             v
+BattleSessionComponent
+  SkillSlotIds           = map-scoped Battle presentation/input order
+  SkillSlotRevision      = Battle receipt/version state
+
+BattleTurnState / BattleSession execution fields
+  QueuedTileIds          = queued SkillIds
+  ExecutingTileIds       = executing SkillIds
+  ExecutingTileIndex     = execution progress
+```
+
+`RunSkillSnapshot` never became an equip/loadout order. `RunSkillBarSlotIds` never became a queue. `BattleSessionComponent.SkillSlotIds` remains presentation/input state and does not own run inventory. Queue and execution sequences retain SkillIds and are not rewritten when the bar moves.
+
+The only normal Fisher-Yates path is the first `GetOrInitializeRunSkillBarOrder` call of a new run. The remaining shuffle in `BattleSessionComponent:RefreshSkillSlots` is a documented compatibility fallback used only when a valid run owner is unavailable; it was not reached in valid first-entry, continuation, or different-map tests.
+
+#### Authoritative mutation and lifecycle rules
+
+- A click remains a click until accumulated pointer movement reaches the exact 10 px threshold.
+- Occupied target means swap; empty target means move without compaction.
+- Same slot, outside target, empty source, stale revision, replayed request, invalid index, non-decision phase, action processing, ended Battle, and unavailable content all reject without mutation.
+- A successful request commits the expected six-slot transition to `PlayerRunInventoryComponent` before publishing the matching Battle snapshot.
+- Acquisition reconciles a new distinct SkillId into the first empty slot while preserving every surviving position.
+- Upgrade replaces the base SkillId in its exact position. Removal clears only the removed position.
+- A seventh distinct owned SkillId is retained in ownership but reported by `FUTURE_CONTENT_GUARD`; the active six remain stable and no random replacement occurs.
+- `StartNewRun` clears the order, revision, and ownership snapshot before the new job initializes. Starting another run before using the first one follows the same clean reset path.
+- Drag cleanup owns candidate/active/cancelling flags, source/target indices, pending request state, timers, ghost, source treatment, and all target highlights. Success, cancel, server rejection, timeout, and map transfer all converge on the same cleared state.
+
+#### A-X final regression matrix
+
+| ID | Regression | Result | Evidence |
+|---|---|---|---|
+| A | Refresh/build | PASS | 500 Info, 2 pre-existing Warning, 0 Error. |
+| B | Fresh Play startup | PASS | 292 Info, 0 Warning, 0 Error. |
+| C | Normal slot click | PASS | Slots 1 and 2 queued their displayed SkillIds; no drag activation occurred. |
+| D | 10 px activation threshold | PASS | 5 px jitter stayed a candidate; a 10 px drag activated. |
+| E | Occupied-slot swap | PASS | Actual `1 -> 2` swapped both Battle and run order exactly once. |
+| F | Empty-slot move | PASS | Actual `1 -> 4` preserved the empty gap and did not compact. |
+| G | Same-slot release | PASS | Cancelled as `INVALID_TARGET`; no order or revision mutation. |
+| H | Outside/HUD-edge release | PASS | World, queue-HUD area, and 25 stress releases cancelled with target 0. |
+| I | Empty source | PASS | No candidate, request, receipt, or mutation was created. |
+| J | Click after moved skill | PASS | The moved slot queued its new displayed SkillId through the unchanged click path. |
+| K | Rapid sequential reorders | PASS | `1<->2`, `2->4`, `4->6`, `6->1` completed sequentially without loss, duplication, or ghost mutation. |
+| L | 50-gesture stress | PASS | 25 accepted swaps + 25 outside cancels; 50 candidates/activations, 0 rejects, 0 stale/replay, 0 runtime Error. |
+| M | Queue/execution isolation | PASS | Queued/executing SkillIds, execution index, queued action, and turn number were stable across controlled reorder. |
+| N | Battle-state guards | PASS | `CONTENT_NOT_READY`, `BATTLE_ALREADY_ENDED`, `NOT_PLAYER_DECISION_STATE`, and `ACTION_PROCESSING` rejected. |
+| O | Slot/index guards | PASS | Zero, negative, seven, huge, and fractional inputs rejected with the expected range/type reasons. |
+| P | Stale/replay protection | PASS | Duplicate request mutated once then returned `DUPLICATE_REQUEST`; old request returned `STALE_REQUEST`; old revision returned `STALE_SLOT_REVISION`. |
+| Q | Battle 1 -> 2 -> 3 | PASS | The exact latest run order was copied into all three initialized Battle sessions. |
+| R | Different physical Battle map | PASS | `region_01_battle -> region_01_boss` retained the exact order with the run owner available. |
+| S | Acquisition and multiple acquisition | PASS | New skills filled the first available gaps in sequence without moving existing entries. |
+| T | Upgrade after manual reorder | PASS | Warrior `brandish -> brave_slash` and six-skill Mage `cold_beam -> ice_strike` retained the exact slots. |
+| U | Skill removal | PASS | Removed SkillId cleared its position; later positions did not compact. |
+| V | Mage six / Union start count | PASS | Mage reached and persisted six unique slots; captured run effects initialized exactly 2 skills without bonus and 3 with `StartingSkillBonus=1`. |
+| W | Overflow and run reset/restart | PASS | Seventh skill reported explicit overflow while preserving six; new run and immediate restart cleared revision/order and initialized fresh job sets. |
+| X | Cleanup, timeout, and mid-drag map transfer | PASS | Success/cancel/reject/10 ms forced timeout/map-transfer paths ended with flags false, indices/request/timers 0, ghost hidden, and 0 highlights. |
+
+#### Detailed stress and close-state evidence
+
+The 50-gesture sequence ended with six unique SkillIds and byte-identical Battle/run order:
+
+`holy_arrow|heal|poison_breath|flame_orb|thunder_bolt|cold_beam`
+
+It produced exactly 25 `[BattleSkillSlotReorder] success` entries, 25 client success feedback entries, and 25 `INVALID_TARGET` cancels. No server rejection, stale receipt, duplicate receipt, Warning, or Error occurred in that sequence. Three additional cross-pair swaps exercised `1<->6`, `2<->5`, and `3<->4`, then restored the same arrangement.
+
+The mid-drag transfer deliberately kept pointer-down active while moving from `region_01_battle` to `region_01_boss`. The late release produced a safe `STALE_SLOT_REVISION` rejection. The client then reported candidate/active/cancelling false, source/target 0, pending request 0, both timers 0, ghost hidden, and zero target highlights. A controlled 10 ms pending timeout independently converged on the same clean state.
+
+#### Test boundaries and non-production setup
+
+- The Union 2/3 count was verified at real run reset/owned-state initialization boundaries using captured effect snapshots. A persistent Union profile round-trip was intentionally abandoned when the asynchronous storage test did not complete; no profile or DataStorage mutation was used for skill-bar persistence.
+- Guard probes temporarily changed runtime-only Battle fields and restored them in the same script. The overflow probe temporarily added one snapshot SkillId, asserted the guard, then restored the original snapshot and reconciled it.
+- One upgrade-stage attempt first returned `NEXT_STAGE_MAP_UNAVAILABLE` because the controlled entry omitted a route. After supplying the test route, the unchanged production upgrade request completed and the next Battle retained the upgraded slot.
+- No raw `.ui` edit, new loadout/equip system, permanent account setting, hotkey change, queue drag, skill-data change, or gameplay rule was introduced.
+
+#### Step 6 final state
+
+- Production script changes required by final regression: **NONE**
+- Documentation modified: `Docs/SkillDragSystemAudit.md` only
+- Runtime regressions found: **NONE**
+- Build/runtime errors after final refresh: **0 / 0**
+- Run-scoped order persistence: **PASS**
+- Server authority and replay protection: **PASS**
+- Queue/execution isolation: **PASS**
+- Cleanup and stress hardening: **PASS**
+- Merge readiness: **READY**
+- Push/merge performed: **NO**
+- STEP 6 stop condition: **satisfied**
