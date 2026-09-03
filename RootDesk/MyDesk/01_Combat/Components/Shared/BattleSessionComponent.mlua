@@ -1035,6 +1035,64 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table BuildChargeTelegraph(any unit, integer direction, string skillId)
+		-- Reuses the shared target-cell snapshot; the client only renders this server-owned line.
+		local result = { Success = false, TelegraphKind = "", LandingCell = -1, TargetCells = "" }
+		if unit == nil or unit.IsDead == true or self.BoardState == nil or self.CellCount <= 0 then
+			return result
+		end
+		if direction ~= -1 and direction ~= 1 then
+			direction = unit.Facing == "Right" and 1 or -1
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			return result
+		end
+		local cells = {}
+		local maxDistance = math.max(1, math.min(self.CellCount, math.floor(tonumber(definition.Range) or 1)))
+		for offset = 1, maxDistance do
+			local cellIndex = unit.CellIndex + direction * offset
+			if self:IsValidCell(cellIndex) == false then
+				break
+			end
+			local occupantEntity = self.BoardState:FindAtCell(cellIndex, unit.UnitId)
+			if isvalid(occupantEntity) then
+				local occupantUnit = occupantEntity:GetComponent("script.BattleUnitComponent")
+				if occupantUnit ~= nil and occupantUnit.IsDead == false and occupantUnit.Team ~= unit.Team then
+					table.insert(cells, tostring(cellIndex))
+				end
+				break
+			end
+			table.insert(cells, tostring(cellIndex))
+		end
+		result.Success = true
+		result.TelegraphKind = "CHARGE_LINE"
+		result.TargetCells = table.concat(cells, "|")
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildSkillAreaTelegraph(any unit, string skillId)
+		-- Uses the same target resolver as impact execution so the warning cells cannot drift from damage.
+		local result = { Success = false, TelegraphKind = "", LandingCell = -1, TargetCells = "" }
+		if unit == nil or unit.IsDead == true or self.BoardState == nil or skillId == "" then
+			return result
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			return result
+		end
+		local targetResult = _SkillTargetResolverLogic:Resolve(self, unit.UnitId, definition)
+		if targetResult.Success == false then
+			return result
+		end
+		result.Success = true
+		result.TelegraphKind = "SKILL_AREA"
+		result.TargetCells = _SkillTargetResolverLogic:SerializeIntegers(targetResult.TargetCellIndices)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method void PublishEnemyPlanSnapshot(string reason)
 		-- Synchronizes a compact read-only list so UI can render every enemy without running AI rules.
 		local entries = {}
@@ -1079,6 +1137,18 @@ script BattleSessionComponent extends Component
 							targetCellSnapshot = telegraph.TargetCells
 							telegraphKind = telegraph.TelegraphKind
 							landingCell = telegraph.LandingCell
+						end
+					elseif actionType == "CHARGE_FORWARD" then
+						local telegraph = self:BuildChargeTelegraph(unit, direction, tileId)
+						if telegraph.Success == true then
+							targetCellSnapshot = telegraph.TargetCells
+							telegraphKind = telegraph.TelegraphKind
+						end
+					elseif actionType == "TELEGRAPH_TILE" then
+						local telegraph = self:BuildSkillAreaTelegraph(unit, tileId)
+						if telegraph.Success == true then
+							targetCellSnapshot = telegraph.TargetCells
+							telegraphKind = telegraph.TelegraphKind
 						end
 					end
 					table.insert(entries, table.concat({
@@ -1830,6 +1900,15 @@ script BattleSessionComponent extends Component
 				patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, result.Reason)
 				return result
 			end
+			local preparedAction = actionPlan:GetCurrentAction()
+			if preparedAction.Success == true and preparedAction.ActionType == "CHARGE_FORWARD" then
+				-- Freeze the warned cells with the round plan. Charge execution must not reacquire a player
+				-- who moved beyond the line that was visible during the preceding PlayerTurn.
+				local telegraph = self:BuildChargeTelegraph(preparedEnemyUnit, preparedAction.Direction, preparedAction.TileId)
+				if telegraph.Success == true then
+					actionPlan.TargetCellSnapshot = telegraph.TargetCells
+				end
+			end
 			if actionPlan.PlanState == "TRACKING" then
 				local readiness = self:RefreshQueuedAttackReadiness(enemyUnitId)
 				if readiness.Success == false then
@@ -2042,6 +2121,8 @@ script BattleSessionComponent extends Component
 			actionResult = self:TryFaceDirection(intent.EnemyId, intent.Direction)
 		elseif intent.ActionType == "TELEGRAPH_TILE" then
 			actionResult = { Success = true, Reason = "TELEGRAPH_COMPLETED" }
+		elseif intent.ActionType == "CHARGE_FORWARD" then
+			actionResult = self:TryChargeForward(intent.EnemyId, intent.Direction, intent.TileId, executingPlan.TargetCellSnapshot)
 		elseif intent.ActionType == "BOSS_JUMP_TELEGRAPH" then
 			actionResult = self:BeginBossOppositeJump(intent.EnemyId)
 		elseif intent.ActionType == "BOSS_LAND_OPPOSITE" then
@@ -2131,7 +2212,7 @@ script BattleSessionComponent extends Component
 			return math.max(0.05, self.EnemyMoveActionDuration)
 		elseif actionType == "TURN_TO_PLAYER" then
 			return math.max(0.05, self.TurnActionDuration)
-		elseif actionType == "EXECUTE_TILE" then
+		elseif actionType == "EXECUTE_TILE" or actionType == "CHARGE_FORWARD" then
 			-- Keep the enemy turn open through the Skill's configured impact/presentation window.
 			return math.max(0.1, self:GetSkillActionDuration(tileId))
 		elseif actionType == "BOSS_LAND_OPPOSITE" then
@@ -5197,6 +5278,20 @@ script BattleSessionComponent extends Component
 			log_error("[BattleDeath] state transition failed unit=" .. unitId .. " reason=" .. deathState.Reason)
 			return
 		end
+		local defeatedPlan = unitEntity:GetComponent("script.EnemyActionPlanComponent")
+		local defeatedRunner = unitEntity:GetComponent("script.EnemyPatternRunnerComponent")
+		if defeatedPlan ~= nil and defeatedPlan.PlanState ~= "EMPTY" then
+			local currentAction = defeatedPlan:GetCurrentAction()
+			if defeatedRunner ~= nil and currentAction.Success == true then
+				defeatedRunner:CancelPreparedStep(currentAction.PatternId, currentAction.StepIndex, "UNIT_DIED")
+			end
+			defeatedPlan:ResetPlan("UNIT_DIED")
+		end
+		local preparedIntent = self:GetPreparedEnemyIntent()
+		if preparedIntent.EnemyId == unitId then
+			self:ResetEnemyIntentCursor("UNIT_DIED")
+		end
+		self:PublishEnemyPlanSnapshot("UNIT_DIED")
 		if unit.Team == "Enemy" and self.DropRuntime ~= nil then
 			local sourceEntity = self:FindUnitEntity(sourceUnitId)
 			local sourceUnit = nil
@@ -5501,6 +5596,121 @@ script BattleSessionComponent extends Component
 		result.Success = true
 		result.Reason = "OK"
 		log("[BattleMoveAway] success unit=" .. unit.UnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " facing=" .. result.PreviousFacing .. "->" .. result.CurrentFacing)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryChargeForward(string unitId, integer direction, string skillId, string committedCellSnapshot)
+		-- Traverses only the cells frozen with the visible plan and stops before the first occupied cell.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			FromCell = -1,
+			ToCell = -1,
+			TraversedCells = "",
+			MovedCellCount = 0,
+			Hit = false,
+			TargetUnitId = "",
+			DamageAmount = 0,
+			StopReason = ""
+		}
+		if self.BattleResult ~= "" then
+			result.Reason = "BATTLE_ENDED"
+			return result
+		end
+		if direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+		local unitEntity = self:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if unit.IsDead == true or unit.IsAirborne == true then
+			result.Reason = "UNIT_UNAVAILABLE"
+			return result
+		end
+		if self:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			result.Reason = "CHARGE_SKILL_INVALID"
+			return result
+		end
+
+		result.FromCell = unit.CellIndex
+		result.ToCell = unit.CellIndex
+		local committedCells = {}
+		for token in string.gmatch(committedCellSnapshot or "", "([^|]+)") do
+			local cellIndex = math.floor(tonumber(token) or -1)
+			if self:IsValidCell(cellIndex) then
+				table.insert(committedCells, cellIndex)
+			end
+		end
+		if #committedCells == 0 then
+			result.Reason = "CHARGE_TARGET_SNAPSHOT_MISSING"
+			return result
+		end
+
+		local traversed = {}
+		for _, nextCell in ipairs(committedCells) do
+			if nextCell ~= unit.CellIndex + direction then
+				result.StopReason = "COMMITTED_PATH_ENDED"
+				break
+			end
+			if self:IsValidCell(nextCell) == false then
+				result.StopReason = "OUT_OF_BOUNDS"
+				break
+			end
+
+			local occupantEntity = self.BoardState ~= nil and self.BoardState:FindAtCell(nextCell, unitId) or nil
+			if isvalid(occupantEntity) then
+				local occupantUnit = occupantEntity:GetComponent("script.BattleUnitComponent")
+				result.StopReason = "CELL_OCCUPIED"
+				if occupantUnit ~= nil and occupantUnit.IsDead == false and occupantUnit.Team ~= unit.Team then
+					self:BeginSkillEffectPresentation(unitId, definition)
+					local damage = self:ResolveSkillDamageImpact(unitId, skillId, occupantUnit.UnitId, nextCell, unit.BasicAttackDamage)
+					result.Success = damage.Success == true
+					result.Hit = damage.Hit == true
+					result.TargetUnitId = occupantUnit.UnitId
+					result.DamageAmount = damage.DamageAmount or 0
+					result.Reason = damage.Success == true and "CHARGE_HIT" or damage.Reason
+					result.ToCell = unit.CellIndex
+					result.TraversedCells = table.concat(traversed, "|")
+					log("[EnemyCharge] resolved unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " path=" .. result.TraversedCells .. " target=" .. result.TargetUnitId .. " damage=" .. result.DamageAmount .. " success=" .. tostring(result.Success))
+					return result
+				end
+				break
+			end
+
+			local move = self:TryMove(unitId, direction)
+			if move.Success == false then
+				if move.Reason == "OUT_OF_BOUNDS" or move.Reason == "CELL_OCCUPIED" then
+					result.StopReason = move.Reason
+					break
+				end
+				result.Reason = move.Reason
+				result.ToCell = unit.CellIndex
+				result.TraversedCells = table.concat(traversed, "|")
+				return result
+			end
+			table.insert(traversed, tostring(unit.CellIndex))
+			result.MovedCellCount = result.MovedCellCount + 1
+			result.ToCell = unit.CellIndex
+		end
+
+		result.Success = true
+		result.Reason = result.StopReason == "CELL_OCCUPIED" and "CHARGE_BLOCKED" or "CHARGE_ENDPOINT_REACHED"
+		result.TraversedCells = table.concat(traversed, "|")
+		log("[EnemyCharge] resolved unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " path=" .. result.TraversedCells .. " target=- damage=0 stop=" .. result.StopReason)
 		return result
 	end
 
