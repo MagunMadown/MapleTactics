@@ -15,45 +15,21 @@ script MinimapUI extends Component
 
 	property boolean RouteSelectionLocked = false
 
-	property integer LastObservedCompletedStageCount = -1
+	property Entity ProgressEventOwner = nil
 
-	property string LastObservedWorldMapBranch = "__UNSET__"
+	property any ProgressEventHandler = nil
 
-	property any ShopClickHandler = nil
+	property table StageButtonComponents = {}
 
-	property any LowerShopClickHandler = nil
+	property table ShopButtonComponents = {}
 
-	property any KerningPerionShopClickHandler = nil
+	property table PresentationComponents = {}
 
-	property any ElliniaNautilusShopClickHandler = nil
+	property boolean WorldMapComponentsCached = false
 
-	property any PerionSleepywoodShopClickHandler = nil
+	property Entity WorldMapPopupCache = nil
 
-	property any NautilusSleepywoodShopClickHandler = nil
-
-	property any HenesysUpperShopTooltipEnterHandler = nil
-
-	property any HenesysUpperShopTooltipExitHandler = nil
-
-	property any HenesysLowerShopTooltipEnterHandler = nil
-
-	property any HenesysLowerShopTooltipExitHandler = nil
-
-	property any KerningPerionShopTooltipEnterHandler = nil
-
-	property any KerningPerionShopTooltipExitHandler = nil
-
-	property any ElliniaNautilusShopTooltipEnterHandler = nil
-
-	property any ElliniaNautilusShopTooltipExitHandler = nil
-
-	property any PerionSleepywoodShopTooltipEnterHandler = nil
-
-	property any PerionSleepywoodShopTooltipExitHandler = nil
-
-	property any NautilusSleepywoodShopTooltipEnterHandler = nil
-
-	property any NautilusSleepywoodShopTooltipExitHandler = nil
+	property table WorldMapEntityCache = {}
 
 	property any ShopCloseHandler = nil
 
@@ -66,6 +42,7 @@ script MinimapUI extends Component
 		if isvalid(travelAvatar) and isvalid(travelAvatar.UITransformComponent) then
 			self.TravelStartPosition = travelAvatar.UITransformComponent.anchoredPosition
 		end
+		self:EnsureProgressEventHandler("BEGIN_PLAY")
 		self:ConnectWorldMapButtons()
 		self:RefreshWorldMapProgress("begin_play")
 		log("[WorldMap] controller ready popup=" .. tostring(isvalid(self:GetWorldMapPopup())))
@@ -76,6 +53,9 @@ script MinimapUI extends Component
 		-- Releases the travel animation timer when the UI controller is destroyed.
 		self:StopTravelAnimation(true)
 		self:DisconnectWorldMapButtons()
+		self:DisconnectProgressEventHandler()
+		self.WorldMapPopupCache = nil
+		self.WorldMapEntityCache = {}
 	end
 
 	@ExecSpace("ClientOnly")
@@ -83,28 +63,6 @@ script MinimapUI extends Component
 		-- Guarantees the world map is hidden outside the lobby.
 		if self.CurrentMode == "LOBBY_STAGE" and isvalid(mapEntity) and mapEntity.Name ~= "lobby" then
 			self:CloseWorldMapForTransfer(mapEntity.Name)
-		end
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnUpdate(number delta)
-		-- Refreshes synced progression while visible and closes a stale popup after transfer.
-		local popup = self:GetWorldMapPopup()
-		if isvalid(popup) == false or popup.Enable == false or popup.Visible == false then
-			return
-		end
-		local player = _UserService.LocalPlayer
-		if self.CurrentMode == "LOBBY_STAGE" and isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name ~= "lobby" then
-			self:CloseWorldMapForTransfer(player.CurrentMap.Name)
-			return
-		end
-		if self.CurrentMode ~= "LOBBY_STAGE" then
-			return
-		end
-		local completedStageCount = self:GetCompletedStageCount()
-		local selectedBranch = self:GetSelectedWorldMapBranch()
-		if completedStageCount ~= self.LastObservedCompletedStageCount or selectedBranch ~= self.LastObservedWorldMapBranch then
-			self:RefreshWorldMapProgress("sync_changed")
 		end
 	end
 
@@ -118,18 +76,19 @@ script MinimapUI extends Component
 		-- Reuses one world map for lobby entry, shop choice, and the locked post-shop route.
 		self.CurrentMode = mode or "LOBBY_STAGE"
 		self.SelectedRouteId = selectedRouteId or ""
-		if self.ShopClickHandler == nil or self.LowerShopClickHandler == nil or self.WorldMapCloseHandler == nil then
-			self:DisconnectWorldMapButtons()
-			self:ConnectWorldMapButtons()
-		end
-		-- Keep the shared base map synchronized in every presentation mode. Choice
-		-- modes add overlays; they must not replace the already-rendered world map.
-		self:RefreshWorldMapProgress(source)
-		self:ConfigureWorldMapMode()
+		-- Refresh/Hot Reload can keep entities alive while invalidating component event handles.
+		self:DisconnectProgressEventHandler()
+		self:EnsureProgressEventHandler("OPEN_WORLD_MAP")
+		self:DisconnectWorldMapButtons()
+		self:ConnectWorldMapButtons()
+		self:InvalidateWorldMapComponentCache("OPEN_WORLD_MAP")
 		if self:SetWorldMapVisible(true) == false then
 			log_warning("[WorldMap] open failed mode=" .. self.CurrentMode .. " source=" .. source .. " reason=UI_MISSING")
 			return false
 		end
+		-- Bind after the popup is active. Hidden UI descendants can miss lifecycle/event activation after Refresh.
+		self:RefreshWorldMapProgress(source)
+		self:ConfigureWorldMapMode()
 		if self.CurrentMode == "POST_SHOP_ROUTE" then
 			self:ShowTravelAvatarAtRoute(self.SelectedRouteId)
 		elseif self.CurrentMode == "SHOP_CHOICE" then
@@ -144,6 +103,7 @@ script MinimapUI extends Component
 
 	@ExecSpace("ClientOnly")
 	method void ConfigureWorldMapMode()
+		-- Keeps the selected shop marker visible as completed after departure while locking its action.
 		local henesys = self:GetWorldMapEntity("HenesysCityBranchBtn")
 		local upper = self:GetWorldMapEntity("UpperShopBranchBtn")
 		local lower = self:GetWorldMapEntity("LowerShopBranchBtn")
@@ -162,8 +122,10 @@ script MinimapUI extends Component
 		-- Preserve the city graph while SHOP_CHOICE is displayed. The route-choice
 		-- controls below are an overlay on the map, not a replacement for it.
 		self:SetNodeVisible(henesys, showBaseMap)
-		self:SetNodeVisible(upper, shopChoice)
-		self:SetNodeVisible(lower, shopChoice)
+		local upperSelected = self.SelectedRouteId == "shop_upper"
+		local lowerSelected = self.SelectedRouteId == "shop_lower"
+		self:SetNodeVisible(upper, shopChoice or (postShop and upperSelected))
+		self:SetNodeVisible(lower, shopChoice or (postShop and lowerSelected))
 		self:SetNodeVisible(upperLine, shopChoice or (postShop and self.SelectedRouteId == "shop_upper"))
 		self:SetNodeVisible(lowerLine, shopChoice or (postShop and self.SelectedRouteId == "shop_lower"))
 		if shopChoice then
@@ -177,18 +139,34 @@ script MinimapUI extends Component
 		self:SetNodeVisible(kerning, showBaseMap)
 		self:SetNodeVisible(legacyUpperShop, lobbyStage)
 		self:SetNodeVisible(legacyLowerShop, lobbyStage)
-		if shopChoice then
-			-- Base city nodes stay visible for continuity, but only the two route
-			-- overlay buttons may accept input during the mandatory choice.
-			self:SetButtonEnabled(henesys, false)
-			self:SetButtonEnabled(ellinia, false)
-			self:SetButtonEnabled(kerning, false)
+		if lobbyStage then
+			-- Locked city buttons stay hoverable; their click components enforce progression.
+			self:SetButtonEnabled(henesys, true)
+			self:SetButtonEnabled(ellinia, true)
+			self:SetButtonEnabled(kerning, true)
 		end
-		local upperSelected = self.SelectedRouteId == "shop_upper"
-		local lowerSelected = self.SelectedRouteId == "shop_lower"
+		if shopChoice then
+			-- Overlay buttons act during the choice; city buttons remain hoverable for tooltips.
+			self:SetButtonEnabled(henesys, true)
+			self:SetButtonEnabled(ellinia, true)
+			self:SetButtonEnabled(kerning, true)
+		end
 		if postShop then
-			self:SetButtonEnabled(kerning, upperSelected)
-			self:SetButtonEnabled(ellinia, lowerSelected)
+			-- The visited route-node remains hoverable, but COMPLETED prevents another shop action.
+			self:SetButtonEnabled(kerning, true)
+			self:SetButtonEnabled(ellinia, true)
+			local visitedShop = lowerSelected and lower or (upperSelected and upper or nil)
+			local visitedStateSource = lowerSelected and legacyLowerShop or (upperSelected and legacyUpperShop or nil)
+			local visitedPresentation = isvalid(visitedShop) and visitedShop:GetComponent("script.WorldMapButtonPresentationComponent") or nil
+			local visitedShopState = isvalid(visitedStateSource) and visitedStateSource:GetComponent("script.WorldMapShopButtonComponent") or nil
+			if visitedPresentation ~= nil then
+				local visitedTooltip = visitedShopState ~= nil and visitedShopState.CompletedTooltipText or visitedPresentation.DefaultTooltipText
+				visitedPresentation:ApplyState("COMPLETED", visitedTooltip)
+				log("[WorldMap] visited shop retained route=" .. self.SelectedRouteId .. " state=COMPLETED actionEnabled=" .. tostring(visitedPresentation:CanActivate()))
+			end
+			local activeRegion = lowerSelected and ellinia or (upperSelected and kerning or nil)
+			local regionButton = isvalid(activeRegion) and activeRegion:GetComponent("script.WorldMapFutureRegionButtonComponent") or nil
+			if regionButton ~= nil then regionButton:ResetForRoute() end
 		end
 		self:SetNodeVisible(upperLock, postShop and not upperSelected)
 		self:SetNodeVisible(lowerLock, postShop and not lowerSelected)
@@ -221,117 +199,20 @@ script MinimapUI extends Component
 
 	@ExecSpace("ClientOnly")
 	method void ConnectWorldMapButtons()
-		-- Owns the close and shop overlay events from the persistent UI controller.
-		local shopButton = self:GetWorldMapEntity("ShopVisitBtn")
-		if isvalid(shopButton) then
-			self.ShopClickHandler = shopButton:ConnectEvent(ButtonClickEvent, self.OnShopVisitClicked)
-			self.HenesysUpperShopTooltipEnterHandler = shopButton:ConnectEvent(UITouchEnterEvent, self.OnHenesysUpperShopTooltipEnter)
-			self.HenesysUpperShopTooltipExitHandler = shopButton:ConnectEvent(UITouchExitEvent, self.OnHenesysUpperShopTooltipExit)
-		end
-		local lowerShopButton = self:GetWorldMapEntity("LowerShopVisitBtn")
-		if isvalid(lowerShopButton) then
-			self.LowerShopClickHandler = lowerShopButton:ConnectEvent(ButtonClickEvent, self.OnLowerShopVisitClicked)
-			self.HenesysLowerShopTooltipEnterHandler = lowerShopButton:ConnectEvent(UITouchEnterEvent, self.OnHenesysLowerShopTooltipEnter)
-			self.HenesysLowerShopTooltipExitHandler = lowerShopButton:ConnectEvent(UITouchExitEvent, self.OnHenesysLowerShopTooltipExit)
-		end
-		local kerningPerionShop = self:GetWorldMapEntity("KerningPerionShopVisitBtn")
-		if isvalid(kerningPerionShop) then
-			self.KerningPerionShopClickHandler = kerningPerionShop:ConnectEvent(ButtonClickEvent, self.OnKerningPerionShopLockedClicked)
-			self.KerningPerionShopTooltipEnterHandler = kerningPerionShop:ConnectEvent(UITouchEnterEvent, self.OnKerningPerionShopTooltipEnter)
-			self.KerningPerionShopTooltipExitHandler = kerningPerionShop:ConnectEvent(UITouchExitEvent, self.OnKerningPerionShopTooltipExit)
-		end
-		local elliniaNautilusShop = self:GetWorldMapEntity("ElliniaNautilusShopVisitBtn")
-		if isvalid(elliniaNautilusShop) then
-			self.ElliniaNautilusShopClickHandler = elliniaNautilusShop:ConnectEvent(ButtonClickEvent, self.OnElliniaNautilusShopLockedClicked)
-			self.ElliniaNautilusShopTooltipEnterHandler = elliniaNautilusShop:ConnectEvent(UITouchEnterEvent, self.OnElliniaNautilusShopTooltipEnter)
-			self.ElliniaNautilusShopTooltipExitHandler = elliniaNautilusShop:ConnectEvent(UITouchExitEvent, self.OnElliniaNautilusShopTooltipExit)
-		end
-		local perionSleepywoodShop = self:GetWorldMapEntity("PerionSleepywoodShopVisitBtn")
-		if isvalid(perionSleepywoodShop) then
-			self.PerionSleepywoodShopClickHandler = perionSleepywoodShop:ConnectEvent(ButtonClickEvent, self.OnPerionSleepywoodShopLockedClicked)
-			self.PerionSleepywoodShopTooltipEnterHandler = perionSleepywoodShop:ConnectEvent(UITouchEnterEvent, self.OnPerionSleepywoodShopTooltipEnter)
-			self.PerionSleepywoodShopTooltipExitHandler = perionSleepywoodShop:ConnectEvent(UITouchExitEvent, self.OnPerionSleepywoodShopTooltipExit)
-		end
-		local nautilusSleepywoodShop = self:GetWorldMapEntity("NautilusSleepywoodShopVisitBtn")
-		if isvalid(nautilusSleepywoodShop) then
-			self.NautilusSleepywoodShopClickHandler = nautilusSleepywoodShop:ConnectEvent(ButtonClickEvent, self.OnNautilusSleepywoodShopLockedClicked)
-			self.NautilusSleepywoodShopTooltipEnterHandler = nautilusSleepywoodShop:ConnectEvent(UITouchEnterEvent, self.OnNautilusSleepywoodShopTooltipEnter)
-			self.NautilusSleepywoodShopTooltipExitHandler = nautilusSleepywoodShop:ConnectEvent(UITouchExitEvent, self.OnNautilusSleepywoodShopTooltipExit)
-		end
+		-- MinimapUI owns only popup close actions; button presentation is component-owned.
 		local shopCloseButton = self:GetWorldMapEntity("ShopVisitPanel/ShopCloseBtn")
-		if isvalid(shopCloseButton) then
+		if isvalid(shopCloseButton) and self.ShopCloseHandler == nil then
 			self.ShopCloseHandler = shopCloseButton:ConnectEvent(ButtonClickEvent, self.OnShopCloseClicked)
 		end
 		local worldMapCloseButton = self:GetWorldMapEntity("WorldMapCloseBtn")
-		if isvalid(worldMapCloseButton) then
+		if isvalid(worldMapCloseButton) and self.WorldMapCloseHandler == nil then
 			self.WorldMapCloseHandler = worldMapCloseButton:ConnectEvent(ButtonClickEvent, self.OnWorldMapCloseClicked)
 		end
-		log("[WorldMap] interaction handlers connected upperShop=" .. tostring(isvalid(shopButton)) .. " lowerShop=" .. tostring(isvalid(lowerShopButton)))
+		log("[WorldMap] central close handlers connected")
 	end
 
 	@ExecSpace("ClientOnly")
 	method void DisconnectWorldMapButtons()
-		-- Releases UI event handlers without affecting other popup consumers.
-		local shopButton = self:GetWorldMapEntity("ShopVisitBtn")
-		if isvalid(shopButton) and self.ShopClickHandler ~= nil then
-			shopButton:DisconnectEvent(ButtonClickEvent, self.ShopClickHandler)
-		end
-		local lowerShopButton = self:GetWorldMapEntity("LowerShopVisitBtn")
-		if isvalid(lowerShopButton) and self.LowerShopClickHandler ~= nil then
-			lowerShopButton:DisconnectEvent(ButtonClickEvent, self.LowerShopClickHandler)
-		end
-		if isvalid(shopButton) and self.HenesysUpperShopTooltipEnterHandler ~= nil then
-			shopButton:DisconnectEvent(UITouchEnterEvent, self.HenesysUpperShopTooltipEnterHandler)
-		end
-		if isvalid(shopButton) and self.HenesysUpperShopTooltipExitHandler ~= nil then
-			shopButton:DisconnectEvent(UITouchExitEvent, self.HenesysUpperShopTooltipExitHandler)
-		end
-		if isvalid(lowerShopButton) and self.HenesysLowerShopTooltipEnterHandler ~= nil then
-			lowerShopButton:DisconnectEvent(UITouchEnterEvent, self.HenesysLowerShopTooltipEnterHandler)
-		end
-		if isvalid(lowerShopButton) and self.HenesysLowerShopTooltipExitHandler ~= nil then
-			lowerShopButton:DisconnectEvent(UITouchExitEvent, self.HenesysLowerShopTooltipExitHandler)
-		end
-		local kerningPerionShop = self:GetWorldMapEntity("KerningPerionShopVisitBtn")
-		if isvalid(kerningPerionShop) and self.KerningPerionShopClickHandler ~= nil then
-			kerningPerionShop:DisconnectEvent(ButtonClickEvent, self.KerningPerionShopClickHandler)
-		end
-		if isvalid(kerningPerionShop) and self.KerningPerionShopTooltipEnterHandler ~= nil then
-			kerningPerionShop:DisconnectEvent(UITouchEnterEvent, self.KerningPerionShopTooltipEnterHandler)
-		end
-		if isvalid(kerningPerionShop) and self.KerningPerionShopTooltipExitHandler ~= nil then
-			kerningPerionShop:DisconnectEvent(UITouchExitEvent, self.KerningPerionShopTooltipExitHandler)
-		end
-		local elliniaNautilusShop = self:GetWorldMapEntity("ElliniaNautilusShopVisitBtn")
-		if isvalid(elliniaNautilusShop) and self.ElliniaNautilusShopClickHandler ~= nil then
-			elliniaNautilusShop:DisconnectEvent(ButtonClickEvent, self.ElliniaNautilusShopClickHandler)
-		end
-		if isvalid(elliniaNautilusShop) and self.ElliniaNautilusShopTooltipEnterHandler ~= nil then
-			elliniaNautilusShop:DisconnectEvent(UITouchEnterEvent, self.ElliniaNautilusShopTooltipEnterHandler)
-		end
-		if isvalid(elliniaNautilusShop) and self.ElliniaNautilusShopTooltipExitHandler ~= nil then
-			elliniaNautilusShop:DisconnectEvent(UITouchExitEvent, self.ElliniaNautilusShopTooltipExitHandler)
-		end
-		local perionSleepywoodShop = self:GetWorldMapEntity("PerionSleepywoodShopVisitBtn")
-		if isvalid(perionSleepywoodShop) and self.PerionSleepywoodShopClickHandler ~= nil then
-			perionSleepywoodShop:DisconnectEvent(ButtonClickEvent, self.PerionSleepywoodShopClickHandler)
-		end
-		if isvalid(perionSleepywoodShop) and self.PerionSleepywoodShopTooltipEnterHandler ~= nil then
-			perionSleepywoodShop:DisconnectEvent(UITouchEnterEvent, self.PerionSleepywoodShopTooltipEnterHandler)
-		end
-		if isvalid(perionSleepywoodShop) and self.PerionSleepywoodShopTooltipExitHandler ~= nil then
-			perionSleepywoodShop:DisconnectEvent(UITouchExitEvent, self.PerionSleepywoodShopTooltipExitHandler)
-		end
-		local nautilusSleepywoodShop = self:GetWorldMapEntity("NautilusSleepywoodShopVisitBtn")
-		if isvalid(nautilusSleepywoodShop) and self.NautilusSleepywoodShopClickHandler ~= nil then
-			nautilusSleepywoodShop:DisconnectEvent(ButtonClickEvent, self.NautilusSleepywoodShopClickHandler)
-		end
-		if isvalid(nautilusSleepywoodShop) and self.NautilusSleepywoodShopTooltipEnterHandler ~= nil then
-			nautilusSleepywoodShop:DisconnectEvent(UITouchEnterEvent, self.NautilusSleepywoodShopTooltipEnterHandler)
-		end
-		if isvalid(nautilusSleepywoodShop) and self.NautilusSleepywoodShopTooltipExitHandler ~= nil then
-			nautilusSleepywoodShop:DisconnectEvent(UITouchExitEvent, self.NautilusSleepywoodShopTooltipExitHandler)
-		end
 		local shopCloseButton = self:GetWorldMapEntity("ShopVisitPanel/ShopCloseBtn")
 		if isvalid(shopCloseButton) and self.ShopCloseHandler ~= nil then
 			shopCloseButton:DisconnectEvent(ButtonClickEvent, self.ShopCloseHandler)
@@ -340,84 +221,141 @@ script MinimapUI extends Component
 		if isvalid(worldMapCloseButton) and self.WorldMapCloseHandler ~= nil then
 			worldMapCloseButton:DisconnectEvent(ButtonClickEvent, self.WorldMapCloseHandler)
 		end
-		self.ShopClickHandler = nil
-		self.LowerShopClickHandler = nil
-		self.KerningPerionShopClickHandler = nil
-		self.ElliniaNautilusShopClickHandler = nil
-		self.PerionSleepywoodShopClickHandler = nil
-		self.NautilusSleepywoodShopClickHandler = nil
-		self.HenesysUpperShopTooltipEnterHandler = nil
-		self.HenesysUpperShopTooltipExitHandler = nil
-		self.HenesysLowerShopTooltipEnterHandler = nil
-		self.HenesysLowerShopTooltipExitHandler = nil
-		self.KerningPerionShopTooltipEnterHandler = nil
-		self.KerningPerionShopTooltipExitHandler = nil
-		self.ElliniaNautilusShopTooltipEnterHandler = nil
-		self.ElliniaNautilusShopTooltipExitHandler = nil
-		self.PerionSleepywoodShopTooltipEnterHandler = nil
-		self.PerionSleepywoodShopTooltipExitHandler = nil
-		self.NautilusSleepywoodShopTooltipEnterHandler = nil
-		self.NautilusSleepywoodShopTooltipExitHandler = nil
 		self.ShopCloseHandler = nil
 		self.WorldMapCloseHandler = nil
 	end
 
 	@ExecSpace("ClientOnly")
-	method integer GetCompletedStageCount()
-		-- Reads the server-synced progression owner without inventing a client-side save value.
+	method boolean EnsureProgressEventHandler(string reason)
 		local player = _UserService.LocalPlayer
-		if isvalid(player) == false then
-			return 0
-		end
-		local runState = player:GetComponent("script.PlayerRunStateComponent")
-		if runState == nil then
-			return 0
-		end
-		return runState.CompletedStageCount
+		if isvalid(player) == false then return false end
+		if self.ProgressEventHandler ~= nil and self.ProgressEventOwner == player then return true end
+		self:DisconnectProgressEventHandler()
+		self.ProgressEventOwner = player
+		self.ProgressEventHandler = player:ConnectEvent(WorldMapProgressChangedEvent, self.OnWorldMapProgressChanged)
+		log("[WorldMapProgress] listener connected reason=" .. (reason or "UNSPECIFIED"))
+		return self.ProgressEventHandler ~= nil
 	end
 
 	@ExecSpace("ClientOnly")
-	method string GetSelectedWorldMapBranch()
-		-- Reads the server-authoritative upper/lower route choice from synced run state.
+	method void DisconnectProgressEventHandler()
+		if isvalid(self.ProgressEventOwner) and self.ProgressEventHandler ~= nil then
+			self.ProgressEventOwner:DisconnectEvent(WorldMapProgressChangedEvent, self.ProgressEventHandler)
+		end
+		self.ProgressEventOwner = nil
+		self.ProgressEventHandler = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnWorldMapProgressChanged(WorldMapProgressChangedEvent event)
+		if event == nil then return end
+		self:ApplyWorldMapProgress(event.CompletedStageCount, event.SelectedWorldMapBranch or "", event.Reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void InvalidateWorldMapComponentCache(string reason)
+		-- Component identity may change independently from its persistent UI entity.
+		self.WorldMapComponentsCached = false
+		self.StageButtonComponents = {}
+		self.ShopButtonComponents = {}
+		self.PresentationComponents = {}
+		log("[WorldMapProgress] component cache invalidated reason=" .. (reason or "UNSPECIFIED"))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnsureWorldMapComponentCache()
+		local cacheValid = self.WorldMapComponentsCached and #self.StageButtonComponents > 0 and #self.ShopButtonComponents > 0 and #self.PresentationComponents >= 14
+		if cacheValid then
+			for _, component in ipairs(self.StageButtonComponents) do
+				if component == nil or isvalid(component.Entity) == false then cacheValid = false break end
+			end
+		end
+		if cacheValid then
+			for _, component in ipairs(self.ShopButtonComponents) do
+				if component == nil or isvalid(component.Entity) == false then cacheValid = false break end
+			end
+		end
+		if cacheValid then
+			for _, component in ipairs(self.PresentationComponents) do
+				if component == nil or isvalid(component.Entity) == false then cacheValid = false break end
+			end
+		end
+		if cacheValid then return end
+
+		self.StageButtonComponents = {}
+		self.ShopButtonComponents = {}
+		self.PresentationComponents = {}
+		for _, path in ipairs({
+			"HenesysCityBranchBtn", "KerningCityBranchBtn", "ElliniaBranchBtn",
+			"PerionCityBranchBtn", "NautilusCityBranchBtn", "SleepywoodCityBranchBtn",
+			"UpperShopBranchBtn", "LowerShopBranchBtn", "ShopVisitBtn", "LowerShopVisitBtn",
+			"KerningPerionShopVisitBtn", "ElliniaNautilusShopVisitBtn",
+			"PerionSleepywoodShopVisitBtn", "NautilusSleepywoodShopVisitBtn"
+		}) do
+			local entity = self:GetWorldMapEntity(path)
+			local component = isvalid(entity) and entity:GetComponent("script.WorldMapButtonPresentationComponent") or nil
+			if component ~= nil then
+				component:RebindHoverHandlers("MINIMAP_CACHE")
+				component:ApplyState(component.InitialState, component.DefaultTooltipText)
+				table.insert(self.PresentationComponents, component)
+			end
+		end
+		for _, path in ipairs({ "HenesysCityBranchBtn", "KerningCityBranchBtn", "ElliniaBranchBtn" }) do
+			local entity = self:GetWorldMapEntity(path)
+			local component = isvalid(entity) and entity:GetComponent("script.WorldMapStageButtonComponent") or nil
+			if component ~= nil then
+				component:RebindClickHandler("MINIMAP_CACHE")
+				table.insert(self.StageButtonComponents, component)
+			end
+		end
+		for _, path in ipairs({
+			"ShopVisitBtn",
+			"LowerShopVisitBtn",
+			"KerningPerionShopVisitBtn",
+			"ElliniaNautilusShopVisitBtn",
+			"PerionSleepywoodShopVisitBtn",
+			"NautilusSleepywoodShopVisitBtn"
+		}) do
+			local entity = self:GetWorldMapEntity(path)
+			local component = isvalid(entity) and entity:GetComponent("script.WorldMapShopButtonComponent") or nil
+			if component ~= nil then
+				component:RebindClickHandler("MINIMAP_CACHE")
+				table.insert(self.ShopButtonComponents, component)
+			end
+		end
+		self.WorldMapComponentsCached = #self.StageButtonComponents > 0 and #self.ShopButtonComponents > 0 and #self.PresentationComponents >= 14
+		log("[WorldMapProgress] components cached stages=" .. tostring(#self.StageButtonComponents) .. " shops=" .. tostring(#self.ShopButtonComponents) .. " presentations=" .. tostring(#self.PresentationComponents))
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetWorldMapProgressSnapshot()
 		local player = _UserService.LocalPlayer
-		if isvalid(player) == false then
-			return ""
-		end
-		local runState = player:GetComponent("script.PlayerRunStateComponent")
-		if runState == nil then
-			return ""
-		end
-		return runState.SelectedWorldMapBranch or ""
+		local runState = isvalid(player) and player:GetComponent("script.PlayerRunStateComponent") or nil
+		if runState == nil then return { CompletedStageCount = 0, SelectedWorldMapBranch = "" } end
+		return {
+			CompletedStageCount = runState.CompletedStageCount,
+			SelectedWorldMapBranch = runState.SelectedWorldMapBranch or ""
+		}
 	end
 
 	@ExecSpace("ClientOnly")
 	method void RefreshWorldMapProgress(string reason)
-		-- Unlocks two mutually exclusive shop branches after Henesys: upper Kerning or lower Ellinia.
-		local completedStageCount = self:GetCompletedStageCount()
-		local selectedBranch = self:GetSelectedWorldMapBranch()
-		self.LastObservedCompletedStageCount = completedStageCount
-		self.LastObservedWorldMapBranch = selectedBranch
-		local henesysNode = self:GetWorldMapEntity("HenesysCityBranchBtn")
-		local kerningNode = self:GetWorldMapEntity("KerningCityBranchBtn")
-		local elliniaNode = self:GetWorldMapEntity("ElliniaBranchBtn")
-		for _, node in ipairs({ henesysNode, kerningNode, elliniaNode }) do
-			if isvalid(node) then
-				local stageButton = node:GetComponent("script.WorldMapStageButtonComponent")
-				if stageButton ~= nil then
-					stageButton:ResetForLobby(reason)
-				end
-			end
+		local snapshot = self:GetWorldMapProgressSnapshot()
+		self:ApplyWorldMapProgress(snapshot.CompletedStageCount, snapshot.SelectedWorldMapBranch, reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyWorldMapProgress(integer completedStageCount, string selectedBranch, string reason)
+		-- Distributes one immutable snapshot to reusable state components.
+		self:EnsureWorldMapComponentCache()
+		for _, stageButton in ipairs(self.StageButtonComponents) do
+			stageButton:RefreshState(completedStageCount, selectedBranch, reason)
+		end
+		for _, shopButton in ipairs(self.ShopButtonComponents) do
+			shopButton:RefreshState(completedStageCount, selectedBranch, reason)
 		end
 
 		local branchAvailable = completedStageCount >= 1
-		local upperAvailable = branchAvailable and (selectedBranch == "" or selectedBranch == "UPPER")
-		local lowerAvailable = branchAvailable and (selectedBranch == "" or selectedBranch == "LOWER")
-		self:SetWorldMapShopAvailable("ShopVisitBtn", upperAvailable)
-		self:SetWorldMapShopAvailable("LowerShopVisitBtn", lowerAvailable)
-		self:SetWorldMapShopAvailable("KerningPerionShopVisitBtn", false)
-		self:SetWorldMapShopAvailable("ElliniaNautilusShopVisitBtn", false)
-		self:SetWorldMapShopAvailable("PerionSleepywoodShopVisitBtn", false)
-		self:SetWorldMapShopAvailable("NautilusSleepywoodShopVisitBtn", false)
 		self:SetWorldMapEntityVisible("KerningLockText", completedStageCount < 1 or selectedBranch ~= "UPPER")
 		self:SetWorldMapEntityVisible("ElliniaLock", completedStageCount < 1 or selectedBranch ~= "LOWER")
 		self:SetWorldMapEntityVisible("PerionLockText", true)
@@ -440,23 +378,7 @@ script MinimapUI extends Component
 				statusText.TextGUIRendererComponent.Text = "선택한 경로를 확인하세요."
 			end
 		end
-		log("[WorldMap] progression refreshed completed=" .. completedStageCount .. " branch=" .. selectedBranch .. " upper=" .. tostring(upperAvailable) .. " lower=" .. tostring(lowerAvailable) .. " reason=" .. (reason or ""))
-	end
-
-	@ExecSpace("ClientOnly")
-	method void SetWorldMapShopAvailable(string relativePath, boolean available)
-		-- Keeps shop hover/click input alive while visually distinguishing locked future edges.
-		local entity = self:GetWorldMapEntity(relativePath)
-		if isvalid(entity) and isvalid(entity.ButtonComponent) then
-			entity.ButtonComponent.Enable = true
-		end
-		if isvalid(entity) and isvalid(entity.SpriteGUIRendererComponent) then
-			if available then
-				entity.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
-			else
-				entity.SpriteGUIRendererComponent.Color = Color(0.35, 0.35, 0.35, 0.62)
-			end
-		end
+		log("[WorldMapProgress] snapshot applied clears=" .. tostring(completedStageCount) .. " branch=" .. selectedBranch .. " reason=" .. (reason or "UNSPECIFIED"))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -470,133 +392,15 @@ script MinimapUI extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method void ShowShopRequirementTooltip(string ownerKey, string message)
-		-- Uses the shared cursor tooltip for both current and future route shops.
-		local tooltipUI = self:GetTooltipUI()
-		if tooltipUI ~= nil then
-			tooltipUI:Show(ownerKey, message)
-			log("[WorldMap] shop tooltip shown owner=" .. ownerKey .. " message=" .. message)
-		else
-			log_warning("[WorldMap] shop tooltip unavailable owner=" .. ownerKey)
-		end
-	end
-
-	@ExecSpace("ClientOnly")
-	method void HideShopRequirementTooltip(string ownerKey)
-		local tooltipUI = self:GetTooltipUI()
-		if tooltipUI ~= nil then
-			tooltipUI:Hide(ownerKey)
-		end
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnHenesysUpperShopTooltipEnter()
-		self:ShowShopRequirementTooltip("world_map_shop:henesys_upper", "헤네시스 클리어 필요")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnHenesysUpperShopTooltipExit()
-		self:HideShopRequirementTooltip("world_map_shop:henesys_upper")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnHenesysLowerShopTooltipEnter()
-		self:ShowShopRequirementTooltip("world_map_shop:henesys_lower", "헤네시스 클리어 필요")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnHenesysLowerShopTooltipExit()
-		self:HideShopRequirementTooltip("world_map_shop:henesys_lower")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnKerningPerionShopTooltipEnter()
-		self:ShowShopRequirementTooltip("world_map_shop:kerning_perion", "커닝시티 클리어 필요")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnKerningPerionShopTooltipExit()
-		self:HideShopRequirementTooltip("world_map_shop:kerning_perion")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnElliniaNautilusShopTooltipEnter()
-		self:ShowShopRequirementTooltip("world_map_shop:ellinia_nautilus", "엘리니아 클리어 필요")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnElliniaNautilusShopTooltipExit()
-		self:HideShopRequirementTooltip("world_map_shop:ellinia_nautilus")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnPerionSleepywoodShopTooltipEnter()
-		self:ShowShopRequirementTooltip("world_map_shop:perion_sleepywood", "페리온 클리어 필요")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnPerionSleepywoodShopTooltipExit()
-		self:HideShopRequirementTooltip("world_map_shop:perion_sleepywood")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnNautilusSleepywoodShopTooltipEnter()
-		self:ShowShopRequirementTooltip("world_map_shop:nautilus_sleepywood", "노틸러스 클리어 필요")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnNautilusSleepywoodShopTooltipExit()
-		self:HideShopRequirementTooltip("world_map_shop:nautilus_sleepywood")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnKerningPerionShopLockedClicked()
-		self:OnKerningPerionShopTooltipEnter()
-		log("[WorldMap] future shop locked requires=KERNING_CLEAR")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnElliniaNautilusShopLockedClicked()
-		self:OnElliniaNautilusShopTooltipEnter()
-		log("[WorldMap] future shop locked requires=ELLINIA_CLEAR")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnPerionSleepywoodShopLockedClicked()
-		self:OnPerionSleepywoodShopTooltipEnter()
-		log("[WorldMap] future shop locked requires=PERION_CLEAR")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnNautilusSleepywoodShopLockedClicked()
-		self:OnNautilusSleepywoodShopTooltipEnter()
-		log("[WorldMap] future shop locked requires=NAUTILUS_CLEAR")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnShopVisitClicked()
-		-- Selects the upper shop route leading to Kerning City.
-		self:OpenBranchShop("UPPER")
-	end
-
-	@ExecSpace("ClientOnly")
-	method void OnLowerShopVisitClicked()
-		-- Selects the lower shop route leading to Ellinia.
-		self:OpenBranchShop("LOWER")
-	end
-
-	@ExecSpace("ClientOnly")
 	method void OpenBranchShop(string branchId)
 		-- Commits one branch through the server and opens the shared shop visit panel.
-		if self:GetCompletedStageCount() < 1 then
-			local ownerKey = branchId == "LOWER" and "world_map_shop:henesys_lower" or "world_map_shop:henesys_upper"
-			self:ShowShopRequirementTooltip(ownerKey, "헤네시스 클리어 필요")
+		local snapshot = self:GetWorldMapProgressSnapshot()
+		if snapshot.CompletedStageCount < 1 then
 			log_warning("[WorldMap] shop visit rejected reason=HENESYS_NOT_CLEARED")
 			return
 		end
-		local selectedBranch = self:GetSelectedWorldMapBranch()
-		if selectedBranch ~= "" and selectedBranch ~= branchId then
-			log_warning("[WorldMap] shop visit rejected reason=BRANCH_ALREADY_SELECTED selected=" .. selectedBranch .. " requested=" .. branchId)
+		if snapshot.SelectedWorldMapBranch ~= "" then
+			log_warning("[WorldMap] shop visit rejected reason=BRANCH_ALREADY_SELECTED selected=" .. snapshot.SelectedWorldMapBranch .. " requested=" .. branchId)
 			return
 		end
 		local panel = self:GetWorldMapEntity("ShopVisitPanel")
@@ -689,20 +493,25 @@ script MinimapUI extends Component
 
 	@ExecSpace("ClientOnly")
 	method any GetWorldMapPopup()
-		-- Resolves the shared popup from one stable path instead of a duplicated UUID binding.
-		return _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup")
+		-- Resolves the shared popup once and only repeats the lookup after invalidation.
+		if isvalid(self.WorldMapPopupCache) then return self.WorldMapPopupCache end
+		self.WorldMapPopupCache = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup")
+		return self.WorldMapPopupCache
 	end
 
 	@ExecSpace("ClientOnly")
 	method any GetWorldMapEntity(string relativePath)
-		-- Resolves one descendant beneath the stable world-map popup path.
-		return _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/" .. relativePath)
+		-- Caches frequently reused descendants and resolves them again only after invalidation.
+		local cached = self.WorldMapEntityCache[relativePath]
+		if isvalid(cached) then return cached end
+		local entity = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/" .. relativePath)
+		if isvalid(entity) then self.WorldMapEntityCache[relativePath] = entity end
+		return entity
 	end
 
 	@ExecSpace("ClientOnly")
 	method any GetTravelAvatar()
-		-- Resolves the local-player avatar used by the start-to-Henesys route effect.
-		return _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/TravelAvatar")
+		return self:GetWorldMapEntity("TravelAvatar")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -717,6 +526,16 @@ script MinimapUI extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void BringTravelAvatarToFront(Entity avatar, string reason)
+		-- Moves the world-map avatar to the last sibling so shops and route markers render behind it.
+		if isvalid(avatar) == false or isvalid(avatar.UITransformComponent) == false then
+			return
+		end
+		_UILogic:SetSiblingIndex(avatar.UITransformComponent, 1000000)
+		log("[WorldMap] travel avatar brought to front reason=" .. (reason or "UNSPECIFIED"))
+	end
+
+	@ExecSpace("ClientOnly")
 	method void ShowTravelAvatarAtStart()
 		-- Shows the local player's avatar standing at the start arrow before selection.
 		self:StopTravelAnimation(false)
@@ -728,6 +547,7 @@ script MinimapUI extends Component
 
 		avatar.Enable = true
 		avatar.Visible = true
+		self:BringTravelAvatarToFront(avatar, "STANDING")
 		avatar.UITransformComponent.anchoredPosition = self.TravelStartPosition
 		local renderer = avatar.AvatarGUIRendererComponent
 		if isvalid(renderer) then
@@ -786,6 +606,7 @@ script MinimapUI extends Component
 		local endPosition = self:GetTravelTargetPosition(targetCityPath)
 		avatar.Enable = true
 		avatar.Visible = true
+		self:BringTravelAvatarToFront(avatar, "TRAVEL")
 		avatar.UITransformComponent.anchoredPosition = startPosition
 		self.TravelProgress = 0
 
@@ -866,7 +687,6 @@ script MinimapUI extends Component
 		local uiRoot = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
 		if isvalid(uiRoot) then
 			uiRoot.Enable = true
-			uiRoot.Visible = true
 			return uiRoot:GetComponent("script.MouseTooltipUIComponent")
 		end
 		return nil
