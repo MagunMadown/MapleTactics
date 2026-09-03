@@ -1414,3 +1414,33 @@ The queue component has one `RequestMoveQueuedTile` call and zero `RequestSlotSk
 - DataStorage: **UNCHANGED**
 - Maker Play: **UNVERIFIED UNTIL THE EXACT BRANCH SOURCE ROOT IS OPEN**
 - Push/merge: **NO**
+
+### STEP 10.1 Runtime Queue Drag Failure
+
+#### Runtime checkout identity
+
+- Classification: **CASE A — OLD_PRIMARY**.
+- Maker was inspected on `lobby` in Edit mode after the reported manual failure.
+- The newest matching runtime initialization record is `2026-09-03 11:03:20 [PlayerOverheadQueueHUD] ready maxSlots=3 utilityPips=4`.
+- The active runtime therefore did not load the STEP 8/9/10 branch source, whose queue HUD contract is `maxSlots=6` and includes `QueueSlot04` through `QueueSlot06`, `QueueDropRegion`, and queued-item drag handling.
+- No STEP 10 queue-drag begin/end/reorder receipt record exists in the inspected runtime log.
+
+#### Earliest failure and root cause
+
+- Earliest failed stage: **runtime source loading, before queue pointer input**.
+- Root cause: Maker is still bound to the dirty primary checkout instead of the isolated `skill-queue-drag` worktree that contains STEP 8 through STEP 10.
+- The reported mouse gesture cannot reach the STEP 10 queue drag handlers because those handlers and their six-slot UI are absent from the loaded runtime source.
+- This is not evidence of an input-routing, hit-test, request, server-validation, or queue-mutation defect in the STEP 10 branch.
+
+#### Fix scope and verification status
+
+- Production-code fix: **none**. Debugging stopped at the mandatory wrong-source gate; no speculative `.mlua` or `.ui` change was made.
+- Required environmental fix: open/register the exact `skill-queue-drag` worktree as Maker's project source, refresh it, and only then rerun the STEP 10 mouse matrix.
+- Actual mouse verification of queue reorder: **blocked**, because the running source was OLD_PRIMARY.
+- Queue Skill -> occupied QueueIndex reorder: **not exercised against STEP 10 source**.
+- Same-slot, outside Queue, Queue -> bottom, duplicate end, executing-state rejection, and stale-revision cases: **not exercised against STEP 10 source**.
+- Turn-consumption invariant: **not runtime-verified in this attempt**; the STEP 10 static design remains turn-free and was not changed.
+- STEP 9 Bottom Skill -> Queue regression: **not testable in this runtime**, because the STEP 9 source/artifacts were not loaded.
+- Maker state after inspection: `lobby`, **Edit mode**; no Play/Stop or runtime mutation was performed.
+- STEP 10.1 readiness: **BLOCKED — WRONG MAKER SOURCE**.
+- Push/merge: **NO**.
