@@ -1444,3 +1444,27 @@ The queue component has one `RequestMoveQueuedTile` call and zero `RequestSlotSk
 - Maker state after inspection: `lobby`, **Edit mode**; no Play/Stop or runtime mutation was performed.
 - STEP 10.1 readiness: **BLOCKED — WRONG MAKER SOURCE**.
 - Push/merge: **NO**.
+
+#### Source correction completed
+
+- The dirty primary checkout was first preserved in local commit `a9a95f2` before integration.
+- The `skill-queue-drag` branch was then integrated into the primary Maker checkout without copying production files manually or resetting user work.
+- Both affected UI assets passed UIBuilder validation after conflict resolution.
+- Maker workspace refresh completed successfully on the existing primary project root.
+- Fresh runtime evidence at `2026-09-03 11:24:09` reports `[PlayerQueueDrag] handlers bound count=6` and `[PlayerOverheadQueueHUD] ready maxSlots=6 utilityPips=4`.
+- Fresh runtime errors after the refresh/bootstrap: **0**.
+- Runtime source identity is now **STEP10_SOURCE**; the previous wrong-source blocker is resolved.
+- Actual queue-item mouse reorder remains pending a battle session with at least two queued Skills and is not claimed as runtime-passed by this source-identity correction alone.
+
+#### Runtime input defect and minimum fix
+
+- Correct-source user Play evidence at `2026-09-03 11:56:13` showed `count=2`, `queueRevision=2`, and an editable queued snapshot (`divine_swing|brandish`), but no queue `begin candidate`, activation, target, request, or receipt log followed the mouse attempt.
+- Earliest missing stage: **A — pointer interaction never reached the queued item**.
+- Root cause: each queued `InnerBackground` had a `ButtonComponent`, but its `SpriteGUIRendererComponent.RaycastTarget` was `false` and it had no `UITouchReceiveComponent`. Event handlers were connected successfully, yet the entity could not receive the touch/drag event stream.
+- Verified comparison: the working bottom Battle Skill slots use an input surface with `RaycastTarget=true` plus `UITouchReceiveComponent` in addition to their Button.
+- Minimum fix: through UIBuilder, set `RaycastTarget=true` and add an enabled `UITouchReceiveComponent` to the existing 68x68 `InnerBackground` for QueueSlot 01 through 06. No hierarchy, size, layout, QueueDropRegion, request, server, INSERT, turn, cooldown, or execution rule changed.
+- UIBuilder validation: **PASS**, 43 entities and zero validation errors; all six queue input surfaces report Button enabled in authored data, Touch receiver enabled, Raycast target enabled, and unchanged 68x68 size.
+- Maker refresh/build: **PASS**, zero build errors. The two existing unrelated build warnings remain unchanged.
+- Fresh bootstrap at `2026-09-03 12:01:21`: `handlers bound count=6`, `ready maxSlots=6`, and zero fresh runtime errors.
+- Temporary diagnostics: **none added**; the existing bounded queue-drag logs are sufficient for the next mouse verification.
+- Actual post-fix 2-item/3-item mouse reorder and zero-turn/outside-drop matrix: **pending user Play; runtime pass is not claimed yet**.
