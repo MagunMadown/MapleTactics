@@ -1478,3 +1478,38 @@ The queue component has one `RequestMoveQueuedTile` call and zero `RequestSlotSk
 - UIBuilder rewrite/validation: **PASS** with the same 43 entities and expected six 68x68 lint warnings; no hierarchy or layout change.
 - Maker refresh/build: **PASS**, zero build errors. Fresh bootstrap at `2026-09-03 12:06:50` again reports `handlers bound count=6` and `ready maxSlots=6`.
 - Actual post-parent-fix Queue reorder remains pending mouse verification and is not yet marked runtime-passed.
+
+### STEP 11 Queue Interaction Polish
+
+#### Production scope
+
+- STEP 11 changes only `PlayerOverheadQueueHudComponent` client presentation and hit testing. Reservation, reorder, turn, cooldown, execution, queue capacity, ownership, and server validation paths are unchanged.
+- Visible reservation cells now follow `min(QueuedCount + 1, QueueCapacity)`, with one empty cell at count zero and no extra empty cell when the queue is full. QueueIndex 1 remains the bottom execution position.
+- The passive `QueueDropRegion` follows the currently visible compact stack instead of the six-slot pool. Its manual bounds add 22 UI units on each horizontal side and 20 UI units on each vertical side; it still owns no input component.
+- Queued-item target resolution uses the stable authoritative slot guide while the visual entities animate, preventing insertion-target oscillation.
+- A queued-item drag previews INSERT ordering locally by shifting the source and intervening occupied items for 0.10 seconds. The next empty reservation cell is never a reorder target.
+- The preview holds while the single existing reorder proposal is pending. Authoritative success uses a 0.14-second settle tint; rejection, timeout, same-slot, stale, and outside drops return to authoritative positions over 0.12 seconds.
+- Successful reservation reveals only the newly available next empty cell with a 0.11-second short vertical/fade entrance. A full queue does not create another cell.
+
+#### Maker verification — 2026-09-03
+
+- Maker workspace refresh completed and the Build Console contained zero errors for the STEP 11 source.
+- Fresh Play bootstrap logged six queue handlers and `ready maxSlots=6`; no runtime errors were recorded through the interaction matrix.
+- Empty queue rendered one empty overhead cell (`count=0`, `capacity=3`, `slots=1`).
+- The first bottom-skill drag was released outside the visible tile but inside the expanded right margin. The server accepted `brandish`, and the overhead HUD advanced to `count=1`, `slots=2`.
+- The second forgiving-margin drag was accepted for `divine_swing`, and the overhead HUD advanced to `count=2`, `slots=3`.
+- Reservation kept its normal gameplay cost: the two accepted reservations advanced the battle from turn 1 to turn 3 through the unchanged queue command path.
+- A real mouse drag from QueueIndex 1 to QueueIndex 2 submitted exactly one reorder request and received authoritative `MOVED`; the queue became `divine_swing|brandish`.
+- A real mouse drag from QueueIndex 2 to QueueIndex 1 submitted exactly one reorder request and received authoritative `MOVED`; the queue returned to `brandish|divine_swing`.
+- Both reorder operations remained on turn 3, confirming zero-turn reorder behavior.
+- A held mouse drag screenshot showed the source dimmed and the neighboring occupied item shifted into the insertion preview before mouse-up.
+- Releasing the held preview outside the queue logged `OUTSIDE_QUEUE`, emitted no reorder request, and restored the authoritative order.
+- The current Warrior run owns only two equipped skills, so a temporary client-only 3/3 HUD state was used to verify the full visual boundary without changing production data or server state. It rendered exactly three occupied cells and no fourth cell.
+- A real bottom-skill mouse drop against that temporary full state was rejected locally as `QUEUE_NOT_AVAILABLE` and emitted no reservation request; clearing feedback immediately restored the live authoritative 2/3 snapshot.
+- Thief capacity-4 coverage was not required for the fix and was not substituted for the completed capacity-3 boundary verification.
+
+#### STEP 11 final state
+
+- Result: **PASS** for dynamic compact visibility, forgiving bottom-to-queue drop bounds, live INSERT preview, both reorder directions, cancel restore, full-state suppression, normal reservation cost, and zero-turn reorder.
+- Production files changed by STEP 11: `RootDesk/MyDesk/02_UI/PlayerOverheadQueueHudComponent.mlua` and this audit section only.
+- Push/merge: **NO**. STEP 11 stops after the verified local commit.

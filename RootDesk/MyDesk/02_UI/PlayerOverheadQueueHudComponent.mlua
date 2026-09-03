@@ -45,6 +45,7 @@ script PlayerOverheadQueueHudComponent extends Component
 	property number QueueFirstSlotCenterOffsetY = -24
 	property integer CurrentQueueCapacity = 0
 	property integer CurrentQueueCount = 0
+	property integer CurrentVisibleSlotCount = 0
 	property integer CurrentQueueOrderRevision = 0
 	property boolean QueueInteractionAvailable = false
 	property boolean QueueReorderAvailable = false
@@ -57,6 +58,13 @@ script PlayerOverheadQueueHudComponent extends Component
 	property number QueueDragGhostOffsetX = 14
 	property number QueueDragGhostOffsetY = 18
 	property number QueueReorderPendingTimeout = 1.00
+	property number QueueDropMarginX = 22
+	property number QueueDropMarginY = 20
+	property number QueuePreviewShiftDuration = 0.10
+	property number QueuePreviewSettleDuration = 0.14
+	property number QueuePreviewCancelDuration = 0.12
+	property number QueueEmptyRevealDuration = 0.11
+	property number QueueEmptyRevealOffsetY = 10
 	property integer QueueReorderNextRequestId = 0
 	property integer QueueReorderPendingRequestId = 0
 	property number QueueReorderPendingElapsed = 0
@@ -82,6 +90,7 @@ script PlayerOverheadQueueHudComponent extends Component
 	method void OnBeginPlay()
 		self._T.QueueItemDragHandlers = {}
 		self:ResetQueueItemDragState()
+		self:ResetQueuePreviewState()
 		self:SetCoveredIconsHidden()
 		self:BindQueueItemDragHandlers()
 		self:BuildUtilityCooldownPipView()
@@ -115,6 +124,9 @@ script PlayerOverheadQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+		self:UpdateQueueSlotMotion(delta)
+		self:UpdateQueueEmptyReveal(delta)
+		self:UpdateQueueSuccessSettle(delta)
 		local player = _UserService.LocalPlayer
 		local session = self:GetBattleSession(player)
 		if session == nil then
@@ -132,6 +144,8 @@ script PlayerOverheadQueueHudComponent extends Component
 				log_warning("[PlayerQueueDrag] receipt timeout request=" .. tostring(self.QueueReorderPendingRequestId))
 				self.QueueReorderPendingRequestId = 0
 				self.QueueReorderPendingElapsed = 0
+				self._T.QueuePreviewPending = false
+				self:StartAuthoritativeQueueMotion(self.QueuePreviewCancelDuration)
 			end
 		end
 
@@ -151,6 +165,7 @@ script PlayerOverheadQueueHudComponent extends Component
 		self:CleanupQueueItemDragVisuals(false)
 		self.QueueReorderPendingRequestId = 0
 		self.QueueReorderPendingElapsed = 0
+		self:ResetQueuePreviewState()
 		self:SetQueueHidden("END_PLAY")
 		self:HideUtilityCooldownHud("END_PLAY")
 	end
@@ -174,8 +189,8 @@ script PlayerOverheadQueueHudComponent extends Component
 		local screenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y + self.PlayerHeadOffsetY))
 		local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
 		if self.ReservationQueueTransform ~= nil then
-			local capacity = math.max(1, math.min(self.QueueMaxSlots, self.CurrentQueueCapacity))
-			local centerOffsetY = self.QueueFirstSlotCenterOffsetY + math.max(0, capacity - 1) * self.QueueSlotSpacing * 0.5
+			local visibleSlotCount = math.max(1, math.min(self.QueueMaxSlots, self.CurrentVisibleSlotCount))
+			local centerOffsetY = self.QueueFirstSlotCenterOffsetY + math.max(0, visibleSlotCount - 1) * self.QueueSlotSpacing * 0.5
 			self.ReservationQueueTransform.anchoredPosition = Vector2(uiPosition.x, uiPosition.y + centerOffsetY)
 		end
 		if self.UtilitySkillHUDTransform ~= nil then
@@ -288,6 +303,12 @@ script PlayerOverheadQueueHudComponent extends Component
 		end
 
 		local queueState = uiState.PlayerQueue
+		local positionsBeforeRefresh = self:CaptureQueueSlotYPositions()
+		local previousQueueCount = self.CurrentQueueCount
+		local previousVisibleSlotCount = self.CurrentVisibleSlotCount
+		local previewWasPending = self._T.QueuePreviewPending == true
+		local previewSnapshot = self._T.QueuePreviewPendingSnapshot or ""
+		local previewRevision = self._T.QueuePreviewPendingRevision or 0
 		self:ConsumeQueueReorderReceipt(queueState)
 		local queueCapacity = math.max(1, math.min(self.QueueMaxSlots, queueState.EffectiveCapacity or 1))
 		local serializedQueue = queueState.QueuedTileIds or ""
@@ -300,6 +321,13 @@ script PlayerOverheadQueueHudComponent extends Component
 		end
 
 		local visibleSkills = self:GetVisibleSkills(serializedQueue, firstVisibleIndex)
+		local queueCount = queueState.Count or 0
+		local visibleSlotCount = math.max(1, math.min(queueCapacity, queueCount))
+		if source == "QUEUED" and queueCount < queueCapacity then
+			visibleSlotCount = math.min(queueCapacity, queueCount + 1)
+		elseif source == "EXECUTING" then
+			visibleSlotCount = math.max(1, math.min(queueCapacity, #visibleSkills))
+		end
 		local queueInteractionAvailable = source == "QUEUED"
 			and uiState.Commands ~= nil
 			and uiState.Commands.CanQueue == true
@@ -310,22 +338,51 @@ script PlayerOverheadQueueHudComponent extends Component
 		local reorderReceiptRevision = queueState.ReorderReceipt ~= nil and (queueState.ReorderReceipt.Revision or 0) or 0
 		-- The icon snapshot is part of the signature because it syncs independently of the queue: without
 		-- it, icons that arrive after the tiles were already drawn would stay on the placeholder.
-		local signature = source .. ":" .. tostring(firstVisibleIndex) .. ":" .. tostring(queueCapacity) .. ":" .. tostring(queueOrderRevision) .. ":" .. tostring(reorderReceiptRevision) .. ":" .. tostring(queueInteractionAvailable) .. ":" .. tostring(queueReorderAvailable) .. ":" .. table.concat(visibleSkills, "|") .. ":" .. self.IconSnapshot
+		local signature = source .. ":" .. tostring(firstVisibleIndex) .. ":" .. tostring(queueCapacity) .. ":" .. tostring(visibleSlotCount) .. ":" .. tostring(queueOrderRevision) .. ":" .. tostring(reorderReceiptRevision) .. ":" .. tostring(queueInteractionAvailable) .. ":" .. tostring(queueReorderAvailable) .. ":" .. table.concat(visibleSkills, "|") .. ":" .. self.IconSnapshot
 		if self.LastSignature == signature then
 			return
 		end
 
 		self.LastSignature = signature
 		self.CurrentQueueCapacity = queueCapacity
-		self.CurrentQueueCount = queueState.Count or 0
+		self.CurrentQueueCount = queueCount
+		self.CurrentVisibleSlotCount = visibleSlotCount
 		self.CurrentQueueOrderRevision = queueOrderRevision
 		self.QueueInteractionAvailable = queueInteractionAvailable
 		self.QueueReorderAvailable = queueReorderAvailable
 		self.CurrentQueuedTileIds = source == "QUEUED" and serializedQueue or ""
 		self:ValidateQueueItemDragSnapshot()
-		self:UpdateQueueLayout(queueCapacity)
+		self:UpdateQueueLayout(visibleSlotCount)
 		for slotIndex = 1, self.QueueMaxSlots do
-			self:SetSlot(slotIndex, visibleSkills[slotIndex] or "", slotIndex <= queueCapacity)
+			self:SetSlot(slotIndex, visibleSkills[slotIndex] or "", slotIndex <= visibleSlotCount)
+		end
+
+		local receiptResult = self._T.QueuePreviewReceiptResult or ""
+		local activePreviewMatches = self._T.QueueItemDragCandidate == true
+			and source == "QUEUED"
+			and self._T.QueueItemDragExpectedRevision == queueOrderRevision
+			and self.CurrentQueuedTileIds == serializedQueue
+		local pendingPreviewMatches = previewWasPending
+			and receiptResult == ""
+			and source == "QUEUED"
+			and previewRevision == queueOrderRevision
+			and previewSnapshot == serializedQueue
+		if activePreviewMatches or pendingPreviewMatches then
+			self:RestoreQueueSlotYPositions(positionsBeforeRefresh)
+		elseif receiptResult == "REJECT" then
+			self:RestoreQueueSlotYPositions(positionsBeforeRefresh)
+			self:StartAuthoritativeQueueMotion(self.QueuePreviewCancelDuration)
+		elseif receiptResult == "SUCCESS" then
+			self:StartQueueSuccessSettle()
+		end
+		self._T.QueuePreviewReceiptResult = ""
+
+		if source == "QUEUED"
+			and receiptResult == ""
+			and queueCount > previousQueueCount
+			and queueCount < queueCapacity
+			and visibleSlotCount > previousVisibleSlotCount then
+			self:StartQueueEmptyReveal(queueCount + 1)
 		end
 		if self._T.QueueItemDragCandidate == true then
 			self:ApplyQueueItemDragVisuals()
@@ -335,8 +392,8 @@ script PlayerOverheadQueueHudComponent extends Component
 		if self.QueueDropRegion ~= nil then
 			self.QueueDropRegion.Enable = queueInteractionAvailable
 		end
-		self.ReservationQueue.Enable = #visibleSkills > 0 or queueInteractionAvailable
-		log("[PlayerOverheadQueueHUD] refreshed source=" .. source .. " first=" .. firstVisibleIndex .. " capacity=" .. tostring(queueCapacity) .. " count=" .. tostring(self.CurrentQueueCount) .. " visible=" .. #visibleSkills .. " queueRevision=" .. tostring(queueOrderRevision) .. " drop=" .. tostring(queueInteractionAvailable) .. " queue=" .. serializedQueue)
+		self.ReservationQueue.Enable = visibleSlotCount > 0
+		log("[PlayerOverheadQueueHUD] refreshed source=" .. source .. " first=" .. firstVisibleIndex .. " capacity=" .. tostring(queueCapacity) .. " count=" .. tostring(self.CurrentQueueCount) .. " slots=" .. tostring(visibleSlotCount) .. " visible=" .. #visibleSkills .. " queueRevision=" .. tostring(queueOrderRevision) .. " drop=" .. tostring(queueInteractionAvailable) .. " queue=" .. serializedQueue)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -420,6 +477,208 @@ script PlayerOverheadQueueHudComponent extends Component
 		self._T.QueueItemDragExpectedRevision = 0
 		self._T.QueueItemDragSourceSkillId = ""
 		self._T.QueueItemDragLastTouchPoint = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetQueuePreviewState()
+		self._T.QueuePreviewTargetIndex = 0
+		self._T.QueuePreviewPending = false
+		self._T.QueuePreviewPendingSourceIndex = 0
+		self._T.QueuePreviewPendingTargetIndex = 0
+		self._T.QueuePreviewPendingRevision = 0
+		self._T.QueuePreviewPendingSnapshot = ""
+		self._T.QueuePreviewReceiptResult = ""
+		self._T.QueueSlotMotionActive = false
+		self._T.QueueSlotMotionElapsed = 0
+		self._T.QueueSlotMotionDuration = 0
+		self._T.QueueSlotMotionStartY = {}
+		self._T.QueueSlotMotionTargetY = {}
+		self._T.QueueEmptyRevealSlotIndex = 0
+		self._T.QueueEmptyRevealElapsed = 0
+		self._T.QueueSuccessSettleActive = false
+		self._T.QueueSuccessSettleElapsed = 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetQueueSlotBaseY(integer queueIndex, integer visibleSlotCount)
+		local count = math.max(1, math.min(self.QueueMaxSlots, visibleSlotCount))
+		local firstLocalY = -math.max(0, count - 1) * self.QueueSlotSpacing * 0.5
+		return firstLocalY + (queueIndex - 1) * self.QueueSlotSpacing
+	end
+
+	@ExecSpace("ClientOnly")
+	method table CaptureQueueSlotYPositions()
+		local positions = {}
+		for slotIndex = 1, self.QueueMaxSlots do
+			local slot = self:GetSlotEntity(slotIndex)
+			if isvalid(slot) and slot.UITransformComponent ~= nil then
+				positions[slotIndex] = slot.UITransformComponent.anchoredPosition.y
+			end
+		end
+		return positions
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreQueueSlotYPositions(table positions)
+		if positions == nil then
+			return
+		end
+		for slotIndex = 1, self.QueueMaxSlots do
+			local y = positions[slotIndex]
+			local slot = self:GetSlotEntity(slotIndex)
+			if y ~= nil and isvalid(slot) and slot.UITransformComponent ~= nil then
+				slot.UITransformComponent.anchoredPosition = Vector2(0, y)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartQueueSlotMotion(table targetYBySlot, number duration)
+		self._T.QueueSlotMotionStartY = self:CaptureQueueSlotYPositions()
+		self._T.QueueSlotMotionTargetY = targetYBySlot or {}
+		self._T.QueueSlotMotionElapsed = 0
+		self._T.QueueSlotMotionDuration = math.max(0.01, duration)
+		self._T.QueueSlotMotionActive = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateQueueSlotMotion(number delta)
+		if self._T.QueueSlotMotionActive ~= true then
+			return
+		end
+		self._T.QueueSlotMotionElapsed = self._T.QueueSlotMotionElapsed + delta
+		local progress = math.min(1, self._T.QueueSlotMotionElapsed / self._T.QueueSlotMotionDuration)
+		local eased = 1 - (1 - progress) * (1 - progress)
+		local starts = self._T.QueueSlotMotionStartY or {}
+		local targets = self._T.QueueSlotMotionTargetY or {}
+		for slotIndex = 1, self.QueueMaxSlots do
+			local startY = starts[slotIndex]
+			local targetY = targets[slotIndex]
+			local slot = self:GetSlotEntity(slotIndex)
+			if startY ~= nil and targetY ~= nil and isvalid(slot) and slot.UITransformComponent ~= nil then
+				local y = startY + (targetY - startY) * eased
+				slot.UITransformComponent.anchoredPosition = Vector2(0, y)
+			end
+		end
+		if progress >= 1 then
+			self._T.QueueSlotMotionActive = false
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartAuthoritativeQueueMotion(number duration)
+		local targets = {}
+		for slotIndex = 1, self.CurrentVisibleSlotCount do
+			targets[slotIndex] = self:GetQueueSlotBaseY(slotIndex, self.CurrentVisibleSlotCount)
+		end
+		self._T.QueuePreviewTargetIndex = 0
+		self:StartQueueSlotMotion(targets, duration)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartQueuePreviewMotion(integer targetIndex)
+		local sourceIndex = self._T.QueueItemDragSourceIndex or 0
+		if targetIndex < 1 or targetIndex > self.CurrentQueueCount then
+			targetIndex = 0
+		end
+		if self._T.QueuePreviewTargetIndex == targetIndex then
+			return
+		end
+		self._T.QueuePreviewTargetIndex = targetIndex
+		local targets = {}
+		for slotIndex = 1, self.CurrentVisibleSlotCount do
+			local previewIndex = slotIndex
+			if targetIndex > 0 and targetIndex ~= sourceIndex then
+				if slotIndex == sourceIndex then
+					previewIndex = targetIndex
+				elseif sourceIndex < targetIndex and slotIndex > sourceIndex and slotIndex <= targetIndex then
+					previewIndex = slotIndex - 1
+				elseif sourceIndex > targetIndex and slotIndex >= targetIndex and slotIndex < sourceIndex then
+					previewIndex = slotIndex + 1
+				end
+			end
+			targets[slotIndex] = self:GetQueueSlotBaseY(previewIndex, self.CurrentVisibleSlotCount)
+		end
+		self:StartQueueSlotMotion(targets, self.QueuePreviewShiftDuration)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartQueueEmptyReveal(integer slotIndex)
+		if slotIndex < 1 or slotIndex > self.CurrentVisibleSlotCount then
+			return
+		end
+		local slot = self:GetSlotEntity(slotIndex)
+		if isvalid(slot) == false or slot.UITransformComponent == nil then
+			return
+		end
+		local targetY = self:GetQueueSlotBaseY(slotIndex, self.CurrentVisibleSlotCount)
+		slot.UITransformComponent.anchoredPosition = Vector2(0, targetY - self.QueueEmptyRevealOffsetY)
+		self._T.QueueEmptyRevealSlotIndex = slotIndex
+		self._T.QueueEmptyRevealElapsed = 0
+		self:StartQueueSlotMotion({ [slotIndex] = targetY }, self.QueueEmptyRevealDuration)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateQueueEmptyReveal(number delta)
+		local slotIndex = self._T.QueueEmptyRevealSlotIndex or 0
+		if slotIndex <= 0 then
+			return
+		end
+		self._T.QueueEmptyRevealElapsed = self._T.QueueEmptyRevealElapsed + delta
+		local progress = math.min(1, self._T.QueueEmptyRevealElapsed / math.max(0.01, self.QueueEmptyRevealDuration))
+		local eased = 1 - (1 - progress) * (1 - progress)
+		local slot = self:GetSlotEntity(slotIndex)
+		local background = isvalid(slot) and slot:GetChildByName("Background", false) or nil
+		if isvalid(background) and background.SpriteGUIRendererComponent ~= nil then
+			background.SpriteGUIRendererComponent.Color = Color(0.38, 0.34, 0.30, 0.12 + 0.36 * eased)
+		end
+		if progress >= 1 then
+			self._T.QueueEmptyRevealSlotIndex = 0
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartQueueSuccessSettle()
+		self._T.QueueSuccessSettleActive = true
+		self._T.QueueSuccessSettleElapsed = 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateQueueSuccessSettle(number delta)
+		if self._T.QueueSuccessSettleActive ~= true then
+			return
+		end
+		self._T.QueueSuccessSettleElapsed = self._T.QueueSuccessSettleElapsed + delta
+		local progress = math.min(1, self._T.QueueSuccessSettleElapsed / math.max(0.01, self.QueuePreviewSettleDuration))
+		for slotIndex = 1, self.CurrentQueueCount do
+			local slot = self:GetSlotEntity(slotIndex)
+			local background = isvalid(slot) and slot:GetChildByName("Background", false) or nil
+			if isvalid(background) and background.SpriteGUIRendererComponent ~= nil then
+				local remaining = 1 - progress
+				if slotIndex == 1 then
+					background.SpriteGUIRendererComponent.Color = Color(
+						0.92 + (0.34 - 0.92) * remaining,
+						0.66 + (0.74 - 0.66) * remaining,
+						0.26 + (1.00 - 0.26) * remaining,
+						1.00)
+				elseif slotIndex == 2 then
+					background.SpriteGUIRendererComponent.Color = Color(
+						0.82 + (0.34 - 0.82) * remaining,
+						0.57 + (0.74 - 0.57) * remaining,
+						0.22 + (1.00 - 0.22) * remaining,
+						0.98)
+				else
+					background.SpriteGUIRendererComponent.Color = Color(
+						0.72 + (0.34 - 0.72) * remaining,
+						0.49 + (0.74 - 0.49) * remaining,
+						0.18 + (1.00 - 0.18) * remaining,
+						0.96)
+				end
+			end
+		end
+		if progress >= 1 then
+			self._T.QueueSuccessSettleActive = false
+		end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -528,8 +787,11 @@ script PlayerOverheadQueueHudComponent extends Component
 			local slot = self:GetSlotEntity(queueIndex)
 			if isvalid(slot) and slot.UITransformComponent ~= nil then
 				local slotTransform = slot.UITransformComponent
-				local centerX = self.ReservationQueueTransform.anchoredPosition.x + slotTransform.anchoredPosition.x
-				local centerY = self.ReservationQueueTransform.anchoredPosition.y + slotTransform.anchoredPosition.y
+				-- Resolve against the authoritative slot guide, not the animated preview transform.
+				-- This keeps the insertion target stable while neighbouring items shift visually.
+				local centerX = self.ReservationQueueTransform.anchoredPosition.x
+				local centerY = self.ReservationQueueTransform.anchoredPosition.y
+					+ self:GetQueueSlotBaseY(queueIndex, self.CurrentVisibleSlotCount)
 				local minX = centerX - slotTransform.RectSize.x * slotTransform.Pivot.x
 				local maxX = minX + slotTransform.RectSize.x
 				local minY = centerY - slotTransform.RectSize.y * slotTransform.Pivot.y
@@ -546,6 +808,7 @@ script PlayerOverheadQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void UpdateQueueItemDragDestination(Vector2 touchPoint)
 		self._T.QueueItemDragTargetIndex = self:ResolveQueueItemDropIndex(touchPoint)
+		self:StartQueuePreviewMotion(self._T.QueueItemDragTargetIndex)
 		self:ApplyQueueItemDragVisuals()
 	end
 
@@ -573,7 +836,7 @@ script PlayerOverheadQueueHudComponent extends Component
 			local slot = self:GetSlotEntity(queueIndex)
 			local background = isvalid(slot) and slot:GetChildByName("Background", false) or nil
 			if isvalid(background) and background.SpriteGUIRendererComponent ~= nil then
-				background.SpriteGUIRendererComponent.Color = queueIndex == targetIndex and targetIndex ~= sourceIndex
+				background.SpriteGUIRendererComponent.Color = queueIndex == sourceIndex and targetIndex > 0 and targetIndex ~= sourceIndex
 					and Color(0.34, 0.74, 1.00, 0.82)
 					or self:GetQueueSlotBackgroundColor(queueIndex)
 			end
@@ -600,7 +863,8 @@ script PlayerOverheadQueueHudComponent extends Component
 			return
 		end
 		if self._T.QueueItemDragActive ~= true then
-			self:CleanupQueueItemDragVisuals(true)
+			self:CleanupQueueItemDragVisuals(false)
+			self:StartAuthoritativeQueueMotion(self.QueuePreviewCancelDuration)
 			return
 		end
 
@@ -608,26 +872,41 @@ script PlayerOverheadQueueHudComponent extends Component
 		local targetIndex = self:ResolveQueueItemDropIndex(dragEvent.TouchPoint)
 		local expectedRevision = self._T.QueueItemDragExpectedRevision or 0
 		local sourceSkillId = self._T.QueueItemDragSourceSkillId or ""
-		self:CleanupQueueItemDragVisuals(true)
 
 		if targetIndex <= 0 then
+			self:CleanupQueueItemDragVisuals(false)
+			self:StartAuthoritativeQueueMotion(self.QueuePreviewCancelDuration)
 			log("[PlayerQueueDrag] cancelled source=" .. tostring(sourceIndex) .. " reason=OUTSIDE_QUEUE")
 			return
 		end
 		if targetIndex == sourceIndex then
+			self:CleanupQueueItemDragVisuals(false)
+			self:StartAuthoritativeQueueMotion(self.QueuePreviewCancelDuration)
 			log("[PlayerQueueDrag] no-op source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex))
 			return
 		end
 		if self.QueueReorderAvailable ~= true
 			or expectedRevision ~= self.CurrentQueueOrderRevision
 			or self:GetQueuedSkillIdAt(sourceIndex) ~= sourceSkillId then
+			self:CleanupQueueItemDragVisuals(false)
+			self:StartAuthoritativeQueueMotion(self.QueuePreviewCancelDuration)
 			log_warning("[PlayerQueueDrag] cancelled stale source=" .. tostring(sourceIndex)
 				.. " target=" .. tostring(targetIndex)
 				.. " expectedRevision=" .. tostring(expectedRevision)
 				.. " currentRevision=" .. tostring(self.CurrentQueueOrderRevision))
 			return
 		end
+		self:CleanupQueueItemDragVisuals(false)
 		self:SubmitQueueReorderRequest(sourceIndex, targetIndex, expectedRevision)
+		if self.QueueReorderPendingRequestId > 0 then
+			self._T.QueuePreviewPending = true
+			self._T.QueuePreviewPendingSourceIndex = sourceIndex
+			self._T.QueuePreviewPendingTargetIndex = targetIndex
+			self._T.QueuePreviewPendingRevision = expectedRevision
+			self._T.QueuePreviewPendingSnapshot = self.CurrentQueuedTileIds
+		else
+			self:StartAuthoritativeQueueMotion(self.QueuePreviewCancelDuration)
+		end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -670,12 +949,15 @@ script PlayerOverheadQueueHudComponent extends Component
 		end
 		self.QueueReorderPendingRequestId = 0
 		self.QueueReorderPendingElapsed = 0
+		self._T.QueuePreviewPending = false
 		if receipt.Success == true then
+			self._T.QueuePreviewReceiptResult = "SUCCESS"
 			log("[PlayerQueueDrag] authoritative success request=" .. tostring(receipt.RequestId)
 				.. " source=" .. tostring(receipt.SourceIndex)
 				.. " target=" .. tostring(receipt.TargetIndex)
 				.. " revision=" .. tostring(receipt.QueueOrderRevision))
 		else
+			self._T.QueuePreviewReceiptResult = "REJECT"
 			log_warning("[PlayerQueueDrag] authoritative reject request=" .. tostring(receipt.RequestId)
 				.. " reason=" .. tostring(receipt.Reason))
 		end
@@ -711,7 +993,9 @@ script PlayerOverheadQueueHudComponent extends Component
 			local slot = self:GetSlotEntity(queueIndex)
 			local background = isvalid(slot) and slot:GetChildByName("Background", false) or nil
 			if isvalid(background) and background.SpriteGUIRendererComponent ~= nil then
-				background.SpriteGUIRendererComponent.Color = self:GetQueueSlotBackgroundColor(queueIndex)
+				background.SpriteGUIRendererComponent.Color = queueIndex <= self.CurrentQueueCount
+					and self:GetQueueSlotBackgroundColor(queueIndex)
+					or self:GetQueueEmptySlotBackgroundColor()
 			end
 		end
 		self:ResetQueueItemDragState()
@@ -726,21 +1010,22 @@ script PlayerOverheadQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method void UpdateQueueLayout(integer queueCapacity)
-		local capacity = math.max(1, math.min(self.QueueMaxSlots, queueCapacity))
-		local stackHeight = self.QueueSlotSize + math.max(0, capacity - 1) * self.QueueSlotSpacing
+	method void UpdateQueueLayout(integer visibleSlotCount)
+		local count = math.max(1, math.min(self.QueueMaxSlots, visibleSlotCount))
+		local stackHeight = self.QueueSlotSize + math.max(0, count - 1) * self.QueueSlotSpacing
 		if self.ReservationQueueTransform ~= nil then
 			self.ReservationQueueTransform.RectSize = Vector2(84, stackHeight)
 		end
 		if self.QueueDropRegionTransform ~= nil then
 			self.QueueDropRegionTransform.anchoredPosition = Vector2(0, 0)
-			self.QueueDropRegionTransform.RectSize = Vector2(84, stackHeight)
+			self.QueueDropRegionTransform.RectSize = Vector2(
+				84 + self.QueueDropMarginX * 2,
+				stackHeight + self.QueueDropMarginY * 2)
 		end
-		local firstLocalY = -math.max(0, capacity - 1) * self.QueueSlotSpacing * 0.5
 		for slotIndex = 1, self.QueueMaxSlots do
 			local slot = self:GetSlotEntity(slotIndex)
 			if isvalid(slot) and slot.UITransformComponent ~= nil then
-				slot.UITransformComponent.anchoredPosition = Vector2(0, firstLocalY + (slotIndex - 1) * self.QueueSlotSpacing)
+				slot.UITransformComponent.anchoredPosition = Vector2(0, self:GetQueueSlotBaseY(slotIndex, count))
 				slot.UITransformComponent.RectSize = Vector2(self.QueueSlotSize, self.QueueSlotSize)
 			end
 		end
@@ -749,7 +1034,7 @@ script PlayerOverheadQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method boolean IsPointInsideQueueDropRegion(Vector2 touchPoint)
 		-- Passive coordinate test only. QueueDropRegion intentionally owns no input component.
-		if self.CurrentQueueCapacity <= 0
+		if self.CurrentVisibleSlotCount <= 0
 			or self.ReservationQueueTransform == nil
 			or self.QueueDropRegionTransform == nil then
 			return false
@@ -805,11 +1090,11 @@ script PlayerOverheadQueueHudComponent extends Component
 		if self.BottomSkillDragTargetActive ~= true then
 			return
 		end
-		local capacity = math.max(1, math.min(self.QueueMaxSlots, self.CurrentQueueCapacity))
+		local visibleSlotCount = math.max(1, math.min(self.QueueMaxSlots, self.CurrentVisibleSlotCount))
 		local highlightColor = self.BottomSkillDragTargetValid
 			and Color(0.34, 0.74, 1.00, 0.78)
 			or Color(0.50, 0.54, 0.60, 0.46)
-		for slotIndex = 1, capacity do
+		for slotIndex = 1, visibleSlotCount do
 			local slot = self:GetSlotEntity(slotIndex)
 			local background = isvalid(slot) and slot:GetChildByName("Background", false) or nil
 			if isvalid(slot) then
@@ -834,6 +1119,11 @@ script PlayerOverheadQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method Color GetQueueEmptySlotBackgroundColor()
+		return Color(0.38, 0.34, 0.30, 0.48)
+	end
+
+	@ExecSpace("ClientOnly")
 	method void SetSlot(integer slotIndex, string skillId, boolean capacityActive)
 		local slot = self:GetSlotEntity(slotIndex)
 		local icon = self:GetSlotIcon(slotIndex)
@@ -847,9 +1137,11 @@ script PlayerOverheadQueueHudComponent extends Component
 		slot.Enable = capacityActive
 		local background = slot:GetChildByName("Background", false)
 		if isvalid(background) then
-			background.Enable = visible
+			background.Enable = capacityActive
 			if background.SpriteGUIRendererComponent ~= nil then
-				background.SpriteGUIRendererComponent.Color = self:GetQueueSlotBackgroundColor(slotIndex)
+				background.SpriteGUIRendererComponent.Color = visible
+					and self:GetQueueSlotBackgroundColor(slotIndex)
+					or self:GetQueueEmptySlotBackgroundColor()
 			end
 		end
 		if icon.Entity ~= nil then
@@ -976,12 +1268,14 @@ script PlayerOverheadQueueHudComponent extends Component
 		self.RefreshElapsed = 0
 		self.CurrentQueueCapacity = 0
 		self.CurrentQueueCount = 0
+		self.CurrentVisibleSlotCount = 0
 		self.CurrentQueueOrderRevision = 0
 		self.QueueInteractionAvailable = false
 		self.QueueReorderAvailable = false
 		self.CurrentQueuedTileIds = ""
 		self.BottomSkillDragTargetActive = false
 		self.BottomSkillDragTargetValid = false
+		self:ResetQueuePreviewState()
 		if self.ReservationQueue ~= nil then
 			self.ReservationQueue.Enable = false
 		end
