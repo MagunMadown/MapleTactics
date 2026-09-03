@@ -1468,3 +1468,13 @@ The queue component has one `RequestMoveQueuedTile` call and zero `RequestSlotSk
 - Fresh bootstrap at `2026-09-03 12:01:21`: `handlers bound count=6`, `ready maxSlots=6`, and zero fresh runtime errors.
 - Temporary diagnostics: **none added**; the existing bounded queue-drag logs are sufficient for the next mouse verification.
 - Actual post-fix 2-item/3-item mouse reorder and zero-turn/outside-drop matrix: **pending user Play; runtime pass is not claimed yet**.
+
+#### Parent CanvasGroup input blocker
+
+- A post-input-surface user Play at `2026-09-03 12:04:43` again reached an editable two-item overhead Queue (`brandish|divine_swing`, `count=2`, `queueRevision=2`) without any queue `begin candidate` log.
+- The remaining parent gate was then confirmed: `/ui/TacticsPlayerOverheadHUD` authored `CanvasGroupComponent.BlocksRaycasts=false` and `Interactable=false`, while the verified working `/ui/BattleQueueHUD` authors both properties as `true`.
+- Root cause refinement: the six child input surfaces were valid after the first fix, but the overhead HUD's root CanvasGroup still blocked their complete pointer/event path. This affects the shared overhead Queue UI, not one player account.
+- Minimum follow-up fix: set only the existing overhead root CanvasGroup `BlocksRaycasts=true` and `Interactable=true`. The full-screen root has no raycast-renderer surface; only explicitly raycast-enabled children receive input, so `QueueDropRegion` remains passive and world-input interception is not broadened to empty space.
+- UIBuilder rewrite/validation: **PASS** with the same 43 entities and expected six 68x68 lint warnings; no hierarchy or layout change.
+- Maker refresh/build: **PASS**, zero build errors. Fresh bootstrap at `2026-09-03 12:06:50` again reports `handlers bound count=6` and `ready maxSlots=6`.
+- Actual post-parent-fix Queue reorder remains pending mouse verification and is not yet marked runtime-passed.
