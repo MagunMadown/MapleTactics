@@ -1207,3 +1207,116 @@ Maker Play verification is **not claimed** in this checkout. The connected Maker
 - UI asset authoring: **UIBuilder only**
 - Push/merge performed: **NO**
 - STEP 8 stop condition: **implementation complete; branch-local Maker Play pending**
+
+### STEP 9 Bottom Skill → Queue Drag Reservation
+
+#### Implementation boundary
+
+STEP 9 extends only the existing bottom Battle Skill slot drag gesture. It does not add a second drag system, queue-item drag, queue insertion, queue removal, a reservation RPC, optimistic queue content, keyboard input, or DataStorage changes. The source Skill remains in its bottom slot after reservation.
+
+Maker still points at the dirty primary checkout, so this implementation is intentionally marked **MAKER PLAY UNVERIFIED**. No production file was copied into that checkout.
+
+#### Final drag state and destination classification
+
+The existing state remains:
+
+```text
+IDLE
+  -> DRAG_CANDIDATE
+  -> threshold >= 10 px
+  -> DRAGGING_BOTTOM_SKILL
+  -> resolve final TouchPoint once
+       QUEUE     -> existing slot reservation
+       BAR_SLOT  -> existing authoritative bar reorder
+       INVALID   -> existing cancel feedback
+  -> CLEANUP
+```
+
+`ResolveSkillSlotDragDestination` evaluates the actual drag-end `TouchPoint` and returns exactly one typed result. Queue geometry has deterministic precedence, then a different bottom slot, then invalid. It does not depend on the last enter/exit hover event.
+
+Continuous drag updates use the same classifier, so queue target feedback turns on when entering the queue bounds and is restored immediately when leaving. HUD refreshes during a gesture re-evaluate the cached latest pointer position instead of replacing queue feedback with a stale bar hover.
+
+#### Passive QueueDropRegion hit test
+
+`PlayerOverheadQueueHudComponent:IsPointInsideQueueDropRegion` converts the pointer with `_UILogic:ScreenToUIPosition` and compares it against the runtime `ReservationQueueTransform` position plus the current `QueueDropRegionTransform` size/pivot. The region height therefore follows synchronized effective capacity 1-6, including current capacity 3, Thief capacity 4, and the supported synthetic maximum 6.
+
+`QueueDropRegion` remains UITransform-only. No Button, touch receiver, raycast component, `ConnectEvent`, or queue-slot input handler was added. The bottom drag owner performs the coordinate comparison, including when the queue contains zero items.
+
+#### Queue target feedback
+
+While the pointer is inside the queue region, active-capacity slot backgrounds provide a restrained temporary marker:
+
+- valid synchronized queue state: subtle blue target tint;
+- locally known full/locked state: muted invalid tint;
+- empty queue: the same capacity markers appear only during the active drag;
+- pointer leave, cancel, submit, map/UI cleanup: authoritative queue presentation is restored immediately.
+
+The client validity check uses only synchronized `CanQueue`, count, and capacity for responsive feedback. It does not reproduce skill ownership, cooldown, duplicate, phase, execution, or server business rules.
+
+#### Existing reservation path reused exactly once
+
+Both click and queue drag still converge on one slot-based method:
+
+```text
+BattleQueueHudComponent:RequestSlotSkill(slotIndex, inputSource)
+  -> resolve the SkillId currently displayed in that slot
+  -> BattleHudPresenterLogic:RequestQueueTile(skillId)
+  -> BattleSessionComponent:RequestQueueTile(skillId)
+  -> TryQueueTile
+  -> BattleTurnComponent:TryAppendSkill
+```
+
+No new reservation method/RPC was introduced. `BattleQueueHudComponent` contains one production call to `BattleHudPresenterLogic:RequestQueueTile`.
+
+The six button callbacks pass `fromQueueDrag=false`. The queue destination passes `fromQueueDrag=true` once after drag cleanup. This flag bypasses only the normal click-suppression guard for the intentional drag-end submission; it does not bypass Presenter/server validation.
+
+#### Click event ordering and duplicate protection
+
+When the 10 px threshold is crossed, the existing active-drag flag and `SuppressSkillClickUntil` are set before drag end. Therefore a Maker `ButtonClickEvent` delivered before `UITouchEndDragEvent` is suppressed by the ordinary button path. Drag end then performs the one explicit queue reservation call. A click delivered after drag end is still covered by the suppression window.
+
+A movement below threshold never activates the drag, creates no ghost/queue feedback, and the ordinary ButtonClick callback submits one reservation as before.
+
+#### Mutual exclusion and semantics
+
+| Gesture | Final request | Queue mutation | Bar mutation | Turn behavior |
+|---|---|---|---|---|
+| short bottom-slot click | existing reservation | server append on success | none | existing reservation cost |
+| bottom Skill -> Queue | existing reservation exactly once | server append on success | none | existing reservation cost |
+| bottom Skill -> other bottom slot | existing Step 1-6 reorder | none | SWAP/MOVE | none |
+| bottom Skill -> full/locked Queue | none client-side; server remains final authority for submitted races | none | none | none |
+| bottom Skill -> outside | none | none | none | none |
+
+Queue drops always append through `TryAppendSkill`; vertical drop position is ignored. Queue internal INSERT/reorder and queue removal remain unimplemented for UI.
+
+Because a successful drag uses the same append path, `QueueOrderRevision` advances naturally through STEP 8's `TryAppendSkill` mutation. Rejected/cancelled drops do not directly touch the revision. `ExecutingTileIds`, `ExecutingTileIndex`, `RunSkillBarSlotIds`, `RunSkillBarRevision`, and DataStorage are untouched.
+
+#### Static verification
+
+- `git diff --check`: **PASS**;
+- UIBuilder validation of `TacticsPlayerOverheadHUD.ui`: **PASS**;
+- UI asset changes in STEP 9: **NONE**;
+- `QueueDropRegion`/queue-slot input handlers added: **NONE**;
+- new reservation RPC/server mutation: **NONE**;
+- Presenter `RequestQueueTile` production call sites in the bottom HUD: **1**;
+- queue-drag reservation call sites: **1**;
+- normal-click call sites: **6**;
+- final coordinate classifier: **QUEUE -> BAR_SLOT -> INVALID**;
+- bar target and queue target requests in one branch: **mutually exclusive**;
+- source Skill removal or bar persistence mutation: **NONE**;
+- capacity dependency: runtime synchronized geometry, **1-6; no hardcoded 3**;
+- queue append/revision path: existing `TryAppendSkill`/`IncrementQueueOrderRevision`;
+- Maker Play: **BLOCKED BY MAKER SOURCE ROOT; PASS NOT CLAIMED**.
+
+#### STEP 9 final state
+
+- Bottom Skill -> Bottom Slot: **EXISTING REORDER**
+- Bottom Skill -> Queue: **RESERVE VIA EXISTING PATH**
+- Successful queue reserve: **NORMAL EXISTING TURN COST**
+- Queue internal drag reorder: **NOT IMPLEMENTED**
+- Queue removal drag: **NOT IMPLEMENTED**
+- Bottom Skill removed from bar: **NO**
+- Run skill-bar order changed by reservation: **NO**
+- DataStorage: **UNCHANGED**
+- STEP 9 implementation: **COMPLETE STATICALLY**
+- Maker Play: **UNVERIFIED — WRONG PROJECT ROOT**
+- Push/merge: **NO**
