@@ -1320,3 +1320,97 @@ Because a successful drag uses the same append path, `QueueOrderRevision` advanc
 - STEP 9 implementation: **COMPLETE STATICALLY**
 - Maker Play: **UNVERIFIED — WRONG PROJECT ROOT**
 - Push/merge: **NO**
+
+### STEP 10 Queue Internal Drag Reorder
+
+#### Scope and interaction architecture
+
+STEP 10 adds only queued Skill -> occupied queue position drag reorder. The queue's six existing visible `InnerBackground` icon surfaces now own a `ButtonComponent` with no visual transition and the established `UITouchBeginDragEvent` -> `UITouchDragEvent` -> `UITouchEndDragEvent` sequence. Runtime enables those buttons only for occupied, editable queued items. Empty capacity slots, executing items, the legacy covered icon entities, and `QueueDropRegion` remain non-sources. `QueueDropRegion` is still UITransform-only and performs no input interception.
+
+Queue drag state is independent from the bottom bar's state and records the explicit source type `QUEUED_SKILL` once at begin. It never changes source type during a gesture. The queue uses the same 10 px activation threshold as the bottom bar, so press/release and small jitter do not submit a reorder.
+
+#### QueueIndex mapping and final hit test
+
+The authoritative compact list remains 1-based. `QueuedTileIds = A|B|C` means execution order 1=A, 2=B, 3=C. The overhead mapping is explicit: QueueIndex 1 is the bottom slot and indices increase upward. `ResolveQueueItemDropIndex` converts the final `TouchPoint` with `_UILogic:ScreenToUIPosition`, then tests only slot bounds for indices `1..CurrentQueueCount`. Empty capacity positions are excluded even when effective capacity is larger than count. No top/bottom inference or last-hover dependency is used.
+
+#### Visual feedback and cleanup
+
+After the 10 px threshold, a root-level, non-raycast `QueueDragGhost` reuses the queued Skill's current icon RUID at 86% alpha and follows the pointer. The source icon remains in its authoritative slot and is dimmed to 42%. A valid different target receives a restrained blue border/background emphasis; same-slot and invalid destinations mute the ghost and show no insertion target. No sliding animation or audio was added.
+
+Every end, cancel, state invalidation, receipt, map loss, and component shutdown path hides the ghost, restores source/target colors, and clears logical drag state. A queue refresh invalidates an active gesture if its captured Skill/index or `QueueOrderRevision` no longer matches. Source entities are therefore never trusted as authority after a dynamic rebuild.
+
+#### Authoritative INSERT request and safety
+
+A valid different-slot drop sends exactly one proposal:
+
+```text
+PlayerOverheadQueueHudComponent
+  -> BattleSessionComponent:RequestMoveQueuedTile(
+       sourceQueueIndex,
+       targetQueueIndex,
+       requestId,
+       expectedQueueOrderRevision)
+  -> TryReorderQueuedTile
+  -> BattleTurnComponent:TryMoveQueuedSkill
+```
+
+No Skill identity is sent. The server resolves current queue content and preserves the existing remove-then-insert behavior. Examples: `A|B|C`, 3->1 becomes `C|A|B`; `A|B|C|D`, 2->4 becomes `A|C|D|B`. It is not SWAP.
+
+The client advances a monotonic request id from the latest synchronized receipt/request value and allows one pending request. A duplicate end event sees cleared gesture state and cannot submit again. Server replay protection rejects any request id less than or equal to the last processed id. The drag captures `QueueOrderRevision`; the server rejects a mismatched revision with `STALE_QUEUE_REVISION`.
+
+The existing server decision gate remains authoritative: valid sender/session, valid integer indices/revision, valid content, no battle result, `PlayerTurn`, `IsActionProcessing == false`, no active `ExecutingTileIds`, matching revision, and at least two queued items. If execution begins during a drag before the client observes the change, the server rejects the request; if the synchronized change arrives first, the client cancels locally. `ExecutingTileIds` is never mutated by queue reorder.
+
+#### Gameplay invariants
+
+- successful queue reorder changes order only and increments `QueueOrderRevision` once;
+- `QueuedCount` and the queued SkillId multiset remain unchanged;
+- turn/action counters remain unchanged because only the reorder path is called;
+- cooldown state is neither validated as a new reservation nor changed;
+- `FreePlay` does not affect reorder cost;
+- `RunSkillBarSlotIds`, `RunSkillBarRevision`, and DataStorage are untouched;
+- same-slot drop is a client no-op with no request/revision change;
+- outside Queue and Queue -> bottom bar both cancel with no remove, reserve, bar mutation, or execute request;
+- queue removal remains unconnected.
+
+#### Source / destination matrix
+
+| Source | Target | Result | Turn |
+|---|---|---|---|
+| Bottom Skill | Bottom Skill | existing bar reorder | 0 |
+| Bottom Skill | Queue region | existing reservation/append | existing normal cost |
+| Queued Skill | occupied QueueIndex | INSERT reorder | 0 |
+| Queued Skill | outside Queue | cancel | 0 |
+| Queued Skill | bottom Skill bar | cancel | 0 |
+
+The queue component has one `RequestMoveQueuedTile` call and zero `RequestSlotSkill`, `RequestQueueTile`, and `RequestRemoveQueuedTile` calls. The STEP 9 bottom component retains one queue-drag `RequestSlotSkill(sourceIndex, true)` call, one Presenter `RequestQueueTile` production call, and its existing bottom-slot reorder request. This keeps the two source types mutually exclusive.
+
+#### Static verification
+
+- UIBuilder validation: **PASS**, 43 entities and zero validation errors;
+- UI lint: **0 errors**, with six expected L007 warnings because the intentionally minimal existing icon hit surfaces are 68x68 inside locked 76x76 queue slots (expanding them to 88x88 would overlap adjacent slots and broaden world-input interception);
+- queue input structure: **PASS**, six visible `InnerBackground` icon buttons only;
+- `QueueDropRegion` input components: **0**;
+- drag ghost input components: **0**, `RaycastTarget=false`;
+- INSERT cases: **PASS** for 3, 4, and 6 queued items;
+- count and SkillId multiset preservation: **PASS** in controlled synthetic cases;
+- same-slot: **PASS**, no-op and revision delta 0;
+- success revision: **PASS**, delta +1;
+- replay: **PASS**, the same request id applies once;
+- stale revision: **PASS**, no mutation;
+- request call-count/source isolation inspection: **PASS**;
+- `git diff --check`: **PASS**;
+- vendored mLua diagnose process: **completed with status 0 and no parse/syntax diagnostic**; semantic output is not a clean build result because this isolated workspace reports unavailable native UI/event types and the pre-existing stale `.codeblock` `SetSlot` arity until Maker imports the branch;
+- production build/Maker Play: **BLOCKED / UNVERIFIED** because Maker still opens the dirty primary workspace instead of this branch worktree.
+
+#### STEP 10 final state
+
+- Bottom Skill -> Bottom: **REORDER / TURN 0**
+- Bottom Skill -> Queue: **RESERVE / NORMAL TURN COST**
+- Queue Skill -> Queue: **INSERT REORDER / TURN 0**
+- Queue Skill -> Outside: **CANCEL / TURN 0**
+- Queue Skill -> Bottom: **CANCEL / TURN 0**
+- Queue removal: **NOT IMPLEMENTED**
+- executing queue reorder: **FORBIDDEN**
+- DataStorage: **UNCHANGED**
+- Maker Play: **UNVERIFIED UNTIL THE EXACT BRANCH SOURCE ROOT IS OPEN**
+- Push/merge: **NO**
