@@ -1484,12 +1484,12 @@ The queue component has one `RequestMoveQueuedTile` call and zero `RequestSlotSk
 #### Production scope
 
 - STEP 11 changes only `PlayerOverheadQueueHudComponent` client presentation and hit testing. Reservation, reorder, turn, cooldown, execution, queue capacity, ownership, and server validation paths are unchanged.
-- Visible reservation cells now follow `min(QueuedCount + 1, QueueCapacity)`, with one empty cell at count zero and no extra empty cell when the queue is full. QueueIndex 1 remains the bottom execution position.
+- While idle, visible reservation cells match only `QueuedCount`; an empty queue therefore shows no overhead frame. During an active bottom-skill drag, the view temporarily follows `min(QueuedCount + 1, QueueCapacity)` so exactly one valid empty drop cell appears. QueueIndex 1 remains the bottom execution position.
 - The passive `QueueDropRegion` follows the currently visible compact stack instead of the six-slot pool. Its manual bounds add 22 UI units on each horizontal side and 20 UI units on each vertical side; it still owns no input component.
 - Queued-item target resolution uses the stable authoritative slot guide while the visual entities animate, preventing insertion-target oscillation.
 - A queued-item drag previews INSERT ordering locally by shifting the source and intervening occupied items for 0.10 seconds. The next empty reservation cell is never a reorder target.
 - The preview holds while the single existing reorder proposal is pending. Authoritative success uses a 0.14-second settle tint; rejection, timeout, same-slot, stale, and outside drops return to authoritative positions over 0.12 seconds.
-- Successful reservation reveals only the newly available next empty cell with a 0.11-second short vertical/fade entrance. A full queue does not create another cell.
+- Beginning a bottom-skill drag reveals the one available empty drop cell. Ending the drag removes that empty cell; a successful reservation leaves only the newly occupied skill visible, and a full queue never creates another cell.
 
 #### Maker verification — 2026-09-03
 
@@ -1513,3 +1513,8 @@ The queue component has one `RequestMoveQueuedTile` call and zero `RequestSlotSk
 - Result: **PASS** for dynamic compact visibility, forgiving bottom-to-queue drop bounds, live INSERT preview, both reorder directions, cancel restore, full-state suppression, normal reservation cost, and zero-turn reorder.
 - Production files changed by STEP 11: `RootDesk/MyDesk/02_UI/PlayerOverheadQueueHudComponent.mlua` and this audit section only.
 - Push/merge: **NO**. STEP 11 stops after the verified local commit.
+
+#### Post-STEP 11 visibility follow-up — 2026-09-03
+
+- User-directed adjustment: the empty reservation frame is hidden during ordinary play and appears only after a bottom skill crosses the drag threshold.
+- Maker mouse verification passed for idle-hidden, drag-visible, outside-drop-hidden, and successful-reservation occupied-only states. Existing occupied queued skills remain visible so queue reorder is still available.
