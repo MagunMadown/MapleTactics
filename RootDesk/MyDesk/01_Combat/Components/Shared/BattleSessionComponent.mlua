@@ -11,7 +11,23 @@ script BattleSessionComponent extends Component
 	@Sync property string ExecutingTileIds = ""
 	@Sync property integer ExecutingTileIndex = 0
 	@Sync property integer TileQueueCapacity = 3
+	@Sync property integer QueueReorderReceiptRevision = 0
+	@Sync property integer QueueLastRequestId = 0
+	@Sync property boolean QueueLastRequestSuccess = false
+	@Sync property string QueueLastRequestReason = ""
+	@Sync property integer QueueLastSourceIndex = 0
+	@Sync property integer QueueLastTargetIndex = 0
+	@Sync property integer QueueLastOrderRevision = 0
 	@Sync property string BattleResult = ""
+	@Sync property integer UnionRewardRunId = 0
+	@Sync property integer UnionRewardBasePoints = 0
+	@Sync property integer UnionRewardBonusPoints = 0
+	@Sync property integer UnionRewardFinalPoints = 0
+	@Sync property boolean UnionRewardWasCommitted = false
+	@Sync property boolean UnionRewardWasDuplicate = false
+	@Sync property boolean UnionRewardRunEnded = false
+	@Sync property string UnionRewardRunEndReason = ""
+	@Sync property integer UnionRewardRevision = 0
 	-- Stable map-owned HP snapshot for client HUDs. Player battle components are attached at runtime.
 	@Sync property number PlayerCurrentHp = 0
 	@Sync property number PlayerMaxHp = 0
@@ -61,17 +77,28 @@ script BattleSessionComponent extends Component
 	@Sync property string SkillSlotNames = ""
 	-- Pipe-aligned authored CooldownTurns for the six HUD slots. Runtime remaining turns stay owned by SkillRuntimeStateComponent.
 	@Sync property string SkillSlotCooldownTurns = ""
+	@Sync property integer SkillSlotRevision = 0
+	@Sync property integer SkillSlotReorderReceiptRevision = 0
+	@Sync property integer SkillSlotLastRequestId = 0
+	@Sync property boolean SkillSlotLastRequestSuccess = false
+	@Sync property string SkillSlotLastRequestReason = ""
+	@Sync property integer SkillSlotLastSourceIndex = 0
+	@Sync property integer SkillSlotLastTargetIndex = 0
 	-- "skillId~iconRuid|..." for every skill the player owns, not just the drawn slots: the queue accepts
 	-- any owned skill, and the skill DataSets are server-only so the HUD has no other way to read icons.
 	@Sync property string SkillIconSnapshot = ""
 	property string SkillSlotSourceSnapshot = ""
+	property integer SkillSlotSourceRunOrderRevision = 0
 	property integer SkillSlotCount = 6
+	property integer LastProcessedSkillSlotReorderRequestId = 0
+	property integer LastProcessedQueueReorderRequestId = 0
 	-- One knob for how fast every skill plays. Above 1 speeds the swing, the effects, the impact frame,
 	-- and the queue slot together, so presentation and pacing never drift apart.
 	@Sync property number SkillSpeedMultiplier = 1.25
 	@Sync property integer SelectedJobBaseMaxHp = 0
 	@Sync property integer SelectedJobBaseQueueCapacity = 0
 	@Sync property integer SelectedJobRevision = 0
+	property number UnionItemDropRate = 0
 	@Sync property string LastJobMechanicId = ""
 	@Sync property boolean LastJobMechanicSuccess = false
 	@Sync property string LastJobMechanicReason = ""
@@ -500,6 +527,7 @@ script BattleSessionComponent extends Component
 		log("[BattleSession] stage definition loaded stageId=" .. self.StageId)
 		self.StageTurnNumber = 0
 		self.BattleResult = ""
+		self:ResetUnionRewardPresentation("STAGE_START")
 		self.DropRuntime:ResetDropState("STAGE_START")
 		self.WaveRuntime:ResetWaveState(self.TotalWaves, "STAGE_START")
 		self:PublishWaveStateSnapshot("STAGE_START")
@@ -838,7 +866,7 @@ script BattleSessionComponent extends Component
 			if runState.SelectedJobId == "" then
 				_RunManagerLogic:ApplyJobSelection(player, "")
 			end
-			self:ApplyRunJobConfiguration(runState)
+			self:ApplyRunJobConfiguration(runState, player)
 			if self.TurnState ~= nil and self.SelectedJobBaseQueueCapacity > 0 then
 				self.TurnState:ConfigureQueueCapacity(self.SelectedJobBaseQueueCapacity, self.MinQueueCapacity, self.MaxQueueCapacity, "JOB_REGISTERED")
 				self:PublishTurnStateSnapshot("JOB_REGISTERED")
@@ -854,6 +882,9 @@ script BattleSessionComponent extends Component
 		end
 
 		local playerMaxHp = self.SelectedJobBaseMaxHp
+		if runState ~= nil and runState.RunHpInitialized == true then
+			playerMaxHp = runState.RunMaxHp
+		end
 		if playerMaxHp <= 0 then
 			playerMaxHp = 100
 		end
@@ -1004,6 +1035,64 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table BuildChargeTelegraph(any unit, integer direction, string skillId)
+		-- Reuses the shared target-cell snapshot; the client only renders this server-owned line.
+		local result = { Success = false, TelegraphKind = "", LandingCell = -1, TargetCells = "" }
+		if unit == nil or unit.IsDead == true or self.BoardState == nil or self.CellCount <= 0 then
+			return result
+		end
+		if direction ~= -1 and direction ~= 1 then
+			direction = unit.Facing == "Right" and 1 or -1
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			return result
+		end
+		local cells = {}
+		local maxDistance = math.max(1, math.min(self.CellCount, math.floor(tonumber(definition.Range) or 1)))
+		for offset = 1, maxDistance do
+			local cellIndex = unit.CellIndex + direction * offset
+			if self:IsValidCell(cellIndex) == false then
+				break
+			end
+			local occupantEntity = self.BoardState:FindAtCell(cellIndex, unit.UnitId)
+			if isvalid(occupantEntity) then
+				local occupantUnit = occupantEntity:GetComponent("script.BattleUnitComponent")
+				if occupantUnit ~= nil and occupantUnit.IsDead == false and occupantUnit.Team ~= unit.Team then
+					table.insert(cells, tostring(cellIndex))
+				end
+				break
+			end
+			table.insert(cells, tostring(cellIndex))
+		end
+		result.Success = true
+		result.TelegraphKind = "CHARGE_LINE"
+		result.TargetCells = table.concat(cells, "|")
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildSkillAreaTelegraph(any unit, string skillId)
+		-- Uses the same target resolver as impact execution so the warning cells cannot drift from damage.
+		local result = { Success = false, TelegraphKind = "", LandingCell = -1, TargetCells = "" }
+		if unit == nil or unit.IsDead == true or self.BoardState == nil or skillId == "" then
+			return result
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			return result
+		end
+		local targetResult = _SkillTargetResolverLogic:Resolve(self, unit.UnitId, definition)
+		if targetResult.Success == false then
+			return result
+		end
+		result.Success = true
+		result.TelegraphKind = "SKILL_AREA"
+		result.TargetCells = _SkillTargetResolverLogic:SerializeIntegers(targetResult.TargetCellIndices)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method void PublishEnemyPlanSnapshot(string reason)
 		-- Synchronizes a compact read-only list so UI can render every enemy without running AI rules.
 		local entries = {}
@@ -1048,6 +1137,18 @@ script BattleSessionComponent extends Component
 							targetCellSnapshot = telegraph.TargetCells
 							telegraphKind = telegraph.TelegraphKind
 							landingCell = telegraph.LandingCell
+						end
+					elseif actionType == "CHARGE_FORWARD" then
+						local telegraph = self:BuildChargeTelegraph(unit, direction, tileId)
+						if telegraph.Success == true then
+							targetCellSnapshot = telegraph.TargetCells
+							telegraphKind = telegraph.TelegraphKind
+						end
+					elseif actionType == "TELEGRAPH_TILE" then
+						local telegraph = self:BuildSkillAreaTelegraph(unit, tileId)
+						if telegraph.Success == true then
+							targetCellSnapshot = telegraph.TargetCells
+							telegraphKind = telegraph.TelegraphKind
 						end
 					end
 					table.insert(entries, table.concat({
@@ -1799,6 +1900,15 @@ script BattleSessionComponent extends Component
 				patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, result.Reason)
 				return result
 			end
+			local preparedAction = actionPlan:GetCurrentAction()
+			if preparedAction.Success == true and preparedAction.ActionType == "CHARGE_FORWARD" then
+				-- Freeze the warned cells with the round plan. Charge execution must not reacquire a player
+				-- who moved beyond the line that was visible during the preceding PlayerTurn.
+				local telegraph = self:BuildChargeTelegraph(preparedEnemyUnit, preparedAction.Direction, preparedAction.TileId)
+				if telegraph.Success == true then
+					actionPlan.TargetCellSnapshot = telegraph.TargetCells
+				end
+			end
 			if actionPlan.PlanState == "TRACKING" then
 				local readiness = self:RefreshQueuedAttackReadiness(enemyUnitId)
 				if readiness.Success == false then
@@ -2011,6 +2121,8 @@ script BattleSessionComponent extends Component
 			actionResult = self:TryFaceDirection(intent.EnemyId, intent.Direction)
 		elseif intent.ActionType == "TELEGRAPH_TILE" then
 			actionResult = { Success = true, Reason = "TELEGRAPH_COMPLETED" }
+		elseif intent.ActionType == "CHARGE_FORWARD" then
+			actionResult = self:TryChargeForward(intent.EnemyId, intent.Direction, intent.TileId, executingPlan.TargetCellSnapshot)
 		elseif intent.ActionType == "BOSS_JUMP_TELEGRAPH" then
 			actionResult = self:BeginBossOppositeJump(intent.EnemyId)
 		elseif intent.ActionType == "BOSS_LAND_OPPOSITE" then
@@ -2100,7 +2212,7 @@ script BattleSessionComponent extends Component
 			return math.max(0.05, self.EnemyMoveActionDuration)
 		elseif actionType == "TURN_TO_PLAYER" then
 			return math.max(0.05, self.TurnActionDuration)
-		elseif actionType == "EXECUTE_TILE" then
+		elseif actionType == "EXECUTE_TILE" or actionType == "CHARGE_FORWARD" then
 			-- Keep the enemy turn open through the Skill's configured impact/presentation window.
 			return math.max(0.1, self:GetSkillActionDuration(tileId))
 		elseif actionType == "BOSS_LAND_OPPOSITE" then
@@ -2586,6 +2698,207 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
+	method void RequestReorderBattleSkillSlot(integer sourceIndex, integer targetIndex, integer requestId, integer expectedRevision)
+		-- The client proposes indices only. Skill identities always come from this authoritative session.
+		if self:IsValidPlayerRequest(senderUserId) == false then
+			log_warning("[BattleSkillSlotReorder] rejected request=" .. tostring(requestId) .. " reason=INVALID_SENDER")
+			return
+		end
+		if requestId <= 0 then
+			log_warning("[BattleSkillSlotReorder] rejected request=" .. tostring(requestId) .. " reason=INVALID_REQUEST_ID")
+			return
+		end
+		if requestId <= self.LastProcessedSkillSlotReorderRequestId then
+			local replayReason = requestId == self.LastProcessedSkillSlotReorderRequestId and "DUPLICATE_REQUEST" or "STALE_REQUEST"
+			log_warning("[BattleSkillSlotReorder] rejected request=" .. tostring(requestId) .. " last=" .. tostring(self.LastProcessedSkillSlotReorderRequestId) .. " reason=" .. replayReason)
+			return
+		end
+
+		self.LastProcessedSkillSlotReorderRequestId = requestId
+		local result = self:TryReorderBattleSkillSlot(sourceIndex, targetIndex, expectedRevision)
+		self:PublishSkillSlotReorderReceipt(sourceIndex, targetIndex, result)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryReorderBattleSkillSlot(integer sourceIndex, integer targetIndex, integer expectedRevision)
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			SourceIndex = sourceIndex,
+			TargetIndex = targetIndex,
+			SlotIds = self.SkillSlotIds,
+			PreviousSlotIds = self.SkillSlotIds,
+			Revision = self.SkillSlotRevision
+		}
+
+		if sourceIndex ~= math.floor(sourceIndex) or targetIndex ~= math.floor(targetIndex) then
+			result.Reason = "INVALID_SLOT_INDEX_TYPE"
+			return result
+		end
+		if sourceIndex < 1 or sourceIndex > self.SkillSlotCount or targetIndex < 1 or targetIndex > self.SkillSlotCount then
+			result.Reason = "SLOT_INDEX_OUT_OF_RANGE"
+			return result
+		end
+		if sourceIndex == targetIndex then
+			result.Reason = "SAME_SLOT"
+			return result
+		end
+		if expectedRevision ~= self.SkillSlotRevision then
+			result.Reason = "STALE_SLOT_REVISION"
+			return result
+		end
+		if self.ContentValidationState ~= "VALID" then
+			result.Reason = "CONTENT_NOT_READY"
+			return result
+		end
+		if self.BattleResult ~= "" then
+			result.Reason = "BATTLE_ALREADY_ENDED"
+			return result
+		end
+		if self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "NOT_PLAYER_DECISION_STATE"
+			return result
+		end
+		if self.TurnState.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+
+		local slotIds = self:ParseSkillSlotPipe(self.SkillSlotIds)
+		local sourceSkillId = slotIds[sourceIndex] or ""
+		local targetSkillId = slotIds[targetIndex] or ""
+		if sourceSkillId == "" then
+			result.Reason = "SOURCE_SLOT_EMPTY"
+			return result
+		end
+		local sourceValidation = _ContentValidatorLogic:ValidateSkillById(sourceSkillId)
+		if sourceValidation.Success == false then
+			result.Reason = "SOURCE_SKILL_INVALID"
+			result.DetailReason = sourceValidation.Reason
+			return result
+		end
+		local sourceOwnership = _RunManagerLogic:CanUseRunSkill(self.PlayerEntity, sourceSkillId)
+		if sourceOwnership.Success == false then
+			result.Reason = "SOURCE_SKILL_NOT_OWNED"
+			return result
+		end
+		if targetSkillId ~= "" then
+			local targetValidation = _ContentValidatorLogic:ValidateSkillById(targetSkillId)
+			if targetValidation.Success == false then
+				result.Reason = "TARGET_SKILL_INVALID"
+				result.DetailReason = targetValidation.Reason
+				return result
+			end
+			local targetOwnership = _RunManagerLogic:CanUseRunSkill(self.PlayerEntity, targetSkillId)
+			if targetOwnership.Success == false then
+				result.Reason = "TARGET_SKILL_NOT_OWNED"
+				return result
+			end
+		end
+
+		local seenSkillIds = {}
+		for slotIndex = 1, self.SkillSlotCount do
+			local skillId = slotIds[slotIndex] or ""
+			if skillId ~= "" then
+				if seenSkillIds[skillId] == true then
+					result.Reason = "DUPLICATE_SKILL_SLOT"
+					return result
+				end
+				seenSkillIds[skillId] = true
+			end
+		end
+
+		-- Names and authored cooldowns are parallel presentation data for the same fixed six positions.
+		-- QueuedTileIds and ExecutingTileIds deliberately remain untouched because they already store SkillIds.
+		local slotNames = self:ParseSkillSlotPipe(self.SkillSlotNames)
+		local slotCooldownTurns = self:ParseSkillSlotPipe(self.SkillSlotCooldownTurns)
+		local operation = "SWAP"
+		if targetSkillId == "" then
+			operation = "MOVE"
+			slotIds[targetIndex] = slotIds[sourceIndex]
+			slotIds[sourceIndex] = ""
+			slotNames[targetIndex] = slotNames[sourceIndex]
+			slotNames[sourceIndex] = ""
+			slotCooldownTurns[targetIndex] = slotCooldownTurns[sourceIndex]
+			slotCooldownTurns[sourceIndex] = ""
+		else
+			slotIds[sourceIndex], slotIds[targetIndex] = slotIds[targetIndex], slotIds[sourceIndex]
+			slotNames[sourceIndex], slotNames[targetIndex] = slotNames[targetIndex], slotNames[sourceIndex]
+			slotCooldownTurns[sourceIndex], slotCooldownTurns[targetIndex] = slotCooldownTurns[targetIndex], slotCooldownTurns[sourceIndex]
+		end
+
+		local nextSlotIds = self:SerializeSkillSlotPipe(slotIds)
+		local nextSlotNames = self:SerializeSkillSlotPipe(slotNames)
+		local nextSlotCooldownTurns = self:SerializeSkillSlotPipe(slotCooldownTurns)
+		local runInventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if runInventory == nil then
+			result.Reason = "RUN_SKILL_BAR_OWNER_UNAVAILABLE"
+			return result
+		end
+		local runOrderResult = runInventory:CommitRunSkillBarOrder(self.SkillSlotIds, nextSlotIds, "BATTLE_REORDER")
+		if runOrderResult.Success ~= true then
+			result.Reason = runOrderResult.Reason or "RUN_SKILL_BAR_COMMIT_FAILED"
+			return result
+		end
+
+		self.SkillSlotIds = nextSlotIds
+		self.SkillSlotNames = nextSlotNames
+		self.SkillSlotCooldownTurns = nextSlotCooldownTurns
+		self.SkillSlotSourceSnapshot = runInventory.RunSkillSnapshot
+		self.SkillSlotSourceRunOrderRevision = runOrderResult.Revision or self.SkillSlotSourceRunOrderRevision
+		self.SkillSlotRevision = self.SkillSlotRevision + 1
+		result.Success = true
+		result.Reason = "OK"
+		result.SourceSkillId = sourceSkillId
+		result.TargetSkillId = targetSkillId
+		result.Operation = operation
+		result.SlotIds = self.SkillSlotIds
+		result.Revision = self.SkillSlotRevision
+		result.RunSkillBarRevision = self.SkillSlotSourceRunOrderRevision
+		log("[BattleSkillSlotReorder] success request=" .. tostring(self.LastProcessedSkillSlotReorderRequestId) .. " operation=" .. operation .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " before=" .. result.PreviousSlotIds .. " after=" .. result.SlotIds .. " runOrderRevision=" .. tostring(self.SkillSlotSourceRunOrderRevision) .. " queued=" .. self.QueuedTileIds .. " executing=" .. self.ExecutingTileIds)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ParseSkillSlotPipe(string snapshot)
+		local values = {}
+		local serialized = snapshot or ""
+		local startIndex = 1
+		for slotIndex = 1, self.SkillSlotCount do
+			local separatorIndex, _ = string.find(serialized, "|", startIndex, true)
+			if separatorIndex == nil then
+				values[slotIndex] = string.sub(serialized, startIndex)
+				startIndex = string.len(serialized) + 1
+			else
+				values[slotIndex] = string.sub(serialized, startIndex, separatorIndex - 1)
+				startIndex = separatorIndex + 1
+			end
+		end
+		return values
+	end
+
+	@ExecSpace("ServerOnly")
+	method string SerializeSkillSlotPipe(table values)
+		local fixedValues = {}
+		for slotIndex = 1, self.SkillSlotCount do
+			fixedValues[slotIndex] = values[slotIndex] or ""
+		end
+		return table.concat(fixedValues, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishSkillSlotReorderReceipt(integer sourceIndex, integer targetIndex, table result)
+		self.SkillSlotLastRequestId = self.LastProcessedSkillSlotReorderRequestId
+		self.SkillSlotLastRequestSuccess = result ~= nil and result.Success == true
+		self.SkillSlotLastRequestReason = result ~= nil and result.Reason or "UNKNOWN"
+		self.SkillSlotLastSourceIndex = sourceIndex
+		self.SkillSlotLastTargetIndex = targetIndex
+		self.SkillSlotReorderReceiptRevision = self.SkillSlotReorderReceiptRevision + 1
+		local operation = result ~= nil and result.Operation or "NONE"
+		log("[BattleSkillSlotReorder] receipt request=" .. tostring(self.SkillSlotLastRequestId) .. " success=" .. tostring(self.SkillSlotLastRequestSuccess) .. " reason=" .. self.SkillSlotLastRequestReason .. " operation=" .. tostring(operation) .. " revision=" .. tostring(self.SkillSlotRevision) .. " slots=" .. self.SkillSlotIds)
+	end
+
+	@ExecSpace("Server")
 	method void RequestExecuteQueuedTile()
 		-- Validates the requesting player before executing the registered tile.
 		if self:IsValidPlayerRequest(senderUserId) == false then
@@ -2631,18 +2944,27 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
-	method void RequestMoveQueuedTile(integer fromIndex, integer toIndex)
-		-- Validates the requesting player before reordering the queued tiles for free.
+	method void RequestMoveQueuedTile(integer fromIndex, integer toIndex, integer requestId, integer expectedQueueOrderRevision)
+		-- Future queue drag sends indices and concurrency metadata only. Skill identities remain
+		-- server-owned inside TurnState. No current UI calls this method in STEP 8.
 		if self:IsValidPlayerRequest(senderUserId) == false then
-			log_warning("[BattleTileQueue] move rejected from=" .. fromIndex .. " to=" .. toIndex .. " reason=INVALID_SENDER")
+			log_warning("[BattleQueueReorder] rejected request=" .. tostring(requestId) .. " reason=INVALID_SENDER")
+			return
+		end
+		if requestId <= 0 then
+			log_warning("[BattleQueueReorder] rejected request=" .. tostring(requestId) .. " reason=INVALID_REQUEST_ID")
+			return
+		end
+		if requestId <= self.LastProcessedQueueReorderRequestId then
+			local replayReason = requestId == self.LastProcessedQueueReorderRequestId and "DUPLICATE_REQUEST" or "STALE_REQUEST"
+			log_warning("[BattleQueueReorder] rejected request=" .. tostring(requestId) .. " last=" .. tostring(self.LastProcessedQueueReorderRequestId) .. " reason=" .. replayReason)
 			return
 		end
 
-		local result = self:TryMoveQueuedTile(fromIndex, toIndex)
+		self.LastProcessedQueueReorderRequestId = requestId
+		local result = self:TryReorderQueuedTile(fromIndex, toIndex, expectedQueueOrderRevision)
 		self:PublishPlayerCommandResult("REORDER_QUEUE", result)
-		if result.Success == false then
-			log_warning("[BattleTileQueue] move rejected from=" .. fromIndex .. " to=" .. toIndex .. " reason=" .. result.Reason)
-		end
+		self:PublishQueueReorderReceipt(fromIndex, toIndex, result)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2937,6 +3259,63 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table TryReorderQueuedTile(integer fromIndex, integer toIndex, integer expectedQueueOrderRevision)
+		local currentRevision = self.TurnState ~= nil and self.TurnState.QueueOrderRevision or 0
+		local currentQueue = self.TurnState ~= nil and self.TurnState.QueuedTileIds or ""
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			FromIndex = fromIndex,
+			ToIndex = toIndex,
+			PreviousQueue = currentQueue,
+			QueuedTileIds = currentQueue,
+			QueueOrderRevision = currentRevision
+		}
+		if fromIndex ~= math.floor(fromIndex) or toIndex ~= math.floor(toIndex) then
+			result.Reason = "INVALID_QUEUE_INDEX_TYPE"
+			return result
+		end
+		if expectedQueueOrderRevision ~= math.floor(expectedQueueOrderRevision) then
+			result.Reason = "INVALID_QUEUE_REVISION_TYPE"
+			return result
+		end
+		if self.ContentValidationState ~= "VALID" then
+			result.Reason = "CONTENT_NOT_READY"
+			return result
+		end
+		if self.BattleResult ~= "" then
+			result.Reason = "BATTLE_ALREADY_ENDED"
+			return result
+		end
+		if self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "NOT_PLAYER_DECISION_STATE"
+			return result
+		end
+		if self.TurnState.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+		if self.TurnState.ExecutingTileIds ~= "" then
+			result.Reason = "EXECUTION_SNAPSHOT_ACTIVE"
+			return result
+		end
+		if expectedQueueOrderRevision ~= self.TurnState.QueueOrderRevision then
+			result.Reason = "STALE_QUEUE_REVISION"
+			return result
+		end
+		if self.TurnState.QueuedTileCount < 2 then
+			result.Reason = "QUEUE_REORDER_NOT_NEEDED"
+			return result
+		end
+
+		result = self:TryMoveQueuedTile(fromIndex, toIndex)
+		result.PreviousQueue = currentQueue
+		result.QueuedTileIds = self.TurnState.QueuedTileIds
+		result.QueueOrderRevision = self.TurnState.QueueOrderRevision
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method table TryMoveQueuedTile(integer fromIndex, integer toIndex)
 		-- Reorders the queued tiles without advancing the turn or starting the enemy round.
 		local result = self.TurnState:TryMoveQueuedSkill(fromIndex, toIndex)
@@ -2948,6 +3327,25 @@ script BattleSessionComponent extends Component
 			log("[BattleTileQueue] moved tile=" .. result.MovedSkillId .. " from=" .. fromIndex .. " to=" .. toIndex .. " queue=" .. self.TurnState.QueuedTileIds .. " turn=" .. self.TurnNumber)
 		end
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishQueueReorderReceipt(integer fromIndex, integer toIndex, table result)
+		self.QueueLastRequestId = self.LastProcessedQueueReorderRequestId
+		self.QueueLastRequestSuccess = result ~= nil and result.Success == true
+		self.QueueLastRequestReason = result ~= nil and result.Reason or "UNKNOWN"
+		self.QueueLastSourceIndex = fromIndex
+		self.QueueLastTargetIndex = toIndex
+		self.QueueLastOrderRevision = self.TurnState ~= nil and self.TurnState.QueueOrderRevision or 0
+		self.QueueReorderReceiptRevision = self.QueueReorderReceiptRevision + 1
+		log("[BattleQueueReorder] receipt request=" .. tostring(self.QueueLastRequestId)
+			.. " success=" .. tostring(self.QueueLastRequestSuccess)
+			.. " reason=" .. self.QueueLastRequestReason
+			.. " from=" .. tostring(fromIndex)
+			.. " to=" .. tostring(toIndex)
+			.. " queueRevision=" .. tostring(self.QueueLastOrderRevision)
+			.. " queued=" .. tostring(self.TurnState ~= nil and self.TurnState.QueuedTileIds or "")
+			.. " executing=" .. tostring(self.TurnState ~= nil and self.TurnState.ExecutingTileIds or ""))
 	end
 
 	@ExecSpace("Server")
@@ -3001,10 +3399,49 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method void ApplyRunJobConfiguration(any runState)
+	method void ResetUnionRewardPresentation(string reason)
+		self.UnionRewardRunId = 0
+		self.UnionRewardBasePoints = 0
+		self.UnionRewardBonusPoints = 0
+		self.UnionRewardFinalPoints = 0
+		self.UnionRewardWasCommitted = false
+		self.UnionRewardWasDuplicate = false
+		self.UnionRewardRunEnded = false
+		self.UnionRewardRunEndReason = reason or ""
+		self.UnionRewardRevision = self.UnionRewardRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshUnionRewardPresentation()
+		if isvalid(self.PlayerEntity) == false then
+			return
+		end
+		local snapshot = _UnionRewardServiceLogic:GetRunRewardSnapshot(self.PlayerEntity)
+		if snapshot.Success == false then
+			log_warning("[BattleResult] Union reward snapshot unavailable reason=" .. snapshot.Reason)
+			return
+		end
+		self.UnionRewardRunId = snapshot.RewardRunId or 0
+		self.UnionRewardBasePoints = snapshot.BaseUnionPoints or 0
+		self.UnionRewardBonusPoints = snapshot.BonusUnionPoints or 0
+		self.UnionRewardFinalPoints = snapshot.FinalUnionPoints or 0
+		self.UnionRewardWasCommitted = snapshot.WasCommitted == true
+		self.UnionRewardWasDuplicate = snapshot.WasDuplicate == true
+		self.UnionRewardRunEnded = snapshot.RunEnded == true
+		self.UnionRewardRunEndReason = snapshot.RunEndReason or ""
+		self.UnionRewardRevision = self.UnionRewardRevision + 1
+		log("[BattleResult] Union reward runId=" .. self.UnionRewardRunId .. " base=" .. self.UnionRewardBasePoints .. " bonus=" .. self.UnionRewardBonusPoints .. " final=" .. self.UnionRewardFinalPoints .. " committed=" .. tostring(self.UnionRewardWasCommitted) .. " ended=" .. tostring(self.UnionRewardRunEnded))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyRunJobConfiguration(any runState, Entity playerEntity)
 		-- Copies the player-owned job snapshot into synchronized map-scoped battle state.
 		if runState == nil then
 			return
+		end
+		local runOwner = playerEntity
+		if isvalid(runOwner) == false then
+			runOwner = self.PlayerEntity
 		end
 		self.SelectedJobId = runState.SelectedJobId
 		self.SelectedJobMechanicId = runState.SelectedJobMechanicId
@@ -3013,29 +3450,50 @@ script BattleSessionComponent extends Component
 		self.SelectedJobBaseMaxHp = runState.JobBaseMaxHp
 		self.SelectedJobBaseQueueCapacity = runState.JobBaseQueueCapacity
 		self.SelectedJobRevision = runState.JobRevision
+		local unionSnapshot = _RunManagerLogic:GetRunUnionEffectSnapshot(runOwner)
+		if unionSnapshot.Success == true then
+			self.UnionItemDropRate = unionSnapshot.ItemDropRate
+		else
+			self.UnionItemDropRate = 0
+			log_error("[UnionEffect] battle snapshot unavailable reason=" .. (unionSnapshot.Reason or "UNKNOWN"))
+		end
 		log("[BattleJob] configuration applied job=" .. self.SelectedJobId .. " mechanic=" .. self.SelectedJobMechanicId .. " passive=" .. self.SelectedJobPassiveSetId .. " hp=" .. self.SelectedJobBaseMaxHp .. " queue=" .. self.SelectedJobBaseQueueCapacity .. " skills=" .. self.SelectedJobStartingSkillIds .. " revision=" .. self.SelectedJobRevision)
-		self:RefreshSkillSlots("JOB_APPLIED")
+		self:RefreshSkillSlots("JOB_APPLIED", runOwner)
 	end
 
 	@ExecSpace("ServerOnly")
-	method void RefreshSkillSlots(string reason)
-		-- Draws this battle's HUD slots at random from the skills the player actually owns, and resolves
-		-- their display names here because the skill DataSets are server-only and the HUD cannot read them.
-		-- Re-rolls only when the owned set changes, so slots stay stable for the duration of a battle.
+	method void RefreshSkillSlots(string reason, Entity playerEntity)
+		-- Reconciles the player-owned run order and copies it into this map-scoped BattleSession.
 		local ownedSnapshot = ""
-		if isvalid(self.PlayerEntity) then
-			local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local runSlotIds = ""
+		local runOrderRevision = 0
+		local runOrderAvailable = false
+		local inventory = nil
+		if isvalid(playerEntity) then
+			inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
 			if inventory ~= nil then
 				ownedSnapshot = inventory.RunSkillSnapshot
+				local runOrderResult = inventory:GetOrInitializeRunSkillBarOrder()
+				if runOrderResult.Success == true then
+					runSlotIds = runOrderResult.SlotIds or ""
+					runOrderRevision = runOrderResult.Revision or 0
+					runOrderAvailable = runSlotIds ~= ""
+				else
+					log_error("[BattleSkillSlots] run order unavailable reason=" .. (runOrderResult.Reason or "UNKNOWN") .. " refresh=" .. (reason or ""))
+				end
 			end
 		end
 		if ownedSnapshot == "" then
 			ownedSnapshot = self.SelectedJobStartingSkillIds
 		end
-		if ownedSnapshot == self.SkillSlotSourceSnapshot then
+		if runOrderAvailable == true
+			and ownedSnapshot == self.SkillSlotSourceSnapshot
+			and runOrderRevision == self.SkillSlotSourceRunOrderRevision
+			and runSlotIds == self.SkillSlotIds then
 			return
 		end
 		self.SkillSlotSourceSnapshot = ownedSnapshot
+		self.SkillSlotSourceRunOrderRevision = runOrderRevision
 
 		local candidates = {}
 		local seen = {}
@@ -3048,42 +3506,115 @@ script BattleSessionComponent extends Component
 			end
 		end
 
-		-- Fisher-Yates so every owned skill has an equal chance of reaching a slot.
-		for index = #candidates, 2, -1 do
-			local swap = _UtilLogic:RandomIntegerRange(1, index)
-			local held = candidates[index]
-			candidates[index] = candidates[swap]
-			candidates[swap] = held
-		end
-
 		-- Icons cover every candidate, not just the drawn slots, because the queue accepts any owned skill.
+		-- The same pass collects the clips those skills will play, so the client can warm them before the
+		-- first cast instead of loading one mid-flight.
 		local iconRecords = {}
+		local presentationRuids = {}
+		local presentationSeen = {}
 		for _, skillId in ipairs(candidates) do
 			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
-			if definition.Success == true and definition.IconRuid ~= nil and definition.IconRuid ~= "" then
-				table.insert(iconRecords, skillId .. "~" .. definition.IconRuid)
+			if definition.Success == true then
+				if definition.IconRuid ~= nil and definition.IconRuid ~= "" then
+					table.insert(iconRecords, skillId .. "~" .. definition.IconRuid)
+				end
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CastEffectRuid)
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.HitEffectRuid)
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.ProjectileRuid)
 			end
 		end
 
 		local slotIds = {}
 		local slotNames = {}
 		local slotCooldownTurns = {}
-		local slotCount = math.min(self.SkillSlotCount, #candidates)
-		for index = 1, slotCount do
-			local skillId = candidates[index]
-			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
-			if definition.Success == true then
-				table.insert(slotIds, skillId)
-				table.insert(slotNames, definition.DisplayName)
-				table.insert(slotCooldownTurns, tostring(math.max(0, math.floor(definition.CooldownTurns or 0))))
+		if runOrderAvailable == true then
+			slotIds = self:ParseSkillSlotPipe(runSlotIds)
+		else
+			-- Compatibility fallback only; valid runs initialize and persist their random default in the run owner.
+			for index = #candidates, 2, -1 do
+				local swapIndex = _UtilLogic:RandomIntegerRange(1, index)
+				candidates[index], candidates[swapIndex] = candidates[swapIndex], candidates[index]
+			end
+			for index = 1, math.min(self.SkillSlotCount, #candidates) do
+				slotIds[index] = candidates[index]
+			end
+			log_warning("[BattleSkillSlots] using nonpersistent fallback reason=RUN_ORDER_UNAVAILABLE refresh=" .. (reason or ""))
+		end
+		for slotIndex = 1, self.SkillSlotCount do
+			local skillId = slotIds[slotIndex] or ""
+			slotNames[slotIndex] = ""
+			slotCooldownTurns[slotIndex] = ""
+			if skillId ~= "" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+				if definition.Success == true then
+					slotNames[slotIndex] = definition.DisplayName
+					slotCooldownTurns[slotIndex] = tostring(math.max(0, math.floor(definition.CooldownTurns or 0)))
+				else
+					log_error("[BattleSkillSlots] ordered skill definition unavailable skill=" .. skillId .. " reason=" .. (definition.Reason or "UNKNOWN"))
+				end
 			end
 		end
 
-		self.SkillSlotIds = table.concat(slotIds, "|")
-		self.SkillSlotNames = table.concat(slotNames, "|")
-		self.SkillSlotCooldownTurns = table.concat(slotCooldownTurns, "|")
+		self.SkillSlotIds = self:SerializeSkillSlotPipe(slotIds)
+		self.SkillSlotNames = self:SerializeSkillSlotPipe(slotNames)
+		self.SkillSlotCooldownTurns = self:SerializeSkillSlotPipe(slotCooldownTurns)
+		self.SkillSlotRevision = self.SkillSlotRevision + 1
 		self.SkillIconSnapshot = table.concat(iconRecords, "|")
-		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " slots=" .. self.SkillSlotIds .. " names=" .. self.SkillSlotNames .. " cooldowns=" .. self.SkillSlotCooldownTurns .. " icons=" .. tostring(#iconRecords))
+		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " runOrder=" .. tostring(runOrderAvailable) .. " runOrderRevision=" .. tostring(self.SkillSlotSourceRunOrderRevision) .. " slots=" .. self.SkillSlotIds .. " names=" .. self.SkillSlotNames .. " cooldowns=" .. self.SkillSlotCooldownTurns .. " icons=" .. tostring(#iconRecords) .. " presentationRuids=" .. tostring(#presentationRuids))
+
+		-- Scope note: this method is only reached from job apply, so the warm covers the skills owned at
+		-- battle start. A skill granted mid-run is not re-warmed here -- it falls back to the renderer being
+		-- held off until its RUID lands, which costs a brief invisible projectile rather than a wrong one.
+		if #presentationRuids > 0 and isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
+			self:PreloadSkillPresentation(table.concat(presentationRuids, "|"), self.PlayerEntity.PlayerComponent.UserId)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CollectPresentationRuid(table collected, table seen, string ruid)
+		-- Appends one distinct non-empty clip RUID. Skills share cast and hit clips across tiers, so the
+		-- seen set keeps the preload list from asking for the same resource several times.
+		if ruid == nil or ruid == "" or seen[ruid] ~= nil then
+			return
+		end
+		seen[ruid] = true
+		table.insert(collected, ruid)
+	end
+
+	@ExecSpace("Client")
+	method void PreloadSkillPresentation(string ruidCsv)
+		-- Warms the client resource cache with this run's cast / hit / projectile clips.
+		-- These RUIDs are only ever assigned at cast time, so on a cold cache the renderer keeps showing
+		-- whatever it had while the clip loads -- long enough to cover a whole projectile flight. Loading
+		-- them up front is what makes the first cast of a skill look like every later one.
+		if ruidCsv == "" then
+			return
+		end
+
+		local ruids = {}
+		for ruid in string.gmatch(ruidCsv, "([^|]+)") do
+			table.insert(ruids, ruid)
+		end
+		if #ruids == 0 then
+			return
+		end
+
+		local requested = #ruids
+		log("[SkillPreload] requested count=" .. tostring(requested))
+		_ResourceService:PreloadAsync(ruids, function(results)
+			local succeeded = 0
+			local failed = 0
+			for _, status in pairs(results or {}) do
+				if status == PreloadResultStatus.Success then
+					succeeded = succeeded + 1
+				else
+					failed = failed + 1
+					log_warning("[SkillPreload] resource rejected status=" .. tostring(status))
+				end
+			end
+			-- Purely an optimisation: a failure here costs the old first-cast flicker, never gameplay.
+			log("[SkillPreload] complete requested=" .. tostring(requested) .. " success=" .. tostring(succeeded) .. " failed=" .. tostring(failed))
+		end)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3106,7 +3637,7 @@ script BattleSessionComponent extends Component
 		if jobResult.Success == false then
 			return jobResult
 		end
-		self:ApplyRunJobConfiguration(runState)
+		self:ApplyRunJobConfiguration(runState, self.PlayerEntity)
 		self.RunSeed = runState.RunSeed
 		log("[BattleRun] new run requested sequence=" .. runState.RunSequence .. " seed=" .. self.RunSeed)
 		return self:RebuildBattleState("NEW_RUN")
@@ -3162,7 +3693,7 @@ script BattleSessionComponent extends Component
 			result.DetailReason = jobResult.DetailReason or ""
 			return result
 		end
-		self:ApplyRunJobConfiguration(runState)
+		self:ApplyRunJobConfiguration(runState, playerEntity)
 
 		local applyResult = self:LoadAndApplyStageDefinition(stageId)
 		if applyResult.Success == false then
@@ -3524,11 +4055,22 @@ script BattleSessionComponent extends Component
 				HitFlashDuration = self.HitFlashDuration,
 				HitReactionDuration = self.HitReactionDuration
 			},
-			RevisionKey = tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. self.BattleResult,
+			RevisionKey = tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.QueueOrderRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. tostring(self.UnionRewardRevision) .. ":" .. self.BattleResult,
 			Phase = turnState.BattlePhase,
 			TurnNumber = turnState.TurnNumber,
 			IsProcessing = turnState.IsActionProcessing,
 			BattleResult = self.BattleResult,
+			UnionReward = {
+				RewardRunId = self.UnionRewardRunId,
+				BaseUnionPoints = self.UnionRewardBasePoints,
+				BonusUnionPoints = self.UnionRewardBonusPoints,
+				FinalUnionPoints = self.UnionRewardFinalPoints,
+				WasCommitted = self.UnionRewardWasCommitted,
+				WasDuplicate = self.UnionRewardWasDuplicate,
+				RunEnded = self.UnionRewardRunEnded,
+				RunEndReason = self.UnionRewardRunEndReason,
+				Revision = self.UnionRewardRevision
+			},
 			Stage = {
 				StageId = self.StageId,
 				RegionId = self.RegionId,
@@ -3606,6 +4148,16 @@ script BattleSessionComponent extends Component
 				ExecutingTileIds = turnState.ExecutingTileIds,
 				ExecutingIndex = turnState.ExecutingTileIndex,
 				ModifierSnapshot = turnState.QueueCapacityModifierSnapshot,
+				QueueOrderRevision = turnState.QueueOrderRevision,
+				ReorderReceipt = {
+					Revision = self.QueueReorderReceiptRevision,
+					RequestId = self.QueueLastRequestId,
+					Success = self.QueueLastRequestSuccess,
+					Reason = self.QueueLastRequestReason,
+					SourceIndex = self.QueueLastSourceIndex,
+					TargetIndex = self.QueueLastTargetIndex,
+					QueueOrderRevision = self.QueueLastOrderRevision
+				},
 				Revision = turnState.QueueCapacityRevision
 			},
 			EnemyIntentMode = "PER_ENEMY_RANGE_AWARE_QUEUE_V2",
@@ -3850,6 +4402,7 @@ script BattleSessionComponent extends Component
 
 		local queuedBeforeReset = self.TurnState.QueuedTileIds
 		self.BattleResult = ""
+		self:ResetUnionRewardPresentation("REBUILD_" .. reason)
 		self.PlayerExitObservedAfterBattle = false
 		self.StageTurnNumber = 0
 		self.TurnState:ResetTurnState(self.TileQueueCapacity, reason)
@@ -4725,6 +5278,20 @@ script BattleSessionComponent extends Component
 			log_error("[BattleDeath] state transition failed unit=" .. unitId .. " reason=" .. deathState.Reason)
 			return
 		end
+		local defeatedPlan = unitEntity:GetComponent("script.EnemyActionPlanComponent")
+		local defeatedRunner = unitEntity:GetComponent("script.EnemyPatternRunnerComponent")
+		if defeatedPlan ~= nil and defeatedPlan.PlanState ~= "EMPTY" then
+			local currentAction = defeatedPlan:GetCurrentAction()
+			if defeatedRunner ~= nil and currentAction.Success == true then
+				defeatedRunner:CancelPreparedStep(currentAction.PatternId, currentAction.StepIndex, "UNIT_DIED")
+			end
+			defeatedPlan:ResetPlan("UNIT_DIED")
+		end
+		local preparedIntent = self:GetPreparedEnemyIntent()
+		if preparedIntent.EnemyId == unitId then
+			self:ResetEnemyIntentCursor("UNIT_DIED")
+		end
+		self:PublishEnemyPlanSnapshot("UNIT_DIED")
 		if unit.Team == "Enemy" and self.DropRuntime ~= nil then
 			local sourceEntity = self:FindUnitEntity(sourceUnitId)
 			local sourceUnit = nil
@@ -4743,7 +5310,8 @@ script BattleSessionComponent extends Component
 				unit.UnitId,
 				unit.SpawnOrder,
 				unit.CellIndex,
-				triggerResult.TriggerSnapshot
+				triggerResult.TriggerSnapshot,
+				self.UnionItemDropRate
 			)
 			if dropResult.Success == false then
 				log_error("[BattleDeath] drop failed unit=" .. unitId .. " reason=" .. dropResult.Reason)
@@ -4809,11 +5377,18 @@ script BattleSessionComponent extends Component
 				self.DropRuntime:DiscardPending("BATTLE_DEFEAT")
 			end
 			runResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
+			if runResultRecorded == true then
+				self:RefreshUnionRewardPresentation()
+			end
 		end
 		log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=" .. self.BattleResult .. " wave=" .. self.CurrentWave)
 		log("[BattleResult] result=" .. self.BattleResult .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " runRecorded=" .. tostring(runResultRecorded))
 		if self.BattleResult == "Victory" and runResultRecorded == true and isvalid(self.PlayerEntity) then
-			_StageTransitionManagerLogic:HandleVictoryTransition(self.PlayerEntity, self.StageId)
+			if self.UnionRewardRunEnded == true and self.UnionRewardWasCommitted == true then
+				_StageTransitionManagerLogic:HandleCompletedRunTransition(self.PlayerEntity)
+			else
+				_StageTransitionManagerLogic:HandleVictoryTransition(self.PlayerEntity, self.StageId)
+			end
 		end
 	end
 
@@ -5021,6 +5596,121 @@ script BattleSessionComponent extends Component
 		result.Success = true
 		result.Reason = "OK"
 		log("[BattleMoveAway] success unit=" .. unit.UnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " facing=" .. result.PreviousFacing .. "->" .. result.CurrentFacing)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryChargeForward(string unitId, integer direction, string skillId, string committedCellSnapshot)
+		-- Traverses only the cells frozen with the visible plan and stops before the first occupied cell.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			FromCell = -1,
+			ToCell = -1,
+			TraversedCells = "",
+			MovedCellCount = 0,
+			Hit = false,
+			TargetUnitId = "",
+			DamageAmount = 0,
+			StopReason = ""
+		}
+		if self.BattleResult ~= "" then
+			result.Reason = "BATTLE_ENDED"
+			return result
+		end
+		if direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+		local unitEntity = self:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if unit.IsDead == true or unit.IsAirborne == true then
+			result.Reason = "UNIT_UNAVAILABLE"
+			return result
+		end
+		if self:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			result.Reason = "CHARGE_SKILL_INVALID"
+			return result
+		end
+
+		result.FromCell = unit.CellIndex
+		result.ToCell = unit.CellIndex
+		local committedCells = {}
+		for token in string.gmatch(committedCellSnapshot or "", "([^|]+)") do
+			local cellIndex = math.floor(tonumber(token) or -1)
+			if self:IsValidCell(cellIndex) then
+				table.insert(committedCells, cellIndex)
+			end
+		end
+		if #committedCells == 0 then
+			result.Reason = "CHARGE_TARGET_SNAPSHOT_MISSING"
+			return result
+		end
+
+		local traversed = {}
+		for _, nextCell in ipairs(committedCells) do
+			if nextCell ~= unit.CellIndex + direction then
+				result.StopReason = "COMMITTED_PATH_ENDED"
+				break
+			end
+			if self:IsValidCell(nextCell) == false then
+				result.StopReason = "OUT_OF_BOUNDS"
+				break
+			end
+
+			local occupantEntity = self.BoardState ~= nil and self.BoardState:FindAtCell(nextCell, unitId) or nil
+			if isvalid(occupantEntity) then
+				local occupantUnit = occupantEntity:GetComponent("script.BattleUnitComponent")
+				result.StopReason = "CELL_OCCUPIED"
+				if occupantUnit ~= nil and occupantUnit.IsDead == false and occupantUnit.Team ~= unit.Team then
+					self:BeginSkillEffectPresentation(unitId, definition)
+					local damage = self:ResolveSkillDamageImpact(unitId, skillId, occupantUnit.UnitId, nextCell, unit.BasicAttackDamage)
+					result.Success = damage.Success == true
+					result.Hit = damage.Hit == true
+					result.TargetUnitId = occupantUnit.UnitId
+					result.DamageAmount = damage.DamageAmount or 0
+					result.Reason = damage.Success == true and "CHARGE_HIT" or damage.Reason
+					result.ToCell = unit.CellIndex
+					result.TraversedCells = table.concat(traversed, "|")
+					log("[EnemyCharge] resolved unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " path=" .. result.TraversedCells .. " target=" .. result.TargetUnitId .. " damage=" .. result.DamageAmount .. " success=" .. tostring(result.Success))
+					return result
+				end
+				break
+			end
+
+			local move = self:TryMove(unitId, direction)
+			if move.Success == false then
+				if move.Reason == "OUT_OF_BOUNDS" or move.Reason == "CELL_OCCUPIED" then
+					result.StopReason = move.Reason
+					break
+				end
+				result.Reason = move.Reason
+				result.ToCell = unit.CellIndex
+				result.TraversedCells = table.concat(traversed, "|")
+				return result
+			end
+			table.insert(traversed, tostring(unit.CellIndex))
+			result.MovedCellCount = result.MovedCellCount + 1
+			result.ToCell = unit.CellIndex
+		end
+
+		result.Success = true
+		result.Reason = result.StopReason == "CELL_OCCUPIED" and "CHARGE_BLOCKED" or "CHARGE_ENDPOINT_REACHED"
+		result.TraversedCells = table.concat(traversed, "|")
+		log("[EnemyCharge] resolved unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " path=" .. result.TraversedCells .. " target=- damage=0 stop=" .. result.StopReason)
 		return result
 	end
 

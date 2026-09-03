@@ -1,0 +1,247 @@
+@Logic
+script UnionJobGradeDefinitionRepositoryLogic extends Logic
+
+    property string GradeDataSetName = "UnionJobGradeDefinitions"
+
+    @ExecSpace("ServerOnly")
+    method table GetGrade(string gradeId)
+        -- Loads one shared Job Union Grade definition without reading player progress.
+        local result = { Success = false, Reason = "UNION_JOB_GRADE_NOT_FOUND", GradeId = gradeId or "", MatchCount = 0 }
+        if gradeId == nil or gradeId == "" then
+            result.Reason = "INVALID_GRADE_ID"
+            return result
+        end
+        if gradeId == "NONE" then
+            return self:MakeNoGrade(0)
+        end
+        local dataSet = _DataService:GetTable(self.GradeDataSetName)
+        if dataSet == nil then
+            result.Reason = "UNION_JOB_GRADE_DATASET_MISSING"
+            return result
+        end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            if dataSet:GetCell(rowIndex, "GradeId") == gradeId then
+                result.MatchCount = result.MatchCount + 1
+                if result.Success == false then
+                    result = self:ConvertGradeRow(dataSet, rowIndex)
+                    result.MatchCount = 1
+                end
+            end
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllGrades()
+        -- Returns the five shared grade definitions in deterministic progression order.
+        local result = { Success = false, Reason = "UNION_JOB_GRADE_DATASET_MISSING", Grades = {}, GradeCount = 0 }
+        local dataSet = _DataService:GetTable(self.GradeDataSetName)
+        if dataSet == nil then
+            return result
+        end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            table.insert(result.Grades, self:ConvertGradeRow(dataSet, rowIndex))
+        end
+        table.sort(result.Grades, function(left, right)
+            if left.RequiredJobProgress == right.RequiredJobProgress then
+                return left.SortOrder < right.SortOrder
+            end
+            return left.RequiredJobProgress < right.RequiredJobProgress
+        end)
+        result.Success = true
+        result.Reason = "OK"
+        result.GradeCount = #result.Grades
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ResolveGradeByProgress(integer progress)
+        -- Resolves the highest grade threshold reached by one non-negative progress value.
+        if progress == nil or progress < 0 or progress ~= math.floor(progress) then
+            return { Success = false, Reason = "INVALID_JOB_UNION_PROGRESS", Progress = progress or 0, GradeId = "NONE", StatPointContribution = 0 }
+        end
+        local allGrades = self:GetAllGrades()
+        if allGrades.Success == false then
+            return allGrades
+        end
+        local selected = nil
+        for _, grade in ipairs(allGrades.Grades) do
+            if progress >= grade.RequiredJobProgress then
+                selected = grade
+            else
+                break
+            end
+        end
+        if selected == nil then
+            return self:MakeNoGrade(progress)
+        end
+        selected.Progress = progress
+        return selected
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetStatPointContribution(string gradeId)
+        if gradeId == "NONE" then
+            return { Success = true, Reason = "OK", GradeId = "NONE", StatPointContribution = 0 }
+        end
+        local grade = self:GetGrade(gradeId)
+        if grade.Success == false then
+            return { Success = false, Reason = grade.Reason, GradeId = gradeId or "", StatPointContribution = 0 }
+        end
+        return { Success = true, Reason = "OK", GradeId = grade.GradeId, StatPointContribution = grade.StatPointContribution }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table CalculateTotalStatPoints(table gradeIds)
+        -- Pure deterministic helper for a future caller that already resolved five grade IDs.
+        local result = { Success = false, Reason = "INVALID_GRADE_ID_LIST", TotalStatPoints = 0, GradeCount = 0 }
+        if gradeIds == nil then
+            return result
+        end
+        for _, gradeId in ipairs(gradeIds) do
+            local contribution = self:GetStatPointContribution(gradeId)
+            if contribution.Success == false then
+                result.Reason = contribution.Reason
+                result.InvalidGradeId = gradeId or ""
+                return result
+            end
+            result.TotalStatPoints = result.TotalStatPoints + contribution.StatPointContribution
+            result.GradeCount = result.GradeCount + 1
+        end
+        result.Success = true
+        result.Reason = "OK"
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidateDefinitions()
+        -- Validates exact B/A/S/SS/SSS ordering, total contributions, and thresholds.
+        local result = {
+            Success = false,
+            Reason = "CONTENT_VALIDATION_FAILED",
+            CheckedGradeCount = 0,
+            ErrorCount = 0,
+            Errors = {},
+            ErrorSnapshot = ""
+        }
+        local dataSet = _DataService:GetTable(self.GradeDataSetName)
+        if dataSet == nil then
+            self:AddValidationError(result, 0, "", "DATASET_NOT_FOUND")
+            return self:FinalizeValidation(result)
+        end
+        local expectedGradeIds = { "B", "A", "S", "SS", "SSS" }
+        local expectedContributions = { 1, 2, 3, 4, 5 }
+        local expectedThresholds = { 1, 2, 3, 4, 5 }
+        local seenGradeIds = {}
+        local seenSortOrders = {}
+        local previousThreshold = -1
+        for rowIndex = 1, dataSet:GetRowCount() do
+            result.CheckedGradeCount = result.CheckedGradeCount + 1
+            local grade = self:ConvertGradeRow(dataSet, rowIndex)
+            local expectedGradeId = expectedGradeIds[rowIndex]
+            local expectedContribution = expectedContributions[rowIndex]
+            local expectedThreshold = expectedThresholds[rowIndex]
+            if grade.GradeId == "" then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "INVALID_GRADE_ID")
+            elseif seenGradeIds[grade.GradeId] == true then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "DUPLICATE_GRADE_ID")
+            else
+                seenGradeIds[grade.GradeId] = true
+            end
+            if expectedGradeId == nil or grade.GradeId ~= expectedGradeId then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "INVALID_GRADE_ORDER")
+            end
+            if grade.DisplayName == "" then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "DISPLAY_NAME_MISSING")
+            end
+            if self:IsPositiveIntegerCell(dataSet:GetCell(rowIndex, "StatPointContribution")) == false or grade.StatPointContribution ~= expectedContribution then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "INVALID_STAT_POINT_CONTRIBUTION")
+            end
+            if self:IsNonNegativeIntegerCell(dataSet:GetCell(rowIndex, "RequiredJobProgress")) == false then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "INVALID_REQUIRED_JOB_PROGRESS")
+            elseif expectedThreshold == nil or grade.RequiredJobProgress ~= expectedThreshold then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "INVALID_MILESTONE_GRADE_THRESHOLD")
+            elseif grade.RequiredJobProgress <= previousThreshold then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "JOB_PROGRESS_THRESHOLD_NOT_INCREASING")
+            end
+            if self:IsPositiveIntegerCell(dataSet:GetCell(rowIndex, "SortOrder")) == false then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "INVALID_SORT_ORDER")
+            elseif seenSortOrders[grade.SortOrder] == true then
+                self:AddValidationError(result, rowIndex, grade.GradeId, "DUPLICATE_SORT_ORDER")
+            else
+                seenSortOrders[grade.SortOrder] = true
+            end
+            previousThreshold = grade.RequiredJobProgress
+        end
+        if result.CheckedGradeCount ~= 5 then
+            self:AddValidationError(result, 0, "", "EXPECTED_FIVE_GRADES")
+        end
+        return self:FinalizeValidation(result)
+    end
+
+    method table ConvertGradeRow(any dataSet, integer rowIndex)
+        return {
+            Success = true,
+            Reason = "OK",
+            GradeId = dataSet:GetCell(rowIndex, "GradeId") or "",
+            DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+            StatPointContribution = math.floor(tonumber(dataSet:GetCell(rowIndex, "StatPointContribution")) or 0),
+            RequiredJobProgress = math.floor(tonumber(dataSet:GetCell(rowIndex, "RequiredJobProgress")) or 0),
+            SortOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "SortOrder")) or 0),
+            RowIndex = rowIndex,
+            Source = "DATASET"
+        }
+    end
+
+    method table MakeNoGrade(integer progress)
+        return {
+            Success = true,
+            Reason = "NO_GRADE",
+            GradeId = "NONE",
+            DisplayName = "",
+            StatPointContribution = 0,
+            RequiredJobProgress = 0,
+            SortOrder = 0,
+            Progress = progress or 0,
+            MatchCount = 0,
+            Source = "DERIVED"
+        }
+    end
+
+    method boolean IsPositiveIntegerCell(any cellValue)
+        local numericValue = tonumber(cellValue)
+        return numericValue ~= nil and numericValue > 0 and numericValue == math.floor(numericValue)
+    end
+
+    method boolean IsNonNegativeIntegerCell(any cellValue)
+        local numericValue = tonumber(cellValue)
+        return numericValue ~= nil and numericValue >= 0 and numericValue == math.floor(numericValue)
+    end
+
+    method void AddValidationError(table result, integer rowIndex, string gradeId, string detailReason)
+        table.insert(result.Errors, {
+            DataSetName = self.GradeDataSetName,
+            RowIndex = rowIndex,
+            GradeId = gradeId or "",
+            DetailReason = detailReason or "UNKNOWN"
+        })
+    end
+
+    method table FinalizeValidation(table result)
+        local parts = {}
+        for _, item in ipairs(result.Errors) do
+            table.insert(parts, item.DataSetName .. "[" .. tostring(item.RowIndex) .. "]" .. item.GradeId .. "=" .. item.DetailReason)
+        end
+        result.ErrorCount = #result.Errors
+        result.ErrorSnapshot = table.concat(parts, "|")
+        if result.ErrorCount == 0 then
+            result.Success = true
+            result.Reason = "OK"
+            log("[UnionJobGradeValidation] valid grades=" .. result.CheckedGradeCount)
+        else
+            log_error("[UnionJobGradeValidation] rejected errors=" .. result.ErrorCount .. " details=" .. result.ErrorSnapshot)
+        end
+        return result
+    end
+
+end

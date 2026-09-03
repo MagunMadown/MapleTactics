@@ -1,0 +1,174 @@
+@Logic
+script UnionRewardDefinitionRepositoryLogic extends Logic
+
+	property string RewardDataSetName = "UnionRewardDefinitions"
+
+	@ExecSpace("ServerOnly")
+	method table GetDefinition(string rewardId)
+		local result = { Success = false, Reason = "UNION_REWARD_NOT_FOUND", RewardId = rewardId or "", MatchCount = 0 }
+		if rewardId == nil or rewardId == "" then
+			result.Reason = "INVALID_REWARD_ID"
+			return result
+		end
+		local dataSet = _DataService:GetTable(self.RewardDataSetName)
+		if dataSet == nil then
+			result.Reason = "UNION_REWARD_DATASET_MISSING"
+			return result
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "RewardId") == rewardId then
+				result.MatchCount = result.MatchCount + 1
+				if result.Success == false then
+					result = self:ConvertRow(dataSet, rowIndex)
+					result.MatchCount = 1
+				end
+			end
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetDefinitionsForTrigger(string triggerType, string targetId)
+		local result = { Success = false, Reason = "UNION_REWARD_DATASET_MISSING", TriggerType = triggerType or "", TargetId = targetId or "", Definitions = {}, DefinitionCount = 0, BaseUnionPoints = 0 }
+		if self:IsKnownTriggerType(triggerType) == false then
+			result.Reason = "UNKNOWN_TRIGGER_TYPE"
+			return result
+		end
+		local dataSet = _DataService:GetTable(self.RewardDataSetName)
+		if dataSet == nil then
+			return result
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local definition = self:ConvertRow(dataSet, rowIndex)
+			if definition.TriggerType == triggerType and (definition.TargetId == "*" or definition.TargetId == (targetId or "")) then
+				table.insert(result.Definitions, definition)
+				result.BaseUnionPoints = result.BaseUnionPoints + definition.BaseUnionPoints
+			end
+		end
+		table.sort(result.Definitions, function(left, right)
+			if left.SortOrder == right.SortOrder then
+				return left.RewardId < right.RewardId
+			end
+			return left.SortOrder < right.SortOrder
+		end)
+		result.Success = true
+		result.Reason = #result.Definitions > 0 and "OK" or "NO_MATCHING_UNION_REWARDS"
+		result.DefinitionCount = #result.Definitions
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetAllDefinitions()
+		local result = { Success = false, Reason = "UNION_REWARD_DATASET_MISSING", Definitions = {}, DefinitionCount = 0 }
+		local dataSet = _DataService:GetTable(self.RewardDataSetName)
+		if dataSet == nil then
+			return result
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			table.insert(result.Definitions, self:ConvertRow(dataSet, rowIndex))
+		end
+		table.sort(result.Definitions, function(left, right)
+			if left.SortOrder == right.SortOrder then
+				return left.RewardId < right.RewardId
+			end
+			return left.SortOrder < right.SortOrder
+		end)
+		result.Success = true
+		result.Reason = "OK"
+		result.DefinitionCount = #result.Definitions
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateDefinitions()
+		local result = { Success = false, Reason = "CONTENT_VALIDATION_FAILED", CheckedRewardCount = 0, ErrorCount = 0, Errors = {}, ErrorSnapshot = "" }
+		local dataSet = _DataService:GetTable(self.RewardDataSetName)
+		if dataSet == nil then
+			self:AddValidationError(result, 0, "", "DATASET_NOT_FOUND")
+			return self:FinalizeValidation(result)
+		end
+		local seenRewardIds = {}
+		local seenSortOrders = {}
+		for rowIndex = 1, dataSet:GetRowCount() do
+			result.CheckedRewardCount = result.CheckedRewardCount + 1
+			local definition = self:ConvertRow(dataSet, rowIndex)
+			if definition.RewardId == "" then
+				self:AddValidationError(result, rowIndex, definition.RewardId, "INVALID_REWARD_ID")
+			elseif seenRewardIds[definition.RewardId] == true then
+				self:AddValidationError(result, rowIndex, definition.RewardId, "DUPLICATE_REWARD_ID")
+			else
+				seenRewardIds[definition.RewardId] = true
+			end
+			if self:IsKnownTriggerType(definition.TriggerType) == false then
+				self:AddValidationError(result, rowIndex, definition.RewardId, "UNKNOWN_TRIGGER_TYPE")
+			end
+			if definition.TargetId == "" then
+				self:AddValidationError(result, rowIndex, definition.RewardId, "TARGET_ID_MISSING")
+			end
+			if self:IsNonNegativeIntegerCell(dataSet:GetCell(rowIndex, "BaseUnionPoints")) == false then
+				self:AddValidationError(result, rowIndex, definition.RewardId, "INVALID_BASE_UNION_POINTS")
+			end
+			if self:IsPositiveIntegerCell(dataSet:GetCell(rowIndex, "SortOrder")) == false then
+				self:AddValidationError(result, rowIndex, definition.RewardId, "INVALID_SORT_ORDER")
+			elseif seenSortOrders[definition.SortOrder] == true then
+				self:AddValidationError(result, rowIndex, definition.RewardId, "DUPLICATE_SORT_ORDER")
+			else
+				seenSortOrders[definition.SortOrder] = true
+			end
+		end
+		if result.CheckedRewardCount == 0 then
+			self:AddValidationError(result, 0, "", "NO_REWARD_ROWS")
+		end
+		return self:FinalizeValidation(result)
+	end
+
+	method table ConvertRow(any dataSet, integer rowIndex)
+		return {
+			Success = true,
+			Reason = "OK",
+			RewardId = dataSet:GetCell(rowIndex, "RewardId") or "",
+			TriggerType = dataSet:GetCell(rowIndex, "TriggerType") or "",
+			TargetId = dataSet:GetCell(rowIndex, "TargetId") or "",
+			BaseUnionPoints = math.floor(tonumber(dataSet:GetCell(rowIndex, "BaseUnionPoints")) or 0),
+			SortOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "SortOrder")) or 0),
+			RowIndex = rowIndex,
+			Source = "DATASET"
+		}
+	end
+
+	method boolean IsKnownTriggerType(string triggerType)
+		return triggerType == "StageClear" or triggerType == "BossClear" or triggerType == "RunClear"
+	end
+
+	method boolean IsPositiveIntegerCell(any cellValue)
+		local numericValue = tonumber(cellValue)
+		return numericValue ~= nil and numericValue > 0 and numericValue == math.floor(numericValue)
+	end
+
+	method boolean IsNonNegativeIntegerCell(any cellValue)
+		local numericValue = tonumber(cellValue)
+		return numericValue ~= nil and numericValue >= 0 and numericValue == math.floor(numericValue)
+	end
+
+	method void AddValidationError(table result, integer rowIndex, string rewardId, string detailReason)
+		table.insert(result.Errors, { DataSetName = self.RewardDataSetName, RowIndex = rowIndex, RewardId = rewardId or "", DetailReason = detailReason or "UNKNOWN" })
+	end
+
+	method table FinalizeValidation(table result)
+		local parts = {}
+		for _, item in ipairs(result.Errors) do
+			table.insert(parts, item.DataSetName .. "[" .. tostring(item.RowIndex) .. "]" .. item.RewardId .. "=" .. item.DetailReason)
+		end
+		result.ErrorCount = #result.Errors
+		result.ErrorSnapshot = table.concat(parts, "|")
+		if result.ErrorCount == 0 then
+			result.Success = true
+			result.Reason = "OK"
+			log("[UnionRewardValidation] valid rewards=" .. result.CheckedRewardCount)
+		else
+			log_error("[UnionRewardValidation] rejected errors=" .. result.ErrorCount .. " details=" .. result.ErrorSnapshot)
+		end
+		return result
+	end
+
+end

@@ -1,0 +1,149 @@
+@Logic
+script UnionBlockDefinitionRepositoryLogic extends Logic
+
+    property string BlockDataSetName = "UnionBlockDefinitions"
+
+    @ExecSpace("ServerOnly")
+    method table GetBlock(string blockId)
+        -- Returns immutable shop/ownership metadata only. No purchase or profile mutation occurs here.
+        local result = { Success = false, Reason = "UNION_BLOCK_NOT_FOUND", BlockId = blockId or "" }
+        if self:IsSafeToken(blockId) == false then
+            result.Reason = "INVALID_BLOCK_ID"
+            return result
+        end
+        local dataSet = _DataService:GetTable(self.BlockDataSetName)
+        if dataSet == nil then
+            result.Reason = "UNION_BLOCK_DATASET_MISSING"
+            return result
+        end
+        local matchCount = 0
+        for rowIndex = 1, dataSet:GetRowCount() do
+            if dataSet:GetCell(rowIndex, "BlockId") == blockId then
+                matchCount = matchCount + 1
+                if result.Success == false then result = self:ConvertBlockRow(dataSet, rowIndex) end
+            end
+        end
+        result.MatchCount = matchCount
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllBlocks()
+        local result = { Success = false, Reason = "UNION_BLOCK_DATASET_MISSING", Blocks = {}, BlockCount = 0 }
+        local dataSet = _DataService:GetTable(self.BlockDataSetName)
+        if dataSet == nil then return result end
+        for rowIndex = 1, dataSet:GetRowCount() do table.insert(result.Blocks, self:ConvertBlockRow(dataSet, rowIndex)) end
+        table.sort(result.Blocks, function(left, right)
+            if left.SortOrder == right.SortOrder then return left.BlockId < right.BlockId end
+            return left.SortOrder < right.SortOrder
+        end)
+        result.Success = true
+        result.Reason = "OK"
+        result.BlockCount = #result.Blocks
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidateDefinitions()
+        local result = { Success = false, Reason = "CONTENT_VALIDATION_FAILED", CheckedBlockCount = 0, ErrorCount = 0, Errors = {}, ErrorSnapshot = "" }
+        local shapeValidation = _UnionBlockShapeDefinitionRepositoryLogic:ValidateShapes()
+        if shapeValidation.Success == false then
+            self:AddValidationError(result, 0, "", "SHAPE_DEFINITIONS_INVALID:" .. (shapeValidation.ErrorSnapshot or shapeValidation.Reason))
+        end
+        local dataSet = _DataService:GetTable(self.BlockDataSetName)
+        if dataSet == nil then
+            self:AddValidationError(result, 0, "", "DATASET_NOT_FOUND")
+            return self:FinalizeValidation(result)
+        end
+        local seenBlockIds = {}
+        local seenSortOrders = {}
+        for rowIndex = 1, dataSet:GetRowCount() do
+            result.CheckedBlockCount = result.CheckedBlockCount + 1
+            local definition = self:ConvertBlockRow(dataSet, rowIndex)
+            local shopCostCell = dataSet:GetCell(rowIndex, "ShopCost")
+            local maxOwnedCell = dataSet:GetCell(rowIndex, "MaxOwned")
+            local sortOrderCell = dataSet:GetCell(rowIndex, "SortOrder")
+            if self:IsSafeToken(definition.BlockId) == false then
+                self:AddValidationError(result, rowIndex, definition.BlockId, "INVALID_BLOCK_ID")
+            elseif seenBlockIds[definition.BlockId] == true then
+                self:AddValidationError(result, rowIndex, definition.BlockId, "DUPLICATE_BLOCK_ID")
+            else
+                seenBlockIds[definition.BlockId] = true
+            end
+            if definition.DisplayName == "" then self:AddValidationError(result, rowIndex, definition.BlockId, "DISPLAY_NAME_MISSING") end
+            local shape = _UnionBlockShapeDefinitionRepositoryLogic:GetShape(definition.ShapeId)
+            if shape.Success == false or (shape.MatchCount or 0) ~= 1 then
+                self:AddValidationError(result, rowIndex, definition.BlockId, "MISSING_REFERENCED_SHAPE_ID")
+            end
+            if self:IsNonNegativeIntegerCell(shopCostCell) == false then
+                self:AddValidationError(result, rowIndex, definition.BlockId, tonumber(shopCostCell) ~= nil and tonumber(shopCostCell) < 0 and "NEGATIVE_SHOP_COST" or "INVALID_SHOP_COST")
+            end
+            local rank = _UnionRankDefinitionRepositoryLogic:GetDefinition(definition.RequiredUnionRank)
+            if definition.RequiredUnionRank == "" or rank.Success == false or (rank.MatchCount or 0) ~= 1 then
+                self:AddValidationError(result, rowIndex, definition.BlockId, "INVALID_REQUIRED_UNION_RANK")
+            end
+            if self:IsPositiveIntegerCell(maxOwnedCell) == false then self:AddValidationError(result, rowIndex, definition.BlockId, "INVALID_MAX_OWNED") end
+            if self:IsPositiveIntegerCell(sortOrderCell) == false then
+                self:AddValidationError(result, rowIndex, definition.BlockId, "INVALID_SORT_ORDER")
+            elseif seenSortOrders[definition.SortOrder] == true then
+                self:AddValidationError(result, rowIndex, definition.BlockId, "DUPLICATE_SORT_ORDER")
+            else
+                seenSortOrders[definition.SortOrder] = true
+            end
+        end
+        if result.CheckedBlockCount == 0 then self:AddValidationError(result, 0, "", "NO_BLOCK_ROWS") end
+        return self:FinalizeValidation(result)
+    end
+
+    method table ConvertBlockRow(any dataSet, integer rowIndex)
+        return {
+            Success = true,
+            Reason = "OK",
+            BlockId = dataSet:GetCell(rowIndex, "BlockId") or "",
+            DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+            ShapeId = dataSet:GetCell(rowIndex, "ShapeId") or "",
+            ShopCost = math.floor(tonumber(dataSet:GetCell(rowIndex, "ShopCost")) or 0),
+            RequiredUnionRank = dataSet:GetCell(rowIndex, "RequiredUnionRank") or "",
+            MaxOwned = math.floor(tonumber(dataSet:GetCell(rowIndex, "MaxOwned")) or 0),
+            SortOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "SortOrder")) or 0),
+            RowIndex = rowIndex,
+            Source = "DATASET"
+        }
+    end
+
+    method boolean IsPositiveIntegerCell(any cellValue)
+        local numeric = tonumber(cellValue)
+        return numeric ~= nil and numeric > 0 and numeric == math.floor(numeric)
+    end
+
+    method boolean IsNonNegativeIntegerCell(any cellValue)
+        local numeric = tonumber(cellValue)
+        return numeric ~= nil and numeric >= 0 and numeric == math.floor(numeric)
+    end
+
+    method boolean IsSafeToken(string value)
+        return value ~= nil and value ~= "" and string.match(value, "^[%w_]+$") ~= nil
+    end
+
+    method void AddValidationError(table result, integer rowIndex, string blockId, string detailReason)
+        table.insert(result.Errors, { DataSetName = self.BlockDataSetName, RowIndex = rowIndex, BlockId = blockId or "", DetailReason = detailReason or "UNKNOWN" })
+    end
+
+    method table FinalizeValidation(table result)
+        local parts = {}
+        for _, item in ipairs(result.Errors) do
+            table.insert(parts, item.DataSetName .. "[" .. tostring(item.RowIndex) .. "]" .. item.BlockId .. "=" .. item.DetailReason)
+        end
+        result.ErrorCount = #result.Errors
+        result.ErrorSnapshot = table.concat(parts, "|")
+        if result.ErrorCount == 0 then
+            result.Success = true
+            result.Reason = "OK"
+            log("[UnionBlockValidation] valid blocks=" .. result.CheckedBlockCount)
+        else
+            log_error("[UnionBlockValidation] rejected errors=" .. result.ErrorCount .. " details=" .. result.ErrorSnapshot)
+        end
+        return result
+    end
+
+end

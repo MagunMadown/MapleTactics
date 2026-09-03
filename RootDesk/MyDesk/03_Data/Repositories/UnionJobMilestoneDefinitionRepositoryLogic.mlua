@@ -1,0 +1,284 @@
+@Logic
+script UnionJobMilestoneDefinitionRepositoryLogic extends Logic
+
+    property string DataSetName = "UnionJobMilestoneDefinitions"
+
+    @ExecSpace("ServerOnly")
+    method table GetMilestone(string milestoneId)
+        local result = { Success = false, Reason = "UNION_JOB_MILESTONE_NOT_FOUND", MilestoneId = milestoneId or "", MatchCount = 0 }
+        if milestoneId == nil or milestoneId == "" then
+            result.Reason = "INVALID_MILESTONE_ID"
+            return result
+        end
+        local dataSet = _DataService:GetTable(self.DataSetName)
+        if dataSet == nil then
+            result.Reason = "UNION_JOB_MILESTONE_DATASET_MISSING"
+            return result
+        end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            if dataSet:GetCell(rowIndex, "MilestoneId") == milestoneId then
+                result.MatchCount = result.MatchCount + 1
+                if result.Success == false then
+                    result = self:ConvertRow(dataSet, rowIndex)
+                    result.MatchCount = 1
+                end
+            end
+        end
+        if result.MatchCount > 1 then
+            result.Success = false
+            result.Reason = "AMBIGUOUS_UNION_JOB_MILESTONE_ID"
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllMilestones()
+        local result = { Success = false, Reason = "UNION_JOB_MILESTONE_DATASET_MISSING", Milestones = {}, MilestoneCount = 0 }
+        local dataSet = _DataService:GetTable(self.DataSetName)
+        if dataSet == nil then
+            return result
+        end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            table.insert(result.Milestones, self:ConvertRow(dataSet, rowIndex))
+        end
+        table.sort(result.Milestones, function(left, right)
+            if left.SortOrder == right.SortOrder then
+                return left.MilestoneId < right.MilestoneId
+            end
+            return left.SortOrder < right.SortOrder
+        end)
+        result.Success = true
+        result.Reason = "OK"
+        result.MilestoneCount = #result.Milestones
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ResolveMilestone(string targetType, string targetId, string nodeGraphId, string worldMapBranch)
+        -- Resolves only implemented definitions from server-owned result context.
+        local result = {
+            Success = true,
+            Reason = "NO_UNION_JOB_MILESTONE",
+            MatchCount = 0,
+            TargetType = targetType or "",
+            TargetId = targetId or "",
+            RequiredNodeGraphId = nodeGraphId or "",
+            RequiredWorldMapBranch = worldMapBranch or ""
+        }
+        if targetType == nil or targetType == "" or targetId == nil or targetId == "" then
+            result.Success = false
+            result.Reason = "INVALID_UNION_JOB_MILESTONE_TARGET"
+            return result
+        end
+        local allMilestones = self:GetAllMilestones()
+        if allMilestones.Success == false then
+            return allMilestones
+        end
+        local matched = nil
+        for _, milestone in ipairs(allMilestones.Milestones) do
+            if milestone.IsImplemented == true
+                and milestone.TargetType == targetType
+                and milestone.TargetId == targetId
+                and (milestone.RequiredNodeGraphId == "" or milestone.RequiredNodeGraphId == (nodeGraphId or ""))
+                and (milestone.RequiredWorldMapBranch == "" or milestone.RequiredWorldMapBranch == (worldMapBranch or "")) then
+                result.MatchCount = result.MatchCount + 1
+                matched = milestone
+            end
+        end
+        if result.MatchCount > 1 then
+            return {
+                Success = false,
+                Reason = "AMBIGUOUS_UNION_JOB_MILESTONE_TARGET",
+                MatchCount = result.MatchCount,
+                TargetType = targetType,
+                TargetId = targetId
+            }
+        end
+        if matched == nil then
+            return result
+        end
+        matched.MatchCount = 1
+        return matched
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetProgressValue(string milestoneId)
+        local milestone = self:GetMilestone(milestoneId)
+        if milestone.Success == false then
+            return milestone
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            MilestoneId = milestone.MilestoneId,
+            ProgressValue = milestone.ProgressValue,
+            GradeId = milestone.GradeId,
+            IsImplemented = milestone.IsImplemented
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidateDefinitions()
+        local result = {
+            Success = false,
+            Reason = "CONTENT_VALIDATION_FAILED",
+            CheckedMilestoneCount = 0,
+            ImplementedMilestoneCount = 0,
+            ErrorCount = 0,
+            Errors = {},
+            ErrorSnapshot = ""
+        }
+        local dataSet = _DataService:GetTable(self.DataSetName)
+        if dataSet == nil then
+            self:AddValidationError(result, 0, "", "DATASET_NOT_FOUND")
+            return self:FinalizeValidation(result)
+        end
+        local seenMilestoneIds = {}
+        local seenSortOrders = {}
+        local implementedSelectors = {}
+        for rowIndex = 1, dataSet:GetRowCount() do
+            result.CheckedMilestoneCount = result.CheckedMilestoneCount + 1
+            local milestone = self:ConvertRow(dataSet, rowIndex)
+            if milestone.MilestoneId == "" then
+                self:AddValidationError(result, rowIndex, milestone.MilestoneId, "INVALID_MILESTONE_ID")
+            elseif seenMilestoneIds[milestone.MilestoneId] == true then
+                self:AddValidationError(result, rowIndex, milestone.MilestoneId, "DUPLICATE_MILESTONE_ID")
+            else
+                seenMilestoneIds[milestone.MilestoneId] = true
+            end
+            if self:IsPositiveIntegerCell(dataSet:GetCell(rowIndex, "ProgressValue")) == false or milestone.ProgressValue > 5 then
+                self:AddValidationError(result, rowIndex, milestone.MilestoneId, "INVALID_PROGRESS_VALUE")
+            end
+            if milestone.TargetType ~= "RUN_NODE_CLEAR" then
+                self:AddValidationError(result, rowIndex, milestone.MilestoneId, "INVALID_TARGET_TYPE")
+            end
+            if self:IsBooleanCell(dataSet:GetCell(rowIndex, "IsImplemented")) == false then
+                self:AddValidationError(result, rowIndex, milestone.MilestoneId, "INVALID_IS_IMPLEMENTED")
+            end
+            if self:IsPositiveIntegerCell(dataSet:GetCell(rowIndex, "SortOrder")) == false then
+                self:AddValidationError(result, rowIndex, milestone.MilestoneId, "INVALID_SORT_ORDER")
+            elseif seenSortOrders[milestone.SortOrder] == true then
+                self:AddValidationError(result, rowIndex, milestone.MilestoneId, "DUPLICATE_SORT_ORDER")
+            else
+                seenSortOrders[milestone.SortOrder] = true
+            end
+            local grade = _UnionJobGradeDefinitionRepositoryLogic:GetGrade(milestone.GradeId)
+            if grade.Success == false then
+                self:AddValidationError(result, rowIndex, milestone.MilestoneId, "INVALID_GRADE_ID")
+            elseif grade.RequiredJobProgress ~= milestone.ProgressValue then
+                self:AddValidationError(result, rowIndex, milestone.MilestoneId, "PROGRESS_GRADE_THRESHOLD_MISMATCH")
+            end
+            if milestone.IsImplemented == true then
+                result.ImplementedMilestoneCount = result.ImplementedMilestoneCount + 1
+                if milestone.TargetId == "" then
+                    self:AddValidationError(result, rowIndex, milestone.MilestoneId, "IMPLEMENTED_TARGET_ID_MISSING")
+                end
+                if milestone.RequiredNodeGraphId == "" then
+                    self:AddValidationError(result, rowIndex, milestone.MilestoneId, "IMPLEMENTED_NODE_GRAPH_ID_MISSING")
+                end
+                local selectorKey = milestone.TargetType .. "|" .. milestone.TargetId .. "|" .. milestone.RequiredNodeGraphId .. "|" .. milestone.RequiredWorldMapBranch
+                if implementedSelectors[selectorKey] == true then
+                    self:AddValidationError(result, rowIndex, milestone.MilestoneId, "DUPLICATE_TARGET_MAPPING")
+                else
+                    implementedSelectors[selectorKey] = true
+                end
+                local node = _NodeDefinitionRepositoryLogic:GetNodeDefinition(milestone.RequiredNodeGraphId, milestone.TargetId)
+                if node.Success == false or (node.NodeType ~= "BATTLE" and node.NodeType ~= "BOSS") then
+                    self:AddValidationError(result, rowIndex, milestone.MilestoneId, "TARGET_RUN_NODE_NOT_FOUND")
+                end
+                if milestone.RequiredWorldMapBranch ~= "" and milestone.RequiredWorldMapBranch ~= "UPPER" and milestone.RequiredWorldMapBranch ~= "LOWER" then
+                    self:AddValidationError(result, rowIndex, milestone.MilestoneId, "INVALID_REQUIRED_WORLD_MAP_BRANCH")
+                end
+            end
+        end
+        self:ValidateSelectorAmbiguity(result)
+        return self:FinalizeValidation(result)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ValidateSelectorAmbiguity(table result)
+        local allMilestones = self:GetAllMilestones()
+        if allMilestones.Success == false then
+            return
+        end
+        for leftIndex = 1, #allMilestones.Milestones do
+            local left = allMilestones.Milestones[leftIndex]
+            if left.IsImplemented == true then
+                for rightIndex = leftIndex + 1, #allMilestones.Milestones do
+                    local right = allMilestones.Milestones[rightIndex]
+                    if right.IsImplemented == true
+                        and left.TargetType == right.TargetType
+                        and left.TargetId == right.TargetId
+                        and left.RequiredNodeGraphId == right.RequiredNodeGraphId
+                        and (left.RequiredWorldMapBranch == "" or right.RequiredWorldMapBranch == "" or left.RequiredWorldMapBranch == right.RequiredWorldMapBranch) then
+                        self:AddValidationError(result, right.RowIndex, right.MilestoneId, "AMBIGUOUS_TARGET_MAPPING")
+                    end
+                end
+            end
+        end
+    end
+
+    method table ConvertRow(any dataSet, integer rowIndex)
+        return {
+            Success = true,
+            Reason = "OK",
+            MilestoneId = dataSet:GetCell(rowIndex, "MilestoneId") or "",
+            ProgressValue = math.floor(tonumber(dataSet:GetCell(rowIndex, "ProgressValue")) or 0),
+            GradeId = dataSet:GetCell(rowIndex, "GradeId") or "",
+            DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+            TargetType = dataSet:GetCell(rowIndex, "TargetType") or "",
+            TargetId = dataSet:GetCell(rowIndex, "TargetId") or "",
+            RequiredNodeGraphId = dataSet:GetCell(rowIndex, "RequiredNodeGraphId") or "",
+            RequiredWorldMapBranch = dataSet:GetCell(rowIndex, "RequiredWorldMapBranch") or "",
+            IsImplemented = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "IsImplemented")),
+            SortOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "SortOrder")) or 0),
+            RowIndex = rowIndex,
+            Source = "DATASET"
+        }
+    end
+
+    method boolean ParseBooleanCell(any cellValue)
+        if cellValue == true then return true end
+        if cellValue == nil or cellValue == false then return false end
+        local normalized = string.lower(tostring(cellValue))
+        return normalized == "true" or normalized == "1"
+    end
+
+    method boolean IsBooleanCell(any cellValue)
+        if cellValue == true or cellValue == false then return true end
+        local normalized = string.lower(tostring(cellValue or ""))
+        return normalized == "true" or normalized == "false" or normalized == "1" or normalized == "0"
+    end
+
+    method boolean IsPositiveIntegerCell(any cellValue)
+        local numericValue = tonumber(cellValue)
+        return numericValue ~= nil and numericValue > 0 and numericValue == math.floor(numericValue)
+    end
+
+    method void AddValidationError(table result, integer rowIndex, string milestoneId, string detailReason)
+        table.insert(result.Errors, {
+            DataSetName = self.DataSetName,
+            RowIndex = rowIndex,
+            MilestoneId = milestoneId or "",
+            DetailReason = detailReason or "UNKNOWN"
+        })
+    end
+
+    method table FinalizeValidation(table result)
+        local parts = {}
+        for _, item in ipairs(result.Errors) do
+            table.insert(parts, item.DataSetName .. "[" .. tostring(item.RowIndex) .. "]" .. item.MilestoneId .. "=" .. item.DetailReason)
+        end
+        result.ErrorCount = #result.Errors
+        result.ErrorSnapshot = table.concat(parts, "|")
+        if result.ErrorCount == 0 then
+            result.Success = true
+            result.Reason = "OK"
+            log("[UnionJobMilestoneValidation] valid milestones=" .. tostring(result.CheckedMilestoneCount) .. " implemented=" .. tostring(result.ImplementedMilestoneCount))
+        else
+            log_error("[UnionJobMilestoneValidation] rejected errors=" .. tostring(result.ErrorCount) .. " details=" .. result.ErrorSnapshot)
+        end
+        return result
+    end
+
+end
