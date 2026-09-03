@@ -1518,3 +1518,11 @@ The queue component has one `RequestMoveQueuedTile` call and zero `RequestSlotSk
 
 - User-directed adjustment: the empty reservation frame is hidden during ordinary play and appears only after a bottom skill crosses the drag threshold.
 - Maker mouse verification passed for idle-hidden, drag-visible, outside-drop-hidden, and successful-reservation occupied-only states. Existing occupied queued skills remain visible so queue reorder is still available.
+
+#### Post-STEP 11 repeated-direction preview fix — 2026-09-03
+
+- Root cause: `QueuePreviewTargetIndex` could retain the previous successful insertion index. A later gesture aimed at the same index was incorrectly treated as an unchanged preview target, so the bottom-to-top shift animation could be skipped.
+- Each queued-item drag now clears the cached preview target before sampling its own source/target pair. Authoritative success also clears the cache.
+- Mouse-up applies the final release-point target once before validation and submission, covering fast upward releases that occur before the last drag sample.
+- Maker verification forced a stale target of 2, then performed a real QueueIndex 1 to 2 drag. Logs showed fresh preview samples `1 -> 1 -> 2`, an authoritative success at revision 3, and the held-drag screenshot showed the neighboring item shifted before release.
+- The reverse QueueIndex 2 to 1 drag then succeeded at revision 4. Both directions remained turn-free, and the Build Console and runtime error counts were zero.
