@@ -12,6 +12,10 @@ script EnemyIntentHudComponent extends Component
 	property boolean UseStaticSkillThumbnail = true
 	property number QueueOffsetX = 0
 	property number QueueOffsetY = 112
+	-- Distance from the head marker to the FIRST queue slot's center. Slots are 76px tall and
+	-- centre-pivoted, so anything below ~38 puts the slot's lower half back over the sprite.
+	property number QueueGapAboveHead = 66
+	property string HeadMarkerChildName = "BattleHpText"
 	property number QueueSlotSpacing = 84
 	property number SkillIconOffsetX = 0
 	property number SkillIconOffsetY = 0
@@ -75,7 +79,12 @@ script EnemyIntentHudComponent extends Component
 				local view = self:GetOrCreateEnemyView(intent.UnitId, enemyEntity)
 				if isvalid(view) then
 					self._T.ActiveEnemyIds[intent.UnitId] = true
-					self:ApplyEnemyIntent(view, intent)
+					local record = self._T.EnemyViews[intent.UnitId]
+					local headOffsetUiY = 0
+					if record ~= nil and record.HeadOffsetUiY ~= nil then
+						headOffsetUiY = record.HeadOffsetUiY
+					end
+					self:ApplyEnemyIntent(view, intent, headOffsetUiY)
 				end
 			end
 			if intent.IsAttackReady == true or intent.TelegraphKind == "BOSS_LANDING" or intent.TelegraphKind == "CHARGE_LINE" or intent.TelegraphKind == "SKILL_AREA" then
@@ -110,6 +119,9 @@ script EnemyIntentHudComponent extends Component
 		local record = self._T.EnemyViews[unitId]
 		if record ~= nil and isvalid(record.View) then
 			record.Enemy = enemyEntity
+			if isvalid(record.HeadMarker) == false then
+				record.HeadMarker = self:ResolveHeadMarker(enemyEntity)
+			end
 			return record.View
 		end
 		if isvalid(self.EnemyIntentTemplate) == false then
@@ -117,13 +129,39 @@ script EnemyIntentHudComponent extends Component
 		end
 		local view = self.EnemyIntentTemplate:Clone("EnemyIntent_" .. unitId)
 		view.Enable = true
-		self._T.EnemyViews[unitId] = { View = view, Enemy = enemyEntity }
+		self._T.EnemyViews[unitId] = {
+			View = view,
+			Enemy = enemyEntity,
+			HeadMarker = self:ResolveHeadMarker(enemyEntity),
+			HeadOffsetUiY = 0
+		}
 		return view
 	end
 
 	@ExecSpace("ClientOnly")
-	method void ApplyEnemyIntent(Entity view, table intent)
+	method Entity ResolveHeadMarker(Entity enemyEntity)
+		-- Every monster model carries a BattleHpText child authored at that monster's head
+		-- height, so it doubles as the per-monster overhead anchor for this HUD.
+		if isvalid(enemyEntity) == false then
+			return nil
+		end
+		local marker = enemyEntity:GetChildByName(self.HeadMarkerChildName, false)
+		if isvalid(marker) then
+			log("[EnemyIntentHUD] head anchor resolved enemy=" .. tostring(enemyEntity.Name) .. " marker=" .. self.HeadMarkerChildName .. " localY=" .. tostring(marker.TransformComponent.Position.y))
+		else
+			log_warning("[EnemyIntentHUD] head anchor missing enemy=" .. tostring(enemyEntity.Name) .. " marker=" .. self.HeadMarkerChildName .. " reason=FALLBACK_TO_FIXED_OFFSET")
+		end
+		return marker
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyEnemyIntent(Entity view, table intent, number headOffsetUiY)
+		-- Stacks the queue above the monster's head marker so the icons never cover the sprite.
 		view.Enable = true
+		local queueBaseY = self.QueueOffsetY
+		if headOffsetUiY > 0 then
+			queueBaseY = headOffsetUiY + self.QueueGapAboveHead
+		end
 		local queuedIds = self:SplitTokens(intent.QueuedTileIds or "")
 		local queuedIconRuids = self:SplitTokens(intent.QueuedIconRuids or "")
 		for slotIndex = 1, 3 do
@@ -131,7 +169,7 @@ script EnemyIntentHudComponent extends Component
 			local tileId = queuedIds[slotIndex] or ""
 			if isvalid(slot) then
 				slot.Enable = tileId ~= ""
-				slot.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, self.QueueOffsetY + (slotIndex - 1) * self.QueueSlotSpacing)
+				slot.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, queueBaseY + (slotIndex - 1) * self.QueueSlotSpacing)
 				self:ApplyQueueSlotColor(slot, intent.State)
 				local icon = slot:GetChildByName("SkillIcon")
 				if isvalid(icon) and icon.SpriteGUIRendererComponent ~= nil and tileId ~= "" then
@@ -150,11 +188,11 @@ script EnemyIntentHudComponent extends Component
 		local readyLabel = view:GetChildByName("ReadyLabel")
 		if isvalid(readyBadge) then
 			readyBadge.Enable = intent.IsAttackReady == true
-			readyBadge.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, self.QueueOffsetY + 54 + math.max(0, #queuedIds - 1) * self.QueueSlotSpacing)
+			readyBadge.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, queueBaseY + 54 + math.max(0, #queuedIds - 1) * self.QueueSlotSpacing)
 		end
 		if isvalid(readyLabel) then
 			readyLabel.Enable = intent.IsAttackReady == true
-			readyLabel.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, self.QueueOffsetY + 54 + math.max(0, #queuedIds - 1) * self.QueueSlotSpacing)
+			readyLabel.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, queueBaseY + 54 + math.max(0, #queuedIds - 1) * self.QueueSlotSpacing)
 		end
 		local moveArrow = view:GetChildByName("MoveArrow")
 		if isvalid(moveArrow) and moveArrow.TextGUIRendererComponent ~= nil then
@@ -260,12 +298,23 @@ script EnemyIntentHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void UpdateViewPositions(any session)
+		-- Tracks each enemy and measures how far above its origin the head marker sits, in UI
+		-- pixels, so the queue can clear sprites of any height at the current camera zoom.
 		for _, record in pairs(self._T.EnemyViews or {}) do
 			if record ~= nil and isvalid(record.View) and isvalid(record.Enemy) and record.Enemy.TransformComponent ~= nil then
 				local worldPosition = record.Enemy.TransformComponent.WorldPosition
 				local screenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y))
 				local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
 				record.View.UITransformComponent.anchoredPosition = uiPosition
+
+				local headOffsetUiY = 0
+				if isvalid(record.HeadMarker) and record.HeadMarker.TransformComponent ~= nil then
+					local headWorldPosition = record.HeadMarker.TransformComponent.WorldPosition
+					local headScreenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, headWorldPosition.y))
+					local headUiPosition = _UILogic:ScreenToUIPosition(headScreenPosition)
+					headOffsetUiY = headUiPosition.y - uiPosition.y
+				end
+				record.HeadOffsetUiY = headOffsetUiY
 			end
 		end
 	end
