@@ -235,23 +235,70 @@ script UnionStatAllocationServiceLogic extends Logic
         return table.concat(parts, ";")
     end
 
+    method table CalculateUnionCoinRefund(table allocationMap)
+        -- Rebuilds the refund exclusively from authoritative level definitions.
+        local definitions = _UnionStatDefinitionRepositoryLogic:GetAllStats()
+        if definitions.Success == false then
+            return { Success = false, Reason = definitions.Reason or "UNION_STAT_DEFINITIONS_UNAVAILABLE", RefundedUnionCoins = 0 }
+        end
+        local totalRefund = 0
+        for _, definition in ipairs(definitions.Stats or {}) do
+            local purchasedLevel = math.floor(tonumber(allocationMap ~= nil and allocationMap[definition.StatId] or 0) or 0)
+            for level = 1, purchasedLevel do
+                local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, level)
+                if levelDefinition.Success == false then
+                    return {
+                        Success = false,
+                        Reason = levelDefinition.Reason or "UNION_STAT_LEVEL_NOT_FOUND",
+                        StatId = definition.StatId,
+                        Level = level,
+                        RefundedUnionCoins = 0
+                    }
+                end
+                local coinCost = math.floor(tonumber(levelDefinition.CoinCost) or 0)
+                if coinCost <= 0 then
+                    return {
+                        Success = false,
+                        Reason = "INVALID_UNION_COIN_COST",
+                        StatId = definition.StatId,
+                        Level = level,
+                        RefundedUnionCoins = 0
+                    }
+                end
+                totalRefund = totalRefund + coinCost
+            end
+        end
+        return { Success = true, Reason = "OK", RefundedUnionCoins = totalRefund }
+    end
+
     @ExecSpace("ServerOnly")
     method table CanResetUnionStats(Entity userEntity)
-        -- Permanent Coin purchases cannot be reset through the former free-allocation API.
-        return { Success = false, CanReset = false, Reason = "COIN_UPGRADE_ONLY" }
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            profileResult.CanReset = false
+            return profileResult
+        end
+        local refund = self:CalculateUnionCoinRefund(profileResult.Profile.AllocatedUnionStats)
+        if refund.Success == false then
+            refund.CanReset = false
+            return refund
+        end
+        refund.CanReset = refund.RefundedUnionCoins > 0
+        refund.Reason = refund.CanReset and "OK" or "UNION_STATS_ALREADY_RESET"
+        return refund
     end
 
     @ExecSpace("ServerOnly")
     method table TryResetUnionStats(Entity userEntity, string requestId)
-        -- Permanent Coin purchases cannot be reset through the former free-allocation API.
-        return { Success = false, Reason = "COIN_UPGRADE_ONLY", WasReset = false }
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return self:TryResetUnionStatsByStorageKey(profileResult.StorageUserKey, requestId)
     end
 
     @ExecSpace("ServerOnly")
     method table TryResetUnionStatsByStorageKey(string storageUserKey, string requestId)
-        -- Rejects internal callers of the retired free-reset path as well.
-        return { Success = false, Reason = "COIN_UPGRADE_ONLY", WasReset = false }
-        --[[
         local profile = _UnionProfileRepositoryLogic:GetCachedSnapshot(storageUserKey)
         if profile == nil then
             return { Success = false, Reason = "PROFILE_CACHE_MISSING", WasReset = false }
@@ -280,10 +327,9 @@ script UnionStatAllocationServiceLogic extends Logic
             self:StoreMutationReceipt(storageUserKey, requestId, "RESET", "", mutation)
         end
         if mutation.Success == true then
-            log("[UnionStatAllocation] free reset committed request=" .. requestId .. " changed=" .. tostring(mutation.WasReset == true))
+            log("[UnionCoinReset] committed request=" .. requestId .. " changed=" .. tostring(mutation.WasReset == true) .. " refunded=" .. tostring(mutation.RefundedUnionCoins or 0) .. " remaining=" .. tostring(mutation.RemainingUnionCoins or 0))
         end
         return mutation
-        ]]
     end
 
     @ExecSpace("ServerOnly")
@@ -565,7 +611,8 @@ script UnionStatAllocationServiceLogic extends Logic
             PreviousLevel = result.PreviousLevel or 0,
             NewLevel = result.NewLevel or 0,
             RequiredCoinCost = result.RequiredCoinCost or 0,
-            RemainingUnionCoins = result.RemainingUnionCoins or 0
+            RemainingUnionCoins = result.RemainingUnionCoins or 0,
+            RefundedUnionCoins = result.RefundedUnionCoins or 0
         }
         while #order > self.RequestReceiptRetention do
             local expiredRequestId = table.remove(order, 1)
@@ -597,6 +644,7 @@ script UnionStatAllocationServiceLogic extends Logic
             NewLevel = receipt.NewLevel,
             RequiredCoinCost = receipt.RequiredCoinCost,
             RemainingUnionCoins = receipt.RemainingUnionCoins,
+            RefundedUnionCoins = receipt.RefundedUnionCoins,
             Snapshot = snapshotResult.Snapshot
         }
     end

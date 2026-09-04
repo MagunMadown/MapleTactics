@@ -381,7 +381,7 @@ script UnionProfileRepositoryLogic extends Logic
 
     @ExecSpace("ServerOnly")
     method table TryResetAllocatedUnionStatsByStorageKey(string storageUserKey)
-        -- Reset is free and replaces only AllocatedUnionStats; Union Coin and PurchasedLevels are untouched.
+        -- Refunds every server-priced purchased level and clears the allocation in one persisted mutation.
         if storageUserKey == nil or storageUserKey == "" then
             return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING", WasReset = false }
         end
@@ -408,9 +408,19 @@ script UnionProfileRepositoryLogic extends Logic
                 Reason = "UNION_STATS_ALREADY_RESET",
                 WasReset = false,
                 WasWritten = false,
+                RefundedUnionCoins = 0,
+                RemainingUnionCoins = candidate.UnionPoints,
                 Snapshot = candidate
             }
         end
+        local refund = _UnionStatAllocationServiceLogic:CalculateUnionCoinRefund(candidate.AllocatedUnionStats)
+        if refund.Success == false then
+            self:ReleaseMutationLock(storageUserKey)
+            refund.WasReset = false
+            refund.Snapshot = candidate
+            return refund
+        end
+        candidate.UnionPoints = math.floor(tonumber(candidate.UnionPoints) or 0) + refund.RefundedUnionCoins
         candidate.AllocatedUnionStats = {}
         local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
         self:ReleaseMutationLock(storageUserKey)
@@ -421,15 +431,18 @@ script UnionProfileRepositoryLogic extends Logic
                 DetailReason = persisted.DetailReason or "",
                 ErrorCode = persisted.ErrorCode or 0,
                 WasReset = false,
+                RefundedUnionCoins = 0,
                 Snapshot = self:GetCachedSnapshot(storageUserKey)
             }
         end
-        log("[UnionStatAllocation] persisted free reset cleared=" .. tostring(previousAllocationCount))
+        log("[UnionCoinReset] persisted cleared=" .. tostring(previousAllocationCount) .. " refunded=" .. tostring(refund.RefundedUnionCoins) .. " remaining=" .. tostring(candidate.UnionPoints))
         return {
             Success = true,
             Reason = "UNION_STATS_RESET",
             WasReset = true,
             WasWritten = persisted.WasWritten == true,
+            RefundedUnionCoins = refund.RefundedUnionCoins,
+            RemainingUnionCoins = candidate.UnionPoints,
             Snapshot = self:CloneProfile(candidate)
         }
     end
