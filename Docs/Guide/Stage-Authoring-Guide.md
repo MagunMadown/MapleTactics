@@ -87,6 +87,24 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 기본 피해는 1, HP는 2다. 모든 직업의 기본 시작 공격 피해가 2 이상이므로 초반에는 스킬
 한 번으로 처치할 수 있다. `EnemySpawnPools.Weight`를 낮게 두어 원거리 압박이 과해지지 않게 한다.
 
+커닝시티(`region_Kerning_City`) 전투 Stage는 다음처럼 분리돼 있다.
+
+| Stage | 물리 맵 | Wave 수 | 기본 구성 |
+|---|---|---:|---|
+| `region_kerning_stage_01` | `kerning_city_battle` | 3 | 스티치 5 (2+2+1) |
+| `region_kerning_stage_02` | `kerning_city_battle` | 3 | 스티치 2 → 주니어 레이스 2 → 레이스 1 |
+| `region_kerning_stage_03` | `kerning_city_battle` | 3 | 주니어 레이스 2 → 레이스 2 → 레이스 1 |
+| `region_kerning_stage_04` | `kerning_city_boss` | 2 | 보스 다일 1, `StageType=BOSS`, Phase 2 전환 시 리게이터 2 증원 |
+
+일반 3단계는 Wave당 최대 2마리씩 `TURN_LIMIT`(3턴)으로 나누어 투입하고 `MaxConcurrent=2`로
+동시 등장을 제한한다. 마릿수를 정확히 맞춰야 하므로 가중치 혼합 Pool 대신 **적 1종만 담은
+전용 Pool**(`region_kerning_stirge_pool` / `_jr_wraith_pool` / `_wraith_pool`)을 Wave별로 지정한다.
+가중치 Pool은 어떤 적이 몇 마리 나올지 보장하지 못한다.
+
+커닝시티 적은 모두 전용 `EnemyDefinitions`와 `RootDesk/MyDesk/Models/Monsters/Kerning*.model`을
+사용하며 헤네시스 적을 재사용하지 않는다. 보스 규칙은
+[Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)를 따른다.
+
 Node/REST 연결은 별도 제작 영역이다. Stage 행을 추가하는 작업에서 다른 팀이 소유한
 `NodeDefinitions.NextNodeIds`나 REST/상점 Node를 임의로 변경하지 않는다.
 

@@ -112,3 +112,34 @@ Session에 특정 스킬 ID 분기를 추가하지 않는다. 실행은 항상 �
 `EXECUTE_TILE`을 `ConditionType=ALWAYS`로 작성하면 사거리 밖에서도 공격 Tile을 먼저 등록하는
 사거리 추적형 공격 주기를 사용한다. 실제 준비 가능 거리는 Skill의 `TargetingType`, `Range`,
 `TargetOffsets`로 판정하므로 Pattern CSV에 같은 거리 숫자를 중복 작성하지 않는다.
+
+## 7. 이동 연출 클립은 적 Model에서 지정한다
+
+`BattleSessionComponent.EnemyHopAnimationRuid`의 기본값은 주황버섯 animationclip
+(`6df12df0c9ce4caea61385606a4d40d3`)이며 **모든 적이 공유한다**. 이 값을 그대로 두면 이동
+Hop 동안 `SpriteRUID`가 주황버섯 클립으로 교체됐다가 복구되므로, 주황버섯이 아닌 적은 이동할
+때마다 주황버섯이 스쳐 보인다. 로그에는 오류가 남지 않는다.
+
+새 적을 만들 때는 해당 적의 `.model`에 `script.BattleUnitPresentationComponent`를 포함하고
+다음 값을 설정한다. `BattleSessionComponent`는 모델에 이미 붙어 있는 presentation 컴포넌트를
+재사용하므로 전투 코어를 수정할 필요가 없다.
+
+| 값 | 설정 |
+|---|---|
+| `UseCustomMoveHopProfile` | `true` |
+| `CustomMoveHopEnabled` | `true` |
+| `CustomMoveHopAnimationRuid` | 해당 적 리소스 팩의 `move` 클립 RUID |
+| `CustomMoveHopAnimationPlayRate` | `1.8` |
+| `CustomMoveHopDuration` / `Height` | `0.12` / `0.06` |
+| `CustomMoveHopTakeoffDuration` / `LandingDuration` | `0.02` / `0.04` |
+| `CustomMoveHopSquashScale` / `LandingScale` | `(1.04, 0.95)` / `(1.06, 0.93)` |
+| `CustomMoveHopPeakProgress` | `0.50` |
+
+`UseCustomMoveHopProfile=true`는 RUID뿐 아니라 Hop 타이밍 값 전체를 커스텀 값으로 대체하므로,
+위 수치는 Session의 `Enemy*` 기본값과 같게 두어 연출 감각을 유지한다.
+
+검증은 `[MoveHopAnimation] started ... kind=SPRITE ruid=<적의 move 클립>`과 뒤이은
+`restored ... ruid=<적의 stand 클립>` 로그로 확인한다. Hop은 0.12초라 스크린샷으로는 잡히지 않는다.
+
+커닝시티 적 5종에는 적용돼 있다. Region 4(페리온·발굴지) 적 4종은 아직 미적용이라 이동 시
+주황버섯이 보인다.
