@@ -12,7 +12,7 @@ script UnionStatAllocationServiceLogic extends Logic
     method void OnBeginPlay()
         local validation = self:EnsureDefinitionsValid()
         if validation.Success == true then
-            log("[UnionStatAllocation] service ready")
+            log("[UnionStatAllocation] coin upgrade service ready")
         else
             log_error("[UnionStatAllocation] service unavailable reason=" .. (validation.Reason or "UNKNOWN"))
         end
@@ -47,7 +47,7 @@ script UnionStatAllocationServiceLogic extends Logic
 
     @ExecSpace("ServerOnly")
     method table TryIncreaseUnionStat(Entity userEntity, string statId, string requestId)
-        -- The client supplies intent only. Cost, next level, rank, and available points are resolved twice on the server.
+        -- The client supplies intent only. Coin cost, next level, rank, and balance are resolved twice on the server.
         local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
         if profileResult.Success == false then
             return profileResult
@@ -99,21 +99,22 @@ script UnionStatAllocationServiceLogic extends Logic
             self:StoreMutationReceipt(storageUserKey, requestId, "INCREASE", statId or "", mutation)
         end
         if mutation.Success == true then
-            log("[UnionStatAllocation] increase committed stat=" .. statId .. " level=" .. tostring(mutation.NewLevel) .. " request=" .. requestId)
+            log("[UnionCoinUpgrade] committed stat=" .. statId .. " level=" .. tostring(mutation.NewLevel) .. " cost=" .. tostring(mutation.RequiredCoinCost or 0) .. " remaining=" .. tostring(mutation.RemainingUnionCoins or 0) .. " request=" .. requestId)
         end
         return mutation
     end
 
     @ExecSpace("ServerOnly")
     method table TryApplyUnionStatAllocation(Entity userEntity, table allocationMap, string requestId)
-        -- Applies one complete allocation intent. The client never supplies totals, costs, or rank eligibility.
-        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
-        if profileResult.Success == false then return profileResult end
-        return self:TryApplyUnionStatAllocationByStorageKey(profileResult.StorageUserKey, allocationMap, requestId)
+        -- Rejects the retired free-allocation path now that levels are permanent Coin purchases.
+        return { Success = false, Reason = "COIN_UPGRADE_ONLY", WasReplaced = false }
     end
 
     @ExecSpace("ServerOnly")
     method table TryApplyUnionStatAllocationByStorageKey(string storageUserKey, table allocationMap, string requestId)
+        -- Rejects internal callers of the retired free-allocation path as well.
+        return { Success = false, Reason = "COIN_UPGRADE_ONLY", WasReplaced = false }
+        --[[
         local profile = _UnionProfileRepositoryLogic:GetCachedSnapshot(storageUserKey)
         if profile == nil then
             return { Success = false, Reason = "PROFILE_CACHE_MISSING", WasReplaced = false }
@@ -152,6 +153,7 @@ script UnionStatAllocationServiceLogic extends Logic
             log("[UnionStatAllocation] allocation replaced spent=" .. tostring(preflight.SpentUnionStatPoints) .. " request=" .. requestId)
         end
         return mutation
+        ]]
     end
 
     @ExecSpace("ServerOnly")
@@ -233,16 +235,57 @@ script UnionStatAllocationServiceLogic extends Logic
         return table.concat(parts, ";")
     end
 
+    method table CalculateUnionCoinRefund(table allocationMap)
+        -- Rebuilds the refund exclusively from authoritative level definitions.
+        local definitions = _UnionStatDefinitionRepositoryLogic:GetAllStats()
+        if definitions.Success == false then
+            return { Success = false, Reason = definitions.Reason or "UNION_STAT_DEFINITIONS_UNAVAILABLE", RefundedUnionCoins = 0 }
+        end
+        local totalRefund = 0
+        for _, definition in ipairs(definitions.Stats or {}) do
+            local purchasedLevel = math.floor(tonumber(allocationMap ~= nil and allocationMap[definition.StatId] or 0) or 0)
+            for level = 1, purchasedLevel do
+                local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, level)
+                if levelDefinition.Success == false then
+                    return {
+                        Success = false,
+                        Reason = levelDefinition.Reason or "UNION_STAT_LEVEL_NOT_FOUND",
+                        StatId = definition.StatId,
+                        Level = level,
+                        RefundedUnionCoins = 0
+                    }
+                end
+                local coinCost = math.floor(tonumber(levelDefinition.CoinCost) or 0)
+                if coinCost <= 0 then
+                    return {
+                        Success = false,
+                        Reason = "INVALID_UNION_COIN_COST",
+                        StatId = definition.StatId,
+                        Level = level,
+                        RefundedUnionCoins = 0
+                    }
+                end
+                totalRefund = totalRefund + coinCost
+            end
+        end
+        return { Success = true, Reason = "OK", RefundedUnionCoins = totalRefund }
+    end
+
     @ExecSpace("ServerOnly")
     method table CanResetUnionStats(Entity userEntity)
-        local snapshotResult = self:GetUnionStatAllocationSnapshot(userEntity)
-        if snapshotResult.Success == false then
-            snapshotResult.CanReset = false
-            return snapshotResult
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            profileResult.CanReset = false
+            return profileResult
         end
-        snapshotResult.CanReset = true
-        snapshotResult.Reason = snapshotResult.Snapshot.SpentUnionStatPoints > 0 and "OK" or "UNION_STATS_ALREADY_RESET"
-        return snapshotResult
+        local refund = self:CalculateUnionCoinRefund(profileResult.Profile.AllocatedUnionStats)
+        if refund.Success == false then
+            refund.CanReset = false
+            return refund
+        end
+        refund.CanReset = refund.RefundedUnionCoins > 0
+        refund.Reason = refund.CanReset and "OK" or "UNION_STATS_ALREADY_RESET"
+        return refund
     end
 
     @ExecSpace("ServerOnly")
@@ -284,7 +327,7 @@ script UnionStatAllocationServiceLogic extends Logic
             self:StoreMutationReceipt(storageUserKey, requestId, "RESET", "", mutation)
         end
         if mutation.Success == true then
-            log("[UnionStatAllocation] free reset committed request=" .. requestId .. " changed=" .. tostring(mutation.WasReset == true))
+            log("[UnionCoinReset] committed request=" .. requestId .. " changed=" .. tostring(mutation.WasReset == true) .. " refunded=" .. tostring(mutation.RefundedUnionCoins or 0) .. " remaining=" .. tostring(mutation.RemainingUnionCoins or 0))
         end
         return mutation
     end
@@ -335,24 +378,27 @@ script UnionStatAllocationServiceLogic extends Logic
                 RequiredUnionRank = requiredRank.RankId
             }
         end
-        local pointSummary = self:ResolvePointSummaryFromProfile(profile)
-        if pointSummary.Success == false then
-            pointSummary.CanIncrease = false
-            pointSummary.StatId = statId
-            return pointSummary
-        end
-        if pointSummary.AvailableUnionStatPoints < levelDefinition.PointCost then
+        local coinCost = math.floor(tonumber(levelDefinition.CoinCost) or 0)
+        if coinCost <= 0 then
             return {
                 Success = false,
                 CanIncrease = false,
-                Reason = "INSUFFICIENT_UNION_STAT_POINTS",
+                Reason = "INVALID_UNION_COIN_COST",
+                StatId = statId,
+                CurrentLevel = currentLevel,
+                NextLevel = nextLevel
+            }
+        end
+        if profile.UnionPoints < coinCost then
+            return {
+                Success = false,
+                CanIncrease = false,
+                Reason = "INSUFFICIENT_UNION_COINS",
                 StatId = statId,
                 CurrentLevel = currentLevel,
                 NextLevel = nextLevel,
-                RequiredPointCost = levelDefinition.PointCost,
-                TotalUnionStatPoints = pointSummary.TotalUnionStatPoints,
-                SpentUnionStatPoints = pointSummary.SpentUnionStatPoints,
-                AvailableUnionStatPoints = pointSummary.AvailableUnionStatPoints
+                RequiredCoinCost = coinCost,
+                UnionCoins = profile.UnionPoints
             }
         end
         return {
@@ -363,12 +409,10 @@ script UnionStatAllocationServiceLogic extends Logic
             CurrentLevel = currentLevel,
             NextLevel = nextLevel,
             MaxLevel = definition.MaxLevel,
-            RequiredPointCost = levelDefinition.PointCost,
+            RequiredCoinCost = coinCost,
+            UnionCoins = profile.UnionPoints,
             CurrentUnionRank = currentRank.RankId,
-            RequiredUnionRank = requiredRank.RankId,
-            TotalUnionStatPoints = pointSummary.TotalUnionStatPoints,
-            SpentUnionStatPoints = pointSummary.SpentUnionStatPoints,
-            AvailableUnionStatPoints = pointSummary.AvailableUnionStatPoints
+            RequiredUnionRank = requiredRank.RankId
         }
     end
 
@@ -393,20 +437,22 @@ script UnionStatAllocationServiceLogic extends Logic
             local requiredRank = self:ResolveHigherRequiredRank(definition.RequiredUnionRank, definition.RequiredUnionRank)
             local isRankUnlocked = requiredRank.Success == true and currentRank.SortOrder >= requiredRank.SortOrder
             local nextLevel = currentLevel + 1
-            local nextPointCost = 0
+            local nextCoinCost = 0
             local increaseReason = "MAX_LEVEL"
             if nextLevel <= definition.MaxLevel then
                 local nextLevelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, nextLevel)
                 if nextLevelDefinition.Success == true then
-                    nextPointCost = nextLevelDefinition.PointCost
+                    nextCoinCost = math.floor(tonumber(nextLevelDefinition.CoinCost) or 0)
                     requiredRank = self:ResolveHigherRequiredRank(definition.RequiredUnionRank, nextLevelDefinition.RequiredUnionRank)
                     isRankUnlocked = requiredRank.Success == true and currentRank.SortOrder >= requiredRank.SortOrder
                     if definition.IsImplemented ~= true then
                         increaseReason = "STAT_NOT_IMPLEMENTED"
                     elseif isRankUnlocked == false then
                         increaseReason = "RANK_LOCKED"
-                    elseif pointSummary.AvailableUnionStatPoints < nextPointCost then
-                        increaseReason = "INSUFFICIENT_UNION_STAT_POINTS"
+                    elseif nextCoinCost <= 0 then
+                        increaseReason = "INVALID_UNION_COIN_COST"
+                    elseif profile.UnionPoints < nextCoinCost then
+                        increaseReason = "INSUFFICIENT_UNION_COINS"
                     else
                         increaseReason = "OK"
                     end
@@ -419,13 +465,13 @@ script UnionStatAllocationServiceLogic extends Logic
                 local currentLevelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, currentLevel)
                 if currentLevelDefinition.Success == true then currentEffectValue = currentLevelDefinition.EffectValue end
             end
-            local levelPointCosts = {}
+            local levelCoinCosts = {}
             local levelEffectValues = {}
             local editableMaxLevel = 0
             for level = 1, definition.MaxLevel do
                 local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, level)
                 if levelDefinition.Success == true then
-                    table.insert(levelPointCosts, math.floor(tonumber(levelDefinition.PointCost) or 0))
+                    table.insert(levelCoinCosts, math.floor(tonumber(levelDefinition.CoinCost) or 0))
                     table.insert(levelEffectValues, tonumber(levelDefinition.EffectValue) or 0)
                     local levelRank = self:ResolveHigherRequiredRank(definition.RequiredUnionRank, levelDefinition.RequiredUnionRank)
                     if definition.IsImplemented == true and levelRank.Success == true and currentRank.SortOrder >= levelRank.SortOrder then
@@ -445,12 +491,12 @@ script UnionStatAllocationServiceLogic extends Logic
                 RequiredUnionRank = requiredRank.RankId or definition.RequiredUnionRank,
                 CurrentUnionRank = currentRank.RankId,
                 IsRankUnlocked = isRankUnlocked,
-                NextPointCost = nextPointCost,
+                NextCoinCost = nextCoinCost,
                 CanIncrease = increaseReason == "OK",
                 IncreaseReason = increaseReason,
                 SortOrder = definition.SortOrder,
                 EditableMaxLevel = editableMaxLevel,
-                LevelPointCosts = levelPointCosts,
+                LevelCoinCosts = levelCoinCosts,
                 LevelEffectValues = levelEffectValues
             })
         end
@@ -485,16 +531,7 @@ script UnionStatAllocationServiceLogic extends Logic
         if gradeSummary.Success == false then return gradeSummary end
         local spentSummary = _UnionJobProgressionServiceLogic:CalculateSpentPoints(profile.AllocatedUnionStats)
         if spentSummary.Success == false then return spentSummary end
-        local available = gradeSummary.TotalUnionStatPoints - spentSummary.SpentUnionStatPoints
-        if available < 0 then
-            return {
-                Success = false,
-                Reason = "ALLOCATED_UNION_STAT_POINTS_EXCEED_TOTAL",
-                TotalUnionStatPoints = gradeSummary.TotalUnionStatPoints,
-                SpentUnionStatPoints = spentSummary.SpentUnionStatPoints,
-                AvailableUnionStatPoints = available
-            }
-        end
+        local available = math.max(0, gradeSummary.TotalUnionStatPoints - spentSummary.SpentUnionStatPoints)
         return {
             Success = true,
             Reason = "OK",
@@ -572,7 +609,10 @@ script UnionStatAllocationServiceLogic extends Logic
             WasReset = result.WasReset == true,
             WasReplaced = result.WasReplaced == true,
             PreviousLevel = result.PreviousLevel or 0,
-            NewLevel = result.NewLevel or 0
+            NewLevel = result.NewLevel or 0,
+            RequiredCoinCost = result.RequiredCoinCost or 0,
+            RemainingUnionCoins = result.RemainingUnionCoins or 0,
+            RefundedUnionCoins = result.RefundedUnionCoins or 0
         }
         while #order > self.RequestReceiptRetention do
             local expiredRequestId = table.remove(order, 1)
@@ -602,6 +642,9 @@ script UnionStatAllocationServiceLogic extends Logic
             WasDuplicate = true,
             PreviousLevel = receipt.PreviousLevel,
             NewLevel = receipt.NewLevel,
+            RequiredCoinCost = receipt.RequiredCoinCost,
+            RemainingUnionCoins = receipt.RemainingUnionCoins,
+            RefundedUnionCoins = receipt.RefundedUnionCoins,
             Snapshot = snapshotResult.Snapshot
         }
     end
@@ -610,7 +653,7 @@ script UnionStatAllocationServiceLogic extends Logic
         return reason == "STAT_NOT_IMPLEMENTED"
             or reason == "MAX_LEVEL"
             or reason == "RANK_LOCKED"
-            or reason == "INSUFFICIENT_UNION_STAT_POINTS"
+            or reason == "INSUFFICIENT_UNION_COINS"
     end
 
     method boolean IsTransientMutationReason(string reason)
