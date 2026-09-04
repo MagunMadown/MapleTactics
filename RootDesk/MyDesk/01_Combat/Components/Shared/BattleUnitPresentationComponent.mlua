@@ -32,6 +32,9 @@ script BattleUnitPresentationComponent extends Component
 	@Sync property number CustomMoveHopPeakProgress = 0.50
 	@Sync property string CustomMoveHopAnimationRuid = ""
 	@Sync property number CustomMoveHopAnimationPlayRate = 1.0
+	-- Optional data-driven movement clip used by this enemy for ordinary moves and movement actions.
+	@Sync property string MovementMotionRuid = ""
+	@Sync property number MovementMotionPlayRate = 1.0
 
 	-- MapleStory skill clips are authored with their pivot already on the caster/target anchor
 	-- (measured: hit clips center at ~0, piercing's cast pivot sits at the forward edge), so the
@@ -46,6 +49,11 @@ script BattleUnitPresentationComponent extends Component
 	property integer HitReactionMidTimerId = 0
 	property integer HitReactionRestoreTimerId = 0
 	property integer MotionTimerId = 0
+	property boolean CombatMotionHandoffPending = false
+	property boolean CombatMotionReady = false
+	property boolean CombatMotionReleaseRequested = false
+	property string CombatMotionUnitId = ""
+	property string CombatMotionKey = ""
 	property integer SpriteMotionTimerId = 0
 	property boolean HasOriginalSpriteColor = false
 	property Color OriginalSpriteColor = Color(1, 1, 1, 1)
@@ -124,10 +132,12 @@ script BattleUnitPresentationComponent extends Component
 			_TimerService:ClearTimer(self.MotionTimerId)
 			self.MotionTimerId = 0
 		end
-		if self.SpriteMotionTimerId > 0 then
-			_TimerService:ClearTimer(self.SpriteMotionTimerId)
-			self.SpriteMotionTimerId = 0
-		end
+		self.CombatMotionHandoffPending = false
+		self.CombatMotionReady = false
+		self.CombatMotionReleaseRequested = false
+		self.CombatMotionUnitId = ""
+		self.CombatMotionKey = ""
+		self:StopSpriteMotion(self.Entity.Name, "END_PLAY")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -444,6 +454,10 @@ script BattleUnitPresentationComponent extends Component
 		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
 		local isAirborne = unit ~= nil and unit.IsAirborne == true
 		local shouldEnable = isDead == false and isAirborne == false
+		if isDead then
+			self:StopMoveHopVisual("UNIT_DEFEATED")
+			self:StopSpriteMotion(unitId, "UNIT_DEFEATED")
+		end
 
 		if self.Entity.SpriteRendererComponent ~= nil then
 			self.Entity.SpriteRendererComponent.Enable = shouldEnable
@@ -573,8 +587,8 @@ script BattleUnitPresentationComponent extends Component
 	end
 
 	@ExecSpace("Client")
-	method void PlayCombatMotion(string unitId, string motionKey, string actionName, number playRate, number duration)
-		-- Plays either the equipped weapon attack or one arbitrary one-shot avatar action for this attack profile.
+	method void PlayCombatMotion(string unitId, string motionKey, string actionName, number playRate, number duration, boolean waitForServerHandoff)
+		-- Plays one avatar action. Queued player skills hold their final pose until the server releases the handoff.
 		local state = self.Entity.StateComponent
 		local avatarRenderer = self.Entity.AvatarRendererComponent
 		if state == nil or avatarRenderer == nil then
@@ -591,6 +605,12 @@ script BattleUnitPresentationComponent extends Component
 			_TimerService:ClearTimer(self.MotionTimerId)
 			self.MotionTimerId = 0
 		end
+		-- A following queued skill replaces the previous one-shot directly; never inject Stand between tiles.
+		self.CombatMotionHandoffPending = false
+		self.CombatMotionReady = false
+		self.CombatMotionReleaseRequested = false
+		self.CombatMotionUnitId = ""
+		self.CombatMotionKey = ""
 
 		local safePlayRate = math.max(0.1, playRate)
 		local safeDuration = math.max(0.1, duration)
@@ -617,28 +637,102 @@ script BattleUnitPresentationComponent extends Component
 			actionEvent.PlayType = SpriteAnimClipPlayType.Onetime
 			body:SendEvent(actionEvent)
 		end
-		log("[BattleMotion] started unit=" .. unitId .. " motion=" .. motionKey .. " mode=" .. motionMode .. " action=" .. actionName .. " rate=" .. safePlayRate .. " duration=" .. safeDuration)
+		self.CombatMotionHandoffPending = waitForServerHandoff
+		self.CombatMotionUnitId = unitId
+		self.CombatMotionKey = motionKey
+		log("[BattleMotion] started unit=" .. unitId .. " motion=" .. motionKey .. " mode=" .. motionMode .. " action=" .. actionName .. " rate=" .. safePlayRate .. " duration=" .. safeDuration .. " serverHandoff=" .. tostring(waitForServerHandoff))
 
 		local restore = function()
-			if isvalid(self.Entity) then
-				if self.Entity.StateComponent ~= nil then
-					self.Entity.StateComponent:ChangeState(self.CombatMotionReturnState)
-				end
-				local resetEvent = BodyActionStateChangeEvent()
-				resetEvent.ActionState = MapleAvatarBodyActionState.Stand
-				resetEvent.needResetAction = true
-				self.Entity:SendEvent(resetEvent)
-				log("[BattleMotion] restored unit=" .. unitId .. " motion=" .. motionKey .. " state=" .. self.CombatMotionReturnState)
-			end
 			self.MotionTimerId = 0
+			if waitForServerHandoff then
+				self.CombatMotionReady = true
+				log("[BattleMotionHandoff] ready unit=" .. unitId .. " motion=" .. motionKey .. " releaseRequested=" .. tostring(self.CombatMotionReleaseRequested))
+				if self.CombatMotionReleaseRequested then
+					self:RestoreCombatMotionState(unitId, motionKey, "SERVER_RELEASED")
+				end
+				return
+			end
+			self:RestoreCombatMotionState(unitId, motionKey, "LOCAL_DURATION_COMPLETE")
 		end
 
 		self.MotionTimerId = _TimerService:SetTimerOnce(restore, safeDuration)
 	end
 
+	@ExecSpace("ClientOnly")
+	method void RestoreCombatMotionState(string unitId, string motionKey, string reason)
+		if isvalid(self.Entity) then
+			if self.Entity.StateComponent ~= nil then
+				self.Entity.StateComponent:ChangeState(self.CombatMotionReturnState)
+			end
+			local resetEvent = BodyActionStateChangeEvent()
+			resetEvent.ActionState = MapleAvatarBodyActionState.Stand
+			resetEvent.needResetAction = true
+			self.Entity:SendEvent(resetEvent)
+			log("[BattleMotion] restored unit=" .. unitId .. " motion=" .. motionKey .. " state=" .. self.CombatMotionReturnState .. " reason=" .. reason)
+		end
+		self.CombatMotionHandoffPending = false
+		self.CombatMotionReady = false
+		self.CombatMotionReleaseRequested = false
+		self.CombatMotionUnitId = ""
+		self.CombatMotionKey = ""
+	end
+
 	@ExecSpace("Client")
-	method void PlaySpriteMotion(string unitId, string motionRuid, number playRate, number duration)
-		-- Sprite-based enemies opt into one-shot attack motion through skill CSV data.
+	method void CompleteCombatMotionHandoff(string unitId, string reason)
+		if self.CombatMotionHandoffPending == false or self.CombatMotionUnitId ~= unitId then
+			return
+		end
+		self.CombatMotionReleaseRequested = true
+		log("[BattleMotionHandoff] release unit=" .. unitId .. " motion=" .. self.CombatMotionKey .. " ready=" .. tostring(self.CombatMotionReady) .. " reason=" .. reason)
+		if self.CombatMotionReady then
+			self:RestoreCombatMotionState(unitId, self.CombatMotionKey, reason)
+		end
+	end
+
+	@ExecSpace("Client")
+	method void CancelCombatMotionHandoff(string unitId, string reason, boolean restoreToStand)
+		if self.MotionTimerId > 0 then
+			_TimerService:ClearTimer(self.MotionTimerId)
+			self.MotionTimerId = 0
+		end
+		local motionKey = self.CombatMotionKey
+		self.CombatMotionHandoffPending = false
+		self.CombatMotionReady = false
+		self.CombatMotionReleaseRequested = false
+		self.CombatMotionUnitId = ""
+		self.CombatMotionKey = ""
+		if restoreToStand then
+			self:RestoreCombatMotionState(unitId, motionKey, reason)
+		end
+		log("[BattleMotionHandoff] cancelled unit=" .. unitId .. " restore=" .. tostring(restoreToStand) .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopSpriteMotion(string unitId, string reason)
+		-- Cancels one temporary sprite motion and restores the exact clip/play rate it replaced.
+		if self.SpriteMotionTimerId > 0 then
+			_TimerService:ClearTimer(self.SpriteMotionTimerId)
+			self.SpriteMotionTimerId = 0
+		end
+		if self.HasOriginalSpriteMotion == false then
+			return
+		end
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer ~= nil then
+			renderer.SpriteRUID = self.OriginalSpriteRuid
+			renderer.PlayRate = self.OriginalSpritePlayRate
+			local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then
+				self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+			end
+		end
+		self.HasOriginalSpriteMotion = false
+		log("[BattleSpriteMotion] cancelled unit=" .. unitId .. " reason=" .. reason)
+	end
+
+	@ExecSpace("Client")
+	method void PlaySpriteMotion(string unitId, string motionRuid, number playRate, number duration, string facingOverride)
+		-- Sprite-based enemies opt into one-shot attack or movement-action motion through data.
 		-- The model's original idle clip is cached once and restored after the authored duration.
 		local renderer = self.Entity.SpriteRendererComponent
 		if renderer == nil then
@@ -649,39 +743,26 @@ script BattleUnitPresentationComponent extends Component
 			return
 		end
 		self:StopMoveHopVisual("SPRITE_MOTION_STARTED")
-
-		if self.HasOriginalSpriteMotion == false then
-			self.OriginalSpriteRuid = renderer.SpriteRUID
-			self.OriginalSpritePlayRate = renderer.PlayRate
-			self.HasOriginalSpriteMotion = true
-		end
-		if self.SpriteMotionTimerId > 0 then
-			_TimerService:ClearTimer(self.SpriteMotionTimerId)
-			self.SpriteMotionTimerId = 0
-		end
+		self:StopSpriteMotion(unitId, "REPLACED")
+		self.OriginalSpriteRuid = renderer.SpriteRUID
+		self.OriginalSpritePlayRate = renderer.PlayRate
+		self.HasOriginalSpriteMotion = true
 
 		local safePlayRate = math.max(0.1, playRate)
 		local safeDuration = math.max(0.1, duration)
 		renderer.SpriteRUID = motionRuid
 		renderer.PlayRate = safePlayRate
 		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
-		if unit ~= nil then
+		if facingOverride == "Left" or facingOverride == "Right" then
+			self:ApplySpriteFacing(unitId, facingOverride)
+		elseif unit ~= nil then
 			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
 		end
 		log("[BattleSpriteMotion] started unit=" .. unitId .. " ruid=" .. motionRuid .. " rate=" .. safePlayRate .. " duration=" .. safeDuration)
 
 		local restore = function()
-			if isvalid(self.Entity) and self.Entity.SpriteRendererComponent ~= nil then
-				self.Entity.SpriteRendererComponent.SpriteRUID = self.OriginalSpriteRuid
-				self.Entity.SpriteRendererComponent.PlayRate = self.OriginalSpritePlayRate
-				local restoredUnit = self.Entity:GetComponent("script.BattleUnitComponent")
-				if restoredUnit ~= nil then
-					self:ApplySpriteFacing(restoredUnit.UnitId, restoredUnit.Facing)
-				end
-				log("[BattleSpriteMotion] restored unit=" .. unitId .. " ruid=" .. self.OriginalSpriteRuid)
-			end
 			self.SpriteMotionTimerId = 0
-			self.HasOriginalSpriteMotion = false
+			self:StopSpriteMotion(unitId, "COMPLETED")
 		end
 
 		self.SpriteMotionTimerId = _TimerService:SetTimerOnce(restore, safeDuration)

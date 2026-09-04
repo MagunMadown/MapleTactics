@@ -265,6 +265,23 @@ script UnionProfileRepositoryLogic extends Logic
             return evaluation
         end
         local previousLevel = evaluation.CurrentLevel
+        local coinCost = math.floor(tonumber(evaluation.RequiredCoinCost) or 0)
+        local remainingCoins = candidate.UnionPoints - coinCost
+        if coinCost <= 0 or remainingCoins < 0 then
+            self:ReleaseMutationLock(storageUserKey)
+            return {
+                Success = false,
+                Reason = coinCost <= 0 and "INVALID_UNION_COIN_COST" or "INSUFFICIENT_UNION_COINS",
+                StatId = statId,
+                PreviousLevel = previousLevel,
+                NewLevel = previousLevel,
+                RequiredCoinCost = coinCost,
+                UnionCoins = candidate.UnionPoints,
+                WasApplied = false,
+                Snapshot = candidate
+            }
+        end
+        candidate.UnionPoints = remainingCoins
         candidate.AllocatedUnionStats[statId] = evaluation.NextLevel
         local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
         self:ReleaseMutationLock(storageUserKey)
@@ -281,14 +298,15 @@ script UnionProfileRepositoryLogic extends Logic
                 Snapshot = self:GetCachedSnapshot(storageUserKey)
             }
         end
-        log("[UnionStatAllocation] persisted increase stat=" .. statId .. " previous=" .. tostring(previousLevel) .. " new=" .. tostring(evaluation.NextLevel) .. " cost=" .. tostring(evaluation.RequiredPointCost))
+        log("[UnionCoinUpgrade] persisted stat=" .. statId .. " previous=" .. tostring(previousLevel) .. " new=" .. tostring(evaluation.NextLevel) .. " cost=" .. tostring(coinCost) .. " remaining=" .. tostring(remainingCoins))
         return {
             Success = true,
             Reason = "UNION_STAT_INCREASED",
             StatId = statId,
             PreviousLevel = previousLevel,
             NewLevel = evaluation.NextLevel,
-            RequiredPointCost = evaluation.RequiredPointCost,
+            RequiredCoinCost = coinCost,
+            RemainingUnionCoins = remainingCoins,
             WasApplied = true,
             WasWritten = persisted.WasWritten == true,
             Snapshot = self:CloneProfile(candidate)
@@ -363,7 +381,7 @@ script UnionProfileRepositoryLogic extends Logic
 
     @ExecSpace("ServerOnly")
     method table TryResetAllocatedUnionStatsByStorageKey(string storageUserKey)
-        -- Reset is free and replaces only AllocatedUnionStats; Union Coin and PurchasedLevels are untouched.
+        -- Refunds every server-priced purchased level and clears the allocation in one persisted mutation.
         if storageUserKey == nil or storageUserKey == "" then
             return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING", WasReset = false }
         end
@@ -390,9 +408,19 @@ script UnionProfileRepositoryLogic extends Logic
                 Reason = "UNION_STATS_ALREADY_RESET",
                 WasReset = false,
                 WasWritten = false,
+                RefundedUnionCoins = 0,
+                RemainingUnionCoins = candidate.UnionPoints,
                 Snapshot = candidate
             }
         end
+        local refund = _UnionStatAllocationServiceLogic:CalculateUnionCoinRefund(candidate.AllocatedUnionStats)
+        if refund.Success == false then
+            self:ReleaseMutationLock(storageUserKey)
+            refund.WasReset = false
+            refund.Snapshot = candidate
+            return refund
+        end
+        candidate.UnionPoints = math.floor(tonumber(candidate.UnionPoints) or 0) + refund.RefundedUnionCoins
         candidate.AllocatedUnionStats = {}
         local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
         self:ReleaseMutationLock(storageUserKey)
@@ -403,15 +431,18 @@ script UnionProfileRepositoryLogic extends Logic
                 DetailReason = persisted.DetailReason or "",
                 ErrorCode = persisted.ErrorCode or 0,
                 WasReset = false,
+                RefundedUnionCoins = 0,
                 Snapshot = self:GetCachedSnapshot(storageUserKey)
             }
         end
-        log("[UnionStatAllocation] persisted free reset cleared=" .. tostring(previousAllocationCount))
+        log("[UnionCoinReset] persisted cleared=" .. tostring(previousAllocationCount) .. " refunded=" .. tostring(refund.RefundedUnionCoins) .. " remaining=" .. tostring(candidate.UnionPoints))
         return {
             Success = true,
             Reason = "UNION_STATS_RESET",
             WasReset = true,
             WasWritten = persisted.WasWritten == true,
+            RefundedUnionCoins = refund.RefundedUnionCoins,
+            RemainingUnionCoins = candidate.UnionPoints,
             Snapshot = self:CloneProfile(candidate)
         }
     end
@@ -1912,24 +1943,7 @@ script UnionProfileRepositoryLogic extends Logic
     end
 
     method table ValidateAllocatedUnionStatConsistency(table profile)
-        -- Rejects corrupted Schema 5 allocations instead of silently removing or reinterpreting them.
-        local gradeSummary = _UnionJobProgressionServiceLogic:ResolveGradeSummary(profile.JobUnionProgress)
-        if gradeSummary.Success == false then
-            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = gradeSummary.Reason or "INVALID_JOB_UNION_GRADE_SUMMARY" }
-        end
-        local spentSummary = _UnionJobProgressionServiceLogic:CalculateSpentPoints(profile.AllocatedUnionStats)
-        if spentSummary.Success == false then
-            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = spentSummary.Reason or "INVALID_ALLOCATED_UNION_STAT_COST", StatId = spentSummary.StatId or "" }
-        end
-        if spentSummary.SpentUnionStatPoints > gradeSummary.TotalUnionStatPoints then
-            return {
-                Success = false,
-                Reason = "PROFILE_VALIDATION_FAILED",
-                DetailReason = "ALLOCATED_UNION_STAT_POINTS_EXCEED_TOTAL",
-                TotalUnionStatPoints = gradeSummary.TotalUnionStatPoints,
-                SpentUnionStatPoints = spentSummary.SpentUnionStatPoints
-            }
-        end
+        -- Coin-purchased stat levels are permanent and no longer capped by derived job-grade points.
         local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(profile.LifetimeUnionPoints)
         if currentRank.Success == false then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = currentRank.Reason or "INVALID_CURRENT_UNION_RANK" }
@@ -1957,12 +1971,7 @@ script UnionProfileRepositoryLogic extends Logic
                 end
             end
         end
-        return {
-            Success = true,
-            Reason = "OK",
-            TotalUnionStatPoints = gradeSummary.TotalUnionStatPoints,
-            SpentUnionStatPoints = spentSummary.SpentUnionStatPoints
-        }
+        return { Success = true, Reason = "OK" }
     end
 
     method table CreateDefaultJobUnionProgress()

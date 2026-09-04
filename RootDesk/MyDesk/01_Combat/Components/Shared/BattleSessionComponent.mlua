@@ -184,6 +184,9 @@ script BattleSessionComponent extends Component
 	@Sync property string EnemyHopAnimationRuid = "6df12df0c9ce4caea61385606a4d40d3"
 	@Sync property number EnemyHopAnimationPlayRate = 1.8
 	@Sync property number PlayerToEnemyBeatDuration = 0.05
+	@Sync property number PlayerPresentationSettledBeatDuration = 0.02
+	@Sync property number EnemyToEnemyBeatDuration = 0.03
+	@Sync property number QuickEnemyToEnemyBeatDuration = 0.02
 	@Sync property number EnemyToPlayerBeatDuration = 0.04
 	@Sync property number QueuePopDuration = 0.10
 	@Sync property number NormalHitStopDuration = 0.04
@@ -195,6 +198,7 @@ script BattleSessionComponent extends Component
 	@Sync property number StrongCameraShakeAmplitude = 0.045
 	@Sync property number ImpactCameraShakeDuration = 0.08
 
+	property number PlayerTurnActionDuration = 0.06
 	property number TurnActionDuration = 0.12
 	property number BasicAttackActionDuration = 0.45
 	property number HeavySlashActionDuration = 0.70
@@ -222,6 +226,10 @@ script BattleSessionComponent extends Component
 	property integer ActionTimerId = 0
 	property integer TurnTransitionTimerId = 0
 	property boolean PlayerToEnemyBeatPending = false
+	property number PendingPlayerToEnemyHandoffDelay = -1
+	property boolean EnemyToEnemyHandoffPending = false
+	property string PendingEnemyHandoffSourceId = ""
+	property string PendingEnemyHandoffActionType = ""
 	property integer ImpactTimerId = 0
 	property integer ImpactCameraShakeMidTimerId = 0
 	property integer ImpactCameraShakeLateTimerId = 0
@@ -378,12 +386,16 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void OnEndPlay()
 		-- Prevents a pending action callback from surviving this map-scoped battle session.
+		self:CancelPlayerCombatPresentationHandoff("SESSION_END", false)
 		self:FinishPlayerGridMovePresentation("SESSION_END")
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
 		end
 		self:ClearTurnTransitionTimer("SESSION_END")
+		self.PlayerToEnemyBeatPending = false
+		self.PendingPlayerToEnemyHandoffDelay = -1
+		self:ClearEnemyToEnemyPresentationHandoff("SESSION_END")
 		self:ClearSkillImpactTimers()
 		if self.TurnState ~= nil then
 			self.TurnState:ResetTurnState(self.TileQueueCapacity, "SESSION_END")
@@ -780,6 +792,7 @@ script BattleSessionComponent extends Component
 			end
 			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " traits=" .. enemyUnit.EnemyTraitIds .. " boss=" .. tostring(enemyUnit.IsBoss) .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
 		end
+		self:ConfigureEnemyMovementPresentation(enemy, spawnDefinition)
 		local registration = self:RegisterConfiguredUnit(enemy)
 		if registration.Success == false then
 			log_error("[BattleWave] enemy registration failed unit=" .. unitId .. " reason=" .. registration.Reason)
@@ -787,6 +800,23 @@ script BattleSessionComponent extends Component
 			return nil
 		end
 		return enemy
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConfigureEnemyMovementPresentation(Entity enemyEntity, table spawnDefinition)
+		-- Injects an optional per-enemy movement clip without changing logical movement or action timing.
+		if isvalid(enemyEntity) == false or spawnDefinition == nil then
+			return
+		end
+		local presentation = enemyEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			return
+		end
+		presentation.MovementMotionRuid = spawnDefinition.MoveMotionRuid or ""
+		presentation.MovementMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.MoveMotionPlayRate) or 1)
+		log("[EnemyMoveMotion] configured definition=" .. tostring(spawnDefinition.EnemyDefinitionId)
+			.. " ruid=" .. tostring(presentation.MovementMotionRuid)
+			.. " rate=" .. tostring(presentation.MovementMotionPlayRate))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1538,7 +1568,7 @@ script BattleSessionComponent extends Component
 		if actionType == "MOVE" then
 			return self:GetPlayerMoveDuration()
 		elseif actionType == "TURN" then
-			return math.max(0.05, self.TurnActionDuration)
+			return math.max(0.05, self.PlayerTurnActionDuration)
 		elseif actionType == "PUSH" then
 			return math.max(0.1, self.PushActionDuration)
 		end
@@ -1574,9 +1604,27 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void BeginEnemyTurnFromPlayerAction(string completionReason)
 		-- The authoritative action completion has already happened. Lock the enemy phase now,
-		-- then use a short presentation-only beat before the first enemy actually acts.
+		-- then consume only the presentation handoff that this action still needs.
+		local handoffDelay = self.PlayerToEnemyBeatDuration
+		if completionReason == "IMMEDIATE_ACTION_COMPLETED" or completionReason == "SKILL_QUEUE_COMPLETED" then
+			handoffDelay = self.PlayerPresentationSettledBeatDuration
+		elseif completionReason == "SKILL_QUEUED" then
+			-- Reservation is a real turn handoff. Let its existing pop read before the enemy acts.
+			handoffDelay = self.QueuePopDuration
+		end
 		self.PlayerToEnemyBeatPending = true
-		log("[BattleTurnTempo] player action completed reason=" .. completionReason .. " beat=" .. tostring(self.PlayerToEnemyBeatDuration))
+		self.PendingPlayerToEnemyHandoffDelay = math.max(0.016, math.min(0.12, handoffDelay))
+		log("[BattlePlayerHandoff] player action completed reason=" .. completionReason .. " remainingBeat=" .. tostring(self.PendingPlayerToEnemyHandoffDelay))
+		self:BeginEnemyTurn()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginEnemyTurnFromEnemyAction(string completedEnemyId, string completedActionType)
+		-- Marks only the presentation cadence between two already-ordered enemy actions.
+		-- Authoritative completion happens before this method and the next intent still executes later.
+		self.EnemyToEnemyHandoffPending = true
+		self.PendingEnemyHandoffSourceId = completedEnemyId
+		self.PendingEnemyHandoffActionType = completedActionType
 		self:BeginEnemyTurn()
 	end
 
@@ -1584,7 +1632,15 @@ script BattleSessionComponent extends Component
 	method void BeginEnemyTurn()
 		-- Executes only actions that were frozen for every enemy before the player committed this turn.
 		local usePlayerTransitionBeat = self.PlayerToEnemyBeatPending
+		local playerHandoffDelay = self.PendingPlayerToEnemyHandoffDelay
+		local useEnemyTransitionBeat = self.EnemyToEnemyHandoffPending
+		local enemyHandoffSourceId = self.PendingEnemyHandoffSourceId
+		local enemyHandoffActionType = self.PendingEnemyHandoffActionType
 		self.PlayerToEnemyBeatPending = false
+		self.PendingPlayerToEnemyHandoffDelay = -1
+		self.EnemyToEnemyHandoffPending = false
+		self.PendingEnemyHandoffSourceId = ""
+		self.PendingEnemyHandoffActionType = ""
 		local preparedIntent = self:GetPreparedEnemyIntent()
 		if preparedIntent.State ~= "PREPARED" then
 			log_warning("[BattleEnemyIntent] compatibility cursor missing; selecting frozen plan turn=" .. self.TurnNumber)
@@ -1630,10 +1686,50 @@ script BattleSessionComponent extends Component
 		-- no AI result is applied until the callback actually executes the prepared intent.
 		local executeDelay = _EnemyTraitRouterLogic:GetEnemyThinkDuration(traitIds, self.EnemyThinkDuration)
 		if usePlayerTransitionBeat == true then
-			executeDelay = math.max(0.03, math.min(0.08, self.PlayerToEnemyBeatDuration))
-			log("[BattleTurnTempo] enemy action queued after player beat=" .. tostring(executeDelay) .. " enemy=" .. preparedIntent.EnemyId)
+			if playerHandoffDelay < 0 then
+				playerHandoffDelay = self.PlayerToEnemyBeatDuration
+			end
+			executeDelay = math.max(0.016, math.min(0.12, playerHandoffDelay))
+			log("[BattlePlayerHandoff] enemy action queued delay=" .. tostring(executeDelay) .. " enemy=" .. preparedIntent.EnemyId)
+		elseif useEnemyTransitionBeat == true then
+			executeDelay = self.EnemyToEnemyBeatDuration
+			if _EnemyTraitRouterLogic:HasTrait(traitIds, "QUICK") then
+				executeDelay = self.QuickEnemyToEnemyBeatDuration
+			end
+			executeDelay = math.max(0.02, math.min(0.05, executeDelay))
+			log("[BattleEnemyHandoff] from=" .. enemyHandoffSourceId .. " action=" .. enemyHandoffActionType .. " to=" .. preparedIntent.EnemyId .. " delay=" .. tostring(executeDelay))
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(execute, executeDelay)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompletePlayerCombatPresentationHandoff(string reason)
+		local playerEntity = self.PlayerEntity
+		if playerEntity == nil or isvalid(playerEntity) == false then
+			playerEntity = self:FindUnitEntity("player_01")
+		end
+		if playerEntity == nil or isvalid(playerEntity) == false then
+			return
+		end
+		local presentation = playerEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			presentation:CompleteCombatMotionHandoff("player_01", reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CancelPlayerCombatPresentationHandoff(string reason, boolean restoreToStand)
+		local playerEntity = self.PlayerEntity
+		if playerEntity == nil or isvalid(playerEntity) == false then
+			playerEntity = self:FindUnitEntity("player_01")
+		end
+		if playerEntity == nil or isvalid(playerEntity) == false then
+			return
+		end
+		local presentation = playerEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			presentation:CancelCombatMotionHandoff("player_01", reason, restoreToStand)
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2173,7 +2269,7 @@ script BattleSessionComponent extends Component
 		if self.BattleResult == "" then
 			local nextResult = self:PrepareNextEnemyIntent()
 			if nextResult.Success == true then
-				self:BeginEnemyTurn()
+				self:BeginEnemyTurnFromEnemyAction(enemyId, actionType)
 				return
 			end
 		end
@@ -2213,14 +2309,36 @@ script BattleSessionComponent extends Component
 		elseif actionType == "TURN_TO_PLAYER" then
 			return math.max(0.05, self.TurnActionDuration)
 		elseif actionType == "EXECUTE_TILE" or actionType == "CHARGE_FORWARD" then
-			-- Keep the enemy turn open through the Skill's configured impact/presentation window.
-			return math.max(0.1, self:GetSkillActionDuration(tileId))
+			return self:GetEnemySkillPresentationReadyDuration(tileId)
 		elseif actionType == "BOSS_LAND_OPPOSITE" then
-			return math.max(0.1, self:GetSkillActionDuration(tileId))
+			return self:GetEnemySkillPresentationReadyDuration(tileId)
 		elseif actionType == "TELEGRAPH_TILE" or actionType == "BOSS_JUMP_TELEGRAPH" then
 			return 0.05
 		end
 		return 0.05
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetEnemySkillPresentationReadyDuration(string skillId)
+		-- Enemy-to-enemy sequencing follows the meaningful caster motion instead of the longer
+		-- generic action lock. Projectile skills retain the full flight-safe duration.
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then
+			return math.max(0.1, self:GetSkillActionDuration(skillId))
+		end
+		local definition = validation.Data.Definition
+		if self:HasSkillProjectile(definition) then
+			return math.max(0.1, self:GetSkillActionDuration(skillId))
+		end
+		local speed = self:GetSkillSpeedMultiplier()
+		local authoredMotionDuration = definition.CasterMotionDuration or 0
+		if authoredMotionDuration <= 0 then
+			authoredMotionDuration = definition.ActionDuration or 0.1
+		end
+		local motionDuration = authoredMotionDuration / speed
+		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
+		local impactReadyDuration = motionProfile.ImpactDelay or 0
+		return math.max(0.1, motionDuration, impactReadyDuration)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2350,7 +2468,7 @@ script BattleSessionComponent extends Component
 					log("[BattleEnemyIntent] deferred enemy=" .. enemyId .. " action=" .. pendingAction.ActionType .. " untilTurn=" .. deferResult.DeferredUntilTurn)
 					local nextEnemy = self:PrepareNextEnemyIntent()
 					if nextEnemy.Success == true then
-						self:BeginEnemyTurn()
+						self:BeginEnemyTurnFromEnemyAction(enemyId, actionType)
 						return
 					end
 					self:CompleteEnemyTurn(actionType, success, "POST_ATTACK_ACTION_DEFERRED")
@@ -2359,7 +2477,7 @@ script BattleSessionComponent extends Component
 			end
 			local nextAction = self:LoadEnemyPlanActionToCompatibility(enemyId)
 			if nextAction.Success == true then
-				self:BeginEnemyTurn()
+				self:BeginEnemyTurnFromEnemyAction(enemyId, actionType)
 				return
 			end
 		end
@@ -2371,7 +2489,7 @@ script BattleSessionComponent extends Component
 			local nextResult = self:PrepareNextEnemyIntent()
 			if nextResult.Success == true then
 				log("[BattleEnemyIntent] advance next=" .. self.PreparedEnemyId .. " afterSpawnOrder=" .. self.LastEnemySpawnOrder)
-				self:BeginEnemyTurn()
+				self:BeginEnemyTurnFromEnemyAction(enemyId, actionType)
 				return
 			end
 		end
@@ -2524,6 +2642,17 @@ script BattleSessionComponent extends Component
 			log("[BattleTurnTempo] transition timer cleared reason=" .. reason)
 		end
 		self.PlayerToEnemyBeatPending = false
+		self.PendingPlayerToEnemyHandoffDelay = -1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearEnemyToEnemyPresentationHandoff(string reason)
+		if self.EnemyToEnemyHandoffPending then
+			log("[BattleEnemyHandoff] pending handoff cleared reason=" .. reason)
+		end
+		self.EnemyToEnemyHandoffPending = false
+		self.PendingEnemyHandoffSourceId = ""
+		self.PendingEnemyHandoffActionType = ""
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3124,7 +3253,7 @@ script BattleSessionComponent extends Component
 		end
 
 		local completedIndex = self.TurnState.ExecutingTileIndex
-		local duration = self:GetSkillActionDuration(tileId)
+		local duration = actionResult.PresentationHandoffDuration or self:GetSkillActionDuration(tileId)
 		local complete = function()
 			self.ActionTimerId = 0
 			log("[BattleTileQueue] tile completed index=" .. completedIndex .. "/" .. tileCount .. " tile=" .. tileId .. " reason=" .. actionResult.Reason)
@@ -3144,6 +3273,7 @@ script BattleSessionComponent extends Component
 		-- Clears execution state once, then hands control to the enemy only after the full queue succeeds.
 		local executedCount = self.TurnState:GetTileIdCount(self.TurnState.ExecutingTileIds)
 		self.ActionTimerId = 0
+		self:CompletePlayerCombatPresentationHandoff(reason)
 		self.TurnState:CompleteSkillQueue(reason)
 		self:PublishTurnStateSnapshot("SKILL_QUEUE_COMPLETED")
 		log("[BattleTileQueue] execution completed success=" .. tostring(success) .. " reason=" .. reason .. " count=" .. executedCount)
@@ -4391,12 +4521,16 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
+		self:CancelPlayerCombatPresentationHandoff("REBUILD_" .. reason, true)
 		self:FinishPlayerGridMovePresentation("REBUILD_" .. reason)
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
 		end
 		self:ClearTurnTransitionTimer("REBUILD_" .. reason)
+		self.PlayerToEnemyBeatPending = false
+		self.PendingPlayerToEnemyHandoffDelay = -1
+		self:ClearEnemyToEnemyPresentationHandoff("REBUILD_" .. reason)
 		self:ClearSkillImpactTimers()
 		self.WaveRuntime:ClearAllTimers(reason)
 
@@ -4645,6 +4779,11 @@ script BattleSessionComponent extends Component
 		-- Swap the avatar weapon before the motion starts so the swing shows the skill's own weapon.
 		self:ApplySkillWeapon(sourceUnitId, sourceEntity, definition)
 		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
+		local logicalActionDuration = self:GetSkillActionDuration(skillId)
+		local presentationHandoffDuration = math.max(logicalActionDuration, motionProfile.Duration)
+		local waitForPlayerHandoff = sourceUnitId == "player_01"
+			and self.TurnState ~= nil
+			and self.TurnState.ExecutingTileIds ~= ""
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
 		if sourcePresentation ~= nil then
 			if sourceEntity.PlayerControllerComponent ~= nil then
@@ -4653,7 +4792,8 @@ script BattleSessionComponent extends Component
 					motionProfile.MotionKey,
 					motionProfile.ActionName,
 					motionProfile.PlayRate,
-					motionProfile.Duration
+					presentationHandoffDuration,
+					waitForPlayerHandoff
 				)
 			else
 				local speed = self:GetSkillSpeedMultiplier()
@@ -4661,9 +4801,13 @@ script BattleSessionComponent extends Component
 					sourceUnitId,
 					definition.CasterMotionRuid or "",
 					(definition.CasterMotionPlayRate or 1) * speed,
-					(definition.CasterMotionDuration or definition.ActionDuration or 0.1) / speed
+					(definition.CasterMotionDuration or definition.ActionDuration or 0.1) / speed,
+					""
 				)
 			end
+		end
+		if waitForPlayerHandoff then
+			log("[BattlePlayerHandoff] skill=" .. skillId .. " logical=" .. tostring(logicalActionDuration) .. " motion=" .. tostring(motionProfile.Duration) .. " handoff=" .. tostring(presentationHandoffDuration))
 		end
 		self:BeginSkillEffectPresentation(sourceUnitId, definition)
 
@@ -4691,7 +4835,11 @@ script BattleSessionComponent extends Component
 			end
 		end
 		if totalImpactDelay <= 0 then
-			return _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
+			local immediateResult = _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
+			if immediateResult ~= nil then
+				immediateResult.PresentationHandoffDuration = presentationHandoffDuration
+			end
+			return immediateResult
 		end
 
 		self.ImpactTimerId = _TimerService:SetTimerOnce(resolveEffects, totalImpactDelay)
@@ -4701,7 +4849,8 @@ script BattleSessionComponent extends Component
 			Reason = "IMPACT_PENDING",
 			SourceUnitId = sourceUnitId,
 			SkillId = skillId,
-			StepCount = #effectSteps
+			StepCount = #effectSteps,
+			PresentationHandoffDuration = presentationHandoffDuration
 		}
 	end
 
@@ -5326,6 +5475,10 @@ script BattleSessionComponent extends Component
 		end
 		self:ClearForcedSpawnSchedule("ALL_ENEMIES_DEFEATED")
 		self:ClearTurnTransitionTimer("ALL_ENEMIES_DEFEATED")
+		self:CancelPlayerCombatPresentationHandoff("UNIT_DEATH_" .. unitId, unit.Team == "Enemy")
+		self.PlayerToEnemyBeatPending = false
+		self.PendingPlayerToEnemyHandoffDelay = -1
+		self:ClearEnemyToEnemyPresentationHandoff("UNIT_DEATH_" .. unitId)
 		self:ClearSkillImpactTimers()
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
@@ -5659,6 +5812,13 @@ script BattleSessionComponent extends Component
 			result.Reason = "CHARGE_TARGET_SNAPSHOT_MISSING"
 			return result
 		end
+		local committedFacing = direction == 1 and "Right" or "Left"
+		local facingResult = unit:ApplyFacingState(committedFacing)
+		if facingResult.Success == false then
+			result.Reason = facingResult.Reason
+			return result
+		end
+		self:PlayEnemyMovementActionMotion(unitEntity, unitId, definition)
 
 		local traversed = {}
 		for _, nextCell in ipairs(committedCells) do
@@ -5712,6 +5872,37 @@ script BattleSessionComponent extends Component
 		result.TraversedCells = table.concat(traversed, "|")
 		log("[EnemyCharge] resolved unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " path=" .. result.TraversedCells .. " target=- damage=0 stop=" .. result.StopReason)
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayEnemyMovementActionMotion(Entity sourceEntity, string unitId, table definition)
+		-- Reuses the source enemy's configured movement clip for movement-type skill presentation only.
+		if isvalid(sourceEntity) == false or definition == nil then
+			return
+		end
+		local presentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			return
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local motionRuid = definition.CasterMotionRuid or ""
+		local motionPlayRate = tonumber(definition.CasterMotionPlayRate) or 1
+		if motionRuid == "" then
+			motionRuid = presentation.MovementMotionRuid or ""
+			motionPlayRate = motionPlayRate * math.max(0.1, tonumber(presentation.MovementMotionPlayRate) or 1)
+		end
+		if motionRuid == "" then
+			log_warning("[EnemyMoveMotion] action skipped unit=" .. unitId .. " reason=MOTION_RUID_MISSING")
+			return
+		end
+		local speed = self:GetSkillSpeedMultiplier()
+		local motionDuration = (definition.CasterMotionDuration or definition.ActionDuration or 0.1) / speed
+		presentation:PlaySpriteMotion(unitId, motionRuid, motionPlayRate * speed, motionDuration, sourceUnit ~= nil and sourceUnit.Facing or "")
+		log("[EnemyMoveMotion] action started unit=" .. unitId
+			.. " skill=" .. tostring(definition.SkillId)
+			.. " ruid=" .. motionRuid
+			.. " facing=" .. tostring(sourceUnit ~= nil and sourceUnit.Facing or "UNKNOWN")
+			.. " duration=" .. tostring(motionDuration))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -6021,8 +6212,12 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method number GetPlayerMoveDuration()
-		-- Keeps the movement feel tunable without allowing it outside the STEP 2 timing budget.
-		return math.max(0.10, math.min(0.16, self.MoveActionDuration))
+		-- One deterministic duration owns both horizontal interpolation and the cosmetic player hop.
+		local horizontalDuration = math.max(0.10, math.min(0.16, self.MoveActionDuration))
+		if self.EnablePlayerHopVisual then
+			return math.max(horizontalDuration, self:GetPlayerHopDuration())
+		end
+		return horizontalDuration
 	end
 
 	@ExecSpace("ServerOnly")
@@ -6050,7 +6245,7 @@ script BattleSessionComponent extends Component
 			end
 			presentation:PlayMoveHop(
 				unit.UnitId,
-				self:GetPlayerHopDuration(),
+				self:GetPlayerMoveDuration(),
 				self.PlayerHopHeight,
 				self.PlayerHopTakeoffSquashDuration,
 				self.PlayerHopLandingSquashDuration,
@@ -6066,6 +6261,12 @@ script BattleSessionComponent extends Component
 		end
 
 		if unit.Team == "Enemy" and self.EnableEnemyHopVisual then
+			local movementMotionRuid = self.EnemyHopAnimationRuid
+			local movementMotionPlayRate = self.EnemyHopAnimationPlayRate
+			if presentation.MovementMotionRuid ~= nil and presentation.MovementMotionRuid ~= "" then
+				movementMotionRuid = presentation.MovementMotionRuid
+				movementMotionPlayRate = presentation.MovementMotionPlayRate
+			end
 			presentation:PlayMoveHop(
 				unit.UnitId,
 				math.max(0.12, math.min(0.16, self.EnemyHopDuration)),
@@ -6077,8 +6278,8 @@ script BattleSessionComponent extends Component
 				self.EnemyHopLandingXScale,
 				self.EnemyHopLandingYScale,
 				self.EnemyHopPeakProgress,
-				self.EnemyHopAnimationRuid,
-				self.EnemyHopAnimationPlayRate
+				movementMotionRuid,
+				movementMotionPlayRate
 			)
 		end
 	end
