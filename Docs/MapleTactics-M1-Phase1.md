@@ -16,6 +16,14 @@
 - 완료 뒤 `POST_SHOP_ROUTE` 월드맵에서 선택한 엘리니아 또는 커닝시티 경로만 활성화한다.
 - 완료 기준: 데이터·중복·권한 검증, UIBuilder strict lint, Maker build 오류 0, 위/아래 선택·구매·무구매 퇴장·반대 경로 잠금 positive log.
 
+## 2026-08-30 — 엘리니아 전투 무대 1차 시각 패스
+
+- 🟡 상태: Implemented (MapBuilder 정적 검증 및 Maker 화면 검토 대기)
+- 대상: `map/ellinia_battle.map`의 전투 구조·foothold·Battle 컴포넌트는 유지하고, 헤네시스 복제 장식만 엘리니아 숲 테마로 교체한다.
+- 시각 기준: 짙은 청록 배경, 푸른 마력 나무, 매달린 덩굴, 나무집, 숲 등불, 발광 식물로 헤네시스의 밝은 들판과 즉시 구분한다.
+- 실제 Stage 연결은 별도 범위다. 아래쪽 상점 완료 후 `region_03`/엘리니아 첫 Stage로 라우팅하는 데이터·게이트 작업은 Roadmap Backlog에 유지한다.
+- 완료 기준: `TileMapMode=0`, foothold 48개와 전투 컴포넌트가 보존되고 모든 신규 `SpriteRUID`가 비어 있지 않으며, Maker에서 전투 셀·플레이어·적을 가리지 않는지 확인한다.
+
 ## Skills to reference (this Phase)
 
 - `msw-general`: `platform.md`, 확정 맵 타입의 `platform-*.md`, `workspace.md`, `entity.md`, `authoring.md`, `builder-protocol.md`, `model.md`
