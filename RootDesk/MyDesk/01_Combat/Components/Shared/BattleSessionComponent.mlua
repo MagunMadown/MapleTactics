@@ -780,6 +780,7 @@ script BattleSessionComponent extends Component
 			end
 			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " traits=" .. enemyUnit.EnemyTraitIds .. " boss=" .. tostring(enemyUnit.IsBoss) .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
 		end
+		self:ConfigureEnemyMovementPresentation(enemy, spawnDefinition)
 		local registration = self:RegisterConfiguredUnit(enemy)
 		if registration.Success == false then
 			log_error("[BattleWave] enemy registration failed unit=" .. unitId .. " reason=" .. registration.Reason)
@@ -787,6 +788,23 @@ script BattleSessionComponent extends Component
 			return nil
 		end
 		return enemy
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConfigureEnemyMovementPresentation(Entity enemyEntity, table spawnDefinition)
+		-- Injects an optional per-enemy movement clip without changing logical movement or action timing.
+		if isvalid(enemyEntity) == false or spawnDefinition == nil then
+			return
+		end
+		local presentation = enemyEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			return
+		end
+		presentation.MovementMotionRuid = spawnDefinition.MoveMotionRuid or ""
+		presentation.MovementMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.MoveMotionPlayRate) or 1)
+		log("[EnemyMoveMotion] configured definition=" .. tostring(spawnDefinition.EnemyDefinitionId)
+			.. " ruid=" .. tostring(presentation.MovementMotionRuid)
+			.. " rate=" .. tostring(presentation.MovementMotionPlayRate))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4661,7 +4679,8 @@ script BattleSessionComponent extends Component
 					sourceUnitId,
 					definition.CasterMotionRuid or "",
 					(definition.CasterMotionPlayRate or 1) * speed,
-					(definition.CasterMotionDuration or definition.ActionDuration or 0.1) / speed
+					(definition.CasterMotionDuration or definition.ActionDuration or 0.1) / speed,
+					""
 				)
 			end
 		end
@@ -5659,6 +5678,13 @@ script BattleSessionComponent extends Component
 			result.Reason = "CHARGE_TARGET_SNAPSHOT_MISSING"
 			return result
 		end
+		local committedFacing = direction == 1 and "Right" or "Left"
+		local facingResult = unit:ApplyFacingState(committedFacing)
+		if facingResult.Success == false then
+			result.Reason = facingResult.Reason
+			return result
+		end
+		self:PlayEnemyMovementActionMotion(unitEntity, unitId, definition)
 
 		local traversed = {}
 		for _, nextCell in ipairs(committedCells) do
@@ -5712,6 +5738,37 @@ script BattleSessionComponent extends Component
 		result.TraversedCells = table.concat(traversed, "|")
 		log("[EnemyCharge] resolved unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " path=" .. result.TraversedCells .. " target=- damage=0 stop=" .. result.StopReason)
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayEnemyMovementActionMotion(Entity sourceEntity, string unitId, table definition)
+		-- Reuses the source enemy's configured movement clip for movement-type skill presentation only.
+		if isvalid(sourceEntity) == false or definition == nil then
+			return
+		end
+		local presentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			return
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local motionRuid = definition.CasterMotionRuid or ""
+		local motionPlayRate = tonumber(definition.CasterMotionPlayRate) or 1
+		if motionRuid == "" then
+			motionRuid = presentation.MovementMotionRuid or ""
+			motionPlayRate = motionPlayRate * math.max(0.1, tonumber(presentation.MovementMotionPlayRate) or 1)
+		end
+		if motionRuid == "" then
+			log_warning("[EnemyMoveMotion] action skipped unit=" .. unitId .. " reason=MOTION_RUID_MISSING")
+			return
+		end
+		local speed = self:GetSkillSpeedMultiplier()
+		local motionDuration = (definition.CasterMotionDuration or definition.ActionDuration or 0.1) / speed
+		presentation:PlaySpriteMotion(unitId, motionRuid, motionPlayRate * speed, motionDuration, sourceUnit ~= nil and sourceUnit.Facing or "")
+		log("[EnemyMoveMotion] action started unit=" .. unitId
+			.. " skill=" .. tostring(definition.SkillId)
+			.. " ruid=" .. motionRuid
+			.. " facing=" .. tostring(sourceUnit ~= nil and sourceUnit.Facing or "UNKNOWN")
+			.. " duration=" .. tostring(motionDuration))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -6066,6 +6123,12 @@ script BattleSessionComponent extends Component
 		end
 
 		if unit.Team == "Enemy" and self.EnableEnemyHopVisual then
+			local movementMotionRuid = self.EnemyHopAnimationRuid
+			local movementMotionPlayRate = self.EnemyHopAnimationPlayRate
+			if presentation.MovementMotionRuid ~= nil and presentation.MovementMotionRuid ~= "" then
+				movementMotionRuid = presentation.MovementMotionRuid
+				movementMotionPlayRate = presentation.MovementMotionPlayRate
+			end
 			presentation:PlayMoveHop(
 				unit.UnitId,
 				math.max(0.12, math.min(0.16, self.EnemyHopDuration)),
@@ -6077,8 +6140,8 @@ script BattleSessionComponent extends Component
 				self.EnemyHopLandingXScale,
 				self.EnemyHopLandingYScale,
 				self.EnemyHopPeakProgress,
-				self.EnemyHopAnimationRuid,
-				self.EnemyHopAnimationPlayRate
+				movementMotionRuid,
+				movementMotionPlayRate
 			)
 		end
 	end
