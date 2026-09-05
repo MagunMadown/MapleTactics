@@ -890,8 +890,8 @@ Region 1의 세 전투 뒤에 REST 보상 노드를 두며 세 번째 보상은 
 | henesys_graph | n3 | BOSS | henesys_boss_mushmom | false | |
 
 상점/이벤트 노드가 필요하면 같은 그래프에 `NodeType=SHOP`, `StageId`는 비운 행을 추가한다.
-SHOP의 `NextContentId`는 NodeId다. 현재 런 상점은 SHOP Node와 같은 NodeGraphId/NodeId를 가진
-`ShopDefinitions`를 찾고, `ShopEntries.ShopId`로 상품을 구성한다. 전투 StageId나
+SHOP의 `NextContentId`는 `ShopNodeBindings`가 해석한 ShopId다. NodeId는 방문 지점으로
+유일해야 하지만 하나의 ShopId를 여러 NodeId에서 재사용할 수 있다. 전투 StageId나
 `ShopEntryId`를 `NextNodeIds`에 직접 넣지 않는다. 계획 단계의 메타/월드 상점
 `ShopItemDefinitions`는 NodeDefinitions 진행 그래프에 연결하지 않는다.
 
@@ -1138,14 +1138,25 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 
 | 열 | 타입 | 필수 | 설명 |
 |---|---|:---:|---|
-| SchemaVersion | integer | O | 현재 `1` |
+| SchemaVersion | integer | O | 현재 `2` |
 | ShopId | string | O | 런 상점 고유 ID |
 | DisplayName | string | O | 제작자/UI 표시 이름 |
-| NodeGraphId | string | O | NodeDefinitions.NodeGraphId 참조 |
-| NodeId | string | O | 같은 그래프의 `NodeType=SHOP` NodeId 참조 |
+| MapId | string | O | 상점 진입 목적지 맵 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-기본 키는 `ShopId`이며 전역에서 유일해야 한다. 현재 규격에서는 `ShopId`와 `NodeId`가 같아야 한다.
+기본 키는 `ShopId`이며 전역에서 유일해야 한다.
+
+### 20.1.1 ShopNodeBindings (IMPLEMENTED)
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| SchemaVersion | integer | O | 현재 `1` |
+| NodeGraphId | string | O | NodeDefinitions.NodeGraphId 참조 |
+| NodeId | string | O | 같은 그래프의 `NodeType=SHOP` 방문 노드 |
+| ShopId | string | O | ShopDefinitions.ShopId 참조 |
+| Enabled | boolean | O | 콘텐츠 활성 여부 |
+
+기본 키는 `(NodeGraphId, NodeId)`다. 모든 활성 SHOP 노드는 정확히 하나의 바인딩을 가져야 한다.
 
 ### 20.2 ShopEntries (IMPLEMENTED)
 
@@ -1155,20 +1166,20 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | ShopEntryId | string | O | 전체 런 상점에서 유일한 상품 행 ID |
 | ShopId | string | O | ShopDefinitions.ShopId 참조 |
 | DisplayName | string | O | 제작자/UI 표시 이름 |
-| RewardType | enum | O | 현재 `SKILL`, `CONSUMABLE` |
+| RewardType | enum | O | 현재 `SKILL`, `CONSUMABLE`, `ITEM` |
 | RewardRefId | string | O | RewardType에 맞는 SkillId 또는 ConsumableId |
 | RewardAmount | integer | O | 지급 수량, 1 이상 |
 | PriceCurrencyId | string | O | `RUN_SCOPED` CurrencyDefinitions.CurrencyId 참조 |
 | PriceAmount | integer | O | 가격, 0 이상 |
 | DisplayOrder | integer | O | 같은 ShopId 안의 오름차순 표시 순서 |
-| MaxPurchasesPerVisit | integer | O | 현재 반드시 `1` |
+| MaxPurchasesPerRun | integer | O | 현재 반드시 `1` |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-현재 실제 Dataset에는 `shop_after_stage01` 상점과 `potion_hp_small` 상품 1행이 등록되어 있다.
-`RewardType=SKILL` 상품은 현재 없다 — 판매하던 `heavy_slash`가 §4.1의 스킬 정리에서
-제거되면서 함께 삭제했다. 서버는 Dataset의 가격과 보상 참조를 다시 조회한 뒤 재화 차감과
-지급을 원자적으로 확정한다. 자세한 제작·API 규격은 `Guide/Run-Shop-Authoring-Guide.md`를
-따른다.
+현재 실제 Dataset에는 `shop_upper`, `shop_lower` 카탈로그가 등록되어 있다.
+서버는 Dataset의 가격과 보상 참조를 다시 조회한 뒤 재화 차감과 지급을 원자적으로 확정한다.
+구매 완료 키는 `RunSequence + ShopEntryId`이므로 같은 상점을 다른 노드에서 재방문해도
+이미 구매한 상품은 다시 지급되지 않는다. 자세한 제작·API 규격은
+`Guide/Run-Shop-Authoring-Guide.md`를 따른다.
 
 `RewardType=SKILL` 상품을 다시 넣을 때는 `RewardRefId`가 §4.1의
 `GetPlayerGrantableSkillIds()` 범위 안에 있어야 한다. 적 전용 SkillId를 넣으면 플레이어가
