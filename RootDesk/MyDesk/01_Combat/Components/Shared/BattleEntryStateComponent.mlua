@@ -19,11 +19,16 @@ script BattleEntryStateComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table Prepare(string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode)
+		-- Creates a fresh entry request unless the current request is already being consumed.
 		local result = {
 			Success = false,
 			Reason = "UNKNOWN",
 			RequestId = self.RequestId
 		}
+		if self.EntryState == "INITIALIZING" then
+			result.Reason = "ENTRY_INITIALIZATION_IN_PROGRESS"
+			return result
+		end
 		if stageId == nil or stageId == "" then
 			result.Reason = "INVALID_STAGE_ID"
 			return result
@@ -52,11 +57,33 @@ script BattleEntryStateComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method table MarkStarted()
+	method table BeginInitialization()
+		-- Atomically claims the prepared request before any yielding run initialization begins.
 		if self.EntryState ~= "PREPARED" then
 			return {
 				Success = false,
-				Reason = "ENTRY_NOT_PREPARED",
+				Reason = self.EntryState == "INITIALIZING" and "ENTRY_INITIALIZATION_IN_PROGRESS" or "ENTRY_NOT_PREPARED",
+				RequestId = self.RequestId
+			}
+		end
+
+		self.EntryState = "INITIALIZING"
+		self.LastReason = "INITIALIZING"
+		log("[BattleEntryState] initialization claimed request=" .. self.RequestId .. " stage=" .. self.StageId)
+		return {
+			Success = true,
+			Reason = "INITIALIZING",
+			RequestId = self.RequestId
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table MarkStarted()
+		-- Commits only the request that previously claimed the initialization boundary.
+		if self.EntryState ~= "INITIALIZING" then
+			return {
+				Success = false,
+				Reason = "ENTRY_NOT_INITIALIZING",
 				RequestId = self.RequestId
 			}
 		end
@@ -86,9 +113,13 @@ script BattleEntryStateComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table RecordFailure(string reason)
+		-- Releases a claimed request for an explicit retry while preserving its payload.
 		local failureReason = reason
 		if failureReason == nil or failureReason == "" then
 			failureReason = "UNKNOWN"
+		end
+		if self.EntryState == "INITIALIZING" then
+			self.EntryState = "PREPARED"
 		end
 		self.LastReason = failureReason
 		log_warning("[BattleEntryState] pending request=" .. self.RequestId .. " reason=" .. failureReason)
