@@ -32,9 +32,22 @@ script BattleUnitPresentationComponent extends Component
 	@Sync property number CustomMoveHopPeakProgress = 0.50
 	@Sync property string CustomMoveHopAnimationRuid = ""
 	@Sync property number CustomMoveHopAnimationPlayRate = 1.0
-	-- Optional data-driven movement clip used by this enemy for ordinary moves and movement actions.
+	-- Data-driven enemy motion profile. Empty values preserve legacy model/skill fallbacks.
+	@Sync property string IdleMotionRuid = ""
+	@Sync property number IdleMotionPlayRate = 1.0
 	@Sync property string MovementMotionRuid = ""
 	@Sync property number MovementMotionPlayRate = 1.0
+	@Sync property string HitMotionRuid = ""
+	@Sync property number HitMotionPlayRate = 1.0
+	@Sync property number HitMotionDuration = 0.25
+	@Sync property string AttackMotionRuid = ""
+	@Sync property number AttackMotionPlayRate = 1.0
+	@Sync property number AttackMotionDuration = 0.35
+	@Sync property string DeathMotionRuid = ""
+	@Sync property number DeathMotionPlayRate = 1.0
+	@Sync property number DeathMotionDuration = 0.5
+	-- Keeps the final death frame readable before the renderer is hidden or the next wave replaces it.
+	property number DeathMotionHoldDuration = 0.3
 
 	-- MapleStory skill clips are authored with their pivot already on the caster/target anchor
 	-- (measured: hit clips center at ~0, piercing's cast pivot sits at the forward edge), so the
@@ -55,6 +68,9 @@ script BattleUnitPresentationComponent extends Component
 	property string CombatMotionUnitId = ""
 	property string CombatMotionKey = ""
 	property integer SpriteMotionTimerId = 0
+	property integer DeathMotionTimerId = 0
+	property boolean DeathMotionActive = false
+	property boolean DeathMotionCompleted = false
 	property boolean HasOriginalSpriteColor = false
 	property Color OriginalSpriteColor = Color(1, 1, 1, 1)
 	property boolean HasOriginalImpactPlayRate = false
@@ -137,6 +153,11 @@ script BattleUnitPresentationComponent extends Component
 		self.CombatMotionReleaseRequested = false
 		self.CombatMotionUnitId = ""
 		self.CombatMotionKey = ""
+		if self.DeathMotionTimerId > 0 then
+			_TimerService:ClearTimer(self.DeathMotionTimerId)
+			self.DeathMotionTimerId = 0
+		end
+		self.DeathMotionActive = false
 		self:StopSpriteMotion(self.Entity.Name, "END_PLAY")
 	end
 
@@ -456,11 +477,20 @@ script BattleUnitPresentationComponent extends Component
 		local shouldEnable = isDead == false and isAirborne == false
 		if isDead then
 			self:StopMoveHopVisual("UNIT_DEFEATED")
-			self:StopSpriteMotion(unitId, "UNIT_DEFEATED")
+			self:PlayDeathMotion(unitId)
+		else
+			if self.DeathMotionTimerId > 0 then
+				_TimerService:ClearTimer(self.DeathMotionTimerId)
+				self.DeathMotionTimerId = 0
+			end
+			self.DeathMotionActive = false
+			self.DeathMotionCompleted = false
 		end
 
 		if self.Entity.SpriteRendererComponent ~= nil then
-			self.Entity.SpriteRendererComponent.Enable = shouldEnable
+			if isDead == false or self.DeathMotionRuid == "" then
+				self.Entity.SpriteRendererComponent.Enable = shouldEnable
+			end
 		end
 
 		local hpTextEntity = self.Entity:GetChildByName(self.HpTextChildName, false)
@@ -468,6 +498,44 @@ script BattleUnitPresentationComponent extends Component
 			hpTextEntity.TextRendererComponent.Enable = shouldEnable
 		end
 		log("[BattlePresentation] visibility unit=" .. unitId .. " enabled=" .. tostring(shouldEnable) .. " dead=" .. tostring(isDead) .. " airborne=" .. tostring(isAirborne))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayDeathMotion(string unitId)
+		-- Death owns the renderer until its one-shot duration ends; repeated syncs cannot restart it.
+		if self.DeathMotionActive or self.DeathMotionCompleted then
+			return
+		end
+		self:StopSpriteMotion(unitId, "DEATH_STARTED")
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer == nil or self.DeathMotionRuid == "" then
+			if renderer ~= nil then
+				renderer.Enable = false
+			end
+			self.DeathMotionCompleted = true
+			return
+		end
+		self.DeathMotionActive = true
+		renderer.Enable = true
+		renderer.SpriteRUID = self.DeathMotionRuid
+		renderer.PlayRate = math.max(0.1, self.DeathMotionPlayRate)
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then
+			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+		end
+		local duration = math.max(0.05, self.DeathMotionDuration)
+		local holdDuration = math.max(0, self.DeathMotionHoldDuration)
+		local visibleDuration = duration + holdDuration
+		log("[EnemyDeathMotion] started unit=" .. unitId .. " ruid=" .. self.DeathMotionRuid .. " duration=" .. tostring(duration) .. " hold=" .. tostring(holdDuration))
+		self.DeathMotionTimerId = _TimerService:SetTimerOnce(function()
+			self.DeathMotionTimerId = 0
+			self.DeathMotionActive = false
+			self.DeathMotionCompleted = true
+			if isvalid(self.Entity) and self.Entity.SpriteRendererComponent ~= nil then
+				self.Entity.SpriteRendererComponent.Enable = false
+			end
+			log("[EnemyDeathMotion] completed unit=" .. unitId)
+		end, visibleDuration)
 	end
 
 	@ExecSpace("Client")
@@ -581,6 +649,9 @@ script BattleUnitPresentationComponent extends Component
 	@ExecSpace("Client")
 	method void PlayHitImpact(string unitId, boolean strongHit, number normalHitStopDuration, number strongHitStopDuration, number hitReactionDuration, number hitFlashDuration)
 		-- One accepted damage impact fans out to presentation-only feedback exactly once.
+		if self.DeathMotionActive == false and self.DeathMotionCompleted == false and self.HitMotionRuid ~= "" then
+			self:PlaySpriteMotion(unitId, self.HitMotionRuid, self.HitMotionPlayRate, self.HitMotionDuration, "")
+		end
 		self:PlayHitStop(unitId, strongHit, normalHitStopDuration, strongHitStopDuration)
 		self:PlayHitReaction(unitId, strongHit, hitReactionDuration)
 		self:PlayHitFlash(unitId, hitFlashDuration)
@@ -709,7 +780,7 @@ script BattleUnitPresentationComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void StopSpriteMotion(string unitId, string reason)
-		-- Cancels one temporary sprite motion and restores the exact clip/play rate it replaced.
+		-- Cancels one temporary sprite motion and restores the enemy's canonical idle clip.
 		if self.SpriteMotionTimerId > 0 then
 			_TimerService:ClearTimer(self.SpriteMotionTimerId)
 			self.SpriteMotionTimerId = 0
@@ -719,8 +790,13 @@ script BattleUnitPresentationComponent extends Component
 		end
 		local renderer = self.Entity.SpriteRendererComponent
 		if renderer ~= nil then
-			renderer.SpriteRUID = self.OriginalSpriteRuid
-			renderer.PlayRate = self.OriginalSpritePlayRate
+			if self.IdleMotionRuid ~= "" then
+				renderer.SpriteRUID = self.IdleMotionRuid
+				renderer.PlayRate = math.max(0.1, self.IdleMotionPlayRate)
+			else
+				renderer.SpriteRUID = self.OriginalSpriteRuid
+				renderer.PlayRate = self.OriginalSpritePlayRate
+			end
 			local unit = self.Entity:GetComponent("script.BattleUnitComponent")
 			if unit ~= nil then
 				self:ApplySpriteFacing(unit.UnitId, unit.Facing)
@@ -742,10 +818,13 @@ script BattleUnitPresentationComponent extends Component
 		if motionRuid == "" then
 			return
 		end
+		if self.DeathMotionActive or self.DeathMotionCompleted then
+			return
+		end
 		self:StopMoveHopVisual("SPRITE_MOTION_STARTED")
 		self:StopSpriteMotion(unitId, "REPLACED")
-		self.OriginalSpriteRuid = renderer.SpriteRUID
-		self.OriginalSpritePlayRate = renderer.PlayRate
+		self.OriginalSpriteRuid = self.IdleMotionRuid ~= "" and self.IdleMotionRuid or renderer.SpriteRUID
+		self.OriginalSpritePlayRate = self.IdleMotionRuid ~= "" and math.max(0.1, self.IdleMotionPlayRate) or renderer.PlayRate
 		self.HasOriginalSpriteMotion = true
 
 		local safePlayRate = math.max(0.1, playRate)
