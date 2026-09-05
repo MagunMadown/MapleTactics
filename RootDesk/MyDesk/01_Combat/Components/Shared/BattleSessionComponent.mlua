@@ -175,14 +175,14 @@ script BattleSessionComponent extends Component
 	@Sync property number PlayerHopPeakProgress = 0.50
 	@Sync property number PlayerHopAnimationPlayRate = 1.0
 	@Sync property boolean EnableEnemyHopVisual = true
-	@Sync property number EnemyHopDuration = 0.12
-	@Sync property number EnemyHopHeight = 0.06
+	@Sync property number EnemyHopDuration = 0.13
+	@Sync property number EnemyHopHeight = 0.09
 	@Sync property number EnemyHopTakeoffSquashDuration = 0.02
 	@Sync property number EnemyHopLandingSquashDuration = 0.04
-	@Sync property number EnemyHopSquashXScale = 1.04
-	@Sync property number EnemyHopSquashYScale = 0.95
-	@Sync property number EnemyHopLandingXScale = 1.06
-	@Sync property number EnemyHopLandingYScale = 0.93
+	@Sync property number EnemyHopSquashXScale = 1.03
+	@Sync property number EnemyHopSquashYScale = 0.97
+	@Sync property number EnemyHopLandingXScale = 1.04
+	@Sync property number EnemyHopLandingYScale = 0.96
 	@Sync property number EnemyHopPeakProgress = 0.50
 	@Sync property string EnemyHopAnimationRuid = "6df12df0c9ce4caea61385606a4d40d3"
 	@Sync property number EnemyHopAnimationPlayRate = 1.8
@@ -391,6 +391,7 @@ script BattleSessionComponent extends Component
 		-- Prevents a pending action callback from surviving this map-scoped battle session.
 		self:CancelPlayerCombatPresentationHandoff("SESSION_END", false)
 		self:FinishPlayerGridMovePresentation("SESSION_END")
+		self:FinishEnemyGridMovePresentation("SESSION_END", false)
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
@@ -436,6 +437,7 @@ script BattleSessionComponent extends Component
 			return
 		end
 		self:UpdatePlayerGridMove(delta)
+		self:UpdateEnemyGridMove(delta)
 		self:RefreshPlayerHpSnapshot("")
 		-- Battle map entities persist after the player visits another map. A completed
 		-- battle observes the exit normally, while defeat return explicitly arms the
@@ -2249,11 +2251,11 @@ script BattleSessionComponent extends Component
 
 		local actionResult = nil
 		if intent.ActionType == "MOVE_TOWARD" then
-			actionResult = self:TryMove(intent.EnemyId, actionDirection)
+			actionResult = self:TryMoveInternal(intent.EnemyId, actionDirection, true)
 		elseif intent.ActionType == "MOVE_AWAY" then
-			actionResult = self:TryMoveAway(intent.EnemyId, actionDirection)
+			actionResult = self:TryMoveAwayInternal(intent.EnemyId, actionDirection, true)
 		elseif intent.ActionType == "MOVE_FIXED_FACING" then
-			actionResult = self:TryMove(intent.EnemyId, intent.Direction)
+			actionResult = self:TryMoveInternal(intent.EnemyId, intent.Direction, true)
 		elseif intent.ActionType == "TURN_TO_PLAYER" then
 			actionResult = self:TryFaceDirection(intent.EnemyId, intent.Direction)
 		elseif intent.ActionType == "TELEGRAPH_TILE" then
@@ -2281,12 +2283,30 @@ script BattleSessionComponent extends Component
 		end
 
 		local duration = self:GetEnemyActionDuration(intent.ActionType, intent.TileId)
+		local completed = false
 		local complete = function()
+			if completed then
+				return
+			end
+			completed = true
+			self.ActionTimerId = 0
 			if isTrackingCommand then
 				self:CompleteQueuedAttackTrackingCommand(intent.EnemyId, intent.ActionType, success, reason)
 				return
 			end
 			self:CompletePreparedEnemyIntent(intent.EnemyId, intent.PatternId, intent.StepIndex, intent.ActionType, intent.TileId, intent.TelegraphTurnsRemaining, success, reason)
+		end
+		local movement = self._T.enemyGridMove
+		if actionResult ~= nil and actionResult.PresentationStarted == true
+			and movement ~= nil and movement.UnitId == intent.EnemyId then
+			movement.CompleteAction = complete
+			movement.TimerId = _TimerService:SetTimerOnce(function()
+				if self._T.enemyGridMove == movement then
+					self:FinishEnemyGridMovePresentation("FALLBACK_COMPLETE", true)
+				end
+			end, movement.Duration + math.max(0.02, self.MoveCompletionFallbackGrace))
+			self.ActionTimerId = movement.TimerId
+			return
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
 	end
@@ -2572,6 +2592,7 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void ClearPreparedEnemyIntent(string reason)
 		-- Cancels every per-enemy frozen plan at a real round/battle boundary.
+		self:FinishEnemyGridMovePresentation("INTENT_CLEAR_" .. reason, false)
 		local intentRuntime = self.EnemyIntentRuntime
 		if intentRuntime == nil then
 			intentRuntime = self:EnsureEnemyIntentComponent()
@@ -4564,6 +4585,7 @@ script BattleSessionComponent extends Component
 
 		self:CancelPlayerCombatPresentationHandoff("REBUILD_" .. reason, true)
 		self:FinishPlayerGridMovePresentation("REBUILD_" .. reason)
+		self:FinishEnemyGridMovePresentation("REBUILD_" .. reason, false)
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
@@ -5733,6 +5755,12 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryMoveAway(string unitId, integer direction)
+		-- Preserves existing player and special-skill callers; only ordinary enemy commands opt in.
+		return self:TryMoveAwayInternal(unitId, direction, false)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryMoveAwayInternal(string unitId, integer direction, boolean smoothEnemyMove)
 		-- Atomically turns away and moves one cell; blocked destinations never change Facing.
 		local result = { Success = false, Reason = "UNKNOWN", FromCell = -1, ToCell = -1, PreviousFacing = "", CurrentFacing = "" }
 		if direction ~= -1 and direction ~= 1 then
@@ -5776,7 +5804,7 @@ script BattleSessionComponent extends Component
 			result.Reason = facingResult.Reason
 			return result
 		end
-		local moveResult = self:TryMove(unitId, direction)
+		local moveResult = self:TryMoveInternal(unitId, direction, smoothEnemyMove)
 		if moveResult.Success == false then
 			unit:ApplyFacingState(result.PreviousFacing)
 			self:ApplyFacing(unitEntity, unit.Facing)
@@ -5794,6 +5822,7 @@ script BattleSessionComponent extends Component
 		end
 		result.Success = true
 		result.Reason = "OK"
+		result.PresentationStarted = moveResult.PresentationStarted == true
 		log("[BattleMoveAway] success unit=" .. unit.UnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " facing=" .. result.PreviousFacing .. "->" .. result.CurrentFacing)
 		return result
 	end
@@ -5977,6 +6006,12 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryMove(string unitId, integer direction)
+		-- Preserves existing player and special-skill callers; only ordinary enemy commands opt in.
+		return self:TryMoveInternal(unitId, direction, false)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryMoveInternal(string unitId, integer direction, boolean smoothEnemyMove)
 		-- Moves one logical cell after checking phase, range, life, and occupancy.
 		local result = {
 			Success = false,
@@ -6065,6 +6100,11 @@ script BattleSessionComponent extends Component
 			local started = self:StartPlayerGridMovePresentation(unitEntity, result.FromCell, result.ToCell)
 			result.PresentationStarted = started
 			if started == false then
+				self:PlaceEntity(unitEntity, position)
+			end
+		elseif unit.Team == "Enemy" and smoothEnemyMove then
+			result.PresentationStarted = self:StartEnemyGridMovePresentation(unitEntity, result.FromCell, result.ToCell)
+			if result.PresentationStarted == false then
 				self:PlaceEntity(unitEntity, position)
 			end
 		else
@@ -6325,7 +6365,8 @@ script BattleSessionComponent extends Component
 				self.PlayerHopLandingYScale,
 				self.PlayerHopPeakProgress,
 				"",
-				self.PlayerHopAnimationPlayRate
+				self.PlayerHopAnimationPlayRate,
+				true
 			)
 			return
 		end
@@ -6349,8 +6390,183 @@ script BattleSessionComponent extends Component
 				self.EnemyHopLandingYScale,
 				self.EnemyHopPeakProgress,
 				movementMotionRuid,
-				movementMotionPlayRate
+				movementMotionPlayRate,
+				true
 			)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEnemyMoveHopProfile(Entity targetEntity)
+		-- Resolves one server-side snapshot for both position and client appearance timing.
+		local profile = {
+			Enabled = self.EnableEnemyHopVisual,
+			Duration = self.EnemyHopDuration,
+			Height = self.EnemyHopHeight,
+			Takeoff = self.EnemyHopTakeoffSquashDuration,
+			Landing = self.EnemyHopLandingSquashDuration,
+			SquashX = self.EnemyHopSquashXScale,
+			SquashY = self.EnemyHopSquashYScale,
+			LandingX = self.EnemyHopLandingXScale,
+			LandingY = self.EnemyHopLandingYScale,
+			Peak = self.EnemyHopPeakProgress,
+			AnimationRuid = self.EnemyHopAnimationRuid,
+			AnimationPlayRate = self.EnemyHopAnimationPlayRate
+		}
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			if presentation.MovementMotionRuid ~= "" then
+				profile.AnimationRuid = presentation.MovementMotionRuid
+				profile.AnimationPlayRate = presentation.MovementMotionPlayRate
+			end
+			if presentation.UseCustomMoveHopProfile then
+				profile.Enabled = profile.Enabled and presentation.CustomMoveHopEnabled
+				profile.Duration = presentation.CustomMoveHopDuration
+				profile.Height = presentation.CustomMoveHopHeight
+				profile.Takeoff = presentation.CustomMoveHopTakeoffDuration
+				profile.Landing = presentation.CustomMoveHopLandingDuration
+				profile.SquashX = presentation.CustomMoveHopSquashScale.x
+				profile.SquashY = presentation.CustomMoveHopSquashScale.y
+				profile.LandingX = presentation.CustomMoveHopLandingScale.x
+				profile.LandingY = presentation.CustomMoveHopLandingScale.y
+				profile.Peak = presentation.CustomMoveHopPeakProgress
+				if presentation.CustomMoveHopAnimationRuid ~= "" then
+					profile.AnimationRuid = presentation.CustomMoveHopAnimationRuid
+					profile.AnimationPlayRate = presentation.CustomMoveHopAnimationPlayRate
+				end
+			end
+		end
+		local actionDuration = math.max(0.05, self.EnemyMoveActionDuration)
+		profile.Duration = profile.Enabled and math.max(actionDuration, math.max(0.12, math.min(0.16, profile.Duration))) or actionDuration
+		profile.Height = profile.Enabled and math.max(0, profile.Height) or 0
+		profile.Peak = math.max(0.45, math.min(0.55, profile.Peak))
+		return profile
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean StartEnemyGridMovePresentation(Entity targetEntity, integer fromCell, integer toCell)
+		-- Ordinary enemy moves share the player curve, with all position axes owned by the server.
+		if isvalid(targetEntity) == false or targetEntity.TransformComponent == nil then
+			log_warning("[EnemyMoveVisual] skipped reason=TRANSFORM_UNAVAILABLE")
+			return false
+		end
+		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead or unit.IsAirborne then
+			return false
+		end
+		self:FinishEnemyGridMovePresentation("REPLACED", false)
+		local profile = self:GetEnemyMoveHopProfile(targetEntity)
+		local startPosition = self:GetCellPosition(fromCell)
+		self:PlaceEntity(targetEntity, startPosition)
+		self._T.enemyGridMove = {
+			Entity = targetEntity,
+			UnitId = unit.UnitId,
+			FromCell = fromCell,
+			ToCell = toCell,
+			StartPosition = startPosition,
+			TargetPosition = self:GetCellPosition(toCell),
+			Elapsed = 0,
+			Duration = profile.Duration,
+			Height = profile.Height,
+			Peak = profile.Peak,
+			TimerId = 0,
+			CompleteAction = nil,
+			LoggedIntermediate = false
+		}
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil and profile.Enabled then
+			presentation:PlayMoveHop(unit.UnitId, profile.Duration, profile.Height, profile.Takeoff, profile.Landing,
+				profile.SquashX, profile.SquashY, profile.LandingX, profile.LandingY, profile.Peak,
+				profile.AnimationRuid, profile.AnimationPlayRate, false)
+		end
+		log("[EnemyMoveVisual] started unit=" .. unit.UnitId .. " from=" .. tostring(fromCell)
+			.. " to=" .. tostring(toCell) .. " duration=" .. tostring(profile.Duration)
+			.. " height=" .. tostring(profile.Height) .. " curve=" .. tostring(self.MoveCurve))
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateEnemyGridMove(number delta)
+		-- Advances one accepted move without touching logical occupancy or emitting another move event.
+		local movement = self._T.enemyGridMove
+		if movement == nil then
+			return
+		end
+		if self.BattleResult ~= "" then
+			self:FinishEnemyGridMovePresentation("BATTLE_ENDED", false)
+			return
+		end
+		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.CurrentMap ~= self.Entity then
+			self:FinishEnemyGridMovePresentation("PLAYER_LEFT_MAP", false)
+			return
+		end
+		local targetEntity = movement.Entity
+		if isvalid(targetEntity) == false or targetEntity.TransformComponent == nil then
+			self:FinishEnemyGridMovePresentation("ENTITY_REMOVED", true)
+			return
+		end
+		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead or unit.IsAirborne or unit.CellIndex ~= movement.ToCell
+			or targetEntity.CurrentMap ~= self.Entity then
+			self:FinishEnemyGridMovePresentation("UNIT_INTERRUPTED", true)
+			return
+		end
+		movement.Elapsed = movement.Elapsed + math.max(0, delta)
+		local progress = math.min(1, movement.Elapsed / movement.Duration)
+		if progress >= 1 then
+			self:FinishEnemyGridMovePresentation("VISUAL_COMPLETE", true)
+			return
+		end
+		local eased = self:EvaluatePlayerMoveCurve(progress)
+		local x = movement.StartPosition.x + (movement.TargetPosition.x - movement.StartPosition.x) * eased
+		if math.abs(movement.TargetPosition.x - x) <= math.max(0, self.MoveSnapThreshold) then
+			x = movement.TargetPosition.x
+		end
+		local yOffset = 0
+		if progress <= movement.Peak then
+			yOffset = math.sin(progress / movement.Peak * math.pi * 0.5) * movement.Height
+		else
+			yOffset = math.cos((progress - movement.Peak) / (1 - movement.Peak) * math.pi * 0.5) * movement.Height
+		end
+		self:PlaceEntity(targetEntity, Vector2(x, movement.TargetPosition.y + yOffset))
+		if movement.LoggedIntermediate == false and progress > 0 then
+			movement.LoggedIntermediate = true
+			log("[EnemyMoveVisual] intermediate unit=" .. movement.UnitId .. " progress=" .. tostring(progress)
+				.. " x=" .. tostring(x) .. " yOffset=" .. tostring(yOffset))
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishEnemyGridMovePresentation(string reason, boolean completeAction)
+		-- Releases ownership before callbacks, so visual completion and fallback cannot finish twice.
+		local movement = self._T.enemyGridMove
+		if movement == nil then
+			return
+		end
+		self._T.enemyGridMove = nil
+		if movement.TimerId > 0 then
+			_TimerService:ClearTimer(movement.TimerId)
+			if self.ActionTimerId == movement.TimerId then
+				self.ActionTimerId = 0
+			end
+		end
+		local targetEntity = movement.Entity
+		if isvalid(targetEntity) then
+			local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+			if targetEntity.TransformComponent ~= nil and targetEntity.CurrentMap == self.Entity then
+				local cell = unit ~= nil and unit.CellIndex or movement.ToCell
+				self:PlaceEntity(targetEntity, self:GetCellPosition(cell))
+			end
+			local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+			if presentation ~= nil then
+				presentation:StopMoveHopVisual(reason)
+			end
+		end
+		log("[EnemyMoveVisual] completed unit=" .. movement.UnitId .. " from=" .. tostring(movement.FromCell)
+			.. " to=" .. tostring(movement.ToCell) .. " reason=" .. reason .. " completeAction=" .. tostring(completeAction))
+		if completeAction and movement.CompleteAction ~= nil and self.BattleResult == ""
+			and isvalid(self.PlayerEntity) and self.PlayerEntity.CurrentMap == self.Entity then
+			movement.CompleteAction()
 		end
 	end
 
