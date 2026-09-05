@@ -118,7 +118,7 @@ M1 직업 슬롯:
 | 맵 배치 | 일반전 공용 `region_01_battle.map` + 보스전 `region_01_boss.map`; `StageId`와 물리 `MapId`를 분리하고 CSV로 라우팅 |
 | 전투 이벤트 | `@Event extends EventType` |
 | 무상태 규칙 | `@Logic` Resolver/Router |
-| 권장 맵 타입 | SideViewRectTile(2) |
+| 현재 전투 맵 타입 | MapleTile(0); 전투 유닛 이동은 물리 이동이 아닌 서버 권위 Cell Snapshot |
 
 협업 시 소유권은 다음과 같이 분리한다.
 
@@ -183,3 +183,5 @@ M1 직업 슬롯:
 | 2026-08-15 | 수정 | 적 공격 타일 등록과 공격 예고를 분리하고, 타일을 보유한 채 사거리까지 추적한 뒤 대응 턴 후 고정 실행하는 흐름으로 확장 | 사거리 진입 뒤에야 큐를 만드는 현재 동작을 참고작의 읽을 수 있는 적 공격 주기에 맞추고, 회피·밀치기로 예고 공격을 빗나가게 하는 전술을 보존하기 위함 | GDD §3/§6/§8, Phase 1 Slice 10.6, Shogun Queue Plan Slice 6, 전용 수정 계획 |
 | 2026-08-22 | 수정 | 모든 전투 StageId를 `region_01_battle` 물리 맵으로 라우팅하고 스테이지 콘텐츠는 CSV의 StageId로만 선택 | 전투 맵을 한 번만 꾸미고 여러 스테이지가 동일한 컴포넌트 구성을 재사용하도록 하기 위함 | StageMapRoutes, BattleSession 맵 설정, SectorConfig, Phase 1 Slice 14; Static Map 운영을 위해 월드 최대 인원 1명으로 제한 |
 | 2026-08-22 | 수정 | 1-1~1-3은 헤네시스 일반전 공용 맵을 유지하고 1-4는 `region_01_boss` 전용 물리 맵으로 분리 | 일반 스테이지 재사용 이점은 유지하면서 머쉬맘 보스전의 배경·전조 가독성과 공간 연출을 독립 조정하기 위함 | StageMapRoutes, 물리 맵 2종, Phase 1 Slice 14~15 |
+| 2026-08-29 | 수정 | 전투 맵 타입 문서를 실제 `MapleTile(0)` 구현에 맞추고 `region_05` 노틸러스 콘텐츠 확장을 시작 | 문서의 SideViewRectTile 표기가 실제 전투 맵·Foothold 구성과 달랐으며, 지역 번호와 진행 난이도를 분리해야 함 | GDD §8, Region/Stage/Map 데이터, 노틸러스 제작 가이드 |
+| 2026-09-03 | 추가 | 적 Pattern 공용 행동에 피해 스킬로 끊을 수 있는 `CAST_INTERRUPTIBLE`을 추가하고 킹크랑 2 Phase 버블 캐논에 적용 | 플레이어가 보스의 강한 공격을 수동적으로 피하기만 하지 않고 큐 구성과 공격 횟수로 대응하게 하며, 보스 ID 하드코딩 없이 다른 적도 같은 규격을 재사용하기 위함 | EnemyPatternSteps, EnemyActionPlan, Battle UI DTO, Boss 제작 가이드 |
