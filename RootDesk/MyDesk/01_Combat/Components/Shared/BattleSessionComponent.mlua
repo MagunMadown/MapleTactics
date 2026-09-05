@@ -1253,7 +1253,11 @@ script BattleSessionComponent extends Component
 						queuedIconRuids ~= "" and queuedIconRuids or "-",
 						telegraphKind ~= "" and telegraphKind or "-",
 						tostring(landingCell),
-						tostring(plan.DeferredUntilTurn)
+						tostring(plan.DeferredUntilTurn),
+						plan.CastState ~= "" and plan.CastState or "NONE",
+						plan.CastingSkillId ~= "" and plan.CastingSkillId or "-",
+						tostring(plan.InterruptHitsRequired),
+						tostring(plan.InterruptHitsReceived)
 					}, ","))
 				end
 			end
@@ -2262,13 +2266,20 @@ script BattleSessionComponent extends Component
 			actionResult = { Success = true, Reason = "TELEGRAPH_COMPLETED" }
 		elseif intent.ActionType == "CHARGE_FORWARD" then
 			actionResult = self:TryChargeForward(intent.EnemyId, intent.Direction, intent.TileId, executingPlan.TargetCellSnapshot)
+		elseif intent.ActionType == "CAST_INTERRUPTIBLE" then
+			actionResult = self:BeginEnemyInterruptibleCast(intent.EnemyId, intent.PatternId, intent.StepIndex, intent.TileId)
 		elseif intent.ActionType == "BOSS_JUMP_TELEGRAPH" then
 			actionResult = self:BeginBossOppositeJump(intent.EnemyId)
 		elseif intent.ActionType == "BOSS_LAND_OPPOSITE" then
 			actionResult = self:ResolveBossOppositeLanding(intent.EnemyId, intent.TileId)
 		elseif intent.ActionType == "EXECUTE_TILE" and intent.TileId ~= "" then
 			-- Resolves the pattern's TileId through the enemy-only skill table and shared skill pipeline.
-			actionResult = self:TryExecuteSkill(intent.EnemyId, intent.TileId)
+			local castResult = self:ConsumeEnemyInterruptibleCast(intent.EnemyId, intent.TileId)
+			if castResult.CanExecute == false then
+				actionResult = { Success = false, Reason = "CAST_INTERRUPTED" }
+			else
+				actionResult = self:TryExecuteSkill(intent.EnemyId, intent.TileId)
+			end
 		else
 			 actionResult = { Success = true, Reason = intent.Reason }
 		end
@@ -2373,7 +2384,7 @@ script BattleSessionComponent extends Component
 			return self:GetEnemySkillPresentationReadyDuration(tileId)
 		elseif actionType == "BOSS_LAND_OPPOSITE" then
 			return self:GetEnemySkillPresentationReadyDuration(tileId)
-		elseif actionType == "TELEGRAPH_TILE" or actionType == "BOSS_JUMP_TELEGRAPH" then
+		elseif actionType == "TELEGRAPH_TILE" or actionType == "CAST_INTERRUPTIBLE" or actionType == "BOSS_JUMP_TELEGRAPH" then
 			return 0.05
 		end
 		return 0.05
@@ -2400,6 +2411,49 @@ script BattleSessionComponent extends Component
 		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
 		local impactReadyDuration = motionProfile.ImpactDelay or 0
 		return math.max(0.1, motionDuration, impactReadyDuration)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BeginEnemyInterruptibleCast(string enemyId, string patternId, integer stepIndex, string skillId)
+		-- Reads the interruption threshold from the pattern row so boss difficulty remains data-driven.
+		local enemyEntity = self:FindUnitEntity(enemyId)
+		if isvalid(enemyEntity) == false then
+			return { Success = false, Reason = "ENEMY_NOT_FOUND" }
+		end
+		local plan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+		if plan == nil then
+			return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING" }
+		end
+		local stepResult = _EnemyPatternStepRepositoryLogic:GetPatternStep(patternId, stepIndex)
+		if stepResult.Success == false then
+			return { Success = false, Reason = "CAST_PATTERN_STEP_NOT_FOUND" }
+		end
+		if stepResult.Step == nil then
+			return { Success = false, Reason = "CAST_PATTERN_STEP_NOT_FOUND" }
+		end
+		local requiredHits = math.max(1, math.floor(tonumber(stepResult.Step.ParamA) or 1))
+		local result = plan:BeginInterruptibleCast(skillId, requiredHits)
+		if result.Success == true then
+			self:PublishEnemyPlanSnapshot("CAST_STARTED")
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConsumeEnemyInterruptibleCast(string enemyId, string skillId)
+		local enemyEntity = self:FindUnitEntity(enemyId)
+		if isvalid(enemyEntity) == false then
+			return { Success = false, Reason = "ENEMY_NOT_FOUND", CanExecute = false }
+		end
+		local plan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+		if plan == nil then
+			return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING", CanExecute = false }
+		end
+		local result = plan:ConsumeInterruptibleCast(skillId)
+		if result.Reason ~= "CAST_NOT_REQUIRED" then
+			self:PublishEnemyPlanSnapshot(result.Reason)
+		end
+		return result
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3995,6 +4049,10 @@ script BattleSessionComponent extends Component
 				local telegraphKind = ""
 				local landingCell = -1
 				local deferredUntilTurn = 0
+				local castState = "NONE"
+				local castingSkillId = ""
+				local interruptHitsRequired = 0
+				local interruptHitsReceived = 0
 				if #fields >= 17 then
 					bossPhaseId = self:DecodeEnemyPlanField(fields[15])
 					bossPhaseIndex = math.floor(tonumber(fields[16]) or 0)
@@ -4025,6 +4083,12 @@ script BattleSessionComponent extends Component
 				end
 				if #fields >= 29 then
 					deferredUntilTurn = math.floor(tonumber(fields[29]) or 0)
+				end
+				if #fields >= 33 then
+					castState = self:DecodeEnemyPlanField(fields[30])
+					castingSkillId = self:DecodeEnemyPlanField(fields[31])
+					interruptHitsRequired = math.floor(tonumber(fields[32]) or 0)
+					interruptHitsReceived = math.floor(tonumber(fields[33]) or 0)
 				end
 				local queuedTileIds = ""
 				local hasInsertedQueue = fields[3] ~= "INSERTING"
@@ -4081,6 +4145,11 @@ script BattleSessionComponent extends Component
 					TelegraphKind = telegraphKind,
 					LandingCell = landingCell,
 					DeferredUntilTurn = deferredUntilTurn,
+					CastState = castState,
+					CastingSkillId = castingSkillId,
+					InterruptHitsRequired = interruptHitsRequired,
+					InterruptHitsReceived = interruptHitsReceived,
+					IsCastInterrupted = castState == "INTERRUPTED",
 					IsAttackReady = fields[3] == "ATTACK_READY",
 					IsQueueReady = hasInsertedQueue
 				})
@@ -5316,6 +5385,43 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table TryRegisterEnemyCastInterrupt(string sourceUnitId, string skillId, string targetUnitId, number appliedDamage)
+		-- Interruption is a combat-domain consequence of a successful player skill hit, not a special case inside one skill.
+		local result = { Success = false, Reason = "NOT_INTERRUPTIBLE", Interrupted = false }
+		if appliedDamage <= 0 then
+			result.Reason = "NO_APPLIED_DAMAGE"
+			return result
+		end
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		local targetEntity = self:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false or isvalid(targetEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		local plan = targetEntity:GetComponent("script.EnemyActionPlanComponent")
+		if sourceUnit == nil or targetUnit == nil or plan == nil then
+			result.Reason = "COMPONENT_MISSING"
+			return result
+		end
+		if sourceUnit.Team ~= "Player" or targetUnit.Team ~= "Enemy" then
+			result.Reason = "INVALID_TEAMS"
+			return result
+		end
+		local executionIndex = self.ExecutingTileIndex
+		if self.TurnState ~= nil then
+			executionIndex = self.TurnState.ExecutingTileIndex
+		end
+		local hitKey = tostring(self.TurnNumber) .. ":" .. tostring(executionIndex) .. ":" .. skillId
+		result = plan:RegisterInterruptHit(skillId, hitKey)
+		if result.Success == true and result.Reason ~= "INTERRUPT_HIT_DUPLICATE" then
+			self:PublishEnemyPlanSnapshot(result.Reason)
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method table ResolveSkillDamageImpact(string sourceUnitId, string skillId, string targetUnitId, integer targetCell, number damageAmount)
 		-- Applies damage to an immutable impact-time target selected by the shared skill Target Resolver.
 		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, AttackId = skillId, TargetUnitId = targetUnitId, TargetCell = targetCell, DamageAmount = 0, TargetHpBefore = -1, TargetHpAfter = -1 }
@@ -5359,6 +5465,7 @@ script BattleSessionComponent extends Component
 		result.DamageAmount = damageResult.AppliedAmount
 		result.TargetHpBefore = damageResult.HpBefore
 		result.TargetHpAfter = damageResult.HpAfter
+		self:TryRegisterEnemyCastInterrupt(sourceUnitId, skillId, targetUnitId, result.DamageAmount)
 		self:PlayActiveHitEffect(targetUnitId)
 
 		local attackEvent = BasicAttackResolvedEvent()
@@ -6372,7 +6479,7 @@ script BattleSessionComponent extends Component
 		end
 
 		if unit.Team == "Enemy" and self.EnableEnemyHopVisual then
-			local movementMotionRuid = self.EnemyHopAnimationRuid
+			local movementMotionRuid = "" -- Keep the actor's sprite when no per-enemy motion is authored.
 			local movementMotionPlayRate = self.EnemyHopAnimationPlayRate
 			if presentation.MovementMotionRuid ~= nil and presentation.MovementMotionRuid ~= "" then
 				movementMotionRuid = presentation.MovementMotionRuid
