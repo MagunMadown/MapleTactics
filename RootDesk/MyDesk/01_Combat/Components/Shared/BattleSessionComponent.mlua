@@ -121,6 +121,9 @@ script BattleSessionComponent extends Component
 	@Sync property integer CurrentWaveSpawnCount = 2
 	@Sync property integer MaxConcurrentEnemies = 5
 	@Sync property number CurrentClearSpawnDelay = 0.60
+	-- Must cover the 0.5s death clip plus its 0.3s final-frame hold.
+	property number EnemyDeathPresentationDelay = 0.85
+	property integer ResultTransitionTimerId = 0
 
 	property integer CellCount = 6
 	property boolean RequireValidContentAtStartup = true
@@ -391,6 +394,10 @@ script BattleSessionComponent extends Component
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
+		end
+		if self.ResultTransitionTimerId > 0 then
+			_TimerService:ClearTimer(self.ResultTransitionTimerId)
+			self.ResultTransitionTimerId = 0
 		end
 		self:ClearTurnTransitionTimer("SESSION_END")
 		self.PlayerToEnemyBeatPending = false
@@ -821,7 +828,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ConfigureEnemyMovementPresentation(Entity enemyEntity, table spawnDefinition)
-		-- Injects an optional per-enemy movement clip without changing logical movement or action timing.
+		-- Injects the complete per-enemy motion profile without changing logical combat timing.
 		if isvalid(enemyEntity) == false or spawnDefinition == nil then
 			return
 		end
@@ -829,11 +836,28 @@ script BattleSessionComponent extends Component
 		if presentation == nil then
 			return
 		end
+		presentation.IdleMotionRuid = spawnDefinition.IdleMotionRuid or ""
+		presentation.IdleMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.IdleMotionPlayRate) or 1)
 		presentation.MovementMotionRuid = spawnDefinition.MoveMotionRuid or ""
+		if presentation.MovementMotionRuid == "" then
+			presentation.MovementMotionRuid = presentation.IdleMotionRuid
+		end
 		presentation.MovementMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.MoveMotionPlayRate) or 1)
-		log("[EnemyMoveMotion] configured definition=" .. tostring(spawnDefinition.EnemyDefinitionId)
-			.. " ruid=" .. tostring(presentation.MovementMotionRuid)
-			.. " rate=" .. tostring(presentation.MovementMotionPlayRate))
+		presentation.HitMotionRuid = spawnDefinition.HitMotionRuid or ""
+		presentation.HitMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.HitMotionPlayRate) or 1)
+		presentation.HitMotionDuration = math.max(0.05, tonumber(spawnDefinition.HitMotionDuration) or 0.25)
+		presentation.AttackMotionRuid = spawnDefinition.AttackMotionRuid or ""
+		presentation.AttackMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.AttackMotionPlayRate) or 1)
+		presentation.AttackMotionDuration = math.max(0.05, tonumber(spawnDefinition.AttackMotionDuration) or 0.35)
+		presentation.DeathMotionRuid = spawnDefinition.DeathMotionRuid or ""
+		presentation.DeathMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.DeathMotionPlayRate) or 1)
+		presentation.DeathMotionDuration = math.max(0.05, tonumber(spawnDefinition.DeathMotionDuration) or 0.5)
+		log("[EnemyMotionProfile] configured definition=" .. tostring(spawnDefinition.EnemyDefinitionId)
+			.. " idle=" .. tostring(presentation.IdleMotionRuid)
+			.. " move=" .. tostring(presentation.MovementMotionRuid)
+			.. " hit=" .. tostring(presentation.HitMotionRuid)
+			.. " attack=" .. tostring(presentation.AttackMotionRuid)
+			.. " death=" .. tostring(presentation.DeathMotionRuid))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4813,14 +4837,7 @@ script BattleSessionComponent extends Component
 					waitForPlayerHandoff
 				)
 			else
-				local speed = self:GetSkillSpeedMultiplier()
-				sourcePresentation:PlaySpriteMotion(
-					sourceUnitId,
-					definition.CasterMotionRuid or "",
-					(definition.CasterMotionPlayRate or 1) * speed,
-					(definition.CasterMotionDuration or definition.ActionDuration or 0.1) / speed,
-					""
-				)
+				self:PlayEnemyAttackMotion(sourceEntity, sourceUnitId, definition)
 			end
 		end
 		if waitForPlayerHandoff then
@@ -5510,7 +5527,8 @@ script BattleSessionComponent extends Component
 				self:ClearPreparedEnemyIntent("WAVE_CLEARED")
 				local clearedWave = self.CurrentWave
 				local nextWave = clearedWave + 1
-				self.WaveRuntime:ScheduleWaveTransition(clearedWave, nextWave, self.CurrentClearSpawnDelay)
+				local transitionDelay = math.max(self.CurrentClearSpawnDelay, self.EnemyDeathPresentationDelay)
+				self.WaveRuntime:ScheduleWaveTransition(clearedWave, nextWave, transitionDelay)
 				self:PublishWaveStateSnapshot("WAVE_CLEARED")
 				log("[BattleWave] cleared stage=" .. self.StageNumber .. " wave=" .. clearedWave .. "/" .. self.TotalWaves .. " nextWave=" .. nextWave)
 				return
@@ -5554,11 +5572,22 @@ script BattleSessionComponent extends Component
 		log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=" .. self.BattleResult .. " wave=" .. self.CurrentWave)
 		log("[BattleResult] result=" .. self.BattleResult .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " runRecorded=" .. tostring(runResultRecorded))
 		if self.BattleResult == "Victory" and runResultRecorded == true and isvalid(self.PlayerEntity) then
-			if self.UnionRewardRunEnded == true and self.UnionRewardWasCommitted == true then
-				_StageTransitionManagerLogic:HandleCompletedRunTransition(self.PlayerEntity)
-			else
-				_StageTransitionManagerLogic:HandleVictoryTransition(self.PlayerEntity, self.StageId)
-			end
+			local transitionPlayer = self.PlayerEntity
+			local completedRun = self.UnionRewardRunEnded == true and self.UnionRewardWasCommitted == true
+			local completedStageId = self.StageId
+			local transitionDelay = math.max(0, self.EnemyDeathPresentationDelay)
+			self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
+				self.ResultTransitionTimerId = 0
+				if isvalid(transitionPlayer) == false then
+					return
+				end
+				if completedRun then
+					_StageTransitionManagerLogic:HandleCompletedRunTransition(transitionPlayer)
+				else
+					_StageTransitionManagerLogic:HandleVictoryTransition(transitionPlayer, completedStageId)
+				end
+			end, transitionDelay)
+			log("[BattleResult] transition delayed seconds=" .. tostring(transitionDelay) .. " reason=DEATH_PRESENTATION")
 		end
 	end
 
@@ -5893,7 +5922,13 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void PlayEnemyMovementActionMotion(Entity sourceEntity, string unitId, table definition)
-		-- Reuses the source enemy's configured movement clip for movement-type skill presentation only.
+		-- Movement-type enemy skills use the same monster-specific attack selection as ordinary skills.
+		self:PlayEnemyAttackMotion(sourceEntity, unitId, definition)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayEnemyAttackMotion(Entity sourceEntity, string unitId, table definition)
+		-- Priority: enemy attack -> skill caster fallback -> enemy move -> enemy idle/model.
 		if isvalid(sourceEntity) == false or definition == nil then
 			return
 		end
@@ -5902,22 +5937,40 @@ script BattleSessionComponent extends Component
 			return
 		end
 		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
-		local motionRuid = definition.CasterMotionRuid or ""
-		local motionPlayRate = tonumber(definition.CasterMotionPlayRate) or 1
+		local motionRuid = presentation.AttackMotionRuid or ""
+		local motionPlayRate = tonumber(presentation.AttackMotionPlayRate) or 1
+		local motionDuration = tonumber(presentation.AttackMotionDuration) or 0.35
+		local source = "ENEMY_DEFINITION"
 		if motionRuid == "" then
-			motionRuid = presentation.MovementMotionRuid or ""
-			motionPlayRate = motionPlayRate * math.max(0.1, tonumber(presentation.MovementMotionPlayRate) or 1)
+			motionRuid = definition.CasterMotionRuid or ""
+			motionPlayRate = tonumber(definition.CasterMotionPlayRate) or 1
+			motionDuration = tonumber(definition.CasterMotionDuration) or tonumber(definition.ActionDuration) or 0.35
+			source = "SKILL_FALLBACK"
 		end
 		if motionRuid == "" then
-			log_warning("[EnemyMoveMotion] action skipped unit=" .. unitId .. " reason=MOTION_RUID_MISSING")
+			motionRuid = presentation.MovementMotionRuid or ""
+			motionPlayRate = tonumber(presentation.MovementMotionPlayRate) or 1
+			source = "MOVE_FALLBACK"
+		end
+		if motionRuid == "" then
+			motionRuid = presentation.IdleMotionRuid or ""
+			motionPlayRate = tonumber(presentation.IdleMotionPlayRate) or 1
+			source = "IDLE_FALLBACK"
+		end
+		if motionRuid == "" then
+			log_warning("[EnemyAttackMotion] skipped unit=" .. unitId .. " reason=MOTION_RUID_MISSING")
 			return
 		end
 		local speed = self:GetSkillSpeedMultiplier()
-		local motionDuration = (definition.CasterMotionDuration or definition.ActionDuration or 0.1) / speed
+		local skillDuration = tonumber(definition.CasterMotionDuration) or tonumber(definition.ActionDuration) or 0
+		motionDuration = math.max(motionDuration, skillDuration) / speed
 		presentation:PlaySpriteMotion(unitId, motionRuid, motionPlayRate * speed, motionDuration, sourceUnit ~= nil and sourceUnit.Facing or "")
-		log("[EnemyMoveMotion] action started unit=" .. unitId
+		log("[EnemyAttackMotion] selected unit=" .. unitId
+			.. " definition=" .. tostring(sourceUnit ~= nil and sourceUnit.EnemyDefinitionId or "")
 			.. " skill=" .. tostring(definition.SkillId)
 			.. " ruid=" .. motionRuid
+			.. " source=" .. source
+			.. " fallback=" .. tostring(source ~= "ENEMY_DEFINITION")
 			.. " facing=" .. tostring(sourceUnit ~= nil and sourceUnit.Facing or "UNKNOWN")
 			.. " duration=" .. tostring(motionDuration))
 	end
