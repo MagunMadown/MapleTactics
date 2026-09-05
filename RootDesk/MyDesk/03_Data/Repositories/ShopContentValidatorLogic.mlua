@@ -1,5 +1,5 @@
 @Logic
-script ShopContentValidatorLogic
+script ShopContentValidatorLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table ValidateAll()
@@ -18,10 +18,6 @@ script ShopContentValidatorLogic
 			local bundle = _ShopDefinitionRepositoryLogic:GetShopBundle(shopId)
 			if bundle.Success == false then
 				return self:Reject(shopId, "", bundle.DetailReason or bundle.Reason, 0)
-			end
-			local node = _NodeDefinitionRepositoryLogic:GetNodeDefinition(bundle.Definition.NodeGraphId, bundle.Definition.NodeId)
-			if node.Success == false or node.NodeType ~= "SHOP" or node.NodeId ~= shopId then
-				return self:Reject(shopId, "", "SHOP_NODE_REFERENCE_INVALID", bundle.Definition.RowIndex or 0)
 			end
 			if #bundle.Entries > 17 then
 				return self:Reject(shopId, "", "SHOP_ENTRY_LIMIT_EXCEEDED", bundle.Definition.RowIndex or 0)
@@ -47,8 +43,48 @@ script ShopContentValidatorLogic
 			seenShopIds[shopId] = true
 			validatedShopCount = validatedShopCount + 1
 		end
-		log("[ShopValidation] all valid shops=" .. validatedShopCount .. " entries=" .. validatedEntryCount)
-		return { Success = true, Reason = "OK", ValidatedShopCount = validatedShopCount, ValidatedEntryCount = validatedEntryCount }
+		local bindingValidation = self:ValidateBindings(seenShopIds)
+		if bindingValidation.Success == false then return bindingValidation end
+		log("[ShopValidation] all valid shops=" .. validatedShopCount .. " entries=" .. validatedEntryCount .. " bindings=" .. bindingValidation.ValidatedBindingCount)
+		return { Success = true, Reason = "OK", ValidatedShopCount = validatedShopCount, ValidatedEntryCount = validatedEntryCount, ValidatedBindingCount = bindingValidation.ValidatedBindingCount }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateBindings(table validShopIds)
+		local all = _ShopNodeBindingRepositoryLogic:GetAllBindings()
+		if all.Success == false then
+			return self:Reject(all.ShopId or "", all.NodeId or "", all.DetailReason or all.Reason, all.RowIndex or 0)
+		end
+		local seenBindingKeys = {}
+		for _, binding in ipairs(all.Bindings) do
+			local bindingKey = binding.NodeGraphId .. ":" .. binding.NodeId
+			if seenBindingKeys[bindingKey] == true then
+				return self:Reject(binding.ShopId, binding.NodeId, "DUPLICATE_SHOP_NODE_BINDING", binding.RowIndex or 0)
+			end
+			local node = _NodeDefinitionRepositoryLogic:GetNodeDefinition(binding.NodeGraphId, binding.NodeId)
+			if node.Success == false or node.NodeType ~= "SHOP" then
+				return self:Reject(binding.ShopId, binding.NodeId, "SHOP_NODE_BINDING_NODE_INVALID", binding.RowIndex or 0)
+			end
+			if validShopIds[binding.ShopId] ~= true then
+				return self:Reject(binding.ShopId, binding.NodeId, "SHOP_NODE_BINDING_SHOP_INVALID", binding.RowIndex or 0)
+			end
+			seenBindingKeys[bindingKey] = true
+		end
+		local nodes = _DataService:GetTable("NodeDefinitions")
+		if nodes == nil then return self:Reject("", "", "NODE_DATASET_NOT_FOUND", 0) end
+		for rowIndex = 1, nodes:GetRowCount() do
+			local enabledValue = nodes:GetCell(rowIndex, "Enabled")
+			local enabledText = string.lower(tostring(enabledValue or ""))
+			local enabled = enabledValue == true or enabledText == "true" or enabledText == "1" or enabledText == "yes"
+			if nodes:GetCell(rowIndex, "NodeType") == "SHOP" and enabled == true then
+				local nodeGraphId = nodes:GetCell(rowIndex, "NodeGraphId") or ""
+				local nodeId = nodes:GetCell(rowIndex, "NodeId") or ""
+				if seenBindingKeys[nodeGraphId .. ":" .. nodeId] ~= true then
+					return self:Reject("", nodeId, "SHOP_NODE_BINDING_MISSING", rowIndex)
+				end
+			end
+		end
+		return { Success = true, Reason = "OK", ValidatedBindingCount = #all.Bindings }
 	end
 
 	@ExecSpace("ServerOnly")
