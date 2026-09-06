@@ -1,0 +1,75 @@
+@Component
+script FaustSummonComponent extends Component
+
+	property Entity SummonedEnemy = nil
+	property integer NextSummonTurn = 0
+	property integer SummonSequence = 0
+
+	@ExecSpace("ServerOnly")
+	method boolean CanSummon(any session, integer targetCell)
+		local boss = self.Entity:GetComponent("script.BattleUnitComponent")
+		if boss == nil or boss.IsDead or session.BattleResult ~= "" or session.StageTurnNumber < self.NextSummonTurn then
+			return false
+		end
+		if isvalid(self.SummonedEnemy) then
+			local summon = self.SummonedEnemy:GetComponent("script.BattleUnitComponent")
+			if summon ~= nil and summon.IsDead == false then
+				return false
+			end
+		end
+		return session:IsValidCell(targetCell) and session:IsCellOccupied(targetCell, "") == false
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TrySummon(any session, integer targetCell)
+		-- Recheck the frozen tile; a failed attempt consumes the action, never the cooldown.
+		if self:CanSummon(session, targetCell) == false then
+			log("[FaustSummon] wait reason=SUMMON_BLOCKED cell=" .. targetCell)
+			return { Success = false, Reason = "SUMMON_BLOCKED_WAIT" }
+		end
+		local playerEntity = session:FindUnitEntity("player_01")
+		if isvalid(playerEntity) == false then
+			return { Success = false, Reason = "PLAYER_MISSING_WAIT" }
+		end
+		local player = playerEntity:GetComponent("script.BattleUnitComponent")
+		if player == nil or player.IsDead then
+			return { Success = false, Reason = "PLAYER_UNAVAILABLE_WAIT" }
+		end
+		local definition = _StageWaveRepositoryLogic:GetEnemySpawnDefinition("ellinia_faust_summon_pool", session.CurrentWave, 1, session.RunSeed)
+		if definition.Success == false then
+			return definition
+		end
+		self.SummonSequence = self.SummonSequence + 1
+		local boss = self.Entity:GetComponent("script.BattleUnitComponent")
+		local facing = player.CellIndex < targetCell and "Left" or "Right"
+		local summon = session:SpawnWaveEnemy("faust_summon_" .. self.SummonSequence, targetCell, facing, boss.SpawnOrder + self.SummonSequence, definition)
+		if isvalid(summon) == false then
+			return { Success = false, Reason = "SUMMON_SPAWN_FAILED_WAIT" }
+		end
+		-- SpawnWaveEnemy registers an EMPTY plan. It joins planning next round with SPAWN_WAIT.
+		self.SummonedEnemy = summon
+		self.NextSummonTurn = session.StageTurnNumber + 5
+		local presentation = self.Entity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			presentation:PlaySpriteMotion(boss.UnitId, "681d4068577d4610945b63da43f48b9f", 1, 0.6, boss.Facing)
+		end
+		log("[FaustSummon] summoned sequence=" .. self.SummonSequence .. " cell=" .. targetCell .. " turn=" .. session.StageTurnNumber .. " next=" .. self.NextSummonTurn)
+		return { Success = true, Reason = "SUMMON_COMPLETED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RemoveSummon(any session)
+		if isvalid(self.SummonedEnemy) then
+			local unit = self.SummonedEnemy:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then
+				-- Forced removal deliberately bypasses death/drop/kill-effect dispatch.
+				unit:MarkDead()
+				session.BoardState:UnregisterUnit(unit.UnitId)
+			end
+			_EntityService:Destroy(self.SummonedEnemy)
+		end
+		self.SummonedEnemy = nil
+		log("[FaustSummon] removed reason=BOSS_DEFEATED")
+	end
+
+end
