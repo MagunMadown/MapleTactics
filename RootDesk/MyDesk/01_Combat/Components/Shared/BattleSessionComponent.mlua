@@ -818,6 +818,9 @@ script BattleSessionComponent extends Component
 			end
 			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " traits=" .. enemyUnit.EnemyTraitIds .. " boss=" .. tostring(enemyUnit.IsBoss) .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
 		end
+		if spawnDefinition.EnemyDefinitionId == "ellinia_faust" then
+			enemy:AddComponent("FaustSummonComponent")
+		end
 		self:ConfigureEnemyMovementPresentation(enemy, spawnDefinition)
 		local registration = self:RegisterConfiguredUnit(enemy)
 		if registration.Success == false then
@@ -1851,7 +1854,10 @@ script BattleSessionComponent extends Component
 			return { ActionType = "WAIT", TileId = "", Direction = 0, Reason = "PATTERN_INVALID_" .. detailReason, PatternId = enemy.EnemyPatternId, StepIndex = 1 }
 		end
 
+		local summoner = enemyEntity:GetComponent("script.FaustSummonComponent")
+		local summonReady = summoner ~= nil and summoner:CanSummon(self, self:GetOppositeEdgeCell(enemy.CellIndex))
 		return _EnemyIntentResolverLogic:ResolvePatternIntent({
+			SummonReady = summonReady,
 			EnemyUnitId = enemyUnitId,
 			PatternId = enemy.EnemyPatternId,
 			StartStepIndex = patternRunner.CurrentStepIndex,
@@ -2049,6 +2055,9 @@ script BattleSessionComponent extends Component
 			if result.Success == false then
 				patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, result.Reason)
 				return result
+			end
+			if intent.ActionType == "SUMMON_ENEMIES" then
+				actionPlan.TargetCellSnapshot = tostring(self:GetOppositeEdgeCell(preparedEnemyUnit.CellIndex))
 			end
 			local preparedAction = actionPlan:GetCurrentAction()
 			if preparedAction.Success == true and preparedAction.ActionType == "CHARGE_FORWARD" then
@@ -2273,6 +2282,12 @@ script BattleSessionComponent extends Component
 			actionResult = { Success = true, Reason = "TELEGRAPH_COMPLETED" }
 		elseif intent.ActionType == "CHARGE_FORWARD" then
 			actionResult = self:TryChargeForward(intent.EnemyId, intent.Direction, intent.TileId, executingPlan.TargetCellSnapshot)
+		elseif intent.ActionType == "SUMMON_ENEMIES" then
+			local summoner = executingEnemy:GetComponent("script.FaustSummonComponent")
+			actionResult = { Success = false, Reason = "SUMMON_COMPONENT_MISSING_WAIT" }
+			if summoner ~= nil then
+				actionResult = summoner:TrySummon(self, tonumber(executingPlan.TargetCellSnapshot) or -1)
+			end
 		elseif intent.ActionType == "BOSS_JUMP_TELEGRAPH" then
 			actionResult = self:BeginBossOppositeJump(intent.EnemyId)
 		elseif intent.ActionType == "BOSS_LAND_OPPOSITE" then
@@ -2282,6 +2297,10 @@ script BattleSessionComponent extends Component
 			actionResult = self:TryExecuteSkill(intent.EnemyId, intent.TileId)
 		else
 			 actionResult = { Success = true, Reason = intent.Reason }
+		end
+		if intent.ActionType == "SUMMON_ENEMIES" and actionResult.Success == false then
+			self.TurnState:UpdateEnemyAction("ENEMY_WAIT", 0)
+			self:PublishTurnStateSnapshot("SUMMON_BLOCKED_WAIT")
 		end
 		if intent.ActionType == "MOVE_TOWARD" or intent.ActionType == "MOVE_AWAY" or intent.ActionType == "MOVE_FIXED_FACING" then
 			actionResult = self:ConvertBlockedEnemyMoveToWait(intent.EnemyId, intent.ActionType, actionDirection, actionResult)
@@ -2382,6 +2401,8 @@ script BattleSessionComponent extends Component
 			return math.max(0.05, self.TurnActionDuration)
 		elseif actionType == "EXECUTE_TILE" or actionType == "CHARGE_FORWARD" then
 			return self:GetEnemySkillPresentationReadyDuration(tileId)
+		elseif actionType == "SUMMON_ENEMIES" then
+			return 0.6
 		elseif actionType == "BOSS_LAND_OPPOSITE" then
 			return self:GetEnemySkillPresentationReadyDuration(tileId)
 		elseif actionType == "TELEGRAPH_TILE" or actionType == "BOSS_JUMP_TELEGRAPH" then
@@ -2414,6 +2435,14 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method integer GetOppositeEdgeCell(integer cellIndex)
+		if cellIndex <= (self.CellCount - 1) * 0.5 then
+			return self.CellCount - 1
+		end
+		return 0
+	end
+
+	@ExecSpace("ServerOnly")
 	method table BeginBossOppositeJump(string enemyId)
 		-- Freezes the opposite edge at takeoff so later player movement cannot retarget the landing.
 		local enemyEntity = self:FindUnitEntity(enemyId)
@@ -2424,11 +2453,7 @@ script BattleSessionComponent extends Component
 		if enemy == nil or enemy.IsBoss ~= true or enemy.IsDead == true then
 			return { Success = false, Reason = "BOSS_UNAVAILABLE" }
 		end
-		local centerCell = (self.CellCount - 1) * 0.5
-		local landingCell = 0
-		if enemy.CellIndex <= centerCell then
-			landingCell = self.CellCount - 1
-		end
+		local landingCell = self:GetOppositeEdgeCell(enemy.CellIndex)
 		local result = enemy:SetAirborneState(true, landingCell)
 		if result.Success == true then
 			log("[BossJump] takeoff enemy=" .. enemyId .. " from=" .. enemy.CellIndex .. " landing=" .. landingCell)
@@ -2596,7 +2621,7 @@ script BattleSessionComponent extends Component
 			stepIndex,
 			success,
 			stepResult.Step.NextStepOnSuccess,
-			stepResult.Step.NextStepOnFailure,
+			stepResult.Step.ActionType == "SUMMON_ENEMIES" and 1 or stepResult.Step.NextStepOnFailure,
 			stepResult.StepCount,
 			stepResult.Step.ActionType
 		)
@@ -5495,6 +5520,10 @@ script BattleSessionComponent extends Component
 		if deathState.Success == false then
 			log_error("[BattleDeath] state transition failed unit=" .. unitId .. " reason=" .. deathState.Reason)
 			return
+		end
+		local summoner = unitEntity:GetComponent("script.FaustSummonComponent")
+		if summoner ~= nil then
+			summoner:RemoveSummon(self)
 		end
 		local defeatedPlan = unitEntity:GetComponent("script.EnemyActionPlanComponent")
 		local defeatedRunner = unitEntity:GetComponent("script.EnemyPatternRunnerComponent")
