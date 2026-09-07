@@ -123,6 +123,19 @@ script BattleHudPresenterLogic extends Logic
 	@ExecSpace("ClientOnly")
 	method void RefreshState(boolean force)
 		local session = self:GetBattleSession()
+		if self._T.HudTransferPending == true then
+			local player = _UserService.LocalPlayer
+			local map = isvalid(player) and player.CurrentMap or nil
+			local changed = isvalid(map) and map ~= self._T.HudTransferMap
+			if session ~= nil and (session.EntryRequestId ~= self._T.HudTransferEntry or session.HudContextRevision ~= self._T.HudTransferRevision) then
+				changed = true
+			end
+			if changed == false then
+				self:PublishUnavailableState("MAP_TRANSFER_PENDING", force)
+				return
+			end
+			self._T.HudTransferPending = false
+		end
 		if session == nil then
 			self:PublishUnavailableState("BATTLE_CONTEXT_MISSING", force)
 			return
@@ -149,11 +162,48 @@ script BattleHudPresenterLogic extends Logic
 			runFlowRevision = runFlowUi.RevisionKey
 		end
 
-		local signature = tostring(session.StageId) .. ":" .. tostring(session.StageNumber) .. ":" .. tostring(session.StageTurnNumber) .. ":" .. uiState.RevisionKey .. ":" .. tostring(waveState.CurrentWaveSpawnMode) .. ":" .. tostring(waveState.ForceAfterTurns) .. ":" .. tostring(waveState.WaveSpawnStageTurn) .. ":" .. tostring(waveState.ForceSpawnPending) .. ":" .. tostring(waveState.ForceSpawnPendingReason) .. ":" .. tostring(uiState.Drops.Revision) .. ":" .. tostring(uiState.RunInventory.Revision) .. ":" .. runFlowRevision .. ":" .. tostring(session.SkillSlotIds) .. ":" .. tostring(session.SkillSlotNames) .. ":" .. tostring(session.SkillSlotCooldownTurns) .. ":" .. tostring(session.SkillSlotRevision) .. ":" .. tostring(session.SkillSlotReorderReceiptRevision) .. ":" .. tostring(session.SkillIconSnapshot)
-		if force == false and self.LastSignature == signature then
+		-- Read the existing run reward accumulation; never substitute account balances.
+		local runUnion = nil
+		local localPlayer = _UserService.LocalPlayer
+		local unionState = isvalid(localPlayer) and localPlayer:GetComponent("script.PlayerRunUnionEffectComponent") or nil
+		if unionState ~= nil and unionState.RewardRunId > 0 and unionState.UnionRewardRevision > 0 then
+			runUnion = {
+				RewardRunId = unionState.RewardRunId,
+				Points = unionState.LastRewardWasCommitted and unionState.LastCommittedUnionPoints or unionState.PendingUnionPoints,
+				Revision = unionState.UnionRewardRevision
+			}
+		end
+		local runUnionSignature = runUnion ~= nil and (tostring(runUnion.RewardRunId) .. ":" .. tostring(runUnion.Revision) .. ":" .. tostring(runUnion.Points)) or ""
+		-- Quantizes only the existing DTO for display; never requests or mutates authoritative statistics.
+		local runStats = nil
+		local statsSource = uiState.RunStats
+		local runStatsSignature = "MISSING"
+		if statsSource ~= nil and statsSource.Success == true and (statsSource.RunSequence or 0) > 0 then
+			local elapsed = statsSource.ElapsedSeconds
+			if statsSource.IsRunning == false and statsSource.FinalElapsedSeconds ~= nil then
+				elapsed = statsSource.FinalElapsedSeconds
+			end
+			if type(elapsed) == "number" and type(statsSource.ConsumedTurns) == "number" and type(statsSource.HitsTaken) == "number" then
+				runStats = {
+					ElapsedSeconds = math.max(0, math.floor(elapsed)),
+					ConsumedTurns = statsSource.ConsumedTurns,
+					HitsTaken = statsSource.HitsTaken,
+					RunSequence = statsSource.RunSequence,
+					Revision = statsSource.Revision,
+					IsRunning = statsSource.IsRunning
+				}
+				runStatsSignature = tostring(runStats.RunSequence) .. ":" .. tostring(runStats.Revision)
+					.. ":" .. tostring(runStats.IsRunning) .. ":" .. tostring(runStats.ElapsedSeconds)
+					.. ":" .. tostring(runStats.ConsumedTurns) .. ":" .. tostring(runStats.HitsTaken)
+			end
+		end
+		local relics = self:GetRelicDisplayState(session)
+		local signature = runStatsSignature .. ":" .. runUnionSignature .. ":" .. relics.Signature .. ":" .. session.HudProgressSnapshot .. ":" .. tostring(session.Entity.Id) .. ":" .. tostring(session.EntryRequestId) .. ":" .. tostring(session.HudContextRevision) .. ":" .. tostring(uiState.Stage.DisplayName) .. ":" .. tostring(uiState.Stage.StageType) .. ":" .. tostring(uiState.Wave.Total) .. ":" .. tostring(uiState.Wave.State) .. ":" .. tostring(uiState.RunInventory.CurrencySnapshot) .. ":" .. tostring(session.StageId) .. ":" .. tostring(session.StageNumber) .. ":" .. tostring(session.StageTurnNumber) .. ":" .. uiState.RevisionKey .. ":" .. tostring(waveState.CurrentWaveSpawnMode) .. ":" .. tostring(waveState.ForceAfterTurns) .. ":" .. tostring(waveState.WaveSpawnStageTurn) .. ":" .. tostring(waveState.ForceSpawnPending) .. ":" .. tostring(waveState.ForceSpawnPendingReason) .. ":" .. tostring(uiState.Drops.Revision) .. ":" .. tostring(uiState.RunInventory.Revision) .. ":" .. runFlowRevision .. ":" .. tostring(session.SkillSlotIds) .. ":" .. tostring(session.SkillSlotNames) .. ":" .. tostring(session.SkillSlotCooldownTurns) .. ":" .. tostring(session.SkillSlotRevision) .. ":" .. tostring(session.SkillSlotReorderReceiptRevision) .. ":" .. tostring(session.SkillIconSnapshot)
+		if force == false and self.LastSignature == signature and self._T.HudSessionEntity == session.Entity then
 			return
 		end
 
+		self._T.HudSessionEntity = session.Entity
 		self.LastSignature = signature
 		self.StateRevision = self.StateRevision + 1
 		self.CurrentState = {
@@ -162,7 +212,15 @@ script BattleHudPresenterLogic extends Logic
 			ContextReason = "BATTLE_CONTEXT_READY",
 			Revision = self.StateRevision,
 			RevisionKey = signature,
+			ProgressSnapshot = session.HudProgressSnapshot,
+			RunUnion = runUnion,
+			RunStats = runStats,
+			Relics = relics.Items,
+			RelicSignature = relics.DisplayKey or "",
 			Session = {
+				MapId = session.Entity.Id,
+				EntryRequestId = session.EntryRequestId,
+				HudContextRevision = session.HudContextRevision,
 				StageId = session.StageId,
 				StageNumber = session.StageNumber,
 				StageTurnNumber = session.StageTurnNumber,
@@ -215,7 +273,21 @@ script BattleHudPresenterLogic extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method void PrepareForMapTransfer()
+		-- Invalidates display snapshots until a different map or entry generation is observed.
+		local player = _UserService.LocalPlayer
+		local session = self:GetBattleSession()
+		self._T.HudTransferMap = isvalid(player) and player.CurrentMap or nil
+		self._T.HudTransferEntry = session ~= nil and session.EntryRequestId or 0
+		self._T.HudTransferRevision = session ~= nil and session.HudContextRevision or 0
+		self._T.HudTransferPending = true
+		self:PublishUnavailableState("MAP_TRANSFER_PENDING", true)
+	end
+
+	@ExecSpace("ClientOnly")
 	method void PublishUnavailableState(string reason, boolean force)
+		self._T.RelicJson = nil
+		self._T.RelicData = nil
 		local signature = "Unavailable:" .. tostring(reason)
 		if force == false and self.LastSignature == signature then
 			return
@@ -350,6 +422,32 @@ script BattleHudPresenterLogic extends Logic
 			return player.CurrentMap:GetComponent("script.BattleWaveComponent")
 		end
 		return stateEntity:GetComponent("script.BattleWaveComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetRelicDisplayState(any session)
+		-- Decode only changed server display data; reject stale owner/run/entry generations.
+		local empty = { Items = {}, Signature = "" }
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return empty end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then return empty end
+		local snapshot = session.HudRelicSnapshot or ""
+		if snapshot == "" then return empty end
+		if self._T.RelicJson ~= snapshot then
+			self._T.RelicJson = snapshot
+			local ok, decoded = pcall(function() return _HttpService:JSONDecode(snapshot) end)
+			self._T.RelicData = ok and decoded or nil
+			self._T.RelicItemsKey = ok and type(decoded) == "table" and type(decoded.Items) == "table" and _HttpService:JSONEncode(decoded.Items) or ""
+		end
+		local data = self._T.RelicData
+		if type(data) ~= "table" or type(data.Items) ~= "table" then return empty end
+		if data.UserId ~= player.PlayerComponent.UserId or data.RunSequence ~= inventory.ActiveRunSequence
+			or data.InventoryRevision ~= inventory.InventoryRevision or data.ItemSnapshot ~= inventory.RunItemSnapshot
+			or data.MapId ~= session.Entity.Id or player.CurrentMap ~= session.Entity
+			or data.StageId ~= session.StageId or data.EntryRequestId ~= session.EntryRequestId
+			or data.HudContextRevision ~= session.HudContextRevision then return empty end
+		return { Items = data.Items, Signature = snapshot, DisplayKey = tostring(data.RunSequence) .. ":" .. tostring(data.MapId) .. ":" .. tostring(data.EntryRequestId) .. ":" .. tostring(data.HudContextRevision) .. ":" .. data.StageId .. ":" .. self._T.RelicItemsKey }
 	end
 
 end
