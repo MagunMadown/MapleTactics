@@ -67,6 +67,9 @@ script BattleSessionComponent extends Component
 	@Sync property integer StageSchemaVersion = 0
 	@Sync property integer RunSeed = 1000
 	@Sync property integer EntryRequestId = 0
+	@Sync property integer HudContextRevision = 0
+	@Sync property string HudProgressSnapshot = ""
+	@Sync property string HudRelicSnapshot = ""
 	@Sync property string EntryMode = ""
 	@Sync property string SelectedCharacterId = ""
 	@Sync property string SelectedJobId = ""
@@ -431,6 +434,7 @@ script BattleSessionComponent extends Component
 			end
 			return
 		end
+		self:RefreshHudProgressSnapshot()
 		self:UpdatePlayerGridMove(delta)
 		self:UpdateEnemyGridMove(delta)
 		self:RefreshPlayerHpSnapshot("")
@@ -461,6 +465,7 @@ script BattleSessionComponent extends Component
 		if self.BattlePhase == "Setup" then
 			self:TryStartBattle()
 		end
+		self:RefreshHudRelicSnapshot()
 	end
 
 	@ExecSpace("ServerOnly")
@@ -805,7 +810,7 @@ script BattleSessionComponent extends Component
 		end
 		local enemyUnit = enemy:GetComponent("script.BattleUnitComponent")
 		if enemyUnit ~= nil then
-			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, spawnDefinition.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.TraitIds or "", spawnDefinition.IsBoss == true)
+			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, spawnDefinition.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.TraitIds or "", spawnDefinition.IsBoss == true, spawnDefinition.DisplayName or "")
 			if enemyConfiguration.Success == false then
 				log_error("[EnemyData] apply failed unit=" .. unitId .. " reason=" .. enemyConfiguration.Reason)
 				_EntityService:Destroy(enemy)
@@ -1646,6 +1651,7 @@ script BattleSessionComponent extends Component
 	method void BeginEnemyTurnFromPlayerAction(string completionReason)
 		-- The authoritative action completion has already happened. Lock the enemy phase now,
 		-- then consume only the presentation handoff that this action still needs.
+		self:RecordRunConsumedPlayerTurn()
 		local handoffDelay = self.PlayerToEnemyBeatDuration
 		if completionReason == "IMMEDIATE_ACTION_COMPLETED" or completionReason == "SKILL_QUEUE_COMPLETED" then
 			handoffDelay = self.PlayerPresentationSettledBeatDuration
@@ -4161,6 +4167,7 @@ script BattleSessionComponent extends Component
 			return { Success = false, Reason = "BATTLE_STATE_MISSING" }
 		end
 
+		local runStats = _RunManagerLogic:GetLocalRunStatsSnapshot()
 		local cooldownSnapshot = ""
 		local cooldownRevision = 0
 		local runConsumableSnapshot = ""
@@ -4261,6 +4268,7 @@ script BattleSessionComponent extends Component
 			Success = true,
 			Reason = "OK",
 			PlayerActionState = playerActionState,
+			RunStats = runStats,
 			CombatFeel = {
 				PlayerMoveDuration = self.MoveActionDuration,
 				MoveCurve = self.MoveCurve,
@@ -4280,7 +4288,7 @@ script BattleSessionComponent extends Component
 				HitFlashDuration = self.HitFlashDuration,
 				HitReactionDuration = self.HitReactionDuration
 			},
-			RevisionKey = tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.QueueOrderRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. tostring(self.UnionRewardRevision) .. ":" .. self.BattleResult,
+			RevisionKey = tostring(runStats.Revision) .. ":" .. tostring(runStats.RunSequence) .. ":" .. tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.QueueOrderRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. tostring(self.UnionRewardRevision) .. ":" .. self.BattleResult,
 			Phase = turnState.BattlePhase,
 			TurnNumber = turnState.TurnNumber,
 			IsProcessing = turnState.IsActionProcessing,
@@ -4616,6 +4624,8 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
+		-- Presentation generation invalidates cached HUD references even when StageId and UnitId repeat.
+		self.HudContextRevision = self.HudContextRevision + 1
 		self:CancelPlayerCombatPresentationHandoff("REBUILD_" .. reason, true)
 		self:FinishPlayerGridMovePresentation("REBUILD_" .. reason)
 		self:FinishEnemyGridMovePresentation("REBUILD_" .. reason, false)
@@ -5564,6 +5574,13 @@ script BattleSessionComponent extends Component
 			if #livingEnemies > 0 then
 				log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=CONTINUE livingEnemies=" .. #livingEnemies)
 				return
+			end
+		end
+		-- A successful queue can clear the wave before its completion timer reaches the handoff.
+		if unit.Team == "Enemy" and self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0 then
+			local sourceEntity = self:FindUnitEntity(sourceUnitId)
+			if isvalid(sourceEntity) and sourceEntity == self.PlayerEntity then
+				self:RecordRunConsumedPlayerTurn()
 			end
 		end
 		self:ClearForcedSpawnSchedule("ALL_ENEMIES_DEFEATED")
@@ -6712,6 +6729,170 @@ script BattleSessionComponent extends Component
 		log("[BattleSession] ready phase=" .. self.BattlePhase .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " playerCell=" .. self.PlayerStartCell .. " livingEnemies=" .. #livingEnemies .. " enemyHp=" .. self.CurrentEnemyMaxHp)
 		log("[BattleSession] battle started stageId=" .. self.StageId .. " wave=" .. self.CurrentWave)
 		self:PrepareEnemyIntent()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshHudProgressSnapshot()
+		-- Presentation only. Never validate or gate battle entry through this optional path.
+		local run = nil
+		if isvalid(self.PlayerEntity) then run = self.PlayerEntity:GetComponent("script.PlayerRunStateComponent") end
+		local graphId = run ~= nil and run.CurrentNodeGraphId or ""
+		local nodeId = run ~= nil and run.CurrentNodeId or ""
+		local context = self.StageId .. "~" .. tostring(self.EntryRequestId) .. "~" .. tostring(self.HudContextRevision)
+		local cacheKey = context .. "~" .. self.RegionId .. "~" .. graphId .. "~" .. nodeId .. "~" .. tostring(run ~= nil and run.RunSequence or 0)
+		if self._T.HudProgressCacheKey == cacheKey then return end
+		self._T.HudProgressCacheKey = cacheKey
+		self.HudProgressSnapshot = ""
+		local currentNode = nil
+		if graphId ~= "" or nodeId ~= "" then
+			if graphId == "" or nodeId == "" then return end
+			currentNode = _NodeDefinitionRepositoryLogic:GetNodeDefinition(graphId, nodeId)
+			if currentNode.Success ~= true or currentNode.StageId ~= self.StageId then return end
+		else
+			currentNode = _NodeDefinitionRepositoryLogic:FindNodeByStageId(self.StageId)
+			if currentNode.Success ~= true then return end
+			graphId = currentNode.NodeGraphId
+		end
+		local graph = _NodeDefinitionRepositoryLogic:GetGraphDefinitions(graphId)
+		if graph.Success ~= true then return end
+		local nodes = {}
+		local battles = {}
+		local stages = {}
+		local count = 0
+		for _, node in ipairs(graph.Definitions) do
+			if node.Enabled == true then
+				if nodes[node.NodeId] ~= nil then return end
+				nodes[node.NodeId] = node
+				if node.NodeType == "BATTLE" or node.NodeType == "BOSS" then
+					local stage = _StageDefinitionRepositoryLogic:GetStageDefinition(node.StageId)
+					if stage.Success ~= true or stage.MatchCount ~= 1 then return end
+					if stage.StageType ~= "NORMAL" and stage.StageType ~= "BOSS" then return end
+					stages[node.NodeId] = stage
+					if stage.RegionId == self.RegionId then
+						battles[node.NodeId] = node
+						count = count + 1
+					end
+				end
+			end
+		end
+		if battles[currentNode.NodeId] == nil or count == 0 then return end
+		local nextBattle = {}
+		local incoming = {}
+		for id, battle in pairs(battles) do
+			local cursor = battle
+			local seen = {}
+			-- A boss is the regional endpoint; outgoing shops/regions are not part of this strip.
+			if stages[id].StageType ~= "BOSS" then
+				while cursor ~= nil do
+					if seen[cursor.NodeId] then return end
+					seen[cursor.NodeId] = true
+					local nextId = nil
+					for candidate in string.gmatch(cursor.NextNodeIds or "", "([^|]+)") do
+						if nextId ~= nil then return end
+						nextId = candidate
+					end
+					if nextId == nil then break end
+					cursor = nodes[nextId]
+					if cursor == nil then return end
+					if stages[nextId] ~= nil then
+						if battles[nextId] ~= nil then
+							nextBattle[id] = nextId
+							incoming[nextId] = (incoming[nextId] or 0) + 1
+						end
+						break
+					end
+					if cursor.NodeType ~= "REST" and cursor.NodeType ~= "SHOP" then return end
+				end
+			end
+		end
+		local head = nil
+		for id, _ in pairs(battles) do
+			if (incoming[id] or 0) > 1 then return end
+			if incoming[id] == nil then
+				if head ~= nil then return end
+				head = id
+			end
+		end
+		local entries = { context }
+		local visited = {}
+		local visitedStages = {}
+		local included = 0
+		local foundCurrent = false
+		while head ~= nil do
+			if visited[head] then return end
+			visited[head] = true
+			local stage = stages[head]
+			if visitedStages[stage.StageId] or string.find(stage.StageId, "[~|]") ~= nil then return end
+			visitedStages[stage.StageId] = true
+			if stage.StageId == self.StageId then foundCurrent = true end
+			table.insert(entries, stage.StageId .. "~" .. stage.StageType)
+			included = included + 1
+			head = nextBattle[head]
+		end
+		if included ~= count or not foundCurrent then return end
+		self.HudProgressSnapshot = table.concat(entries, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshHudRelicSnapshot()
+		-- Optional display data only; membership and quantities stay owned by the run inventory.
+		local player = self.PlayerEntity
+		if not isvalid(player) or player.CurrentMap ~= self.Entity then
+			self.HudRelicSnapshot = ""
+			self._T.HudRelicCache = nil
+			return
+		end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.ActiveRunSequence <= 0 or _RelicDefinitionRepositoryLogic == nil then
+			self.HudRelicSnapshot = ""
+			self._T.HudRelicCache = nil
+			return
+		end
+		local snapshot = inventory.RunItemSnapshot or ""
+		local context = self.StageId .. "~" .. tostring(self.EntryRequestId) .. "~" .. tostring(self.HudContextRevision)
+		local cached = self._T.HudRelicCache
+		if cached ~= nil and cached.Inventory == inventory and cached.Context == context
+			and cached.RunSequence == inventory.ActiveRunSequence and cached.Revision == inventory.InventoryRevision
+			and cached.Snapshot == snapshot then return end
+		local items = {}
+		local seen = {}
+		for entry in string.gmatch(snapshot, "([^|]+)") do
+			local itemId, amount = string.match(entry, "^([^~]+)~([^~]+)$")
+			local quantity = tonumber(amount) or 0
+			if itemId ~= nil and quantity > 0 and not seen[itemId] then
+				seen[itemId] = true
+				local ok, definition = pcall(function() return _RelicDefinitionRepositoryLogic:GetRelicDefinition(itemId) end)
+				if ok and definition ~= nil and definition.Success == true then
+					table.insert(items, { RelicId = itemId, DisplayName = definition.DisplayName,
+						IconImageRUID = definition.IconImageRUID, EffectDescription = definition.EffectDescription, Quantity = quantity })
+				end
+			end
+		end
+		-- Preserve snapshot order (stable ItemId order); it is not acquisition order.
+		self.HudRelicSnapshot = ""
+		if #items > 0 then
+			self.HudRelicSnapshot = _HttpService:JSONEncode({ Items = items, ItemSnapshot = snapshot,
+			UserId = player.PlayerComponent.UserId, RunSequence = inventory.ActiveRunSequence,
+			InventoryRevision = inventory.InventoryRevision, MapId = self.Entity.Id, StageId = self.StageId,
+			EntryRequestId = self.EntryRequestId, HudContextRevision = self.HudContextRevision })
+		end
+		self._T.HudRelicCache = { Inventory = inventory, Context = context, RunSequence = inventory.ActiveRunSequence,
+			Revision = inventory.InventoryRevision, Snapshot = snapshot }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RecordRunConsumedPlayerTurn()
+		-- Observes successful handoff or wave-clearing execution; enemy turns and duplicate commits are excluded.
+		if self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or isvalid(self.PlayerEntity) == false then
+			return
+		end
+		local combatStats = self.PlayerEntity:GetComponent("script.PlayerRunCombatStatsComponent")
+		if combatStats == nil then
+			return
+		end
+		local consumptionKey = tostring(self.Entity.Id) .. ":" .. self.StageId .. ":" .. tostring(self.EntryRequestId)
+			.. ":" .. tostring(self.HudContextRevision) .. ":" .. tostring(self.TurnState.StateRevision)
+		combatStats:RecordConsumedTurn(consumptionKey)
 	end
 
 end
