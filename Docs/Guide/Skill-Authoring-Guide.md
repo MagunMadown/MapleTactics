@@ -97,6 +97,8 @@ TryQueueTile
 | `CasterMotionDuration` | number | `0.35` | 적 공격 모션 유지 시간. 비우면 `ActionDuration` |
 | `EnemyQueueTurns` | integer | `1` | 적이 공격 Tile을 준비하는 데 소비할 적 턴 수 |
 | `HudIconRuid` | string | sprite/animationclip RUID | 적 머리 위 Queue와 전투 HUD용 아이콘 |
+| `CastSoundRuid` | string | audioclip RUID | 시전 순간 재생할 사운드. 비우면 생략 |
+| `HitSoundRuid` | string | audioclip RUID | 피격 프레임에 대상마다 재생할 사운드. 비우면 생략 |
 
 ## WeaponType과 무기 카탈로그
 

@@ -128,6 +128,8 @@
 | CasterMotionDuration | number | 조건부 | 공격 클립 유지 시간. 비우면 ActionDuration |
 | EnemyQueueTurns | integer | - | 적 공격 Tile 준비에 필요한 적 턴 수. 플레이어 스킬은 0 |
 | HudIconRuid | string | - | 적 머리 위 Queue/HUD 아이콘 |
+| CastSoundRuid | string | - | 시전 순간 재생할 audioclip RUID. 비우면 시전 사운드 없음 |
+| HitSoundRuid | string | - | 피격 프레임에 대상마다 재생할 audioclip RUID. 비우면 피격 사운드 없음 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -136,6 +138,11 @@
 TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 수 있는 지원 스킬에 사용한다.
 
 ### 4.0 이펙트 RUID 규칙
+
+`CastSoundRuid`/`HitSoundRuid`는 이펙트와 짝을 이루는 **`audioclip` RUID**다. 이펙트와
+독립적으로 판정되므로 둘 중 하나만 채워도 그 절반만 연출된다. 재생은 위치 감쇠 없는
+2D(`_SoundService:PlaySound`)이며, 볼륨은 `BattleSessionComponent.SkillSoundVolume`이
+전체에 공통 적용된다. 적 스킬 행은 비워 두는 것이 현재 기본값이다.
 
 `CastEffectRuid`/`HitEffectRuid`는 `sprite`가 아니라 **`animationclip` RUID**여야 한다.
 값은 각 스킬의 공식 리소스 팩에서 가져오며, 팩 안의 `effect` 엘리먼트가 시전,

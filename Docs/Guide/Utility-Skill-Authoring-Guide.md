@@ -172,6 +172,9 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 - `CastEffectRuid`, `HitEffectRuid`, `IconRuid`가 모두 비어 있다. 비어 있어도 스킬은 동작하고
   표현 계층이 기본 스프라이트로 대체한다. 실제 RUID는 `msw-search`로 각 스킬 리소스 팩을
   찾아 채운다. 절차는 [`Skill-Authoring-Guide.md`](./Skill-Authoring-Guide.md) "아이콘"을 따른다.
+- `CastSoundRuid`/`HitSoundRuid`는 5행 모두 채워져 있지만, `UtilitySkillDefinitions`는 아직
+  어떤 리포지토리도 로드하지 않으므로 런타임에서 재생되지 않는다. 데이터셋을
+  `SkillDefinitionRepositoryLogic`에 연결하는 시점에 함께 살아난다.
 - `MotionProfileId`는 기존 `basic_slash`/`heavy_slash`를 재사용한다. 유틸리티 전용 모션이
   필요하면 Motion Profile을 먼저 확장한다.
 - 2단계 강화 행은 없다. 전 행이 `SkillTier=1`, `BaseSkillId` 비움이다.
