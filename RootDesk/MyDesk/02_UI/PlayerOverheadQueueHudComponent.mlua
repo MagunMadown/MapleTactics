@@ -80,8 +80,8 @@ script PlayerOverheadQueueHudComponent extends Component
 	property SpriteGUIRendererComponent UtilityIcon = "a17311dd-c941-496d-a43c-5d1fbc7242ae"
 	property Entity UtilityCooldownPipContainer = "db94f1e4-293f-4d64-98e0-2b9b18177b8d"
 	property integer UtilityCooldownPipPoolSize = 4
-	property number UtilityHudOffsetX = 94
-	property number UtilityHudOffsetY = -24
+	property number UtilityHudOffsetX = 0
+	property number UtilityHudOffsetY = -116
 	property string UtilitySkillId = ""
 	property integer UtilityMaxCooldown = 0
 	property integer UtilityRemainingCooldown = 0
@@ -158,6 +158,8 @@ script PlayerOverheadQueueHudComponent extends Component
 
 		self.RefreshElapsed = 0
 		self:RefreshQueue(session)
+		self:SetUtilityCooldownState(session.UtilitySkillId, session.UtilitySkillIconRuid,
+			session.UtilityMaxCooldown, session.UtilityRemainingCooldown, session.BattleResult == "")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -195,8 +197,10 @@ script PlayerOverheadQueueHudComponent extends Component
 			self.ReservationQueueTransform.anchoredPosition = Vector2(uiPosition.x, uiPosition.y + centerOffsetY)
 		end
 		if self.UtilitySkillHUDTransform ~= nil then
-			-- Align beside the lowest reservation slot so the utility HUD never covers the avatar.
-			self.UtilitySkillHUDTransform.anchoredPosition = Vector2(uiPosition.x + self.UtilityHudOffsetX, uiPosition.y + self.UtilityHudOffsetY)
+			-- Track the feet independently of the overhead queue; leave room for the red HP rows.
+			local feetScreen = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y))
+			local feetUI = _UILogic:ScreenToUIPosition(feetScreen)
+			self.UtilitySkillHUDTransform.anchoredPosition = Vector2(feetUI.x + self.UtilityHudOffsetX, feetUI.y + self.UtilityHudOffsetY)
 		end
 	end
 
@@ -217,14 +221,12 @@ script PlayerOverheadQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void SetUtilityCooldownState(string utilitySkillId, string iconRuid, integer maxCooldown, integer remainingCooldown, boolean runtimeAvailable)
-		-- Future utility runtime/presenter boundary. This view never starts or decrements cooldowns itself.
-		if runtimeAvailable == false or utilitySkillId == nil or utilitySkillId == "" or maxCooldown <= 0 then
-			self:HideUtilityCooldownHud("RUNTIME_UNAVAILABLE")
+		-- Displays server-owned utility cooldowns; this view never advances turns itself.
+		if isvalid(self.UtilitySkillHUD) == false or isvalid(self.UtilityCooldownPipContainer) == false then
 			return
 		end
-		if iconRuid == nil or iconRuid == "" then
-			-- UtilitySkillDefinitions currently author no icon RUID; do not invent a placeholder.
-			self:HideUtilityCooldownHud("ICON_DATA_MISSING")
+		if runtimeAvailable == false or utilitySkillId == nil or utilitySkillId == "" or maxCooldown <= 0 then
+			self:HideUtilityCooldownHud("RUNTIME_UNAVAILABLE")
 			return
 		end
 
@@ -232,12 +234,18 @@ script PlayerOverheadQueueHudComponent extends Component
 		self.UtilitySkillId = utilitySkillId
 		self.UtilityMaxCooldown = math.max(0, math.min(self.UtilityCooldownPipPoolSize, maxCooldown))
 		self.UtilityRemainingCooldown = math.max(0, math.min(self.UtilityMaxCooldown, remainingCooldown))
-		self.UtilityIcon.ImageRUID = DataRef(iconRuid)
-		self.UtilityIcon.Type = ImageType.Simple
-		self.UtilityIcon.DropShadow = false
-		self.UtilityIcon.Color = Color(1, 1, 1, 1)
-		self.UtilityIcon.Entity.Enable = true
-		self.UtilityIcon.Enable = true
+		-- Missing authored icons must not hide the usable cooldown pips.
+		local hasIcon = iconRuid ~= nil and iconRuid ~= ""
+		if self.UtilityIcon ~= nil then
+			if hasIcon then
+				self.UtilityIcon.ImageRUID = DataRef(iconRuid)
+				self.UtilityIcon.Type = ImageType.Simple
+				self.UtilityIcon.DropShadow = false
+				self.UtilityIcon.Color = Color(1, 1, 1, 1)
+			end
+			self.UtilityIcon.Entity.Enable = hasIcon
+			self.UtilityIcon.Enable = hasIcon
+		end
 		self.UtilityCooldownPipContainer.Enable = true
 		self.UtilitySkillHUD.Enable = true
 		self:RefreshUtilityCooldownPips(self.UtilityMaxCooldown, self.UtilityRemainingCooldown)
@@ -249,9 +257,9 @@ script PlayerOverheadQueueHudComponent extends Component
 		local visibleCount = math.max(0, math.min(self.UtilityCooldownPipPoolSize, maxCooldown))
 		local clampedRemaining = math.max(0, math.min(visibleCount, remainingCooldown))
 		local recoveredCount = visibleCount - clampedRemaining
-		local pipWidth = 10
-		local pipHeight = 6
-		local pipSpacing = 2
+		local pipWidth = 18
+		local pipHeight = 10
+		local pipSpacing = 4
 		local rowWidth = visibleCount * pipWidth + math.max(0, visibleCount - 1) * pipSpacing
 		local activeColor = Color(1.00, 0.72, 0.18, 1)
 		local inactiveColor = Color(0.48, 0.52, 0.58, 1)
@@ -324,7 +332,8 @@ script PlayerOverheadQueueHudComponent extends Component
 		local visibleSkills = self:GetVisibleSkills(serializedQueue, firstVisibleIndex)
 		local queueCount = queueState.Count or 0
 		local visibleSlotCount = math.max(0, math.min(queueCapacity, queueCount))
-		if source == "QUEUED" and self.BottomSkillDragPresentationActive and queueCount < queueCapacity then
+		if source == "QUEUED" and self.BottomSkillDragPresentationActive
+			and uiState.Commands ~= nil and uiState.Commands.CanQueue == true and queueCount < queueCapacity then
 			visibleSlotCount = math.min(queueCapacity, queueCount + 1)
 		elseif source == "EXECUTING" then
 			visibleSlotCount = math.max(1, math.min(queueCapacity, #visibleSkills))
@@ -444,6 +453,8 @@ script PlayerOverheadQueueHudComponent extends Component
 				local sourceEntity = button.Entity
 				table.insert(self._T.QueueItemDragHandlers, {
 					Entity = sourceEntity,
+					Enter = sourceEntity:ConnectEvent(UITouchEnterEvent, self.OnQueueItemEnter),
+					Exit = sourceEntity:ConnectEvent(UITouchExitEvent, self.OnQueueItemExit),
 					BeginDrag = sourceEntity:ConnectEvent(UITouchBeginDragEvent, self.OnQueueItemBeginDrag),
 					Drag = sourceEntity:ConnectEvent(UITouchDragEvent, self.OnQueueItemDrag),
 					EndDrag = sourceEntity:ConnectEvent(UITouchEndDragEvent, self.OnQueueItemEndDrag)
@@ -459,12 +470,46 @@ script PlayerOverheadQueueHudComponent extends Component
 		for index = 1, #handlers do
 			local record = handlers[index]
 			if record ~= nil and isvalid(record.Entity) then
+				if record.Enter ~= nil then record.Entity:DisconnectEvent(UITouchEnterEvent, record.Enter) end
+				if record.Exit ~= nil then record.Entity:DisconnectEvent(UITouchExitEvent, record.Exit) end
 				if record.BeginDrag ~= nil then record.Entity:DisconnectEvent(UITouchBeginDragEvent, record.BeginDrag) end
 				if record.Drag ~= nil then record.Entity:DisconnectEvent(UITouchDragEvent, record.Drag) end
 				if record.EndDrag ~= nil then record.Entity:DisconnectEvent(UITouchEndDragEvent, record.EndDrag) end
 			end
 		end
 		self._T.QueueItemDragHandlers = {}
+		self._T.HoveredQueueIndex = 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnQueueItemEnter(UITouchEnterEvent event)
+		-- Track the actual raycast target so covered slots cannot receive cancellation.
+		self._T.HoveredQueueIndex = self:ResolveQueueDragIndex(event.Entity)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnQueueItemExit(UITouchExitEvent event)
+		-- Ignore an old exit delivered after another slot was entered.
+		if self._T.HoveredQueueIndex == self:ResolveQueueDragIndex(event.Entity) then
+			self._T.HoveredQueueIndex = 0
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleQueueRightClick(KeyDownEvent event)
+		-- PC right-click cancels only the hovered reservation through the existing server route.
+		if event.key ~= KeyboardKey.Mouse1 or not isvalid(self.ReservationQueue)
+			or self.ReservationQueue.Enable == false or self.QueueReorderPendingRequestId > 0
+			or self._T.QueueItemDragCandidate == true or self.BottomSkillDragPresentationActive then
+			return
+		end
+		local index = self._T.HoveredQueueIndex or 0
+		if index <= 0 or self:GetQueuedSkillIdAt(index) == ""
+			or self:ResolveQueueItemDropIndex(_InputService:GetCursorPosition()) ~= index then
+			return
+		end
+		_BattleHudPresenterLogic:RequestRemoveQueueItem(index)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1180,8 +1225,10 @@ script PlayerOverheadQueueHudComponent extends Component
 			-- remain presentation-only even when their icon entity is visible.
 			dragButton.Enable = visible and self.QueueReorderAvailable
 		end
-		-- The vertical position already communicates execution order; reserve the tile face for the real skill icon.
-		label.Enable = false
+		-- Show the insertion hint only while a bottom skill is being held or dragged.
+		label.Entity.Enable = capacityActive and not visible and self.QueueInteractionAvailable
+		label.Enable = capacityActive and not visible and self.QueueInteractionAvailable
+		label.Text = "+"
 		if visible then
 			local iconRuid = self:GetSkillIconRuid(skillId)
 			icon.ImageRUID = DataRef(iconRuid)

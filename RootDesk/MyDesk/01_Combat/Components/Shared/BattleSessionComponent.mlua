@@ -75,6 +75,10 @@ script BattleSessionComponent extends Component
 	@Sync property string SelectedJobId = ""
 	@Sync property string SelectedJobMechanicId = "NONE"
 	@Sync property string SelectedJobPassiveSetId = ""
+	@Sync property string UtilitySkillId = ""
+	@Sync property string UtilitySkillIconRuid = ""
+	@Sync property integer UtilityMaxCooldown = 0
+	@Sync property integer UtilityRemainingCooldown = 0
 	@Sync property string SelectedJobStartingSkillIds = ""
 	@Sync property string SkillSlotIds = ""
 	@Sync property string SkillSlotNames = ""
@@ -260,7 +264,27 @@ script BattleSessionComponent extends Component
 	@EventSender("Service", "InputService")
 	handler HandleMoveKeyDown(KeyDownEvent event)
 		-- Converts one movement/turn/attack key press into a server-authoritative request.
-		if event.key == KeyboardKey.Space then
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= self.Entity then
+			return
+		end
+		-- UI clicks belong to skill selection and dragging, never to world commands.
+		if (event.key == KeyboardKey.Mouse0 or event.key == KeyboardKey.Mouse1 or event.key == KeyboardKey.Mouse2)
+			and _InputService:IsPointerOverUI() then
+			return
+		end
+		if event.key == KeyboardKey.Space or event.key == KeyboardKey.Mouse0 then
+			log("[BattleInput] execute queue requested")
+			_BattleHudPresenterLogic:RequestExecuteQueue()
+			return
+		end
+		if event.key == KeyboardKey.Mouse1 then
+			if _BattleHudPresenterLogic:TryBeginLocalCommand("UTILITY") then
+				self:RequestUtilitySkill()
+			end
+			return
+		end
+		if event.key == KeyboardKey.W or event.key == KeyboardKey.Mouse2 then
 			if _BattleHudPresenterLogic:TryBeginLocalCommand("TURN") == false then
 				return
 			end
@@ -271,9 +295,7 @@ script BattleSessionComponent extends Component
 		end
 
 		if event.key == KeyboardKey.H then
-			self.ConsumableRequestSequence = self.ConsumableRequestSequence + 1
-			log("[BattleInput] consumable requested ref=potion_hp_small request=" .. self.ConsumableRequestSequence)
-			self:RequestUseConsumable("potion_hp_small", self.ConsumableRequestSequence)
+			self:SubmitConsumableUse("orange_potion", "")
 			return
 		end
 
@@ -290,7 +312,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void PreviewLocalTurnFacing()
-		-- Gives Space an immediate visual response without mutating authoritative BattleUnit facing.
+		-- Gives direction input an immediate visual response without mutating authoritative BattleUnit facing.
 		local player = _UserService.LocalPlayer
 		if isvalid(player) == false or player.PlayerControllerComponent == nil then
 			return
@@ -1520,6 +1542,142 @@ script BattleSessionComponent extends Component
 		local position = self:GetCellPosition(unit.CellIndex)
 		log("[BattleSession] unit registered id=" .. unit.UnitId .. " team=" .. unit.Team .. " cell=" .. unit.CellIndex .. " spawnOrder=" .. unit.SpawnOrder .. " x=" .. position.x)
 		return { Success = true, Reason = "UNIT_REGISTERED", UnitId = unit.UnitId }
+	end
+
+	@ExecSpace("Server")
+	method void RequestUtilitySkill()
+		-- The server chooses the utility from the selected job; clients cannot submit arbitrary skill IDs.
+		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil
+			or self.PlayerEntity.PlayerComponent.UserId ~= senderUserId
+			or self.PlayerEntity.CurrentMap ~= self.Entity then
+			return
+		end
+		local result = self:TryUseUtilitySkill()
+		self:PublishPlayerCommandResult("UTILITY", result)
+		log("[UtilitySkill] request job=" .. self.SelectedJobId .. " skill=" .. self.UtilitySkillId
+			.. " success=" .. tostring(result.Success) .. " reason=" .. result.Reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryUseUtilitySkill()
+		-- Reserves the existing immediate-action lock without consuming or rewriting queued skills.
+		if self.TurnState == nil or self.BoardState == nil or self.BattleResult ~= ""
+			or self.BattlePhase ~= "PlayerTurn" then
+			return { Success = false, Reason = "INVALID_PHASE" }
+		end
+		local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead or unit.IsAirborne then
+			return { Success = false, Reason = "UNIT_UNAVAILABLE" }
+		end
+		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(self.SelectedJobId)
+		if bundle.Success == false then return bundle end
+		local definition = bundle.Definition
+		local runtime = self:GetSkillRuntimeState("player_01")
+		if runtime == nil then return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" } end
+		local cooldown = runtime:CanUseSkill(definition.SkillId)
+		if cooldown.Success == false then return cooldown end
+		local reserved = self.TurnState:TryReserveImmediateAction("UTILITY", 0)
+		if reserved.Success == false then return reserved end
+		self.CurrentPlayerActionKillCount = 0
+		local result = self:ExecuteUtilityEffect(definition, bundle.Step, unit)
+		if result.Success == false then
+			self:CompleteQueuedAction("UTILITY", false, result.Reason)
+			return result
+		end
+		self.UtilitySkillId = definition.SkillId
+		self.UtilitySkillIconRuid = definition.IconRuid
+		self.UtilityMaxCooldown = definition.CooldownTurns
+		runtime:StartCooldown(definition.SkillId, definition.CooldownTurns)
+		self.UtilityRemainingCooldown = runtime:GetRemainingCooldown(definition.SkillId)
+		self:PublishTurnStateSnapshot("UTILITY_EXECUTED")
+		local duration = math.max(0.1, definition.ActionDuration) / self:GetSkillSpeedMultiplier()
+		self.ActionTimerId = _TimerService:SetTimerOnce(function()
+			self:CompleteQueuedAction("UTILITY", true, result.Reason)
+		end, duration)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ExecuteUtilityEffect(table definition, table step, any sourceUnit)
+		-- Executes the authored utility effect through existing board, push and HP boundaries.
+		local direction = sourceUnit.Facing == "Right" and 1 or -1
+		local sourceCell = sourceUnit.CellIndex
+		if step.EffectType == "GUARD" and step.TargetSelector == "SELF_UNIT"
+			and step.ParameterA == "UNTIL_NEXT_PLAYER_TURN" and step.ParameterB == "ALL_DAMAGE" then
+			sourceUnit.UtilityGuardActive = true
+			return { Success = true, Reason = "UTILITY_GUARD_ACTIVE" }
+		end
+		if step.EffectType == "MOVE_SELF" and step.TargetSelector == "SELF_UNIT" then
+			local destination = -1
+			if step.ParameterA == "FARTHEST_EMPTY_FORWARD" then
+				for distance = 1, self.CellCount do
+					local cell = sourceCell + direction * distance
+					if self:IsValidCell(cell) and self:IsCellOccupied(cell, sourceUnit.UnitId) == false then
+						destination = cell
+					end
+				end
+			elseif step.ParameterA == "BEHIND_FARTHEST_ENEMY_FORWARD" and step.ParameterB == "REQUIRE_EMPTY" then
+				local farthestEnemy = -1
+				for distance = 1, self.CellCount do
+					local cell = sourceCell + direction * distance
+					if self:IsValidCell(cell) then
+						local entity = self.BoardState:FindAtCell(cell, sourceUnit.UnitId)
+						if isvalid(entity) then
+							local target = entity:GetComponent("script.BattleUnitComponent")
+							if target ~= nil and target.Team ~= sourceUnit.Team and not target.IsDead and not target.IsAirborne then
+								farthestEnemy = cell
+							end
+						end
+					end
+				end
+				if farthestEnemy >= 0 then
+					destination = farthestEnemy + direction * math.max(1, math.floor(step.Value))
+				end
+			else
+				return { Success = false, Reason = "UTILITY_MOVE_RULE_UNSUPPORTED" }
+			end
+			if self:IsValidCell(destination) == false or self:IsCellOccupied(destination, sourceUnit.UnitId) then
+				return { Success = false, Reason = "UTILITY_NO_EMPTY_DESTINATION" }
+			end
+			return self:RelocateUnitForMechanic(sourceUnit.UnitId, destination, definition.SkillId)
+		end
+		if step.EffectType ~= "PUSH_DISTANCE"
+			or (step.ParameterA ~= "STOP_BEFORE_BLOCKED" and step.ParameterA ~= "MAX")
+			or (step.TargetSelector ~= "PRIMARY_TARGET" and step.TargetSelector ~= "ALL_SKILL_TARGETS") then
+			return { Success = false, Reason = "UTILITY_EFFECT_UNSUPPORTED" }
+		end
+		local targets = _SkillTargetResolverLogic:Resolve(self, sourceUnit.UnitId, definition)
+		if targets.Success == false then return targets end
+		local targetIds = step.TargetSelector == "PRIMARY_TARGET" and { targets.PrimaryTargetUnitId } or targets.TargetUnitIds
+		if #targetIds == 0 or targetIds[1] == "" then
+			return { Success = false, Reason = "UTILITY_NO_TARGET" }
+		end
+		-- Move the farthest target first so nearer targets cannot block a multi-target wave.
+		table.sort(targetIds, function(left, right)
+			return math.abs(targets.TargetCellsByUnitId[left] - sourceCell) > math.abs(targets.TargetCellsByUnitId[right] - sourceCell)
+		end)
+		local maxSteps = step.ParameterA == "MAX" and self.CellCount or math.max(0, math.floor(step.Value))
+		local moved = 0
+		for _, targetId in ipairs(targetIds) do
+			for distance = 1, maxSteps do
+				local pushed = self:ResolvePushImpactOnTarget(sourceUnit.UnitId, targetId)
+				if pushed.Success == false or pushed.Reason ~= "PUSHED" then break end
+				moved = moved + 1
+			end
+		end
+		if step.ParameterB == "CARRY_CASTER" and moved > 0 then
+			local destination = sourceCell
+			for distance = 1, self.CellCount do
+				local cell = sourceCell + direction * distance
+				if self:IsValidCell(cell) == false or self:IsCellOccupied(cell, sourceUnit.UnitId) then break end
+				destination = cell
+			end
+			if destination ~= sourceCell then
+				self:RelocateUnitForMechanic(sourceUnit.UnitId, destination, definition.SkillId)
+			end
+		end
+		log("[UtilitySkill] pushed skill=" .. definition.SkillId .. " cells=" .. tostring(moved))
+		return { Success = true, Reason = moved > 0 and "UTILITY_PUSHED" or "UTILITY_PUSH_BLOCKED" }
 	end
 
 	@ExecSpace("Server")
@@ -3681,6 +3839,11 @@ script BattleSessionComponent extends Component
 		self.SelectedJobId = runState.SelectedJobId
 		self.SelectedJobMechanicId = runState.SelectedJobMechanicId
 		self.SelectedJobPassiveSetId = runState.SelectedJobPassiveSetId
+		local utility = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(self.SelectedJobId)
+		self.UtilitySkillId = utility.Success and utility.Definition.SkillId or ""
+		self.UtilitySkillIconRuid = utility.Success and utility.Definition.IconRuid or ""
+		self.UtilityMaxCooldown = utility.Success and utility.Definition.CooldownTurns or 0
+		self.UtilityRemainingCooldown = 0
 		self.SelectedJobStartingSkillIds = runState.StartingSkillIds
 		self.SelectedJobBaseMaxHp = runState.JobBaseMaxHp
 		self.SelectedJobBaseQueueCapacity = runState.JobBaseQueueCapacity
@@ -4458,7 +4621,7 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
-	method void RequestUseConsumable(string consumableId, integer requestId)
+	method void RequestUseConsumable(string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Authenticates a client request before entering the server-only consumable workflow.
 		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil then
 			log_warning("[BattleConsumable] rejected reason=PLAYER_MISSING")
@@ -4468,15 +4631,17 @@ script BattleSessionComponent extends Component
 			log_warning("[BattleConsumable] rejected reason=INVALID_SENDER")
 			return
 		end
-		local result = self:TryUseRunConsumable(self.PlayerEntity, consumableId, requestId)
+		local result = self:TryUseRunConsumable(self.PlayerEntity, consumableId, requestId, targetSkillId, entryId, inventoryRevision)
+		result.RequestId = requestId
+		self:ReceiveConsumableUseResult(result, entryId, self.PlayerEntity.PlayerComponent.UserId)
 		log("[BattleConsumable] request id=" .. tostring(requestId) .. " ref=" .. consumableId .. " success=" .. tostring(result.Success) .. " reason=" .. result.Reason)
 	end
 
 	@ExecSpace("ServerOnly")
-	method table TryUseRunConsumable(Entity playerEntity, string consumableId, integer requestId)
+	method table TryUseRunConsumable(Entity playerEntity, string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Validates timing and inventory, executes the registered effect, then commits consumption exactly once.
 		local result = { Success = false, Reason = "UNKNOWN", ConsumableId = consumableId or "", AppliedAmount = 0, ConsumedAmount = 0, ConsumesTurn = false }
-		if isvalid(playerEntity) == false or playerEntity ~= self.PlayerEntity then
+		if isvalid(playerEntity) == false or playerEntity ~= self.PlayerEntity or playerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then
 			result.Reason = "INVALID_PLAYER"
 			return result
 		end
@@ -4484,7 +4649,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "INVALID_REQUEST_ID"
 			return result
 		end
-		if self.BattleResult ~= "" or self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or self.TurnState.IsActionProcessing == true then
+		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or self.TurnState.IsActionProcessing == true then
 			result.Reason = "INVALID_CONSUMABLE_TIMING"
 			return result
 		end
@@ -4495,7 +4660,7 @@ script BattleSessionComponent extends Component
 			result.DetailReason = definition.DetailReason or ""
 			return result
 		end
-		if definition.TargetType ~= "SELF" then
+		if definition.TargetType ~= "SELF" and definition.TargetType ~= "OWNED_SKILL" then
 			result.Reason = "UNSUPPORTED_CONSUMABLE_TARGET"
 			return result
 		end
@@ -4505,7 +4670,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "RUN_STATE_UNAVAILABLE"
 			return result
 		end
-		local useKey = tostring(runState.RunSequence) .. ":" .. self.StageId .. ":consumable:" .. tostring(requestId)
+		local useKey = tostring(runState.RunSequence) .. ":" .. self.StageId .. ":" .. tostring(self.EntryRequestId) .. ":consumable:" .. tostring(inventoryRevision) .. ":" .. tostring(requestId)
 		local availability = _RunManagerLogic:CanUseRunConsumable(playerEntity, consumableId, useKey)
 		if availability.Success == false then
 			result.Reason = availability.Reason
@@ -4516,6 +4681,11 @@ script BattleSessionComponent extends Component
 			result.Reason = "DUPLICATE_USE_IGNORED"
 			return result
 		end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.InventoryRevision ~= inventoryRevision then
+			result.Reason = "STALE_INVENTORY"
+			return result
+		end
 
 		local targetEntity = self:FindUnitEntity("player_01")
 		if isvalid(targetEntity) == false then
@@ -4523,7 +4693,7 @@ script BattleSessionComponent extends Component
 			return result
 		end
 		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
-		local effectResult = _ConsumableEffectRouterLogic:Execute(definition, targetUnit)
+		local effectResult = _ConsumableEffectRouterLogic:Execute(definition, targetUnit, targetSkillId)
 		if effectResult.Success == false then
 			result.Reason = effectResult.Reason
 			return result
@@ -4541,11 +4711,96 @@ script BattleSessionComponent extends Component
 		result.HpBefore = effectResult.HpBefore or -1
 		result.HpAfter = effectResult.HpAfter or -1
 		result.ConsumedAmount = consumeResult.ConsumedAmount or 0
-		result.ConsumesTurn = definition.ConsumesTurn == true
+		result.ConsumesTurn = false
+		result.InventoryRevision = inventory.InventoryRevision
+		result.TargetSkillId = targetSkillId or ""
+		result.CooldownBefore = effectResult.CooldownBefore or 0
+		result.CooldownAfter = effectResult.CooldownAfter or 0
 		log("[BattleConsumable] used ref=" .. consumableId .. " effect=" .. definition.EffectType .. " applied=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter .. " consumesTurn=" .. tostring(result.ConsumesTurn) .. " key=" .. useKey)
-		if result.ConsumesTurn == true and self.BattleResult == "" then
-			self:BeginEnemyTurnFromPlayerAction("CONSUMABLE_USED")
+		return result
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean SubmitConsumableUse(string consumableId, string targetSkillId)
+		-- Shares the hotkey/HUD request counter and waits for the authoritative receipt.
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or player.CurrentMap ~= self.Entity then return false end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then return false end
+		if self._T.ConsumablePending and self._T.ConsumablePendingEntry == self.EntryRequestId and self._T.ConsumablePendingRun == inventory.ActiveRunSequence then return false end
+		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.BattlePhase ~= "PlayerTurn" or self.IsActionProcessing then return false end
+		self.ConsumableRequestSequence = self.ConsumableRequestSequence + 1
+		self._T.ConsumablePending = true
+		self._T.ConsumablePendingEntry = self.EntryRequestId
+		self._T.ConsumablePendingRun = inventory.ActiveRunSequence
+		self:RequestUseConsumable(consumableId, self.ConsumableRequestSequence, targetSkillId, self.EntryRequestId, inventory.InventoryRevision)
+		return true
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveConsumableUseResult(table result, integer entryId)
+		-- Receipts stay on the battle component; UI entities never host a server RPC.
+		if entryId ~= self.EntryRequestId or result.RequestId ~= self.ConsumableRequestSequence then return end
+		self._T.ConsumablePending = false
+		self._T.ConsumableUseResult = result
+		self._T.ConsumableReceiptRevision = (self._T.ConsumableReceiptRevision or 0) + 1
+	end
+
+	@ExecSpace("Server")
+	method void RequestConsumableHudState(integer queryId, integer entryId)
+		-- Sends a small owner-only read model because the authored dataset is server-only.
+		if not isvalid(self.PlayerEntity) or self.PlayerEntity.PlayerComponent == nil then return end
+		if senderUserId ~= self.PlayerEntity.PlayerComponent.UserId then return end
+		if self.PlayerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then return end
+		self:ReceiveConsumableHudState(self:BuildConsumableHudState(), queryId, entryId, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveConsumableHudState(table data, integer queryId, integer entryId)
+		-- Ignores delayed responses from an older battle or older query.
+		if entryId ~= self.EntryRequestId or queryId < (self._T.ConsumableHudQuery or 0) then return end
+		self._T.ConsumableHudQuery = queryId
+		self._T.ConsumableHudState = data
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildConsumableHudState()
+		-- Reuses run inventory and cooldown owners without creating client-authoritative state.
+		local result = { Success = false, Items = {}, Skills = {}, Capacity = 0, CanUse = false, EntryId = self.EntryRequestId }
+		if not isvalid(self.PlayerEntity) then return result end
+		local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local runtime = self.PlayerEntity:GetComponent("script.SkillRuntimeStateComponent")
+		local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if inventory == nil or runtime == nil or unit == nil then return result end
+		inventory:NormalizeLegacyConsumables()
+		result.Success = true
+		result.Capacity = inventory.ConsumableCapacity
+		result.CooldownRevision = runtime.CooldownRevision
+		result.CurrentHp = unit.CurrentHp
+		result.MaxHp = unit.MaxHp
+		result.InventoryRevision = inventory.InventoryRevision
+		result.RunSequence = inventory.ActiveRunSequence
+		result.CanUse = inventory.ActiveRunSequence > 0 and not unit.IsDead and self.ContentValidationState == "VALID" and self.BattleResult == "" and self.TurnState ~= nil and self.TurnState.BattlePhase == "PlayerTurn" and not self.TurnState.IsActionProcessing
+		for _, skillId in ipairs(inventory:GetDistinctOwnedSkillIds()) do
+			local cooldown = runtime:GetRemainingCooldown(skillId)
+			if cooldown > 0 then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+				table.insert(result.Skills, { SkillId = skillId, DisplayName = definition.DisplayName or skillId, Cooldown = cooldown })
+			end
 		end
+		for itemId, count in string.gmatch(inventory.RunConsumableSnapshot or "", "([^|~]+)~(%d+)") do
+			local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(itemId)
+			if tonumber(count) > 0 and definition.Success then
+				local usable = result.CanUse
+				local reason = ""
+				if definition.EffectType == "HEAL" and unit.CurrentHp >= unit.MaxHp then usable = false; reason = "HP_ALREADY_FULL" end
+				if definition.EffectType == "COOLDOWN_REDUCTION" and #result.Skills == 0 then usable = false; reason = "NO_COOLDOWN_SKILLS" end
+				-- No status system exists yet; keep the future cleanse item visible but unavailable.
+				if definition.EffectType == "CLEANSE" then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
+				table.insert(result.Items, { ConsumableId = itemId, DisplayOrder = definition.RowIndex, DisplayName = definition.DisplayName, Count = tonumber(count), EffectType = definition.EffectType, EffectValue = definition.EffectValue, IconKey = definition.IconKey, Description = definition.Description, Usable = usable, Reason = reason })
+			end
+		end
+		table.sort(result.Items, function(left, right) return left.DisplayOrder < right.DisplayOrder end)
 		return result
 	end
 
@@ -5696,6 +5951,10 @@ script BattleSessionComponent extends Component
 			return
 		end
 		self.TurnState:OpenPlayerTurn(self.TurnNumber + 1, "NEXT_WAVE")
+		if isvalid(self.PlayerEntity) then
+			local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then unit.UtilityGuardActive = false end
+		end
 		self:PublishTurnStateSnapshot("NEXT_WAVE")
 		self.StageTurnNumber = self.TurnNumber
 		self:SpawnWave(nextWave)
@@ -6248,12 +6507,18 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void AdvancePlayerSkillCooldowns(string reason)
+		-- A guard lasts through one enemy round; utilities share the existing turn cooldown clock.
+		if isvalid(self.PlayerEntity) then
+			local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then unit.UtilityGuardActive = false end
+		end
 		local runtimeState = self:GetSkillRuntimeState("player_01")
 		if runtimeState == nil then
 			log_warning("[BattleCooldown] advance skipped reason=SKILL_RUNTIME_STATE_MISSING turn=" .. self.TurnNumber)
 			return
 		end
 		runtimeState:AdvanceCooldowns(1, reason)
+		self.UtilityRemainingCooldown = runtimeState:GetRemainingCooldown(self.UtilitySkillId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -6765,16 +7030,11 @@ script BattleSessionComponent extends Component
 		if self._T.HudProgressCacheKey == cacheKey then return end
 		self._T.HudProgressCacheKey = cacheKey
 		self.HudProgressSnapshot = ""
-		local currentNode = nil
-		if graphId ~= "" or nodeId ~= "" then
-			if graphId == "" or nodeId == "" then return end
-			currentNode = _NodeDefinitionRepositoryLogic:GetNodeDefinition(graphId, nodeId)
-			if currentNode.Success ~= true or currentNode.StageId ~= self.StageId then return end
-		else
-			currentNode = _NodeDefinitionRepositoryLogic:FindNodeByStageId(self.StageId)
-			if currentNode.Success ~= true then return end
-			graphId = currentNode.NodeGraphId
-		end
+		-- Reward-map transitions may retain the completed Run node. The HUD follows
+		-- the active battle StageId without changing authoritative Run progression.
+		local currentNode = _NodeDefinitionRepositoryLogic:FindNodeByStageId(self.StageId)
+		if currentNode.Success ~= true then return end
+		graphId = currentNode.NodeGraphId
 		local graph = _NodeDefinitionRepositoryLogic:GetGraphDefinitions(graphId)
 		if graph.Success ~= true then return end
 		local nodes = {}
