@@ -64,7 +64,7 @@ Node 선택 → OPEN_SHOP
 | `MaxPurchasesPerRun` | 현재 규격은 `1`만 지원 |
 | `Enabled` | 활성 여부 |
 
-현재 예제 상품은 `heavy_slash` 골드 5, `potion_hp_small` 골드 2다.
+기존 스킬·포션 상품 예시는 초기 프로토타입 기록이다. 현재 `ShopEntries.csv`는 장비 상품이며 소비 아이템 상품은 없다. 소비 아이템 추가 시 현재 5종 ID와 기존 구매 API를 사용하고, 총 수량 3~5칸 및 초과 재화 정책을 따른다. 이번 소비 HUD 작업에서는 상품 행을 추가하지 않았다.
 
 ## 서버 API
 

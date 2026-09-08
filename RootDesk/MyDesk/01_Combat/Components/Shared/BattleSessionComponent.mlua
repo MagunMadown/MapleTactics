@@ -291,9 +291,7 @@ script BattleSessionComponent extends Component
 		end
 
 		if event.key == KeyboardKey.H then
-			self.ConsumableRequestSequence = self.ConsumableRequestSequence + 1
-			log("[BattleInput] consumable requested ref=potion_hp_small request=" .. self.ConsumableRequestSequence)
-			self:RequestUseConsumable("potion_hp_small", self.ConsumableRequestSequence)
+			self:SubmitConsumableUse("orange_potion", "")
 			return
 		end
 
@@ -4615,7 +4613,7 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
-	method void RequestUseConsumable(string consumableId, integer requestId)
+	method void RequestUseConsumable(string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Authenticates a client request before entering the server-only consumable workflow.
 		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil then
 			log_warning("[BattleConsumable] rejected reason=PLAYER_MISSING")
@@ -4625,15 +4623,17 @@ script BattleSessionComponent extends Component
 			log_warning("[BattleConsumable] rejected reason=INVALID_SENDER")
 			return
 		end
-		local result = self:TryUseRunConsumable(self.PlayerEntity, consumableId, requestId)
+		local result = self:TryUseRunConsumable(self.PlayerEntity, consumableId, requestId, targetSkillId, entryId, inventoryRevision)
+		result.RequestId = requestId
+		self:ReceiveConsumableUseResult(result, entryId, self.PlayerEntity.PlayerComponent.UserId)
 		log("[BattleConsumable] request id=" .. tostring(requestId) .. " ref=" .. consumableId .. " success=" .. tostring(result.Success) .. " reason=" .. result.Reason)
 	end
 
 	@ExecSpace("ServerOnly")
-	method table TryUseRunConsumable(Entity playerEntity, string consumableId, integer requestId)
+	method table TryUseRunConsumable(Entity playerEntity, string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Validates timing and inventory, executes the registered effect, then commits consumption exactly once.
 		local result = { Success = false, Reason = "UNKNOWN", ConsumableId = consumableId or "", AppliedAmount = 0, ConsumedAmount = 0, ConsumesTurn = false }
-		if isvalid(playerEntity) == false or playerEntity ~= self.PlayerEntity then
+		if isvalid(playerEntity) == false or playerEntity ~= self.PlayerEntity or playerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then
 			result.Reason = "INVALID_PLAYER"
 			return result
 		end
@@ -4641,7 +4641,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "INVALID_REQUEST_ID"
 			return result
 		end
-		if self.BattleResult ~= "" or self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or self.TurnState.IsActionProcessing == true then
+		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or self.TurnState.IsActionProcessing == true then
 			result.Reason = "INVALID_CONSUMABLE_TIMING"
 			return result
 		end
@@ -4652,7 +4652,7 @@ script BattleSessionComponent extends Component
 			result.DetailReason = definition.DetailReason or ""
 			return result
 		end
-		if definition.TargetType ~= "SELF" then
+		if definition.TargetType ~= "SELF" and definition.TargetType ~= "OWNED_SKILL" then
 			result.Reason = "UNSUPPORTED_CONSUMABLE_TARGET"
 			return result
 		end
@@ -4662,7 +4662,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "RUN_STATE_UNAVAILABLE"
 			return result
 		end
-		local useKey = tostring(runState.RunSequence) .. ":" .. self.StageId .. ":consumable:" .. tostring(requestId)
+		local useKey = tostring(runState.RunSequence) .. ":" .. self.StageId .. ":" .. tostring(self.EntryRequestId) .. ":consumable:" .. tostring(inventoryRevision) .. ":" .. tostring(requestId)
 		local availability = _RunManagerLogic:CanUseRunConsumable(playerEntity, consumableId, useKey)
 		if availability.Success == false then
 			result.Reason = availability.Reason
@@ -4673,6 +4673,11 @@ script BattleSessionComponent extends Component
 			result.Reason = "DUPLICATE_USE_IGNORED"
 			return result
 		end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.InventoryRevision ~= inventoryRevision then
+			result.Reason = "STALE_INVENTORY"
+			return result
+		end
 
 		local targetEntity = self:FindUnitEntity("player_01")
 		if isvalid(targetEntity) == false then
@@ -4680,7 +4685,7 @@ script BattleSessionComponent extends Component
 			return result
 		end
 		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
-		local effectResult = _ConsumableEffectRouterLogic:Execute(definition, targetUnit)
+		local effectResult = _ConsumableEffectRouterLogic:Execute(definition, targetUnit, targetSkillId)
 		if effectResult.Success == false then
 			result.Reason = effectResult.Reason
 			return result
@@ -4698,11 +4703,96 @@ script BattleSessionComponent extends Component
 		result.HpBefore = effectResult.HpBefore or -1
 		result.HpAfter = effectResult.HpAfter or -1
 		result.ConsumedAmount = consumeResult.ConsumedAmount or 0
-		result.ConsumesTurn = definition.ConsumesTurn == true
+		result.ConsumesTurn = false
+		result.InventoryRevision = inventory.InventoryRevision
+		result.TargetSkillId = targetSkillId or ""
+		result.CooldownBefore = effectResult.CooldownBefore or 0
+		result.CooldownAfter = effectResult.CooldownAfter or 0
 		log("[BattleConsumable] used ref=" .. consumableId .. " effect=" .. definition.EffectType .. " applied=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter .. " consumesTurn=" .. tostring(result.ConsumesTurn) .. " key=" .. useKey)
-		if result.ConsumesTurn == true and self.BattleResult == "" then
-			self:BeginEnemyTurnFromPlayerAction("CONSUMABLE_USED")
+		return result
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean SubmitConsumableUse(string consumableId, string targetSkillId)
+		-- Shares the hotkey/HUD request counter and waits for the authoritative receipt.
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or player.CurrentMap ~= self.Entity then return false end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then return false end
+		if self._T.ConsumablePending and self._T.ConsumablePendingEntry == self.EntryRequestId and self._T.ConsumablePendingRun == inventory.ActiveRunSequence then return false end
+		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.BattlePhase ~= "PlayerTurn" or self.IsActionProcessing then return false end
+		self.ConsumableRequestSequence = self.ConsumableRequestSequence + 1
+		self._T.ConsumablePending = true
+		self._T.ConsumablePendingEntry = self.EntryRequestId
+		self._T.ConsumablePendingRun = inventory.ActiveRunSequence
+		self:RequestUseConsumable(consumableId, self.ConsumableRequestSequence, targetSkillId, self.EntryRequestId, inventory.InventoryRevision)
+		return true
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveConsumableUseResult(table result, integer entryId)
+		-- Receipts stay on the battle component; UI entities never host a server RPC.
+		if entryId ~= self.EntryRequestId or result.RequestId ~= self.ConsumableRequestSequence then return end
+		self._T.ConsumablePending = false
+		self._T.ConsumableUseResult = result
+		self._T.ConsumableReceiptRevision = (self._T.ConsumableReceiptRevision or 0) + 1
+	end
+
+	@ExecSpace("Server")
+	method void RequestConsumableHudState(integer queryId, integer entryId)
+		-- Sends a small owner-only read model because the authored dataset is server-only.
+		if not isvalid(self.PlayerEntity) or self.PlayerEntity.PlayerComponent == nil then return end
+		if senderUserId ~= self.PlayerEntity.PlayerComponent.UserId then return end
+		if self.PlayerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then return end
+		self:ReceiveConsumableHudState(self:BuildConsumableHudState(), queryId, entryId, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveConsumableHudState(table data, integer queryId, integer entryId)
+		-- Ignores delayed responses from an older battle or older query.
+		if entryId ~= self.EntryRequestId or queryId < (self._T.ConsumableHudQuery or 0) then return end
+		self._T.ConsumableHudQuery = queryId
+		self._T.ConsumableHudState = data
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildConsumableHudState()
+		-- Reuses run inventory and cooldown owners without creating client-authoritative state.
+		local result = { Success = false, Items = {}, Skills = {}, Capacity = 0, CanUse = false, EntryId = self.EntryRequestId }
+		if not isvalid(self.PlayerEntity) then return result end
+		local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local runtime = self.PlayerEntity:GetComponent("script.SkillRuntimeStateComponent")
+		local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if inventory == nil or runtime == nil or unit == nil then return result end
+		inventory:NormalizeLegacyConsumables()
+		result.Success = true
+		result.Capacity = inventory.ConsumableCapacity
+		result.CooldownRevision = runtime.CooldownRevision
+		result.CurrentHp = unit.CurrentHp
+		result.MaxHp = unit.MaxHp
+		result.InventoryRevision = inventory.InventoryRevision
+		result.RunSequence = inventory.ActiveRunSequence
+		result.CanUse = inventory.ActiveRunSequence > 0 and not unit.IsDead and self.ContentValidationState == "VALID" and self.BattleResult == "" and self.TurnState ~= nil and self.TurnState.BattlePhase == "PlayerTurn" and not self.TurnState.IsActionProcessing
+		for _, skillId in ipairs(inventory:GetDistinctOwnedSkillIds()) do
+			local cooldown = runtime:GetRemainingCooldown(skillId)
+			if cooldown > 0 then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+				table.insert(result.Skills, { SkillId = skillId, DisplayName = definition.DisplayName or skillId, Cooldown = cooldown })
+			end
 		end
+		for itemId, count in string.gmatch(inventory.RunConsumableSnapshot or "", "([^|~]+)~(%d+)") do
+			local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(itemId)
+			if tonumber(count) > 0 and definition.Success then
+				local usable = result.CanUse
+				local reason = ""
+				if definition.EffectType == "HEAL" and unit.CurrentHp >= unit.MaxHp then usable = false; reason = "HP_ALREADY_FULL" end
+				if definition.EffectType == "COOLDOWN_REDUCTION" and #result.Skills == 0 then usable = false; reason = "NO_COOLDOWN_SKILLS" end
+				-- No status system exists yet; keep the future cleanse item visible but unavailable.
+				if definition.EffectType == "CLEANSE" then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
+				table.insert(result.Items, { ConsumableId = itemId, DisplayOrder = definition.RowIndex, DisplayName = definition.DisplayName, Count = tonumber(count), EffectType = definition.EffectType, EffectValue = definition.EffectValue, IconKey = definition.IconKey, Description = definition.Description, Usable = usable, Reason = reason })
+			end
+		end
+		table.sort(result.Items, function(left, right) return left.DisplayOrder < right.DisplayOrder end)
 		return result
 	end
 
