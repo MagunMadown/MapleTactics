@@ -640,6 +640,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 | InitialFacingPolicy | enum | O | 생성 순간 한 번만 결정되는 초기 방향 |
 | TraitIds | string | - | `|` 구분 Trait 목록. 비어 있는 일반 적은 공격 후 기본 1칸 후퇴 |
 | IsBoss | boolean | O | `true`이면 사망 시 `BOSS_KILL` 드롭 Trigger를 함께 발행 |
+| VisualOffsetY | number | - | 몬스터 리소스의 발 피벗을 셀 바닥에 맞추는 월드 Y 보정값. 논리 CellIndex와 판정 위치는 바꾸지 않으며 기본값은 `0` |
 
 허용 MovementPolicy M1: `TRACK_PLAYER`, `FIXED_FACING`.
 
@@ -659,6 +660,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 
 적의 실제 `EnemyModelId`는 외형·컴포넌트 템플릿의 배치 책임이므로 `EnemySpawnPools`에서 연결한다.
 Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponent`에 HP·공격력·패턴·이동 정책을 복사한다.
+`VisualOffsetY`는 `BattleUnitPresentationComponent`에 복사되어 생성·이동·착지에 일관되게 적용된다.
 따라서 서로 다른 정의의 적이 같은 보드에 동시에 살아 있어도 세션 공용 값에 서로 덮어쓰지 않는다.
 
 ## 7. EnemyPatternSteps

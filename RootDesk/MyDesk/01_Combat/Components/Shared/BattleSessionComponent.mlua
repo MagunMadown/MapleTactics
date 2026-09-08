@@ -187,7 +187,8 @@ script BattleSessionComponent extends Component
 	@Sync property number EnemyHopLandingXScale = 1.04
 	@Sync property number EnemyHopLandingYScale = 0.96
 	@Sync property number EnemyHopPeakProgress = 0.50
-	@Sync property string EnemyHopAnimationRuid = "6df12df0c9ce4caea61385606a4d40d3"
+	-- Empty by default: movement must preserve the spawned enemy unless its definition authors a motion.
+	@Sync property string EnemyHopAnimationRuid = ""
 	@Sync property number EnemyHopAnimationPlayRate = 1.8
 	@Sync property number PlayerToEnemyBeatDuration = 0.05
 	@Sync property number PlayerPresentationSettledBeatDuration = 0.02
@@ -220,6 +221,22 @@ script BattleSessionComponent extends Component
 	property string CurrentEnemyMovementPolicy = ""
 	property number WaveTransitionDelay = 0.60
 	property boolean AutoStartPrototypeBattle = true
+	-- Standalone Maker Play uses the same NEW_RUN entry pipeline as the lobby instead of the old partial Stage start.
+	property string PrototypeTestJobId = "warrior"
+	property string PrototypeTestCharacterId = ""
+	property string PrototypeTestLoadoutId = ""
+	property integer PrototypeTestRunSeed = 5001
+	property integer PrototypeTestEntryRequestId = 9500001
+	property number PrototypeTestRetryInterval = 0.25
+	property integer PrototypeTestMaxRetryCount = 80
+	-- F8 is accepted only after the direct Maker Play fallback starts this map as a prototype battle.
+	property boolean EnablePrototypeForceStageClear = true
+	property boolean PrototypeTestEntryActive = false
+	property boolean PrototypeTestEntryPending = false
+	property Entity PrototypeTestPendingPlayer = nil
+	property string PrototypeTestPendingStageId = ""
+	property number PrototypeTestRetryElapsed = 0
+	property integer PrototypeTestRetryCount = 0
 	property string LeftEnemyEntityName = "BattleEnemyLeft"
 	property string RightEnemyEntityName = "BattleEnemyRight"
 	property Entity PlayerEntity = nil
@@ -256,6 +273,12 @@ script BattleSessionComponent extends Component
 	@EventSender("Service", "InputService")
 	handler HandleMoveKeyDown(KeyDownEvent event)
 		-- Converts one movement/turn/attack key press into a server-authoritative request.
+		if event.key == KeyboardKey.F8 then
+			log("[BattlePrototypeTest] force stage clear requested key=F8")
+			self:RequestPrototypeForceStageClear()
+			return
+		end
+
 		if event.key == KeyboardKey.Space then
 			if _BattleHudPresenterLogic:TryBeginLocalCommand("TURN") == false then
 				return
@@ -380,6 +403,7 @@ script BattleSessionComponent extends Component
 		-- The map component can begin before the transferred player is visible. OnUpdate
 		-- routes the first visible player through OnMapEnter so PREPARED always wins.
 		self.EntryPolicyResolved = false
+		self.PrototypeTestEntryActive = false
 		self.LastInitializedEntryRequestId = 0
 		log("[BattleSession] waiting for player entry policy")
 	end
@@ -387,6 +411,8 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void OnEndPlay()
 		-- Prevents a pending action callback from surviving this map-scoped battle session.
+		self:ClearPrototypeBattleEntryRetry("SESSION_END")
+		self.PrototypeTestEntryActive = false
 		self:CancelPlayerCombatPresentationHandoff("SESSION_END", false)
 		self:FinishPlayerGridMovePresentation("SESSION_END")
 		self:FinishEnemyGridMovePresentation("SESSION_END", false)
@@ -424,6 +450,10 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void OnUpdate(number delta)
 		-- Route the first visible player through the existing entry path exactly once.
+		if self.PrototypeTestEntryPending == true then
+			self:UpdatePrototypeBattleEntryRetry(delta)
+			return
+		end
 		if self.EntryPolicyResolved == false then
 			local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
 			if users ~= nil then
@@ -499,8 +529,10 @@ script BattleSessionComponent extends Component
 		end
 		local entryState = enteredEntity:GetComponent("script.BattleEntryStateComponent")
 		if entryState ~= nil and entryState.EntryState == "PREPARED" then
+			local runState = enteredEntity:GetComponent("script.PlayerRunStateComponent")
+			self.PrototypeTestEntryActive = runState ~= nil and runState.PrototypeTestMode == true
 			self.EntryPolicyResolved = true
-			log("[BattleSession] prepared entry detected request=" .. entryState.RequestId .. " stage=" .. entryState.StageId)
+			log("[BattleSession] prepared entry detected request=" .. entryState.RequestId .. " stage=" .. entryState.StageId .. " prototype=" .. tostring(self.PrototypeTestEntryActive))
 			local entryResult = _BattleGatewayLogic:ConsumePreparedBattle(enteredEntity, self)
 			if entryResult.Success == true then
 				return
@@ -521,16 +553,191 @@ script BattleSessionComponent extends Component
 		end
 		self.EntryPolicyResolved = true
 		log("[BattleSession] no prepared entry, prototype auto start player=" .. enteredEntity.Name)
-		self:RegisterPlayer(enteredEntity)
 		local targetStageId = self.StageId
-		if isvalid(self.Entity) and self.Entity.Name ~= nil then
-			local mapName = self.Entity.Name
-			local stageDef = _StageDefinitionRepositoryLogic:GetStageDefinition(mapName)
-			if stageDef.Success == true then
-				targetStageId = stageDef.StageId
+		local testResult = self:StartPrototypeBattleFromMap(enteredEntity, targetStageId)
+		if testResult.Success == false then
+			if testResult.Retryable == true then
+				self:QueuePrototypeBattleEntryRetry(enteredEntity, targetStageId, testResult.Reason)
+			else
+				log_error("[BattlePrototypeEntry] rejected stage=" .. targetStageId .. " reason=" .. testResult.Reason .. " detail=" .. (testResult.DetailReason or ""))
 			end
 		end
-		self:StartStageById(targetStageId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table StartPrototypeBattleFromMap(Entity playerEntity, string targetStageId)
+		-- Initializes a direct Maker Play session through the production NEW_RUN boundary for realistic HP, skills, queue, and inventory.
+		local unionReadiness = _UnionEffectResolverLogic:GetEffectSnapshot(playerEntity)
+		if unionReadiness.Success == false then
+			return {
+				Success = false,
+				Reason = unionReadiness.Reason or "UNION_EFFECT_UNAVAILABLE",
+				DetailReason = unionReadiness.DetailReason or "",
+				Retryable = self:IsPrototypeBattleEntryRetryableReason(unionReadiness.Reason)
+			}
+		end
+		local resolvedJobId = _RunManagerLogic:ResolveJobId(self.PrototypeTestJobId)
+		local requestId = math.max(1, self.PrototypeTestEntryRequestId)
+		local runSeed = math.max(1, self.PrototypeTestRunSeed)
+		local result = self:InitializeFromEntry(
+			playerEntity,
+			targetStageId,
+			self.PrototypeTestCharacterId,
+			resolvedJobId,
+			self.PrototypeTestLoadoutId,
+			runSeed,
+			"NEW_RUN",
+			requestId
+		)
+		if result.Success == true then
+			local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+			if runState ~= nil then
+				runState.PrototypeTestMode = true
+			end
+			self.PrototypeTestEntryActive = true
+			log("[BattlePrototypeEntry] started stage=" .. targetStageId .. " job=" .. resolvedJobId .. " seed=" .. runSeed .. " request=" .. requestId)
+		end
+		return result
+	end
+
+	@ExecSpace("Server")
+	method void RequestPrototypeForceStageClear()
+		-- Test-only RPC: sender ownership and direct Maker Play mode are both required.
+		if self:IsValidPlayerRequest(senderUserId) == false then
+			log_warning("[BattlePrototypeTest] force clear rejected reason=INVALID_SENDER")
+			return
+		end
+		if self.EnablePrototypeForceStageClear == false or self.PrototypeTestEntryActive == false then
+			log_warning("[BattlePrototypeTest] force clear rejected reason=NOT_PROTOTYPE_ENTRY")
+			return
+		end
+
+		local result = self:TryPrototypeForceStageClear()
+		if result.Success == false then
+			log_warning("[BattlePrototypeTest] force clear rejected reason=" .. result.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryPrototypeForceStageClear()
+		-- Skips remaining waves, then kills one retained enemy through the normal damage/death/victory pipeline.
+		local result = { Success = false, Reason = "UNKNOWN" }
+		if self.BattleResult ~= "" then
+			result.Reason = "BATTLE_ALREADY_ENDED"
+			return result
+		end
+		if self.BoardState == nil or self.TurnState == nil or self.WaveRuntime == nil then
+			result.Reason = "BATTLE_STATE_UNAVAILABLE"
+			return result
+		end
+		if isvalid(self.PlayerEntity) == false then
+			result.Reason = "PLAYER_UNAVAILABLE"
+			return result
+		end
+
+		local livingEnemies = self.BoardState:CollectLivingEnemies()
+		if livingEnemies == nil or #livingEnemies == 0 then
+			result.Reason = "NO_LIVING_ENEMY"
+			return result
+		end
+
+		-- Retain one enemy so ApplyDamage can enter the exact production victory boundary.
+		local finalEnemy = livingEnemies[1]
+		for index = 2, #livingEnemies do
+			local enemyEntity = livingEnemies[index]
+			if isvalid(enemyEntity) then
+				local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+				if enemyUnit ~= nil then
+					self.BoardState:UnregisterUnit(enemyUnit.UnitId)
+				end
+				_EntityService:Destroy(enemyEntity)
+			end
+		end
+
+		local finalUnit = finalEnemy:GetComponent("script.BattleUnitComponent")
+		if finalUnit == nil then
+			result.Reason = "FINAL_ENEMY_COMPONENT_MISSING"
+			return result
+		end
+		local waveResult = self.WaveRuntime:ForceFinalWaveForPrototypeTest("PROTOTYPE_FORCE_CLEAR")
+		if waveResult.Success == false then
+			result.Reason = waveResult.Reason
+			return result
+		end
+		self:PublishWaveStateSnapshot("PROTOTYPE_FORCE_CLEAR")
+		local damageAmount = math.max(1, finalUnit.CurrentHp)
+		local damageResult = self:ApplyDamage("player_01", finalUnit.UnitId, damageAmount)
+		if damageResult.Success == false then
+			result.Reason = damageResult.Reason
+			return result
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[BattlePrototypeTest] force clear accepted stage=" .. self.StageId .. " skippedEnemies=" .. tostring(math.max(0, #livingEnemies - 1)))
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsPrototypeBattleEntryRetryableReason(string reason)
+		-- Restricts automatic retries to transient Union profile readiness states.
+		return reason == "PROFILE_LOAD_IN_PROGRESS"
+			or reason == "PROFILE_NOT_LOADED"
+			or reason == "PROFILE_CACHE_MISSING"
+			or reason == "USER_DATA_STORAGE_UNAVAILABLE"
+	end
+
+	@ExecSpace("ServerOnly")
+	method void QueuePrototypeBattleEntryRetry(Entity playerEntity, string targetStageId, string reason)
+		-- Holds one direct-Play request while the player profile finishes loading.
+		self.PrototypeTestEntryPending = true
+		self.PrototypeTestPendingPlayer = playerEntity
+		self.PrototypeTestPendingStageId = targetStageId
+		self.PrototypeTestRetryElapsed = 0
+		self.PrototypeTestRetryCount = 0
+		log("[BattlePrototypeEntry] waiting stage=" .. targetStageId .. " reason=" .. (reason or "PROFILE_NOT_READY"))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdatePrototypeBattleEntryRetry(number delta)
+		-- Retries the production NEW_RUN boundary at a bounded interval without starting a partial battle.
+		if isvalid(self.PrototypeTestPendingPlayer) == false then
+			log_error("[BattlePrototypeEntry] retry cancelled reason=PLAYER_UNAVAILABLE")
+			self:ClearPrototypeBattleEntryRetry("PLAYER_UNAVAILABLE")
+			return
+		end
+		self.PrototypeTestRetryElapsed = self.PrototypeTestRetryElapsed + math.max(0, delta)
+		if self.PrototypeTestRetryElapsed < self.PrototypeTestRetryInterval then
+			return
+		end
+		self.PrototypeTestRetryElapsed = 0
+		self.PrototypeTestRetryCount = self.PrototypeTestRetryCount + 1
+		local result = self:StartPrototypeBattleFromMap(self.PrototypeTestPendingPlayer, self.PrototypeTestPendingStageId)
+		if result.Success == true then
+			self:ClearPrototypeBattleEntryRetry("STARTED")
+			return
+		end
+		if result.Retryable == true and self.PrototypeTestRetryCount < self.PrototypeTestMaxRetryCount then
+			if self.PrototypeTestRetryCount % 10 == 0 then
+				log("[BattlePrototypeEntry] still waiting stage=" .. self.PrototypeTestPendingStageId .. " retry=" .. self.PrototypeTestRetryCount .. "/" .. self.PrototypeTestMaxRetryCount .. " reason=" .. result.Reason)
+			end
+			return
+		end
+		log_error("[BattlePrototypeEntry] retry exhausted stage=" .. self.PrototypeTestPendingStageId .. " retry=" .. self.PrototypeTestRetryCount .. " reason=" .. result.Reason .. " detail=" .. (result.DetailReason or ""))
+		self:ClearPrototypeBattleEntryRetry("RETRY_EXHAUSTED")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearPrototypeBattleEntryRetry(string reason)
+		-- Releases the map-scoped direct-Play retry state after success, failure, or teardown.
+		if self.PrototypeTestEntryPending == true then
+			log("[BattlePrototypeEntry] retry cleared reason=" .. (reason or ""))
+		end
+		self.PrototypeTestEntryPending = false
+		self.PrototypeTestPendingPlayer = nil
+		self.PrototypeTestPendingStageId = ""
+		self.PrototypeTestRetryElapsed = 0
+		self.PrototypeTestRetryCount = 0
 	end
 
 	@ExecSpace("ServerOnly")
@@ -822,6 +1029,8 @@ script BattleSessionComponent extends Component
 			enemy:AddComponent("FaustSummonComponent")
 		end
 		self:ConfigureEnemyMovementPresentation(enemy, spawnDefinition)
+		-- Re-apply the logical cell after the resource-specific ground offset is configured.
+		self:PlaceEntity(enemy, position)
 		local registration = self:RegisterConfiguredUnit(enemy)
 		if registration.Success == false then
 			log_error("[BattleWave] enemy registration failed unit=" .. unitId .. " reason=" .. registration.Reason)
@@ -857,12 +1066,14 @@ script BattleSessionComponent extends Component
 		presentation.DeathMotionRuid = spawnDefinition.DeathMotionRuid or ""
 		presentation.DeathMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.DeathMotionPlayRate) or 1)
 		presentation.DeathMotionDuration = math.max(0.05, tonumber(spawnDefinition.DeathMotionDuration) or 0.5)
+		presentation.GroundVisualOffsetY = tonumber(spawnDefinition.VisualOffsetY) or 0
 		log("[EnemyMotionProfile] configured definition=" .. tostring(spawnDefinition.EnemyDefinitionId)
 			.. " idle=" .. tostring(presentation.IdleMotionRuid)
 			.. " move=" .. tostring(presentation.MovementMotionRuid)
 			.. " hit=" .. tostring(presentation.HitMotionRuid)
 			.. " attack=" .. tostring(presentation.AttackMotionRuid)
-			.. " death=" .. tostring(presentation.DeathMotionRuid))
+			.. " death=" .. tostring(presentation.DeathMotionRuid)
+			.. " groundOffsetY=" .. tostring(presentation.GroundVisualOffsetY))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1202,8 +1413,17 @@ script BattleSessionComponent extends Component
 						patternId = current.PatternId
 						stepIndex = current.StepIndex
 					end
-					local queuedTileNames = self:GetEnemyQueueDisplayNames(plan.PlannedActionSnapshot)
-					local queuedIconRuids = self:GetEnemyQueueIconRuids(plan.PlannedActionSnapshot)
+					-- Only publish Tiles that the enemy actually owns. INSERTING is a future choice,
+					-- while PREPARED/COMPLETED may still carry the previous action snapshot briefly.
+					local hasVisibleQueue = plan.PlanState == "TRACKING"
+						or plan.PlanState == "ATTACK_READY"
+						or plan.PlanState == "EXECUTING"
+					local queuedTileNames = ""
+					local queuedIconRuids = ""
+					if hasVisibleQueue then
+						queuedTileNames = self:GetEnemyQueueDisplayNames(plan.PlannedActionSnapshot)
+						queuedIconRuids = self:GetEnemyQueueIconRuids(plan.PlannedActionSnapshot)
+					end
 					local targetCellSnapshot = plan.TargetCellSnapshot
 					local telegraphKind = ""
 					local landingCell = -1
@@ -4130,7 +4350,12 @@ script BattleSessionComponent extends Component
 					interruptHitsReceived = math.floor(tonumber(fields[33]) or 0)
 				end
 				local queuedTileIds = ""
-				local hasInsertedQueue = fields[3] ~= "INSERTING"
+				-- Keep the client read model aligned with the server DTO: a completed or merely
+				-- selected action is not a newly filled enemy queue slot.
+				local planState = self:DecodeEnemyPlanField(fields[3])
+				local hasInsertedQueue = planState == "TRACKING"
+					or planState == "ATTACK_READY"
+					or planState == "EXECUTING"
 				if hasInsertedQueue then
 					for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
 						local actionFields = {}
@@ -6478,7 +6703,12 @@ script BattleSessionComponent extends Component
 		end
 
 		local current = targetEntity.TransformComponent.Position
-		targetEntity.TransformComponent.Position = Vector3(position.x, position.y, current.z)
+		local groundVisualOffsetY = 0
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			groundVisualOffsetY = tonumber(presentation.GroundVisualOffsetY) or 0
+		end
+		targetEntity.TransformComponent.Position = Vector3(position.x, position.y + groundVisualOffsetY, current.z)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -6550,7 +6780,8 @@ script BattleSessionComponent extends Component
 			LandingX = self.EnemyHopLandingXScale,
 			LandingY = self.EnemyHopLandingYScale,
 			Peak = self.EnemyHopPeakProgress,
-			AnimationRuid = self.EnemyHopAnimationRuid,
+			-- A global monster clip can replace an unrelated enemy sprite. Only use per-enemy authored motion.
+			AnimationRuid = "",
 			AnimationPlayRate = self.EnemyHopAnimationPlayRate
 		}
 		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
