@@ -124,7 +124,7 @@
 - 플레이어별 Run 진행과 다음 콘텐츠 후보는 `PlayerRunStateComponent`가 소유하고,
   `RunManagerLogic`과 `NodeDefinitionRepositoryLogic`만 갱신한다.
 - 전투 중 미회수 드롭은 맵의 `BattleDropComponent`, 회수된 런 재화·소모품은 플레이어의 `PlayerRunInventoryComponent`만 소유한다. 진행 상태는 `PlayerRunStateComponent`와 섞지 않으며 지급·사용은 `RunManagerLogic` Facade를 통과해야 한다.
-- 플레이어가 드롭이 놓인 Cell로 이동하면 `BattleDropComponent.CollectAtCell()`이 Pending Drop을 즉시 런 인벤토리로 옮긴다. 전투 종료까지 밟지 않은 드롭은 최종 승리 시 자동 회수한다. 회수된 `potion_hp_small`은 `PlayerTurn`에서 HP가 감소한 상태일 때 `H` 키 또는 `RequestUseConsumable()`로 사용하며 턴을 소비하지 않는다.
+- 플레이어가 드롭이 놓인 Cell로 이동하면 `BattleDropComponent.CollectAtCell()`이 Pending Drop을 즉시 런 인벤토리로 옮긴다. 전투 종료까지 밟지 않은 드롭은 최종 승리 시 자동 회수한다. 회수된 소비 아이템은 좌측 하단 전투 HUD의 개별 슬롯으로 표시된다. `PlayerTurn`에서 슬롯을 클릭하면 `SubmitConsumableUse()`가 기존 서버 사용 API로 전달하며 턴을 소비하지 않는다. 빨강/주황/하양 포션은 HP를 2/4/6 회복하고 시간의 모래는 보유 중인 쿨다운 스킬을 선택한다. 가득 찬 3~5칸의 초과 수량은 기존 골드 정책으로 전환된다.
 
 Session의 기존 Turn/Wave `@Sync` 필드는 호환 Snapshot이다. 신규 기능은 이 필드를 직접
 대입하지 않는다. 반드시 소유 컴포넌트의 공개 메서드를 호출하고 필요한 경우 Session의

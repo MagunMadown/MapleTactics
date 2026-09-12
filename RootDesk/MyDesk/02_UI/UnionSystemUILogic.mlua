@@ -11,6 +11,10 @@ script UnionSystemUILogic extends Logic
     property ButtonComponent SaveButton = nil
     property ButtonComponent CancelButton = nil
     property TextGUIRendererComponent RankCodeText = nil
+    property Entity InvestmentRankMark = nil
+    property TextGUIRendererComponent GrowthRankInfoText = nil
+    property table InvestmentRankThresholds = { 0, 3, 6, 9, 12, 15, 18, 21, 24, 26 }
+    property table InvestmentRankMarkRUIDs = { "287dda20db7940ffb1e922ffcee4b08e", "d4339e0a70724e649ee59ff71c2e7e8a", "27dfb3714d8340b499b1db43ca697264", "c71123918e5e41bcbfcfe8f8b3b9dce5", "e9b192ae70ce43838d0920f21a5f1626", "49ef5ccb094745dfa9ff564ec653b822", "450041782ba44211a3fd57416e19af65", "7db07cd1418849fb84f124ca5f8bc3d8", "17b3e448c8cf45479f3735cc73098a07", "702b358fd90946dbaee2631473a50e5e" }
     property TextGUIRendererComponent RankNameText = nil
     property TextGUIRendererComponent GrowthText = nil
     property TextGUIRendererComponent NextRankText = nil
@@ -183,7 +187,10 @@ script UnionSystemUILogic extends Logic
         if self.IsWindowOpen == false or self.IsRequestPending then return end
         local row = self.StatRowsById[statId]
         if row == nil or self:IsStatCardInteractive(statId) == false then
-            self:SetStatus(self:GetUpgradeUnavailableReason(statId))
+            local reason = self:GetUpgradeUnavailableReason(statId)
+            self:SetStatus(reason)
+            self:SetText(self.PointStripText, reason)
+            log("[UnionCoinUpgradeUI] unavailable stat=" .. statId .. " reason=" .. reason)
             return
         end
         self.MutationSequence = self.MutationSequence + 1
@@ -436,7 +443,7 @@ script UnionSystemUILogic extends Logic
         self:SetText(self.TotalPointsText, self:FormatInteger(totalPoints))
         self:SetText(self.SpentPointsText, self:FormatInteger(spentPoints))
         self:SetText(self.AvailablePointsText, self:FormatInteger(availablePoints))
-        self:SetText(self.PointStripText, "COIN UPGRADE   " .. self:FormatInteger(unionCoins))
+        self:SetText(self.PointStripText, "보유 " .. self:FormatInteger(unionCoins) .. " 코인 · 카드를 눌러 1단계 강화")
         self:RenderAppliedEffectsText(appliedEffects)
     end
 
@@ -495,6 +502,7 @@ script UnionSystemUILogic extends Logic
         end
         self:SortVisibleStatIdsFromRows()
         self:RefreshAllCards()
+        self:RenderInvestmentRank()
         if self.LastMutationMessage ~= "" then
             self:SetStatus(self.LastMutationMessage)
         else
@@ -632,10 +640,10 @@ script UnionSystemUILogic extends Logic
         if row.IsImplemented ~= true then return "아직 구현되지 않은 유니온 스탯입니다." end
         local level = math.floor(tonumber(row.CurrentLevel) or 0)
         if level >= row.MaxLevel then return "이미 최대 레벨입니다." end
-        if level >= row.EditableMaxLevel then return "현재 유니온 등급에서 더 올릴 수 없습니다." end
+        if level >= row.EditableMaxLevel then return string.gsub(row.RequiredUnionRank or "UNION", "_", " ") .. " 등급이 필요합니다." end
         local nextCost = math.floor(tonumber(row.LevelCoinCosts[level + 1]) or row.NextCoinCost or 0)
         if nextCost <= 0 then return "강화 비용 정보를 불러올 수 없습니다." end
-        if nextCost > self.CurrentUnionCoins then return "유니온 코인이 부족합니다." end
+        if nextCost > self.CurrentUnionCoins then return "필요 " .. self:FormatInteger(nextCost) .. " 코인 · 보유 " .. self:FormatInteger(self.CurrentUnionCoins) .. " 코인 · " .. self:FormatInteger(nextCost - self.CurrentUnionCoins) .. " 코인 부족" end
         return "강화할 수 있습니다."
     end
 
@@ -648,7 +656,7 @@ script UnionSystemUILogic extends Logic
 
     @ExecSpace("ClientOnly")
     method void RenderStatCard(string statId)
-        -- Renders card text and disables interaction for pending, locked, maxed, or unavailable rows.
+        -- Unavailable cards still explain their requirements; only pending requests block clicks.
         local row = self.StatRowsById[statId]
         local button = self.StatCardButtons[statId]
         if row == nil then
@@ -690,11 +698,20 @@ script UnionSystemUILogic extends Logic
             end
         end
         local nextCoinCost = math.floor(tonumber(row.LevelCoinCosts[displayLevel + 1]) or row.NextCoinCost or 0)
-        self:SetText(self.StatCostTexts[statId], isMaxLevel and "다음 MAX" or "다음 " .. self:FormatInteger(nextCoinCost) .. " 코인")
+        local costLabel = "강화 " .. self:FormatInteger(nextCoinCost) .. " 코인"
+        if isMaxLevel then
+            costLabel = "최대 레벨"
+        elseif row.IsImplemented ~= true then
+            costLabel = "준비 중"
+        elseif isRankLocked then
+            costLabel = "등급 달성 후 강화"
+        elseif nextCoinCost > self.CurrentUnionCoins then
+            costLabel = self:FormatInteger(nextCoinCost) .. " 코인 · 부족"
+        end
+        self:SetText(self.StatCostTexts[statId], costLabel)
         self:SetText(self.StatStatusTexts[statId], self.IsRequestPending and "처리 중" or (isMaxLevel and "MAX" or (row.IsImplemented ~= true and "준비 중" or self:StatStateLabel(row))))
 
-        local canIncrease = self:IsStatCardInteractive(statId)
-        self:SetButtonEnabled(button, canIncrease)
+        self:SetButtonEnabled(button, self.IsWindowOpen and self.IsRequestPending == false)
         self:ApplyStatCardInteractionVisual(statId, ButtonState.Normal)
         self:ApplyStatCardPressScale(statId, ButtonState.Normal)
     end
@@ -765,33 +782,60 @@ script UnionSystemUILogic extends Logic
 
     @ExecSpace("ClientOnly")
     method void RenderRankPresentation(string rankId, string rankDisplayName, integer lifetimeUnionGrowth, boolean progressAvailable, boolean hasNextRank, integer currentRankThreshold, integer nextRankThreshold, string nextRankDisplayName)
-        -- Keeps A-2 presentation isolated from saved data so synthetic I-V states can be previewed safely.
-        self:SetText(self.RankCodeText, self:BuildRankCode(rankId))
-        self:SetText(self.RankNameText, rankDisplayName)
-        self:SetText(self.GrowthText, self:FormatInteger(lifetimeUnionGrowth))
+        -- Growth still controls existing unlocks; investment marks are presentation only.
+        self:SetText(self.GrowthRankInfoText, "성장 " .. rankDisplayName .. " · " .. self:FormatInteger(lifetimeUnionGrowth))
+    end
 
-        if isvalid(self.NextRankText.Entity) then self.NextRankText.Entity.Enable = progressAvailable end
-        if isvalid(self.NextRankValueText.Entity) then self.NextRankValueText.Entity.Enable = progressAvailable end
-        if isvalid(self.RankProgressTrack) then self.RankProgressTrack.Enable = progressAvailable end
-        if progressAvailable == false then return end
 
-        local progressRatio = 0
-        if hasNextRank and nextRankThreshold > currentRankThreshold then
-            local earnedInRank = math.max(0, lifetimeUnionGrowth - currentRankThreshold)
-            local requiredInRank = nextRankThreshold - currentRankThreshold
-            progressRatio = math.min(1, earnedInRank / requiredInRank)
-            self:SetText(self.NextRankText, "다음 " .. (nextRankDisplayName or ""))
-            self:SetText(self.NextRankValueText, self:FormatInteger(lifetimeUnionGrowth) .. " / " .. self:FormatInteger(nextRankThreshold))
+    method table ResolveInvestmentRank(table rows)
+        -- Counts invested levels, never coin costs, job-grade points, or future stats.
+        local invested = 0
+        for _, row in pairs(rows or {}) do
+            if row.IsImplemented == true then
+                invested = invested + math.max(0, math.min(math.floor(tonumber(row.MaxLevel) or 0), math.floor(tonumber(row.CurrentLevel) or 0)))
+            end
+        end
+        local rankIndex = 1
+        for index, threshold in ipairs(self.InvestmentRankThresholds) do
+            if invested >= threshold then rankIndex = index end
+        end
+        local roman = { "I", "II", "III", "IV", "V" }
+        local names = { "브론즈", "실버" }
+        local rankName = names[math.floor((rankIndex - 1) / 5) + 1] .. " " .. roman[(rankIndex - 1) % 5 + 1]
+        local nextThreshold = self.InvestmentRankThresholds[rankIndex + 1]
+        local ratio = 1
+        if nextThreshold ~= nil then
+            local currentThreshold = self.InvestmentRankThresholds[rankIndex]
+            ratio = (invested - currentThreshold) / (nextThreshold - currentThreshold)
+        end
+        return { Index = rankIndex, Name = rankName, Invested = invested, NextThreshold = nextThreshold, Ratio = ratio }
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RenderInvestmentRank()
+        -- Runs after the authoritative rows complete, including purchase, reset and reopen.
+        local rank = self:ResolveInvestmentRank(self.StatRowsById)
+        self:SetText(self.RankNameText, rank.Name)
+        self:SetText(self.GrowthText, "투자 " .. tostring(rank.Invested) .. "단계")
+        if self.RankCodeText ~= nil then self.RankCodeText.Entity.Enable = false end
+        local ruid = self.InvestmentRankMarkRUIDs[rank.Index] or ""
+        if isvalid(self.InvestmentRankMark) and self.InvestmentRankMark.SpriteGUIRendererComponent ~= nil then
+            self.InvestmentRankMark.Enable = ruid ~= ""
+            self.InvestmentRankMark.SpriteGUIRendererComponent.ImageRUID = DataRef(ruid)
+        end
+        self.NextRankText.Entity.Enable = true
+        self.NextRankValueText.Entity.Enable = true
+        self.RankProgressTrack.Enable = true
+        self.RankProgressFill.Enable = rank.Ratio > 0
+        if rank.NextThreshold ~= nil then
+            self:SetText(self.NextRankText, "다음 마크까지 " .. tostring(rank.NextThreshold - rank.Invested) .. "단계")
+            self:SetText(self.NextRankValueText, tostring(rank.Invested) .. " / " .. tostring(rank.NextThreshold))
         else
-            progressRatio = 1
-            self:SetText(self.NextRankText, "최고 등급")
-            self:SetText(self.NextRankValueText, self:FormatInteger(lifetimeUnionGrowth))
+            self:SetText(self.NextRankText, "최고 마크 달성")
+            self:SetText(self.NextRankValueText, tostring(rank.Invested) .. "단계 투자")
         end
-
-        if isvalid(self.RankProgressFill) and self.RankProgressFill.UITransformComponent ~= nil then
-            self.RankProgressFill.UITransformComponent.RectSize = Vector2(math.max(1, 318 * progressRatio), 6)
-        end
-        log("[UnionUI2026] rank presentation rank=" .. (rankId or "") .. " growth=" .. tostring(lifetimeUnionGrowth) .. " progress=" .. tostring(progressRatio))
+        self.RankProgressFill.UITransformComponent.RectSize = Vector2(math.max(1, 318 * rank.Ratio), 6)
+        log("[UnionInvestmentMark] invested=" .. tostring(rank.Invested) .. " rank=" .. tostring(rank.Index) .. " ruid=" .. ruid)
     end
 
     method string GetStatEffectLabel(string statId, string fallbackLabel)
@@ -873,6 +917,9 @@ script UnionSystemUILogic extends Logic
         self.SaveButton = self:GetButton(active .. "/SaveButton")
         self.CancelButton = self:GetButton(active .. "/CancelButton")
         self.RankCodeText = self:GetText(summary .. "/RankCard/RankCodeText")
+        self.InvestmentRankMark = _EntityService:GetEntityByPath(summary .. "/RankCard/RankEmblem")
+        self.GrowthRankInfoText = self:GetText(summary .. "/RankCard/GrowthLabelText")
+        if isvalid(self.InvestmentRankMark) == false or self.InvestmentRankMark.SpriteGUIRendererComponent == nil or self.GrowthRankInfoText == nil then return self:ReportBindingWait() end
         self.RankNameText = self:GetText(summary .. "/RankCard/RankNameText")
         self.GrowthText = self:GetText(summary .. "/RankCard/GrowthText")
         self.NextRankText = self:GetText(summary .. "/RankCard/NextRankText")

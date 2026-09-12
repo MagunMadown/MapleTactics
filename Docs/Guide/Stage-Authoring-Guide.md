@@ -91,8 +91,8 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 
 | Stage | 물리 맵 | Wave 수 | 기본 구성 |
 |---|---|---:|---|
-| `region_kerning_stage_01` | `kerning_city_battle` | 3 | 스티치 5 (2+2+1) |
-| `region_kerning_stage_02` | `kerning_city_battle` | 3 | 스티치 2 → 주니어 레이스 2 → 레이스 1 |
+| `region_kerning_stage_01` | `kerning_city_battle` | 3 | 스티지 5 (2+2+1) |
+| `region_kerning_stage_02` | `kerning_city_battle` | 3 | 스티지 2 → 주니어 레이스 2 → 레이스 1 |
 | `region_kerning_stage_03` | `kerning_city_battle` | 3 | 주니어 레이스 2 → 레이스 2 → 레이스 1 |
 | `region_kerning_stage_04` | `kerning_city_boss` | 2 | 보스 다일 1, `StageType=BOSS`, Phase 2 전환 시 리게이터 2 증원 |
 
