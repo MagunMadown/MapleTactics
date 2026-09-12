@@ -1,69 +1,90 @@
 @Logic
-script ItemCodexProvider
+script ItemCodexProvider extends Logic
 
 	@Sync property string EntrySnapshot = ""
-	property string DataSetName = "ConsumableDefinitions"
-	property string ConsumableIconRuid = "f02d66457cea4f63b1d9f4abaec1f4ad"
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
+		-- Publishes consumables and relics through their gameplay repositories.
 		self:RefreshFromSource()
 	end
 
 	@ExecSpace("ServerOnly")
 	method void RefreshFromSource()
-		local records = {}
-		local dataSet = _DataService:GetTable(self.DataSetName)
+		-- Loads sources independently so one unavailable catalog does not hide the other.
+		local entries = {}
+		self:AppendConsumables(entries)
+		local consumableCount = #entries
+		self:AppendRelics(entries)
+		self.EntrySnapshot = _HttpService:JSONEncode({ Entries = entries })
+		log("[ItemCodexProvider] refreshed consumables=" .. tostring(consumableCount) .. " relics=" .. tostring(#entries - consumableCount))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AppendConsumables(table entries)
+		-- Uses validated gameplay definitions, including authored descriptions and icons.
+		local dataSet = _DataService:GetTable(_ConsumableDefinitionRepositoryLogic.DataSetName)
 		if dataSet == nil then
-			self.EntrySnapshot = ""
-			log_warning("[ItemCodexProvider] dataset missing name=" .. self.DataSetName)
+			log_warning("[ItemCodexProvider] consumable dataset missing")
 			return
 		end
 		for rowIndex = 1, dataSet:GetRowCount() do
 			local id = dataSet:GetCell(rowIndex, "ConsumableId") or ""
-			local name = dataSet:GetCell(rowIndex, "DisplayName") or id
-			if id ~= "" and self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")) then
-				local effectType = dataSet:GetCell(rowIndex, "EffectType") or ""
-				local effectValue = tonumber(dataSet:GetCell(rowIndex, "EffectValue")) or 0
-				local targetType = dataSet:GetCell(rowIndex, "TargetType") or ""
-				local maxStack = math.floor(tonumber(dataSet:GetCell(rowIndex, "MaxStack")) or 0)
-				local description = self:BuildDescription(effectType, effectValue, targetType, maxStack)
-				table.insert(records, id .. "~" .. name .. "~" .. self.ConsumableIconRuid .. "~" .. description)
+			local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(id)
+			if definition.Success then
+				local targetLabel = definition.TargetType == "SELF" and "자신" or "보유 스킬 하나"
+				table.insert(entries, {
+					Id = "Consumable:" .. id, ItemKind = "Consumable", Category = "Item",
+					DisplayName = definition.DisplayName, Icon = definition.IconKey,
+					Description = definition.Description, TypeLabel = "소비 아이템",
+					MetaPrimaryLabel = "사용 대상", MetaPrimaryValue = targetLabel,
+					MetaSecondaryLabel = "최대 소지 수", MetaSecondaryValue = tostring(definition.MaxStack),
+					IsDiscovered = true
+				})
+			elseif definition.Reason ~= "CONSUMABLE_DISABLED" then
+				log_warning("[ItemCodexProvider] consumable skipped id=" .. id .. " reason=" .. definition.Reason)
 			end
 		end
-		self.EntrySnapshot = table.concat(records, "|")
-		log("[ItemCodexProvider] refreshed source=" .. self.DataSetName .. " count=" .. tostring(#records))
 	end
 
-	method string BuildDescription(string effectType, number effectValue, string targetType, integer maxStack)
-		local description = ""
-		if effectType == "HEAL" and effectValue > 0 then
-			description = "체력을 " .. tostring(effectValue) .. " 회복합니다."
-		elseif effectType ~= "" then
-			description = effectType .. " 효과를 적용합니다."
-		else
-			description = "소비 아이템입니다."
+	@ExecSpace("ServerOnly")
+	method void AppendRelics(table entries)
+		-- Derives effects from gameplay bonuses and preserves authored thumbnail prefixes.
+		local catalog = _RelicDefinitionRepositoryLogic:GetAllDefinitions()
+		if catalog.Success == false then
+			log_warning("[ItemCodexProvider] relic catalog unavailable reason=" .. catalog.Reason)
+			return
 		end
-		if targetType == "SELF" then description = description .. " 자신에게 사용합니다." end
-		if maxStack > 0 then description = description .. " 최대 소지 수: " .. tostring(maxStack) end
-		return description
-	end
-
-	method boolean ParseBooleanCell(any value)
-		if value == true then return true end
-		local normalized = string.lower(tostring(value or ""))
-		return normalized == "true" or normalized == "1" or normalized == "yes"
+		local ids = {}
+		for id, _ in pairs(catalog.Definitions) do table.insert(ids, id) end
+		table.sort(ids)
+		for _, id in ipairs(ids) do
+			local definition = catalog.Definitions[id]
+			table.insert(entries, {
+				Id = "Relic:" .. id, ItemKind = "Relic", Category = "Item",
+				DisplayName = definition.DisplayName, Icon = definition.IconImageRUID,
+				Description = definition.EffectDescription, TypeLabel = "유물",
+				MetaPrimaryLabel = "효과", MetaPrimaryValue = definition.EffectDescription,
+				MetaSecondaryLabel = "적용 방식", MetaSecondaryValue = "보유 시 자동 적용",
+				IsDiscovered = true
+			})
+		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method table GetEntries()
-		local entries = {}
-		for record in string.gmatch(self.EntrySnapshot or "", "([^|]+)") do
-			local fields = {}
-			for field in string.gmatch(record, "([^~]+)") do table.insert(fields, field) end
-			if #fields >= 4 then table.insert(entries, { Id=fields[1], Category="Item", DisplayName=fields[2], Icon=fields[3], Description=fields[4] }) end
+		-- Reads only synchronized public display data on the client.
+		if self.EntrySnapshot == "" then return {} end
+		local snapshot = _HttpService:JSONDecode(self.EntrySnapshot)
+		return snapshot.Entries or {}
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- Refreshes late-arriving data without resetting the selected item kind.
+		if name == "EntrySnapshot" and _LobbyCodexLogic:IsOpen() and _LobbyCodexLogic.ActiveCategory == "Item" then
+			_LobbyCodexLogic:RefreshCodex()
 		end
-		return entries
 	end
 
 end
