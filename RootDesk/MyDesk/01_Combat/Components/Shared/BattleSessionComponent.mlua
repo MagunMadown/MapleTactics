@@ -19,6 +19,14 @@ script BattleSessionComponent extends Component
 	@Sync property integer QueueLastTargetIndex = 0
 	@Sync property integer QueueLastOrderRevision = 0
 	@Sync property string BattleResult = ""
+	@Sync property boolean ResultReady = false
+	@Sync property integer ResultKillCount = 0
+	@Sync property integer ResultElapsedSeconds = 0
+	@Sync property integer ResultGold = 0
+	property number ResultStartTime = 0
+	property integer ResultStartGold = 0
+	property boolean ResultRecorded = false
+	property table ResultDefeatReset = {}
 	@Sync property integer UnionRewardRunId = 0
 	@Sync property integer UnionRewardBasePoints = 0
 	@Sync property integer UnionRewardBonusPoints = 0
@@ -590,6 +598,16 @@ script BattleSessionComponent extends Component
 		log("[BattleSession] stage definition loaded stageId=" .. self.StageId)
 		self.StageTurnNumber = 0
 		self.BattleResult = ""
+		self.ResultReady = false
+		self.ResultRecorded = false
+		self.ResultDefeatReset = {}
+		self.ResultKillCount = 0
+		self.ResultElapsedSeconds = 0
+		self.ResultGold = 0
+		self.ResultStartTime = _UtilLogic.ElapsedSeconds
+		_MonsterCollectionLogic:GetRecord(self.PlayerEntity)
+		local inventory = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent") or nil
+		self.ResultStartGold = inventory ~= nil and inventory:GetSnapshotAmount(inventory.RunCurrencySnapshot, "gold") or 0
 		self:ResetUnionRewardPresentation("STAGE_START")
 		self.DropRuntime:ResetDropState("STAGE_START")
 		self.WaveRuntime:ResetWaveState(self.TotalWaves, "STAGE_START")
@@ -3799,7 +3817,11 @@ script BattleSessionComponent extends Component
 			return { Success = false, Reason = "ENTRY_STATE_UNAVAILABLE" }
 		end
 
-		local resetResult = _RunManagerLogic:ResetFailedRun(self.PlayerEntity, "BATTLE_DEFEAT_RETURN")
+		local resetResult = self.ResultDefeatReset
+		if resetResult.Success ~= true then
+			resetResult = _RunManagerLogic:ResetFailedRun(self.PlayerEntity, "BATTLE_DEFEAT_RETURN")
+			if resetResult.Success then self.ResultDefeatReset = resetResult end
+		end
 		if resetResult.Success == false then
 			return resetResult
 		end
@@ -3814,6 +3836,8 @@ script BattleSessionComponent extends Component
 			"BATTLE_DEFEAT_RETURN"
 		)
 		if navigationResult.Success == false then
+			self.BattleResult = "Defeat"
+			self.PlayerExitObservedAfterBattle = false
 			return navigationResult
 		end
 		log("[BattleDefeatReturn] completed player=" .. self.PlayerEntity.Name .. " previousSequence=" .. resetResult.RunSequence .. " destination=lobby")
@@ -5874,6 +5898,10 @@ script BattleSessionComponent extends Component
 			log_error("[BattleDeath] state transition failed unit=" .. unitId .. " reason=" .. deathState.Reason)
 			return
 		end
+		if unit.Team == "Enemy" and isvalid(self.PlayerEntity) then
+			self.ResultKillCount = self.ResultKillCount + 1
+			_MonsterCollectionLogic:RecordDefeat(self.PlayerEntity, unit.EnemyDefinitionId)
+		end
 		local summoner = unitEntity:GetComponent("script.FaustSummonComponent")
 		if summoner ~= nil then
 			summoner:RemoveSummon(self)
@@ -5995,24 +6023,18 @@ script BattleSessionComponent extends Component
 		end
 		log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=" .. self.BattleResult .. " wave=" .. self.CurrentWave)
 		log("[BattleResult] result=" .. self.BattleResult .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " runRecorded=" .. tostring(runResultRecorded))
-		if self.BattleResult == "Victory" and runResultRecorded == true and isvalid(self.PlayerEntity) then
-			local transitionPlayer = self.PlayerEntity
-			local completedRun = self.UnionRewardRunEnded == true and self.UnionRewardWasCommitted == true
-			local completedStageId = self.StageId
-			local transitionDelay = math.max(0, self.EnemyDeathPresentationDelay)
-			self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
-				self.ResultTransitionTimerId = 0
-				if isvalid(transitionPlayer) == false then
-					return
-				end
-				if completedRun then
-					_StageTransitionManagerLogic:HandleCompletedRunTransition(transitionPlayer)
-				else
-					_StageTransitionManagerLogic:HandleVictoryTransition(transitionPlayer, completedStageId)
-				end
-			end, transitionDelay)
-			log("[BattleResult] transition delayed seconds=" .. tostring(transitionDelay) .. " reason=DEATH_PRESENTATION")
-		end
+		self.ResultRecorded = runResultRecorded
+		self.ResultElapsedSeconds = math.max(0, math.floor(_UtilLogic.ElapsedSeconds - self.ResultStartTime))
+		local inventory = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent") or nil
+		self.ResultGold = inventory ~= nil and math.max(0, inventory:GetSnapshotAmount(inventory.RunCurrencySnapshot, "gold") - self.ResultStartGold) or 0
+		local expectedEntry = self.EntryRequestId
+		self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
+			self.ResultTransitionTimerId = 0
+			if self.EntryRequestId == expectedEntry and self.BattleResult ~= "" then
+				self.ResultReady = true
+				log("[BattleResult] ready for confirmation kills=" .. self.ResultKillCount)
+			end
+		end, math.max(0.1, self.EnemyDeathPresentationDelay))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -7248,6 +7270,35 @@ script BattleSessionComponent extends Component
 		local consumptionKey = tostring(self.Entity.Id) .. ":" .. self.StageId .. ":" .. tostring(self.EntryRequestId)
 			.. ":" .. tostring(self.HudContextRevision) .. ":" .. tostring(self.TurnState.StateRevision)
 		combatStats:RecordConsumedTurn(consumptionKey)
+	end
+
+	@ExecSpace("Server")
+	method void RequestContinueResult()
+		-- Only the registered player can advance an ended, presented battle once.
+		if self:IsValidPlayerRequest(senderUserId) == false or self.ResultReady == false then return end
+		if self.BattleResult ~= "Victory" and self.BattleResult ~= "Defeat" then return end
+		self.ResultReady = false
+		if self.ResultRecorded == false then
+			self.ResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
+			if self.ResultRecorded then self:RefreshUnionRewardPresentation() end
+		end
+		if self.ResultRecorded == false then self.ResultReady = true return end
+		if self.BattleResult == "Defeat" then
+			local result = self:ReturnToLobbyAfterDefeat()
+			if result.Success == false then self.ResultReady = true end
+			self:PublishPlayerCommandResult("RETURN_TO_LOBBY", result)
+			return
+		end
+		if self.UnionRewardRunEnded and self.UnionRewardWasCommitted then
+			_StageTransitionManagerLogic:HandleCompletedRunTransition(self.PlayerEntity)
+		else
+			_StageTransitionManagerLogic:HandleVictoryTransition(self.PlayerEntity, self.StageId)
+		end
+		local expectedEntry = self.EntryRequestId
+		self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
+			self.ResultTransitionTimerId = 0
+			if isvalid(self.PlayerEntity) and self.PlayerEntity.CurrentMap == self.Entity and self.EntryRequestId == expectedEntry then self.ResultReady = true end
+		end, 8)
 	end
 
 end

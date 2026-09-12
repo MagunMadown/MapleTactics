@@ -1,0 +1,93 @@
+@Logic
+script LobbyInteractionFocusLogic extends Logic
+
+	property Entity FocusEntity = nil
+	property boolean IsPortalFocus = false
+	property number InputCooldown = 0
+	property table TargetPaths = {}
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Keeps one deterministic interaction owner for the whole lobby.
+		self.TargetPaths = {
+			"/maps/lobby/Lobby_2F/Facilities/UnionManagerNPC",
+			"/maps/lobby/Lobby_2F/FutureZones/CharacterSelectZone",
+			"/maps/lobby/Lobby_2F/FutureZones/CodexZone",
+			"/maps/lobby/Lobby_2F/Object_Lobby/Object_Lobby_Portal"
+		}
+		self.FocusEntity = nil
+		log("[LobbyFocus] ready targets=4")
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsModalOpen()
+		-- Prevents E and proximity prompts from leaking through an open service.
+		if _GameUIPolishLogic:IsTransitioning() or _LobbyCodexLogic:IsOpen() or _LobbyCharacterSelectionLogic:IsOpen() or _UnionSystemUILogic:IsOpen() then return true end
+		local root = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		local minimap = isvalid(root) and root:GetComponent("script.MinimapUI") or nil
+		return minimap ~= nil and minimap:IsWorldMapOpen()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Selects the nearest eligible target; equal distances retain the listed priority.
+		self.InputCooldown = math.max(0, self.InputCooldown - delta)
+		local player = _UserService.LocalPlayer
+		local nearest = nil
+		local nearestDistance = math.huge
+		local portal = false
+		if isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name == "lobby" and self:IsModalOpen() == false then
+			for i, path in ipairs(self.TargetPaths) do
+				local target = _EntityService:GetEntityByPath(path)
+				if isvalid(target) and target.TransformComponent ~= nil and player.TransformComponent ~= nil then
+					local zone = target:GetComponent("script.LobbyInteractionComponent")
+					local dx = player.TransformComponent.WorldPosition.x - target.TransformComponent.WorldPosition.x
+					local dy = player.TransformComponent.WorldPosition.y - target.TransformComponent.WorldPosition.y
+					local rx = zone ~= nil and zone.InteractionRangeX or 1.15
+					local ry = zone ~= nil and zone.InteractionRangeY or 1.5
+					local distance = dx * dx + dy * dy
+					if math.abs(dx) <= rx and math.abs(dy) <= ry and distance < nearestDistance then
+						nearest = target
+						nearestDistance = distance
+						portal = i == 4
+					end
+				end
+			end
+		end
+		self.FocusEntity = nearest
+		self.IsPortalFocus = portal
+		local prompt = _EntityService:GetEntityByPath("/ui/DefaultGroup/LobbyInteractionPrompt")
+		if isvalid(prompt) then prompt:SetEnable(isvalid(nearest)) end
+		if isvalid(nearest) == false then return end
+		local zone = nearest:GetComponent("script.LobbyInteractionComponent")
+		local label = portal and "게임 시작" or (zone ~= nil and zone.InteractionPromptText or "상호작용")
+		local text = _EntityService:GetEntityByPath("/ui/DefaultGroup/LobbyInteractionPrompt/PromptText")
+		if isvalid(text) then text.TextGUIRendererComponent.Text = label end
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleKeyDown(KeyDownEvent event)
+		-- One key press opens at most one target, including the central portal.
+		if event.key ~= KeyboardKey.E or self.InputCooldown > 0 or self:IsModalOpen() or isvalid(self.FocusEntity) == false then return end
+		self.InputCooldown = 0.25
+		if self.IsPortalFocus then
+			local root = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+			local start = isvalid(root) and root:GetComponent("script.LobbyStartButtonComponent") or nil
+			if start ~= nil then start:OnStartButtonClicked() end
+		else
+			local zone = self.FocusEntity:GetComponent("script.LobbyInteractionComponent")
+			if zone ~= nil then zone:OnInteract() end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Clears the local reference and hides the shared interaction prompt.
+		self.FocusEntity = nil
+		for _, path in ipairs({"/ui/DefaultGroup/LobbyInteractionPrompt"}) do
+			local entity = _EntityService:GetEntityByPath(path)
+			if isvalid(entity) then entity:SetEnable(false) end
+		end
+	end
+end
