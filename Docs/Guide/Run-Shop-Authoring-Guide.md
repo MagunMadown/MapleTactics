@@ -2,7 +2,7 @@
 
 ## 범위
 
-이 상점은 한 로그라이크 Run에서 획득한 `RUN_SCOPED` 골드로 스킬이나 소모품을 구매하는
+이 상점은 한 로그라이크 Run에서 획득한 `RUN_SCOPED` 골드로 런 능력치 유물, 소모품을 구매하는
 시스템이다. 영구 상품·캐시 결제·DB 구매 횟수를 사용하는 WorldShop과 분리한다.
 
 데이터 사전 §20.1~20.2의 `ShopDefinitions`/`ShopEntries`와
@@ -57,26 +57,27 @@ Node 선택 → OPEN_SHOP
 | `ShopEntryId` | 전체 상점에서 유일한 상품 ID |
 | `ShopId` | 소속 상점 |
 | `DisplayName` | 상품 표시 이름 |
-| `RewardType` | 현재 `SKILL`, `CONSUMABLE` |
+| `RewardType` | 공통 `shop_relic`은 `ITEM` |
 | `RewardRefId`, `RewardAmount` | 지급 대상과 수량 |
 | `PriceCurrencyId`, `PriceAmount` | RUN_SCOPED 가격 재화와 수량 |
 | `DisplayOrder` | 오름차순 표시 순서 |
 | `MaxPurchasesPerRun` | 현재 규격은 `1`만 지원 |
 | `Enabled` | 활성 여부 |
 
+현재 33종 유물은 모두 1골드다. `RelicDefinitions`에 같은 RewardRefId와 세 보너스(0 이상의 정수)를 등록한다. 기존 ItemCategory·IconImageRUID는 유지한다. 미보유 활성 유물 중 한 개만 진열하며 재열기·구매 후 재추첨하지 않는다. 전체 보유 시 빈 상점에서도 퇴장할 수 있다.
 기존 스킬·포션 상품 예시는 초기 프로토타입 기록이다. 현재 `ShopEntries.csv`는 장비 상품이며 소비 아이템 상품은 없다. 소비 아이템 추가 시 현재 5종 ID와 기존 구매 API를 사용하고, 총 수량 3~5칸 및 초과 재화 정책을 따른다. 이번 소비 HUD 작업에서는 상품 행을 추가하지 않았다.
 
 ## 서버 API
 
 ```lua
-_RunShopLogic:RequestOpenShop("shop_after_stage01")
-_RunShopLogic:RequestPurchaseOffer("shop01_heavy_slash", requestId)
+_RunShopLogic:RequestOpenSelectedShop()
+_RunShopLogic:RequestPurchaseOffer(displayedOfferId, requestId)
 _RunShopLogic:RequestCloseShop(requestId)
 ```
 
 서버 직접 통합과 테스트에서는 `OpenShop(player, shopId)`와
 `PurchaseOffer(player, shopEntryId, requestId)`를 사용한다. Client가 가격이나 지급 내용을
-인자로 보내지 않으며 서버가 Dataset 행을 다시 조회한다.
+인자로 보내지 않으며 서버가 새 런에 캡처한 현재 진열 행과 비교한다. 정의·가격 변경은 다음 새 런부터 반영한다.
 
 구매는 선택 사항이다. 아무 상품도 구매하지 않은 상태에서도 `RequestCloseShop()`으로 상점을
 건너뛸 수 있다. 서버는 `RunManagerLogic.CompleteCurrentContent()`를 통해 현재 SHOP 노드만
@@ -90,9 +91,9 @@ local ui = _RunShopLogic:GetLocalShopUiState()
 
 주요 값:
 
-- `OfferSnapshot`: `OfferId~DisplayName~RewardType~RewardRefId~RewardAmount~CurrencyId~Price~Order`
-- `PurchasedOfferIds`: 현재 방문에서 구매 완료한 Offer ID 목록
-- `CurrencySnapshot`, `ConsumableSnapshot`, `SkillSnapshot`
+- `OfferSnapshot`: `OfferId~DisplayName~RewardType~RewardRefId~RewardAmount~CurrencyId~Price~Order~IconImageRUID~ItemCategory~AttackBonus~MaxHpBonus~DefenseBonus~EffectDescription`
+- `PurchasedOfferIds`: 현재 런에서 구매 완료한 Offer ID 목록
+- `CurrencySnapshot`, `ConsumableSnapshot`, `SkillSnapshot`, `ItemSnapshot`, `NodeId`
 - `LastPurchase.OfferId/Success/Reason`
 - `Completion.RunState/RunFlowState/LastCompletedContentType/LastCompletedContentId`
 - `RevisionKey`, `Commands.CanPurchase/CanClose/CanSkip`
@@ -106,16 +107,16 @@ UI는 표를 직접 읽거나 잔액을 차감하지 않는다. Snapshot은 `|`,
 - 가격 재화는 `RUN_SCOPED`만 허용한다.
 - 상품 참조는 전체 콘텐츠 검증에서 확인한다.
 - `RunSequence + ShopEntryId` 구매 키로 같은 상품을 한 Run에서 한 번만 지급한다.
-- `RunSequence + requestId`로 성공한 Client 요청 재전송을 무시한다.
+- `RunSequence + VisitSequence + requestId`로 성공한 Client 요청 재전송을 무시한다.
 - 상점 완료도 `RunSequence + requestId`를 사용하며 동일 종료 요청은
   `DUPLICATE_CONTENT_COMPLETION_IGNORED`로 처리한다.
-- 골드 차감과 스킬·소모품 지급은 `PlayerRunInventoryComponent.ApplyShopPurchase` 한 경계에서 처리한다.
+- 골드 차감과 유물 지급은 `PlayerRunInventoryComponent.ApplyShopPurchase` 한 경계에서 처리한다.
 - 잔액 부족이나 잘못된 상품은 인벤토리를 변경하지 않는다.
 - 종료가 확정되면 Shop State는 `CLOSED`가 되고 구매·닫기·건너뛰기 명령이 비활성화된다.
 
 ## 확장 규칙
 
-1. 상품 추가는 우선 CSV 행만 추가한다.
+1. 상품 추가는 ShopEntries와 RelicDefinitions에 동일 ID의 행을 추가한다. 능력치 변경은 RelicDefinitions 세 수치를 수정하고 새 런에서 확인한다.
 2. 새 RewardType은 전용 상태 소유자와 원자적 거래 경계를 먼저 설계한다.
 3. Run당 2회 이상 구매나 재입고가 필요하면 숫자를 먼저 풀지 말고 Shop State의 구매 수량
    Snapshot과 Validator를 함께 확장한다.
@@ -124,3 +125,5 @@ UI는 표를 직접 읽거나 잔액을 차감하지 않는다. Snapshot은 `|`,
    `NodeDefinitions.NextNodeIds`를 수정한다.
 6. 새 방문 지점은 `ShopDefinitions → ShopEntries → ShopNodeBindings → NodeDefinitions` 순서로
    추가한다. 재방문은 새 고유 `NodeId`를 만들고 기존 `ShopId`에 바인딩한다.
+
+경로는 shop_upper/shop_lower NodeId로 구분하며 두 바인딩의 ShopId는 shop_relic이다. 퇴장 UI도 NodeId로 다음 경로를 선택한다.

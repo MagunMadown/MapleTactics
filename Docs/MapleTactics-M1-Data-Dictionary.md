@@ -1154,7 +1154,7 @@ HUD는 같은 종류도 한 개씩 분리한다. 초과분은 기존 재화 정�
 | MapId | string | O | 상점 진입 목적지 맵 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-기본 키는 `ShopId`이며 전역에서 유일해야 한다.
+기본 키는 `ShopId`이며 전역에서 유일해야 한다. 현재는 `shop_relic` 한 행을 사용한다.
 
 ### 20.1.1 ShopNodeBindings (IMPLEMENTED)
 
@@ -1166,7 +1166,7 @@ HUD는 같은 종류도 한 개씩 분리한다. 초과분은 기존 재화 정�
 | ShopId | string | O | ShopDefinitions.ShopId 참조 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-기본 키는 `(NodeGraphId, NodeId)`다. 모든 활성 SHOP 노드는 정확히 하나의 바인딩을 가져야 한다.
+기본 키는 `(NodeGraphId, NodeId)`다. 모든 활성 SHOP 노드는 정확히 하나의 바인딩을 가져야 한다. `shop_upper`·`shop_lower`는 모두 `shop_relic`을 참조한다. 경로 잠금은 ShopId가 아닌 NodeId로 구분한다.
 
 ### 20.2 ShopEntries (IMPLEMENTED)
 
@@ -1177,16 +1177,16 @@ HUD는 같은 종류도 한 개씩 분리한다. 초과분은 기존 재화 정�
 | ShopId | string | O | ShopDefinitions.ShopId 참조 |
 | DisplayName | string | O | 제작자/UI 표시 이름 |
 | RewardType | enum | O | 현재 `SKILL`, `CONSUMABLE`, `ITEM` |
-| RewardRefId | string | O | RewardType에 맞는 SkillId 또는 ConsumableId |
+| RewardRefId | string | O | ITEM은 RelicDefinitions.RelicId 참조; shop_relic은 ITEM만 허용 |
 | RewardAmount | integer | O | 지급 수량, 1 이상 |
 | PriceCurrencyId | string | O | `RUN_SCOPED` CurrencyDefinitions.CurrencyId 참조 |
-| PriceAmount | integer | O | 가격, 0 이상 |
+| PriceAmount | integer | O | 가격, 1 이상; 초기 유물 가격 1골드 |
 | DisplayOrder | integer | O | 같은 ShopId 안의 오름차순 표시 순서 |
 | MaxPurchasesPerRun | integer | O | 현재 반드시 `1` |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-현재 실제 Dataset에는 `shop_upper`, `shop_lower` 카탈로그가 등록되어 있다.
-서버는 Dataset의 가격과 보상 참조를 다시 조회한 뒤 재화 차감과 지급을 원자적으로 확정한다.
+현재 실제 Dataset에는 공통 `shop_relic` 카탈로그의 기존 33종 ID·이미지가 등록되어 있다. 목록 17개 제한은 없다. ItemCategory와 IconImageRUID는 기존 값을 유지한다.
+서버는 새 런에 정의·가격을 캡처하고 활성 상품 중 미보유 유물 후보를 ID 정렬한 뒤 RunSeed·NodeId·방문 순번으로 동일 가중치의 하나를 추첨한다. 현재 방문의 OfferedEntry와 일치하는 구매만 원자적으로 차감·지급한다. 팝업 재열기와 구매 후에는 재추첨하지 않는다. 후보가 없으면 빈 상점이며 구매만 비활성화한다.
 구매 완료 키는 `RunSequence + ShopEntryId`이므로 같은 상점을 다른 노드에서 재방문해도
 이미 구매한 상품은 다시 지급되지 않는다. 자세한 제작·API 규격은
 `Guide/Run-Shop-Authoring-Guide.md`를 따른다.
@@ -1194,6 +1194,22 @@ HUD는 같은 종류도 한 개씩 분리한다. 초과분은 기존 재화 정�
 `RewardType=SKILL` 상품을 다시 넣을 때는 `RewardRefId`가 §4.1의
 `GetPlayerGrantableSkillIds()` 범위 안에 있어야 한다. 적 전용 SkillId를 넣으면 플레이어가
 몬스터 전용 행을 보유하게 된다.
+
+### 20.2.1 RelicDefinitions (IMPLEMENTED — Maker 검증 대기)
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| RelicId | string | O | 고유 유물 ID; 기존 RewardRefId 유지 |
+| DisplayName | string | O | 상점·전투 HUD 표시 이름 |
+| IconImageRUID | string | O | 기존 상품 이미지 |
+| EffectDescription | string | O | 제작자 참고 설명; 런타임은 아래 수치에서 동일 설명 생성 |
+| AttackBonus | integer | O | 0 이상, 실제 양수 타격에 합산 |
+| MaxHpBonus | integer | O | 0 이상, 최대 체력 및 현재 체력 차이 적용 |
+| DefenseBonus | integer | O | 0 이상, 받는 타격에서 차감; 최소 1, 완전 방어는 0 |
+
+한 행에 세 효과를 함께 설정할 수 있다. 안경·펜던트·귀고리는 (1,0,0), 모자·신발은 (0,1,0), 견장·벨트·옷은 (0,0,1)로 시작한다. 음수·소수·빈 수치·중복 ID를 거절한다.
+PlayerRunRelicEffectComponent는 새 런에서 정의를 고정하고 보유 유물별 합계를 구매 및 전투 진입에 계산한다. HP 5/10에서 체력 +1 구매는 6/11이며 재계산·재진입은 추가 회복하지 않는다. 새 런은 합계를 0으로 초기화한다. 계정 영구 저장은 없다.
+상점 OfferSnapshot 기존 10필드 뒤에 AttackBonus, MaxHpBonus, DefenseBonus, EffectDescription을 붙인다. 첫 상품 행·상세 패널만 사용하고 나머지는 숨긴다. 전투 HUD도 캡처된 동일 정의를 사용한다.
 
 ### 20.3 ShopItemDefinitions (PLANNED — Meta/World Shop)
 
