@@ -15,15 +15,21 @@ script RunShopLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table ResetPlayerShopState(Entity playerEntity, integer runSequence)
+		-- Reset the visit and capture immutable relic definitions at the new-run boundary.
 		local shopState = self:GetOrCreateShopState(playerEntity)
 		if shopState == nil then
 			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
 		end
+		local relics = self:GetOrCreateRelicEffects(playerEntity)
+		if relics == nil then return { Success = false, Reason = "RUN_RELIC_STATE_UNAVAILABLE" } end
+		local captured = relics:CaptureForRun(runSequence)
+		if captured.Success == false then return captured end
 		return shopState:ResetForRun(runSequence)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table OpenShop(Entity playerEntity, string shopId)
+		-- Keep an existing visit or draw one unowned relic from its frozen run catalog.
 		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
 		local shopState = self:GetOrCreateShopState(playerEntity)
 		if runState == nil or shopState == nil then
@@ -33,20 +39,44 @@ script RunShopLogic extends Logic
 			or runState.SelectedContentType ~= "SHOP" or runState.SelectedContentId ~= shopId then
 			return { Success = false, Reason = "SHOP_TRANSITION_NOT_READY" }
 		end
-		local validation = _ContentValidatorLogic:ValidateShopById(shopId)
-		if validation.Success == false then
-			return validation
+		if shopState.ActiveRunSequence == runState.RunSequence and shopState.VisitKey == runState.LastContentSelectionKey
+			and shopState.ActiveShopId == shopId and shopState.ActiveNodeId == runState.SelectedNodeId then
+			return shopState:GetSnapshot()
 		end
-		local bundle = validation.Data
-		local offerParts = {}
+		local relics = self:GetOrCreateRelicEffects(playerEntity)
+		local inventory = _RunManagerLogic:GetOrCreateRunInventory(playerEntity)
+		if relics == nil or not relics.IsInitialized or relics.ActiveRunSequence ~= runState.RunSequence
+			or inventory == nil or inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" }
+		end
+		local bundle = relics.ShopBundle
+		if bundle.Definition.ShopId ~= shopId then return { Success = false, Reason = "INVALID_SHOP_ID" } end
+		local candidates = {}
 		for _, entry in ipairs(bundle.Entries) do
-			table.insert(offerParts, entry.ShopEntryId .. "~" .. entry.DisplayName .. "~" .. entry.RewardType .. "~" .. entry.RewardRefId .. "~" .. tostring(entry.RewardAmount) .. "~" .. entry.PriceCurrencyId .. "~" .. tostring(entry.PriceAmount) .. "~" .. tostring(entry.DisplayOrder) .. "~" .. entry.IconImageRUID .. "~" .. entry.ItemCategory)
+			if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, entry.RewardRefId) == 0 then
+				table.insert(candidates, entry)
+			end
 		end
-		return shopState:Open(runState.RunSequence, shopId, runState.SelectedNodeId, bundle.Definition.DisplayName, runState.LastContentSelectionKey, table.concat(offerParts, "|"))
+		table.sort(candidates, function(left, right) return left.ShopEntryId < right.ShopEntryId end)
+		local visit = shopState.ActiveRunSequence == runState.RunSequence and shopState.VisitSequence + 1 or 1
+		local index = self:SelectOfferIndex(runState.RunSeed, runState.SelectedNodeId, visit, #candidates)
+		local offered = index > 0 and candidates[index] or nil
+		local snapshot = ""
+		if offered ~= nil then
+			local definition = relics.Definitions[offered.RewardRefId]
+			snapshot = table.concat({ offered.ShopEntryId, definition.DisplayName, offered.RewardType, offered.RewardRefId,
+				tostring(offered.RewardAmount), offered.PriceCurrencyId, tostring(offered.PriceAmount), tostring(offered.DisplayOrder),
+				offered.IconImageRUID, offered.ItemCategory, tostring(definition.AttackBonus), tostring(definition.MaxHpBonus),
+				tostring(definition.DefenseBonus), definition.EffectDescription }, "~")
+		end
+		local opened = shopState:Open(runState.RunSequence, shopId, runState.SelectedNodeId, bundle.Definition.DisplayName, runState.LastContentSelectionKey, snapshot)
+		if opened.Success then shopState.OfferedEntry = offered or {} end
+		return opened
 	end
 
 	@ExecSpace("ServerOnly")
 	method table PurchaseOffer(Entity playerEntity, string shopEntryId, integer requestId)
+		-- Accept only the displayed offer and make successful retries idempotent.
 		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
 		local shopState = self:GetOrCreateShopState(playerEntity)
 		if runState == nil or shopState == nil then
@@ -57,11 +87,17 @@ script RunShopLogic extends Logic
 			return { Success = false, Reason = "INVALID_SHOP_PURCHASE_REQUEST" }
 		end
 		if shopState.ShopState ~= "OPEN" or shopState.ActiveRunSequence ~= runState.RunSequence
-			or shopState.ActiveShopId ~= runState.SelectedContentId or runState.RunFlowState ~= "AWAITING_SHOP" then
+			or shopState.ActiveShopId ~= runState.SelectedContentId or runState.RunFlowState ~= "AWAITING_SHOP"
+			or shopState.ActiveNodeId ~= runState.SelectedNodeId or shopState.VisitKey ~= runState.LastContentSelectionKey
+			or runState.ContentTransitionState ~= "READY" then
 			shopState:PublishPurchaseResult(shopEntryId, false, "SHOP_NOT_OPEN")
 			return { Success = false, Reason = "SHOP_NOT_OPEN" }
 		end
-		local requestKey = tostring(runState.RunSequence) .. ":" .. tostring(requestId)
+		if shopState.OfferedEntry.ShopEntryId == nil or shopState.OfferedEntry.ShopEntryId ~= shopEntryId then
+			shopState:PublishPurchaseResult(shopEntryId, false, "SHOP_OFFER_MISMATCH")
+			return { Success = false, Reason = "SHOP_OFFER_MISMATCH" }
+		end
+		local requestKey = tostring(runState.RunSequence) .. ":" .. tostring(shopState.VisitSequence) .. ":" .. tostring(requestId)
 		if shopState:IsPurchaseRequestApplied(requestKey) then
 			return { Success = true, Reason = "DUPLICATE_PURCHASE_REQUEST_IGNORED", ShopEntryId = shopEntryId, Revision = shopState.ShopRevision }
 		end
@@ -70,7 +106,7 @@ script RunShopLogic extends Logic
 			shopState:PublishPurchaseResult(shopEntryId, true, "DUPLICATE_PURCHASE_IGNORED")
 			return { Success = true, Reason = "DUPLICATE_PURCHASE_IGNORED", ShopEntryId = shopEntryId, Revision = shopState.ShopRevision }
 		end
-		local entry = _ShopDefinitionRepositoryLogic:GetEntry(shopState.ActiveShopId, shopEntryId)
+		local entry = shopState.OfferedEntry
 		if entry.Success == false then
 			shopState:PublishPurchaseResult(shopEntryId, false, entry.Reason)
 			return entry
@@ -184,6 +220,7 @@ script RunShopLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method table GetLocalShopUiState()
+		-- Expose owner-synced display data without reading the server-only catalog.
 		local playerEntity = _UserService.LocalPlayer
 		if playerEntity == nil then
 			return { Success = false, Reason = "LOCAL_PLAYER_UNAVAILABLE" }
@@ -194,6 +231,8 @@ script RunShopLogic extends Logic
 		if shopState == nil or inventory == nil or runState == nil then
 			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
 		end
+		local offerId = string.match(shopState.OfferSnapshot, "^([^~]+)~")
+		local sold = offerId ~= nil and string.find("|" .. shopState.PurchasedOfferIds .. "|", "|" .. offerId .. "|", 1, true) ~= nil
 		return {
 			Success = true,
 			Reason = shopState.ShopState == "CLOSED" and shopState.LastCloseReason or shopState.LastPurchaseReason,
@@ -223,11 +262,31 @@ script RunShopLogic extends Logic
 			},
 			Commands = {
 				CanOpenUi = runState.RunFlowState == "AWAITING_SHOP" and runState.SelectedContentType == "SHOP",
-				CanPurchase = shopState.ShopState == "OPEN",
+				CanPurchase = shopState.ShopState == "OPEN" and offerId ~= nil and not sold,
 				CanClose = shopState.ShopState == "OPEN",
 				CanSkip = shopState.ShopState == "OPEN"
 			}
 		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateRelicEffects(Entity playerEntity)
+		-- Attach run-owned effects using the existing runtime component pattern.
+		if not isvalid(playerEntity) or playerEntity.PlayerComponent == nil then return nil end
+		local effects = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if effects == nil then effects = playerEntity:AddComponent("PlayerRunRelicEffectComponent") end
+		return effects
+	end
+
+	method integer SelectOfferIndex(integer runSeed, string nodeId, integer visit, integer count)
+		-- Park-Miller stream with rejection sampling removes modulo bias for equal-weight candidates.
+		if count <= 0 then return 0 end
+		local state = math.floor(runSeed) % 2147483646 + 1
+		local salt = nodeId .. ":" .. tostring(visit)
+		for index = 1, #salt do state = (state * 131.0 + string.byte(salt, index)) % 2147483646 + 1 end
+		local limit = math.floor(2147483646 / count) * count
+		repeat state = (state * 16807.0) % 2147483647 until state - 1 < limit
+		return math.floor((state - 1) % count) + 1
 	end
 
 end
