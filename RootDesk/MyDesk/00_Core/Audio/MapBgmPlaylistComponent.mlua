@@ -2,7 +2,8 @@
 script MapBgmPlaylistComponent extends Component
 
 @Sync
-property string TrackRUIDs = ""
+@Description("Add one BGM RUID per list entry in Maker. Tracks repeat in list order; empty entries are ignored.")
+property SyncTable<string> TrackRUIDs
 property any SoundStateEventHandler = nil
 
 @ExecSpace("ClientOnly")
@@ -14,6 +15,7 @@ method void OnBeginPlay()
 	self._T.trackIndex = 1
 	self._T.ready = false
 	self._T.tracks = {}
+	self._T.playlistEntries = nil
 	local sound = self.Entity.SoundComponent
 	if not isvalid(sound) then
 		log_warning("[MapBgmPlaylist] Map SoundComponent is missing.")
@@ -40,6 +42,60 @@ method boolean IsCurrentMap()
 end
 
 @ExecSpace("ClientOnly")
+method void RefreshPlaylist()
+	-- Detect list edits, preserving the current song when it is still listed.
+	local entries = {}
+	for _, entry in ipairs(self.TrackRUIDs) do
+		table.insert(entries, entry)
+	end
+	local previous = self._T.playlistEntries
+	local changed = previous == nil or #previous ~= #entries
+	if not changed then
+		for index, entry in ipairs(entries) do
+			if previous[index] ~= entry then
+				changed = true
+				break
+			end
+		end
+	end
+	if not changed then return end
+	self._T.playlistEntries = entries
+	local currentTrack = self._T.tracks[self._T.trackIndex]
+	local tracks = {}
+	for _, entry in ipairs(entries) do
+		local track = string.match(entry, "^%s*(.-)%s*$")
+		if #track == 32 and string.match(track, "^%x+$") ~= nil then
+			table.insert(tracks, string.lower(track))
+		elseif track ~= "" then
+			log_warning("[MapBgmPlaylist] Invalid RUID skipped: " .. track)
+		end
+	end
+	self._T.tracks = tracks
+	local sound = self.Entity.SoundComponent
+	if #tracks == 0 then
+		local wasActive = self._T.active
+		self._T.active = false
+		self._T.started = false
+		self._T.pendingNext = false
+		if wasActive and isvalid(sound) then sound:Stop() end
+		return
+	end
+	if self._T.active then
+		local currentIndex = 0
+		for index, track in ipairs(tracks) do
+			if track == currentTrack then
+				currentIndex = index
+				break
+			end
+		end
+		self._T.trackIndex = currentIndex
+		if currentIndex == 0 then self._T.pendingNext = true end
+		if isvalid(sound) then sound.Loop = #tracks == 1 end
+	end
+	log("[MapBgmPlaylist] Playlist updated: " .. tostring(#tracks) .. " tracks")
+end
+
+@ExecSpace("ClientOnly")
 method void OnUpdate(number delta)
 	-- Start on local entry and defer track changes outside the sound event callback.
 	if not self._T.ready then return end
@@ -49,14 +105,9 @@ method void OnUpdate(number delta)
 		self._T.pendingNext = false
 		return
 	end
+	self:RefreshPlaylist()
+	if #self._T.tracks == 0 then return end
 	if not self._T.active then
-		local tracks = {}
-		for track in string.gmatch(self.TrackRUIDs or "", "([^|]+)") do
-			if track ~= "" then table.insert(tracks, track) end
-		end
-		-- Initial property synchronization can finish after OnBeginPlay.
-		if #tracks == 0 then return end
-		self._T.tracks = tracks
 		self._T.trackIndex = 1
 		self:PlayCurrentTrack()
 	elseif self._T.pendingNext then
