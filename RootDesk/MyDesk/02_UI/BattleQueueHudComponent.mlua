@@ -280,10 +280,10 @@ script BattleQueueHudComponent extends Component
 
 		self.LastSignature = signature
 		self:SyncIconSnapshot(iconSnapshot)
-		self.TurnText.Text = "TURN " .. uiState.TurnNumber
+		self.TurnText.Text = "턴 " .. uiState.TurnNumber
 		self.QueueText.Text = queueLabel
 		local consumableLabel = uiState.RunInventory.ConsumableSnapshot == "" and "없음" or uiState.RunInventory.ConsumableSnapshot
-		self.StateText.Text = "STAGE " .. session.StageNumber .. "  ·  WAVE " .. waveState.CurrentWave .. "/" .. waveState.TotalWaves .. "  ·  " .. reinforcementLabel .. "  ·  " .. phaseLabel .. "  ·  " .. inputLabel .. "  ·  " .. cooldownLabel .. "  ·  DROP " .. uiState.Drops.PendingCount .. "  ·  소비품 " .. consumableLabel .. " (H 사용)  ·  적 예고: " .. enemyIntentLabel
+		self.StateText.Text = "스테이지 " .. session.StageNumber .. "  ·  웨이브 " .. waveState.CurrentWave .. "/" .. waveState.TotalWaves .. "  ·  " .. reinforcementLabel .. "  ·  " .. phaseLabel .. "  ·  " .. inputLabel .. "  ·  " .. cooldownLabel .. "  ·  드롭 " .. uiState.Drops.PendingCount .. "  ·  소비품 " .. consumableLabel .. " (H 사용)  ·  적 예고: " .. enemyIntentLabel
 		if transitionLabel ~= "" then
 			self.StateText.Text = "이동 이벤트  ·  " .. transitionLabel
 		end
@@ -415,7 +415,7 @@ script BattleQueueHudComponent extends Component
 			self.QueuePanelEntity.Enable = visible
 		end
 		if visible == false and self.ResultPanelEntity ~= nil then
-			self.ResultPanelEntity.Enable = false
+			_GameUIPolishLogic:HideWindowImmediately(self.ResultPanelEntity)
 		end
 		if self.HasHudContextState and self.IsHudContextVisible == visible then
 			return
@@ -476,29 +476,47 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void SetResultVisibility(string battleResult, string stageId, table unionReward)
-		-- Reuses the existing result panel for defeat and the terminal victory receipt without calculating rewards in UI.
+		-- Shows the receipt after the final death presentation, keeping it visible during transfer.
 		local hasCommittedReward = unionReward ~= nil and unionReward.WasCommitted == true and unionReward.RunEnded == true
-		local visible = self.IsHudContextVisible and (battleResult == "Defeat" or (battleResult == "Victory" and hasCommittedReward))
+		local visible = self.IsHudContextVisible and (battleResult == "Defeat" or battleResult == "Victory")
+		local session = _BattleHudPresenterLogic:GetBattleSession()
+		if self._T.ResultEntryId ~= (session ~= nil and session.EntryRequestId or "") then
+			self._T.ResultEntryId = session ~= nil and session.EntryRequestId or ""
+			self._T.ResultShown = false
+		end
+		if visible == false then self._T.ResultShown = false end
+		if visible and session ~= nil and session.ResultReady then self._T.ResultShown = true end
+		visible = visible and self._T.ResultShown == true
 		local rewardVisible = visible and hasCommittedReward
-		local lobbyReturnVisible = visible and battleResult == "Defeat"
+		local lobbyReturnVisible = visible
 		if self.ResultPanelEntity ~= nil then
-			self.ResultPanelEntity.Enable = visible
+			if visible then
+				if self.ResultPanelEntity.Enable == false then _GameUIPolishLogic:SetWindowVisible(self.ResultPanelEntity, true) end
+			else
+				_GameUIPolishLogic:HideWindowImmediately(self.ResultPanelEntity)
+			end
 		end
 		self.ResultPanelSprite.Enable = visible
 		self.ResultText.Enable = visible
 		self.UnionRewardText.Enable = rewardVisible
 		self.UnionRewardBreakdownText.Enable = rewardVisible
-		self.ResetButton.Enable = lobbyReturnVisible
+		self.ResetButton.Enable = lobbyReturnVisible and session ~= nil and session.ResultReady
 		self.ResetButtonSprite.Enable = lobbyReturnVisible
 		self.ResetButtonText.Enable = lobbyReturnVisible
 		if visible then
-			self.ResultText.Text = battleResult == "Victory" and "VICTORY" or "DEFEAT"
+			local summary = _EntityService:GetEntityByPath("/ui/BattleQueueHUD/ResultPanel/Summary")
+			if isvalid(summary) and session ~= nil then
+				local stageName = _EntityService:GetEntityByPath("/ui/BattleQueueHUD/ResultPanel/StageName")
+				if isvalid(stageName) then stageName.TextGUIRendererComponent.Text = session.StageDisplayName end
+				summary.TextGUIRendererComponent.Text = "처치  " .. tostring(session.ResultKillCount) .. "마리    ·    소요 시간  " .. string.format("%02d:%02d", math.floor(session.ResultElapsedSeconds / 60), session.ResultElapsedSeconds % 60) .. "\n획득 메소  +" .. tostring(session.ResultGold)
+			end
+			self.ResultText.Text = battleResult == "Victory" and "전투 승리" or "전투 종료"
 			if rewardVisible then
-				self.UnionRewardText.Text = "유니온 포인트 +" .. tostring(unionReward.FinalUnionPoints or 0)
-				self.UnionRewardBreakdownText.Text = "Base +" .. tostring(unionReward.BaseUnionPoints or 0) .. "    Union Bonus +" .. tostring(unionReward.BonusUnionPoints or 0)
+				self.UnionRewardText.Text = "유니온 코인 +" .. tostring(unionReward.FinalUnionPoints or 0)
+				self.UnionRewardBreakdownText.Text = "기본 +" .. tostring(unionReward.BaseUnionPoints or 0) .. "    유니온 보너스 +" .. tostring(unionReward.BonusUnionPoints or 0)
 			end
 			if lobbyReturnVisible then
-				self.ResetButtonText.Text = "시작 마을로"
+				self.ResetButtonText.Text = session ~= nil and session.ResultReady and ((battleResult == "Defeat" or hasCommittedReward) and "로비로 돌아가기" or "보상 확인 · 다음으로") or "처리 중..."
 			end
 		end
 		if battleResult ~= "" then
@@ -1693,10 +1711,10 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnResetClicked()
-		-- Prevents duplicate local clicks while the server resets the run and transfers the player.
-		self.ResetButton.Enable = false
+		-- The server owns the in-flight gate; a rejected request cannot strand a disabled local button.
 		log("[BattleQueueHUD] lobby return clicked")
-		_BattleHudPresenterLogic:RequestReturnToLobbyAfterDefeat()
+		local session = _BattleHudPresenterLogic:GetBattleSession()
+		if session ~= nil then session:RequestContinueResult() end
 	end
 
 	@ExecSpace("ClientOnly")
