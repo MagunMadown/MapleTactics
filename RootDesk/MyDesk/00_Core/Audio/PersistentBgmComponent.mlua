@@ -1,0 +1,153 @@
+@Component
+script PersistentBgmComponent extends Component
+
+property any SoundStateEventHandler = nil
+
+@ExecSpace("ClientOnly")
+method void OnBeginPlay()
+	-- Own one audio source on an always-enabled UI entity for the whole client session.
+	self._T.tracks = {}
+	self._T.trackIndex = 1
+	self._T.signature = ""
+	self._T.mapName = ""
+	self._T.pollDelay = 0
+	self._T.active = false
+	self._T.started = false
+	self._T.pendingNext = false
+	self.SoundStateEventHandler = _SoundService:ConnectEvent(SoundPlayStateChangedEvent, function(event)
+		if not self._T.active then return end
+		if event.State == SoundPlayState.Play then
+			self._T.started = true
+		elseif event.State == SoundPlayState.Stop and self._T.started then
+			self._T.started = false
+			self._T.pendingNext = true
+		end
+	end)
+	log("[PersistentBgm] ready source=" .. self.Entity.Path)
+end
+
+@ExecSpace("ClientOnly")
+method void OnUpdate(number delta)
+	-- Map changes select configuration; skill reward maps never touch the audio source.
+	if self._T.tracks == nil then return end
+	self._T.pollDelay = self._T.pollDelay - delta
+	if self._T.pollDelay <= 0 then
+		self._T.pollDelay = 0.25
+		self:UpdateMapPlaylist()
+	end
+	if self._T.pendingNext and #self._T.tracks > 0 then
+		self._T.pendingNext = false
+		if not self.Entity.SoundComponent:IsPlaying() then
+			self._T.trackIndex = self._T.trackIndex % #self._T.tracks + 1
+			self:PlayCurrentTrack()
+		end
+	end
+end
+
+@ExecSpace("ClientOnly")
+method void UpdateMapPlaylist()
+	-- Preserve the current track and playlist index when the same configuration returns.
+	local player = _UserService.LocalPlayer
+	if not isvalid(player) or not isvalid(player.CurrentMap) then return end
+	local map = player.CurrentMap
+	local changedMap = self._T.mapName ~= map.Name
+	self._T.mapName = map.Name
+	if map.Name == "new_skill_stage" or map.Name == "new_upgrade_stage" then
+		if changedMap then self:LogPlayback("preserved") end
+		return
+	end
+	local tracks = {}
+	local playlist = map:GetComponent("script.MapBgmPlaylistComponent")
+	if playlist ~= nil and playlist.Enable then
+		tracks = playlist:GetTracks()
+		-- A synced list can arrive after map entry; keep polling instead of stopping BGM.
+		if #tracks == 0 then return end
+	end
+	local settings = map.SoundComponent
+	local volume = 1
+	local pitch = 1
+	local mute = false
+	if isvalid(settings) then
+		volume = settings.Volume
+		pitch = settings.Pitch
+		mute = settings.Mute
+		if playlist == nil and settings.Enable and settings.AudioClipRUID ~= "" then
+			table.insert(tracks, settings.AudioClipRUID)
+		end
+	end
+	local sound = self.Entity.SoundComponent
+	sound.Volume = volume
+	sound.Pitch = pitch
+	sound.Mute = mute
+	local signature = table.concat(tracks, "|")
+	if signature == self._T.signature then
+		if changedMap then self:LogPlayback("preserved") end
+		return
+	end
+	self._T.signature = signature
+	local currentTrack = self._T.tracks[self._T.trackIndex]
+	self._T.tracks = tracks
+	if #tracks == 0 then
+		self._T.active = false
+		self._T.started = false
+		self._T.pendingNext = false
+		sound:Stop()
+		self:LogPlayback("stopped")
+		return
+	end
+	-- Editing the list should not restart a song that is still present.
+	for index, track in ipairs(tracks) do
+		if track == currentTrack and self._T.active then
+			self._T.trackIndex = index
+			sound.Loop = #tracks == 1
+			self:LogPlayback("preserved")
+			return
+		end
+	end
+	self._T.trackIndex = 1
+	self:PlayCurrentTrack()
+end
+
+@ExecSpace("ClientOnly")
+method void PlayCurrentTrack()
+	-- Stop and play only for an actual song change, never for a reward-map transition.
+	local sound = self.Entity.SoundComponent
+	self._T.active = false
+	self._T.started = false
+	self._T.pendingNext = false
+	sound:Stop()
+	sound.PlayOnEnable = false
+	sound.Bgm = true
+	sound.Loop = #self._T.tracks == 1
+	sound.AudioClipRUID = self._T.tracks[self._T.trackIndex]
+	self._T.active = true
+	sound:Play()
+	self:LogPlayback("started")
+end
+
+@ExecSpace("ClientOnly")
+method void LogPlayback(string action)
+	-- Report the unchanged source and playback position for transition verification.
+	local sound = self.Entity.SoundComponent
+	local position = -1
+	if sound.AudioClipRUID ~= "" and sound:IsAudioClipLoaded() then
+		position = sound:GetTimePosition()
+	end
+	log("[PersistentBgm] " .. action .. " map=" .. self._T.mapName
+		.. " track=" .. tostring(self._T.trackIndex) .. " clip=" .. sound.AudioClipRUID
+		.. " position=" .. tostring(position))
+end
+
+@ExecSpace("ClientOnly")
+method void OnEndPlay()
+	-- Release the global BGM event only when this persistent client entity is destroyed.
+	self._T.active = false
+	self._T.pendingNext = false
+	if self.SoundStateEventHandler ~= nil then
+		_SoundService:DisconnectEvent(SoundPlayStateChangedEvent, self.SoundStateEventHandler)
+		self.SoundStateEventHandler = nil
+	end
+	if isvalid(self.Entity.SoundComponent) then self.Entity.SoundComponent:Stop() end
+end
+
+end
