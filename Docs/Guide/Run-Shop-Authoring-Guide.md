@@ -2,7 +2,7 @@
 
 ## 범위
 
-이 상점은 한 로그라이크 Run에서 획득한 `RUN_SCOPED` 골드로 런 능력치 유물을 구매하는
+이 상점은 한 로그라이크 Run에서 획득한 `RUN_SCOPED` 골드로 런 능력치 유물, 소모품을 구매하는
 시스템이다. 영구 상품·캐시 결제·DB 구매 횟수를 사용하는 WorldShop과 분리한다.
 
 데이터 사전 §20.1~20.2의 `ShopDefinitions`/`ShopEntries`와
