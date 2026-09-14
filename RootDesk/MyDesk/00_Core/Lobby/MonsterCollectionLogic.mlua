@@ -1,0 +1,211 @@
+@Logic
+script MonsterCollectionLogic extends Logic
+
+	property string StorageKey = "MonsterCollectionV1"
+	property table Records = {}
+	property table LocalEntries = {}
+	property boolean IsLoaded = false
+	property boolean Closing = false
+	property string LoadMessage = "수집 기록 불러오는 중"
+
+	method table DecodeRecords(string raw)
+		-- Stores compact monotonic states: 1 is new, 2 is read; corrupt saves are never overwritten.
+		if raw == nil or raw == "" then return {} end
+		local ok, decoded = pcall(function() return _HttpService:JSONDecode(raw) end)
+		if ok == false or type(decoded) ~= "table" or decoded.Version ~= 1 or type(decoded.Entries) ~= "table" then return nil end
+		local entries = {}
+		for id, state in pairs(decoded.Entries) do
+			if id ~= "__empty" then
+				if type(id) ~= "string" or (state ~= 1 and state ~= 2) then return nil end
+				entries[id] = state
+			end
+		end
+		return entries
+	end
+
+	method string EncodeRecords(table entries)
+		-- Keeps an empty dictionary JSON-safe without serializing any runtime references.
+		local copy = { __empty = 0 }
+		for id, state in pairs(entries) do copy[id] = state end
+		return _HttpService:JSONEncode({ Version = 1, Entries = copy })
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetRecord(Entity player)
+		-- Reads one dedicated collection key per player session and reuses the loaded cache.
+		if isvalid(player) == false or player.PlayerComponent == nil then return nil end
+		local userId = player.PlayerComponent.UserId
+		local record = self.Records[userId]
+		if record ~= nil then return record end
+		local key = player.PlayerComponent.ProfileCode
+		if key == nil or key == "" then key = userId end
+		record = { Key = key, UserId = userId, Entries = {}, Pending = {}, Loaded = false, Loading = false, Saving = false, Raw = "", Exists = false, Timer = 0, RetryDelay = 3, NextLoadAt = 0, NextRequestAt = 0, Invalid = false }
+		self.Records[userId] = record
+		self:LoadRecord(record)
+		return record
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean LoadRecord(table record)
+		-- Retains pending discoveries when a read fails instead of replacing the saved catalog.
+		if record.Loading or record.Invalid or _UtilLogic.ElapsedSeconds < record.NextLoadAt then return false end
+		record.NextLoadAt = _UtilLogic.ElapsedSeconds + 10
+		record.Loading = true
+		local storage = _DataStorageService:GetUserDataStorage(record.Key)
+		local code, raw = storage:GetAndWait(self.StorageKey)
+		record.Loading = false
+		if code ~= 0 and code ~= 1000002 then
+			log_warning("[MonsterCollection] load failed code=" .. tostring(code))
+			return false
+		end
+		local entries = self:DecodeRecords(code == 1000002 and "" or raw)
+		if entries == nil then record.Invalid = true log_error("[MonsterCollection] invalid saved record; write blocked") return false end
+		record.Entries = entries
+		record.Raw = raw or ""
+		record.Exists = code == 0 and raw ~= nil and raw ~= ""
+		record.Loaded = true
+		for id, state in pairs(record.Pending) do record.Entries[id] = math.max(record.Entries[id] or 0, state) end
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleSave(table record)
+		-- Debounces discoveries and read acknowledgments into a single event-driven write.
+		if self.Closing or record.Invalid or record.Timer ~= 0 then return end
+		record.Timer = _TimerService:SetTimerOnce(function()
+			record.Timer = 0
+			self:FlushRecord(record, false)
+		end, record.RetryDelay)
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean FlushRecord(table record, boolean isLeaving)
+		-- Keeps live saves asynchronous and preserves newer acknowledgments during a write.
+		if record.Saving or next(record.Pending) == nil or record.Invalid then return false end
+		if record.Loaded == false and self:LoadRecord(record) == false then
+			record.RetryDelay = math.min(120, math.max(10, record.RetryDelay * 2))
+			self:ScheduleSave(record)
+			return false
+		end
+		record.Saving = true
+		local pending = {}
+		for id, state in pairs(record.Pending) do pending[id] = state end
+		local raw = self:EncodeRecords(record.Entries)
+		if raw == record.Raw then self:CompleteSave(record, pending, raw, 0) return true end
+		local storage = _DataStorageService:GetUserDataStorage(record.Key)
+		if isLeaving then
+			local code = 0
+			if record.Exists then code = storage:UpdateAndWait(self.StorageKey, record.Raw, raw)
+			else code = storage:SetAndWait(self.StorageKey, raw) end
+			self:CompleteSave(record, pending, raw, code)
+			return code == 0
+		end
+		if record.Exists then
+			storage:UpdateAsync(self.StorageKey, record.Raw, raw, function(code) self:CompleteSave(record, pending, raw, code) end)
+		else
+			storage:SetAsync(self.StorageKey, raw, function(code) self:CompleteSave(record, pending, raw, code) end)
+		end
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompleteSave(table record, table pending, string raw, integer code)
+		-- A failed write stays dirty and retries with backoff; corrupt saved data stays untouched.
+		record.Saving = false
+		if code ~= 0 then
+			if code == 2000000 then record.Loaded = false end
+			record.RetryDelay = code == 1000005 and 120 or math.min(120, math.max(10, record.RetryDelay * 2))
+			log_warning("[MonsterCollection] save pending code=" .. tostring(code))
+			self:ScheduleSave(record)
+			return
+		end
+		record.Raw = raw
+		record.Exists = true
+		record.RetryDelay = 3
+		for id, state in pairs(pending) do if record.Pending[id] == state then record.Pending[id] = nil end end
+		if next(record.Pending) ~= nil then self:ScheduleSave(record) end
+		self:ReceiveSnapshot(self:EncodeRecords(record.Entries), true, "", record.UserId)
+		log("[MonsterCollection] saved bytes=" .. tostring(string.len(raw)))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RecordDefeat(Entity player, string enemyId)
+		-- Only the authoritative battle death path can register a monster.
+		if enemyId == nil or enemyId == "" then return end
+		local record = self:GetRecord(player)
+		if record == nil then return end
+		if (record.Entries[enemyId] or 0) > 0 then return end
+		record.Entries[enemyId] = 1
+		record.Pending[enemyId] = 1
+		self:ScheduleSave(record)
+		self:ReceiveSnapshot(self:EncodeRecords(record.Entries), record.Loaded, enemyId, record.UserId)
+		log("[MonsterCollection] discovered enemy=" .. enemyId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestSnapshot()
+		-- Resolves the caller on the server rather than accepting a player identity from UI.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		local record = self:GetRecord(player)
+		if record == nil or _UtilLogic.ElapsedSeconds < record.NextRequestAt then return end
+		record.NextRequestAt = _UtilLogic.ElapsedSeconds + 1
+		if record.Loaded == false then self:LoadRecord(record) end
+		self:ReceiveSnapshot(self:EncodeRecords(record.Entries), record.Loaded, "", senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void MarkRead(string enemyId)
+		-- A client can acknowledge only an already discovered entry in its own save.
+		local record = self:GetRecord(_UserService:GetUserEntityByUserId(senderUserId))
+		if record == nil or record.Entries[enemyId] ~= 1 then return end
+		record.Entries[enemyId] = 2
+		record.Pending[enemyId] = 2
+		self:ScheduleSave(record)
+		self:ReceiveSnapshot(self:EncodeRecords(record.Entries), record.Loaded, "", senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveSnapshot(string raw, boolean loaded, string discoveredId)
+		-- Delivers only this player's collection and refreshes an open catalog.
+		local entries = self:DecodeRecords(raw)
+		if entries == nil then return end
+		self.LocalEntries = entries
+		self.IsLoaded = loaded
+		self.LoadMessage = loaded and "" or "수집 기록을 불러오지 못했습니다. 도감을 다시 열어 주세요."
+		if _LobbyCodexLogic:IsOpen() and _LobbyCodexLogic.ActiveCategory == "Monster" then _LobbyCodexLogic:RefreshDiscoveryState() end
+		if discoveredId ~= "" then _GameUIPolishLogic:ShowToast("새 몬스터 등록", "도감에서 새로운 수집 기록을 확인하세요.") end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void WaitForActiveSave(table record)
+		-- Serializes the logout flush behind any live asynchronous write.
+		local remaining = 5
+		while record.Saving and remaining > 0 do
+			wait(0.05)
+			remaining = remaining - 0.05
+		end
+		if record.Saving then log_warning("[MonsterCollection] final save still in flight") end
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Service", "UserService")
+	handler HandleUserLeave(UserLeaveEvent event)
+		-- Flushes dirty state at logout and evicts only successfully saved records.
+		local record = self.Records[event.UserId]
+		if record == nil then return end
+		if record.Timer ~= 0 then _TimerService:ClearTimer(record.Timer) record.Timer = 0 end
+		self:WaitForActiveSave(record)
+		self:FlushRecord(record, true)
+		if next(record.Pending) == nil then self.Records[event.UserId] = nil end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Attempts final persistence without leaving retry timers alive during shutdown.
+		self.Closing = true
+		for _, record in pairs(self.Records) do
+			if record.Timer ~= 0 then _TimerService:ClearTimer(record.Timer) record.Timer = 0 end
+			self:FlushRecord(record, true)
+		end
+	end
+end

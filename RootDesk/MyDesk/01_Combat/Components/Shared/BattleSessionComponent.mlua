@@ -19,6 +19,14 @@ script BattleSessionComponent extends Component
 	@Sync property integer QueueLastTargetIndex = 0
 	@Sync property integer QueueLastOrderRevision = 0
 	@Sync property string BattleResult = ""
+	@Sync property boolean ResultReady = false
+	@Sync property integer ResultKillCount = 0
+	@Sync property integer ResultElapsedSeconds = 0
+	@Sync property integer ResultGold = 0
+	property number ResultStartTime = 0
+	property integer ResultStartGold = 0
+	property boolean ResultRecorded = false
+	property table ResultDefeatReset = {}
 	@Sync property integer UnionRewardRunId = 0
 	@Sync property integer UnionRewardBasePoints = 0
 	@Sync property integer UnionRewardBonusPoints = 0
@@ -57,8 +65,8 @@ script BattleSessionComponent extends Component
 	@Sync property string ContentValidationErrorSnapshot = ""
 	@Sync property integer ContentValidationRevision = 0
 	@Sync property integer StageNumber = 1
-	@Sync property string StageId = "region_01_stage_01"
-	@Sync property string RegionId = "region_01"
+	@Sync property string StageId = "henesys_stage_01"
+	@Sync property string RegionId = "henesys"
 	@Sync property integer StageIndex = 1
 	@Sync property string StageType = "NORMAL"
 	@Sync property string StageDisplayName = ""
@@ -75,6 +83,10 @@ script BattleSessionComponent extends Component
 	@Sync property string SelectedJobId = ""
 	@Sync property string SelectedJobMechanicId = "NONE"
 	@Sync property string SelectedJobPassiveSetId = ""
+	@Sync property string UtilitySkillId = ""
+	@Sync property string UtilitySkillIconRuid = ""
+	@Sync property integer UtilityMaxCooldown = 0
+	@Sync property integer UtilityRemainingCooldown = 0
 	@Sync property string SelectedJobStartingSkillIds = ""
 	@Sync property string SkillSlotIds = ""
 	@Sync property string SkillSlotNames = ""
@@ -97,7 +109,7 @@ script BattleSessionComponent extends Component
 	property integer LastProcessedQueueReorderRequestId = 0
 	-- One knob for how fast every skill plays. Above 1 speeds the swing, the effects, the impact frame,
 	-- and the queue slot together, so presentation and pacing never drift apart.
-	@Sync property number SkillSpeedMultiplier = 1.25
+	@Sync property number SkillSpeedMultiplier = 2.0
 	@Sync property integer SelectedJobBaseMaxHp = 0
 	@Sync property integer SelectedJobBaseQueueCapacity = 0
 	@Sync property integer SelectedJobRevision = 0
@@ -143,24 +155,28 @@ script BattleSessionComponent extends Component
 	property number BasicAttackDamage = 3
 	property string BasicSlashMotionKey = "basic_slash"
 	property string BasicSlashActionName = "swingO1"
-	property number BasicSlashMotionPlayRate = 1
+	property number BasicSlashMotionPlayRate = 3
 	property number BasicSlashMotionDuration = 0.45
 	property number BasicSlashImpactDelay = 0.18
 	property number HeavySlashDamage = 6
 	property string HeavySlashMotionKey = "heavy_slash"
 	property string HeavySlashActionName = "swingO2"
-	property number HeavySlashMotionPlayRate = 0.85
+	property number HeavySlashMotionPlayRate = 3
 	property number HeavySlashMotionDuration = 0.70
 	property number HeavySlashImpactDelay = 0.38
 	property string PushMotionKey = "push"
 	property string PushActionName = "swingO1"
-	property number PushMotionPlayRate = 0.9
+	property number PushMotionPlayRate = 3
 	property number PushMotionDuration = 0.40
 	property number PushImpactDelay = 0.18
 	property string ActiveEffectSkillId = ""
 	property string ActiveHitEffectRuid = ""
+	property string ActiveHitSoundRuid = ""
 	property number ActiveEffectScale = 1
 	property boolean ActiveEffectFlipX = false
+	-- One shared gain for every skill cast / hit sound, so the whole layer can be balanced against the BGM
+	-- from the inspector instead of retuning each authored row.
+	property number SkillSoundVolume = 1
 	-- Combat-feel tuning: adjust presentation tempo here without changing battle rules.
 	@Sync property number MoveActionDuration = 0.12
 	@Sync property string MoveCurve = "QUAD_EASE_OUT"
@@ -176,7 +192,7 @@ script BattleSessionComponent extends Component
 	@Sync property number PlayerHopLandingXScale = 1.04
 	@Sync property number PlayerHopLandingYScale = 0.96
 	@Sync property number PlayerHopPeakProgress = 0.50
-	@Sync property number PlayerHopAnimationPlayRate = 1.0
+	@Sync property number PlayerHopAnimationPlayRate = 3
 	@Sync property boolean EnableEnemyHopVisual = true
 	@Sync property number EnemyHopDuration = 0.13
 	@Sync property number EnemyHopHeight = 0.09
@@ -189,7 +205,7 @@ script BattleSessionComponent extends Component
 	@Sync property number EnemyHopPeakProgress = 0.50
 	-- Empty by default: movement must preserve the spawned enemy unless its definition authors a motion.
 	@Sync property string EnemyHopAnimationRuid = ""
-	@Sync property number EnemyHopAnimationPlayRate = 1.8
+	@Sync property number EnemyHopAnimationPlayRate = 5.4
 	@Sync property number PlayerToEnemyBeatDuration = 0.05
 	@Sync property number PlayerPresentationSettledBeatDuration = 0.02
 	@Sync property number EnemyToEnemyBeatDuration = 0.03
@@ -275,13 +291,32 @@ script BattleSessionComponent extends Component
 	@EventSender("Service", "InputService")
 	handler HandleMoveKeyDown(KeyDownEvent event)
 		-- Converts one movement/turn/attack key press into a server-authoritative request.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= self.Entity then
+			return
+		end
+		-- UI clicks belong to skill selection and dragging, never to world commands.
+		if (event.key == KeyboardKey.Mouse0 or event.key == KeyboardKey.Mouse1 or event.key == KeyboardKey.Mouse2)
+			and _InputService:IsPointerOverUI() then
+			return
+		end
 		if event.key == KeyboardKey.F8 then
 			log("[BattlePrototypeTest] force stage clear requested key=F8")
 			self:RequestPrototypeForceStageClear()
 			return
 		end
-
-		if event.key == KeyboardKey.Space then
+		if event.key == KeyboardKey.Space or event.key == KeyboardKey.Mouse0 then
+			log("[BattleInput] execute queue requested")
+			_BattleHudPresenterLogic:RequestExecuteQueue()
+			return
+		end
+		if event.key == KeyboardKey.Mouse1 then
+			if _BattleHudPresenterLogic:TryBeginLocalCommand("UTILITY") then
+				self:RequestUtilitySkill()
+			end
+			return
+		end
+		if event.key == KeyboardKey.W or event.key == KeyboardKey.Mouse2 then
 			if _BattleHudPresenterLogic:TryBeginLocalCommand("TURN") == false then
 				return
 			end
@@ -292,9 +327,7 @@ script BattleSessionComponent extends Component
 		end
 
 		if event.key == KeyboardKey.H then
-			self.ConsumableRequestSequence = self.ConsumableRequestSequence + 1
-			log("[BattleInput] consumable requested ref=potion_hp_small request=" .. self.ConsumableRequestSequence)
-			self:RequestUseConsumable("potion_hp_small", self.ConsumableRequestSequence)
+			self:SubmitConsumableUse("orange_potion", "")
 			return
 		end
 
@@ -311,7 +344,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void PreviewLocalTurnFacing()
-		-- Gives Space an immediate visual response without mutating authoritative BattleUnit facing.
+		-- Gives direction input an immediate visual response without mutating authoritative BattleUnit facing.
 		local player = _UserService.LocalPlayer
 		if isvalid(player) == false or player.PlayerControllerComponent == nil then
 			return
@@ -413,6 +446,7 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void OnEndPlay()
 		-- Prevents a pending action callback from surviving this map-scoped battle session.
+		self:ClearMotionCompletionWaits()
 		self:ClearPrototypeBattleEntryRetry("SESSION_END")
 		self.PrototypeTestEntryActive = false
 		self:CancelPlayerCombatPresentationHandoff("SESSION_END", false)
@@ -447,6 +481,74 @@ script BattleSessionComponent extends Component
 		if self.DropRuntime ~= nil then
 			self.DropRuntime:DiscardPending("SESSION_END")
 		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearMotionCompletionWaits()
+		-- Entry changes invalidate every outstanding presentation acknowledgement.
+		for _, wait in pairs(self._T.motionCompletionWaits or {}) do
+			_TimerService:ClearTimer(wait.TimerId)
+		end
+		self._T.motionCompletionWaits = {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void WaitForMotionCompletion(any complete)
+		-- Logical delays remain a lower bound; only the owning player's display can release this presentation gate.
+		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.CurrentMap ~= self.Entity then return end
+		self._T.motionCompletionSequence = (self._T.motionCompletionSequence or 0) + 1
+		local sequence = self._T.motionCompletionSequence
+		local entry = self.EntryRequestId
+		self._T.motionCompletionWaits = self._T.motionCompletionWaits or {}
+		local wait = { Complete = complete, Entry = entry, TimerId = 0 }
+		self._T.motionCompletionWaits[sequence] = wait
+		wait.TimerId = _TimerService:SetTimerOnce(function()
+			if self._T.motionCompletionWaits[sequence] ~= wait then return end
+			self._T.motionCompletionWaits[sequence] = nil
+			if self.EntryRequestId ~= entry or isvalid(self.PlayerEntity) == false or self.PlayerEntity.CurrentMap ~= self.Entity then return end
+			log_warning("[BattleMotionGate] acknowledgement timeout sequence=" .. sequence)
+			complete()
+		end, 60)
+		self:AwaitClientMotionCompletion(sequence, entry, self.PlayerEntity.PlayerComponent.UserId)
+	end
+
+	@ExecSpace("Client")
+	method void AwaitClientMotionCompletion(integer sequence, integer entry)
+		-- Includes queued hit poses and death holds, but excludes completed attack handoff poses and repeating movement.
+		-- The recipient UserId is an engine-supplied final call argument, never a declared parameter.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= self.Entity then return end
+		local started = _UtilLogic.ElapsedSeconds
+		local poll = nil
+		poll = function()
+			if isvalid(self.Entity) == false or isvalid(player) == false or player.CurrentMap ~= self.Entity or self.EntryRequestId ~= entry then return end
+			if _UtilLogic.ElapsedSeconds - started > 60 then return end
+			local busy = false
+			local presentations = self.Entity:GetChildComponentsByTypeName("script.BattleUnitPresentationComponent", true)
+			for _, presentation in pairs(presentations) do
+				if presentation:IsFullMotionPending() then busy = true break end
+			end
+			local playerPresentation = player:GetComponent("script.BattleUnitPresentationComponent")
+			if playerPresentation ~= nil and playerPresentation:IsFullMotionPending() then busy = true end
+			if busy == false then
+				self:ConfirmMotionCompletion(sequence, entry)
+				return
+			end
+			_TimerService:SetTimerOnce(poll, 0.01)
+		end
+		_TimerService:SetTimerOnce(poll, 0.01)
+	end
+
+	@ExecSpace("Server")
+	method void ConfirmMotionCompletion(integer sequence, integer entry)
+		-- This acknowledgement can only release an existing server-owned callback; it cannot apply damage or choose actions.
+		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent.UserId ~= senderUserId or self.PlayerEntity.CurrentMap ~= self.Entity then return end
+		local wait = self._T.motionCompletionWaits ~= nil and self._T.motionCompletionWaits[sequence] or nil
+		if wait == nil or wait.Entry ~= entry or self.EntryRequestId ~= entry then return end
+		self._T.motionCompletionWaits[sequence] = nil
+		_TimerService:ClearTimer(wait.TimerId)
+		log("[BattleMotionGate] released sequence=" .. sequence)
+		wait.Complete()
 	end
 
 	@ExecSpace("ServerOnly")
@@ -719,7 +821,7 @@ script BattleSessionComponent extends Component
 		end
 		self:PublishWaveStateSnapshot("PROTOTYPE_FORCE_CLEAR")
 		local damageAmount = math.max(1, finalUnit.CurrentHp)
-		local damageResult = self:ApplyDamage("player_01", finalUnit.UnitId, damageAmount)
+		local damageResult = self:ApplyDamage("player_01", finalUnit.UnitId, damageAmount, "prototype_force_clear")
 		if damageResult.Success == false then
 			result.Reason = damageResult.Reason
 			return result
@@ -824,6 +926,16 @@ script BattleSessionComponent extends Component
 		log("[BattleSession] stage definition loaded stageId=" .. self.StageId)
 		self.StageTurnNumber = 0
 		self.BattleResult = ""
+		self.ResultReady = false
+		self.ResultRecorded = false
+		self.ResultDefeatReset = {}
+		self.ResultKillCount = 0
+		self.ResultElapsedSeconds = 0
+		self.ResultGold = 0
+		self.ResultStartTime = _UtilLogic.ElapsedSeconds
+		_MonsterCollectionLogic:GetRecord(self.PlayerEntity)
+		local inventory = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent") or nil
+		self.ResultStartGold = inventory ~= nil and inventory:GetSnapshotAmount(inventory.RunCurrencySnapshot, "gold") or 0
 		self:ResetUnionRewardPresentation("STAGE_START")
 		self.DropRuntime:ResetDropState("STAGE_START")
 		self.WaveRuntime:ResetWaveState(self.TotalWaves, "STAGE_START")
@@ -1104,20 +1216,20 @@ script BattleSessionComponent extends Component
 			return
 		end
 		presentation.IdleMotionRuid = spawnDefinition.IdleMotionRuid or ""
-		presentation.IdleMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.IdleMotionPlayRate) or 1)
+		presentation.IdleMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.IdleMotionPlayRate) or 1) * 3
 		presentation.MovementMotionRuid = spawnDefinition.MoveMotionRuid or ""
 		if presentation.MovementMotionRuid == "" then
 			presentation.MovementMotionRuid = presentation.IdleMotionRuid
 		end
-		presentation.MovementMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.MoveMotionPlayRate) or 1)
+		presentation.MovementMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.MoveMotionPlayRate) or 1) * 3
 		presentation.HitMotionRuid = spawnDefinition.HitMotionRuid or ""
-		presentation.HitMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.HitMotionPlayRate) or 1)
+		presentation.HitMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.HitMotionPlayRate) or 1) * 3
 		presentation.HitMotionDuration = math.max(0.05, tonumber(spawnDefinition.HitMotionDuration) or 0.25)
 		presentation.AttackMotionRuid = spawnDefinition.AttackMotionRuid or ""
-		presentation.AttackMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.AttackMotionPlayRate) or 1)
+		presentation.AttackMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.AttackMotionPlayRate) or 1) * 3
 		presentation.AttackMotionDuration = math.max(0.05, tonumber(spawnDefinition.AttackMotionDuration) or 0.35)
 		presentation.DeathMotionRuid = spawnDefinition.DeathMotionRuid or ""
-		presentation.DeathMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.DeathMotionPlayRate) or 1)
+		presentation.DeathMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.DeathMotionPlayRate) or 1) * 3
 		presentation.DeathMotionDuration = math.max(0.05, tonumber(spawnDefinition.DeathMotionDuration) or 0.5)
 		presentation.GroundVisualOffsetY = tonumber(spawnDefinition.VisualOffsetY) or 0
 		log("[EnemyMotionProfile] configured definition=" .. tostring(spawnDefinition.EnemyDefinitionId)
@@ -1251,7 +1363,10 @@ script BattleSessionComponent extends Component
 		if hpSnapshot.Success == false then
 			return hpSnapshot
 		end
-		local restoreResult = playerUnit:RestoreCurrentHp(hpSnapshot.CurrentHp)
+		local effects = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if effects ~= nil then effects:Recalculate() end
+		playerUnit.MaxHp = runState.RunMaxHp
+		local restoreResult = playerUnit:RestoreCurrentHp(runState.RunCurrentHp)
 		log("[RunHp] restored stage=" .. self.StageId .. " hp=" .. restoreResult.HpAfter .. "/" .. restoreResult.MaxHp .. " reason=" .. (reason or ""))
 		return restoreResult
 	end
@@ -1473,9 +1588,11 @@ script BattleSessionComponent extends Component
 						or plan.PlanState == "EXECUTING"
 					local queuedTileNames = ""
 					local queuedIconRuids = ""
+					local queuedIconBackgroundColors = ""
 					if hasVisibleQueue then
 						queuedTileNames = self:GetEnemyQueueDisplayNames(plan.PlannedActionSnapshot)
 						queuedIconRuids = self:GetEnemyQueueIconRuids(plan.PlannedActionSnapshot)
+						queuedIconBackgroundColors = self:GetEnemyQueueIconBackgroundColors(plan.PlannedActionSnapshot)
 					end
 					local targetCellSnapshot = plan.TargetCellSnapshot
 					local telegraphKind = ""
@@ -1530,6 +1647,7 @@ script BattleSessionComponent extends Component
 						telegraphKind ~= "" and telegraphKind or "-",
 						tostring(landingCell),
 						tostring(plan.DeferredUntilTurn),
+						queuedIconBackgroundColors ~= "" and queuedIconBackgroundColors or "-",
 						plan.CastState ~= "" and plan.CastState or "NONE",
 						plan.CastingSkillId ~= "" and plan.CastingSkillId or "-",
 						tostring(plan.InterruptHitsRequired),
@@ -1588,10 +1706,30 @@ script BattleSessionComponent extends Component
 				if definition.Success == true then
 					iconRuid = definition.HudIconRuid or ""
 				end
+
 				table.insert(iconRuids, iconRuid ~= "" and iconRuid or "-")
 			end
 		end
 		return table.concat(iconRuids, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueIconBackgroundColors(string actionSnapshot)
+		-- Preserve slot placeholders and omit # on the wire because it separates enemy records.
+		local colors = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local fields = {}
+			for field in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(fields, field)
+			end
+			local tileId = fields[3] or ""
+			if tileId ~= "" and tileId ~= "-" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(tileId)
+				local color = definition.Success and (definition.HudIconBackgroundColor or "") or ""
+				table.insert(colors, string.match(color, "^#%x%x%x%x%x%x%x%x$") and string.sub(color, 2) or "-")
+			end
+		end
+		return table.concat(colors, "|")
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1793,6 +1931,146 @@ script BattleSessionComponent extends Component
 		local position = self:GetCellPosition(unit.CellIndex)
 		log("[BattleSession] unit registered id=" .. unit.UnitId .. " team=" .. unit.Team .. " cell=" .. unit.CellIndex .. " spawnOrder=" .. unit.SpawnOrder .. " x=" .. position.x)
 		return { Success = true, Reason = "UNIT_REGISTERED", UnitId = unit.UnitId }
+	end
+
+	@ExecSpace("Server")
+	method void RequestUtilitySkill()
+		-- The server chooses the utility from the selected job; clients cannot submit arbitrary skill IDs.
+		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil
+			or self.PlayerEntity.PlayerComponent.UserId ~= senderUserId
+			or self.PlayerEntity.CurrentMap ~= self.Entity then
+			return
+		end
+		local result = self:TryUseUtilitySkill()
+		self:PublishPlayerCommandResult("UTILITY", result)
+		log("[UtilitySkill] request job=" .. self.SelectedJobId .. " skill=" .. self.UtilitySkillId
+			.. " success=" .. tostring(result.Success) .. " reason=" .. result.Reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryUseUtilitySkill()
+		-- Reserves the existing immediate-action lock without consuming or rewriting queued skills.
+		if self.TurnState == nil or self.BoardState == nil or self.BattleResult ~= ""
+			or self.BattlePhase ~= "PlayerTurn" then
+			return { Success = false, Reason = "INVALID_PHASE" }
+		end
+		local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead or unit.IsAirborne then
+			return { Success = false, Reason = "UNIT_UNAVAILABLE" }
+		end
+		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(self.SelectedJobId)
+		if bundle.Success == false then return bundle end
+		local definition = bundle.Definition
+		local runtime = self:GetSkillRuntimeState("player_01")
+		if runtime == nil then return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" } end
+		local cooldown = runtime:CanUseSkill(definition.SkillId)
+		if cooldown.Success == false then return cooldown end
+		local reserved = self.TurnState:TryReserveImmediateAction("UTILITY", 0)
+		if reserved.Success == false then return reserved end
+		self.CurrentPlayerActionKillCount = 0
+		local result = self:ExecuteUtilityEffect(definition, bundle.Step, unit)
+		if result.Success == false then
+			self:CompleteQueuedAction("UTILITY", false, result.Reason)
+			return result
+		end
+		-- A utility effect resolves synchronously, so this is still cast time; arming the presentation only
+		-- after acceptance keeps a rejected cast (no target, blocked destination) silent. Utility rows author
+		-- no cast/hit clip today, so in practice this presents the authored cast sound alone.
+		self:BeginSkillEffectPresentation(unit.UnitId, definition)
+		self.UtilitySkillId = definition.SkillId
+		self.UtilitySkillIconRuid = definition.IconRuid
+		self.UtilityMaxCooldown = definition.CooldownTurns
+		runtime:StartCooldown(definition.SkillId, definition.CooldownTurns)
+		self.UtilityRemainingCooldown = runtime:GetRemainingCooldown(definition.SkillId)
+		self:PublishTurnStateSnapshot("UTILITY_EXECUTED")
+		local duration = math.max(0.1, definition.ActionDuration) / self:GetSkillSpeedMultiplier()
+		self.ActionTimerId = _TimerService:SetTimerOnce(function()
+			self:CompleteQueuedAction("UTILITY", true, result.Reason)
+		end, duration)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ExecuteUtilityEffect(table definition, table step, any sourceUnit)
+		-- Executes the authored utility effect through existing board, push and HP boundaries.
+		local direction = sourceUnit.Facing == "Right" and 1 or -1
+		local sourceCell = sourceUnit.CellIndex
+		if step.EffectType == "GUARD" and step.TargetSelector == "SELF_UNIT"
+			and step.ParameterA == "UNTIL_NEXT_PLAYER_TURN" and step.ParameterB == "ALL_DAMAGE" then
+			sourceUnit.UtilityGuardActive = true
+			return { Success = true, Reason = "UTILITY_GUARD_ACTIVE" }
+		end
+		if step.EffectType == "MOVE_SELF" and step.TargetSelector == "SELF_UNIT" then
+			local destination = -1
+			if step.ParameterA == "FARTHEST_EMPTY_FORWARD" then
+				for distance = 1, self.CellCount do
+					local cell = sourceCell + direction * distance
+					if self:IsValidCell(cell) and self:IsCellOccupied(cell, sourceUnit.UnitId) == false then
+						destination = cell
+					end
+				end
+			elseif step.ParameterA == "BEHIND_FARTHEST_ENEMY_FORWARD" and step.ParameterB == "REQUIRE_EMPTY" then
+				local farthestEnemy = -1
+				for distance = 1, self.CellCount do
+					local cell = sourceCell + direction * distance
+					if self:IsValidCell(cell) then
+						local entity = self.BoardState:FindAtCell(cell, sourceUnit.UnitId)
+						if isvalid(entity) then
+							local target = entity:GetComponent("script.BattleUnitComponent")
+							if target ~= nil and target.Team ~= sourceUnit.Team and not target.IsDead and not target.IsAirborne then
+								farthestEnemy = cell
+							end
+						end
+					end
+				end
+				if farthestEnemy >= 0 then
+					destination = farthestEnemy + direction * math.max(1, math.floor(step.Value))
+				end
+			else
+				return { Success = false, Reason = "UTILITY_MOVE_RULE_UNSUPPORTED" }
+			end
+			if self:IsValidCell(destination) == false or self:IsCellOccupied(destination, sourceUnit.UnitId) then
+				return { Success = false, Reason = "UTILITY_NO_EMPTY_DESTINATION" }
+			end
+			return self:RelocateUnitForMechanic(sourceUnit.UnitId, destination, definition.SkillId)
+		end
+		if step.EffectType ~= "PUSH_DISTANCE"
+			or (step.ParameterA ~= "STOP_BEFORE_BLOCKED" and step.ParameterA ~= "MAX")
+			or (step.TargetSelector ~= "PRIMARY_TARGET" and step.TargetSelector ~= "ALL_SKILL_TARGETS") then
+			return { Success = false, Reason = "UTILITY_EFFECT_UNSUPPORTED" }
+		end
+		local targets = _SkillTargetResolverLogic:Resolve(self, sourceUnit.UnitId, definition)
+		if targets.Success == false then return targets end
+		local targetIds = step.TargetSelector == "PRIMARY_TARGET" and { targets.PrimaryTargetUnitId } or targets.TargetUnitIds
+		if #targetIds == 0 or targetIds[1] == "" then
+			return { Success = false, Reason = "UTILITY_NO_TARGET" }
+		end
+		-- Move the farthest target first so nearer targets cannot block a multi-target wave.
+		table.sort(targetIds, function(left, right)
+			return math.abs(targets.TargetCellsByUnitId[left] - sourceCell) > math.abs(targets.TargetCellsByUnitId[right] - sourceCell)
+		end)
+		local maxSteps = step.ParameterA == "MAX" and self.CellCount or math.max(0, math.floor(step.Value))
+		local moved = 0
+		for _, targetId in ipairs(targetIds) do
+			for distance = 1, maxSteps do
+				local pushed = self:ResolvePushImpactOnTarget(sourceUnit.UnitId, targetId)
+				if pushed.Success == false or pushed.Reason ~= "PUSHED" then break end
+				moved = moved + 1
+			end
+		end
+		if step.ParameterB == "CARRY_CASTER" and moved > 0 then
+			local destination = sourceCell
+			for distance = 1, self.CellCount do
+				local cell = sourceCell + direction * distance
+				if self:IsValidCell(cell) == false or self:IsCellOccupied(cell, sourceUnit.UnitId) then break end
+				destination = cell
+			end
+			if destination ~= sourceCell then
+				self:RelocateUnitForMechanic(sourceUnit.UnitId, destination, definition.SkillId)
+			end
+		end
+		log("[UtilitySkill] pushed skill=" .. definition.SkillId .. " cells=" .. tostring(moved))
+		return { Success = true, Reason = moved > 0 and "UTILITY_PUSHED" or "UTILITY_PUSH_BLOCKED" }
 	end
 
 	@ExecSpace("Server")
@@ -2043,6 +2321,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CancelPlayerCombatPresentationHandoff(string reason, boolean restoreToStand)
+		self:ClearMotionCompletionWaits()
 		local playerEntity = self.PlayerEntity
 		if playerEntity == nil or isvalid(playerEntity) == false then
 			playerEntity = self:FindUnitEntity("player_01")
@@ -2598,6 +2877,10 @@ script BattleSessionComponent extends Component
 		end
 
 		local duration = self:GetEnemyActionDuration(intent.ActionType, intent.TileId)
+		if intent.ActionType == "EXECUTE_TILE" and actionResult ~= nil then
+			-- The actual impact delay already includes the final projectile; playback completion supplies the visual boundary.
+			duration = actionResult.PresentationHandoffDuration or 0.01
+		end
 		local completed = false
 		local complete = function()
 			if completed then
@@ -2623,7 +2906,10 @@ script BattleSessionComponent extends Component
 			self.ActionTimerId = movement.TimerId
 			return
 		end
-		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
+		self.ActionTimerId = _TimerService:SetTimerOnce(function()
+			self.ActionTimerId = 0
+			self:WaitForMotionCompletion(complete)
+		end, duration)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3693,7 +3979,10 @@ script BattleSessionComponent extends Component
 			self:PublishTurnStateSnapshot("SKILL_ADVANCED")
 			self:ExecuteNextQueuedTile()
 		end
-		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
+		self.ActionTimerId = _TimerService:SetTimerOnce(function()
+			self.ActionTimerId = 0
+			self:WaitForMotionCompletion(complete)
+		end, duration)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3935,7 +4224,11 @@ script BattleSessionComponent extends Component
 			return { Success = false, Reason = "ENTRY_STATE_UNAVAILABLE" }
 		end
 
-		local resetResult = _RunManagerLogic:ResetFailedRun(self.PlayerEntity, "BATTLE_DEFEAT_RETURN")
+		local resetResult = self.ResultDefeatReset
+		if resetResult.Success ~= true then
+			resetResult = _RunManagerLogic:ResetFailedRun(self.PlayerEntity, "BATTLE_DEFEAT_RETURN")
+			if resetResult.Success then self.ResultDefeatReset = resetResult end
+		end
 		if resetResult.Success == false then
 			return resetResult
 		end
@@ -3950,6 +4243,8 @@ script BattleSessionComponent extends Component
 			"BATTLE_DEFEAT_RETURN"
 		)
 		if navigationResult.Success == false then
+			self.BattleResult = "Defeat"
+			self.PlayerExitObservedAfterBattle = false
 			return navigationResult
 		end
 		log("[BattleDefeatReturn] completed player=" .. self.PlayerEntity.Name .. " previousSequence=" .. resetResult.RunSequence .. " destination=lobby")
@@ -4004,6 +4299,11 @@ script BattleSessionComponent extends Component
 		self.SelectedJobId = runState.SelectedJobId
 		self.SelectedJobMechanicId = runState.SelectedJobMechanicId
 		self.SelectedJobPassiveSetId = runState.SelectedJobPassiveSetId
+		local utility = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(self.SelectedJobId)
+		self.UtilitySkillId = utility.Success and utility.Definition.SkillId or ""
+		self.UtilitySkillIconRuid = utility.Success and utility.Definition.IconRuid or ""
+		self.UtilityMaxCooldown = utility.Success and utility.Definition.CooldownTurns or 0
+		self.UtilityRemainingCooldown = 0
 		self.SelectedJobStartingSkillIds = runState.StartingSkillIds
 		self.SelectedJobBaseMaxHp = runState.JobBaseMaxHp
 		self.SelectedJobBaseQueueCapacity = runState.JobBaseQueueCapacity
@@ -4070,6 +4370,9 @@ script BattleSessionComponent extends Component
 		local iconRecords = {}
 		local presentationRuids = {}
 		local presentationSeen = {}
+		for _, ruid in ipairs(_EnemyImpactPresentationLogic:GetResourceRuids()) do
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, ruid)
+		end
 		for _, skillId in ipairs(candidates) do
 			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
 			if definition.Success == true then
@@ -4079,7 +4382,26 @@ script BattleSessionComponent extends Component
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CastEffectRuid)
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.HitEffectRuid)
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.ProjectileRuid)
+				-- Audio clips warm the same way: an unloaded cast sound lands after its own swing, which
+				-- reads as a mistimed hit rather than a slow load.
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CastSoundRuid)
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.HitSoundRuid)
 			end
+		end
+
+		-- The utility skill comes from the job, not from the owned-skill snapshot, so it never appears among
+		-- the candidates above. Warm it in the same pass; otherwise its first cast is the one that loads it.
+		local utility = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(self.SelectedJobId)
+		if utility.Success == true then
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastEffectRuid)
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitEffectRuid)
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.ProjectileRuid)
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastSoundRuid)
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitSoundRuid)
+		else
+			-- A job with no authored utility row is a valid configuration, and warming is an optimisation
+			-- only, so this stays a log rather than a failure.
+			log("[BattleSkillSlots] utility warm skipped job=" .. self.SelectedJobId .. " reason=" .. (utility.Reason or "UNKNOWN"))
 		end
 
 		local slotIds = {}
@@ -4358,6 +4680,7 @@ script BattleSessionComponent extends Component
 				local entityName = ""
 				local queuedTileNames = ""
 				local queuedIconRuids = ""
+				local queuedIconBackgroundColors = ""
 				local telegraphKind = ""
 				local landingCell = -1
 				local deferredUntilTurn = 0
@@ -4396,11 +4719,14 @@ script BattleSessionComponent extends Component
 				if #fields >= 29 then
 					deferredUntilTurn = math.floor(tonumber(fields[29]) or 0)
 				end
-				if #fields >= 33 then
-					castState = self:DecodeEnemyPlanField(fields[30])
-					castingSkillId = self:DecodeEnemyPlanField(fields[31])
-					interruptHitsRequired = math.floor(tonumber(fields[32]) or 0)
-					interruptHitsReceived = math.floor(tonumber(fields[33]) or 0)
+				if #fields >= 30 then
+					queuedIconBackgroundColors = self:DecodeEnemyPlanField(fields[30])
+				end
+				if #fields >= 34 then
+					castState = self:DecodeEnemyPlanField(fields[31])
+					castingSkillId = self:DecodeEnemyPlanField(fields[32])
+					interruptHitsRequired = math.floor(tonumber(fields[33]) or 0)
+					interruptHitsReceived = math.floor(tonumber(fields[34]) or 0)
 				end
 				local queuedTileIds = ""
 				-- Keep the client read model aligned with the server DTO: a completed or merely
@@ -4430,6 +4756,14 @@ script BattleSessionComponent extends Component
 					-- INSERTING is a selected future action, not an item already owned by the enemy queue.
 					queuedTileNames = ""
 					queuedIconRuids = ""
+					queuedIconBackgroundColors = ""
+				end
+				-- Frozen summon plans are visible during the player turn before the enemy summons.
+				-- Summoning is a command without a TileId, but still occupies a monster skill queue slot.
+				if actionType == "SUMMON_ENEMIES" and (fields[3] == "PREPARED" or fields[3] == "EXECUTING") then
+					queuedTileIds = "faust_summon"
+					queuedTileNames = "좀비루팡 소환"
+					queuedIconRuids = "a878e3aa8b40480cba6f5167285a4ec4"
 				end
 				table.insert(plans, {
 					UnitId = unitId,
@@ -4459,6 +4793,7 @@ script BattleSessionComponent extends Component
 					EntityName = entityName,
 					QueuedTileNames = queuedTileNames,
 					QueuedIconRuids = queuedIconRuids,
+					QueuedIconBackgroundColors = queuedIconBackgroundColors,
 					TelegraphKind = telegraphKind,
 					LandingCell = landingCell,
 					DeferredUntilTurn = deferredUntilTurn,
@@ -4797,7 +5132,7 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
-	method void RequestUseConsumable(string consumableId, integer requestId)
+	method void RequestUseConsumable(string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Authenticates a client request before entering the server-only consumable workflow.
 		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil then
 			log_warning("[BattleConsumable] rejected reason=PLAYER_MISSING")
@@ -4807,15 +5142,17 @@ script BattleSessionComponent extends Component
 			log_warning("[BattleConsumable] rejected reason=INVALID_SENDER")
 			return
 		end
-		local result = self:TryUseRunConsumable(self.PlayerEntity, consumableId, requestId)
+		local result = self:TryUseRunConsumable(self.PlayerEntity, consumableId, requestId, targetSkillId, entryId, inventoryRevision)
+		result.RequestId = requestId
+		self:ReceiveConsumableUseResult(result, entryId, self.PlayerEntity.PlayerComponent.UserId)
 		log("[BattleConsumable] request id=" .. tostring(requestId) .. " ref=" .. consumableId .. " success=" .. tostring(result.Success) .. " reason=" .. result.Reason)
 	end
 
 	@ExecSpace("ServerOnly")
-	method table TryUseRunConsumable(Entity playerEntity, string consumableId, integer requestId)
+	method table TryUseRunConsumable(Entity playerEntity, string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Validates timing and inventory, executes the registered effect, then commits consumption exactly once.
 		local result = { Success = false, Reason = "UNKNOWN", ConsumableId = consumableId or "", AppliedAmount = 0, ConsumedAmount = 0, ConsumesTurn = false }
-		if isvalid(playerEntity) == false or playerEntity ~= self.PlayerEntity then
+		if isvalid(playerEntity) == false or playerEntity ~= self.PlayerEntity or playerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then
 			result.Reason = "INVALID_PLAYER"
 			return result
 		end
@@ -4823,7 +5160,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "INVALID_REQUEST_ID"
 			return result
 		end
-		if self.BattleResult ~= "" or self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or self.TurnState.IsActionProcessing == true then
+		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or self.TurnState.IsActionProcessing == true then
 			result.Reason = "INVALID_CONSUMABLE_TIMING"
 			return result
 		end
@@ -4834,7 +5171,7 @@ script BattleSessionComponent extends Component
 			result.DetailReason = definition.DetailReason or ""
 			return result
 		end
-		if definition.TargetType ~= "SELF" then
+		if definition.TargetType ~= "SELF" and definition.TargetType ~= "OWNED_SKILL" then
 			result.Reason = "UNSUPPORTED_CONSUMABLE_TARGET"
 			return result
 		end
@@ -4844,7 +5181,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "RUN_STATE_UNAVAILABLE"
 			return result
 		end
-		local useKey = tostring(runState.RunSequence) .. ":" .. self.StageId .. ":consumable:" .. tostring(requestId)
+		local useKey = tostring(runState.RunSequence) .. ":" .. self.StageId .. ":" .. tostring(self.EntryRequestId) .. ":consumable:" .. tostring(inventoryRevision) .. ":" .. tostring(requestId)
 		local availability = _RunManagerLogic:CanUseRunConsumable(playerEntity, consumableId, useKey)
 		if availability.Success == false then
 			result.Reason = availability.Reason
@@ -4855,6 +5192,11 @@ script BattleSessionComponent extends Component
 			result.Reason = "DUPLICATE_USE_IGNORED"
 			return result
 		end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.InventoryRevision ~= inventoryRevision then
+			result.Reason = "STALE_INVENTORY"
+			return result
+		end
 
 		local targetEntity = self:FindUnitEntity("player_01")
 		if isvalid(targetEntity) == false then
@@ -4862,7 +5204,7 @@ script BattleSessionComponent extends Component
 			return result
 		end
 		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
-		local effectResult = _ConsumableEffectRouterLogic:Execute(definition, targetUnit)
+		local effectResult = _ConsumableEffectRouterLogic:Execute(definition, targetUnit, targetSkillId)
 		if effectResult.Success == false then
 			result.Reason = effectResult.Reason
 			return result
@@ -4880,11 +5222,96 @@ script BattleSessionComponent extends Component
 		result.HpBefore = effectResult.HpBefore or -1
 		result.HpAfter = effectResult.HpAfter or -1
 		result.ConsumedAmount = consumeResult.ConsumedAmount or 0
-		result.ConsumesTurn = definition.ConsumesTurn == true
+		result.ConsumesTurn = false
+		result.InventoryRevision = inventory.InventoryRevision
+		result.TargetSkillId = targetSkillId or ""
+		result.CooldownBefore = effectResult.CooldownBefore or 0
+		result.CooldownAfter = effectResult.CooldownAfter or 0
 		log("[BattleConsumable] used ref=" .. consumableId .. " effect=" .. definition.EffectType .. " applied=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter .. " consumesTurn=" .. tostring(result.ConsumesTurn) .. " key=" .. useKey)
-		if result.ConsumesTurn == true and self.BattleResult == "" then
-			self:BeginEnemyTurnFromPlayerAction("CONSUMABLE_USED")
+		return result
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean SubmitConsumableUse(string consumableId, string targetSkillId)
+		-- Shares the hotkey/HUD request counter and waits for the authoritative receipt.
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or player.CurrentMap ~= self.Entity then return false end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then return false end
+		if self._T.ConsumablePending and self._T.ConsumablePendingEntry == self.EntryRequestId and self._T.ConsumablePendingRun == inventory.ActiveRunSequence then return false end
+		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.BattlePhase ~= "PlayerTurn" or self.IsActionProcessing then return false end
+		self.ConsumableRequestSequence = self.ConsumableRequestSequence + 1
+		self._T.ConsumablePending = true
+		self._T.ConsumablePendingEntry = self.EntryRequestId
+		self._T.ConsumablePendingRun = inventory.ActiveRunSequence
+		self:RequestUseConsumable(consumableId, self.ConsumableRequestSequence, targetSkillId, self.EntryRequestId, inventory.InventoryRevision)
+		return true
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveConsumableUseResult(table result, integer entryId)
+		-- Receipts stay on the battle component; UI entities never host a server RPC.
+		if entryId ~= self.EntryRequestId or result.RequestId ~= self.ConsumableRequestSequence then return end
+		self._T.ConsumablePending = false
+		self._T.ConsumableUseResult = result
+		self._T.ConsumableReceiptRevision = (self._T.ConsumableReceiptRevision or 0) + 1
+	end
+
+	@ExecSpace("Server")
+	method void RequestConsumableHudState(integer queryId, integer entryId)
+		-- Sends a small owner-only read model because the authored dataset is server-only.
+		if not isvalid(self.PlayerEntity) or self.PlayerEntity.PlayerComponent == nil then return end
+		if senderUserId ~= self.PlayerEntity.PlayerComponent.UserId then return end
+		if self.PlayerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then return end
+		self:ReceiveConsumableHudState(self:BuildConsumableHudState(), queryId, entryId, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveConsumableHudState(table data, integer queryId, integer entryId)
+		-- Ignores delayed responses from an older battle or older query.
+		if entryId ~= self.EntryRequestId or queryId < (self._T.ConsumableHudQuery or 0) then return end
+		self._T.ConsumableHudQuery = queryId
+		self._T.ConsumableHudState = data
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildConsumableHudState()
+		-- Reuses run inventory and cooldown owners without creating client-authoritative state.
+		local result = { Success = false, Items = {}, Skills = {}, Capacity = 0, CanUse = false, EntryId = self.EntryRequestId }
+		if not isvalid(self.PlayerEntity) then return result end
+		local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local runtime = self.PlayerEntity:GetComponent("script.SkillRuntimeStateComponent")
+		local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if inventory == nil or runtime == nil or unit == nil then return result end
+		inventory:NormalizeLegacyConsumables()
+		result.Success = true
+		result.Capacity = inventory.ConsumableCapacity
+		result.CooldownRevision = runtime.CooldownRevision
+		result.CurrentHp = unit.CurrentHp
+		result.MaxHp = unit.MaxHp
+		result.InventoryRevision = inventory.InventoryRevision
+		result.RunSequence = inventory.ActiveRunSequence
+		result.CanUse = inventory.ActiveRunSequence > 0 and not unit.IsDead and self.ContentValidationState == "VALID" and self.BattleResult == "" and self.TurnState ~= nil and self.TurnState.BattlePhase == "PlayerTurn" and not self.TurnState.IsActionProcessing
+		for _, skillId in ipairs(inventory:GetDistinctOwnedSkillIds()) do
+			local cooldown = runtime:GetRemainingCooldown(skillId)
+			if cooldown > 0 then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+				table.insert(result.Skills, { SkillId = skillId, DisplayName = definition.DisplayName or skillId, Cooldown = cooldown })
+			end
 		end
+		for itemId, count in string.gmatch(inventory.RunConsumableSnapshot or "", "([^|~]+)~(%d+)") do
+			local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(itemId)
+			if tonumber(count) > 0 and definition.Success then
+				local usable = result.CanUse
+				local reason = ""
+				if definition.EffectType == "HEAL" and unit.CurrentHp >= unit.MaxHp then usable = false; reason = "HP_ALREADY_FULL" end
+				if definition.EffectType == "COOLDOWN_REDUCTION" and #result.Skills == 0 then usable = false; reason = "NO_COOLDOWN_SKILLS" end
+				-- No status system exists yet; keep the future cleanse item visible but unavailable.
+				if definition.EffectType == "CLEANSE" then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
+				table.insert(result.Items, { ConsumableId = itemId, DisplayOrder = definition.RowIndex, DisplayName = definition.DisplayName, Count = tonumber(count), EffectType = definition.EffectType, EffectValue = definition.EffectValue, IconKey = definition.IconKey, Description = definition.Description, Usable = usable, Reason = reason })
+			end
+		end
+		table.sort(result.Items, function(left, right) return left.DisplayOrder < right.DisplayOrder end)
 		return result
 	end
 
@@ -5207,6 +5634,15 @@ script BattleSessionComponent extends Component
 			return contextResult
 		end
 
+		-- A living enemy's attack attempt animates even when use checks or target resolution fail.
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local isEnemyAttack = sourceUnit.Team == "Enemy"
+		if isEnemyAttack then
+			self:PlayEnemyAttackMotion(sourceEntity, sourceUnitId, definition)
+			log("[EnemyAttackMotion] attempt unit=" .. sourceUnitId .. " skill=" .. skillId)
+		end
+
 		local runtimeState = self:GetSkillRuntimeState(sourceUnitId)
 		if runtimeState == nil then
 			return {
@@ -5228,32 +5664,23 @@ script BattleSessionComponent extends Component
 		end
 		runtimeState:StartCooldown(skillId, definition.CooldownTurns)
 
-		local sourceEntity = self:FindUnitEntity(sourceUnitId)
 		-- Swap the avatar weapon before the motion starts so the swing shows the skill's own weapon.
 		self:ApplySkillWeapon(sourceUnitId, sourceEntity, definition)
 		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
-		local logicalActionDuration = self:GetSkillActionDuration(skillId)
-		local presentationHandoffDuration = math.max(logicalActionDuration, motionProfile.Duration)
-		local waitForPlayerHandoff = sourceUnitId == "player_01"
-			and self.TurnState ~= nil
-			and self.TurnState.ExecutingTileIds ~= ""
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if sourcePresentation ~= nil then
+		if sourcePresentation ~= nil and isEnemyAttack == false then
 			if sourceEntity.PlayerControllerComponent ~= nil then
 				sourcePresentation:PlayCombatMotion(
 					sourceUnitId,
 					motionProfile.MotionKey,
 					motionProfile.ActionName,
 					motionProfile.PlayRate,
-					presentationHandoffDuration,
-					waitForPlayerHandoff
+					motionProfile.Duration,
+					false
 				)
 			else
 				self:PlayEnemyAttackMotion(sourceEntity, sourceUnitId, definition)
 			end
-		end
-		if waitForPlayerHandoff then
-			log("[BattlePlayerHandoff] skill=" .. skillId .. " logical=" .. tostring(logicalActionDuration) .. " motion=" .. tostring(motionProfile.Duration) .. " handoff=" .. tostring(presentationHandoffDuration))
 		end
 		self:BeginSkillEffectPresentation(sourceUnitId, definition)
 
@@ -5283,7 +5710,7 @@ script BattleSessionComponent extends Component
 		if totalImpactDelay <= 0 then
 			local immediateResult = _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
 			if immediateResult ~= nil then
-				immediateResult.PresentationHandoffDuration = presentationHandoffDuration
+				immediateResult.PresentationHandoffDuration = 0.01
 			end
 			return immediateResult
 		end
@@ -5296,7 +5723,8 @@ script BattleSessionComponent extends Component
 			SourceUnitId = sourceUnitId,
 			SkillId = skillId,
 			StepCount = #effectSteps,
-			PresentationHandoffDuration = presentationHandoffDuration
+			-- Wait for damage resolution; the existing completion gate waits for actual playback.
+			PresentationHandoffDuration = totalImpactDelay
 		}
 	end
 
@@ -5483,6 +5911,7 @@ script BattleSessionComponent extends Component
 		-- Battle actions resolve strictly one at a time, so a single latched slot is enough.
 		self.ActiveEffectSkillId = definition.SkillId or ""
 		self.ActiveHitEffectRuid = definition.HitEffectRuid or ""
+		self.ActiveHitSoundRuid = definition.HitSoundRuid or ""
 		self.ActiveEffectScale = definition.EffectScale or 1
 		self.ActiveEffectFlipX = false
 
@@ -5496,7 +5925,18 @@ script BattleSessionComponent extends Component
 		end
 
 		local castEffectRuid = definition.CastEffectRuid or ""
-		if castEffectRuid == "" then
+		if sourceUnit ~= nil and sourceUnit.Team == "Enemy" then
+			-- Only accepted damage emits enemy hit audio; PUSH/HEAL cannot replay it.
+			self.ActiveHitSoundRuid = ""
+			if _EnemyImpactPresentationLogic:GetHitEffect(sourceUnit.EnemyDefinitionId, definition.SkillId) ~= "" then
+				-- The old CAST is a target hit clip; its replacement belongs to the damaged avatar.
+				castEffectRuid = ""
+				self.ActiveHitEffectRuid = ""
+			end
+		end
+
+		local castSoundRuid = definition.CastSoundRuid or ""
+		if castEffectRuid == "" and castSoundRuid == "" then
 			return
 		end
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
@@ -5504,13 +5944,17 @@ script BattleSessionComponent extends Component
 			log_warning("[BattleEffect] cast skipped unit=" .. sourceUnitId .. " skill=" .. self.ActiveEffectSkillId .. " reason=PRESENTATION_MISSING")
 			return
 		end
+		-- The sound is authored independently of the clip, so a skill with only one of the two still
+		-- presents that half; both calls no-op on an empty RUID.
 		sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
+		sourcePresentation:PlaySkillSound(sourceUnitId, "CAST", castSoundRuid, self:GetSkillSoundVolume())
 	end
 
 	@ExecSpace("ServerOnly")
 	method void PlayActiveHitEffect(string targetUnitId)
-		-- Presents the latched hit effect on one target at its impact frame; never gates gameplay resolution.
-		if self.ActiveHitEffectRuid == "" then
+		-- Presents the latched hit effect and hit sound on one target at its impact frame; never gates
+		-- gameplay resolution.
+		if self.ActiveHitEffectRuid == "" and self.ActiveHitSoundRuid == "" then
 			return
 		end
 		local targetEntity = self:FindUnitEntity(targetUnitId)
@@ -5523,12 +5967,20 @@ script BattleSessionComponent extends Component
 			return
 		end
 		targetPresentation:PlaySkillEffect(targetUnitId, "HIT", self.ActiveHitEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
+		targetPresentation:PlaySkillSound(targetUnitId, "HIT", self.ActiveHitSoundRuid, self:GetSkillSoundVolume())
 	end
 
 	@ExecSpace("ServerOnly")
 	method number GetSkillSpeedMultiplier()
 		-- Guarded so a mistyped inspector value can never stall or invert skill playback.
 		return math.max(0.1, self.SkillSpeedMultiplier)
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetSkillSoundVolume()
+		-- Clamped to the engine's accepted 0~1 range so a mistyped inspector value cannot mute or
+		-- distort the whole skill sound layer.
+		return math.max(0, math.min(1, self.SkillSoundVolume))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -5616,7 +6068,8 @@ script BattleSessionComponent extends Component
 
 		if isvalid(targetEntity) then
 			local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
-			local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnit.UnitId, damageAmount)
+			-- Forward the attack ID with damage so the router can select its impact presentation.
+			local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnit.UnitId, damageAmount, attackId)
 			if damageResult.Success == false then
 				result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
 				log_error("[BattleAttack] damage failed source=" .. sourceUnitId .. " target=" .. targetUnit.UnitId .. " reason=" .. damageResult.Reason)
@@ -5775,7 +6228,8 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
-		local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount)
+		-- Skill damage uses the skill ID as the impact presentation key.
+		local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount, skillId)
 		if damageResult.Success == false then
 			result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
 			return result
@@ -5786,8 +6240,10 @@ script BattleSessionComponent extends Component
 		result.DamageAmount = damageResult.AppliedAmount
 		result.TargetHpBefore = damageResult.HpBefore
 		result.TargetHpAfter = damageResult.HpAfter
-		self:TryRegisterEnemyCastInterrupt(sourceUnitId, skillId, targetUnitId, result.DamageAmount)
-		self:PlayActiveHitEffect(targetUnitId)
+		if damageResult.AppliedAmount > 0 then
+			self:TryRegisterEnemyCastInterrupt(sourceUnitId, skillId, targetUnitId, result.DamageAmount)
+			self:PlayActiveHitEffect(targetUnitId)
+		end
 
 		local attackEvent = BasicAttackResolvedEvent()
 		attackEvent.SourceUnitId = sourceUnitId
@@ -5805,7 +6261,30 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ApplyDamage(string sourceUnitId, string targetUnitId, number amount)
+	method void PlayAcceptedEnemyImpact(Entity sourceEntity, Entity targetEntity, string attackId)
+		-- Called once for positive damage before death cleanup; all selection uses this hit's explicit source and attack.
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourceUnit == nil or targetUnit == nil or presentation == nil then return end
+		if targetUnit.Team == "Enemy" then
+			local sound = _EnemyImpactPresentationLogic:GetDamageSound(targetUnit.EnemyDefinitionId)
+			presentation:PlaySkillSound(targetUnit.UnitId, "MONSTER_DAMAGE", sound, self:GetSkillSoundVolume())
+		elseif targetUnit.Team == "Player" and sourceUnit.Team == "Enemy" then
+			local sound = _EnemyImpactPresentationLogic:GetImpactSound(sourceUnit.EnemyDefinitionId, attackId)
+			presentation:PlaySkillSound(targetUnit.UnitId, "ENEMY_HIT", sound, self:GetSkillSoundVolume())
+			local effect = _EnemyImpactPresentationLogic:GetHitEffect(sourceUnit.EnemyDefinitionId, attackId)
+			if effect ~= "" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(attackId)
+				local scale = definition.EffectScale or 1
+				presentation:PlaySkillEffect(targetUnit.UnitId, "HIT", effect, scale, sourceUnit.Facing == "Right", self:GetSkillSpeedMultiplier())
+			end
+		end
+		log("[EnemyImpact] accepted source=" .. sourceUnit.UnitId .. " target=" .. targetUnit.UnitId .. " attack=" .. tostring(attackId))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyDamage(string sourceUnitId, string targetUnitId, number amount, string attackId)
 		-- Owns the single HP mutation path and forwards the first zero-HP transition to death handling.
 		local result = {
 			Success = false,
@@ -5846,6 +6325,19 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
+		local attackerEffects = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		local defenderEffects = targetEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		local attackerRun = sourceEntity:GetComponent("script.PlayerRunStateComponent")
+		local defenderRun = targetEntity:GetComponent("script.PlayerRunStateComponent")
+		if sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
+			and attackerRun ~= nil and attackerEffects.ActiveRunSequence == attackerRun.RunSequence then
+			amount = amount + attackerEffects.AttackBonus
+		end
+		if targetUnit.Team == "Player" and defenderEffects ~= nil and defenderEffects.IsInitialized
+			and defenderRun ~= nil and defenderEffects.ActiveRunSequence == defenderRun.RunSequence then
+			amount = math.max(1, amount - defenderEffects.DefenseBonus)
+		end
+		-- BattleUnit retains the full UtilityGuardActive block, including zero damage.
 		local damageResult = targetUnit:ApplyDamage(amount)
 		if damageResult.Success == false then
 			result.Reason = damageResult.Reason
@@ -5854,13 +6346,16 @@ script BattleSessionComponent extends Component
 		result.HpBefore = damageResult.HpBefore
 		result.HpAfter = damageResult.HpAfter
 		result.AppliedAmount = damageResult.AppliedAmount
+		if damageResult.AppliedAmount > 0 then
+			self:PlayAcceptedEnemyImpact(sourceEntity, targetEntity, attackId)
+		end
 		local strongHit = amount >= math.max(0.01, self.StrongHitDamageThreshold)
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
 		if sourcePresentation ~= nil then
 			sourcePresentation:PlayHitStop(sourceUnitId, strongHit, self.NormalHitStopDuration, self.StrongHitStopDuration)
 		end
 		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if targetPresentation ~= nil then
+		if targetPresentation ~= nil and damageResult.AppliedAmount > 0 then
 			targetPresentation:PlayHitImpact(targetUnitId, strongHit, self.NormalHitStopDuration, self.StrongHitStopDuration, self.HitReactionDuration, self.HitFlashDuration)
 		end
 		self:PlayImpactCameraShake(strongHit)
@@ -5910,6 +6405,10 @@ script BattleSessionComponent extends Component
 		if deathState.Success == false then
 			log_error("[BattleDeath] state transition failed unit=" .. unitId .. " reason=" .. deathState.Reason)
 			return
+		end
+		if unit.Team == "Enemy" and isvalid(self.PlayerEntity) then
+			self.ResultKillCount = self.ResultKillCount + 1
+			_MonsterCollectionLogic:RecordDefeat(self.PlayerEntity, unit.EnemyDefinitionId)
 		end
 		local summoner = unitEntity:GetComponent("script.FaustSummonComponent")
 		if summoner ~= nil then
@@ -5970,7 +6469,10 @@ script BattleSessionComponent extends Component
 		end
 		self:ClearForcedSpawnSchedule("ALL_ENEMIES_DEFEATED")
 		self:ClearTurnTransitionTimer("ALL_ENEMIES_DEFEATED")
-		self:CancelPlayerCombatPresentationHandoff("UNIT_DEATH_" .. unitId, unit.Team == "Enemy")
+		self:ClearMotionCompletionWaits()
+		if unit.Team == "Enemy" then
+			self:CompletePlayerCombatPresentationHandoff("ENEMIES_DEFEATED")
+		end
 		self.PlayerToEnemyBeatPending = false
 		self.PendingPlayerToEnemyHandoffDelay = -1
 		self:ClearEnemyToEnemyPresentationHandoff("UNIT_DEATH_" .. unitId)
@@ -6032,33 +6534,39 @@ script BattleSessionComponent extends Component
 		end
 		log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=" .. self.BattleResult .. " wave=" .. self.CurrentWave)
 		log("[BattleResult] result=" .. self.BattleResult .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " runRecorded=" .. tostring(runResultRecorded))
-		if self.BattleResult == "Victory" and runResultRecorded == true and isvalid(self.PlayerEntity) then
-			local transitionPlayer = self.PlayerEntity
-			local completedRun = self.UnionRewardRunEnded == true and self.UnionRewardWasCommitted == true
-			local completedStageId = self.StageId
-			local transitionDelay = math.max(0, self.EnemyDeathPresentationDelay)
-			self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
-				self.ResultTransitionTimerId = 0
-				if isvalid(transitionPlayer) == false then
-					return
+		self.ResultRecorded = runResultRecorded
+		self.ResultElapsedSeconds = math.max(0, math.floor(_UtilLogic.ElapsedSeconds - self.ResultStartTime))
+		local inventory = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent") or nil
+		self.ResultGold = inventory ~= nil and math.max(0, inventory:GetSnapshotAmount(inventory.RunCurrencySnapshot, "gold") - self.ResultStartGold) or 0
+		local expectedEntry = self.EntryRequestId
+		self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
+			self.ResultTransitionTimerId = 0
+			self:WaitForMotionCompletion(function()
+				if self.EntryRequestId == expectedEntry and self.BattleResult ~= "" then
+					self.ResultReady = true
+					log("[BattleResult] ready for confirmation kills=" .. self.ResultKillCount)
 				end
-				if completedRun then
-					_StageTransitionManagerLogic:HandleCompletedRunTransition(transitionPlayer)
-				else
-					_StageTransitionManagerLogic:HandleVictoryTransition(transitionPlayer, completedStageId)
-				end
-			end, transitionDelay)
-			log("[BattleResult] transition delayed seconds=" .. tostring(transitionDelay) .. " reason=DEATH_PRESENTATION")
-		end
+			end)
+		end, math.max(0.1, self.EnemyDeathPresentationDelay))
 	end
 
 	@ExecSpace("ServerOnly")
 	method void AdvanceClearedWave(integer clearedWave, integer nextWave)
 		-- Called only by BattleWaveComponent after its map-scoped transition timer expires.
+		self:WaitForMotionCompletion(function() self:AdvanceWaveAfterMotion(clearedWave, nextWave) end)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceWaveAfterMotion(integer clearedWave, integer nextWave)
+		-- Dead entities remain visible until their completed animation and hold have been acknowledged.
 		if self.BattleResult ~= "" or self.CurrentWave ~= clearedWave then
 			return
 		end
 		self.TurnState:OpenPlayerTurn(self.TurnNumber + 1, "NEXT_WAVE")
+		if isvalid(self.PlayerEntity) then
+			local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then unit.UtilityGuardActive = false end
+		end
 		self:PublishTurnStateSnapshot("NEXT_WAVE")
 		self.StageTurnNumber = self.TurnNumber
 		self:SpawnWave(nextWave)
@@ -6411,7 +6919,7 @@ script BattleSessionComponent extends Component
 		local source = "ENEMY_DEFINITION"
 		if motionRuid == "" then
 			motionRuid = definition.CasterMotionRuid or ""
-			motionPlayRate = tonumber(definition.CasterMotionPlayRate) or 1
+			motionPlayRate = (tonumber(definition.CasterMotionPlayRate) or 1) * 3
 			motionDuration = tonumber(definition.CasterMotionDuration) or tonumber(definition.ActionDuration) or 0.35
 			source = "SKILL_FALLBACK"
 		end
@@ -6432,7 +6940,7 @@ script BattleSessionComponent extends Component
 		local speed = self:GetSkillSpeedMultiplier()
 		local skillDuration = tonumber(definition.CasterMotionDuration) or tonumber(definition.ActionDuration) or 0
 		motionDuration = math.max(motionDuration, skillDuration) / speed
-		presentation:PlaySpriteMotion(unitId, motionRuid, motionPlayRate * speed, motionDuration, sourceUnit ~= nil and sourceUnit.Facing or "")
+		presentation:PlaySpriteMotion(unitId, motionRuid, motionPlayRate * speed, motionDuration, sourceUnit ~= nil and sourceUnit.Facing or "", false)
 		log("[EnemyAttackMotion] selected unit=" .. unitId
 			.. " definition=" .. tostring(sourceUnit ~= nil and sourceUnit.EnemyDefinitionId or "")
 			.. " skill=" .. tostring(definition.SkillId)
@@ -6611,12 +7119,18 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void AdvancePlayerSkillCooldowns(string reason)
+		-- A guard lasts through one enemy round; utilities share the existing turn cooldown clock.
+		if isvalid(self.PlayerEntity) then
+			local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then unit.UtilityGuardActive = false end
+		end
 		local runtimeState = self:GetSkillRuntimeState("player_01")
 		if runtimeState == nil then
 			log_warning("[BattleCooldown] advance skipped reason=SKILL_RUNTIME_STATE_MISSING turn=" .. self.TurnNumber)
 			return
 		end
 		runtimeState:AdvanceCooldowns(1, reason)
+		self.UtilityRemainingCooldown = runtimeState:GetRemainingCooldown(self.UtilitySkillId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -7247,7 +7761,9 @@ script BattleSessionComponent extends Component
 			local quantity = tonumber(amount) or 0
 			if itemId ~= nil and quantity > 0 and not seen[itemId] then
 				seen[itemId] = true
-				local ok, definition = pcall(function() return _RelicDefinitionRepositoryLogic:GetRelicDefinition(itemId) end)
+				local effects = player:GetComponent("script.PlayerRunRelicEffectComponent")
+				local definition = effects ~= nil and effects.ActiveRunSequence == inventory.ActiveRunSequence and effects.Definitions[itemId] or nil
+				local ok = definition ~= nil
 				if ok and definition ~= nil and definition.Success == true then
 					table.insert(items, { RelicId = itemId, DisplayName = definition.DisplayName,
 						IconImageRUID = definition.IconImageRUID, EffectDescription = definition.EffectDescription, Quantity = quantity })
@@ -7279,6 +7795,35 @@ script BattleSessionComponent extends Component
 		local consumptionKey = tostring(self.Entity.Id) .. ":" .. self.StageId .. ":" .. tostring(self.EntryRequestId)
 			.. ":" .. tostring(self.HudContextRevision) .. ":" .. tostring(self.TurnState.StateRevision)
 		combatStats:RecordConsumedTurn(consumptionKey)
+	end
+
+	@ExecSpace("Server")
+	method void RequestContinueResult()
+		-- Only the registered player can advance an ended, presented battle once.
+		if self:IsValidPlayerRequest(senderUserId) == false or self.ResultReady == false then return end
+		if self.BattleResult ~= "Victory" and self.BattleResult ~= "Defeat" then return end
+		self.ResultReady = false
+		if self.ResultRecorded == false then
+			self.ResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
+			if self.ResultRecorded then self:RefreshUnionRewardPresentation() end
+		end
+		if self.ResultRecorded == false then self.ResultReady = true return end
+		if self.BattleResult == "Defeat" then
+			local result = self:ReturnToLobbyAfterDefeat()
+			if result.Success == false then self.ResultReady = true end
+			self:PublishPlayerCommandResult("RETURN_TO_LOBBY", result)
+			return
+		end
+		if self.UnionRewardRunEnded and self.UnionRewardWasCommitted then
+			_StageTransitionManagerLogic:HandleCompletedRunTransition(self.PlayerEntity)
+		else
+			_StageTransitionManagerLogic:HandleVictoryTransition(self.PlayerEntity, self.StageId)
+		end
+		local expectedEntry = self.EntryRequestId
+		self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
+			self.ResultTransitionTimerId = 0
+			if isvalid(self.PlayerEntity) and self.PlayerEntity.CurrentMap == self.Entity and self.EntryRequestId == expectedEntry then self.ResultReady = true end
+		end, 8)
 	end
 
 end

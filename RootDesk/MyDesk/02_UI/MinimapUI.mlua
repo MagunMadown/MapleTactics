@@ -99,8 +99,9 @@ script MinimapUI extends Component
 		if self.CurrentMode == "POST_SHOP_ROUTE" then
 			self:ShowTravelAvatarAtRoute(self.SelectedRouteId)
 		elseif self.CurrentMode == "SHOP_CHOICE" then
-			-- Henesys has already been cleared when this mandatory route choice opens.
-			self:ShowTravelAvatarAtCity("HenesysCityBranchBtn")
+			-- Place the avatar at the region that opened this shop selection.
+			local cityPath = self.SelectedRouteId == "ellinia_stage_04" and "ElliniaBranchBtn" or "HenesysCityBranchBtn"
+			self:ShowTravelAvatarAtCity(cityPath)
 		else
 			self:ShowTravelAvatarAtStart()
 		end
@@ -135,22 +136,24 @@ script MinimapUI extends Component
 		local lobbyStage = self.CurrentMode == "LOBBY_STAGE"
 		local shopChoice = self.CurrentMode == "SHOP_CHOICE"
 		local postShop = self.CurrentMode == "POST_SHOP_ROUTE"
+		local elliniaChoice = shopChoice and self.SelectedRouteId == "ellinia_stage_04"
+		local henesysChoice = shopChoice and not elliniaChoice
 		local showBaseMap = lobbyStage or shopChoice or postShop
 		-- Preserve the city graph while SHOP_CHOICE is displayed. The route-choice
 		-- controls below are an overlay on the map, not a replacement for it.
 		self:SetNodeVisible(henesys, showBaseMap)
 		local upperSelected = self.SelectedRouteId == "shop_upper"
 		local lowerSelected = self.SelectedRouteId == "shop_lower"
-		self:SetNodeVisible(upper, shopChoice or (postShop and upperSelected))
-		self:SetNodeVisible(lower, shopChoice or (postShop and lowerSelected))
-		self:SetNodeVisible(upperLine, shopChoice or (postShop and self.SelectedRouteId == "shop_upper"))
-		self:SetNodeVisible(lowerLine, shopChoice or (postShop and self.SelectedRouteId == "shop_lower"))
+		self:SetNodeVisible(upper, henesysChoice or (postShop and upperSelected))
+		self:SetNodeVisible(lower, henesysChoice or (postShop and lowerSelected))
+		self:SetNodeVisible(upperLine, henesysChoice or (postShop and self.SelectedRouteId == "shop_upper"))
+		self:SetNodeVisible(lowerLine, henesysChoice or (postShop and self.SelectedRouteId == "shop_lower"))
 		if shopChoice then
 			self.RouteSelectionLocked = false
 			local upperButton = isvalid(upper) and upper:GetComponent("script.WorldMapRunNodeButtonComponent") or nil
 			local lowerButton = isvalid(lower) and lower:GetComponent("script.WorldMapRunNodeButtonComponent") or nil
-			if upperButton ~= nil then upperButton:ResetForChoice() end
-			if lowerButton ~= nil then lowerButton:ResetForChoice() end
+			if henesysChoice and upperButton ~= nil then upperButton:ResetForChoice() end
+			if henesysChoice and lowerButton ~= nil then lowerButton:ResetForChoice() end
 		end
 		self:SetNodeVisible(ellinia, showBaseMap)
 		self:SetNodeVisible(kerning, showBaseMap)
@@ -184,6 +187,18 @@ script MinimapUI extends Component
 			local activeRegion = lowerSelected and ellinia or (upperSelected and kerning or nil)
 			local regionButton = isvalid(activeRegion) and activeRegion:GetComponent("script.WorldMapFutureRegionButtonComponent") or nil
 			if regionButton ~= nil then regionButton:ResetForRoute() end
+		end
+		-- The later shop is one real run node, using the same authoritative selection handler.
+		local elliniaShop = self:GetWorldMapEntity("ElliniaNautilusShopVisitBtn")
+		local elliniaShopPresentation = isvalid(elliniaShop) and elliniaShop:GetComponent("script.WorldMapButtonPresentationComponent") or nil
+		local elliniaShopButton = isvalid(elliniaShop) and elliniaShop:GetComponent("script.WorldMapRunNodeButtonComponent") or nil
+		self:SetNodeVisible(elliniaShop, showBaseMap)
+		if elliniaChoice then
+			if elliniaShopButton ~= nil then elliniaShopButton:ResetForChoice() end
+			local clearedPresentation = isvalid(ellinia) and ellinia:GetComponent("script.WorldMapButtonPresentationComponent") or nil
+			if clearedPresentation ~= nil then clearedPresentation:ApplyState("COMPLETED", "엘리니아 · 클리어") end
+		elseif elliniaShopPresentation ~= nil then
+			elliniaShopPresentation:ApplyState("LOCKED", "엘리니아 클리어 필요")
 		end
 		self:SetNodeVisible(upperLock, postShop and not upperSelected)
 		self:SetNodeVisible(lowerLock, postShop and not lowerSelected)
@@ -266,7 +281,9 @@ script MinimapUI extends Component
 	@ExecSpace("ClientOnly")
 	method void OnWorldMapProgressChanged(WorldMapProgressChangedEvent event)
 		if event == nil then return end
-		self:ApplyWorldMapProgress(event.CompletedStageCount, event.SelectedWorldMapBranch or "", event.Reason)
+		self:RefreshWorldMapProgress(event.Reason)
+		-- Late progression Sync must not overwrite the active route selection presentation.
+		if self.IsWorldMapOpenState then self:ConfigureWorldMapMode() end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -349,10 +366,7 @@ script MinimapUI extends Component
 		local player = _UserService.LocalPlayer
 		local runState = isvalid(player) and player:GetComponent("script.PlayerRunStateComponent") or nil
 		if runState == nil then return { CompletedStageCount = 0, SelectedWorldMapBranch = "" } end
-		return {
-			CompletedStageCount = runState.CompletedStageCount,
-			SelectedWorldMapBranch = runState.SelectedWorldMapBranch or ""
-		}
+		return runState:GetWorldMapProgressSnapshot()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -615,7 +629,7 @@ script MinimapUI extends Component
 
 	@ExecSpace("ClientOnly")
 	method void PlayTravelAnimation(string targetCityPath)
-		-- Moves the local player's UI avatar from the start arrow toward the selected unlocked city.
+		-- Hops four times in the jump pose above the straight route to the selected city.
 		self:StopTravelAnimation(false)
 		local avatar = self:GetTravelAvatar()
 		if isvalid(avatar) == false or isvalid(avatar.UITransformComponent) == false then
@@ -636,11 +650,12 @@ script MinimapUI extends Component
 
 		local renderer = avatar.AvatarGUIRendererComponent
 		if isvalid(renderer) then
-			renderer.FlipX = true
-			renderer.PlayRate = 1.25
+			renderer.FlipX = endPosition.x >= startPosition.x
+			renderer.PlayRate = 1
 			local avatarRoot = renderer:GetAvatarRootEntity()
 			if isvalid(avatarRoot) then
-				avatarRoot:SendEvent(BodyActionStateChangeEvent(true, MapleAvatarBodyActionState.Walk, 0, 2147483647, 1.25))
+				-- Fall resolves to the avatar's jump sprite action in MSW.
+				avatarRoot:SendEvent(BodyActionStateChangeEvent(true, MapleAvatarBodyActionState.Fall, 0, 2147483647, 1.25))
 			end
 		end
 
@@ -653,10 +668,11 @@ script MinimapUI extends Component
 
 			self.TravelProgress = math.min(1, self.TravelProgress + tickInterval / self.TravelDuration)
 			local progress = self.TravelProgress
-			local eased = progress * progress * (3 - 2 * progress)
-			local x = startPosition.x + (endPosition.x - startPosition.x) * eased
-			local baseY = startPosition.y + (endPosition.y - startPosition.y) * eased
-			local y = baseY + math.sin(progress * math.pi * 4) * 2
+			-- Constant-speed baseline: start + (end - start) * progress, in UI pixels.
+			local x = startPosition.x + (endPosition.x - startPosition.x) * progress
+			local baseY = startPosition.y + (endPosition.y - startPosition.y) * progress
+			local jumpProgress = (progress * 4) % 1
+			local y = baseY + 4 * 30 * jumpProgress * (1 - jumpProgress)
 			avatar.UITransformComponent.anchoredPosition = Vector2(x, y)
 
 			if progress >= 1 then
@@ -673,7 +689,7 @@ script MinimapUI extends Component
 			avatar.UITransformComponent.anchoredPosition = endPosition
 			return
 		end
-		log("[WorldMap] travel avatar started")
+		log("[WorldMap] travel avatar started motion=JUMP")
 	end
 
 	@ExecSpace("ClientOnly")

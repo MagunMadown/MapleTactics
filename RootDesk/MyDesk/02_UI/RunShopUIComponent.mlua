@@ -51,12 +51,14 @@ script RunShopUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OpenUi()
+		-- Opens the existing shop and redraws its status even when the revision is unchanged.
 		local flow = _RunManagerLogic:GetLocalRunFlowUiState()
 		if flow.Success ~= true or flow.Transition.ContentType ~= "SHOP" or flow.Commands.CanCompleteContent ~= true then
 			self:SetStatus(flow.Reason or "SHOP_NOT_AVAILABLE")
 			return
 		end
 		self.WaitingForOpen = true
+		self.LastRevisionKey = ""
 		self:SetPopupVisible(true)
 		self:SetStatus("상점 정보를 불러오는 중입니다.")
 		_RunShopLogic:RequestOpenSelectedShop()
@@ -79,10 +81,20 @@ script RunShopUIComponent extends Component
 			self:SetStatus(state.Reason or "SHOP_STATE_UNAVAILABLE")
 			return
 		end
-		if state.RevisionKey == self.LastRevisionKey then return end
-		self.LastRevisionKey = state.RevisionKey
+		-- Synced fields may arrive after their revision; compare the rendered data too.
+		local refreshKey = table.concat({
+			state.RevisionKey or "", state.ShopState or "", state.ShopId or "",
+			state.NodeId or "", tostring(state.VisitSequence or 0), state.ShopDisplayName or "",
+			state.OfferSnapshot or "", state.PurchasedOfferIds or "",
+			state.CurrencySnapshot or "", state.ItemSnapshot or "",
+			state.SkillSnapshot or "", state.ConsumableSnapshot or "",
+			state.LastPurchase.OfferId or "", tostring(state.LastPurchase.Success),
+			state.LastPurchase.Reason or "", tostring(state.Commands.CanPurchase)
+		}, "\n")
+		if refreshKey == self.LastRevisionKey then return end
 		if state.ShopState == "OPEN" then self.WaitingForOpen = false end
 		self:RefreshFromState(state)
+		self.LastRevisionKey = refreshKey
 	end
 
 	@ExecSpace("ClientOnly")
@@ -100,7 +112,7 @@ script RunShopUIComponent extends Component
 			local row = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex))
 			local offer = self.Offers[rowIndex]
 			if isvalid(row) then
-				local visible = offer ~= nil
+				local visible = rowIndex == 1 and offer ~= nil
 				row.Enable = visible
 				row.Visible = visible
 				if visible then
@@ -117,7 +129,22 @@ script RunShopUIComponent extends Component
 			self.SelectedOfferIndex = #self.Offers > 0 and 1 or 0
 		end
 		self:RefreshSelectedOffer(state)
-		if state.LastPurchase.Reason ~= "" and state.LastPurchase.Reason ~= "SHOP_OPENED" then self:SetStatus(state.LastPurchase.Reason) end
+		if state.LastPurchase.Reason ~= "" and state.LastPurchase.Reason ~= "SHOP_OPENED" then
+			local reason = state.LastPurchase.Reason
+			if reason == "PURCHASE_APPLIED" or reason == "DUPLICATE_PURCHASE_IGNORED" or reason == "DUPLICATE_PURCHASE_REQUEST_IGNORED" then
+				self:SetStatus("구매가 완료되었습니다.")
+			elseif reason == "INSUFFICIENT_CURRENCY" then
+				self:SetStatus("골드가 부족합니다.")
+			elseif reason == "SHOP_NOT_OPEN" then
+				self:SetStatus("상점을 다시 열어 주세요.")
+			else
+				self:SetStatus(reason)
+			end
+		elseif #self.Offers == 0 then
+			self:SetStatus("판매 중인 상품이 없습니다.")
+		else
+			self:SetStatus("구매하면 유물 효과가 이번 런에 적용됩니다.")
+		end
 		log("[RunShopUI] refreshed shop=" .. state.ShopId .. " offers=" .. tostring(#self.Offers) .. " items=" .. state.ItemSnapshot)
 	end
 
@@ -137,15 +164,29 @@ script RunShopUIComponent extends Component
 		local buy = self:GetEntity("ShopPopup/DetailPanel/BuyButton")
 		self:RefreshOfferRowVisuals(state)
 		if offer == nil then
-			self:SetText("ShopPopup/DetailPanel/ItemName", "상품을 선택하세요")
-			if isvalid(buy) then buy.ButtonComponent.Enable = false end
+			self:SetText("ShopPopup/DetailPanel/ItemName", "판매 중인 유물이 없습니다")
+			self:SetText("ShopPopup/DetailPanel/CategoryText", "")
+			self:SetText("ShopPopup/DetailPanel/OwnedText", "")
+			self:SetText("ShopPopup/DetailPanel/PriceText", "")
+			local icon = self:GetEntity("ShopPopup/DetailPanel/ItemIcon")
+			if isvalid(icon) then icon.Enable = false end
+			if isvalid(buy) then
+				buy.ButtonComponent.Enable = false
+				buy.TextGUIRendererComponent.Text = "구매"
+			end
 			return
 		end
-		local owned = self:GetSnapshotAmount(state.ItemSnapshot, offer.RewardRefId)
+		local ownedSnapshot = state.ItemSnapshot
+		if offer.RewardType == "SKILL" then
+			ownedSnapshot = state.SkillSnapshot
+		elseif offer.RewardType == "CONSUMABLE" then
+			ownedSnapshot = state.ConsumableSnapshot
+		end
+		local owned = self:GetSnapshotAmount(ownedSnapshot, offer.RewardRefId)
 		local sold = self:ContainsId(state.PurchasedOfferIds, offer.OfferId)
 		self:SetDetailImage(offer.IconImageRUID)
 		self:SetText("ShopPopup/DetailPanel/ItemName", offer.DisplayName)
-		self:SetText("ShopPopup/DetailPanel/CategoryText", "분류  " .. offer.ItemCategory)
+		self:SetText("ShopPopup/DetailPanel/CategoryText", offer.EffectDescription)
 		self:SetText("ShopPopup/DetailPanel/OwnedText", "보유  " .. tostring(owned))
 		self:SetText("ShopPopup/DetailPanel/PriceText", "가격  " .. tostring(offer.Price) .. " 골드")
 		if isvalid(buy) then
@@ -167,12 +208,15 @@ script RunShopUIComponent extends Component
 				if isvalid(selectedBar) then selectedBar.Enable = selected and not sold end
 				if row.SpriteGUIRendererComponent ~= nil then
 					if sold then
-						row.SpriteGUIRendererComponent.Color = Color(0.72, 0.69, 0.63, 0.82)
+						row.SpriteGUIRendererComponent.Color = Color(0.88, 0.86, 0.82, 1.0)
 					elseif selected then
-						row.SpriteGUIRendererComponent.Color = Color(1.0, 0.80, 0.34, 1.0)
+						row.SpriteGUIRendererComponent.Color = Color(1.0, 0.86, 0.65, 1.0)
 					else
-						row.SpriteGUIRendererComponent.Color = Color(1.0, 0.96, 0.84, 0.96)
+						row.SpriteGUIRendererComponent.Color = Color(1.0, 0.976, 0.922, 1.0)
 					end
+				end
+				if row.TextGUIRendererComponent ~= nil then
+					row.TextGUIRendererComponent.FontColor = sold and Color(0.49, 0.46, 0.42, 1.0) or Color(0.318, 0.208, 0.122, 1.0)
 				end
 			end
 		end
@@ -182,7 +226,11 @@ script RunShopUIComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnBuyClicked()
 		local offer = self.Offers[self.SelectedOfferIndex]
-		if offer == nil then return end
+		log("[RunShopUI] buy clicked selected=" .. tostring(self.SelectedOfferIndex))
+		if offer == nil then
+			self:SetStatus("구매하면 유물 효과가 이번 런에 적용됩니다.")
+			return
+		end
 		_SoundService:PlaySound(self.ClickSoundRUID, 1)
 		self.PurchaseRequestId = self.PurchaseRequestId + 1
 		self:SetStatus("구매를 요청했습니다.")
@@ -192,12 +240,13 @@ script RunShopUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method table ParseOffers(string snapshot)
+		-- Read numeric bonuses and their shared effect description after the original fields.
 		local offers = {}
 		for rawOffer in string.gmatch(snapshot or "", "([^|]+)") do
 			local fields = {}
 			for field in string.gmatch(rawOffer .. "~", "([^~]*)~") do table.insert(fields, field) end
 			if #fields >= 10 then
-				table.insert(offers, { OfferId = fields[1], DisplayName = fields[2], RewardType = fields[3], RewardRefId = fields[4], RewardAmount = tonumber(fields[5]) or 0, CurrencyId = fields[6], Price = tonumber(fields[7]) or 0, Order = tonumber(fields[8]) or 0, IconImageRUID = fields[9], ItemCategory = fields[10] })
+				table.insert(offers, { OfferId = fields[1], DisplayName = fields[2], RewardType = fields[3], RewardRefId = fields[4], RewardAmount = tonumber(fields[5]) or 0, CurrencyId = fields[6], Price = tonumber(fields[7]) or 0, Order = tonumber(fields[8]) or 0, IconImageRUID = fields[9], ItemCategory = fields[10], AttackBonus = tonumber(fields[11]) or 0, MaxHpBonus = tonumber(fields[12]) or 0, DefenseBonus = tonumber(fields[13]) or 0, EffectDescription = fields[14] or "" })
 			end
 		end
 		return offers
@@ -250,9 +299,11 @@ script RunShopUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void SetDetailImage(string imageRuid)
-		-- Keeps the enlarged detail icon above its decorative frame and preserves the source colors.
+		-- Restores the selected item artwork after an empty shop state.
 		local entity = self:GetEntity("ShopPopup/DetailPanel/ItemIcon")
-		if isvalid(entity) == false or entity.SpriteGUIRendererComponent == nil or imageRuid == nil or imageRuid == "" then return end
+		if isvalid(entity) == false or entity.SpriteGUIRendererComponent == nil then return end
+		entity.Enable = imageRuid ~= nil and imageRuid ~= ""
+		if entity.Enable == false then return end
 		entity.SpriteGUIRendererComponent.ImageRUID = DataRef(imageRuid)
 		entity.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
 		_UILogic:SetSiblingIndex(entity.UITransformComponent, 1000000)

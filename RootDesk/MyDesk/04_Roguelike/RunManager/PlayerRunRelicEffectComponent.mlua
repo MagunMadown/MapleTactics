@@ -1,0 +1,73 @@
+@Component
+script PlayerRunRelicEffectComponent extends Component
+
+	@TargetUserSync property integer ActiveRunSequence = 0
+	@TargetUserSync property number AttackBonus = 0
+	@TargetUserSync property number MaxHpBonus = 0
+	@TargetUserSync property number DefenseBonus = 0
+	property number AppliedMaxHpBonus = 0
+	property boolean IsInitialized = false
+	property table Definitions = {}
+	property table ShopBundle = {}
+
+	@ExecSpace("ServerOnly")
+	method table CaptureForRun(integer runSequence)
+		-- Freeze validated definitions and prices once per run.
+		if self.IsInitialized and self.ActiveRunSequence == runSequence then
+			return { Success = true, Reason = "RELIC_CATALOG_ALREADY_CAPTURED" }
+		end
+		self.ActiveRunSequence = runSequence
+		self.AttackBonus = 0
+		self.MaxHpBonus = 0
+		self.DefenseBonus = 0
+		self.AppliedMaxHpBonus = 0
+		self.IsInitialized = false
+		self.Definitions = {}
+		self.ShopBundle = {}
+		if runSequence <= 0 then return { Success = true, Reason = "RELIC_RESET" } end
+		local catalog = _RelicDefinitionRepositoryLogic:GetAllDefinitions()
+		if catalog.Success == false then return catalog end
+		local validation = _ShopContentValidatorLogic:ValidateById("shop_relic")
+		if validation.Success == false then return validation end
+		self.Definitions = catalog.Definitions
+		self.ShopBundle = validation.Data
+		self.IsInitialized = true
+		log("[RunRelic] captured sequence=" .. runSequence .. " entries=" .. #self.ShopBundle.Entries)
+		return { Success = true, Reason = "RELIC_CATALOG_CAPTURED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table Recalculate()
+		-- Sum unique owned relics and apply only the unapplied max-HP difference.
+		local runState = self.Entity:GetComponent("script.PlayerRunStateComponent")
+		local inventory = self.Entity:GetComponent("script.PlayerRunInventoryComponent")
+		if not self.IsInitialized or runState == nil or inventory == nil
+			or runState.RunSequence ~= self.ActiveRunSequence or inventory.ActiveRunSequence ~= self.ActiveRunSequence then
+			return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" }
+		end
+		local attack, hp, defense = 0, 0, 0
+		for id, definition in pairs(self.Definitions) do
+			if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) > 0 then
+				attack = attack + definition.AttackBonus
+				hp = hp + definition.MaxHpBonus
+				defense = defense + definition.DefenseBonus
+			end
+		end
+		self.AttackBonus = attack
+		self.MaxHpBonus = hp
+		self.DefenseBonus = defense
+		local delta = hp - self.AppliedMaxHpBonus
+		if runState.RunHpInitialized and delta ~= 0 then
+			runState:SetRunHp(runState.RunCurrentHp + delta, runState.RunMaxHp + delta, "RELIC_EFFECT")
+			self.AppliedMaxHpBonus = hp
+			local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then
+				unit.MaxHp = runState.RunMaxHp
+				unit:RestoreCurrentHp(runState.RunCurrentHp)
+			end
+			log("[RunRelic] hp delta=" .. delta .. " hp=" .. runState.RunCurrentHp .. "/" .. runState.RunMaxHp)
+		end
+		return { Success = true, Reason = "RELIC_EFFECTS_APPLIED", AttackBonus = attack, MaxHpBonus = hp, DefenseBonus = defense }
+	end
+
+end

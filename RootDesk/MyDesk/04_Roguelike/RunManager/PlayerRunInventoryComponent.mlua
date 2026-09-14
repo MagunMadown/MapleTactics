@@ -30,7 +30,7 @@ script PlayerRunInventoryComponent extends Component
 	method void ResetForRun(integer runSequence, integer inventorySlotBonus)
 		-- Clears run-scoped rewards and derives this run's real consumable capacity exactly once.
 		self.ActiveRunSequence = math.max(0, runSequence)
-		self.ConsumableCapacity = math.max(0, self.BaseConsumableCapacity + math.max(0, math.floor(tonumber(inventorySlotBonus) or 0)))
+		self.ConsumableCapacity = 3 + math.min(2, math.max(0, math.floor(tonumber(inventorySlotBonus) or 0)))
 		self.RunCurrencySnapshot = ""
 		self.RunConsumableSnapshot = ""
 		self.RunSkillSnapshot = ""
@@ -379,6 +379,10 @@ script PlayerRunInventoryComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table GrantRunReward(string rewardType, string rewardRefId, integer amount, string rewardKey)
 		-- Applies one run-scoped reward exactly once and converts consumable overflow by policy.
+		if rewardType == "CONSUMABLE" then
+			rewardRefId = _ConsumableDefinitionRepositoryLogic:NormalizeConsumableId(rewardRefId)
+			self:NormalizeLegacyConsumables()
+		end
 		local result = { Success = false, Reason = "UNKNOWN", RewardType = rewardType, RewardRefId = rewardRefId, RequestedAmount = amount, AcceptedAmount = 0, OverflowAmount = 0, Revision = self.InventoryRevision }
 		if self.ActiveRunSequence <= 0 then
 			result.Reason = "RUN_NOT_STARTED"
@@ -406,8 +410,9 @@ script PlayerRunInventoryComponent extends Component
 			self.RunCurrencySnapshot = self:AddSnapshotAmount(self.RunCurrencySnapshot, rewardRefId, amount)
 			result.AcceptedAmount = amount
 		else
-			local usedCapacity = self:GetSnapshotTotal(self.RunConsumableSnapshot)
-			local remainingCapacity = math.max(0, self.ConsumableCapacity - usedCapacity)
+			local space = self:GetConsumableGrantSpace(rewardRefId)
+			if not space.Success then return space end
+			local remainingCapacity = space.Amount
 			result.AcceptedAmount = math.min(amount, remainingCapacity)
 			result.OverflowAmount = amount - result.AcceptedAmount
 			if result.AcceptedAmount > 0 then
@@ -430,6 +435,10 @@ script PlayerRunInventoryComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table ApplyShopPurchase(string priceCurrencyId, integer priceAmount, string rewardType, string rewardRefId, integer rewardAmount, string purchaseKey)
 		-- Owns the atomic currency deduction and reward mutation for one validated run-shop offer.
+		if rewardType == "CONSUMABLE" then
+			rewardRefId = _ConsumableDefinitionRepositoryLogic:NormalizeConsumableId(rewardRefId)
+			self:NormalizeLegacyConsumables()
+		end
 		local result = { Success = false, Reason = "UNKNOWN", PriceCurrencyId = priceCurrencyId or "", PriceAmount = priceAmount or 0, RewardType = rewardType or "", RewardRefId = rewardRefId or "", RewardAmount = rewardAmount or 0, BalanceBefore = 0, BalanceAfter = 0, AcceptedAmount = 0, OverflowAmount = 0, Revision = self.InventoryRevision }
 		if self.ActiveRunSequence <= 0 then
 			result.Reason = "RUN_NOT_STARTED"
@@ -461,6 +470,12 @@ script PlayerRunInventoryComponent extends Component
 			result.BalanceAfter = result.BalanceBefore
 			return result
 		end
+		local consumableSpace = 0
+		if rewardType == "CONSUMABLE" then
+			local space = self:GetConsumableGrantSpace(rewardRefId)
+			if not space.Success then return space end
+			consumableSpace = space.Amount
+		end
 		result.BalanceAfter = result.BalanceBefore - priceAmount
 		self.RunCurrencySnapshot = self:SetSnapshotAmount(self.RunCurrencySnapshot, priceCurrencyId, result.BalanceAfter)
 		if rewardType == "SKILL" then
@@ -472,8 +487,7 @@ script PlayerRunInventoryComponent extends Component
 				self:ReconcileRunSkillBarOrder("SHOP_SKILL_PURCHASED")
 			end
 		elseif rewardType == "CONSUMABLE" then
-			local usedCapacity = self:GetSnapshotTotal(self.RunConsumableSnapshot)
-			local remainingCapacity = math.max(0, self.ConsumableCapacity - usedCapacity)
+			local remainingCapacity = consumableSpace
 			result.AcceptedAmount = math.min(rewardAmount, remainingCapacity)
 			result.OverflowAmount = rewardAmount - result.AcceptedAmount
 			if result.AcceptedAmount > 0 then
@@ -498,7 +512,9 @@ script PlayerRunInventoryComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table CanConsume(string consumableId, integer amount, string useKey)
-		-- Checks inventory availability without changing state.
+		-- Checks availability without consuming; legacy IDs are normalized once.
+		self:NormalizeLegacyConsumables()
+		consumableId = _ConsumableDefinitionRepositoryLogic:NormalizeConsumableId(consumableId)
 		local ownedAmount = self:GetSnapshotAmount(self.RunConsumableSnapshot, consumableId)
 		if self.ActiveRunSequence <= 0 then
 			return { Success = false, Reason = "RUN_NOT_STARTED", OwnedAmount = ownedAmount }
@@ -518,6 +534,8 @@ script PlayerRunInventoryComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table Consume(string consumableId, integer amount, string useKey)
 		-- Removes a consumable exactly once after its gameplay effect succeeds.
+		self:NormalizeLegacyConsumables()
+		consumableId = _ConsumableDefinitionRepositoryLogic:NormalizeConsumableId(consumableId)
 		if self:IsSafeToken(consumableId) == false or self:IsSafeToken(useKey) == false then
 			return { Success = false, Reason = "INVALID_USE_KEY", ConsumedAmount = 0 }
 		end
@@ -541,6 +559,7 @@ script PlayerRunInventoryComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table GetSnapshot()
 		-- Returns the stable DTO used by RunManager, battle adapters, and tests.
+		self:NormalizeLegacyConsumables()
 		return { Success = true, Reason = "OK", RunSequence = self.ActiveRunSequence, CurrencySnapshot = self.RunCurrencySnapshot, ConsumableSnapshot = self.RunConsumableSnapshot, SkillSnapshot = self.RunSkillSnapshot, SkillBarSlotIds = self.RunSkillBarSlotIds, SkillBarRevision = self.RunSkillBarRevision, ItemSnapshot = self.RunItemSnapshot, ConsumableCapacity = self.ConsumableCapacity, ConsumableCount = self:GetSnapshotTotal(self.RunConsumableSnapshot), SkillCount = self:GetSnapshotTotal(self.RunSkillSnapshot), ItemCount = self:GetSnapshotTotal(self.RunItemSnapshot), OverflowCurrencyId = self.OverflowCurrencyId, OverflowCurrencyPerItem = self.OverflowCurrencyPerItem, SkillRevision = self.SkillInventoryRevision, Revision = self.InventoryRevision }
 	end
 
@@ -561,6 +580,45 @@ script PlayerRunInventoryComponent extends Component
 			end
 		end
 		return skillIds
+	end
+
+	@ExecSpace("ServerOnly")
+	method void NormalizeLegacyConsumables()
+		-- Retains the count snapshot; old stack overflow follows the existing currency policy once.
+		local before = self.RunConsumableSnapshot
+		local previousCapacity = self.ConsumableCapacity
+		self.ConsumableCapacity = math.min(5, math.max(3, self.ConsumableCapacity))
+		local amount = self:GetSnapshotAmount(self.RunConsumableSnapshot, "potion_hp_small")
+		if amount > 0 then
+			self.RunConsumableSnapshot = self:SetSnapshotAmount(self.RunConsumableSnapshot, "potion_hp_small", 0)
+			self.RunConsumableSnapshot = self:AddSnapshotAmount(self.RunConsumableSnapshot, "orange_potion", amount)
+		end
+		local remaining = self.ConsumableCapacity
+		local overflow = 0
+		local entries = {}
+		for itemId, countText in string.gmatch(self.RunConsumableSnapshot or "", "([^|~]+)~(%d+)") do
+			local count = tonumber(countText)
+			local accepted = math.min(remaining, count)
+			if accepted > 0 then table.insert(entries, itemId .. "~" .. tostring(accepted)) end
+			remaining = remaining - accepted
+			overflow = overflow + count - accepted
+		end
+		self.RunConsumableSnapshot = table.concat(entries, "|")
+		if overflow > 0 and self.OverflowCurrencyPerItem > 0 and self.OverflowCurrencyId ~= "" then
+			self.RunCurrencySnapshot = self:AddSnapshotAmount(self.RunCurrencySnapshot, self.OverflowCurrencyId, overflow * self.OverflowCurrencyPerItem)
+		end
+		if before ~= self.RunConsumableSnapshot or previousCapacity ~= self.ConsumableCapacity then
+			self.InventoryRevision = self.InventoryRevision + 1
+			log("[RunInventory] consumables normalized capacity=" .. self.ConsumableCapacity .. " overflow=" .. overflow .. " revision=" .. self.InventoryRevision)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetConsumableGrantSpace(string consumableId)
+		-- One physical item occupies one slot, including duplicates of the same kind.
+		local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(consumableId)
+		if not definition.Success then return definition end
+		return { Success = true, Amount = math.max(0, self.ConsumableCapacity - self:GetSnapshotTotal(self.RunConsumableSnapshot)) }
 	end
 
 	@ExecSpace("ServerOnly")

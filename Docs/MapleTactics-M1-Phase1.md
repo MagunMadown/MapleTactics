@@ -4,12 +4,20 @@
 목표: 복잡한 프레임워크를 먼저 만들지 않고, Maker 화면에서 직접 확인할 수 있는 작은 전투 기능을 하나씩 완성한다.  
 진행 원칙: 한 Slice를 구현하고 실제 화면과 로그로 검증한 뒤에만 다음 Slice로 넘어간다.
 
+## 2026-09-12 — 통합 유물 상점과 런 능력치
+
+- 🟡 Implemented (untested): 위·아래 NodeId 유지, 공통 shop_relic의 33종 중 미보유 유물 하나를 결정적으로 추첨. 재열기 유지, 판매 완료, 전체 보유 시 빈 상점.
+- 🟡 Implemented (untested): RelicDefinitions 세 정수 보너스, 새 런 정의 캡처, 구매 즉시 합산 및 HP 차이 적용, 전투 진입 복구·새 런 초기화.
+- 🟡 Implemented (untested): 실제 타격별 공격력·방어력, 최소 피해 1, 완전 방어 0. 상점 단일 행·효과 설명·전투 HUD 연결.
+- 로컬 Lua 테스트: 실제 mLua 메서드로 추첨 재현성·구매 거절·중복 처리·HP 5/10→6/11·전투 피해를 검증. 엔진 서비스와 UI 렌더링은 모의 객체이므로 Maker 검증을 대체하지 않는다.
+- 남은 Verify: Maker Refresh → build/normal 로그 → Play에서 양쪽 경로, 실제 구매·퇴장·다음 전투·새 런 검증. 현재 세션에 Maker MCP 실행 도구가 없어 런타임 증거 미수집.
+
 ## 2026-08-29 — 헤네시스 이후 분기형 런 상점
 
 - 🟡 상태: Implemented (Maker runtime verification pending)
 - 헤네시스 보스 승리 뒤 월드맵을 `SHOP_CHOICE`로 열고 위·아래 상점 중 하나를 선택한다.
 - `TravelAvatar`의 걷기 연출이 끝난 뒤 서버가 노드를 승인하고, 두 분기가 공유하는 `shop.map`으로 이동한다.
-- NPC 상점은 각 분기의 CSV 상품 16/17종을 표시하고, 1골드 구매 결과를 능력치 없는 `RunItemSnapshot`에 저장한다.
+- NPC 상점은 공통 33종 중 미보유 유물 하나를 표시하고, 1골드 구매 결과를 `RunItemSnapshot`에 저장하며 런 능력치를 적용한다.
 - 상점 UI의 X는 팝업만 닫고, 맵 NameTag 대신 화면 오른쪽 아래의 일반 `출발` 버튼이 구매 여부와 무관하게 상점 노드를 완료한다.
 - `출발` 요청은 서버의 `ShopState=CLOSED` 승인을 기다린 뒤 상점 UI를 닫고 `POST_SHOP_ROUTE` 월드맵을 다시 연다.
 - UIGroup 순서는 전투 HUD < `출발` 버튼 < 상점 UI < 월드맵으로 고정해, 월드맵이 열리면 스킬·스킬 큐·HP UI보다 항상 위에 표시한다.
@@ -989,7 +997,7 @@ Phase 1의 헤네시스 첫 분기는 이후 지역을 추가하기 위한 기�
 - 아래쪽 경로: `헤네시스 → 상점 → 엘리니아 → 상점 → 노틸러스 → 상점 → 슬리피우드`
 - Region/MapId 규칙: 헤네시스 `region_01`, 커닝시티 `region_02`, 엘리니아 `region_03`, 페리온 `region_04`, 노틸러스 `region_05`, 슬리피우드 `region_06`
 - 각 Region은 자체 `region_XX_battle`과 `region_XX_boss` 물리 맵을 가지며 같은 Region 내부 Stage만 일반전 맵을 재사용
-- 각 상점은 독립 `ShopId`를 가지지만 UI는 `ShopVisitBtn`, 로직은 공통 Shop Controller를 사용
+- 각 상점 방문은 독립 `NodeId`를 가지며 공통 `shop_relic`을 참조하고 UI는 `ShopVisitBtn`, 로직은 공통 Shop Controller를 사용
 - 각 마을의 최종 전투/보스 클리어가 다음 Edge 상점 해금의 기본 조건이며, 현재 헤네시스 `1-1` 게이트는 프로토타입 예외
 - 선택 경로·상점 방문·다음 도시 해금은 `PlayerRunStateComponent`의 서버 권위 상태로 관리
 - 구현 완료 기준:

@@ -40,10 +40,18 @@ script EnemyIntentHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+		-- Hide combat overlays immediately when the synchronized battle result arrives.
 		local player = _UserService.LocalPlayer
 		local session = self:GetBattleSession(player)
 		if session == nil then
+			self._T.FeedbackEntry = nil
 			self:HideAllViews("NOT_IN_BATTLE")
+			return
+		end
+		self:RefreshCombatFeedback(session)
+		if session.BattleResult ~= nil and session.BattleResult ~= "" then
+			self:HideAllViews("BATTLE_ENDED")
+			self.RefreshElapsed = 0
 			return
 		end
 
@@ -72,6 +80,12 @@ script EnemyIntentHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void RefreshIntentViews(Entity currentMap, any session, table uiState)
+		-- Reject terminal snapshots so stale enemy queues cannot cover the result controls.
+		if uiState.BattleResult ~= nil and uiState.BattleResult ~= "" then
+			self:HideAllViews("BATTLE_ENDED")
+			return
+		end
+		self._T.LastHideReason = nil
 		self._T.ActiveEnemyIds = {}
 		self._T.ActiveTelegraphKeys = {}
 		local cellOccupantCounts = {}
@@ -102,6 +116,20 @@ script EnemyIntentHudComponent extends Component
 		self:HideInactiveEnemyViews()
 		self:HideInactiveTelegraphs()
 		self.LastPlanRevision = uiState.EnemyPlanRevision or self.LastPlanRevision
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshCombatFeedback(any session)
+		-- A stage-local kill counter produces one compact notice per synchronized batch.
+		if self._T.FeedbackEntry ~= session.EntryRequestId then
+			self._T.FeedbackEntry = session.EntryRequestId
+			self._T.FeedbackKills = 0
+		end
+		local kills = session.ResultKillCount or 0
+		if kills > (self._T.FeedbackKills or 0) and _GameUIPolishLogic.ToastRemaining <= 0 then
+			_GameUIPolishLogic:ShowToast("몬스터 처치", "이번 전투에서 " .. tostring(kills) .. "마리 처치 · 획득 보상은 결과 화면에서 확인할 수 있습니다.")
+		end
+		self._T.FeedbackKills = kills
 	end
 
 	@ExecSpace("ClientOnly")
@@ -166,6 +194,7 @@ script EnemyIntentHudComponent extends Component
 		end
 		local queuedIds = self:SplitTokens(intent.QueuedTileIds or "")
 		local queuedIconRuids = self:SplitTokens(intent.QueuedIconRuids or "")
+		local queuedIconBackgroundColors = self:SplitTokens(intent.QueuedIconBackgroundColors or "")
 		for slotIndex = 1, 3 do
 			local slot = view:GetChildByName("QueueSlot0" .. tostring(slotIndex))
 			local tileId = queuedIds[slotIndex] or ""
@@ -178,6 +207,11 @@ script EnemyIntentHudComponent extends Component
 					local iconRuid = queuedIconRuids[slotIndex] or ""
 					if iconRuid == "" or iconRuid == "-" then
 						iconRuid = self:GetEnemySkillFallbackIconRuid(tileId)
+					end
+					local innerBackground = slot:GetChildByName("InnerBackground")
+					if isvalid(innerBackground) and innerBackground.SpriteGUIRendererComponent ~= nil then
+						-- Restore the default too, because these slots are reused across skills.
+						innerBackground.SpriteGUIRendererComponent.Color = self:GetQueueIconBackgroundColor(queuedIconBackgroundColors[slotIndex] or "")
 					end
 					icon.UITransformComponent.anchoredPosition = Vector2(self.SkillIconOffsetX, self.SkillIconOffsetY)
 					icon.UITransformComponent.RectSize = Vector2(self.SkillIconSize, self.SkillIconSize)
@@ -218,6 +252,15 @@ script EnemyIntentHudComponent extends Component
 			moveArrow.Enable = marker ~= ""
 			moveArrow.TextGUIRendererComponent.Text = marker
 		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method Color GetQueueIconBackgroundColor(string encodedColor)
+		-- Snapshot colors are eight hex digits without the record separator #.
+		if string.match(encodedColor or "", "^%x%x%x%x%x%x%x%x$") then
+			return Color.FromHexCode("#" .. encodedColor)
+		end
+		return Color(0.105, 0.075, 0.052, 0.99)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -362,6 +405,13 @@ script EnemyIntentHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void HideAllViews(string reason)
+		-- Disable both overlay trees and log each hide transition only once.
+		if self._T.LastHideReason ~= reason then
+			log("[EnemyIntentHUD] hidden reason=" .. reason)
+			self._T.LastHideReason = reason
+		end
+		self._T.ActiveEnemyIds = {}
+		self._T.ActiveTelegraphKeys = {}
 		for _, record in pairs(self._T.EnemyViews or {}) do
 			if record ~= nil and isvalid(record.View) then
 				record.View.Enable = false

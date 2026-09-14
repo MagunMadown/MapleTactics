@@ -128,6 +128,8 @@
 | CasterMotionDuration | number | 조건부 | 공격 클립 유지 시간. 비우면 ActionDuration |
 | EnemyQueueTurns | integer | - | 적 공격 Tile 준비에 필요한 적 턴 수. 플레이어 스킬은 0 |
 | HudIconRuid | string | - | 적 머리 위 Queue/HUD 아이콘 |
+| CastSoundRuid | string | - | 시전 순간 재생할 audioclip RUID. 비우면 시전 사운드 없음 |
+| HitSoundRuid | string | - | 피격 프레임에 대상마다 재생할 audioclip RUID. 비우면 피격 사운드 없음 |
 
 내부 `SkillDefinitions`는 쇼군 쇼다운식 공격 타일에 해당한다. 직업 고유 능력과
 런 패시브(Augment)는 이 표에 넣지 않는다.
@@ -136,6 +138,11 @@
 TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 수 있는 지원 스킬에 사용한다.
 
 ### 4.0 이펙트 RUID 규칙
+
+`CastSoundRuid`/`HitSoundRuid`는 이펙트와 짝을 이루는 **`audioclip` RUID**다. 이펙트와
+독립적으로 판정되므로 둘 중 하나만 채워도 그 절반만 연출된다. 재생은 위치 감쇠 없는
+2D(`_SoundService:PlaySound`)이며, 볼륨은 `BattleSessionComponent.SkillSoundVolume`이
+전체에 공통 적용된다. 적 스킬 행은 비워 두는 것이 현재 기본값이다.
 
 `CastEffectRuid`/`HitEffectRuid`는 `sprite`가 아니라 **`animationclip` RUID**여야 한다.
 값은 각 스킬의 공식 리소스 팩에서 가져오며, 팩 안의 `effect` 엘리먼트가 시전,
@@ -1089,24 +1096,27 @@ Validator 허용 목록, 회귀 테스트를 함께 갖춘 뒤에만 `IMPLEMENTE
 
 ### 18.2 ConsumableDefinitions
 
-전투 드롭·상점·런 인벤토리가 같은 소모품 ID를 참조하고, 사용 효과를 원시 Effect Handler에 연결하기 위한 정의다.
+전투 드롭·런 인벤토리·사용 효과가 공유하는 현재 5종 정의다.
 
-| 열 | 타입 | 필수 | 설명 |
-|---|---|:---:|---|
-| SchemaVersion | integer | O | 현재 `1` |
-| ConsumableId | string | O | 소모품 고유 ID |
-| DisplayName | string | O | 표시 이름 |
-| MaxStack | integer | O | 런에서 보유 가능한 기본 수량 |
-| UseTiming | enum | O | 현재 `BATTLE_FREEPLAY` |
-| ConsumesTurn | boolean | O | 사용 시 턴 소비 여부 |
-| EffectType | enum | O | 등록된 원시 효과. 현재 `HEAL` |
-| EffectValue | number | O | 효과 기본 수치, 0 초과 |
-| TargetType | enum | O | 현재 `SELF` |
-| Enabled | boolean | O | 활성 여부 |
+| 열 | 타입 | 설명 |
+|---|---|---|
+| SchemaVersion | integer | 현재 1 |
+| ConsumableId / DisplayName | string | 고유 ID / 표시명 |
+| MaxStack | integer | 슬롯당 최대 수량 1. 동일 종류의 총 보유량 제한이 아님 |
+| UseTiming | enum | BATTLE_FREEPLAY |
+| ConsumesTurn / TurnCost | boolean / integer | false / 0 |
+| ConsumeOnUse / Enabled | boolean | true / true |
+| EffectType | enum | HEAL / COOLDOWN_REDUCTION / CLEANSE |
+| EffectValue | number | 회복 2·4·6 / 쿨다운 감소 2 / 상태 제거 0 |
+| TargetType | enum | SELF 또는 OWNED_SKILL |
+| Description / IconKey | string | 효과 설명 / 실제 아이콘 RUID |
 
-현재 실제 Dataset에는 `potion_hp_small / MaxStack=3 / BATTLE_FREEPLAY /
-ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에만
-`PlayerRunInventoryComponent`가 수량을 차감하며, 같은 UseKey는 효과와 소비 모두 한 번만 처리한다.
+현재 ID는 `red_potion`, `orange_potion`, `white_potion`, `time_sand`, `all_cure_potion`이다.
+`potion_hp_small`은 기존 런 스냅샷을 주황 포션으로 이전하는 호환 별칭에만 남는다.
+저장 형식은 `id~count`이며 총 수량이 기본 3, Union +0~2로 최대 5칸을 차지한다.
+HUD는 같은 종류도 한 개씩 분리한다. 초과분은 기존 재화 정책으로 전환한다.
+효과 성공 뒤 1개를 차감하며 UseKey로 재실행을 막는다. HP가 가득 찼거나 선택 가능한 쿨다운 스킬이 없으면 실패한다.
+상태이상 시스템이 아직 없어 만병통치약은 보관·표시만 가능하며 제거할 상태가 없으면 소비하지 않는다.
 
 ## 19. StageRewardDefinitions
 
@@ -1147,7 +1157,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | MapId | string | O | 상점 진입 목적지 맵 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-기본 키는 `ShopId`이며 전역에서 유일해야 한다.
+기본 키는 `ShopId`이며 전역에서 유일해야 한다. 현재는 `shop_relic` 한 행을 사용한다.
 
 ### 20.1.1 ShopNodeBindings (IMPLEMENTED)
 
@@ -1159,7 +1169,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | ShopId | string | O | ShopDefinitions.ShopId 참조 |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-기본 키는 `(NodeGraphId, NodeId)`다. 모든 활성 SHOP 노드는 정확히 하나의 바인딩을 가져야 한다.
+기본 키는 `(NodeGraphId, NodeId)`다. 모든 활성 SHOP 노드는 정확히 하나의 바인딩을 가져야 한다. `shop_upper`·`shop_lower`는 모두 `shop_relic`을 참조한다. 경로 잠금은 ShopId가 아닌 NodeId로 구분한다.
 
 ### 20.2 ShopEntries (IMPLEMENTED)
 
@@ -1170,16 +1180,16 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | ShopId | string | O | ShopDefinitions.ShopId 참조 |
 | DisplayName | string | O | 제작자/UI 표시 이름 |
 | RewardType | enum | O | 현재 `SKILL`, `CONSUMABLE`, `ITEM` |
-| RewardRefId | string | O | RewardType에 맞는 SkillId 또는 ConsumableId |
+| RewardRefId | string | O | ITEM은 RelicDefinitions.RelicId 참조; shop_relic은 ITEM만 허용 |
 | RewardAmount | integer | O | 지급 수량, 1 이상 |
 | PriceCurrencyId | string | O | `RUN_SCOPED` CurrencyDefinitions.CurrencyId 참조 |
-| PriceAmount | integer | O | 가격, 0 이상 |
+| PriceAmount | integer | O | 가격, 1 이상; 초기 유물 가격 1골드 |
 | DisplayOrder | integer | O | 같은 ShopId 안의 오름차순 표시 순서 |
 | MaxPurchasesPerRun | integer | O | 현재 반드시 `1` |
 | Enabled | boolean | O | 콘텐츠 활성 여부 |
 
-현재 실제 Dataset에는 `shop_upper`, `shop_lower` 카탈로그가 등록되어 있다.
-서버는 Dataset의 가격과 보상 참조를 다시 조회한 뒤 재화 차감과 지급을 원자적으로 확정한다.
+현재 실제 Dataset에는 공통 `shop_relic` 카탈로그의 기존 33종 ID·이미지가 등록되어 있다. 목록 17개 제한은 없다. ItemCategory와 IconImageRUID는 기존 값을 유지한다.
+서버는 새 런에 정의·가격을 캡처하고 활성 상품 중 미보유 유물 후보를 ID 정렬한 뒤 RunSeed·NodeId·방문 순번으로 동일 가중치의 하나를 추첨한다. 현재 방문의 OfferedEntry와 일치하는 구매만 원자적으로 차감·지급한다. 팝업 재열기와 구매 후에는 재추첨하지 않는다. 후보가 없으면 빈 상점이며 구매만 비활성화한다.
 구매 완료 키는 `RunSequence + ShopEntryId`이므로 같은 상점을 다른 노드에서 재방문해도
 이미 구매한 상품은 다시 지급되지 않는다. 자세한 제작·API 규격은
 `Guide/Run-Shop-Authoring-Guide.md`를 따른다.
@@ -1187,6 +1197,22 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 `RewardType=SKILL` 상품을 다시 넣을 때는 `RewardRefId`가 §4.1의
 `GetPlayerGrantableSkillIds()` 범위 안에 있어야 한다. 적 전용 SkillId를 넣으면 플레이어가
 몬스터 전용 행을 보유하게 된다.
+
+### 20.2.1 RelicDefinitions (IMPLEMENTED — Maker 검증 대기)
+
+| 열 | 타입 | 필수 | 설명 |
+|---|---|:---:|---|
+| RelicId | string | O | 고유 유물 ID; 기존 RewardRefId 유지 |
+| DisplayName | string | O | 상점·전투 HUD 표시 이름 |
+| IconImageRUID | string | O | 기존 상품 이미지 |
+| EffectDescription | string | O | 제작자 참고 설명; 런타임은 아래 수치에서 동일 설명 생성 |
+| AttackBonus | integer | O | 0 이상, 실제 양수 타격에 합산 |
+| MaxHpBonus | integer | O | 0 이상, 최대 체력 및 현재 체력 차이 적용 |
+| DefenseBonus | integer | O | 0 이상, 받는 타격에서 차감; 최소 1, 완전 방어는 0 |
+
+한 행에 세 효과를 함께 설정할 수 있다. 안경·펜던트·귀고리는 (1,0,0), 모자·신발은 (0,1,0), 견장·벨트·옷은 (0,0,1)로 시작한다. 음수·소수·빈 수치·중복 ID를 거절한다.
+PlayerRunRelicEffectComponent는 새 런에서 정의를 고정하고 보유 유물별 합계를 구매 및 전투 진입에 계산한다. HP 5/10에서 체력 +1 구매는 6/11이며 재계산·재진입은 추가 회복하지 않는다. 새 런은 합계를 0으로 초기화한다. 계정 영구 저장은 없다.
+상점 OfferSnapshot 기존 10필드 뒤에 AttackBonus, MaxHpBonus, DefenseBonus, EffectDescription을 붙인다. 첫 상품 행·상세 패널만 사용하고 나머지는 숨긴다. 전투 HUD도 캡처된 동일 정의를 사용한다.
 
 ### 20.3 ShopItemDefinitions (PLANNED — Meta/World Shop)
 
@@ -1220,7 +1246,7 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 |---|---|---|---|---|---|---|
 | relic_zakum_helmet | 자쿰의 투구 | STARTER_RELIC | cash | 4900 | AUGMENT | zakum_helmet |
 | unlock_job_thief | 도적 해금 | CHARACTER_UNLOCK | cash | 9900 | JOB | thief |
-| potion_hp_small | 체력 물약(소) | CONSUMABLE | gold | 50 | | |
+| red_potion | 빨간 포션 | CONSUMABLE | gold | 50 | | |
 
 ## 21. EnemyDropDefinitions
 
@@ -1254,11 +1280,11 @@ ConsumesTurn=false / HEAL 4 / SELF`가 등록되어 있다. 사용 성공 뒤에
 | DropEntryId | EnemyDefinitionId | TriggerType | DropType | DropRefId | ChancePermille | MinAmount | MaxAmount |
 |---|---|---|---|---|---:|---:|---:|
 | early_gold | early_mushroom | ANY_KILL | CURRENCY | gold | 1000 | 1 | 1 |
-| early_potion | early_mushroom | ANY_KILL | CONSUMABLE | potion_hp_small | 250 | 1 | 1 |
+| early_potion | early_mushroom | ANY_KILL | CONSUMABLE | red_potion | 250 | 1 | 1 |
 | guard_gold | guard_mushroom | ANY_KILL | CURRENCY | gold | 1000 | 1 | 2 |
-| guard_potion | guard_mushroom | ANY_KILL | CONSUMABLE | potion_hp_small | 150 | 1 | 1 |
+| guard_potion | guard_mushroom | ANY_KILL | CONSUMABLE | orange_potion | 150 | 1 | 1 |
 
-`RootDesk/MyDesk/03_Data/EnemyDropDefinitions.userdataset/.csv` 페어에 위 4행이 이관되어 있다. Maker 런타임에서 `Source=DATASET`과 각 적 2행을 확인했으며 Repository의 prototype fallback은 비활성 상태다.
+현재 `EnemyDropDefinitions`는 위 호환 4행을 포함해 총 14행이다. 포션 6행은 빨강·주황·하양으로 배분하며 기존 ChancePermille·MinAmount·MaxAmount·TriggerType·DropEntryId를 보존한다. Repository의 prototype fallback은 비활성 상태다. 이번 변경의 Maker 런타임 검증은 미실행이며 세부 증거는 ConsumableSystem-Implementation-Report.md를 참조한다.
 
 ## 22. Validator 오류 코드
 

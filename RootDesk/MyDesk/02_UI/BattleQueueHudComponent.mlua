@@ -54,7 +54,7 @@ script BattleQueueHudComponent extends Component
 	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
 	property string IconSnapshot = ""
 	property ButtonComponent ExecuteButton = "564a6e86-cad3-49f8-a18f-927f1bb729c3"
-	property ButtonComponent ClearButton = "e46286f2-7013-4c7a-8c03-fd7ca3e887c8"
+	property boolean CanClearQueue = false
 	property SpriteGUIRendererComponent ResultPanelSprite = "6f0764a9-6582-48bb-8163-cb30159fcf81"
 	property TextGUIRendererComponent ResultText = "03d1ba1c-ffab-4aac-8fee-cb226a46b86e"
 	property TextGUIRendererComponent UnionRewardText = "3ac67f60-1514-40e0-bf41-2868ba8d0cc0"
@@ -106,7 +106,6 @@ script BattleQueueHudComponent extends Component
 	property string SlotSkillCooldownTurns = ""
 	property integer CooldownPipPoolSize = 4
 	property any ExecuteClickHandler = nil
-	property any ClearClickHandler = nil
 	property any ResetClickHandler = nil
 
 	@ExecSpace("ClientOnly")
@@ -131,7 +130,6 @@ script BattleQueueHudComponent extends Component
 		self.SkillSlot6ClickHandler = self.SkillSlot6Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot6Clicked)
 		self:BindSkillSlotDragHandlers()
 		self.ExecuteClickHandler = self.ExecuteButton.Entity:ConnectEvent(ButtonClickEvent, self.OnExecuteClicked)
-		self.ClearClickHandler = self.ClearButton.Entity:ConnectEvent(ButtonClickEvent, self.OnClearClicked)
 		self.ResetClickHandler = self.ResetButton.Entity:ConnectEvent(ButtonClickEvent, self.OnResetClicked)
 		self:RefreshHud(true)
 	end
@@ -200,10 +198,6 @@ script BattleQueueHudComponent extends Component
 		if self.ExecuteClickHandler ~= nil then
 			self.ExecuteButton.Entity:DisconnectEvent(ButtonClickEvent, self.ExecuteClickHandler)
 			self.ExecuteClickHandler = nil
-		end
-		if self.ClearClickHandler ~= nil then
-			self.ClearButton.Entity:DisconnectEvent(ButtonClickEvent, self.ClearClickHandler)
-			self.ClearClickHandler = nil
 		end
 		if self.ResetClickHandler ~= nil then
 			self.ResetButton.Entity:DisconnectEvent(ButtonClickEvent, self.ResetClickHandler)
@@ -292,7 +286,6 @@ script BattleQueueHudComponent extends Component
 		local enemyIntentLabel = self:GetEnemyIntentCompactLabel(uiState)
 		local reinforcementLabel = self:GetReinforcementLabel(session.StageTurnNumber, waveState)
 		local cooldownSnapshot = uiState.CooldownSnapshot
-		local cooldownLabel = self:GetCooldownLabel(cooldownSnapshot)
 		local iconSnapshot = session.SkillIconSnapshot or ""
 		local signature = presenterState.RevisionKey .. ":" .. runFlowRevision .. ":" .. iconSnapshot
 		if force == false and self.LastSignature == signature then
@@ -301,11 +294,11 @@ script BattleQueueHudComponent extends Component
 
 		self.LastSignature = signature
 		self:SyncIconSnapshot(iconSnapshot)
-		self.TurnText.Text = "TURN " .. uiState.TurnNumber
+		self.TurnText.Text = "턴 " .. uiState.TurnNumber
 		self.QueueText.Text = queueLabel
 		-- StateText is a narrow one-line HUD slot. Keep only turn-critical information here;
 		-- detailed cooldown/drop/inventory snapshots remain available from GetBattleUiState.
-		self.StateText.Text = "STAGE " .. session.StageNumber .. "  ·  WAVE " .. waveState.CurrentWave .. "/" .. waveState.TotalWaves .. "  ·  " .. phaseLabel .. "  ·  " .. inputLabel
+		self.StateText.Text = "스테이지 " .. session.StageNumber .. "  ·  웨이브 " .. waveState.CurrentWave .. "/" .. waveState.TotalWaves .. "  ·  " .. phaseLabel .. "  ·  " .. inputLabel
 		if enemyIntentLabel ~= "" then
 			self.StateText.Text = self.StateText.Text .. "  ·  " .. enemyIntentLabel
 		end
@@ -340,7 +333,7 @@ script BattleQueueHudComponent extends Component
 			end
 		end
 		self.ExecuteButton.Enable = canUseQueuedTile
-		self.ClearButton.Enable = uiState.Commands.CanClear
+		self.CanClearQueue = uiState.Commands.CanClear
 		if visibleQueue == "" then
 			self.QueueSlotSprite.Color = Color(0.15, 0.20, 0.28, 1)
 		elseif activeIndex > 0 then
@@ -398,6 +391,8 @@ script BattleQueueHudComponent extends Component
 			commandLabel = "공격 준비"
 		elseif commandType == "EXECUTE_QUEUE" then
 			commandLabel = "공격 실행"
+		elseif commandType == "UTILITY" then
+			commandLabel = "고유 스킬"
 		end
 
 		if success == true and reason == "INPUT_RECEIVED" then
@@ -409,7 +404,7 @@ script BattleQueueHudComponent extends Component
 			self.SkillSlot5Button.Enable = false
 			self.SkillSlot6Button.Enable = false
 			self.ExecuteButton.Enable = false
-			self.ClearButton.Enable = false
+			self.CanClearQueue = false
 		elseif success == true then
 			self.InputFeedbackText = "처리 확인  ·  " .. commandLabel
 		elseif reason == "LOCAL_INPUT_PENDING" then
@@ -438,7 +433,7 @@ script BattleQueueHudComponent extends Component
 			self.QueuePanelEntity.Enable = visible
 		end
 		if visible == false and self.ResultPanelEntity ~= nil then
-			self.ResultPanelEntity.Enable = false
+			_GameUIPolishLogic:HideWindowImmediately(self.ResultPanelEntity)
 		end
 		if self.HasHudContextState and self.IsHudContextVisible == visible then
 			return
@@ -492,36 +487,54 @@ script BattleQueueHudComponent extends Component
 		self:HideAllSkillCooldownTexts()
 		self:HideAllSkillCooldownPips()
 		self.ExecuteButton.Enable = false
-		self.ClearButton.Enable = false
+		self.CanClearQueue = false
 		self:SetResultVisibility("", "", nil)
 		log("[BattleQueueHUD] unavailable reason=" .. reason)
 	end
 
 	@ExecSpace("ClientOnly")
 	method void SetResultVisibility(string battleResult, string stageId, table unionReward)
-		-- Reuses the existing result panel for defeat and the terminal victory receipt without calculating rewards in UI.
+		-- Shows the receipt after the final death presentation, keeping it visible during transfer.
 		local hasCommittedReward = unionReward ~= nil and unionReward.WasCommitted == true and unionReward.RunEnded == true
-		local visible = self.IsHudContextVisible and (battleResult == "Defeat" or (battleResult == "Victory" and hasCommittedReward))
+		local visible = self.IsHudContextVisible and (battleResult == "Defeat" or battleResult == "Victory")
+		local session = _BattleHudPresenterLogic:GetBattleSession()
+		if self._T.ResultEntryId ~= (session ~= nil and session.EntryRequestId or "") then
+			self._T.ResultEntryId = session ~= nil and session.EntryRequestId or ""
+			self._T.ResultShown = false
+		end
+		if visible == false then self._T.ResultShown = false end
+		if visible and session ~= nil and session.ResultReady then self._T.ResultShown = true end
+		visible = visible and self._T.ResultShown == true
 		local rewardVisible = visible and hasCommittedReward
-		local lobbyReturnVisible = visible and battleResult == "Defeat"
+		local lobbyReturnVisible = visible
 		if self.ResultPanelEntity ~= nil then
-			self.ResultPanelEntity.Enable = visible
+			if visible then
+				if self.ResultPanelEntity.Enable == false then _GameUIPolishLogic:SetWindowVisible(self.ResultPanelEntity, true) end
+			else
+				_GameUIPolishLogic:HideWindowImmediately(self.ResultPanelEntity)
+			end
 		end
 		self.ResultPanelSprite.Enable = visible
 		self.ResultText.Enable = visible
 		self.UnionRewardText.Enable = rewardVisible
 		self.UnionRewardBreakdownText.Enable = rewardVisible
-		self.ResetButton.Enable = lobbyReturnVisible
+		self.ResetButton.Enable = lobbyReturnVisible and session ~= nil and session.ResultReady
 		self.ResetButtonSprite.Enable = lobbyReturnVisible
 		self.ResetButtonText.Enable = lobbyReturnVisible
 		if visible then
-			self.ResultText.Text = battleResult == "Victory" and "VICTORY" or "DEFEAT"
+			local summary = _EntityService:GetEntityByPath("/ui/BattleQueueHUD/ResultPanel/Summary")
+			if isvalid(summary) and session ~= nil then
+				local stageName = _EntityService:GetEntityByPath("/ui/BattleQueueHUD/ResultPanel/StageName")
+				if isvalid(stageName) then stageName.TextGUIRendererComponent.Text = session.StageDisplayName end
+				summary.TextGUIRendererComponent.Text = "처치  " .. tostring(session.ResultKillCount) .. "마리    ·    소요 시간  " .. string.format("%02d:%02d", math.floor(session.ResultElapsedSeconds / 60), session.ResultElapsedSeconds % 60) .. "\n획득 메소  +" .. tostring(session.ResultGold)
+			end
+			self.ResultText.Text = battleResult == "Victory" and "전투 승리" or "전투 종료"
 			if rewardVisible then
-				self.UnionRewardText.Text = "유니온 포인트 +" .. tostring(unionReward.FinalUnionPoints or 0)
-				self.UnionRewardBreakdownText.Text = "Base +" .. tostring(unionReward.BaseUnionPoints or 0) .. "    Union Bonus +" .. tostring(unionReward.BonusUnionPoints or 0)
+				self.UnionRewardText.Text = "유니온 코인 +" .. tostring(unionReward.FinalUnionPoints or 0)
+				self.UnionRewardBreakdownText.Text = "기본 +" .. tostring(unionReward.BaseUnionPoints or 0) .. "    유니온 보너스 +" .. tostring(unionReward.BonusUnionPoints or 0)
 			end
 			if lobbyReturnVisible then
-				self.ResetButtonText.Text = "시작 마을로"
+				self.ResetButtonText.Text = session ~= nil and session.ResultReady and ((battleResult == "Defeat" or hasCommittedReward) and "로비로 돌아가기" or "보상 확인 · 다음으로") or "처리 중..."
 			end
 		end
 		if battleResult ~= "" then
@@ -836,6 +849,10 @@ script BattleQueueHudComponent extends Component
 		self._T.SkillSlotDragDistance = 0
 		self._T.SkillSlotDragExpectedRevision = self:GetCurrentSkillSlotRevision()
 		self._T.SkillSlotDragLastTouchPoint = dragEvent.TouchPoint
+		local overheadQueueHud = self:GetOverheadQueueHud()
+		if overheadQueueHud ~= nil then
+			overheadQueueHud:SetBottomSkillDragPresentationActive(true)
+		end
 		log("[BattleSkillSlotDrag] begin candidate source=" .. tostring(sourceIndex) .. " touch=" .. tostring(dragEvent.TouchId) .. " revision=" .. tostring(self._T.SkillSlotDragExpectedRevision))
 	end
 
@@ -1210,6 +1227,7 @@ script BattleQueueHudComponent extends Component
 	method void CleanupSkillSlotDragVisuals(boolean refreshHud)
 		local overheadQueueHud = self:GetOverheadQueueHud()
 		if overheadQueueHud ~= nil then
+			overheadQueueHud:SetBottomSkillDragPresentationActive(false)
 			overheadQueueHud:SetBottomSkillDragTargetFeedback(false, false)
 		end
 		if self.SkillSlotDragVisualTimerId > 0 then
@@ -1695,6 +1713,15 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleQuickbarCancelKey(KeyDownEvent event)
+		-- Reuses the former cancel button guard and command; no battle rules change.
+		if event.key == KeyboardKey.Backspace and self.IsHudContextVisible and self.CanClearQueue then
+			self:OnClearClicked()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
 	method void OnClearClicked()
 		log("[BattleQueueHUD] clear clicked")
 		_BattleHudPresenterLogic:RequestClearQueue()
@@ -1702,10 +1729,10 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnResetClicked()
-		-- Prevents duplicate local clicks while the server resets the run and transfers the player.
-		self.ResetButton.Enable = false
+		-- The server owns the in-flight gate; a rejected request cannot strand a disabled local button.
 		log("[BattleQueueHUD] lobby return clicked")
-		_BattleHudPresenterLogic:RequestReturnToLobbyAfterDefeat()
+		local session = _BattleHudPresenterLogic:GetBattleSession()
+		if session ~= nil then session:RequestContinueResult() end
 	end
 
 	@ExecSpace("ClientOnly")

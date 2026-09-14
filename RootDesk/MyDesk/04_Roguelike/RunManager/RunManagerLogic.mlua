@@ -3,9 +3,9 @@ script RunManagerLogic extends Logic
 
 	property integer DefaultRunSeed = 1000
 	property string DefaultJobId = "warrior"
-	property string LobbyPrototypeStageId = "region_01_stage_01"
+	property string LobbyPrototypeStageId = "henesys_stage_01"
 	property string MesoCurrencyId = "gold"
-	property string StartingPotionId = "potion_hp_small"
+	property string StartingPotionId = "orange_potion"
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
@@ -69,17 +69,12 @@ script RunManagerLogic extends Logic
 		if augmentState == nil or augmentState.ActiveRunSequence ~= runState.RunSequence then
 			return { Success = false, Reason = "RUN_AUGMENT_SEQUENCE_MISMATCH", JobId = resolvedJobId }
 		end
-		if runState.SelectedJobPassiveSetId ~= "" then
-			local passiveResult = self:GrantRunAugment(
-				playerEntity,
-				runState.SelectedJobPassiveSetId,
-				"JOB",
-				"job:" .. tostring(runState.RunSequence) .. ":" .. runState.SelectedJobPassiveSetId
-			)
-			if passiveResult.Success == false then
-				return passiveResult
-			end
-		end
+		-- Job utilities replace automatic job augments, including already-started run snapshots.
+		runState.SelectedJobPassiveSetId = ""
+		runState.SelectedJobMechanicId = "NONE"
+		augmentState:RemoveJobPassives()
+		jobSnapshot.PassiveSetId = ""
+		jobSnapshot.MechanicId = "NONE"
 		jobSnapshot.OwnedAugmentSnapshot = augmentState.OwnedAugmentSnapshot
 		jobSnapshot.AugmentRevision = augmentState.AugmentRevision
 		return jobSnapshot
@@ -118,6 +113,9 @@ script RunManagerLogic extends Logic
 		end
 
 		local entryMode = self:ResolveLobbyBattleEntryMode(runState)
+		if runState.RunState == "Completed" then
+			log("[RunManager] completed run restart ready sequence=" .. tostring(runState.RunSequence) .. " stage=" .. stageId .. " mode=" .. entryMode)
+		end
 		return {
 			IsReady = true,
 			Success = true,
@@ -137,6 +135,7 @@ script RunManagerLogic extends Logic
 	method string ResolveLobbyBattleStageId(any runState)
 		-- A selected battle/boss node is authoritative; otherwise use the real StageDefinitions prototype row.
 		if runState ~= nil
+			and runState.RunState == "Active"
 			and (runState.SelectedContentType == "BATTLE" or runState.SelectedContentType == "BOSS")
 			and runState.SelectedContentId ~= "" then
 			return runState.SelectedContentId
@@ -166,6 +165,7 @@ script RunManagerLogic extends Logic
 		end
 		local stageId = self.LobbyPrototypeStageId
 		if runState ~= nil
+			and runState.RunState == "Active"
 			and (runState.SelectedContentType == "BATTLE" or runState.SelectedContentType == "BOSS")
 			and runState.SelectedContentId ~= "" then
 			stageId = runState.SelectedContentId
@@ -632,6 +632,10 @@ script RunManagerLogic extends Logic
 		if flowResult.Success == false then
 			return flowResult
 		end
+		if flowResult.FlowState == "RUN_COMPLETED" then
+			local reward = _UnionRewardServiceLogic:ProcessTerminalContentCompletion(playerEntity, runState.RunSequence, runState.LastCompletedStageId)
+			if reward.Success == false then return reward end
+		end
 		return runState:ApplyContentCompletion(flowResult, completionKey)
 	end
 
@@ -714,7 +718,10 @@ script RunManagerLogic extends Logic
 		if string.find(nodeId or "", "shop_", 1, true) == 1 then
 			local uiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
 			local minimap = isvalid(uiRoot) and uiRoot:GetComponent("script.MinimapUI") or nil
-			if minimap ~= nil then minimap:OpenWorldMapMode("SHOP_CHOICE", "SELECTION_REJECTED:" .. reason, "") end
+			if minimap ~= nil then
+				local clearedStageId = nodeId == "shop_ellinia_nautilus" and "ellinia_stage_04" or "henesys_stage_04"
+				minimap:OpenWorldMapMode("SHOP_CHOICE", "SELECTION_REJECTED:" .. reason, clearedStageId)
+			end
 			log_warning("[WorldMapShop] selection rejected node=" .. nodeId .. " reason=" .. reason)
 			return
 		end
@@ -853,7 +860,15 @@ script RunManagerLogic extends Logic
 		if inventory.ActiveRunSequence ~= runState.RunSequence then
 			return { Success = false, Reason = "RUN_INVENTORY_SEQUENCE_MISMATCH" }
 		end
-		return inventory:ApplyShopPurchase(
+		local effects = _RunShopLogic:GetOrCreateRelicEffects(playerEntity)
+		if effects == nil or not effects.IsInitialized or effects.ActiveRunSequence ~= runState.RunSequence
+			or effects.Definitions[shopEntry.RewardRefId] == nil then
+			return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" }
+		end
+		if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, shopEntry.RewardRefId) > 0 then
+			return { Success = false, Reason = "RELIC_ALREADY_OWNED" }
+		end
+		local purchase = inventory:ApplyShopPurchase(
 			shopEntry.PriceCurrencyId,
 			shopEntry.PriceAmount,
 			shopEntry.RewardType,
@@ -861,6 +876,8 @@ script RunManagerLogic extends Logic
 			shopEntry.RewardAmount,
 			purchaseKey
 		)
+		if purchase.Success then effects:Recalculate() end
+		return purchase
 	end
 
 	@ExecSpace("ServerOnly")

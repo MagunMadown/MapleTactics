@@ -132,10 +132,13 @@ M1 직업 슬롯:
 - 출발 마을의 클리어 조건을 만족하면 해당 Edge의 상점이 열리고, 상점 방문을 마치면 연결된 다음 마을이 선택 가능해진다.
 - 현재 프로토타입은 헤네시스 `1-1` 클리어를 첫 Edge 해금 조건으로 사용한다. 정식 지역 확장 시에는 각 `RegionDefinitions`의 최종 노드 또는 보스 클리어를 기본 조건으로 사용한다.
 - 상점 방문 여부, 구매 결과, 선택 경로와 현재 마을은 서버 권위의 플레이어 Run 상태가 소유한다. 월드맵 UI는 이 Snapshot을 표시하고 요청만 전송한다.
-- 각 Edge 상점은 서로 다른 `ShopId`를 사용하되 `ShopVisitBtn` UI와 공통 Shop Controller를 재사용한다.
+- 각 Edge 상점은 서로 다른 방문 `NodeId`를 유지하고 공통 `shop_relic`을 사용하며 `ShopVisitBtn` UI와 공통 Shop Controller를 재사용한다.
 - `StageMapRoutes`는 각 StageId를 소속 Region의 `region_XX_battle` 또는 `region_XX_boss`로 라우팅한다. 서로 다른 마을을 하나의 Region 물리 맵으로 합치지 않는다.
-- 헤네시스 보스 뒤에는 위·아래 상점 중 하나를 고르는 배타적 분기가 있다. 서버가 승인한 `SelectedContentId`가 현재 런의 경로 원본이며, 상점 완료 뒤에도 반대 경로는 잠긴다.
-- 두 분기는 같은 `shop` 물리 맵을 재사용하되 각자의 `ShopId`와 CSV 상품 목록을 사용한다. 구매 아이템은 능력치 없이 현재 런에만 보관한다.
+- 헤네시스 보스 뒤에는 위·아래 상점 중 하나를 고르는 배타적 분기가 있다. 서버가 승인한 `SelectedNodeId`와 상점 방문 상태의 `ActiveNodeId`가 현재 런의 경로 원본이며, 상점 완료 뒤에도 반대 경로는 잠긴다.
+- 두 분기는 같은 `shop` 물리 맵과 공통 `shop_relic`의 33종을 사용한다. 미보유 유물 중 동일 가중치로 하나만 진열하고 같은 방문에서는 재추첨하지 않는다. 구매 후 판매 완료로 남으며 미구매 퇴장과 전체 보유 시 빈 상점 퇴장을 허용한다.
+- 유물 가격은 1골드, 보유는 현재 런 한정이다. 안경·펜던트·귀고리는 공격력 +1, 모자·신발은 최대 및 현재 체력 +1, 견장·벨트·옷은 방어력 +1이다. 여러 능력치와 서로 다른 유물 효과를 합산한다.
+- 서버가 ID 정렬 후보를 RunSeed·NodeId·방문 순번으로 결정적으로 추첨하고 진열 ID만 구매 허용한다. 데이터 정의와 가격은 새 런에 캡처하며 진행 중인 런에는 변경을 소급하지 않는다.
+- 체력은 이전 적용 합계와 차이만 반영해 5/10→6/11을 유지한다. 실제 양수 타격마다 공격력을 더하고 방어력을 빼되 최소 피해 1, UtilityGuardActive는 0을 유지한다. 빗나감·회복에는 적용하지 않는다.
 
 ## 7. 증강 원칙
 
@@ -145,7 +148,7 @@ M1 직업 슬롯:
 - 최종 규격은 Unique, StackAdd, StackRefresh, ExclusiveGroup 정책을 지원한다. 현재 구현은 Unique 1스택뿐이며 나머지는 계획 단계다.
 - 이벤트 무한 재귀를 막기 위해 SourceTag와 MaxDepth를 둔다.
 - 계획된 확률 기반 증강(예: "50% 확률로 후방 공격")은 `ConditionType=CHANCE_ROLL`과 `ConditionValue`(0.0~1.0)로 표현하며, 판정은 RunSeed 기반 결정적 롤을 사용한다. Router/Validator 구현 전에는 실전 데이터에 사용하지 않는다.
-- 유물(상점에서 얻는 시작 증강 포함)도 같은 `AugmentDefinitions`/`AugmentEffects` 스키마를 사용한다. 유물 전용 별도 테이블을 만들지 않는다.
+- 증강은 `AugmentDefinitions`/`AugmentEffects`를 사용하고, 런 상점 유물은 `RelicDefinitions`의 `AttackBonus`·`MaxHpBonus`·`DefenseBonus`를 사용한다. 유물 효과는 `PlayerRunRelicEffectComponent`가 관리한다.
 
 ## 8. MSW 구현 결정
 
@@ -164,7 +167,7 @@ M1 직업 슬롯:
 | 적/플레이어 엔티티 | `.model` + ModelBuilder |
 | 맵 배치 | Region별 `region_XX_battle.map` + `region_XX_boss.map`; 같은 Region 내부 일반 Stage만 전투 맵을 재사용하고 `StageId`와 `MapId`는 CSV로 분리 라우팅 |
 | 월드맵 진행 | `RegionDefinitions` + `NodeDefinitions` + 서버 `PlayerRunStateComponent` Snapshot |
-| 마을 간 상점 | Edge별 `ShopId`, 공통 `ShopVisitBtn`, RUN_SCOPED Shop Controller |
+| 마을 간 상점 | Edge별 `NodeId`, 공통 `shop_relic` 및 `ShopVisitBtn`, RUN_SCOPED Shop Controller |
 | 전투 이벤트 | `@Event extends EventType` |
 | 무상태 규칙 | `@Logic` Resolver/Router |
 | 현재 전투 맵 타입 | MapleTile(0); 전투 유닛 이동은 물리 이동이 아닌 서버 권위 Cell Snapshot |
@@ -181,7 +184,7 @@ M1 직업 슬롯:
 
 - [ ] Phase 0 — 맵/이동/RPC/데이터/큐 재타깃 기술 검증
 - [ ] Phase 1 — 전투 코어 수직 슬라이스 + CSV 기반 단일 전투 맵 재사용
-  - [ ] 헤네시스 이후 분기형 런 상점 — 월드맵 선택·이동 연출, 33종 CSV 상품, NPC 상점 UI, 무구매 퇴장, 선택 경로 잠금
+  - 🟡 통합 유물 상점 — 33종 미보유 랜덤 1개, 방문 고정·구매 검증·효과 합산·HP 차이 적용·단일 행/HUD·경로 잠금. 로컬 Lua 검증 완료, Maker Refresh·Play 검증 대기
   - 🟡 엘리니아 전투 무대 1차 시각 패스 — 전투 구조는 유지하고 헤네시스 복제 장식을 엘리니아 숲 테마로 교체, Maker 화면 검토 대기
 - [ ] Phase 2 — 데이터 기반 타일과 일반 적
 - [ ] Phase 3 — 스테이지와 보스 패턴
@@ -206,7 +209,7 @@ M1 이후 콘텐츠 확장 트랙:
 - 새로운 효과를 완전히 무코드로 정의하는 범용 스크립팅 언어는 만들지 않는다.
 - 모든 일반 적을 BT로 제작하지 않는다.
 - 메타 진행, 과금 연동, 랭킹은 M1 코어 루프 이후로 미룬다.
-- M1은 `ShopDefinitions`/`ShopEntries` 기반 RUN_SCOPED 런 상점의 서버 흐름, NPC 상점 UI와 디버그 DTO를 포함한다. `ShopItemDefinitions` 기반 Meta/World Shop, 능력치·장착, 영구 구매 상태, 실제 결제 연동은 이후 범위다.
+- M1은 `ShopDefinitions`/`ShopEntries` 기반 RUN_SCOPED 런 상점의 서버 흐름, NPC 상점 UI와 디버그 DTO를 포함한다. `ShopItemDefinitions` 기반 Meta/World Shop, 장착, 영구 구매 상태, 실제 결제 연동은 이후 범위다.
 - 커닝시티·엘리니아·페리온·노틸러스·슬리피우드의 완성 전투 콘텐츠는 M1 수직 슬라이스 이후 범위다. M1에서는 6개 도시 표시, 첫 분기, 공통 상점 Edge 계약까지만 검증한다.
 - 상점 퇴장 뒤 엘리니아·커닝시티 경로의 잠금 표시는 M1에 포함하지만 실제 목적지 맵과 Stage 연결은 후속 Backlog다.
 - 스테이지 클리어 보상(`StageRewardDefinitions`)으로 `RUN_SCOPED`/`META_PERSISTENT` 재화를 지급하는 흐름은 M1 범위에 포함한다. `PREMIUM_CASH` 재화는 보상으로 지급하지 않는다.
@@ -251,3 +254,4 @@ M1 이후 콘텐츠 확장 트랙:
 | 2026-08-29 | 추가 | 헤네시스 보스 뒤 위·아래 런 상점 분기와 선택 경로 잠금, 33종 무능력치 런 아이템 상점 UI를 M1에 추가 | 보스 뒤 선택·소비·다음 지역 예고까지 하나의 플레이 가능한 런 흐름으로 연결하기 위함 | GDD §6/§9/§10, Phase 1 분기형 런 상점, NodeDefinitions·ShopDefinitions·ShopEntries, 월드맵·shop.map |
 | 2026-08-29 | 수정 | 전투 맵 타입 문서를 실제 `MapleTile(0)` 구현에 맞추고 `region_05` 노틸러스 콘텐츠 확장을 시작 | 문서의 SideViewRectTile 표기가 실제 전투 맵·Foothold 구성과 달랐으며, 지역 번호와 진행 난이도를 분리해야 함 | GDD §8, Region/Stage/Map 데이터, 노틸러스 제작 가이드 |
 | 2026-09-03 | 추가 | 적 Pattern 공용 행동에 피해 스킬로 끊을 수 있는 `CAST_INTERRUPTIBLE`을 추가하고 킹크랑 2 Phase 버블 캐논에 적용 | 플레이어가 보스의 강한 공격을 수동적으로 피하기만 하지 않고 큐 구성과 공격 횟수로 대응하게 하며, 보스 ID 하드코딩 없이 다른 적도 같은 규격을 재사용하기 위함 | EnemyPatternSteps, EnemyActionPlan, Battle UI DTO, Boss 제작 가이드 |
+| 2026-09-12 | 수정 | 두 상점 목록을 shop_relic 33종 랜덤 단일 진열로 통합하고 유물 세 능력치 추가 | 사용자 확정 계획 구현 | 데이터 사전 §20, Phase 1; 경로 식별은 NodeId 유지, Maker 검증 대기 |
