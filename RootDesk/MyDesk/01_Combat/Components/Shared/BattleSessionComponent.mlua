@@ -4043,6 +4043,9 @@ script BattleSessionComponent extends Component
 		local iconRecords = {}
 		local presentationRuids = {}
 		local presentationSeen = {}
+		for _, ruid in ipairs(_EnemyImpactPresentationLogic:GetResourceRuids()) do
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, ruid)
+		end
 		for _, skillId in ipairs(candidates) do
 			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
 			if definition.Success == true then
@@ -5575,6 +5578,15 @@ script BattleSessionComponent extends Component
 		end
 
 		local castEffectRuid = definition.CastEffectRuid or ""
+		if sourceUnit ~= nil and sourceUnit.Team == "Enemy" then
+			-- Only accepted damage emits enemy hit audio; PUSH/HEAL cannot replay it.
+			self.ActiveHitSoundRuid = ""
+			if _EnemyImpactPresentationLogic:GetHitEffect(sourceUnit.EnemyDefinitionId, definition.SkillId) ~= "" then
+				-- The old CAST is a target hit clip; its replacement belongs to the damaged avatar.
+				castEffectRuid = ""
+				self.ActiveHitEffectRuid = ""
+			end
+		end
 
 		local castSoundRuid = definition.CastSoundRuid or ""
 		if castEffectRuid == "" and castSoundRuid == "" then
@@ -5709,7 +5721,7 @@ script BattleSessionComponent extends Component
 
 		if isvalid(targetEntity) then
 			local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
-			local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnit.UnitId, damageAmount)
+			local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnit.UnitId, damageAmount, attackId)
 			if damageResult.Success == false then
 				result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
 				log_error("[BattleAttack] damage failed source=" .. sourceUnitId .. " target=" .. targetUnit.UnitId .. " reason=" .. damageResult.Reason)
@@ -5831,7 +5843,7 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
-		local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount)
+		local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount, skillId)
 		if damageResult.Success == false then
 			result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
 			return result
@@ -5842,7 +5854,9 @@ script BattleSessionComponent extends Component
 		result.DamageAmount = damageResult.AppliedAmount
 		result.TargetHpBefore = damageResult.HpBefore
 		result.TargetHpAfter = damageResult.HpAfter
-		self:PlayActiveHitEffect(targetUnitId)
+		if damageResult.AppliedAmount > 0 then
+			self:PlayActiveHitEffect(targetUnitId)
+		end
 
 		local attackEvent = BasicAttackResolvedEvent()
 		attackEvent.SourceUnitId = sourceUnitId
@@ -5860,7 +5874,30 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ApplyDamage(string sourceUnitId, string targetUnitId, number amount)
+	method void PlayAcceptedEnemyImpact(Entity sourceEntity, Entity targetEntity, string attackId)
+		-- Called once for positive damage before death cleanup; all selection uses this hit's explicit source and attack.
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourceUnit == nil or targetUnit == nil or presentation == nil then return end
+		if targetUnit.Team == "Enemy" then
+			local sound = _EnemyImpactPresentationLogic:GetDamageSound(targetUnit.EnemyDefinitionId)
+			presentation:PlaySkillSound(targetUnit.UnitId, "MONSTER_DAMAGE", sound, self:GetSkillSoundVolume())
+		elseif targetUnit.Team == "Player" and sourceUnit.Team == "Enemy" then
+			local sound = _EnemyImpactPresentationLogic:GetImpactSound(sourceUnit.EnemyDefinitionId, attackId)
+			presentation:PlaySkillSound(targetUnit.UnitId, "ENEMY_HIT", sound, self:GetSkillSoundVolume())
+			local effect = _EnemyImpactPresentationLogic:GetHitEffect(sourceUnit.EnemyDefinitionId, attackId)
+			if effect ~= "" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(attackId)
+				local scale = definition.EffectScale or 1
+				presentation:PlaySkillEffect(targetUnit.UnitId, "HIT", effect, scale, sourceUnit.Facing == "Right", self:GetSkillSpeedMultiplier())
+			end
+		end
+		log("[EnemyImpact] accepted source=" .. sourceUnit.UnitId .. " target=" .. targetUnit.UnitId .. " attack=" .. tostring(attackId))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyDamage(string sourceUnitId, string targetUnitId, number amount, string attackId)
 		-- Owns the single HP mutation path and forwards the first zero-HP transition to death handling.
 		local result = {
 			Success = false,
@@ -5922,13 +5959,16 @@ script BattleSessionComponent extends Component
 		result.HpBefore = damageResult.HpBefore
 		result.HpAfter = damageResult.HpAfter
 		result.AppliedAmount = damageResult.AppliedAmount
+		if damageResult.AppliedAmount > 0 then
+			self:PlayAcceptedEnemyImpact(sourceEntity, targetEntity, attackId)
+		end
 		local strongHit = amount >= math.max(0.01, self.StrongHitDamageThreshold)
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
 		if sourcePresentation ~= nil then
 			sourcePresentation:PlayHitStop(sourceUnitId, strongHit, self.NormalHitStopDuration, self.StrongHitStopDuration)
 		end
 		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if targetPresentation ~= nil then
+		if targetPresentation ~= nil and damageResult.AppliedAmount > 0 then
 			targetPresentation:PlayHitImpact(targetUnitId, strongHit, self.NormalHitStopDuration, self.StrongHitStopDuration, self.HitReactionDuration, self.HitFlashDuration)
 		end
 		self:PlayImpactCameraShake(strongHit)
