@@ -83,8 +83,8 @@ M1 이후에는 다음 6개 마을을 하나의 도시 경로 그래프로 확�
 | `region_02` | 커닝시티 | `region_02_battle` | `region_02_boss` | `UPPER` 2번째 |
 | `region_03` | 엘리니아 | `region_03_battle` | `region_03_boss` | `LOWER` 2번째 |
 | `region_04` | 페리온 | `region_04_battle` | `region_04_boss` | `UPPER` 3번째 |
-| `region_05` | 노틸러스 | `region_05_battle` | `region_05_boss` | `LOWER` 3번째 |
-| `region_06` | 슬리피우드 | `region_06_battle` | `region_06_boss` | 공통 합류 지역 |
+| `region_05` | 노틸러스 | `nautilus_battle` | `nautilus_boss` | `LOWER` 3번째 |
+| `region_06` | 슬리피우드 | `sleepywood_ant_tunnel` | `sleepywood_food_cart_boss` | 공통 합류 지역 |
 
 - 일반전 물리 맵 재사용 범위는 같은 Region 내부로 제한한다. 예를 들어 커닝시티의 여러 일반 Stage는 `region_02_battle`을 함께 사용하지만 헤네시스의 `region_01_battle`은 사용하지 않는다.
 - 보스전은 지역별 배경과 전조 연출을 독립 제작할 수 있도록 각 Region의 `region_XX_boss` 맵으로 분리한다.
@@ -170,7 +170,7 @@ M1 직업 슬롯:
 | 마을 간 상점 | Edge별 `NodeId`, 공통 `shop_relic` 및 `ShopVisitBtn`, RUN_SCOPED Shop Controller |
 | 전투 이벤트 | `@Event extends EventType` |
 | 무상태 규칙 | `@Logic` Resolver/Router |
-| 권장 맵 타입 | SideViewRectTile(2) |
+| 현재 전투 맵 타입 | MapleTile(0); 전투 유닛 이동은 물리 이동이 아닌 서버 권위 Cell Snapshot |
 
 협업 시 소유권은 다음과 같이 분리한다.
 
@@ -252,4 +252,6 @@ M1 이후 콘텐츠 확장 트랙:
 | 2026-08-25 | 수정 | 등록 CSV 자산으로 6도시 월드맵을 재구성하고 헤네시스 클리어 후 위·아래 상점 중 하나를 선택하는 분기 추가. 위쪽은 커닝시티, 아래쪽은 엘리니아의 동일 1-2 전투로 연결 | 참고 이미지의 상·하 경로 선택과 다음 전투 전 선택적 상점 동선을 구현하기 위함 | `PopupGroup.ui`, `MinimapUI`, `PlayerRunStateComponent`, `RunManagerLogic`, 월드맵 Stage 버튼, Phase 1 Slice 16 |
 | 2026-08-26 | 수정 | 6개 마을 전체 경로와 모든 마을 사이의 Edge 상점을 확정하고 각 마을을 `region_01`~`region_06` 독립 Region·물리 맵 세트로 분리 | 첫 분기 전용 구현을 반복 가능한 구조로 확장하면서 마을별 배경·몬스터·보스 연출을 독립 제작하기 위함 | GDD 플레이 루프·지역/맵 규칙·MSW 구현 결정·로드맵, Phase 1 후속 확장 순서 |
 | 2026-08-29 | 추가 | 헤네시스 보스 뒤 위·아래 런 상점 분기와 선택 경로 잠금, 33종 무능력치 런 아이템 상점 UI를 M1에 추가 | 보스 뒤 선택·소비·다음 지역 예고까지 하나의 플레이 가능한 런 흐름으로 연결하기 위함 | GDD §6/§9/§10, Phase 1 분기형 런 상점, NodeDefinitions·ShopDefinitions·ShopEntries, 월드맵·shop.map |
+| 2026-08-29 | 수정 | 전투 맵 타입 문서를 실제 `MapleTile(0)` 구현에 맞추고 `region_05` 노틸러스 콘텐츠 확장을 시작 | 문서의 SideViewRectTile 표기가 실제 전투 맵·Foothold 구성과 달랐으며, 지역 번호와 진행 난이도를 분리해야 함 | GDD §8, Region/Stage/Map 데이터, 노틸러스 제작 가이드 |
+| 2026-09-03 | 추가 | 적 Pattern 공용 행동에 피해 스킬로 끊을 수 있는 `CAST_INTERRUPTIBLE`을 추가하고 킹크랑 2 Phase 버블 캐논에 적용 | 플레이어가 보스의 강한 공격을 수동적으로 피하기만 하지 않고 큐 구성과 공격 횟수로 대응하게 하며, 보스 ID 하드코딩 없이 다른 적도 같은 규격을 재사용하기 위함 | EnemyPatternSteps, EnemyActionPlan, Battle UI DTO, Boss 제작 가이드 |
 | 2026-09-12 | 수정 | 두 상점 목록을 shop_relic 33종 랜덤 단일 진열로 통합하고 유물 세 능력치 추가 | 사용자 확정 계획 구현 | 데이터 사전 §20, Phase 1; 경로 식별은 NodeId 유지, Maker 검증 대기 |

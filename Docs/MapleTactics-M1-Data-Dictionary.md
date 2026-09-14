@@ -647,6 +647,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 | InitialFacingPolicy | enum | O | 생성 순간 한 번만 결정되는 초기 방향 |
 | TraitIds | string | - | `|` 구분 Trait 목록. 비어 있는 일반 적은 공격 후 기본 1칸 후퇴 |
 | IsBoss | boolean | O | `true`이면 사망 시 `BOSS_KILL` 드롭 Trigger를 함께 발행 |
+| VisualOffsetY | number | - | 몬스터 리소스의 발 피벗을 셀 바닥에 맞추는 월드 Y 보정값. 논리 CellIndex와 판정 위치는 바꾸지 않으며 기본값은 `0` |
 
 허용 MovementPolicy M1: `TRACK_PLAYER`, `FIXED_FACING`.
 
@@ -666,6 +667,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 
 적의 실제 `EnemyModelId`는 외형·컴포넌트 템플릿의 배치 책임이므로 `EnemySpawnPools`에서 연결한다.
 Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponent`에 HP·공격력·패턴·이동 정책을 복사한다.
+`VisualOffsetY`는 `BattleUnitPresentationComponent`에 복사되어 생성·이동·착지에 일관되게 적용된다.
 따라서 서로 다른 정의의 적이 같은 보드에 동시에 살아 있어도 세션 공용 값에 서로 덮어쓰지 않는다.
 
 ## 7. EnemyPatternSteps
@@ -677,7 +679,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 | StepIndex | integer | O | 실행 순서, 1 이상 |
 | ActionType | enum | O | 등록된 EnemyActionType |
 | ConditionType | enum | O | 실행 조건, 기본 ALWAYS |
-| TileId | string | - | TELEGRAPH/EXECUTE_TILE에서 사용. 적이 쓰는 값이므로 `EnemySkillDefinitions`(§4.1)의 SkillId를 넣는다 |
+| TileId | string | - | TELEGRAPH/CAST_INTERRUPTIBLE/EXECUTE_TILE에서 사용. 적이 쓰는 값이므로 `EnemySkillDefinitions`(§4.1)의 SkillId를 넣는다 |
 | TelegraphTurns | integer | O | 준비 턴 수, 0 이상 |
 | ParamA | string | - | 행동별 인자 |
 | ParamB | string | - | 행동별 인자 |
@@ -686,13 +688,14 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 | NextStepOnFailure | integer | - | 비어 있으면 다음 StepIndex |
 | Enabled | boolean | O | `true`인 행만 Repository가 로드 |
 
-허용 ActionType M1: `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE`.
+허용 ActionType M1: `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `CAST_INTERRUPTIBLE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE`.
 
 - `TURN_TO_PLAYER`: 현재 CellIndex는 유지하고 플레이어 방향으로 `Facing`만 바꾼다.
 - `MOVE_TOWARD`: 플레이어 방향으로 `Facing`을 바꾼 뒤 그 방향으로 1칸 이동한다.
 - `MOVE_AWAY`: 플레이어 반대 방향으로 `Facing`을 바꾼 뒤 그 방향으로 1칸 이동한다.
 - `MOVE_FIXED_FACING`: 플레이어 위치를 참조하거나 `Facing`을 바꾸지 않고 현재 방향으로 1칸 이동한다.
 - `TELEGRAPH_TILE`: `TileId`를 `TelegraphTurns`회 예고한다. 보드·HP를 바꾸지 않으며 카운트가 끝난 뒤 성공 Step으로 이동한다.
+- `CAST_INTERRUPTIBLE`: `TileId` 스킬의 캐스팅을 시작한다. `ParamA`는 중단에 필요한 플레이어 피해 스킬 적중 횟수다. 성공 분기는 같은 `TileId`의 `EXECUTE_TILE`이어야 하며, 공격 실행 전 필요한 적중 수에 도달하면 해당 `EXECUTE_TILE`이 실패 분기로 이동한다.
 - `EXECUTE_TILE`: 예고와 분리된 실제 타일 실행이다. 실행 시점의 보드 상태로 대상을 다시 판정한다.
 - `BOSS_JUMP_TELEGRAPH`: 보스 전용. `TileId`가 필수이며, 현재 위치의 반대편 끝 칸을 착지 칸으로 고정하고 공중 상태로 전환한다. 다음 플레이어 턴 동안 보드는 보스를 점유·공격 대상으로 취급하지 않는다.
 - `BOSS_LAND_OPPOSITE`: 보스 전용. `TileId`가 필수이며, 고정된 칸에 착지한 뒤 해당 Skill을 공통 Skill 파이프라인으로 실행한다. 플레이어가 겹치면 중앙 방향 1칸을 우선하고, 막히면 반대 방향 1칸으로 밀어낸 뒤 보스를 배치한다.
@@ -708,7 +711,7 @@ Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponen
 Repository는 `PatternId → StepIndex`로 정렬하고,
 전용 Validator는 SchemaVersion, 연속 StepIndex, Action/Condition enum, TileId와 거리 인자를
 검사한다. Resolver는 `ALWAYS`, `DISTANCE_EQ`, `DISTANCE_LE`, `HP_RATIO_LE`, `CELL_FREE`와 `WAIT`,
-`TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`,
+`TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `CAST_INTERRUPTIBLE`, `EXECUTE_TILE`,
 `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE`를
 실행 가능 타입으로 받는다. `prototype_retreat`는 `MOVE_AWAY`, `prototype_telegraph`는 2턴 예고 뒤
 `enemy_basic_attack` 실행으로 이어지는 재사용 제작 샘플이다.

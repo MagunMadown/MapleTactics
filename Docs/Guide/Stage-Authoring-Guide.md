@@ -83,6 +83,45 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 | `region_01_stage_03` | `region_01_battle` | 4 | 총 6마리. 스포아 가중치 1/3, 후반 Wave는 2마리 |
 | `region_01_stage_04` | `region_01_boss` | 1 | 보스 1, `StageType=BOSS`, 2 Phase |
 
+현재 Region 05 노틸러스는 작은 범위부터 확장 중이다.
+
+| Stage | 물리 맵 | Wave 수 | 기본 구성 |
+|---|---|---:|---|
+| `region_05_stage_01` | `nautilus_battle` | 3 | 파란 리본돼지 총 5마리, 최대 동시 2 |
+| `region_05_stage_02` | `nautilus_interior_01` | 3 | 노란 불가사리·해파리 총 6마리, 최대 동시 2 |
+| `region_05_stage_03` | `nautilus_interior_02` | 4 | 화난 불가사리·쿨한 해파리·클랑 총 8마리, 최대 동시 3 |
+| `region_05_stage_04` | `nautilus_boss` | 1 | 킹크랑 1마리, `StageType=BOSS`, 2 Phase·중단 가능 캐스팅 |
+
+`nautilus_battle`의 첫 맵 테마는 노틸러스 항구 부두다. 해안 배경 앞에 X자 지지대가 있는
+목재 부두를 전투 발판으로 사용한다. 정확한 노틸러스호 리소스가 없을 때는 유사 선박을 억지로
+배치하지 않고 대포·통·화물로 화면 밖에 정박한 배를 암시한다. 5-2는 화물칸, 5-3은 침수 기관실
+배경을 사용한다. 5-4는 침수 기관실 구조를 독립 보스 맵으로 복제한다. 전투용 6칸과 Foothold
+좌표는 유지하며 Region별 분위기는 장식 모델만 교체한다.
+
+새 `.map` 파일을 만들고 `StageMapRoutes`를 추가한 것만으로 Maker Sector 등록이 끝나지는 않는다.
+Maker에서 맵을 Sector에 등록한 뒤 Refresh하고, 맵 이동·Stage 직접 시작을 각각 확인한다.
+복제 맵의 최상위 `EntryKey`도 반드시 `map://<새 MapId>`인지 확인한다. 원본 EntryKey가 남으면
+`LEA-3015` 중복 오류가 발생하고 새 맵이 목록에 나타나지 않는다.
+
+Maker 직접 실행은 MapId 기준 공통 테스트 진입기를 사용한다. 같은 맵의 가장 낮은 StageIndex가
+기본으로 선택되며, 특정 공유 Stage는 `PrototypeTestStageOverride`로만 지정한다. 자세한 절차는
+[Battle-Prototype-Test-Guide.md](Battle-Prototype-Test-Guide.md)를 따른다.
+
+노틸러스의 상세 ID·맵·적 확장 순서는
+[Region-05-Nautilus-Implementation-Plan.md](Region-05-Nautilus-Implementation-Plan.md)를 따른다.
+
+슬리피우드(`region_06`) 전반전은 물리 맵 두 개로 운영한다.
+
+| Stage | 물리 맵 | Wave 수 | 기본 구성 |
+|---|---|---:|---|
+| `region_06_stage_01` | `sleepywood_ant_tunnel` | 3 | 뿔버섯 5 |
+| `region_06_stage_02` | `sleepywood_ant_tunnel` | 4 | 뿔버섯·좀비버섯 7 |
+| `region_06_stage_03` | `sleepywood_ant_tunnel` | 4 | 뿔버섯·좀비버섯·주니어 부기 7 |
+| `region_06_stage_04` | `sleepywood_food_cart_boss` | 보스 | 포장마차 2 Phase, Phase 2 좀비버섯 증원 |
+
+세부 패턴·데이터 수정 위치·직접 테스트 방법은
+[Region-06-Sleepywood-Implementation-Guide.md](Region-06-Sleepywood-Implementation-Guide.md)를 따른다.
+
 스포아는 1-2부터 `region_01_spore_ranged` Enemy Definition으로 등장한다. 사거리는 2칸,
 기본 피해는 1, HP는 2다. 모든 직업의 기본 시작 공격 피해가 2 이상이므로 초반에는 스킬
 한 번으로 처치할 수 있다. `EnemySpawnPools.Weight`를 낮게 두어 원거리 압박이 과해지지 않게 한다.
@@ -105,8 +144,9 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 사용하며 헤네시스 적을 재사용하지 않는다. 보스 규칙은
 [Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)를 따른다.
 
-Node/REST 연결은 별도 제작 영역이다. Stage 행을 추가하는 작업에서 다른 팀이 소유한
-`NodeDefinitions.NextNodeIds`나 REST/상점 Node를 임의로 변경하지 않는다.
+Node/REST 연결은 별도 제작 영역이다. Stage 행을 추가할 때는 담당자와 연결 ID를 합의한 뒤
+`NodeDefinitions.NextNodeIds`를 변경한다. 슬리피우드는 노틸러스 보스 이후의 REST와 6-1~6-4
+사이 REST 연결 ID까지 등록했으며, REST 화면·보상 선택 로직 자체는 수정하지 않았다.
 
 현재 통합 흐름은 `1-1 → REST → 1-2 → REST → 1-3 → REST → 1-4 BOSS → REST`다.
 `StageMapRoutes`는 1-1~1-3을 일반전 공용 `region_01_battle`로 라우팅하고,
@@ -116,7 +156,7 @@ StageId로 해당 Stage·Wave 데이터를 시작한다.
 
 ## 물리 맵과 장식 교체 규칙
 
-- 일반전 장식은 `region_01_battle.map`, 보스전 장식은 `region_01_boss.map`에서 관리한다.
+- Region별 일반전·보스전 장식은 각 `region_NN_battle.map`, `region_NN_boss.map`에서 관리한다.
 - 장식 이미지는 맵 엔티티에 직접 하드코딩하지 않고 `RootDesk/MyDesk/Models/Objects/`의
   `Henesys*`, `MushmomBossGrove` 모델에서 `SpriteRUID`를 교체한다.
 - 장식은 화면 가장자리와 후경에 두고, 중앙 6칸·유닛·공격 전조·Intent UI 영역은 비운다.
@@ -126,6 +166,8 @@ StageId로 해당 Stage·Wave 데이터를 시작한다.
 - 새 보스 맵을 만들 때는 일반전 맵의 전투 컴포넌트 계약을 복제한 뒤 배경·장식만 분리한다.
 - `region_01_boss`는 원작 머쉬맘의 `남의 집`을 참고해 큰 버섯집·꽃 울타리·작은 버섯·무성한 수풀로 구성한다. 다음 Region 후보는 전투 장식에 섞지 않고 클리어 이후 Node/Run Flow UI에서 표시한다.
 - 물리 맵을 추가하거나 이름을 바꾸면 `StageMapRoutes.csv`와 Maker의 Sector 맵 등록을 함께 확인한다.
+- 현재 실제 전투 맵은 `TileMapMode=0` MapleTile이며 서버 권위 Cell Snapshot 이동을 사용한다.
+  새 Region 맵은 검증된 전투 맵을 복제하고 맵 타입을 임의로 전환하지 않는다.
 
 보스 Stage 제작 규칙은 [Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)를 따른다.
 

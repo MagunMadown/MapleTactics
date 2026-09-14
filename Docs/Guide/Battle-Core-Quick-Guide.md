@@ -460,6 +460,7 @@ HP가 0이 되면 `ApplyDamage → HandleUnitDied`가 한 번만 실행된다. �
 | `BasicAttackDamage` | 해당 적 유닛의 기본 공격 피해 |
 | `PatternId` | 적 Intent를 만드는 패턴 키 |
 | `MovementPolicy` | `TRACK_PLAYER` 또는 `FIXED_FACING` |
+| `VisualOffsetY` | 리소스별 발 피벗 높이 보정. 논리 셀·공격 판정에는 영향 없음 |
 
 ```csv
 EnemyDefinitionId,DisplayName,MaxHp,BasicAttackDamage,PatternId,MovementPolicy
