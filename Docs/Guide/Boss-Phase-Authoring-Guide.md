@@ -111,7 +111,7 @@ Session에 보스별 조건문을 추가하지 않는다.
 |---|---|
 | Stage | `region_06_stage_04`, `StageType=BOSS`, 1 Wave (`CLEAR_ONLY`) |
 | Enemy | `region_06_jr_balrog`, HP 36, `BasicAttackDamage=5`, `IsBoss=true` |
-| Model | `region06jrbalrog` (`Scale=0.6`) |
+| Model | `region06jrbalrog` (`Scale=1.2`, 화염구 `ProjectileHeight=1.2`) |
 | 할퀴기 (`attack1`) | `region_06_jr_balrog_claw`, 전방 1칸, 피해는 `BasicAttackDamage=5` |
 | 화염구 (`attack2`) | `region_06_jr_balrog_fireball`, 전방 3칸 안 첫 적에게 `info/ball` 투사체, 피해 4, 쿨타임 2 |
 | 불꽃 휩쓸기 (`attack3`) | `region_06_jr_balrog_flame_sweep`, 1턴 예고 후 전방 1~3칸, 피해 6 |
