@@ -61,9 +61,15 @@ nautilus_stage04_boss
 → sleepywood_stage02 → sleepywood_rest_after_stage02
 → sleepywood_stage03 → sleepywood_rest_after_stage03
 → sleepywood_stage04_boss
+→ sleepywood_reward_after_stage04
+→ sleepywood_stage05_battle → sleepywood_reward_after_stage05
+→ sleepywood_stage06_battle → sleepywood_reward_after_stage06
+→ sleepywood_stage07_battle → sleepywood_reward_after_stage07
+→ sleepywood_stage08_boss
 ```
 
 REST 화면·보상 선택 구현은 다른 기능 소유 영역이며, 이 문서는 연결 ID 계약만 정의한다.
+6-5 이후는 아래 후반전(신전) 절을 따른다.
 
 ## 5. 직접 테스트
 
@@ -78,3 +84,28 @@ REST 화면·보상 선택 구현은 다른 기능 소유 영역이며, 이 문�
 
 공통 진입 규칙과 테스트 키는
 [Battle-Prototype-Test-Guide.md](Battle-Prototype-Test-Guide.md)를 따른다.
+
+## 6. 후반전(신전)
+
+슬리피우드 후반전은 신전 일반 Stage 3개와 주니어 발록 보스 Stage로 구성하며, 6-4 포장마차 보스
+다음 REST에서 이어진다.
+
+| 물리 MapId | 사용하는 Stage | 역할 |
+|---|---|---|
+| `sleepywood_temple_battle` | `region_06_stage_05`~`07` | 신전 일반전 공용 맵 (`kerning_city_battle` 복제) |
+| `sleepywood_temple_boss` | `region_06_stage_08` | 주니어 발록 전용 보스맵 |
+
+| Stage | 표시명 | 주요 적 | Wave 수 |
+|---|---|---|---:|
+| `region_06_stage_05` | 6-5 신전 입구 | 와일드카고, 타우로스피어 | 3 |
+| `region_06_stage_06` | 6-6 신전 회랑 | 와일드카고, 타우로스피어, 타우로마시스 | 3 |
+| `region_06_stage_07` | 6-7 신전 제단 | 타우로스피어, 타우로마시스 | 3 |
+| `region_06_stage_08` | 6-8 주니어 발록 | 주니어 발록 | 보스 (증원 없음) |
+
+- 와일드카고는 `QUICK` 근접, 타우로스피어는 2칸 찌르기와 1턴 예고 휩쓸기, 타우로마시스는 `HEAVY` 근접이다.
+- 주니어 발록은 할퀴기, 전방 3칸 화염구 투사체, 1턴 예고 불꽃 휩쓸기(격노 시 강화)를 사용한다.
+- 신전 배틀맵은 발판 높이가 달라 6-5~6-7이 `CellStartX=-2.9027`, `UnitY=-1.93`을 사용한다.
+- 신전 적의 피격음·사망음과 스킬별 적중음은 `EnemyImpactPresentations.csv`에 있다.
+
+세부 수치·패턴은 [Stage-Authoring-Guide.md](Stage-Authoring-Guide.md)의 슬리피우드 후반전 절과
+[Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)의 주니어 발록 예시를 따른다.

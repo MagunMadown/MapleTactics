@@ -144,9 +144,50 @@ Maker 직접 실행은 MapId 기준 공통 테스트 진입기를 사용한다. 
 사용하며 헤네시스 적을 재사용하지 않는다. 보스 규칙은
 [Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)를 따른다.
 
+슬리피우드(`region_06`) 후반전은 신전 맵 두 개로 운영한다. 메인 런(`prototype_run`)에서 6-4 포장마차
+보스 다음 `sleepywood_reward_after_stage04`(REST)를 거쳐 `6-5 → REST → 6-6 → REST → 6-7 → REST → 6-8 BOSS`
+순서로 이어진다.
+
+| Stage | 물리 맵 | Wave 수 | 기본 구성 |
+|---|---|---:|---|
+| `region_06_stage_05` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 와일드카고 2 → 타우로스피어 1 |
+| `region_06_stage_06` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 타우로스피어 2 → 타우로마시스 1 |
+| `region_06_stage_07` | `sleepywood_temple_battle` | 3 | 타우로스피어 2 → 타우로마시스 2 → 타우로마시스 1 |
+| `region_06_stage_08` | `sleepywood_temple_boss` | 1 | 보스 주니어 발록 1, `StageType=BOSS`, 2 Phase, 증원 없음 |
+
+커닝시티와 같은 Wave 규칙(`TURN_LIMIT` 3턴, `MaxConcurrent=2`, 적 1종 전용 Pool)을 사용한다.
+
+`sleepywood_temple_battle`은 `kerning_city_battle`을 복제한 맵이라 `BattleCell1~6`이 x `-2.9027`에
+있고 칸 아래 발판 높이가 y `-1.93`이다. 따라서 6-5~6-7은 `CellStartX=-2.9027`, `UnitY=-1.93`을
+사용한다. `sleepywood_temple_boss`는 발판 높이가 y `0`이라 6-8은 `CellStartX=-2.8`, `UnitY=0`이다.
+신전 적의 `EnemyDefinitions.VisualOffsetY`는 비워 둔다(0).
+
+플레이어는 Body가 있어 발판 위에 서지만 적 모델에는 Body가 없어 `UnitY`에 그대로 배치된다. 따라서
+`UnitY`는 칸 타일 위치가 아니라 **칸 x 위치의 발판 y값**과 같아야 적 발이 플레이어와 같은 높이에 선다.
+물리 맵을 복제해 Stage에 연결할 때는 `MapBuilder.getFootholds()`로 칸 아래 발판 높이를 확인해
+`CellStartX`/`UnitY`에 반영한다.
+
+| 적 | HP / 공격 | 역할 |
+|---|---|---|
+| `region_06_wild_kargo` | 8 / 4 | 근접, `QUICK`. attack 클립이 없어 `jump` 클립을 들이받기 모션으로 사용 |
+| `region_06_taurospear` | 9 / 4 | `attack1` 창 찌르기(`FIRST_ENEMY_FORWARD` 2칸, 쿨타임 2) → `attack2` 1턴 예고 휩쓸기(`RANGE_OFFSETS 1\|2`, 피해 5)를 번갈아 사용 |
+| `region_06_tauromacis` | 13 / 5 | 근접, `HEAVY`. `attack1/info/hit` 클립을 적중 효과로 사용 |
+
+모델은 `RootDesk/MyDesk/Models/Monsters/Region06*.model`이며 일반 적은 리소스가 커서 `Scale=0.75`,
+주니어 발록은 `Scale=1.2`를 사용한다.
+
+신전 적의 피격음·사망음과 스킬별 적중음은 `EnemyImpactPresentations.csv`에서 관리한다. 적 행
+(`SkillId=*`)의 `DamageSoundRuid`에 리소스 팩 `audio/Damage`, `DeathSoundRuid`에 `audio/Die`를 넣고,
+타우로스피어·주니어 발록의 `audio/CharDamN`은 해당 `SkillId` 행의 `ImpactSoundRuid`로 지정한다.
+사망음은 `BattleSessionComponent.HandleUnitDiedFromSource`가 적 사망이 확정된 직후 한 번 재생한다.
+몬스터 도감(`MonsterCodexProvider.GetVictoriaRegions`)은 `CollectionUI`의 지역 버튼이 4개뿐이라 아직
+슬리피우드를 등록하지 않았다. 버튼 없이 지역만 추가하면 도감 네비게이션 연결 전체가 실패한다.
+
 Node/REST 연결은 별도 제작 영역이다. Stage 행을 추가할 때는 담당자와 연결 ID를 합의한 뒤
 `NodeDefinitions.NextNodeIds`를 변경한다. 슬리피우드는 노틸러스 보스 이후의 REST와 6-1~6-4
 사이 REST 연결 ID까지 등록했으며, REST 화면·보상 선택 로직 자체는 수정하지 않았다.
+후반전(신전)은 `sleepywood_stage04_boss.NextNodeIds`를 `sleepywood_reward_after_stage04`로 바꿔
+6-5~6-8 노드를 이어 붙였다.
 
 현재 통합 흐름은 `1-1 → REST → 1-2 → REST → 1-3 → REST → 1-4 BOSS → REST`다.
 `StageMapRoutes`는 1-1~1-3을 일반전 공용 `region_01_battle`로 라우팅하고,
