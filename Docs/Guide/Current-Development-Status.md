@@ -1,7 +1,7 @@
 # MapleTactics 현재 개발 현황
 
 기준일: 2026-08-30
-기준 브랜치: `feat/jjr/region-05-nautilus`
+기준 브랜치: `feat/jjr/temp-develop-nautilus-integration`
 
 ## 1. 현재 도달한 수직 슬라이스
 
@@ -42,11 +42,13 @@
 | Region 1 일반 전투 | 1-1~1-3 Stage/Wave/Pool 및 근접·원거리 적 데이터 완료 | 가능 |
 | Region 1 보스 전투 | 1-4 보스, 2 Phase, 예고→범위 공격 규격·데이터 완료 | 가능 |
 | Region 5 노틸러스 | 5-1 실행 및 5-2·5-3 전용 맵·Wave 1 스폰 검증 완료 | 확장 가능 |
+| Region 6 슬리피우드 전반전 | 6-1~6-3 공용 일반맵, 6-4 포장마차 보스맵·적 패턴·Node 연결 구현 | 밸런스 검증 가능 |
 | Run Shop | 데이터 상품, 서버 구매, 종료/건너뛰기 구현 | 가능 |
 | 콘텐츠 전체 Validator | 시작 Gate와 행 단위 오류 계약 구현 | 가능 |
 | 최종 전투/상점/지도 UI | DTO만 제공 | UI 팀 작업 필요 |
 | EVENT·REST 소비기 | Handler만 존재 | 미구현 |
 | StageId→MapId Adapter | `StageMapRoutes` Repository와 Gateway/Transition 연결 구현 | 확장 가능 |
+| 공통 전투 테스트 진입 | 전용 `battle_test_hub`의 Stage·직업·Seed 선택, MapId 기본 Stage 자동 선택, 공용 맵 Override, Prototype 전용 F8 | 사용 가능 |
 | Instance Map 정책 | 미확정 | 합의 필요 |
 | 보스 Phase | HP 임계 전환·Pattern 교체·UI DTO 최소 규격 완료 | 확장 가능 |
 | 증강 3택·4직업 | 미구현 | 후속 작업 |
@@ -56,35 +58,42 @@
 
 마지막 전체 검증 로그 기준:
 
-- Stage: 7
-- Region: 2
-- Skill: 45
-- Skill Effect Step: 50
+- Stage: 24
+- Region: 6
+- Skill: 67
+- Skill Effect Step: 64
 - Job: 5
 - Augment: 5
-- Node Graph: 1
-- Enemy Pattern: 13
-- Boss Phase Owner: 1
-- Stage Reward: 7
-- Shop: 0
-- Shop Entry: 0
+- Node Graph: 3
+- Enemy Pattern: 36
+- Boss Phase Owner: 6
+- Stage Reward: 18
+- Shop: 2
+- Shop Entry: 33
 
-2026-08-30 기준으로 `region_05_battle`의 항구 부두 배경과 목재 발판을 Maker에서 확인했다.
+2026-08-30 기준으로 `nautilus_battle`의 항구 부두 배경과 목재 발판을 Maker에서 확인했다.
 대체 선박은 제거하고 대포·통·부두로 노틸러스 항구를 표현한다. 5-2는 노틸러스 내부의 녹색
 화물칸, 5-3은 어두운 기관실 전용 배경으로 분리했다. 두 맵 모두 Maker 등록·이동·직접 Stage 시작과
 Wave 1 적 스폰을 확인했다.
 
-이번 전체 Validator 로그는 `regions=2`, `stages=7`, `stageMapRoutes=7`, `skills=45`,
-`effectSteps=50`, `enemyPatterns=13`, `stageRewards=7`로 `VALID`를 반환했다.
+2026-09-09 슬리피우드 추가 후 전체 Validator 로그는 `regions=6`, `stages=24`,
+`stageMapRoutes=24`, `skills=67`, `effectSteps=64`, `enemyPatterns=36`,
+`bossPhaseOwners=6`, `stageRewards=18`로 `VALID`를 반환했다.
+
+2026-09-11에는 `battle_test_hub` 전용 시작맵과 데이터 기반 Stage·직업·Seed 선택 UI를 추가했다.
+선택 결과는 운영 `BattleGateway`의 `NEW_RUN` 진입 계약을 재사용하며, 서버 검증을 통과한
+허브 진입만 Prototype Test Mode와 F8 강제 클리어 권한을 얻는다.
 
 ## 4. 마지막 Maker 검증
 
 검증 환경은 `map01`, `TileMapMode=0` MapleTile이다. 전투 유닛 이동은 물리 이동이 아니라
 서버 권위 논리 Cell Snapshot 방식이다.
 
-- Build Console: Info 247, Warning 0, Error 0
-- Runtime Warning/Error: 0
+- Build Console: Info 640, Warning 3, Error 0
+- 슬리피우드 일반전·보스전 Runtime Error: 0
 - Content Integrity Gate: `VALID`
+- `sleepywood_ant_tunnel`: 6-1 뿔버섯 Wave 1 스폰 확인
+- `sleepywood_food_cart_boss`: 포장마차 HP 38, Phase 1 패턴 초기화 확인
 - 상점 구매 없이 건너뛰기: `RUN_COMPLETED`
 - 물약 구매: Gold `5 → 3`, `potion_hp_small` 1개 지급
 - 동일 종료 요청: `DUPLICATE_CONTENT_COMPLETION_IGNORED`
