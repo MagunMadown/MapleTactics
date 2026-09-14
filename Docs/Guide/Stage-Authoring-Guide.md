@@ -117,6 +117,15 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 
 커닝시티와 같은 Wave 규칙(`TURN_LIMIT` 3턴, `MaxConcurrent=2`, 적 1종 전용 Pool)을 사용한다.
 
+`sleepywood_temple_battle`은 `kerning_city_battle`을 복제한 맵이라 `BattleCell1~6`이 x `-2.9027`에
+있고 칸 아래 발판 높이가 y `-1.93`이다. 따라서 6-1~6-3은 `CellStartX=-2.9027`, `UnitY=-1.93`을
+사용한다. `sleepywood_temple_boss`는 발판 높이가 y `0`이라 6-4는 `CellStartX=-2.8`, `UnitY=0`이다.
+
+플레이어는 Body가 있어 발판 위에 서지만 적 모델에는 Body가 없어 `UnitY`에 그대로 배치된다. 따라서
+`UnitY`는 칸 타일 위치가 아니라 **칸 x 위치의 발판 y값**과 같아야 적 발이 플레이어와 같은 높이에 선다.
+물리 맵을 복제해 Stage에 연결할 때는 `MapBuilder.getFootholds()`로 칸 아래 발판 높이를 확인해
+`CellStartX`/`UnitY`에 반영한다.
+
 | 적 | HP / 공격 | 역할 |
 |---|---|---|
 | `region_06_wild_kargo` | 8 / 4 | 근접, `QUICK`. attack 클립이 없어 `jump` 클립을 들이받기 모션으로 사용 |
