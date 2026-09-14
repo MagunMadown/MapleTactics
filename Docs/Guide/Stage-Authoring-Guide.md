@@ -105,6 +105,32 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 사용하며 헤네시스 적을 재사용하지 않는다. 보스 규칙은
 [Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)를 따른다.
 
+슬리피우드(`region_06`) 전투 Stage는 다음처럼 분리돼 있다. Node Graph는 독립된 `sleepywood_run`이며
+보스 Stage는 아직 없다.
+
+| Stage | 물리 맵 | Wave 수 | 기본 구성 |
+|---|---|---:|---|
+| `region_06_stage_01` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 와일드카고 2 → 타우로스피어 1 |
+| `region_06_stage_02` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 타우로스피어 2 → 타우로마시스 1 |
+| `region_06_stage_03` | `sleepywood_temple_battle` | 3 | 타우로스피어 2 → 타우로마시스 2 → 타우로마시스 1 |
+
+커닝시티와 같은 Wave 규칙(`TURN_LIMIT` 3턴, `MaxConcurrent=2`, 적 1종 전용 Pool)을 사용한다.
+
+| 적 | HP / 공격 | 역할 |
+|---|---|---|
+| `region_06_wild_kargo` | 8 / 4 | 근접, `QUICK`. attack 클립이 없어 `jump` 클립을 들이받기 모션으로 사용 |
+| `region_06_taurospear` | 9 / 4 | `attack1` 창 찌르기(`FIRST_ENEMY_FORWARD` 2칸, 쿨타임 2) → `attack2` 1턴 예고 휩쓸기(`RANGE_OFFSETS 1\|2`, 피해 5)를 번갈아 사용 |
+| `region_06_tauromacis` | 13 / 5 | 근접, `HEAVY`. `attack1/info/hit` 클립을 적중 효과로 사용 |
+
+모델은 `RootDesk/MyDesk/Models/Monsters/Region06*.model`이며 리소스가 커서 `Scale=0.75`를 사용한다.
+
+`EnemyDefinitions`의 `DamageSoundRuid`(피격)와 `DeathSoundRuid`(사망)는 적 자신의 반응 사운드다.
+리소스 팩의 `audio/Damage`, `audio/Die` RUID를 넣으며, 비워 두면 소리가 나지 않는다. 볼륨은
+`BattleSessionComponent.SkillSoundVolume`을 따른다. 스킬의 `HitSoundRuid`(공격자 적중음)와는 별개로
+함께 재생된다.
+몬스터 도감(`MonsterCodexProvider.GetVictoriaRegions`)은 `CollectionUI`의 지역 버튼이 4개뿐이라 아직
+슬리피우드를 등록하지 않았다. 버튼 없이 지역만 추가하면 도감 네비게이션 연결 전체가 실패한다.
+
 Node/REST 연결은 별도 제작 영역이다. Stage 행을 추가하는 작업에서 다른 팀이 소유한
 `NodeDefinitions.NextNodeIds`나 REST/상점 Node를 임의로 변경하지 않는다.
 
