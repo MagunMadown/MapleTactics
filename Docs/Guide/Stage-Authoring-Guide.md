@@ -106,13 +106,14 @@ MSW 좌표는 world unit이며 `1 unit = 100 px` 기준이다. 화면 픽셀 값
 [Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)를 따른다.
 
 슬리피우드(`region_06`) 전투 Stage는 다음처럼 분리돼 있다. Node Graph는 독립된 `sleepywood_run`이며
-보스 Stage는 아직 없다.
+`6-1 → REST → 6-2 → REST → 6-3 → REST → 6-4 BOSS` 순서다.
 
 | Stage | 물리 맵 | Wave 수 | 기본 구성 |
 |---|---|---:|---|
 | `region_06_stage_01` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 와일드카고 2 → 타우로스피어 1 |
 | `region_06_stage_02` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 타우로스피어 2 → 타우로마시스 1 |
 | `region_06_stage_03` | `sleepywood_temple_battle` | 3 | 타우로스피어 2 → 타우로마시스 2 → 타우로마시스 1 |
+| `region_06_stage_04` | `sleepywood_temple_boss` | 1 | 보스 주니어 발록 1, `StageType=BOSS`, 2 Phase, 증원 없음 |
 
 커닝시티와 같은 Wave 규칙(`TURN_LIMIT` 3턴, `MaxConcurrent=2`, 적 1종 전용 Pool)을 사용한다.
 

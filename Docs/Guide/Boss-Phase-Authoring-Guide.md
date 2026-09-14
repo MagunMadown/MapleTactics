@@ -102,6 +102,28 @@ Wave 2는 보스 전용 Pool이 아니라 일반 적 `region_kerning_ligator`(HP
 Phase 연동 증원을 넣을 때는 Pattern이 아니라 `StageEnemyWaves` 행에 선언하고,
 Session에 보스별 조건문을 추가하지 않는다.
 
+## Region 06 슬리피우드 Stage 6-4 주니어 발록 예시
+
+`region_06_stage_04`는 슬리피우드 신전의 보스 스테이지다. 물리 맵은 `sleepywood_temple_boss`이며
+리소스 팩의 공격 3종을 모두 스킬로 사용한다. 증원은 없다.
+
+| 구분 | 설정 |
+|---|---|
+| Stage | `region_06_stage_04`, `StageType=BOSS`, 1 Wave (`CLEAR_ONLY`) |
+| Enemy | `region_06_jr_balrog`, HP 36, `BasicAttackDamage=5`, `IsBoss=true` |
+| Model | `region06jrbalrog` (`Scale=0.6`) |
+| 할퀴기 (`attack1`) | `region_06_jr_balrog_claw`, 전방 1칸, 피해는 `BasicAttackDamage=5` |
+| 화염구 (`attack2`) | `region_06_jr_balrog_fireball`, 전방 3칸 안 첫 적에게 `info/ball` 투사체, 피해 4, 쿨타임 2 |
+| 불꽃 휩쓸기 (`attack3`) | `region_06_jr_balrog_flame_sweep`, 1턴 예고 후 전방 1~3칸, 피해 6 |
+| 격노 휩쓸기 | `region_06_jr_balrog_flame_sweep_enraged`, 1턴 예고 후 전방 1~3칸, 피해 7 |
+| Phase 1 | `OPENING`: 할퀴기 → 화염구 → 대기 → 휩쓸기 예고 → 실행 → 대기 |
+| Phase 2 | HP 50% 이하 `ENRAGED`: 격노 휩쓸기 예고 → 실행 → 화염구 → 할퀴기 → 대기 |
+| 처치 드롭 | 골드 8~10, 하얀 포션 1개 |
+
+화염구는 적 스킬 최초의 투사체 사용 사례다. 투사체 연출은 플레이어 스킬과 같은
+`LaunchSkillProjectile` 경로를 쓰며, 조준 셀은 `_SkillTargetResolverLogic`이 정한다.
+각 공격의 `attackN/info/effect`는 `CastEffectRuid`, `attackN/info/hit`는 `HitEffectRuid`에 넣는다.
+
 ## 검증 체크리스트
 
 1. 전체 Validator에서 `bossPhaseOwners`가 증가한다.
