@@ -9,12 +9,12 @@
 ## 현재 상태
 
 - ✅ `region_05`와 5-1~5-3 Stage/Wave/Route/Reward 데이터 추가
-- ✅ `region_05_battle.map` 항구 외부 화면과 기존 전투 규격 Maker 검증
+- ✅ `nautilus_battle.map` 항구 외부 화면과 기존 전투 규격 Maker 검증
 - ✅ 파란 리본돼지·불가사리·해파리·클랑 모델/패턴/스킬/드롭 추가
-- ✅ `region_05_interior_01.map` 화물칸 생성 — Maker 등록·화면·5-2 Wave 1 스폰 검증
-- ✅ `region_05_interior_02.map` 침수 기관실 생성 — Maker 등록·화면·5-3 Wave 1 스폰 검증
+- ✅ `nautilus_interior_01.map` 화물칸 생성 — Maker 등록·화면·5-2 Wave 1 스폰 검증
+- ✅ `nautilus_interior_02.map` 침수 기관실 생성 — Maker 등록·화면·5-3 Wave 1 스폰 검증
 - ✅ 킹크랑 전용 모델·2 Phase·중단 가능 버블 캐논 데이터/공용 로직 구현
-- ✅ `region_05_boss.map`과 5-4 Stage/Wave/Spawn Pool/Route/Reward/Drop 연결
+- ✅ `nautilus_boss.map`과 5-4 Stage/Wave/Spawn Pool/Route/Reward/Drop 연결
 - 🟡 5-4 직접 플레이 밸런스와 바닥 전조·Queue 아이콘 시각 품질 검증
 - ✅ 엘리니아 보스 보상 노드에서 노틸러스 5-1~5-4 Node 체인 연결
 
@@ -24,13 +24,13 @@
 |---|---|
 | Region | `region_05` |
 | 첫 Stage | `region_05_stage_01` |
-| 일반전 물리 맵 | `region_05_battle` |
+| 일반전 물리 맵 | `nautilus_battle` |
 | 첫 Wave Table | `region_05_stage_01_waves` |
 | 첫 Pool | `region_05_stage_01_pool` |
 | 첫 적 | `region_05_blue_ribbon_pig` |
 | 첫 적 모델 | `region05blueribbonpig` |
 | 보스 Stage | `region_05_stage_04` |
-| 보스 물리 맵 | `region_05_boss` |
+| 보스 물리 맵 | `nautilus_boss` |
 | 보스 Spawn Pool | `region_05_stage_04_boss_pool` |
 | 보스 적/모델 | `region_05_king_clang` / `region05kingclang` |
 
@@ -48,7 +48,7 @@ ID의 숫자나 단어를 `match`, `find`, `sub`로 해석하지 않는다. 소�
 
 ## 5-2 콘텐츠
 
-- 물리 맵: `region_05_interior_01` (노틸러스 화물칸)
+- 물리 맵: `nautilus_interior_01` (노틸러스 화물칸)
 - Wave 4개, `1 → 2 → 2 → 2마리`로 총 7마리, 최대 동시 2마리
 - 노란 불가사리: HP 4, 전방 1칸 근접 공격
 - 해파리: HP 6, 전방 최대 2칸 원거리 공격, 재사용 대기 3
@@ -58,7 +58,7 @@ ID의 숫자나 단어를 `match`, `find`, `sub`로 해석하지 않는다. 소�
 
 ## 5-3 콘텐츠
 
-- 물리 맵: `region_05_interior_02` (침수 기관실)
+- 물리 맵: `nautilus_interior_02` (침수 기관실)
 - Wave 4개, 총 8마리, 최대 동시 3마리
 - 화난 불가사리: HP 5, 인접 시 1턴 예고 후 피해 2
 - 쿨한 해파리: HP 7, 전방 최대 2칸 원거리 공격, 재사용 대기 4
@@ -68,7 +68,7 @@ ID의 숫자나 단어를 `match`, `find`, `sub`로 해석하지 않는다. 소�
 
 ## 5-4 콘텐츠
 
-- 물리 맵: `region_05_boss` (킹크랑이 침입한 침수 선내)
+- 물리 맵: `nautilus_boss` (킹크랑이 침입한 침수 선내)
 - 단일 Wave, 킹크랑 1마리, 최대 동시 1마리
 - 킹크랑: HP 26, 기본 피해 3, HP 50%에서 Phase 2 전환
 - 행동: 집게 근접 공격, 공통 후퇴, 중단 가능한 버블 캐논 캐스팅
@@ -103,10 +103,10 @@ Cell Snapshot으로 이동한다. 노틸러스에서도 맵 타입을 바꾸지 
 
 | 물리 맵 | 자동 시작 Stage |
 |---|---|
-| `region_05_battle` | `region_05_stage_01` |
-| `region_05_interior_01` | `region_05_stage_02` |
-| `region_05_interior_02` | `region_05_stage_03` |
-| `region_05_boss` | `region_05_stage_04` |
+| `nautilus_battle` | `region_05_stage_01` |
+| `nautilus_interior_01` | `region_05_stage_02` |
+| `nautilus_interior_02` | `region_05_stage_03` |
+| `nautilus_boss` | `region_05_stage_04` |
 
 `AutoStartPrototypeBattle=true`인 단독 Play는 단순히 Wave만 생성하지 않는다. 정식 전투 진입과
 동일한 `NEW_RUN` 초기화 경로를 사용해 직업 HP, 시작 스킬, Queue 크기, Run 인벤토리와 Stage
@@ -168,7 +168,7 @@ Stage 보상 기록과 다음 Node 준비를 실제 클리어와 동일하게 �
 - Region 01 전투 회귀 이상 없음
 - Build/Runtime Warning·Error 0
 
-2026-08-30 첫 Refresh에서는 복제 맵의 `EntryKey`가 원본 `map://region_05_battle`로 남아
+2026-08-30 첫 Refresh에서는 복제 맵의 `EntryKey`가 원본 `map://nautilus_battle`로 남아
 `LEA-3015`가 발생했다. 각 맵의 고유 EntryKey로 수정한 뒤 Maker 등록과 이동이 정상화됐다.
 5-2는 노란 불가사리 2마리, 5-3은 화난 불가사리 1마리의 Wave 1 스폰까지 직접 검증했다.
-2026-09-04에는 `region_05_boss`를 별도 생성하고 5-4 데이터 연결 및 직접 Play 자동 시작 설정을 추가했다.
+2026-09-04에는 `nautilus_boss`를 별도 생성하고 5-4 데이터 연결 및 직접 Play 자동 시작 설정을 추가했다.

@@ -83,8 +83,8 @@ M1 이후에는 다음 6개 마을을 하나의 도시 경로 그래프로 확�
 | `region_02` | 커닝시티 | `region_02_battle` | `region_02_boss` | `UPPER` 2번째 |
 | `region_03` | 엘리니아 | `region_03_battle` | `region_03_boss` | `LOWER` 2번째 |
 | `region_04` | 페리온 | `region_04_battle` | `region_04_boss` | `UPPER` 3번째 |
-| `region_05` | 노틸러스 | `region_05_battle` | `region_05_boss` | `LOWER` 3번째 |
-| `region_06` | 슬리피우드 | `region_06_battle` | `region_06_boss` | 공통 합류 지역 |
+| `region_05` | 노틸러스 | `nautilus_battle` | `nautilus_boss` | `LOWER` 3번째 |
+| `region_06` | 슬리피우드 | `sleepywood_ant_tunnel` | `sleepywood_food_cart_boss` | 공통 합류 지역 |
 
 - 일반전 물리 맵 재사용 범위는 같은 Region 내부로 제한한다. 예를 들어 커닝시티의 여러 일반 Stage는 `region_02_battle`을 함께 사용하지만 헤네시스의 `region_01_battle`은 사용하지 않는다.
 - 보스전은 지역별 배경과 전조 연출을 독립 제작할 수 있도록 각 Region의 `region_XX_boss` 맵으로 분리한다.
