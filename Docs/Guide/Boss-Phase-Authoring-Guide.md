@@ -44,6 +44,25 @@ StageDefinitions(StageType=BOSS)
 - 다음 플레이어 턴부터 새 Phase Pattern을 계획한다.
 - 공격 타이밍은 각 `SkillDefinitions.ActionDuration`을 사용한다.
 
+## 중단 가능한 캐스팅
+
+`CAST_INTERRUPTIBLE`은 보스 ID를 코드에 분기하지 않는 공용 Pattern Action이다.
+
+```csv
+1,region_05_king_clang_phase_01,3,CAST_INTERRUPTIBLE,ALWAYS,nautilus_king_clang_bubble_cannon,0,1,,,4,5,true
+1,region_05_king_clang_phase_01,4,EXECUTE_TILE,ALWAYS,nautilus_king_clang_bubble_cannon,0,,,,6,5,true
+```
+
+- `TileId`: 캐스팅 후 실행할 `EnemySkillDefinitions.SkillId`
+- `ParamA`: 캐스팅을 끊는 데 필요한 플레이어 피해 스킬 적중 횟수(1 이상)
+- `NextStepOnSuccess`: 같은 `TileId`의 `EXECUTE_TILE` 행
+- `EXECUTE_TILE.NextStepOnFailure`: 중단됐을 때 이동할 경직·대기 행
+- 같은 큐 타일 실행 안의 여러 `DAMAGE` Effect 행은 중단 횟수 1회로 센다.
+- 피해가 0이거나 적중하지 않은 이동·회전·밀치기만으로는 캐스팅이 끊기지 않는다.
+- 2 Phase처럼 `ParamA=2`로 올리면 한 플레이어 큐 안에서 서로 다른 두 스킬 실행을 맞혀야 끊을 수 있다.
+
+Validator는 캐스팅 Skill 참조, `ParamA >= 1`, 다음 성공 Step의 `EXECUTE_TILE` 및 동일 Skill 연결을 검사한다.
+
 ## UI 계약
 
 `GetBattleUiState().EnemyIntents[]`는 다음 값을 제공한다.
@@ -52,6 +71,8 @@ StageDefinitions(StageType=BOSS)
 - `BossPhaseIndex`
 - `BossPhaseRevision`
 - 현재 고정 행동의 `PatternId`, `CommandType`, `TileId`, `TelegraphTurnsRemaining`
+- `CastState` (`NONE`/`CASTING`/`INTERRUPTED`)
+- `CastingSkillId`, `InterruptHitsRequired`, `InterruptHitsReceived`, `IsCastInterrupted`
 
 Phase가 바뀌어도 현재 고정 행동의 PatternId는 옛 Pattern일 수 있다. 이는 오류가 아니라
 플레이어가 이미 확인한 적 Queue를 바꾸지 않기 위한 규칙이다.
@@ -111,3 +132,4 @@ Session에 보스별 조건문을 추가하지 않는다.
 5. 새 턴의 EnemyIntent가 Phase 2 Pattern을 사용한다.
 6. 예고 행동 뒤 실제 스킬이 실행되고 피해가 적용된다.
 7. Build/Runtime Warning·Error가 0인지 확인한다.
+8. 캐스팅 중 필요한 횟수만큼 피해 스킬을 맞히면 공격 대신 실패 분기 `WAIT`가 실행된다.

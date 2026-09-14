@@ -17,6 +17,11 @@ script EnemyActionPlanComponent extends Component
 	@Sync property string PlanReason = ""
 	@Sync property integer PlanRevision = 0
 	@Sync property integer DeferredUntilTurn = 0
+	@Sync property string CastState = "NONE"
+	@Sync property string CastingSkillId = ""
+	@Sync property integer InterruptHitsRequired = 0
+	@Sync property integer InterruptHitsReceived = 0
+	@Sync property string LastInterruptHitKey = ""
 
 	property table PlannedActions = nil
 	property boolean AggregateSuccess = true
@@ -228,6 +233,71 @@ script EnemyActionPlanComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table BeginInterruptibleCast(string skillId, integer requiredHits)
+		-- Starts a cast that survives the telegraph plan reset and can be interrupted by later player skills.
+		if skillId == nil or skillId == "" then
+			return { Success = false, Reason = "INVALID_CAST_SKILL_ID" }
+		end
+		self.CastState = "CASTING"
+		self.CastingSkillId = skillId
+		self.InterruptHitsRequired = math.max(1, math.floor(tonumber(requiredHits) or 1))
+		self.InterruptHitsReceived = 0
+		self.LastInterruptHitKey = ""
+		self.PlanRevision = self.PlanRevision + 1
+		log("[EnemyCast] started enemy=" .. self.OwnerUnitId .. " skill=" .. self.CastingSkillId .. " hits=0/" .. self.InterruptHitsRequired .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = "CAST_STARTED", CastState = self.CastState, RequiredHits = self.InterruptHitsRequired, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RegisterInterruptHit(string skillId, string hitKey)
+		-- Counts one successful player skill execution once, even when it owns multiple DAMAGE effect rows.
+		if self.CastState ~= "CASTING" then
+			return { Success = false, Reason = "CAST_NOT_ACTIVE", Interrupted = false }
+		end
+		if skillId == nil or skillId == "" or hitKey == nil or hitKey == "" then
+			return { Success = false, Reason = "INVALID_INTERRUPT_HIT", Interrupted = false }
+		end
+		if self.LastInterruptHitKey == hitKey then
+			return { Success = true, Reason = "INTERRUPT_HIT_DUPLICATE", Interrupted = false, HitsReceived = self.InterruptHitsReceived, RequiredHits = self.InterruptHitsRequired }
+		end
+		self.LastInterruptHitKey = hitKey
+		self.InterruptHitsReceived = math.min(self.InterruptHitsRequired, self.InterruptHitsReceived + 1)
+		if self.InterruptHitsReceived >= self.InterruptHitsRequired then
+			self.CastState = "INTERRUPTED"
+		end
+		self.PlanRevision = self.PlanRevision + 1
+		log("[EnemyCast] hit enemy=" .. self.OwnerUnitId .. " sourceSkill=" .. skillId .. " hits=" .. self.InterruptHitsReceived .. "/" .. self.InterruptHitsRequired .. " state=" .. self.CastState .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = self.CastState == "INTERRUPTED" and "CAST_INTERRUPTED" or "INTERRUPT_HIT_COUNTED", Interrupted = self.CastState == "INTERRUPTED", HitsReceived = self.InterruptHitsReceived, RequiredHits = self.InterruptHitsRequired, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConsumeInterruptibleCast(string skillId)
+		-- Lets the matching cast execute or reports its interruption, then clears the persistent cast state.
+		if self.CastState == "NONE" or self.CastingSkillId ~= skillId then
+			return { Success = true, Reason = "CAST_NOT_REQUIRED", CanExecute = true }
+		end
+		local wasInterrupted = self.CastState == "INTERRUPTED"
+		local hitsReceived = self.InterruptHitsReceived
+		local requiredHits = self.InterruptHitsRequired
+		self:ClearInterruptibleCast(wasInterrupted and "INTERRUPTED_CONSUMED" or "CAST_EXECUTED")
+		return { Success = true, Reason = wasInterrupted and "CAST_INTERRUPTED" or "CAST_COMPLETED", CanExecute = wasInterrupted == false, HitsReceived = hitsReceived, RequiredHits = requiredHits }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearInterruptibleCast(string reason)
+		-- Clears cast-only state without changing the currently prepared pattern action.
+		if self.CastState ~= "NONE" then
+			log("[EnemyCast] cleared enemy=" .. self.OwnerUnitId .. " skill=" .. self.CastingSkillId .. " state=" .. self.CastState .. " reason=" .. reason)
+		end
+		self.CastState = "NONE"
+		self.CastingSkillId = ""
+		self.InterruptHitsRequired = 0
+		self.InterruptHitsReceived = 0
+		self.LastInterruptHitKey = ""
+		self.PlanRevision = self.PlanRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ResetPlan(string reason)
 		if self.PlanState ~= "EMPTY" then
 			log("[EnemyActionPlan] reset enemy=" .. self.OwnerUnitId .. " state=" .. self.PlanState .. " reason=" .. reason)
@@ -269,7 +339,11 @@ script EnemyActionPlanComponent extends Component
 			Reason = self.PlanReason,
 			DeferredUntilTurn = self.DeferredUntilTurn,
 			Revision = self.PlanRevision,
-			AggregateSuccess = self.AggregateSuccess
+			AggregateSuccess = self.AggregateSuccess,
+			CastState = self.CastState,
+			CastingSkillId = self.CastingSkillId,
+			InterruptHitsRequired = self.InterruptHitsRequired,
+			InterruptHitsReceived = self.InterruptHitsReceived
 		}
 	end
 
