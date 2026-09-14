@@ -1,0 +1,164 @@
+@Logic
+script BattleTestHubLogic extends Logic
+
+	@Sync property string StageSnapshot = ""
+	@Sync property string JobSnapshot = ""
+	@Sync property integer CatalogRevision = 0
+	property string TestHubMapId = "battle_test_hub"
+	property string StageDataSetName = "StageDefinitions"
+	property string JobDataSetName = "JobDefinitions"
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		self:RefreshCatalog()
+		log("[BattleTestHub] ready stages=" .. tostring(self:CountSnapshot(self.StageSnapshot)) .. " jobs=" .. tostring(self:CountSnapshot(self.JobSnapshot)))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshCatalog()
+		local stageRecords = {}
+		local stageData = _DataService:GetTable(self.StageDataSetName)
+		if stageData ~= nil then
+			for rowIndex = 1, stageData:GetRowCount() do
+				local stageId = stageData:GetCell(rowIndex, "StageId") or ""
+				local route = _StageMapRouteRepositoryLogic:GetMapRoute(stageId)
+				if stageId ~= "" and route.Success == true then
+					table.insert(stageRecords,
+						stageId .. "~"
+						.. (stageData:GetCell(rowIndex, "DisplayName") or stageId) .. "~"
+						.. (stageData:GetCell(rowIndex, "RegionId") or "") .. "~"
+						.. tostring(math.floor(tonumber(stageData:GetCell(rowIndex, "StageIndex")) or 0)) .. "~"
+						.. (stageData:GetCell(rowIndex, "StageType") or "NORMAL") .. "~"
+						.. route.MapId)
+				end
+			end
+		end
+
+		local jobRecords = {}
+		local jobData = _DataService:GetTable(self.JobDataSetName)
+		if jobData ~= nil then
+			for rowIndex = 1, jobData:GetRowCount() do
+				local enabled = self:ParseBooleanCell(jobData:GetCell(rowIndex, "Enabled"))
+				local jobId = jobData:GetCell(rowIndex, "JobId") or ""
+				if enabled and jobId ~= "" then
+					table.insert(jobRecords, jobId .. "~" .. (jobData:GetCell(rowIndex, "DisplayName") or jobId))
+				end
+			end
+		end
+
+		self.StageSnapshot = table.concat(stageRecords, "|")
+		self.JobSnapshot = table.concat(jobRecords, "|")
+		self.CatalogRevision = self.CatalogRevision + 1
+		log("[BattleTestHub] catalog refreshed stages=" .. tostring(#stageRecords) .. " jobs=" .. tostring(#jobRecords) .. " revision=" .. tostring(self.CatalogRevision))
+	end
+
+	@ExecSpace("Server")
+	method void RequestStartStage(string stageId, string jobId, integer runSeed)
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:StartStage(playerEntity, stageId, jobId, runSeed)
+		self:NotifyStartResult(result.Success, result.Reason, stageId, senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table StartStage(Entity playerEntity, string stageId, string jobId, integer runSeed)
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			return { Success = false, Reason = "INVALID_PLAYER" }
+		end
+		if isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= self.TestHubMapId then
+			log_warning("[BattleTestHub] start rejected player=" .. playerEntity.Name .. " reason=NOT_IN_TEST_HUB")
+			return { Success = false, Reason = "NOT_IN_TEST_HUB" }
+		end
+
+		local stageValidation = _ContentValidatorLogic:ValidateStageById(stageId)
+		if stageValidation.Success == false then
+			return { Success = false, Reason = stageValidation.Reason }
+		end
+		local route = _StageMapRouteRepositoryLogic:GetMapRoute(stageId)
+		if route.Success == false then
+			return { Success = false, Reason = route.Reason }
+		end
+		local job = _JobDefinitionRepositoryLogic:GetJobDefinition(jobId)
+		if job.Success == false then
+			return { Success = false, Reason = job.Reason }
+		end
+		local readiness = _UnionEffectResolverLogic:GetEffectSnapshot(playerEntity)
+		if readiness.Success == false then
+			return { Success = false, Reason = readiness.Reason or "PROFILE_LOAD_IN_PROGRESS" }
+		end
+
+		local seed = math.max(1, math.min(9999999, math.floor(math.abs(runSeed))))
+		local prepare = _BattleGatewayLogic:PrepareBattleEntry(playerEntity, stageId, "", jobId, "", seed, "NEW_RUN")
+		if prepare.Success == false then
+			return prepare
+		end
+		local entryState = _BattleGatewayLogic:GetOrCreateEntryState(playerEntity)
+		if entryState == nil then
+			return { Success = false, Reason = "ENTRY_STATE_UNAVAILABLE" }
+		end
+		local markResult = entryState:MarkPrototypeTest(prepare.RequestId)
+		if markResult.Success == false then
+			return markResult
+		end
+
+		local transfer = _BattleGatewayLogic:TransferPreparedLobbyBattleEntry(playerEntity, prepare.RequestId)
+		if transfer.Success == false then
+			entryState:Cancel(transfer.Reason)
+			return transfer
+		end
+		log("[BattleTestHub] start accepted player=" .. playerEntity.Name .. " stage=" .. stageId .. " map=" .. route.MapId .. " job=" .. jobId .. " seed=" .. tostring(seed))
+		return transfer
+	end
+
+	@ExecSpace("Client")
+	method void NotifyStartResult(boolean success, string reason, string stageId)
+		local ui = _EntityService:GetEntityByPath("/ui/BattleTestHubUI")
+		local component = isvalid(ui) and ui:GetComponent("script.BattleTestHubUIComponent") or nil
+		if component ~= nil then
+			component:HandleStartResult(success, reason, stageId)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetStages()
+		local result = {}
+		for record in string.gmatch(self.StageSnapshot or "", "[^|]+") do
+			local fields = self:Split(record, "~")
+			if #fields >= 6 then
+				table.insert(result, {
+					StageId = fields[1], DisplayName = fields[2], RegionId = fields[3],
+					StageIndex = tonumber(fields[4]) or 0, StageType = fields[5], MapId = fields[6]
+				})
+			end
+		end
+		return result
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetJobs()
+		local result = {}
+		for record in string.gmatch(self.JobSnapshot or "", "[^|]+") do
+			local fields = self:Split(record, "~")
+			if #fields >= 2 then table.insert(result, { JobId = fields[1], DisplayName = fields[2] }) end
+		end
+		return result
+	end
+
+	method table Split(string value, string separator)
+		local result = {}
+		for part in string.gmatch(value or "", "[^" .. separator .. "]+") do table.insert(result, part) end
+		return result
+	end
+
+	method integer CountSnapshot(string snapshot)
+		local count = 0
+		for _ in string.gmatch(snapshot or "", "[^|]+") do count = count + 1 end
+		return count
+	end
+
+	method boolean ParseBooleanCell(any cellValue)
+		if cellValue == true then return true end
+		local normalized = string.lower(tostring(cellValue or ""))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+end

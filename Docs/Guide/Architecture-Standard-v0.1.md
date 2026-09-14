@@ -721,7 +721,7 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 | `PatternId` | 패턴 ID |
 | `StepIndex` | 실행 순서 |
 | `ConditionType` | `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE` |
-| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE` |
+| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `CAST_INTERRUPTIBLE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE` |
 | `TileId` | 예고·실행할 스킬 타일 ID |
 | `TelegraphTurns` | `TELEGRAPH_TILE` 예고 턴 수, 1 이상 |
 | `ParamA/B/C` | 조건·행동별 인자 |
