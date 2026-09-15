@@ -131,6 +131,16 @@ script BattleQueueHudComponent extends Component
 		self:BindSkillSlotDragHandlers()
 		self.ExecuteClickHandler = self.ExecuteButton.Entity:ConnectEvent(ButtonClickEvent, self.OnExecuteClicked)
 		self.ResetClickHandler = self.ResetButton.Entity:ConnectEvent(ButtonClickEvent, self.OnResetClicked)
+		self._T.ResultCardHandlers = {}
+		self:BindResultRewardDrag()
+		for index = 1, 3 do
+			local slot = index
+			local card = self:GetResultView("Relic" .. tostring(slot))
+			if isvalid(card) then
+				local handler = card:ConnectEvent(ButtonClickEvent, function() self:SelectResultRelic(slot) end)
+				table.insert(self._T.ResultCardHandlers, { Entity = card, Handler = handler })
+			end
+		end
 		self:RefreshHud(true)
 	end
 
@@ -148,6 +158,12 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		-- Release reward gestures alongside the existing button subscriptions.
+		self:DisconnectResultRewardDrag()
+		for _, binding in ipairs(self._T.ResultCardHandlers or {}) do
+			if isvalid(binding.Entity) then binding.Entity:DisconnectEvent(ButtonClickEvent, binding.Handler) end
+		end
+		self._T.ResultCardHandlers = {}
 		-- Disconnects button callbacks so UI reloads cannot duplicate tile requests.
 		for slotIndex = 1, 6 do
 			self:StopSkillIconFeedback(slotIndex)
@@ -434,6 +450,8 @@ script BattleQueueHudComponent extends Component
 		end
 		if visible == false and self.ResultPanelEntity ~= nil then
 			_GameUIPolishLogic:HideWindowImmediately(self.ResultPanelEntity)
+			local backdrop = _EntityService:GetEntityByPath("/ui/BattleQueueHUD/ResultBackdrop")
+			if isvalid(backdrop) then backdrop:SetEnable(false) end
 		end
 		if self.HasHudContextState and self.IsHudContextVisible == visible then
 			return
@@ -502,9 +520,14 @@ script BattleQueueHudComponent extends Component
 			self._T.ResultEntryId = session ~= nil and session.EntryRequestId or ""
 			self._T.ResultShown = false
 		end
-		if visible == false then self._T.ResultShown = false end
+		if visible == false then
+			self._T.ResultShown = false
+			self._T.RewardDragStart = nil
+		end
 		if visible and session ~= nil and session.ResultReady then self._T.ResultShown = true end
 		visible = visible and self._T.ResultShown == true
+		local backdrop = _EntityService:GetEntityByPath("/ui/BattleQueueHUD/ResultBackdrop")
+		if isvalid(backdrop) then backdrop:SetEnable(visible) end
 		local rewardVisible = visible and hasCommittedReward
 		local lobbyReturnVisible = visible
 		if self.ResultPanelEntity ~= nil then
@@ -516,30 +539,229 @@ script BattleQueueHudComponent extends Component
 		end
 		self.ResultPanelSprite.Enable = visible
 		self.ResultText.Enable = visible
-		self.UnionRewardText.Enable = rewardVisible
-		self.UnionRewardBreakdownText.Enable = rewardVisible
+		self.UnionRewardText.Enable = false
+		self.UnionRewardBreakdownText.Enable = false
 		self.ResetButton.Enable = lobbyReturnVisible and session ~= nil and session.ResultReady
 		self.ResetButtonSprite.Enable = lobbyReturnVisible
 		self.ResetButtonText.Enable = lobbyReturnVisible
 		if visible then
-			local summary = _EntityService:GetEntityByPath("/ui/BattleQueueHUD/ResultPanel/Summary")
-			if isvalid(summary) and session ~= nil then
-				local stageName = _EntityService:GetEntityByPath("/ui/BattleQueueHUD/ResultPanel/StageName")
-				if isvalid(stageName) then stageName.TextGUIRendererComponent.Text = session.StageDisplayName end
-				summary.TextGUIRendererComponent.Text = "처치  " .. tostring(session.ResultKillCount) .. "마리    ·    소요 시간  " .. string.format("%02d:%02d", math.floor(session.ResultElapsedSeconds / 60), session.ResultElapsedSeconds % 60) .. "\n획득 메소  +" .. tostring(session.ResultGold)
-			end
 			self.ResultText.Text = battleResult == "Victory" and "전투 승리" or "전투 종료"
-			if rewardVisible then
-				self.UnionRewardText.Text = "유니온 코인 +" .. tostring(unionReward.FinalUnionPoints or 0)
-				self.UnionRewardBreakdownText.Text = "기본 +" .. tostring(unionReward.BaseUnionPoints or 0) .. "    유니온 보너스 +" .. tostring(unionReward.BonusUnionPoints or 0)
-			end
-			if lobbyReturnVisible then
-				self.ResetButtonText.Text = session ~= nil and session.ResultReady and ((battleResult == "Defeat" or hasCommittedReward) and "로비로 돌아가기" or "보상 확인 · 다음으로") or "처리 중..."
-			end
+			if session ~= nil then self:RenderResultRewards(session) end
 		end
 		if battleResult ~= "" then
 			log("[BattleQueueHUD] result visibility stage=" .. tostring(stageId) .. " result=" .. battleResult .. " rewardVisible=" .. tostring(rewardVisible) .. " lobbyReturnVisible=" .. tostring(lobbyReturnVisible))
 		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetResultView(string relativePath)
+		return _EntityService:GetEntityByPath("/ui/BattleQueueHUD/ResultPanel/" .. relativePath)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetResultLabel(string path, string value)
+		local entity = self:GetResultView(path)
+		if isvalid(entity) and entity.TextGUIRendererComponent ~= nil then entity.TextGUIRendererComponent.Text = value end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetResultNodeVisible(string path, boolean visible)
+		local entity = self:GetResultView(path)
+		if isvalid(entity) then entity:SetEnable(visible) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderResultRewards(any session)
+		local context = tostring(session.Entity.Id) .. ":" .. tostring(session.EntryRequestId) .. ":" .. tostring(session.HudContextRevision)
+		if self._T.ResultChoiceContext ~= context then
+			self._T.ResultChoiceContext = context
+			self._T.ResultChoice = ""
+			self._T.RewardPage = 1
+			self._T.RewardDragStart = nil
+		end
+		local snapshot = session.ResultRewardSnapshot or ""
+		if self._T.ResultReceiptJson ~= snapshot then
+			self._T.ResultReceiptJson = snapshot
+			self._T.ResultReceipt = nil
+			if snapshot ~= "" then
+				local ok, decoded = pcall(function() return _HttpService:JSONDecode(snapshot) end)
+				if ok and type(decoded) == "table" then self._T.ResultReceipt = decoded end
+			end
+		end
+		local data = self._T.ResultReceipt
+		local ready = data ~= nil and data.Entry == session.EntryRequestId and data.Context == session.HudContextRevision
+		local rewards = ready and data.Rewards or {}
+		local relics = ready and data.Relics or {}
+		if type(rewards) ~= "table" then rewards = {} end
+		if type(relics) ~= "table" then relics = {} end
+		self._T.ResultOffers = relics
+		local pages = math.max(1, math.ceil(#rewards / 3))
+		self._T.RewardPage = math.min(self._T.RewardPage or 1, pages)
+		self._T.RewardPages = pages
+		for index = 1, 8 do
+			local entry = index <= 3 and rewards[(self._T.RewardPage - 1) * 3 + index] or nil
+			local path = "Reward" .. tostring(index)
+			self:SetResultNodeVisible(path, entry ~= nil)
+			if entry ~= nil then
+				self:SetResultLabel(path .. "/Name", entry.Name or entry.Id or "보상")
+				self:SetResultLabel(path .. "/Amount", (entry.Type == "CONSUMABLE" and "×" or "") .. tostring(entry.Amount or 0))
+				local icon = self:GetResultView(path .. "/Icon")
+				if isvalid(icon) then
+					icon:SetEnable((entry.Icon or "") ~= "")
+					if entry.Icon ~= nil and entry.Icon ~= "" then icon.SpriteGUIRendererComponent.ImageRUID = entry.Icon end
+				end
+			end
+		end
+		self:SetResultNodeVisible("RewardsEmpty", #rewards == 0)
+		self:SetResultLabel("RewardsEmpty", ready and "획득한 보상이 없습니다" or "보상 확인 중...")
+		self:SetResultLabel("RewardPages", pages > 1 and (tostring(self._T.RewardPage) .. " / " .. tostring(pages) .. " · 좌우로 드래그") or "")
+		self:SetResultNodeVisible("RewardDragArea", pages > 1)
+		local committed = session.ResultSelectedRelicId or ""
+		if committed ~= "" then self._T.ResultChoice = committed end
+		for index = 1, 3 do
+			local entry = relics[index]
+			local path = "Relic" .. tostring(index)
+			self:SetResultNodeVisible(path, entry ~= nil)
+			if entry ~= nil then
+				local card = self:GetResultView(path)
+				local selected = self._T.ResultChoice == entry.Id
+				card.SpriteGUIRendererComponent.Color = selected and Color(0.12, 0.24, 0.24, 1) or Color(0.118, 0.184, 0.204, 1)
+				card.SpriteGUIRendererComponent.OutlineColor = selected and Color(0.565, 0.886, 0.812, 1) or Color(0.25, 0.35, 0.37, 1)
+				card.ButtonComponent.Enable = session.ResultReady and committed == ""
+				self:GetResultView(path .. "/Icon").SpriteGUIRendererComponent.ImageRUID = entry.Icon
+				self:SetResultLabel(path .. "/Name", entry.Name)
+				self:SetResultLabel(path .. "/Effect", entry.Description or "")
+				self:SetResultNodeVisible(path .. "/Selected", selected)
+			end
+		end
+		self:SetResultNodeVisible("RelicsTitle", #relics > 0)
+		self:SetResultNodeVisible("RelicsEmpty", false)
+		-- Collapse the unused relic area for defeat, final victory or an exhausted catalog.
+		local compact = #relics == 0
+		local visibleRewards = math.min(3, #rewards - (self._T.RewardPage - 1) * 3)
+		local panelHeight = compact and 500 or 860
+		self.ResultPanelEntity.UITransformComponent.RectSize = Vector2(1280, panelHeight)
+		self.ResultPanelEntity.UITransformComponent.anchoredPosition = Vector2(0, 0)
+		local shift = (panelHeight - 860) / 2
+		for _, name in ipairs({ "ResultText", "Divider", "RewardsTitle", "RewardsEmpty", "RewardPages", "RewardDragArea" }) do
+			local entity = self:GetResultView(name)
+			if isvalid(entity) then
+				self._T.ResultBaseY = self._T.ResultBaseY or {}
+				if self._T.ResultBaseY[name] == nil then self._T.ResultBaseY[name] = entity.UITransformComponent.anchoredPosition.y end
+				local position = entity.UITransformComponent.anchoredPosition
+				entity.UITransformComponent.anchoredPosition = Vector2(position.x, self._T.ResultBaseY[name] + shift)
+			end
+		end
+		for index = 1, 8 do
+			local entity = self:GetResultView("Reward" .. tostring(index))
+			local columns = math.max(1, visibleRewards)
+			local width = columns == 1 and 520 or 376
+			local x = -584 + width / 2 + ((index - 1) % 3) * (width + 20)
+			local y = 132 + shift
+			entity.UITransformComponent.anchoredPosition = Vector2(x, y)
+			entity.UITransformComponent.RectSize = Vector2(width, 128)
+			local icon = self:GetResultView("Reward" .. tostring(index) .. "/Icon")
+			icon.UITransformComponent.anchoredPosition = Vector2(-width / 2 + 60, 0)
+			icon.UITransformComponent.RectSize = Vector2(64, 64)
+			-- Fit receipt icons to their UI rect instead of retaining the asset pivot.
+			icon.SpriteGUIRendererComponent.PreserveSprite = PreserveSpriteType.None
+			icon.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+			for _, part in ipairs({ "Name", "Amount" }) do
+				local label = self:GetResultView("Reward" .. tostring(index) .. "/" .. part)
+				label.UITransformComponent.anchoredPosition = Vector2(48, part == "Name" and 24 or -24)
+				label.UITransformComponent.RectSize = Vector2(width - 144, part == "Name" and 40 or 48)
+			end
+		end
+		for _, name in ipairs({ "FooterDivider", "FooterStats", "BtnReset", "Status" }) do
+			local entity = self:GetResultView(name)
+			self._T.ResultBaseY = self._T.ResultBaseY or {}
+			if self._T.ResultBaseY[name] == nil then self._T.ResultBaseY[name] = entity.UITransformComponent.anchoredPosition.y end
+			local position = entity.UITransformComponent.anchoredPosition
+			entity.UITransformComponent.anchoredPosition = Vector2(position.x, self._T.ResultBaseY[name] - shift)
+		end
+		self:SetResultLabel("FooterStats/TurnValue", tostring(session.StageTurnNumber))
+		self:SetResultLabel("FooterStats/KillValue", tostring(session.ResultKillCount))
+		self:SetResultLabel("Status", session.ResultRewardError or "")
+		local needsChoice = #relics > 0 and (self._T.ResultChoice or "") == ""
+		self.ResetButton.Enable = ready and session.ResultReady and not needsChoice
+		self:SetResultNodeVisible("BtnReset/KeyBadge", self.ResetButton.Enable)
+		self.ResetButtonText.Text = not ready and "보상 확인 중..." or (not session.ResultReady and "처리 중..." or (needsChoice and "유물을 선택하세요" or ((session.BattleResult == "Defeat" or session.UnionRewardRunEnded) and "로비로 돌아가기" or "모험 계속")))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindResultRewardDrag()
+		-- The transparent receiver covers only receipt cards, never relics or Continue.
+		self:DisconnectResultRewardDrag()
+		local area = self:GetResultView("RewardDragArea")
+		if not isvalid(area) then return end
+		self._T.RewardDragArea = area
+		self._T.RewardDragBeginHandler = area:ConnectEvent(UITouchBeginDragEvent, self.OnResultRewardDragBegin)
+		self._T.RewardDragEndHandler = area:ConnectEvent(UITouchEndDragEvent, self.OnResultRewardDragEnd)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DisconnectResultRewardDrag()
+		-- Cancel any gesture and release listeners when this HUD is reloaded.
+		local area = self._T.RewardDragArea
+		if isvalid(area) then
+			if self._T.RewardDragBeginHandler ~= nil then area:DisconnectEvent(UITouchBeginDragEvent, self._T.RewardDragBeginHandler) end
+			if self._T.RewardDragEndHandler ~= nil then area:DisconnectEvent(UITouchEndDragEvent, self._T.RewardDragEndHandler) end
+		end
+		self._T.RewardDragArea = nil
+		self._T.RewardDragBeginHandler = nil
+		self._T.RewardDragEndHandler = nil
+		self._T.RewardDragStart = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnResultRewardDragBegin(UITouchBeginDragEvent event)
+		-- Track a single left-mouse/mobile touch in resolution-independent UI coordinates.
+		if event.TouchId < -1 or self._T.RewardDragStart ~= nil then return end
+		if not self.IsHudContextVisible or not isvalid(self.ResultPanelEntity) or not self.ResultPanelEntity.Enable then return end
+		if (self._T.RewardPages or 1) <= 1 then return end
+		self._T.RewardDragStart = _UILogic:ScreenToUIPosition(event.TouchPoint)
+		self._T.RewardDragTouchId = event.TouchId
+		self._T.RewardDragContext = self._T.ResultChoiceContext
+		self._T.RewardDragReceipt = self._T.ResultReceiptJson
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnResultRewardDragEnd(UITouchEndDragEvent event)
+		-- One deliberate horizontal swipe advances one bounded page without granting rewards.
+		local start = self._T.RewardDragStart
+		if start == nil or event.TouchId ~= self._T.RewardDragTouchId then return end
+		self._T.RewardDragStart = nil
+		if self._T.RewardDragContext ~= self._T.ResultChoiceContext or self._T.RewardDragReceipt ~= self._T.ResultReceiptJson then return end
+		local finish = _UILogic:ScreenToUIPosition(event.TouchPoint)
+		local dx = finish.x - start.x
+		local dy = finish.y - start.y
+		if math.abs(dx) < 64 or math.abs(dx) < math.abs(dy) * 1.2 then return end
+		self:ChangeResultRewardPage(dx < 0 and 1 or -1)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ChangeResultRewardPage(integer direction)
+		-- Reuse the fixed three-card pool for arbitrarily many receipt entries.
+		if not self.IsHudContextVisible or not isvalid(self.ResultPanelEntity) or not self.ResultPanelEntity.Enable then return end
+		local session = _BattleHudPresenterLogic:GetBattleSession()
+		if session == nil then return end
+		local context = tostring(session.Entity.Id) .. ":" .. tostring(session.EntryRequestId) .. ":" .. tostring(session.HudContextRevision)
+		if context ~= self._T.ResultChoiceContext or (session.ResultRewardSnapshot or "") ~= self._T.ResultReceiptJson then return end
+		local current = self._T.RewardPage or 1
+		local nextPage = math.max(1, math.min(self._T.RewardPages or 1, current + direction))
+		if current == nextPage then return end
+		self._T.RewardPage = nextPage
+		self:RenderResultRewards(session)
+		log("[BattleQueueHUD] reward swipe page=" .. tostring(nextPage) .. "/" .. tostring(self._T.RewardPages))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectResultRelic(integer slot)
+		local session = _BattleHudPresenterLogic:GetBattleSession()
+		local entry = (self._T.ResultOffers or {})[slot]
+		if session == nil or not session.ResultReady or session.ResultSelectedRelicId ~= "" or entry == nil then return end
+		self._T.ResultChoice = entry.Id
+		self:RenderResultRewards(session)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1715,6 +1937,14 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
 	handler HandleQuickbarCancelKey(KeyDownEvent event)
+		if self.IsHudContextVisible and self.ResultPanelEntity ~= nil and self.ResultPanelEntity.Enable then
+			if event.key == KeyboardKey.E then self:OnResetClicked() end
+			if event.key == KeyboardKey.LeftArrow or event.key == KeyboardKey.RightArrow then
+				local direction = event.key == KeyboardKey.LeftArrow and -1 or 1
+				self:ChangeResultRewardPage(direction)
+			end
+			return
+		end
 		-- Reuses the former cancel button guard and command; no battle rules change.
 		if event.key == KeyboardKey.Backspace and self.IsHudContextVisible and self.CanClearQueue then
 			self:OnClearClicked()
@@ -1732,7 +1962,9 @@ script BattleQueueHudComponent extends Component
 		-- The server owns the in-flight gate; a rejected request cannot strand a disabled local button.
 		log("[BattleQueueHUD] lobby return clicked")
 		local session = _BattleHudPresenterLogic:GetBattleSession()
-		if session ~= nil then session:RequestContinueResult() end
+		if session ~= nil and self.ResetButton.Enable and self.ResultPanelEntity.Enable then
+			session:RequestConfirmResultReward(session.EntryRequestId, session.HudContextRevision, self._T.ResultChoice or "")
+		end
 	end
 
 	@ExecSpace("ClientOnly")

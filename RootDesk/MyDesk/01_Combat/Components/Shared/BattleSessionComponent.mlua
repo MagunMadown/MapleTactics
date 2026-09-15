@@ -23,6 +23,13 @@ script BattleSessionComponent extends Component
 	@Sync property integer ResultKillCount = 0
 	@Sync property integer ResultElapsedSeconds = 0
 	@Sync property integer ResultGold = 0
+	@Sync property string ResultRewardSnapshot = ""
+	@Sync property string ResultSelectedRelicId = ""
+	@Sync property string ResultRewardError = ""
+	property table ResultRewardReceipt = {}
+	property table ResultRelicOffers = {}
+	property integer ResultRewardRunSequence = 0
+	property boolean ResultOffersPrepared = false
 	property number ResultStartTime = 0
 	property integer ResultStartGold = 0
 	property boolean ResultRecorded = false
@@ -929,6 +936,13 @@ script BattleSessionComponent extends Component
 		self.ResultReady = false
 		self.ResultRecorded = false
 		self.ResultDefeatReset = {}
+		self.ResultRewardSnapshot = ""
+		self.ResultSelectedRelicId = ""
+		self.ResultRewardError = ""
+		self.ResultRewardReceipt = {}
+		self.ResultRelicOffers = {}
+		self.ResultRewardRunSequence = 0
+		self.ResultOffersPrepared = false
 		self.ResultKillCount = 0
 		self.ResultElapsedSeconds = 0
 		self.ResultGold = 0
@@ -6551,6 +6565,8 @@ script BattleSessionComponent extends Component
 			self.ResultTransitionTimerId = 0
 			self:WaitForMotionCompletion(function()
 				if self.EntryRequestId == expectedEntry and self.BattleResult ~= "" then
+					self:PrepareResultRelics()
+					self:PublishResultRewardSnapshot()
 					self.ResultReady = true
 					log("[BattleResult] ready for confirmation kills=" .. self.ResultKillCount)
 				end
@@ -7805,17 +7821,130 @@ script BattleSessionComponent extends Component
 		combatStats:RecordConsumedTurn(consumptionKey)
 	end
 
+	@ExecSpace("ServerOnly")
+	method void AccumulateResultReward(string rewardType, string refId, integer amount)
+		if amount <= 0 or self.EntryRequestId <= 0 then return end
+		local key = rewardType .. ":" .. refId
+		local entry = self.ResultRewardReceipt[key]
+		if entry == nil then
+			entry = { Id = refId, Type = rewardType, Amount = 0, Name = refId, Icon = "" }
+			if rewardType == "CONSUMABLE" then
+				local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(refId)
+				if definition.Success then entry.Name = definition.DisplayName entry.Icon = definition.IconKey end
+			elseif refId == "gold" then entry.Name = "메소" entry.Icon = "4cc5ffc272224edc809a792b8efa16e3" end
+			self.ResultRewardReceipt[key] = entry
+		end
+		entry.Amount = entry.Amount + amount
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PrepareResultRelics()
+		if self.ResultOffersPrepared then return end
+		self.ResultOffersPrepared = true
+		self.ResultRelicOffers = {}
+		-- Only continuing boss victories offer run-scoped relics; ordinary battles show the receipt alone.
+		if self.StageType ~= "BOSS" or self.BattleResult ~= "Victory" or not self.ResultRecorded or self.UnionRewardRunEnded then return end
+		local inventory = _RunManagerLogic:GetOrCreateRunInventory(self.PlayerEntity)
+		local effects = _RunShopLogic:GetOrCreateRelicEffects(self.PlayerEntity)
+		if inventory == nil or effects == nil or not effects.IsInitialized or effects.ActiveRunSequence ~= inventory.ActiveRunSequence then
+			self.ResultOffersPrepared = false
+			self.ResultRewardError = "유물 정보를 불러오지 못했습니다."
+			return
+		end
+		self.ResultRewardRunSequence = inventory.ActiveRunSequence
+		local candidates = {}
+		for id, definition in pairs(effects.Definitions) do
+			if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) == 0 then table.insert(candidates, definition) end
+		end
+		table.sort(candidates, function(a, b) return a.RelicId < b.RelicId end)
+		for index = 1, math.min(3, #candidates) do
+			local selected = _UtilLogic:RandomIntegerRange(1, #candidates)
+			local definition = table.remove(candidates, selected)
+			table.insert(self.ResultRelicOffers, { Id = definition.RelicId, Name = definition.DisplayName,
+				Icon = definition.IconImageRUID, Description = definition.EffectDescription })
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishResultRewardSnapshot()
+		local rewards = {}
+		for _, entry in pairs(self.ResultRewardReceipt) do
+			table.insert(rewards, { Id = tostring(entry.Id or ""), Type = tostring(entry.Type or ""),
+				Name = tostring(entry.Name or ""), Icon = tostring(entry.Icon or ""), Amount = tonumber(entry.Amount) or 0 })
+		end
+		table.sort(rewards, function(a, b) return a.Type .. a.Id < b.Type .. b.Id end)
+		if self.UnionRewardRunEnded and self.UnionRewardWasCommitted then
+			table.insert(rewards, { Id = "union_coin", Name = "유니온 코인", Amount = self.UnionRewardFinalPoints, Icon = "95632823c5e44dab89b9859ff439165b", Type = "ACCOUNT" })
+		end
+		local relics = {}
+		for _, entry in ipairs(self.ResultRelicOffers) do
+			table.insert(relics, { Id = tostring(entry.Id or ""), Name = tostring(entry.Name or ""),
+				Icon = tostring(entry.Icon or ""), Description = tostring(entry.Description or "") })
+		end
+		-- MSW cannot infer the JSON type of an empty Lua table. Omit empty arrays;
+		-- the client already treats absent Rewards/Relics fields as empty lists.
+		local payload = { Entry = self.EntryRequestId, Context = self.HudContextRevision }
+		if #rewards > 0 then payload.Rewards = rewards end
+		if #relics > 0 then payload.Relics = relics end
+		self.ResultRewardSnapshot = _HttpService:JSONEncode(payload)
+	end
+
+	@ExecSpace("Server")
+	method void RequestConfirmResultReward(integer entryId, integer contextRevision, string relicId)
+		if not self:IsValidPlayerRequest(senderUserId) or not self.ResultReady
+			or entryId ~= self.EntryRequestId or contextRevision ~= self.HudContextRevision then return end
+		if self.BattleResult ~= "Victory" and self.BattleResult ~= "Defeat" then return end
+		self.ResultRewardError = ""
+		-- Retry failed recording before deciding whether a selection is required.
+		if not self.ResultRecorded then
+			self.ResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
+			if not self.ResultRecorded then self.ResultRewardError = "보상 처리에 실패했습니다. 다시 시도해주세요." return end
+			self:RefreshUnionRewardPresentation()
+			self.ResultOffersPrepared = false
+			self:PrepareResultRelics()
+			self:PublishResultRewardSnapshot()
+			if #self.ResultRelicOffers > 0 then return end
+		end
+		if not self.ResultOffersPrepared then
+			self:PrepareResultRelics()
+			self:PublishResultRewardSnapshot()
+			if not self.ResultOffersPrepared or #self.ResultRelicOffers > 0 then return end
+		end
+		if #self.ResultRelicOffers > 0 and self.ResultSelectedRelicId == "" then
+			local offered = false
+			for _, entry in ipairs(self.ResultRelicOffers) do if entry.Id == relicId then offered = true end end
+			if not offered then self.ResultRewardError = "유물을 하나 선택해주세요." return end
+			local rewardKey = "battle-relic:" .. tostring(self.ResultRewardRunSequence) .. ":" .. self.StageId .. ":" .. tostring(self.EntryRequestId)
+			local result = _RunManagerLogic:GrantBattleResultRelic(self.PlayerEntity, relicId, self.ResultRewardRunSequence, rewardKey)
+			if not result.Success then self.ResultRewardError = "유물 지급에 실패했습니다. 다시 시도해주세요." return end
+			self.ResultSelectedRelicId = relicId
+			log("[BattleReward] relic granted entry=" .. tostring(entryId) .. " relic=" .. relicId)
+		end
+		self:ContinueConfirmedResult()
+	end
+
 	@ExecSpace("Server")
 	method void RequestContinueResult()
 		-- Only the registered player can advance an ended, presented battle once.
 		if self:IsValidPlayerRequest(senderUserId) == false or self.ResultReady == false then return end
+		if not self.ResultRecorded or not self.ResultOffersPrepared then return end
+		if #self.ResultRelicOffers > 0 and self.ResultSelectedRelicId == "" then return end
+		self:ContinueConfirmedResult()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ContinueConfirmedResult()
 		if self.BattleResult ~= "Victory" and self.BattleResult ~= "Defeat" then return end
 		self.ResultReady = false
 		if self.ResultRecorded == false then
 			self.ResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
 			if self.ResultRecorded then self:RefreshUnionRewardPresentation() end
 		end
-		if self.ResultRecorded == false then self.ResultReady = true return end
+		if self.ResultRecorded == false then
+			self.ResultRewardError = "보상 처리에 실패했습니다. 다시 시도해주세요."
+			self.ResultReady = true
+			return
+		end
 		if self.BattleResult == "Defeat" then
 			local result = self:ReturnToLobbyAfterDefeat()
 			if result.Success == false then self.ResultReady = true end
