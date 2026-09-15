@@ -455,8 +455,8 @@ Phase 1의 헤네시스 첫 분기는 이후 지역을 추가하기 위한 기�
 | `region_02` | 커닝시티 | `region_02_battle`, `region_02_boss` | `region_01 → region_02 → region_04 → region_06` |
 | `region_03` | 엘리니아 | `region_03_battle`, `region_03_boss` | `region_01 → region_03 → region_05 → region_06` |
 | `region_04` | 페리온 | `region_04_battle`, `region_04_boss` | 위쪽 중간 지역 |
-| `region_05` | 노틸러스 | `region_05_battle`, `region_05_boss` | 아래쪽 중간 지역 |
-| `region_06` | 슬리피우드 | `region_06_battle`, `region_06_boss` | 양쪽 경로 합류 |
+| `region_05` | 노틸러스 | `nautilus_battle`, `nautilus_boss` | 아래쪽 중간 지역 |
+| `region_06` | 슬리피우드 | `sleepywood_ant_tunnel`, `sleepywood_food_cart_boss` | 양쪽 경로 합류 |
 
 ```text
 로비
