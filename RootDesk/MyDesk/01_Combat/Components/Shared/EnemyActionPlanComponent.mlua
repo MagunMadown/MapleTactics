@@ -19,12 +19,14 @@ script EnemyActionPlanComponent extends Component
 	@Sync property integer DeferredUntilTurn = 0
 
 	property table PlannedActions = nil
+	property table PendingQueueActions = nil
+	property boolean QueueSkillsIndividually = false
 	property boolean AggregateSuccess = true
 	property boolean SpawnWaitPending = true
 
 	@ExecSpace("ServerOnly")
 	method table ReplacePlan(string ownerUnitId, table actions, integer plannedTurn, string traitIds, string reason, integer queueTurnsRequired)
-		-- One enemy owns one immutable round plan. The session coordinates plans but never owns their queues.
+		-- Each enemy owns its plan; individually queued attacks remain pending until their insertion turn.
 		if ownerUnitId == nil or ownerUnitId == "" then
 			return { Success = false, Reason = "INVALID_OWNER_UNIT_ID" }
 		end
@@ -55,6 +57,11 @@ script EnemyActionPlanComponent extends Component
 
 		self.QueueTurnsRequired = math.max(0, math.floor(tonumber(queueTurnsRequired) or 0))
 		self.QueueTurnsElapsed = 0
+		self.PendingQueueActions = nil
+		self.QueueSkillsIndividually = self.PlannedActions[1].ActionType == "EXECUTE_TILE" and _EnemyTraitRouterLogic:HasTrait(traitIds, "DOUBLE_STRIKE")
+		if self.QueueSkillsIndividually then
+			self.QueueTurnsRequired = 2
+		end
 		self.PlanState = "PREPARED"
 		if self.PlannedActions[1].ActionType == "EXECUTE_TILE" and self.QueueTurnsRequired > 0 then
 			self.PlanState = "INSERTING"
@@ -73,6 +80,11 @@ script EnemyActionPlanComponent extends Component
 		self.NextCommandDirection = 0
 		self.TargetCellSnapshot = ""
 		self.AggregateSuccess = true
+		if self.QueueSkillsIndividually then
+			self.PendingQueueActions = self.PlannedActions
+			self.PlannedActions = {}
+			self.PlannedActionCount = 0
+		end
 		self.PlanRevision = self.PlanRevision + 1
 		self:PublishSnapshot()
 		log("[EnemyActionPlan] prepared enemy=" .. self.OwnerUnitId .. " turn=" .. self.PlannedTurn .. " state=" .. self.PlanState .. " queue=" .. self.QueueTurnsElapsed .. "/" .. self.QueueTurnsRequired .. " actions=" .. self.PlannedActionCount .. " traits=" .. self.TraitIds .. " revision=" .. self.PlanRevision)
@@ -81,6 +93,7 @@ script EnemyActionPlanComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table GetCurrentAction()
+		-- During insertion the pending skill describes the command, but is not yet an owned queue item.
 		if self.PlanState ~= "INSERTING" and self.PlanState ~= "TRACKING" and self.PlanState ~= "ATTACK_READY" and self.PlanState ~= "PREPARED" and self.PlanState ~= "EXECUTING" then
 			return { Success = false, Reason = "PLAN_NOT_PREPARED" }
 		end
@@ -88,6 +101,9 @@ script EnemyActionPlanComponent extends Component
 			return { Success = false, Reason = "PLAN_RUNTIME_MISSING" }
 		end
 		local action = self.PlannedActions[self.CurrentActionIndex]
+		if self.PlanState == "INSERTING" and self.QueueSkillsIndividually and self.PendingQueueActions ~= nil then
+			action = self.PendingQueueActions[1]
+		end
 		if action == nil then
 			return { Success = false, Reason = "PLANNED_ACTION_MISSING" }
 		end
@@ -113,13 +129,29 @@ script EnemyActionPlanComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table AdvanceQueueTurn()
-		-- Normal foes spend an enemy turn placing their attack Tile into the queue.
+		-- Insertion consumes a turn; individually queued skills become owned one at a time.
 		if self.PlanState ~= "INSERTING" then
 			return { Success = false, Reason = "PLAN_NOT_INSERTING", Ready = self.PlanState == "TRACKING" or self.PlanState == "ATTACK_READY" }
+		end
+		if self.QueueSkillsIndividually then
+			local pending = self.PendingQueueActions ~= nil and self.PendingQueueActions[1] or nil
+			if pending == nil or pending.ActionType ~= "EXECUTE_TILE" then
+				return { Success = false, Reason = "PENDING_QUEUE_ATTACK_MISSING", Ready = false }
+			end
+			table.insert(self.PlannedActions, table.remove(self.PendingQueueActions, 1))
+			self.PlannedActionCount = #self.PlannedActions
 		end
 		self.QueueTurnsElapsed = math.min(self.QueueTurnsRequired, self.QueueTurnsElapsed + 1)
 		local isReady = self.QueueTurnsElapsed >= self.QueueTurnsRequired
 		if isReady then
+			if self.QueueSkillsIndividually then
+				-- Recovery movement follows the entire cast and keeps its existing deferred-turn behavior.
+				for _, pending in ipairs(self.PendingQueueActions) do
+					table.insert(self.PlannedActions, pending)
+				end
+				self.PendingQueueActions = nil
+				self.PlannedActionCount = #self.PlannedActions
+			end
 			self.PlanState = "TRACKING"
 			self.PlanReason = "ATTACK_TILE_QUEUED"
 			self.ReadinessReason = "READINESS_PENDING"
@@ -229,6 +261,7 @@ script EnemyActionPlanComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ResetPlan(string reason)
+		-- Discards both registered skills and pending insertions at the existing plan boundaries.
 		if self.PlanState ~= "EMPTY" then
 			log("[EnemyActionPlan] reset enemy=" .. self.OwnerUnitId .. " state=" .. self.PlanState .. " reason=" .. reason)
 		end
@@ -246,6 +279,8 @@ script EnemyActionPlanComponent extends Component
 		self.PlanReason = reason or "RESET"
 		self.DeferredUntilTurn = 0
 		self.PlannedActions = nil
+		self.PendingQueueActions = nil
+		self.QueueSkillsIndividually = false
 		self.AggregateSuccess = true
 		self.PlanRevision = self.PlanRevision + 1
 	end
@@ -275,18 +310,21 @@ script EnemyActionPlanComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void PublishSnapshot()
+		-- Publish only registered, unconsumed entries for the incremental queue; retain legacy snapshots.
 		local entries = {}
 		if self.PlannedActions ~= nil then
 			for index, action in ipairs(self.PlannedActions) do
-				table.insert(entries, table.concat({
-					tostring(index),
-					action.ActionType,
-					action.TileId ~= "" and action.TileId or "-",
-					tostring(action.Direction),
-					tostring(action.TelegraphTurnsRemaining),
-					action.PatternId,
-					tostring(action.StepIndex)
-				}, "~"))
+				if not self.QueueSkillsIndividually or (index >= self.CurrentActionIndex and self.PlanState ~= "COMPLETED") then
+					table.insert(entries, table.concat({
+						tostring(index),
+						action.ActionType,
+						action.TileId ~= "" and action.TileId or "-",
+						tostring(action.Direction),
+						tostring(action.TelegraphTurnsRemaining),
+						action.PatternId,
+						tostring(action.StepIndex)
+					}, "~"))
+				end
 			end
 		end
 		self.PlannedActionSnapshot = table.concat(entries, ">")
