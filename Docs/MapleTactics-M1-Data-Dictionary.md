@@ -166,7 +166,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 공용 | `SkillDefinitions` | (없음 — 헤더만) |
 | 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling`, `flash_slash`, `spirit_blade`, `hyper_body`, `iron_wall` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
-| 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
+| 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal`, `magic_guard`, `meditation`, `bless` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
 | 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge` / `enhanced_piercing`, `arrow_stream`, `cardinal_discharge_ii` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` / `triple_throw`, `edge_carnival`, `bloody_storm` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
@@ -578,8 +578,9 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 
 #### 현재 상태
 
-플레이어 스킬은 1단계 22행 + 2단계 16행 = 38행이고, 적 전용 행은 모두 1단계다.
-`thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`은 아직 상위 단계가 없다. 적 스킬은 강화 대상이 아니지만
+플레이어 스킬은 1단계 25행 + 2단계 16행 = 41행이고, 적 전용 행은 모두 1단계다.
+`thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`,
+마법사 `magic_guard`·`meditation`·`bless`는 아직 상위 단계가 없다. 적 스킬은 강화 대상이 아니지만
 `ConvertSkillRow`가 모든 스킬 테이블에 공용이라 스키마를 맞추기 위해 같은 두 컬럼을 갖는다.
 
 2단계 16행의 저작 규칙은 다음과 같다.
@@ -620,13 +621,15 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 | ParameterB | string | - | 효과별 확장 값 |
 | ConditionId | string | - | 조건 규격 참조용 예약 필드 |
 
-현재 구현 EffectType M1: `DAMAGE`, `PUSH`, `HEAL`, `NEXT_ATTACK_BONUS`, `MAX_HP_BUFF`,
-`DEFENSE_BUFF`. 새 타입은 Executor, Router, Validator, 데이터 사전을 함께 수정한 뒤 사용한다.
+현재 구현 EffectType M1: `DAMAGE`, `PUSH`, `HEAL`, `NEXT_ATTACK_BONUS`, `ATTACK_BUFF`,
+`MAX_HP_BUFF`, `DEFENSE_BUFF`. 새 타입은 Executor, Router, Validator, 데이터 사전을 함께 수정한 뒤 사용한다.
 
-버프 3종은 `BuffEffectExecutorLogic`이 처리하며 `BattleSessionComponent.ResolveSkillBuffImpact`로
-내려간다. `TargetSelector=SELF_UNIT` 전용이고, `Value`는 수치, 지속형(`MAX_HP_BUFF`,
-`DEFENSE_BUFF`)은 `ParameterA`가 적 라운드 단위 턴 수다. 사용 사례는 전사
-`spirit_blade`(다음 공격 +2) · `hyper_body`(최대 HP +4, 3턴) · `iron_wall`(방어력 +2, 2턴)이다.
+버프 4종은 `BuffEffectExecutorLogic`이 처리하며 `BattleSessionComponent.ResolveSkillBuffImpact`로
+내려간다. `TargetSelector=SELF_UNIT` 전용이고, `Value`는 수치, 지속형(`ATTACK_BUFF`, `MAX_HP_BUFF`,
+`DEFENSE_BUFF`)은 `ParameterA`가 적 라운드 단위 턴 수다. 다른 스킬의 같은 능력치는 합산되고 같은 스킬은
+갱신된다. 사용 사례는 전사 `spirit_blade`(다음 공격 +2) · `hyper_body`(최대 HP +4, 3턴) ·
+`iron_wall`(방어력 +2, 2턴), 마법사 `magic_guard`(방어력 +1, 2턴) · `meditation`(공격력 +2, 1턴) ·
+`bless`(공격력 +1 · 방어력 +1, 1턴 — Step 2개)이다.
 세부 규칙은 [`Effect-Executor-Guide.md`](./Guide/Effect-Executor-Guide.md) "버프 EffectType 규칙"을 본다.
 
 `HEAL`은 `HealEffectExecutorLogic`이 처리하며 `BattleSessionComponent.ResolveSkillHealImpact`로

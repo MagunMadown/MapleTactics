@@ -98,20 +98,28 @@ method table Execute(table context, table effectStep)
 | `PUSH` | `PushEffectExecutorLogic` | 전방 대상 Cell 이동 |
 | `HEAL` | `HealEffectExecutorLogic` | 같은 팀 대상 회복 |
 | `NEXT_ATTACK_BONUS` | `BuffEffectExecutorLogic` | 시전자의 다음 피해 스킬 1회 피해 +`Value` |
+| `ATTACK_BUFF` | `BuffEffectExecutorLogic` | 시전자가 주는 모든 피해 +`Value`, `ParameterA`턴 |
 | `MAX_HP_BUFF` | `BuffEffectExecutorLogic` | 시전자 최대 HP·현재 HP +`Value`, `ParameterA`턴 |
 | `DEFENSE_BUFF` | `BuffEffectExecutorLogic` | 시전자가 받는 피해 -`Value`(최소 1), `ParameterA`턴 |
 
 ### 버프 EffectType 규칙
 
-세 버프는 한 Executor(`BuffEffectExecutorLogic`)가 소유하고, 상태는 대상의
-`BattleUnitComponent`(`NextAttackBonus`, `DefenseBuff*`, `MaxHpBuff*`)가 보관한다.
-Router와 Validator는 `IsBuffEffectType`으로 같은 목록을 공유한다.
+네 버프는 한 Executor(`BuffEffectExecutorLogic`)가 소유한다. Router와 Validator는
+`IsBuffEffectType` / `IsTimedBuffEffectType`으로 같은 목록을 공유하고, 지속형 EffectType→능력치 매핑은
+`GetBuffStat`(`ATTACK_BUFF`→`ATTACK`, `DEFENSE_BUFF`→`DEFENSE`, `MAX_HP_BUFF`→`MAX_HP`) 한 곳에 있다.
 
 - `TargetSelector`는 `SELF_UNIT`만 허용한다(`BUFF_REQUIRES_SELF_UNIT`). `Value`는 0 초과(`INVALID_BUFF_VALUE`).
-- 지속형(`MAX_HP_BUFF`, `DEFENSE_BUFF`)은 `ParameterA`에 1 이상 정수 턴 수가 필요하다(`INVALID_BUFF_DURATION`).
+- 지속형(`ATTACK_BUFF`, `MAX_HP_BUFF`, `DEFENSE_BUFF`)은 `ParameterA`에 1 이상 정수 턴 수가 필요하다(`INVALID_BUFF_DURATION`).
 - 턴은 쿨다운과 같은 경계(`AdvancePlayerSkillCooldowns`, 적 라운드 종료 후 다음 플레이어 턴 직전)에서 1 줄어든다.
-  시전 턴 포함 N번의 적 라운드 동안 유지된다.
-- 재시전은 중첩하지 않는다. 수치는 큰 값, 지속은 긴 값으로 갱신된다.
+  실행 후 N번의 적 라운드 동안 유지된다. `1`턴이면 같은 큐의 뒤 스킬과 바로 다음 적 라운드까지 적용된다.
+- **중첩 규칙: 스킬이 다르면 합산, 같은 스킬은 갱신.** `BattleUnitComponent`가 `스킬|능력치`별 항목
+  (`TimedBuffEntries`, `NextAttackBonusBySkill`, 서버 전용)을 보관하고, 동기화 값
+  (`AttackBuffAmount`, `DefenseBuffAmount`, `MaxHpBuffAmount`, `NextAttackBonus`)은 합계, `*Turns`는 가장 긴
+  잔여 턴이다. 같은 스킬을 다시 쓰면 그 항목만 큰 수치·긴 지속으로 갱신된다.
+  예: 블레스(공격 +1) + 메디테이션(공격 +2) = 공격 +3, 블레스(방어 +1) + 매직 가드(방어 +1) = 방어 +2.
+- 한 스킬에 버프 Step이 여러 개면(블레스) 대상 이펙트는 첫 Step에서만 재생한다
+  (`context.BuffHitPresentedUnitIds` → `ResolveSkillBuffImpact(..., presentHit)`).
+- `ATTACK_BUFF`는 `ApplyDamage`에서 지속시간 동안 모든 피해에 더해진다(다음 공격 보너스와 별개로 합산).
 - `NEXT_ATTACK_BONUS`는 `ApplyDamage`에서 더해지고, 피해 스킬의 모든 Step이 끝난 뒤
   하나 이상 적중했을 때 `SkillExecutionLogic.ConsumeNextAttackBonusOnHit`가 소비한다. 그래서 범위기는 모든 대상에 적용된다.
 - `DEFENSE_BUFF`는 유물 방어력 뒤에 `max(1, amount - DefenseBuffAmount)`로 적용된다. Utility Guard 무효화가 우선한다.

@@ -264,15 +264,18 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 1,magnum_shot_effects,2,PUSH,PRIMARY_TARGET,1,,,
 ```
 
-현재 지원 `EffectType`은 `DAMAGE`, `PUSH`, `HEAL`과 자기 버프 3종
-`NEXT_ATTACK_BONUS`, `MAX_HP_BUFF`, `DEFENSE_BUFF`다. 버프는 `SELF_UNIT` 전용이고 지속형은
-`ParameterA`에 턴 수를 적는다. 규칙은 [`Effect-Executor-Guide.md`](./Effect-Executor-Guide.md)
-"버프 EffectType 규칙"이 소유한다.
+현재 지원 `EffectType`은 `DAMAGE`, `PUSH`, `HEAL`과 자기 버프 4종
+`NEXT_ATTACK_BONUS`, `ATTACK_BUFF`, `MAX_HP_BUFF`, `DEFENSE_BUFF`다. 버프는 `SELF_UNIT` 전용이고 지속형은
+`ParameterA`에 턴 수를 적는다. 다른 스킬의 같은 능력치는 합산되고 같은 스킬은 갱신된다. 규칙은
+[`Effect-Executor-Guide.md`](./Effect-Executor-Guide.md) "버프 EffectType 규칙"이 소유한다.
 
 ```csv
 1,spirit_blade_effects,1,NEXT_ATTACK_BONUS,SELF_UNIT,2,,,
 1,hyper_body_effects,1,MAX_HP_BUFF,SELF_UNIT,4,3,,
 1,iron_wall_effects,1,DEFENSE_BUFF,SELF_UNIT,2,2,,
+1,meditation_effects,1,ATTACK_BUFF,SELF_UNIT,2,1,,
+1,bless_effects,1,ATTACK_BUFF,SELF_UNIT,1,1,,
+1,bless_effects,2,DEFENSE_BUFF,SELF_UNIT,1,1,,
 ```
 
 전체 행은
@@ -381,10 +384,10 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 
 ## Dataset 상태
 
-플레이어 스킬 38행(직업별 5개 테이블 — 1단계 22행 + 2단계 16행)이 실제 Dataset으로 올라가 있다.
+플레이어 스킬 41행(직업별 5개 테이블 — 1단계 25행 + 2단계 16행)이 실제 Dataset으로 올라가 있다.
 적 전용 행·Effect Step·무기 행 수는 CSV를 직접 본다. 그중 투사체를 쓰는 플레이어 스킬은
-9행이다. `thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`은
-아직 상위 단계가 없다.
+9행이다. `thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`,
+마법사 `magic_guard`·`meditation`·`bless`는 아직 상위 단계가 없다.
 `AllowPrototypeCompatibilityFallback=false`이며 production
 Skill 하드코딩을 다시 추가하지 않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를
 복제하지 않는다.

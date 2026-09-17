@@ -3,7 +3,7 @@ script BuffEffectExecutorLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table Execute(table context, table effectStep)
-		-- Grants one self-support buff (next-attack bonus, timed max HP, timed defense) on the units chosen by the row's selector.
+		-- Grants one self-support buff (next-attack bonus or a timed stat buff) on the units chosen by the row's selector.
 		local result = {
 			Success = false,
 			Reason = "INVALID_EFFECT_CONTEXT",
@@ -33,14 +33,21 @@ script BuffEffectExecutorLogic extends Logic
 			return result
 		end
 
+		-- A skill with several buff steps (e.g. attack + defense) must show its self effect once, not once per step.
+		if context.BuffHitPresentedUnitIds == nil then
+			context.BuffHitPresentedUnitIds = {}
+		end
 		for _, targetUnitId in ipairs(targetUnitIds) do
+			local presentHit = context.BuffHitPresentedUnitIds[targetUnitId] ~= true
+			context.BuffHitPresentedUnitIds[targetUnitId] = true
 			local buffResult = battleSession:ResolveSkillBuffImpact(
 				context.SourceUnitId,
 				context.SkillId,
 				targetUnitId,
 				result.EffectType,
 				effectStep.Value,
-				turns
+				turns,
+				presentHit
 			)
 			table.insert(result.Results, buffResult)
 			if buffResult.Success == false then
@@ -61,16 +68,28 @@ script BuffEffectExecutorLogic extends Logic
 
 	method boolean IsBuffEffectType(string effectType)
 		-- Single source of truth for which EffectTypes this executor owns; the Router and Validator both ask here.
-		return effectType == "NEXT_ATTACK_BONUS" or effectType == "MAX_HP_BUFF" or effectType == "DEFENSE_BUFF"
+		return effectType == "NEXT_ATTACK_BONUS" or self:IsTimedBuffEffectType(effectType)
 	end
 
 	method boolean IsTimedBuffEffectType(string effectType)
 		-- Timed buffs count down on the enemy-round clock and therefore require a duration in ParameterA.
-		return effectType == "MAX_HP_BUFF" or effectType == "DEFENSE_BUFF"
+		return self:GetBuffStat(effectType) ~= ""
+	end
+
+	method string GetBuffStat(string effectType)
+		-- Maps a timed buff EffectType to the stat key BattleUnitComponent stores it under.
+		if effectType == "ATTACK_BUFF" then
+			return "ATTACK"
+		elseif effectType == "DEFENSE_BUFF" then
+			return "DEFENSE"
+		elseif effectType == "MAX_HP_BUFF" then
+			return "MAX_HP"
+		end
+		return ""
 	end
 
 	method integer ParseDurationTurns(table effectStep)
-		-- ParameterA holds the duration as a whole enemy-round count. The next-attack bonus has no duration.
+		-- ParameterA holds the duration as a whole enemy-round count. The next-attack bonus has none.
 		local turns = tonumber(effectStep.ParameterA)
 		if turns == nil then
 			return 0
@@ -91,13 +110,15 @@ script BuffEffectExecutorLogic extends Logic
 		local parts = {}
 		for _, effectStep in ipairs(effectResult.Steps) do
 			local valueText = self:FormatNumber(effectStep.Value or 0)
-			local turns = self:ParseDurationTurns(effectStep)
+			local turnText = " (" .. tostring(self:ParseDurationTurns(effectStep)) .. "턴)"
 			if effectStep.EffectType == "NEXT_ATTACK_BONUS" then
 				table.insert(parts, "다음 공격 피해 +" .. valueText)
+			elseif effectStep.EffectType == "ATTACK_BUFF" then
+				table.insert(parts, "공격력 +" .. valueText .. turnText)
 			elseif effectStep.EffectType == "MAX_HP_BUFF" then
-				table.insert(parts, "최대 HP +" .. valueText .. " (" .. tostring(turns) .. "턴)")
+				table.insert(parts, "최대 HP +" .. valueText .. turnText)
 			elseif effectStep.EffectType == "DEFENSE_BUFF" then
-				table.insert(parts, "방어력 +" .. valueText .. " (" .. tostring(turns) .. "턴)")
+				table.insert(parts, "방어력 +" .. valueText .. turnText)
 			end
 		end
 		return table.concat(parts, ", ")

@@ -18,11 +18,18 @@ script BattleUnitComponent extends Component
 	@Sync property boolean UtilityGuardActive = false
 	-- Battle-scoped self buffs granted by support skills (BuffEffectExecutorLogic). Turn counts tick on the
 	-- same enemy-round boundary as skill cooldowns and every value resets with InitializeBattleState.
+	-- The synced values are totals (amount = sum over skills, turns = longest remaining) for presentation and
+	-- damage rules; the per-skill entries behind them stay server-side.
 	@Sync property number NextAttackBonus = 0
+	@Sync property number AttackBuffAmount = 0
+	@Sync property integer AttackBuffTurns = 0
 	@Sync property number DefenseBuffAmount = 0
 	@Sync property integer DefenseBuffTurns = 0
 	@Sync property number MaxHpBuffAmount = 0
 	@Sync property integer MaxHpBuffTurns = 0
+	-- Different skills stack; recasting the same skill refreshes its own entry instead of adding a second one.
+	property table NextAttackBonusBySkill = {}
+	property table TimedBuffEntries = {}
 	@Sync property string EnemyDefinitionId = ""
 	@Sync property string EnemyDisplayName = ""
 	@Sync property number BasicAttackDamage = 3
@@ -68,7 +75,11 @@ script BattleUnitComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void ClearBattleBuffs()
 		-- Drops every self buff without touching HP; callers that own MaxHp reset it themselves.
+		self.NextAttackBonusBySkill = {}
+		self.TimedBuffEntries = {}
 		self.NextAttackBonus = 0
+		self.AttackBuffAmount = 0
+		self.AttackBuffTurns = 0
 		self.DefenseBuffAmount = 0
 		self.DefenseBuffTurns = 0
 		self.MaxHpBuffAmount = 0
@@ -218,97 +229,134 @@ script BattleUnitComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ApplyNextAttackBonus(number amount)
-		-- Arms a one-shot damage bonus for this unit's next damaging skill. Recasting keeps the larger value instead of stacking.
+	method table ApplyNextAttackBonus(string skillId, number amount)
+		-- Arms a one-shot damage bonus for this unit's next damaging skill. Bonuses from different skills add up;
+		-- recasting the same skill keeps its larger value instead of stacking.
 		if amount <= 0 then
 			return { Success = false, Reason = "INVALID_AMOUNT" }
 		end
 		if self.IsDead == true then
 			return { Success = false, Reason = "UNIT_DEAD" }
 		end
-		local refreshed = self.NextAttackBonus > 0
-		self.NextAttackBonus = math.max(self.NextAttackBonus, amount)
-		log("[BattleBuff] next attack bonus armed unit=" .. self.UnitId .. " amount=" .. tostring(self.NextAttackBonus) .. " refreshed=" .. tostring(refreshed))
-		return { Success = true, Reason = refreshed and "NEXT_ATTACK_BONUS_REFRESHED" or "NEXT_ATTACK_BONUS_ARMED", Amount = self.NextAttackBonus }
+		local previous = self.NextAttackBonusBySkill[skillId] or 0
+		self.NextAttackBonusBySkill[skillId] = math.max(previous, amount)
+		self.NextAttackBonus = self:SumTableValues(self.NextAttackBonusBySkill)
+		log("[BattleBuff] next attack bonus armed unit=" .. self.UnitId .. " skill=" .. skillId .. " amount=" .. tostring(self.NextAttackBonusBySkill[skillId]) .. " total=" .. tostring(self.NextAttackBonus) .. " refreshed=" .. tostring(previous > 0))
+		return { Success = true, Reason = previous > 0 and "NEXT_ATTACK_BONUS_REFRESHED" or "NEXT_ATTACK_BONUS_ARMED", Amount = self.NextAttackBonus }
 	end
 
 	@ExecSpace("ServerOnly")
 	method number ConsumeNextAttackBonus()
-		-- Spends the armed bonus once the skill it boosted has landed; returns the consumed amount (0 when none was armed).
+		-- Spends every armed bonus once the skill it boosted has landed; returns the consumed total (0 when none was armed).
 		local amount = self.NextAttackBonus
+		self.NextAttackBonusBySkill = {}
+		self.NextAttackBonus = 0
 		if amount > 0 then
-			self.NextAttackBonus = 0
 			log("[BattleBuff] next attack bonus consumed unit=" .. self.UnitId .. " amount=" .. tostring(amount))
 		end
 		return amount
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ApplyDefenseBuff(number amount, integer turns)
-		-- Reduces incoming damage for a number of enemy rounds. Recasting refreshes to the larger amount and duration; it never stacks.
+	method table ApplyTimedBuff(string skillId, string stat, number amount, integer turns)
+		-- Adds or refreshes one skill's timed stat buff (ATTACK / DEFENSE / MAX_HP). Entries from different skills
+		-- stack; the same skill keeps the larger amount and the longer duration.
+		if stat ~= "ATTACK" and stat ~= "DEFENSE" and stat ~= "MAX_HP" then
+			return { Success = false, Reason = "UNSUPPORTED_BUFF_STAT" }
+		end
 		if amount <= 0 or turns <= 0 then
 			return { Success = false, Reason = "INVALID_AMOUNT" }
 		end
 		if self.IsDead == true then
 			return { Success = false, Reason = "UNIT_DEAD" }
 		end
-		local refreshed = self.DefenseBuffTurns > 0
-		self.DefenseBuffAmount = math.max(self.DefenseBuffAmount, amount)
-		self.DefenseBuffTurns = math.max(self.DefenseBuffTurns, turns)
-		log("[BattleBuff] defense buff applied unit=" .. self.UnitId .. " amount=" .. tostring(self.DefenseBuffAmount) .. " turns=" .. tostring(self.DefenseBuffTurns) .. " refreshed=" .. tostring(refreshed))
-		return { Success = true, Reason = refreshed and "DEFENSE_BUFF_REFRESHED" or "DEFENSE_BUFF_APPLIED", Amount = self.DefenseBuffAmount, Turns = self.DefenseBuffTurns }
-	end
-
-	@ExecSpace("ServerOnly")
-	method table ApplyMaxHpBuff(number amount, integer turns)
-		-- Raises MaxHp and CurrentHp by the same amount for a number of enemy rounds. Recasting refreshes the duration and
-		-- only a larger amount grows the bonus, so repeated casts never stack HP.
-		if amount <= 0 or turns <= 0 then
-			return { Success = false, Reason = "INVALID_AMOUNT" }
+		local key = skillId .. "|" .. stat
+		local entry = self.TimedBuffEntries[key]
+		local refreshed = entry ~= nil
+		if entry == nil then
+			entry = { SkillId = skillId, Stat = stat, Amount = 0, Turns = 0 }
+			self.TimedBuffEntries[key] = entry
 		end
-		if self.IsDead == true then
-			return { Success = false, Reason = "UNIT_DEAD" }
-		end
-		local refreshed = self.MaxHpBuffTurns > 0
-		local delta = math.max(0, amount - self.MaxHpBuffAmount)
-		if delta > 0 then
-			self.MaxHpBuffAmount = self.MaxHpBuffAmount + delta
-			self.MaxHp = self.MaxHp + delta
-			self.CurrentHp = math.min(self.MaxHp, self.CurrentHp + delta)
-		end
-		self.MaxHpBuffTurns = math.max(self.MaxHpBuffTurns, turns)
-		self:SyncRunHp("MAX_HP_BUFF_APPLIED")
-		log("[BattleBuff] max hp buff applied unit=" .. self.UnitId .. " amount=" .. tostring(self.MaxHpBuffAmount) .. " turns=" .. tostring(self.MaxHpBuffTurns) .. " hp=" .. tostring(self.CurrentHp) .. "/" .. tostring(self.MaxHp) .. " refreshed=" .. tostring(refreshed))
-		return { Success = true, Reason = refreshed and "MAX_HP_BUFF_REFRESHED" or "MAX_HP_BUFF_APPLIED", Amount = self.MaxHpBuffAmount, Turns = self.MaxHpBuffTurns, HpAfter = self.CurrentHp, MaxHp = self.MaxHp }
+		entry.Amount = math.max(entry.Amount, amount)
+		entry.Turns = math.max(entry.Turns, turns)
+		self:RecomputeBuffTotals(stat .. "_BUFF_APPLIED")
+		log("[BattleBuff] " .. string.lower(stat) .. " buff applied unit=" .. self.UnitId .. " skill=" .. skillId .. " amount=" .. tostring(entry.Amount) .. " turns=" .. tostring(entry.Turns) .. " refreshed=" .. tostring(refreshed) .. " totals atk=" .. tostring(self.AttackBuffAmount) .. " def=" .. tostring(self.DefenseBuffAmount) .. " maxHp=" .. tostring(self.MaxHpBuffAmount) .. " hp=" .. tostring(self.CurrentHp) .. "/" .. tostring(self.MaxHp))
+		return { Success = true, Reason = refreshed and (stat .. "_BUFF_REFRESHED") or (stat .. "_BUFF_APPLIED"), Amount = entry.Amount, Turns = entry.Turns, HpAfter = self.CurrentHp, MaxHp = self.MaxHp }
 	end
 
 	@ExecSpace("ServerOnly")
 	method table AdvanceBuffTurns(string reason)
-		-- Counts timed buffs down by one enemy round and removes the ones that ran out, on the same boundary as skill cooldowns.
-		local result = { Success = true, Reason = "BUFFS_ADVANCED", DefenseExpired = false, MaxHpExpired = false }
-		if self.DefenseBuffTurns > 0 then
-			self.DefenseBuffTurns = self.DefenseBuffTurns - 1
-			if self.DefenseBuffTurns <= 0 then
-				self.DefenseBuffTurns = 0
-				self.DefenseBuffAmount = 0
+		-- Counts every timed buff down by one enemy round and removes the ones that ran out, on the same boundary as
+		-- skill cooldowns. A removed max-HP buff restores MaxHp and clips CurrentHp through RecomputeBuffTotals.
+		local result = { Success = true, Reason = "BUFFS_ADVANCED", AttackExpired = false, DefenseExpired = false, MaxHpExpired = false, MaxHpChanged = false }
+		local expiredKeys = {}
+		for key, entry in pairs(self.TimedBuffEntries) do
+			entry.Turns = entry.Turns - 1
+			if entry.Turns <= 0 then
+				table.insert(expiredKeys, key)
+			end
+		end
+		if #expiredKeys == 0 then
+			self:RecomputeBuffTotals(reason)
+			return result
+		end
+		for _, key in ipairs(expiredKeys) do
+			local entry = self.TimedBuffEntries[key]
+			self.TimedBuffEntries[key] = nil
+			if entry.Stat == "ATTACK" then
+				result.AttackExpired = true
+			elseif entry.Stat == "DEFENSE" then
 				result.DefenseExpired = true
-				log("[BattleBuff] defense buff expired unit=" .. self.UnitId .. " reason=" .. (reason or ""))
-			end
-		end
-		if self.MaxHpBuffTurns > 0 then
-			self.MaxHpBuffTurns = self.MaxHpBuffTurns - 1
-			if self.MaxHpBuffTurns <= 0 then
-				local removedAmount = self.MaxHpBuffAmount
-				self.MaxHpBuffTurns = 0
-				self.MaxHpBuffAmount = 0
-				self.MaxHp = math.max(1, self.MaxHp - removedAmount)
-				self.CurrentHp = math.min(self.CurrentHp, self.MaxHp)
+			elseif entry.Stat == "MAX_HP" then
 				result.MaxHpExpired = true
-				self:SyncRunHp("MAX_HP_BUFF_EXPIRED")
-				log("[BattleBuff] max hp buff expired unit=" .. self.UnitId .. " removed=" .. tostring(removedAmount) .. " hp=" .. tostring(self.CurrentHp) .. "/" .. tostring(self.MaxHp) .. " reason=" .. (reason or ""))
 			end
+			log("[BattleBuff] " .. string.lower(entry.Stat) .. " buff expired unit=" .. self.UnitId .. " skill=" .. entry.SkillId .. " amount=" .. tostring(entry.Amount) .. " reason=" .. (reason or ""))
 		end
+		local maxHpDelta = self:RecomputeBuffTotals("BUFF_EXPIRED")
+		result.MaxHpChanged = maxHpDelta ~= 0
+		log("[BattleBuff] totals after expiry unit=" .. self.UnitId .. " atk=" .. tostring(self.AttackBuffAmount) .. " def=" .. tostring(self.DefenseBuffAmount) .. " maxHp=" .. tostring(self.MaxHpBuffAmount) .. " hp=" .. tostring(self.CurrentHp) .. "/" .. tostring(self.MaxHp) .. " reason=" .. (reason or ""))
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method number RecomputeBuffTotals(string reason)
+		-- Rebuilds the synced totals from the per-skill entries and applies any max-HP change; returns that change.
+		local totals = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0 }
+		local longest = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0 }
+		for _, entry in pairs(self.TimedBuffEntries) do
+			totals[entry.Stat] = totals[entry.Stat] + entry.Amount
+			longest[entry.Stat] = math.max(longest[entry.Stat], entry.Turns)
+		end
+		self.AttackBuffAmount = totals.ATTACK
+		self.AttackBuffTurns = longest.ATTACK
+		self.DefenseBuffAmount = totals.DEFENSE
+		self.DefenseBuffTurns = longest.DEFENSE
+		self.MaxHpBuffTurns = longest.MAX_HP
+		local maxHpDelta = totals.MAX_HP - self.MaxHpBuffAmount
+		if maxHpDelta == 0 then
+			return 0
+		end
+		self.MaxHpBuffAmount = totals.MAX_HP
+		if maxHpDelta > 0 then
+			-- A new or larger buff raises the maximum and the current HP by the same amount.
+			self.MaxHp = self.MaxHp + maxHpDelta
+			self.CurrentHp = math.min(self.MaxHp, self.CurrentHp + maxHpDelta)
+		else
+			-- An expired buff only takes back the maximum; HP above the new maximum is clipped.
+			self.MaxHp = math.max(1, self.MaxHp + maxHpDelta)
+			self.CurrentHp = math.min(self.CurrentHp, self.MaxHp)
+		end
+		self:SyncRunHp("MAX_HP_" .. (reason or ""))
+		return maxHpDelta
+	end
+
+	method number SumTableValues(table values)
+		-- Sums the numeric values of a keyed table.
+		local total = 0
+		for _, value in pairs(values or {}) do
+			total = total + value
+		end
+		return total
 	end
 
 	@ExecSpace("ServerOnly")
