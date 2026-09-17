@@ -96,6 +96,28 @@ method table Execute(table context, table effectStep)
 |---|---|---|
 | `DAMAGE` | `DamageEffectExecutorLogic` | 전방 대상 피해 |
 | `PUSH` | `PushEffectExecutorLogic` | 전방 대상 Cell 이동 |
+| `HEAL` | `HealEffectExecutorLogic` | 같은 팀 대상 회복 |
+| `NEXT_ATTACK_BONUS` | `BuffEffectExecutorLogic` | 시전자의 다음 피해 스킬 1회 피해 +`Value` |
+| `MAX_HP_BUFF` | `BuffEffectExecutorLogic` | 시전자 최대 HP·현재 HP +`Value`, `ParameterA`턴 |
+| `DEFENSE_BUFF` | `BuffEffectExecutorLogic` | 시전자가 받는 피해 -`Value`(최소 1), `ParameterA`턴 |
+
+### 버프 EffectType 규칙
+
+세 버프는 한 Executor(`BuffEffectExecutorLogic`)가 소유하고, 상태는 대상의
+`BattleUnitComponent`(`NextAttackBonus`, `DefenseBuff*`, `MaxHpBuff*`)가 보관한다.
+Router와 Validator는 `IsBuffEffectType`으로 같은 목록을 공유한다.
+
+- `TargetSelector`는 `SELF_UNIT`만 허용한다(`BUFF_REQUIRES_SELF_UNIT`). `Value`는 0 초과(`INVALID_BUFF_VALUE`).
+- 지속형(`MAX_HP_BUFF`, `DEFENSE_BUFF`)은 `ParameterA`에 1 이상 정수 턴 수가 필요하다(`INVALID_BUFF_DURATION`).
+- 턴은 쿨다운과 같은 경계(`AdvancePlayerSkillCooldowns`, 적 라운드 종료 후 다음 플레이어 턴 직전)에서 1 줄어든다.
+  시전 턴 포함 N번의 적 라운드 동안 유지된다.
+- 재시전은 중첩하지 않는다. 수치는 큰 값, 지속은 긴 값으로 갱신된다.
+- `NEXT_ATTACK_BONUS`는 `ApplyDamage`에서 더해지고, 피해 스킬의 모든 Step이 끝난 뒤
+  하나 이상 적중했을 때 `SkillExecutionLogic.ConsumeNextAttackBonusOnHit`가 소비한다. 그래서 범위기는 모든 대상에 적용된다.
+- `DEFENSE_BUFF`는 유물 방어력 뒤에 `max(1, amount - DefenseBuffAmount)`로 적용된다. Utility Guard 무효화가 우선한다.
+- `MAX_HP_BUFF`는 전투 전용이다. `SyncRunHp`는 버프를 뺀 최대 HP와 그 이하로 절삭한 현재 HP만 런 상태에 기록하므로
+  전투가 버프 도중 끝나도 런 HP가 부풀지 않는다. 만료 시 최대 HP를 원복하고 초과 현재 HP를 절삭한다.
+- 툴팁·도감 문구는 `BuffEffectExecutorLogic.DescribeBuffEffects` 한 곳에서 만든다.
 
 ## 복합 스킬 예제
 

@@ -6159,6 +6159,73 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ResolveSkillBuffImpact(string sourceUnitId, string skillId, string targetUnitId, string effectType, number value, integer turns)
+		-- Grants one self buff at the impact frame. Like heal it never needs an enemy on the board; the buff state
+		-- itself is owned and counted down by the target's BattleUnitComponent.
+		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, SkillId = skillId, TargetUnitId = targetUnitId, EffectType = effectType }
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		local targetEntity = self:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		if isvalid(targetEntity) == false then
+			result.Reason = "TARGET_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if self:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		if sourceUnit.Team ~= targetUnit.Team then
+			result.Reason = "TARGET_NOT_ALLY"
+			return result
+		end
+
+		local buffResult = nil
+		if effectType == "NEXT_ATTACK_BONUS" then
+			buffResult = targetUnit:ApplyNextAttackBonus(value)
+		elseif effectType == "MAX_HP_BUFF" then
+			buffResult = targetUnit:ApplyMaxHpBuff(value, turns)
+		elseif effectType == "DEFENSE_BUFF" then
+			buffResult = targetUnit:ApplyDefenseBuff(value, turns)
+		else
+			result.Reason = "UNSUPPORTED_BUFF_TYPE"
+			return result
+		end
+		if buffResult.Success == false then
+			result.Reason = "BUFF_FAILED_" .. buffResult.Reason
+			return result
+		end
+		result.Success = true
+		result.Hit = true
+		result.Reason = buffResult.Reason
+		self:PlayActiveHitEffect(targetUnitId)
+
+		if effectType == "MAX_HP_BUFF" then
+			local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+			if targetPresentation ~= nil then
+				targetPresentation:RefreshHpDisplay(targetUnitId, targetUnit.Team, targetUnit.CurrentHp, targetUnit.MaxHp)
+			end
+			if targetUnit.Team == "Player" then
+				self:RefreshPlayerHpSnapshot("MAX_HP_BUFF_APPLIED")
+			end
+		end
+		log("[BattleBuff] resolved skill=" .. skillId .. " source=" .. sourceUnitId .. " target=" .. targetUnitId .. " effect=" .. effectType .. " value=" .. tostring(value) .. " turns=" .. tostring(turns) .. " reason=" .. result.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method table TryRegisterEnemyCastInterrupt(string sourceUnitId, string skillId, string targetUnitId, number appliedDamage)
 		-- Interruption is a combat-domain consequence of a successful player skill hit, not a special case inside one skill.
 		local result = { Success = false, Reason = "NOT_INTERRUPTIBLE", Interrupted = false }
@@ -6333,9 +6400,19 @@ script BattleSessionComponent extends Component
 			and attackerRun ~= nil and attackerEffects.ActiveRunSequence == attackerRun.RunSequence then
 			amount = amount + attackerEffects.AttackBonus
 		end
+		-- Self buffs live on the units, so both teams share one rule. The next-attack bonus is only read here;
+		-- SkillExecutionLogic spends it once the whole skill has landed so area skills boost every target.
+		if sourceUnit.NextAttackBonus > 0 then
+			amount = amount + sourceUnit.NextAttackBonus
+			log("[BattleBuff] next attack bonus added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " bonus=" .. tostring(sourceUnit.NextAttackBonus) .. " amount=" .. tostring(amount))
+		end
 		if targetUnit.Team == "Player" and defenderEffects ~= nil and defenderEffects.IsInitialized
 			and defenderRun ~= nil and defenderEffects.ActiveRunSequence == defenderRun.RunSequence then
 			amount = math.max(1, amount - defenderEffects.DefenseBonus)
+		end
+		if targetUnit.DefenseBuffAmount > 0 then
+			amount = math.max(1, amount - targetUnit.DefenseBuffAmount)
+			log("[BattleBuff] defense buff reduced source=" .. sourceUnitId .. " target=" .. targetUnitId .. " defense=" .. tostring(targetUnit.DefenseBuffAmount) .. " amount=" .. tostring(amount))
 		end
 		-- BattleUnit retains the full UtilityGuardActive block, including zero damage.
 		local damageResult = targetUnit:ApplyDamage(amount)
@@ -7130,7 +7207,18 @@ script BattleSessionComponent extends Component
 		-- A guard lasts through one enemy round; utilities share the existing turn cooldown clock.
 		if isvalid(self.PlayerEntity) then
 			local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
-			if unit ~= nil then unit.UtilityGuardActive = false end
+			if unit ~= nil then
+				unit.UtilityGuardActive = false
+				-- Timed self buffs share this clock so "N턴" on a buff and on a cooldown mean the same thing.
+				local buffResult = unit:AdvanceBuffTurns(reason)
+				if buffResult.MaxHpExpired == true then
+					local presentation = self.PlayerEntity:GetComponent("script.BattleUnitPresentationComponent")
+					if presentation ~= nil then
+						presentation:RefreshHpDisplay(unit.UnitId, unit.Team, unit.CurrentHp, unit.MaxHp)
+					end
+					self:RefreshPlayerHpSnapshot("MAX_HP_BUFF_EXPIRED")
+				end
+			end
 		end
 		local runtimeState = self:GetSkillRuntimeState("player_01")
 		if runtimeState == nil then
