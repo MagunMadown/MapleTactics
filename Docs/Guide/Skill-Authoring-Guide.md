@@ -385,10 +385,11 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 
 ## Dataset 상태
 
-플레이어 스킬 48행(직업별 5개 테이블 — 1단계 32행 + 2단계 16행)이 실제 Dataset으로 올라가 있다.
+플레이어 스킬 50행(직업별 5개 테이블 — 1단계 34행 + 2단계 16행)이 실제 Dataset으로 올라가 있다.
 적 전용 행·Effect Step·무기 행 수는 CSV를 직접 본다. 그중 투사체를 쓰는 플레이어 스킬은
 10행이다. `thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`,
-마법사 `magic_guard`·`meditation`·`bless`, 궁수 `split_mistel`·`cardinal_transition`·`bolt_swift`는
+마법사 `magic_guard`·`meditation`·`bless`, 궁수 `split_mistel`·`cardinal_transition`·`bolt_swift`,
+도적 `dark_sight`·`wind_talisman`·`muspelheim`·`tornado_spin`·`blade_ascension`과 `fatal_blow`는
 아직 상위 단계가 없다.
 `AllowPrototypeCompatibilityFallback=false`이며 production
 Skill 하드코딩을 다시 추가하지 않는다. 새 Dataset을 만들 때는 기존 `.userdataset` ID를
