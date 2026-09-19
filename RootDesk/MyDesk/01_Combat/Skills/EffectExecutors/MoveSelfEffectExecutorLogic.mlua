@@ -29,11 +29,19 @@ script MoveSelfEffectExecutorLogic extends Logic
 			return result
 		end
 
+		local offset = self:ResolveForwardOffset(context, effectStep)
+		if offset.Success == false then
+			-- No cell to land on (e.g. the skill hit nobody). The damage steps still stand.
+			result.Success = true
+			result.Reason = offset.Reason
+			return result
+		end
+
 		-- Only the caster moves itself; the selector is restricted to SELF_UNIT by the validator.
 		local moveResult = battleSession:ResolveSkillMoveImpact(
 			context.SourceUnitId,
 			context.SkillId,
-			self:ParseForwardOffset(effectStep),
+			offset.ForwardOffset,
 			effectStep.ParameterB ~= "ALLOW_OCCUPIED"
 		)
 		table.insert(result.Results, moveResult)
@@ -52,27 +60,86 @@ script MoveSelfEffectExecutorLogic extends Logic
 		return result
 	end
 
+	@ExecSpace("ServerOnly")
+	method table ResolveForwardOffset(table context, table effectStep)
+		-- Turns the authored mode into "how many cells ahead of the caster to land", counted along its facing.
+		local result = { Success = false, Reason = "UNSUPPORTED_MOVE_MODE", ForwardOffset = 0 }
+		local mode = effectStep.ParameterA or ""
+		local value = self:ParseMoveValue(effectStep)
+		if mode == "FORWARD_OFFSET" then
+			result.Success = true
+			result.Reason = "OK"
+			result.ForwardOffset = value
+			return result
+		end
+		if mode ~= "BEHIND_FARTHEST_TARGET" then
+			return result
+		end
+
+		-- Land behind the farthest enemy this skill actually hit, so the caster ends up past the whole group.
+		local sourceEntity = context.BattleSession:FindUnitEntity(context.SourceUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		local direction = sourceUnit.Facing == "Right" and 1 or -1
+		local farthestDistance = 0
+		for _, targetUnitId in ipairs(context.TargetUnitIds or {}) do
+			local targetCell = (context.TargetCellsByUnitId or {})[targetUnitId]
+			if targetCell ~= nil then
+				local distance = (targetCell - sourceUnit.CellIndex) * direction
+				if distance > farthestDistance then
+					farthestDistance = distance
+				end
+			end
+		end
+		if farthestDistance <= 0 then
+			-- The skill hit nothing ahead, so there is no enemy to land behind.
+			result.Reason = "MOVE_NO_TARGET"
+			return result
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		result.ForwardOffset = farthestDistance + value
+		return result
+	end
+
 	method boolean IsMoveEffectType(string effectType)
 		-- Single source of truth for which EffectTypes this executor owns; the Router and Validator both ask here.
 		return effectType == "MOVE_SELF"
 	end
 
-	method integer ParseForwardOffset(table effectStep)
-		-- Value holds how many cells ahead the caster lands, counted along its facing.
+	method integer ParseMoveValue(table effectStep)
+		-- FORWARD_OFFSET: cells ahead of the caster. BEHIND_FARTHEST_TARGET: cells past that enemy (1 = right behind).
 		return math.floor(tonumber(effectStep.Value) or 0)
 	end
 
+	method integer ParseForwardOffset(table effectStep)
+		-- Kept for the validator's range check; the runtime offset comes from ResolveForwardOffset.
+		return self:ParseMoveValue(effectStep)
+	end
+
 	method boolean IsSupportedMoveMode(string parameterA)
-		-- Only one mode exists so far; the utility catalog's scan modes stay unimplemented.
-		return parameterA == "FORWARD_OFFSET"
+		-- Two modes so far; the utility catalog's scan modes stay unimplemented.
+		return parameterA == "FORWARD_OFFSET" or parameterA == "BEHIND_FARTHEST_TARGET"
 	end
 
 	method string DescribeMoveStep(table effectStep)
 		-- Player-facing summary appended to skill tooltips next to the buff lines.
-		if self:IsSupportedMoveMode(effectStep.ParameterA or "") == false then
-			return ""
+		local mode = effectStep.ParameterA or ""
+		if mode == "FORWARD_OFFSET" then
+			return "시전 후 " .. tostring(self:ParseMoveValue(effectStep)) .. "칸 전진"
 		end
-		return "시전 후 " .. tostring(self:ParseForwardOffset(effectStep)) .. "칸 전진"
+		if mode == "BEHIND_FARTHEST_TARGET" then
+			return "가장 먼 적의 뒤로 이동"
+		end
+		return ""
 	end
 
 end

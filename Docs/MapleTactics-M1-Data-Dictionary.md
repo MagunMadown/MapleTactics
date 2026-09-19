@@ -628,7 +628,9 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 데이터 사전을 함께 수정한 뒤 사용한다.
 
 `GUARD_BUFF`는 받는 피해를 전부 무효로 만들고(도적 `dark_sight`), `MOVE_SELF`는 피해 스텝 뒤에 시전자를
-`Value`칸 전진시킨다(도적 `muspelheim`·`tornado_spin`). 이동이 막히면 피해만 남고 이동만 생략된다.
+`ParameterA` 모드가 정한 칸으로 이동시킨다 — `FORWARD_OFFSET`은 `Value`칸 전진,
+`BEHIND_FARTHEST_TARGET`은 그 스킬이 맞힌 적 중 가장 먼 적의 `Value`칸 뒤다(도적 `muspelheim`·`tornado_spin`).
+이동이 막히거나 맞힌 적이 없으면 피해만 남고 이동만 생략된다.
 규칙은 [`Effect-Executor-Guide.md`](./Guide/Effect-Executor-Guide.md)가 소유한다.
 
 버프 4종은 `BuffEffectExecutorLogic`이 처리하며 `BattleSessionComponent.ResolveSkillBuffImpact`로

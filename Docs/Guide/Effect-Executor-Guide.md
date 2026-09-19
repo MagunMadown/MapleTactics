@@ -102,14 +102,22 @@ method table Execute(table context, table effectStep)
 | `MAX_HP_BUFF` | `BuffEffectExecutorLogic` | 시전자 최대 HP·현재 HP +`Value`, `ParameterA`턴 |
 | `DEFENSE_BUFF` | `BuffEffectExecutorLogic` | 시전자가 받는 피해 -`Value`(최소 1), `ParameterA`턴 |
 | `GUARD_BUFF` | `BuffEffectExecutorLogic` | 시전자가 받는 피해를 전부 무효, `ParameterA`턴 |
-| `MOVE_SELF` | `MoveSelfEffectExecutorLogic` | 시전자를 바라보는 방향으로 `Value`칸 이동 |
+| `MOVE_SELF` | `MoveSelfEffectExecutorLogic` | 시전자를 바라보는 방향으로 이동. 착지 칸은 `ParameterA` 모드가 정한다 |
 
 ### `MOVE_SELF` 규칙
 
 피해 스텝 뒤에 붙여 "공격하고 전진"을 만든다. 상태가 아니라 보드 이동이라 버프와 다른 Executor가 소유한다.
 
-- `TargetSelector`는 `SELF_UNIT`만(`MOVE_REQUIRES_SELF_UNIT`), `Value`는 1 이상 칸 수(`INVALID_MOVE_OFFSET`),
-  `ParameterA`는 현재 `FORWARD_OFFSET`만(`UNSUPPORTED_MOVE_MODE`).
+- `TargetSelector`는 `SELF_UNIT`만(`MOVE_REQUIRES_SELF_UNIT`), `Value`는 1 이상(`INVALID_MOVE_OFFSET`),
+  `ParameterA`는 `FORWARD_OFFSET` 또는 `BEHIND_FARTHEST_TARGET`(`UNSUPPORTED_MOVE_MODE`).
+
+| `ParameterA` | 착지 칸 | `Value`의 뜻 |
+|---|---|---|
+| `FORWARD_OFFSET` | 시전자 기준 앞으로 `Value`칸 | 전진 칸 수 |
+| `BEHIND_FARTHEST_TARGET` | 그 스킬이 맞힌 적 중 가장 먼 적의 `Value`칸 뒤 | 적 뒤로 몇 칸인지(`1`이면 바로 뒤) |
+
+- `BEHIND_FARTHEST_TARGET`은 스킬이 실제로 맞힌 대상 스냅샷(`TargetCellsByUnitId`)에서 가장 먼 칸을 고르므로,
+  맞힌 적이 하나도 없으면 `MOVE_NO_TARGET`으로 이동하지 않는다. 앞쪽 대상만 계산에 넣는다.
 - `ParameterB=ALLOW_OCCUPIED`이면 점유 칸도 허용한다. 비우면 빈 칸일 때만 이동한다.
 - 이동은 `BattleSessionComponent.ResolveSkillMoveImpact` → `RelocateUnitForMechanic`을 통과하므로 칸 검증·점유
   검사·드롭 회수·`UnitMovedEvent`가 그대로 적용된다. 플레이어는 그 위에 기존 이동 연출을 얹는다.
