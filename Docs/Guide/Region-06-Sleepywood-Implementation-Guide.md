@@ -2,12 +2,12 @@
 
 ## 1. 범위
 
-슬리피우드 전반전은 개미굴 3개 일반 Stage와 포장마차 보스 Stage로 구성한다. 물리 맵은
+슬리피우드 전반전은 외곽 숲 3개 일반 Stage와 포장마차 보스 Stage로 구성한다. 물리 맵은
 Stage마다 복제하지 않고 아래 두 개만 사용한다.
 
 | 물리 MapId | 사용하는 Stage | 역할 |
 |---|---|---|
-| `sleepywood_ant_tunnel` | `region_06_stage_01`~`03` | 개미굴 일반전 공용 맵 |
+| `sleepywood_ant_tunnel` | `region_06_stage_01`~`03` | 슬리피우드 외곽 일반전 공용 맵 (호환성을 위해 MapId 유지) |
 | `sleepywood_food_cart_boss` | `region_06_stage_04` | 포장마차 전용 보스맵 |
 
 Stage의 규칙·적·웨이브는 CSV가 결정하고, 맵은 배경·전투 셀·전투 컴포넌트만 소유한다.
@@ -16,19 +16,24 @@ Stage의 규칙·적·웨이브는 CSV가 결정하고, 맵은 배경·전투 �
 
 | Stage | 표시명 | 주요 적 | Wave 수 |
 |---|---|---|---:|
-| `region_06_stage_01` | 6-1 개미굴 입구 | 뿔버섯 | 3 |
-| `region_06_stage_02` | 6-2 버섯 군락 | 뿔버섯, 좀비버섯 | 4 |
-| `region_06_stage_03` | 6-3 깊은 개미굴 | 뿔버섯, 좀비버섯, 주니어 부기 | 4 |
-| `region_06_stage_04` | 6-4 지하 휴게소 | 포장마차 | 보스 + Phase 2 증원 |
+| `region_06_stage_01` | 6-1 슬리피우드 외곽 | 드레이크 | 3 |
+| `region_06_stage_02` | 6-2 드레이크의 숲 | 드레이크, 카파 드레이크 | 4 |
+| `region_06_stage_03` | 6-3 어두운 숲길 | 드레이크, 카파 드레이크, 다크 드레이크 | 4 |
+| `region_06_stage_04` | 6-4 지하 휴게소 | 휴면 포장마차 + 좀비버섯 1마리 | 1 (동시 등장) |
 
-- 뿔버섯은 접근 후 1칸 찌르기로 기본 근접 대응을 학습시킨다.
-- 좀비버섯은 2칸 독 포자를 사용하며 재사용 대기시간은 3턴이다.
-- 주니어 부기는 2칸 저주탄을 사용하며 6-3에서 한 Wave만 등장한다.
-- 포장마차는 철판 내려치기, 2칸 끓는 기름, 전방 1~5칸을 덮는 포장마차 레이저를 사용한다.
+- 드레이크(HP 7)와 카파 드레이크(HP 9)는 접근 후 1칸 물기를 준비한다. 큐 준비 1턴, 쿨다운 1턴이다.
+- 다크 드레이크(HP 6)는 2칸 암흑 브레스를 사용한다. 큐 준비 1턴, 쿨다운 3턴이며 6-3의 두 번째 Wave에 등장한다.
+- 세 종류 모두 대기·이동·피격·사망 모션을 CSV로 설정한다. 일반/카파는 원본 공격 모션이 없어 이동 모션을 짧게 재생하고, 다크는 원본 `attack1`·투사체·명중 효과를 쓴다.
+- 기존 버섯 정의는 삭제하지 않는다. 보스 입장 시 좀비버섯 1마리가 함께 등장한다.
+- 포장마차는 HP 38로 시작하며, 1페이즈 `DORMANT`에서는 이동·공격 없이 피해만 받는다.
+- HP 19 이하에서 2페이즈 `DINNER_RUSH`로 한 번 전환한다. 이후 철판 내려치기, 2칸 끓는 기름, 전방 1~5칸을 덮는 포장마차 레이저를 사용한다.
 - 포장마차 레이저는 피해 5, 재사용 대기시간 5턴, Queue 준비 2턴이며 준비 중 서로 다른
   플레이어 피해 스킬을 2회 적중시키면 끊기는 기존 `CAST_INTERRUPTIBLE` 계약을 사용한다.
 - 포장마차는 `HOLD_POSITION` 특성을 유지하므로 플레이어 쪽으로 접근하지 않는다.
-- 포장마차는 HP 50%에서 Phase 2로 전환하며 좀비버섯 증원 Wave를 호출한다.
+- 2페이즈에서 추가 증원은 없다. 기존 좀비버섯은 살아 있으면 계속 전투한다.
+- 첫 Wave는 `SpawnCount=2`이며, 전용 Pool의 포장마차·좀비버섯 가중치가 각각 1이다. 현재 순환 가중치 선택에서는 연속 두 슬롯이 각 적을 정확히 한 번 선택한다(Seed에 따라 좌우 순서만 달라짐). 이 보장을 유지하려면 Pool 후보·가중치·SpawnCount를 함께 검토한다.
+- 휴면 대기·이동·피격은 `cfa8628b0600429da10170ac92e912c3`, 휴면 사망은 `3462ebeccf2149afaa3c91405f7cfb20`이다. 2페이즈는 `EnemyDefinitions`의 원래 활성 모션으로 복원한다.
+- 레이저 `CasterMotionRuid=91f105e9a3954188a919e2e7720a414b`는 본체와 빔을 포함한다. 중복 발사 이펙트(`CastEffectRuid`)는 비워 두며 피격 효과는 유지한다.
 
 ## 3. 데이터 수정 위치
 
@@ -37,12 +42,12 @@ Stage의 규칙·적·웨이브는 CSV가 결정하고, 맵은 배경·전투 �
 | Stage 이름·유형·Queue 용량 | `StageDefinitions.csv` |
 | 물리 맵 연결 | `StageMapRoutes.csv` |
 | Wave 수·적 수·강제 증원 조건 | `StageEnemyWaves.csv` |
-| 적 HP·공격력·모션·ModelId | `EnemyDefinitions.csv` |
-| Wave용 적 후보와 가중치 | `EnemySpawnPools.csv` |
+| 적 HP·공격력·모션 | `EnemyDefinitions.csv` |
+| Wave용 적 후보·ModelId·가중치 | `EnemySpawnPools.csv` |
 | 적 스킬 사거리·쿨다운·아이콘·이펙트 | `EnemySkillDefinitions.csv` |
 | 실제 피해 단계 | `SkillEffectSteps.csv` |
 | 적 행동 순서 | `EnemyPatternSteps.csv` |
-| 보스 HP 임계와 패턴 교체 | `BossPhaseDefinitions.csv` |
+| 보스 HP 임계·패턴·페이즈별 모션 덮어쓰기 | `BossPhaseDefinitions.csv` |
 | 클리어 보상·적 드롭 | `StageRewardDefinitions.csv`, `EnemyDropDefinitions.csv` |
 | REST/BATTLE 노드 흐름 | `NodeDefinitions.csv` |
 
@@ -55,11 +60,13 @@ Stage의 규칙·적·웨이브는 CSV가 결정하고, 맵은 배경·전투 �
 현재 하단 경로는 다음 순서로 이어진다.
 
 ```text
-nautilus_stage04_boss
-→ nautilus_reward_after_stage04
-→ sleepywood_stage01 → sleepywood_rest_after_stage01
-→ sleepywood_stage02 → sleepywood_rest_after_stage02
-→ sleepywood_stage03 → sleepywood_rest_after_stage03
+ellinia_stage04_battle
+→ shop_ellinia_nautilus (SHOP, 월드맵에서 선택)
+→ nautilus_stage01_battle → … → nautilus_stage04_boss
+→ shop_nautilus_sleepywood (SHOP, 월드맵에서 선택)
+→ sleepywood_stage01_battle → sleepywood_reward_after_stage01
+→ sleepywood_stage02_battle → sleepywood_reward_after_stage02
+→ sleepywood_stage03_battle → sleepywood_reward_after_stage03
 → sleepywood_stage04_boss
 → sleepywood_reward_after_stage04
 → sleepywood_stage05_battle → sleepywood_reward_after_stage05
@@ -71,7 +78,19 @@ nautilus_stage04_boss
 REST 화면·보상 선택 구현은 다른 기능 소유 영역이며, 이 문서는 연결 ID 계약만 정의한다.
 6-5 이후는 아래 후반전(신전) 절을 따른다.
 
-## 5. 직접 테스트
+보스 클리어의 계속 버튼 → 월드맵 상점 마커 → 기존 `shop` 맵 → 출발 버튼 → 월드맵 다음 지역 마커 순서로 진행한다.
+두 SHOP 노드는 `ShopNodeBindings.csv`의 `shop_relic`에 연결된다. 상점 종료는 런 종료가 아니며,
+후속 지역 선택 중에도 헤네시스 양쪽 상점 마커와 연결선은 유지한다. 이전 상점은 방문 완료 또는 잠김으로 표시하며 재입장을 허용하지 않는다.
+다음 지역은 `CONTINUE_RUN`으로 기존 직업·스킬·증강·유물·재화를 유지한다. 최종 종료 여부는
+특정 상점 이름이 아니라 서버의 `RunState == Completed`로 판단한다.
+
+## 5. 외곽 맵 작업 규칙
+
+- `darkwood.img`의 원본 슬리피우드/조용한 습지 배경과 나무를 사용한다.
+- 배경·장식만 변경하며 기존 654개 타일, 48개 Foothold, 6개 BattleCell 좌표는 유지한다.
+- 같은 물리 맵을 쓰므로 6-1~6-3 모두 외곽 배경이 적용된다. 포장마차 보스맵은 변경하지 않는다.
+
+## 6. 직접 테스트
 
 1. Maker에서 `sleepywood_ant_tunnel`을 열고 Play하면 MapId 기준 공통 테스트 진입기가
    `region_06_stage_01`을 자동 선택한다.
@@ -85,7 +104,17 @@ REST 화면·보상 선택 구현은 다른 기능 소유 영역이며, 이 문�
 공통 진입 규칙과 테스트 키는
 [Battle-Prototype-Test-Guide.md](Battle-Prototype-Test-Guide.md)를 따른다.
 
-## 6. 후반전(신전)
+### 2026-09-15 확인 결과
+
+- Maker 빌드 Error 0, 테스트 구간 Runtime Error 0. 기존 Console 이력과 구분하여 확인했다.
+- 전체 콘텐츠 Validator 통과: Stage 24, Skill 72, EnemyPattern 40, Shop 1 / Entry 33.
+- 엘리니아 보스 강제 클리어 → 상점 선택 → `shop` → 출발 → 노틸러스 `CONTINUE_RUN` 진입 확인.
+- 노틸러스 보스 강제 클리어 → 상점 선택 → `shop` → 출발 → 슬리피우드 `CONTINUE_RUN` 진입 확인.
+- 노틸러스 클리어 시 도시 `COMPLETED` / 상점 `AVAILABLE`, 상점 출발 시 슬리피우드 `AVAILABLE` 확인.
+- 6-1 드레이크 생성·이동 턴·물기 큐 준비, 6-3 진입 및 두 번째 Wave 다크 드레이크 생성 확인.
+- 신규 모델 3종 구조 검증 통과. 전 구간 완주·세부 전투 난이도·배경의 시각적 선호도는 별도 플레이 피드백 대상으로 남긴다.
+
+## 7. 후반전(신전)
 
 슬리피우드 후반전은 신전 일반 Stage 3개와 주니어 발록 보스 Stage로 구성하며, 6-4 포장마차 보스
 다음 REST에서 이어진다.

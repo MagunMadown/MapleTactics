@@ -123,7 +123,9 @@ Node 담당 경로에서 `BattleEntryState=PREPARED`로 진입한 경우에는 �
 Stage 보상 기록과 다음 Node 준비를 실제 클리어와 동일하게 검증한다. 로비나 Node에서
 `BattleEntryState=PREPARED`로 들어온 정상 플레이에서는 서버가 요청을 거절한다.
 
-현재 진행 연결은 `ellinia_stage_04 → ellinia_reward_after_stage04 → region_05_stage_01`이며,
+5-2는 4웨이브까지 노란 불가사리·젤리피쉬 출현 후보를 유지한다 (`MaxWaveIndex=4`). 첫 웨이브는 노란 불가사리만, 2~4웨이브는 가중치 3:1을 사용한다.
+
+현재 진행 연결은 `ellinia_stage_04 → shop_ellinia_nautilus(SHOP) → region_05_stage_01`이며,
 이후에도 각 노틸러스 전투 사이의 보상 Node를 거쳐 5-4 보스까지 이어진다.
 엘리니아 보스 맵 `ellinia_boss`도 단독 검증을 위해 `StageId=ellinia_stage_04`,
 `AutoStartPrototypeBattle=true`로 설정되어 있으므로 해당 맵에서 바로 Play한 뒤 `F8`로 이 연결을
