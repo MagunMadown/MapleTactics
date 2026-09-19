@@ -168,7 +168,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling`, `flash_slash`, `spirit_blade`, `hyper_body`, `iron_wall` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal`, `magic_guard`, `meditation`, `bless` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
 | 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift` / `enhanced_piercing`, `arrow_stream`, `cardinal_discharge_ii` |
-| 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` / `triple_throw`, `edge_carnival`, `bloody_storm` |
+| 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow`, `dark_sight`, `wind_talisman`, `muspelheim`, `tornado_spin` / `triple_throw`, `edge_carnival`, `bloody_storm` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
 
@@ -578,7 +578,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 
 #### 현재 상태
 
-플레이어 스킬은 1단계 28행 + 2단계 16행 = 44행이고, 적 전용 행은 모두 1단계다.
+플레이어 스킬은 1단계 32행 + 2단계 16행 = 48행이고, 적 전용 행은 모두 1단계다.
 `thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`,
 마법사 `magic_guard`·`meditation`·`bless`, 궁수 `split_mistel`·`cardinal_transition`·`bolt_swift`는
 아직 상위 단계가 없다. 적 스킬은 강화 대상이 아니지만
@@ -623,7 +623,12 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 | ConditionId | string | - | 조건 규격 참조용 예약 필드 |
 
 현재 구현 EffectType M1: `DAMAGE`, `PUSH`, `HEAL`, `NEXT_ATTACK_BONUS`, `ATTACK_BUFF`,
-`MAX_HP_BUFF`, `DEFENSE_BUFF`. 새 타입은 Executor, Router, Validator, 데이터 사전을 함께 수정한 뒤 사용한다.
+`MAX_HP_BUFF`, `DEFENSE_BUFF`, `GUARD_BUFF`, `MOVE_SELF`. 새 타입은 Executor, Router, Validator,
+데이터 사전을 함께 수정한 뒤 사용한다.
+
+`GUARD_BUFF`는 받는 피해를 전부 무효로 만들고(도적 `dark_sight`), `MOVE_SELF`는 피해 스텝 뒤에 시전자를
+`Value`칸 전진시킨다(도적 `muspelheim`·`tornado_spin`). 이동이 막히면 피해만 남고 이동만 생략된다.
+규칙은 [`Effect-Executor-Guide.md`](./Guide/Effect-Executor-Guide.md)가 소유한다.
 
 버프 4종은 `BuffEffectExecutorLogic`이 처리하며 `BattleSessionComponent.ResolveSkillBuffImpact`로
 내려간다. `TargetSelector=SELF_UNIT` 전용이고, `Value`는 수치, 지속형(`ATTACK_BUFF`, `MAX_HP_BUFF`,
