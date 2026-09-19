@@ -1,0 +1,125 @@
+@Component
+script BattlePlatformUIComponent extends Component
+
+	property string PlatformRUID = "3d401361052d4becb0dbc416772ebd23"
+	property string PlayerPlatformRUID = "29af399010a5402db8c1edd4f69039fe"
+	property string EnemyPlatformRUID = "0552e3e567984004b6a2e549a3794887"
+	-- World-space fitting box; AspectOnly preserves the original image proportions.
+	property number WorldWidth = 1.08
+	property number WorldHeight = 0.36
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Cache the single UI set; maps supply only their visual board origin and spacing.
+		self._T.Platforms = self.Entity:GetChildByName("Platforms")
+		self._T.Cells = {}
+		self._T.Map = nil
+		self._T.ImageReady = false
+		if isvalid(self._T.Platforms) == false then
+			log_error("[BattlePlatformUI] Platforms container is missing")
+			return
+		end
+		self._T.Platforms.Enable = false
+		for _, ruid in ipairs({self.PlatformRUID, self.PlayerPlatformRUID, self.EnemyPlatformRUID}) do
+			local sprite = _ResourceService:LoadSpriteAndWait(ruid)
+			if sprite == nil then
+				log_error("[BattlePlatformUI] Sprite load returned nil: " .. ruid)
+				return
+			end
+			if sprite.IsLoadComplete == false or sprite.Width <= 0 or sprite.Height <= 0 then
+				log_error("[BattlePlatformUI] Sprite load failed: " .. ruid .. "; loaded=" .. tostring(sprite.IsLoadComplete) .. "; pixels=" .. tostring(sprite.Width) .. "x" .. tostring(sprite.Height))
+				return
+			end
+			log("[BattlePlatformUI] Sprite loaded: " .. ruid .. "; pixels=" .. tostring(sprite.Width) .. "x" .. tostring(sprite.Height))
+		end
+		for index = 1, 6 do
+			local cell = self._T.Platforms:GetChildByName("BattleCell" .. tostring(index))
+			if isvalid(cell) == false or cell.SpriteGUIRendererComponent == nil or cell.UITransformComponent == nil then
+				log_error("[BattlePlatformUI] Missing cell or renderer: " .. tostring(index))
+				self._T.Cells = {}
+				return
+			end
+			cell.SpriteGUIRendererComponent.ImageRUID = DataRef(self.PlatformRUID)
+			self._T.Cells[index] = cell
+		end
+		self._T.ImageReady = true
+		log("[BattlePlatformUI] Shared six-cell UI ready; world size=" .. tostring(self.WorldWidth) .. "x" .. tostring(self.WorldHeight))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Project world bounds each frame so camera movement, zoom and resolution preserve size.
+		if self._T.ImageReady ~= true or isvalid(self._T.Platforms) == false or self._T.Cells == nil or #self._T.Cells ~= 6 then
+			return
+		end
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or isvalid(player.CurrentMap) == false then
+			self:HidePlatforms()
+			return
+		end
+		local map = player.CurrentMap
+		---@type BattleTileColor
+		local layout = map:GetComponent("script.BattleTileColor")
+		if layout == nil or layout.Enable == false or map.EnabledInHierarchy == false then
+			self:HidePlatforms()
+			return
+		end
+		local origin = layout.PlatformOrigin
+		local occupied = {}
+		local units = map:GetChildComponentsByTypeName("script.BattleUnitComponent", true)
+		for _, unit in ipairs(units) do
+			if isvalid(unit.Entity) and unit.Entity.EnabledInHierarchy and unit.IsDead == false and unit.CellIndex >= 0 and unit.CellIndex < 6 then
+				if unit.Team == "Player" then
+					occupied[unit.CellIndex] = self.PlayerPlatformRUID
+				elseif unit.Team == "Enemy" and occupied[unit.CellIndex] ~= self.PlayerPlatformRUID then
+					occupied[unit.CellIndex] = self.EnemyPlatformRUID
+				end
+			end
+		end
+		local halfWidth = self.WorldWidth * 0.5
+		local halfHeight = self.WorldHeight * 0.5
+		for index = 1, 6 do
+			local x = origin.x + (index - 1) * layout.PlatformSpacing
+			local lower = self:ToLocalUI(Vector2(x - halfWidth, origin.y - halfHeight))
+			local upper = self:ToLocalUI(Vector2(x + halfWidth, origin.y + halfHeight))
+			local cell = self._T.Cells[index]
+			local ruid = occupied[index - 1] or self.PlatformRUID
+			if cell.SpriteGUIRendererComponent.ImageRUID.DataId ~= ruid then
+				cell.SpriteGUIRendererComponent.ImageRUID = DataRef(ruid)
+			end
+			cell.UITransformComponent.anchoredPosition = Vector2((lower.x + upper.x) * 0.5, (lower.y + upper.y) * 0.5)
+			cell.UITransformComponent.RectSize = Vector2(math.abs(upper.x - lower.x), math.abs(upper.y - lower.y))
+			cell.SpriteGUIRendererComponent.Color = layout.TileColor
+		end
+		self._T.Platforms.Enable = true
+		if self._T.Map ~= map then
+			self._T.Map = map
+			log("[BattlePlatformUI] Displaying six platforms in " .. map.Name .. "; origin=" .. tostring(origin))
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method Vector2 ToLocalUI(Vector2 worldPosition)
+		-- Convert relative to the container pivot, including its parent canvas scaling.
+		local screenPosition = _UILogic:WorldToScreenPosition(worldPosition)
+		return _UILogic:ScreenToLocalUIPosition(screenPosition, self._T.Platforms.UITransformComponent)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HidePlatforms()
+		-- Hide immediately in lobby/shop or while the local player's map is unavailable.
+		if isvalid(self._T.Platforms) then
+			self._T.Platforms.Enable = false
+		end
+		self._T.Map = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Release cached map and cell references when the UI session ends.
+		self:HidePlatforms()
+		self._T.Cells = nil
+		self._T.Platforms = nil
+	end
+
+end
