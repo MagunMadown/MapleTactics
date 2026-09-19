@@ -385,7 +385,7 @@ Effect Executor의 Context와 새 EffectType 추가 방법은
 
 ## Dataset 상태
 
-플레이어 스킬 50행(직업별 5개 테이블 — 1단계 34행 + 2단계 16행)이 실제 Dataset으로 올라가 있다.
+플레이어 스킬 55행(직업별 5개 테이블 — 1단계 39행 + 2단계 16행)이 실제 Dataset으로 올라가 있다.
 적 전용 행·Effect Step·무기 행 수는 CSV를 직접 본다. 그중 투사체를 쓰는 플레이어 스킬은
 10행이다. `thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`,
 마법사 `magic_guard`·`meditation`·`bless`, 궁수 `split_mistel`·`cardinal_transition`·`bolt_swift`,

@@ -169,7 +169,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal`, `magic_guard`, `meditation`, `bless` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
 | 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift` / `enhanced_piercing`, `arrow_stream`, `cardinal_discharge_ii` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow`, `dark_sight`, `wind_talisman`, `muspelheim`, `tornado_spin`, `slash_storm`, `blade_ascension` / `triple_throw`, `edge_carnival`, `bloody_storm` |
-| 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
+| 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot`, `swift_fire`, `backstep_shot`, `bullet_smash`, `monkey_rush_boom`, `monkey_magic` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
 
 2단계 스킬의 원본 연결은 §4.7 `BaseSkillId`가 소유한다. `thunder_bolt`와 `heal`은
@@ -578,7 +578,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 
 #### 현재 상태
 
-플레이어 스킬은 1단계 34행 + 2단계 16행 = 50행이고, 적 전용 행은 모두 1단계다.
+플레이어 스킬은 1단계 39행 + 2단계 16행 = 55행이고, 적 전용 행은 모두 1단계다.
 `thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`,
 마법사 `magic_guard`·`meditation`·`bless`, 궁수 `split_mistel`·`cardinal_transition`·`bolt_swift`,
 도적 `dark_sight`·`wind_talisman`·`muspelheim`·`tornado_spin`·`blade_ascension`과 `fatal_blow`는
@@ -629,6 +629,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 
 `GUARD_BUFF`는 받는 피해를 전부 무효로 만들고(도적 `dark_sight`), `MOVE_SELF`는 피해 스텝 뒤에 시전자를
 `ParameterA` 모드가 정한 칸으로 이동시킨다 — `FORWARD_OFFSET`은 `Value`칸 전진,
+`BACKWARD_OFFSET`은 방향 전환 없이 `Value`칸 후퇴(해적 `backstep_shot`),
 `BEHIND_FARTHEST_TARGET`은 그 스킬이 맞힌 적 중 가장 먼 적의 `Value`칸 뒤다(도적 `muspelheim`·`tornado_spin`).
 이동이 막히거나 맞힌 적이 없으면 피해만 남고 이동만 생략된다.
 규칙은 [`Effect-Executor-Guide.md`](./Guide/Effect-Executor-Guide.md)가 소유한다.
