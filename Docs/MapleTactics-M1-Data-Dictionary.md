@@ -167,7 +167,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling`, `flash_slash`, `spirit_blade`, `hyper_body`, `iron_wall` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal`, `magic_guard`, `meditation`, `bless` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
-| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge` / `enhanced_piercing`, `arrow_stream`, `cardinal_discharge_ii` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift` / `enhanced_piercing`, `arrow_stream`, `cardinal_discharge_ii` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow` / `triple_throw`, `edge_carnival`, `bloody_storm` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
@@ -578,9 +578,10 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 
 #### 현재 상태
 
-플레이어 스킬은 1단계 25행 + 2단계 16행 = 41행이고, 적 전용 행은 모두 1단계다.
+플레이어 스킬은 1단계 28행 + 2단계 16행 = 44행이고, 적 전용 행은 모두 1단계다.
 `thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`,
-마법사 `magic_guard`·`meditation`·`bless`는 아직 상위 단계가 없다. 적 스킬은 강화 대상이 아니지만
+마법사 `magic_guard`·`meditation`·`bless`, 궁수 `split_mistel`·`cardinal_transition`·`bolt_swift`는
+아직 상위 단계가 없다. 적 스킬은 강화 대상이 아니지만
 `ConvertSkillRow`가 모든 스킬 테이블에 공용이라 스키마를 맞추기 위해 같은 두 컬럼을 갖는다.
 
 2단계 16행의 저작 규칙은 다음과 같다.
