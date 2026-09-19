@@ -1,7 +1,7 @@
 # 보스 Phase 제작 가이드
 
 보스도 일반 적과 같은 `EnemyDefinitions`, `EnemyPatternSteps`, `SkillDefinitions` 규격을 사용한다.
-보스 전용 코드를 Session에 추가하지 않고 `BossPhaseDefinitions`가 HP 구간과 Pattern 교체만 선언한다.
+보스 ID별 코드를 Session에 추가하지 않고 `BossPhaseDefinitions`가 HP 구간·Pattern 교체·선택적 모션 교체를 선언한다.
 
 ## 데이터 흐름
 
@@ -26,6 +26,14 @@ StageDefinitions(StageType=BOSS)
 | `HpRatioLE` | number | `(0, 1]`, PhaseIndex가 커질수록 감소 |
 | `PatternId` | string | 유효한 Enemy Pattern 참조 |
 | `Enabled` | boolean | `true` 행만 사용 |
+| `IdleMotionRuid` | string | 선택적 대기 모션. 빈 칸은 EnemyDefinitions 기본값 |
+| `MoveMotionRuid` | string | 선택적 이동 모션. 빈 칸은 EnemyDefinitions 기본값 |
+| `HitMotionRuid` | string | 선택적 피격 모션. 빈 칸은 EnemyDefinitions 기본값 |
+| `DeathMotionRuid` | string | 선택적 사망 모션. 빈 칸은 EnemyDefinitions 기본값 |
+
+모션 열은 SchemaVersion 1의 선택적 확장이다. 기존 행은 네 칸을 비워 기존 외형을 유지한다.
+설정한 값은 32자리 16진수 RUID여야 한다. 빈 칸은 **이전 페이즈 값 유지가 아니라 원래 적 기본값 복원**이다.
+공격별 모션·발사 이펙트는 계속 `EnemySkillDefinitions`가 소유한다.
 
 첫 Phase는 `HpRatioLE=1.0`이어야 하며 `EnemyDefinitions.PatternId`와 같은 Pattern을 사용한다.
 현재 예시는 다음과 같다.
@@ -39,10 +47,18 @@ StageDefinitions(StageType=BOSS)
 
 - Phase 상태는 적 Entity의 `BossPhaseStateComponent`가 소유한다.
 - 피해 적용 후 HP가 임계값을 넘으면 다음 Pattern을 초기화한다.
+- 경계값을 포함한다(`HP / MaxHP <= HpRatioLE`). 페이즈는 역행하지 않으며 회복 후에도 유지한다.
 - 플레이어 턴 시작 때 이미 고정된 적 행동은 그대로 실행한다.
 - Phase 전환 전에 고정된 옛 행동이 끝나면 옛 Pattern Step 진행만 `PATTERN_SUPERSEDED`로 폐기한다.
 - 다음 플레이어 턴부터 새 Phase Pattern을 계획한다.
 - 공격 타이밍은 각 `SkillDefinitions.ActionDuration`을 사용한다.
+- 페이즈별 외형을 설정한 보스만 전환 시 이전 외형의 대기/피격 재생을 정리한다. 외형을 설정하지 않은 기존 보스의 모션·고정 공격 Queue 계약은 유지한다.
+
+### 휴면 보스 예시: 6-4 포장마차
+
+- 1페이즈: `WAIT` 한 행이 자기 자신으로 돌아간다. 휴면 `stand`를 대기·이동·피격에 지정해 맞을 때 활성 모습으로 튀지 않게 한다.
+- 2페이즈: HP 50% 이하에서 공격 Pattern으로 교체하고, 모션 네 칸은 비워 활성 기본 모션으로 복원한다.
+- 입장 잡몹은 StageEnemyWaves/EnemySpawnPools에서 함께 생성한다. 페이즈 컴포넌트가 별도로 소환하지 않는다.
 
 ## 중단 가능한 캐스팅
 
