@@ -37,6 +37,7 @@ script PlayerRunInventoryComponent extends Component
 		self.RunSkillBarSlotIds = ""
 		self.RunItemSnapshot = ""
 		self.AppliedRewardKeys = ""
+		self._T.NewSkillRewardReceipts = {}
 		self.AppliedUseKeys = ""
 		self.AppliedPurchaseKeys = ""
 		self.InventoryRevision = self.InventoryRevision + 1
@@ -338,6 +339,73 @@ script PlayerRunInventoryComponent extends Component
 		end
 		log("[RunSkillInventory] granted key=" .. rewardKey .. " skill=" .. skillId .. " amount=" .. amount .. " owned=" .. self:GetSnapshotAmount(self.RunSkillSnapshot, skillId) .. " revision=" .. self.SkillInventoryRevision)
 		return { Success = true, Reason = "APPLIED", SkillId = skillId, GrantedAmount = amount, OwnedAmount = self:GetSnapshotAmount(self.RunSkillSnapshot, skillId), Revision = self.SkillInventoryRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CommitNewSkillReward(string skillId, string replacedSkillId, boolean skip, string rewardKey, integer expectedRevision, string expectedSlots, string nextMap)
+		-- Commits one stage choice atomically; retries return the original receipt before checking ownership.
+		if self.ActiveRunSequence <= 0 or self:IsSafeToken(rewardKey) == false or self:IsSafeToken(skillId) == false or nextMap == "" then
+			return { Success = false, Reason = "INVALID_SKILL_REWARD_KEY" }
+		end
+		self._T.NewSkillRewardReceipts = self._T.NewSkillRewardReceipts or {}
+		local receipt = self._T.NewSkillRewardReceipts[rewardKey]
+		if receipt ~= nil then return receipt end
+		if self:ContainsDelimitedKey(self.AppliedRewardKeys, rewardKey) then
+			return { Success = false, Reason = "REWARD_ALREADY_PROCESSED" }
+		end
+		if expectedRevision ~= self.SkillInventoryRevision or expectedSlots ~= self.RunSkillBarSlotIds then
+			return { Success = false, Reason = "STALE_SKILL_INVENTORY" }
+		end
+		local owned = self:GetDistinctOwnedSkillIds()
+		local snapshot = self.RunSkillSnapshot
+		local slotIds = self.RunSkillBarSlotIds
+		local reason = "SKIPPED"
+		if skip == false then
+			if self:GetSnapshotAmount(snapshot, skillId) > 0 then return { Success = false, Reason = "SKILL_ALREADY_OWNED" } end
+			local slots = self:ParseRunSkillBarSlotPipe(slotIds)
+			if replacedSkillId ~= "" then
+				if #owned ~= self.RunSkillBarSlotCount then return { Success = false, Reason = "INVALID_REPLACEMENT_COUNT" } end
+				local replacedSlot = 0
+				local seen = {}
+				for index = 1, self.RunSkillBarSlotCount do
+					local id = slots[index]
+					if id == "" or seen[id] or self:GetSnapshotAmount(snapshot, id) <= 0 then
+						return { Success = false, Reason = "STALE_SKILL_INVENTORY" }
+					end
+					seen[id] = true
+					if id == replacedSkillId then replacedSlot = index end
+				end
+				if replacedSlot == 0 then return { Success = false, Reason = "REPLACEMENT_NOT_OWNED" } end
+				snapshot = self:SetSnapshotAmount(snapshot, replacedSkillId, 0)
+				slots[replacedSlot] = skillId
+				slotIds = self:SerializeRunSkillBarSlotPipe(slots)
+				reason = "REPLACED"
+			else
+				if #owned >= self.RunSkillBarSlotCount then return { Success = false, Reason = "REPLACEMENT_REQUIRED" } end
+				if slotIds ~= "" then
+					local emptySlot = self:FindFirstEmptyRunSkillBarSlot(slots)
+					if emptySlot == 0 then return { Success = false, Reason = "STALE_SKILL_INVENTORY" } end
+					slots[emptySlot] = skillId
+					slotIds = self:SerializeRunSkillBarSlotPipe(slots)
+				end
+				reason = "APPLIED"
+			end
+			snapshot = self:AddSnapshotAmount(snapshot, skillId, 1)
+		end
+		-- No waits or external calls between the staged values and the receipt commit.
+		self.RunSkillSnapshot = snapshot
+		if slotIds ~= self.RunSkillBarSlotIds then
+			self.RunSkillBarSlotIds = slotIds
+			self.RunSkillBarRevision = self.RunSkillBarRevision + 1
+		end
+		self.AppliedRewardKeys = self:AppendDelimitedKey(self.AppliedRewardKeys, rewardKey)
+		self.InventoryRevision = self.InventoryRevision + 1
+		if skip == false then self.SkillInventoryRevision = self.SkillInventoryRevision + 1 end
+		receipt = { Success = true, Reason = reason, SkillId = skillId, ReplacedSkillId = replacedSkillId,
+			RunSequence = self.ActiveRunSequence, RewardKey = rewardKey, NextStageMapName = nextMap, Revision = self.SkillInventoryRevision }
+		self._T.NewSkillRewardReceipts[rewardKey] = receipt
+		log("[NewSkillReward] committed key=" .. rewardKey .. " result=" .. reason .. " old=" .. replacedSkillId .. " new=" .. skillId .. " owned=" .. snapshot .. " slots=" .. slotIds)
+		return receipt
 	end
 
 	@ExecSpace("ServerOnly")
