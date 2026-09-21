@@ -819,9 +819,19 @@ Facing을 이전 값으로 복구한다.
 | HpRatioLE | number | O | `(0,1]`, 뒤 Phase일수록 작은 임계값 |
 | PatternId | string | O | EnemyPatternSteps 참조 |
 | Enabled | boolean | O | 활성 행 여부 |
+| IdleMotionRuid | string | - | 페이즈 대기 모션. 빈 칸은 EnemyDefinitions 기본값 |
+| MoveMotionRuid | string | - | 페이즈 이동 모션. 빈 칸은 EnemyDefinitions 기본값 |
+| HitMotionRuid | string | - | 페이즈 피격 모션. 빈 칸은 EnemyDefinitions 기본값 |
+| DeathMotionRuid | string | - | 페이즈 사망 모션. 빈 칸은 EnemyDefinitions 기본값 |
+| ReinforcementPoolId | string | - | 페이즈별 보충 적 Pool. 빈 칸이면 보충 비활성화 |
+| ReinforcementIntervalTurns | integer | - | 보충 활성화 시 1 이상. 성공한 보충 사이의 최소 턴 간격 |
+| ReinforcementMaxAlive | integer | - | 보충 활성화 시 1~4. 최초 잡몹을 포함한 살아 있는 일반 적 상한 |
 
 첫 Phase는 `HpRatioLE=1.0`이고 `EnemyDefinitions.PatternId`와 같아야 한다.
 Phase 전환은 이미 고정된 적 Queue를 바꾸지 않으며, 다음 라운드 계획부터 새 Pattern을 사용한다.
+HP 임계값은 경계를 포함하며, 한 번 진행한 Phase는 회복해도 역행하지 않는다.
+모션 열은 SchemaVersion 1의 선택적 확장이다. 비어 있지 않으면 32자리 16진수 RUID를 검사한다.
+빈 칸은 이전 Phase 값 유지가 아니라 기본 적 모션 복원이며, 공격별 모션은 EnemySkillDefinitions가 소유한다.
 
 ## 8. StageDefinitions
 
