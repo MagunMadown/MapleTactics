@@ -58,7 +58,15 @@ StageDefinitions(StageType=BOSS)
 
 - 1페이즈: `WAIT` 한 행이 자기 자신으로 돌아간다. 휴면 `stand`를 대기·이동·피격에 지정해 맞을 때 활성 모습으로 튀지 않게 한다.
 - 2페이즈: HP 50% 이하에서 공격 Pattern으로 교체하고, 모션 네 칸은 비워 활성 기본 모션으로 복원한다.
-- 입장 잡몹은 StageEnemyWaves/EnemySpawnPools에서 함께 생성한다. 페이즈 컴포넌트가 별도로 소환하지 않는다.
+- 입장 잡몹은 StageEnemyWaves/EnemySpawnPools에서 함께 생성한다. 이후 페이즈별 보충은 아래 선택 설정으로 분리한다.
+
+### 페이즈별 잡몹 보충
+
+- `ReinforcementPoolId`: EnemySpawnPools 참조. 빈 칸이면 비활성화.
+- `ReinforcementIntervalTurns`: 보충 간격(양의 정수). 페이즈 진입 후 이만큼의 턴이 지난 뒤 첫 보충을 시도한다.
+- `ReinforcementMaxAlive`: 최초 등장 잡몹을 포함한 살아 있는 일반 적 상한(1~4).
+- 매 라운드 종료 경계에서만 시도하며 성공 시 다음 보충 턴을 갱신한다. 상한/빈 칸 부족 시 다음 턴에 재시도한다. 전투 종료·보스 사망·보충 없는 페이즈로 전환 시 중단한다.
+- 포장마차 DORMANT는 `region_06_food_cart_adds / 3 / 2`, DINNER_RUSH는 비활성화다. 기존 잡몹은 페이즈 전환 시 남고, 신규 잡몹도 공통 SpawnWaveEnemy와 SPAWN_WAIT 경로를 사용한다.
 
 ## 중단 가능한 캐스팅
 
