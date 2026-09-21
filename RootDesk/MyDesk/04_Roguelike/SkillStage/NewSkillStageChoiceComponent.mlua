@@ -47,7 +47,9 @@ script NewSkillStageChoiceComponent extends Component
 			SkillId = definition.SkillId,
 			DisplayName = definition.DisplayName,
 			IconRuid = self:GetSkillIconRuid(definition),
-			Description = self:BuildSkillDescription(definition)
+			Description = self:BuildSkillDescription(definition),
+			SkillTier = definition.SkillTier,
+			Context = self:BuildSelectionContext(playerEntity)
 		}
 	end
 
@@ -118,66 +120,113 @@ script NewSkillStageChoiceComponent extends Component
 		return self.DefaultSkillIconRuid
 	end
 
-	@ExecSpace("Server")
-	method void RequestSelectOffer(integer choiceIndex, string skillId)
-		-- Recomputes the offer server-side, grants it once, and rejects forged or repeated choices.
-		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+	@ExecSpace("ServerOnly")
+	method table BuildSelectionContext(Entity playerEntity)
+		-- Binds requests to one run reward and the exact inventory shown to the player.
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		return { RunSequence = runState.RunSequence, RewardKey = "new_skill_stage:" .. runState.LastBattleRecordKey,
+			SkillRevision = inventory.SkillInventoryRevision, SlotIds = inventory.RunSkillBarSlotIds }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildReplacementState(Entity playerEntity, table offer, string reason)
+		-- Returns six slots in battle-bar order without granting or removing a skill.
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local order = inventory:GetOrInitializeRunSkillBarOrder()
+		local owned = {}
+		for index, id in ipairs(inventory:ParseRunSkillBarSlotPipe(order.SlotIds or "")) do
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(id)
+			local info = { SkillId = id, DisplayName = id, SkillTier = 1, IconRuid = self.DefaultSkillIconRuid, Description = "정보를 불러오지 못했습니다." }
+			if definition.Success then
+				info.DisplayName = definition.DisplayName
+				info.SkillTier = definition.SkillTier
+				info.IconRuid = self:GetSkillIconRuid(definition)
+				info.Description = self:BuildSkillDescription(definition)
+			end
+			owned[index] = info
+		end
+		local count = #inventory:GetDistinctOwnedSkillIds()
+		log("[NewSkillReward] replacement required count=" .. tostring(count) .. " skill=" .. offer.SkillId .. " slots=" .. inventory.RunSkillBarSlotIds)
+		return { Success = false, PendingReplacement = true, Reason = reason, SkillId = offer.SkillId,
+			Offer = offer, OwnedSkills = owned, CanReplace = order.Success and count == inventory.RunSkillBarSlotCount,
+			Context = self:BuildSelectionContext(playerEntity) }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ProcessSelection(Entity playerEntity, integer choiceIndex, string skillId, table context, string replacedSkillId, boolean skip, boolean resolving)
+		-- Validates the authoritative offer and replays a completed receipt before any ownership-dependent checks.
 		if isvalid(playerEntity) == false or isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap ~= self.Entity or playerEntity.CurrentMap.Name ~= "new_skill_stage" then
-			self:ReceiveSelectionResult(false, "INVALID_REWARD_MAP", skillId, "", senderUserId)
-			return
+			return { Success = false, Reason = "INVALID_REWARD_MAP" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if runState == nil or inventory == nil or runState.RunSequence <= 0 or inventory.ActiveRunSequence ~= runState.RunSequence or runState.LastBattleRecordKey == "" then
+			return { Success = false, Reason = "BATTLE_REWARD_CONTEXT_UNAVAILABLE" }
+		end
+		local rewardKey = "new_skill_stage:" .. runState.LastBattleRecordKey
+		if context == nil or context.RunSequence ~= runState.RunSequence or context.RewardKey ~= rewardKey then
+			return { Success = false, Reason = "STALE_REWARD_CONTEXT" }
+		end
+		local receipt = (inventory._T.NewSkillRewardReceipts or {})[rewardKey]
+		if receipt ~= nil then
+			-- RequestTeleport consumes this authorization; restore it only while still on this reward map.
+			runState.PendingNextStageMapName = receipt.NextStageMapName
+			log("[NewSkillReward] receipt replay key=" .. rewardKey .. " result=" .. receipt.Reason)
+			return receipt
+		end
+		if inventory:ContainsDelimitedKey(inventory.AppliedRewardKeys, rewardKey) then
+			return { Success = false, Reason = "REWARD_ALREADY_PROCESSED" }
 		end
 		local choiceCount = math.min(3, math.max(1, _StageTransitionManagerLogic.NewSkillChoiceCount))
 		if choiceIndex < 1 or choiceIndex > choiceCount then
-			self:ReceiveSelectionResult(false, "CHOICE_SLOT_UNAVAILABLE", skillId, "", senderUserId)
-			return
+			return { Success = false, Reason = "CHOICE_SLOT_UNAVAILABLE" }
 		end
 		local offer = self:ResolveOffer(playerEntity, choiceIndex)
 		if offer.Success == false or offer.SkillId ~= skillId then
-			local reason = offer.Success == false and offer.Reason or "OFFER_MISMATCH"
-			log_warning("[NewSkillStage] selection rejected user=" .. senderUserId .. " slot=" .. choiceIndex .. " reason=" .. reason)
-			self:ReceiveSelectionResult(false, reason, skillId, "", senderUserId)
-			return
+			return { Success = false, Reason = offer.Success == false and offer.Reason or "OFFER_MISMATCH" }
 		end
-		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
-		if runState.LastBattleRecordKey == "" then
-			self:ReceiveSelectionResult(false, "BATTLE_REWARD_CONTEXT_UNAVAILABLE", skillId, "", senderUserId)
-			return
+		local count = #inventory:GetDistinctOwnedSkillIds()
+		if resolving == false and count >= inventory.RunSkillBarSlotCount then
+			return self:BuildReplacementState(playerEntity, offer, "REPLACEMENT_REQUIRED")
 		end
-		-- Stage indices repeat across regions; the battle key includes run, StageId, and entry request.
-		local rewardKey = "new_skill_stage:" .. runState.LastBattleRecordKey
-		local result = _RunManagerLogic:GrantRunSkill(playerEntity, skillId, 1, rewardKey)
-		if result.Success == false or result.GrantedAmount ~= 1 then
-			local reason = result.Success == false and result.Reason or "SKILL_ALREADY_SELECTED"
-			log_warning("[NewSkillStage] grant rejected user=" .. senderUserId .. " skill=" .. skillId .. " reason=" .. reason)
-			self:ReceiveSelectionResult(false, reason, skillId, "", senderUserId)
-			return
+		if resolving and count < inventory.RunSkillBarSlotCount then
+			return { Success = false, Reason = "STALE_SKILL_INVENTORY" }
 		end
-		local nextStageMapName = _StageTransitionManagerLogic:GetNextStageMapNameForPlayer(playerEntity)
-		if nextStageMapName == "" then
-			log_warning("[NewSkillStage] grant applied but next map missing user=" .. senderUserId .. " skill=" .. skillId .. " key=" .. rewardKey)
-			self:ReceiveSelectionResult(false, "NEXT_STAGE_MAP_UNAVAILABLE", skillId, "", senderUserId)
-			return
+		if context.SkillRevision ~= inventory.SkillInventoryRevision or context.SlotIds ~= inventory.RunSkillBarSlotIds then
+			if resolving then return self:BuildReplacementState(playerEntity, offer, "STALE_SKILL_INVENTORY") end
+			return { Success = false, Reason = "STALE_SKILL_INVENTORY" }
 		end
-		log("[NewSkillStage] grant applied user=" .. senderUserId .. " job=" .. offer.JobId .. " skill=" .. skillId .. " key=" .. rewardKey .. " nextMap=" .. nextStageMapName)
-		self:ReceiveSelectionResult(true, "APPLIED", skillId, nextStageMapName, senderUserId)
+		if resolving and skip == false and replacedSkillId == "" then return { Success = false, Reason = "REPLACEMENT_NOT_OWNED" } end
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then return validation end
+		local nextMap = _StageTransitionManagerLogic:GetNextStageMapNameForPlayer(playerEntity)
+		if nextMap == "" or isvalid(_EntityService:GetEntityByPath("/maps/" .. nextMap)) == false then
+			return { Success = false, Reason = "NEXT_STAGE_MAP_UNAVAILABLE" }
+		end
+		return inventory:CommitNewSkillReward(skillId, replacedSkillId, skip, rewardKey, context.SkillRevision, context.SlotIds, nextMap)
+	end
+
+	@ExecSpace("Server")
+	method void RequestSelectOffer(integer choiceIndex, string skillId, table context, integer revision)
+		-- Begins or retries a choice on behalf of the authenticated caller only.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:ProcessSelection(playerEntity, choiceIndex, skillId, context, "", false, false)
+		self:ReceiveSelectionResult(result, revision, senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestResolveReplacement(integer choiceIndex, string skillId, table context, string replacedSkillId, boolean skip, integer revision)
+		-- Confirms replacement or forfeiture through the same reward-key transaction.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:ProcessSelection(playerEntity, choiceIndex, skillId, context, replacedSkillId, skip, true)
+		self:ReceiveSelectionResult(result, revision, senderUserId)
 	end
 
 	@ExecSpace("Client")
-	method void ReceiveSelectionResult(boolean success, string reason, string skillId, string nextStageMapName)
-		-- Teleports with the server-resolved map after this stage grants exactly one skill.
-		_NewSkillSelectionUILogic:ReceiveSelectionState(success, reason, skillId)
-		if success == false then
-			log_warning("[NewSkillStage] selection failed skill=" .. skillId .. " reason=" .. reason)
-			return
-		end
-		local targetMapName = nextStageMapName or ""
-		if targetMapName == "" then
-			log_warning("[NewSkillStage] selection applied but next map is unavailable skill=" .. skillId)
-			return
-		end
-		log("[NewSkillStage] selection complete skill=" .. skillId .. " targetMap=" .. targetMapName)
-		if _NewSkillSelectionUILogic:ShowConfirmation(skillId, targetMapName, self.TargetPosition) then return end
-		_MapTeleportManager:RequestTeleport(targetMapName, self.TargetPosition, "NEW_SKILL_STAGE_COMPLETE")
+	method void ReceiveSelectionResult(table result, integer revision)
+		-- Lets the UI reject late responses before any teleport can be requested.
+		_NewSkillSelectionUILogic:ReceiveSelectionState(result, revision, self.TargetPosition)
 	end
 
 end

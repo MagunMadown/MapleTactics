@@ -312,13 +312,13 @@ script BattleSessionComponent extends Component
 			_BattleHudPresenterLogic:RequestExecuteQueue()
 			return
 		end
-		if event.key == KeyboardKey.Mouse1 then
+		if event.key == KeyboardKey.Mouse1 or event.key == KeyboardKey.DownArrow then
 			if _BattleHudPresenterLogic:TryBeginLocalCommand("UTILITY") then
 				self:RequestUtilitySkill()
 			end
 			return
 		end
-		if event.key == KeyboardKey.W or event.key == KeyboardKey.Mouse2 then
+		if event.key == KeyboardKey.W or event.key == KeyboardKey.Mouse2 or event.key == KeyboardKey.UpArrow then
 			if _BattleHudPresenterLogic:TryBeginLocalCommand("TURN") == false then
 				return
 			end
@@ -2441,6 +2441,14 @@ script BattleSessionComponent extends Component
 		end
 
 		local summoner = enemyEntity:GetComponent("script.FaustSummonComponent")
+		if self:CanSkeletonSwapWithCommander(enemyUnitId) then
+			local swapRuntime = self:GetSkillRuntimeState(enemyUnitId)
+			if swapRuntime ~= nil and swapRuntime:CanUseSkill("perion_skeleton_boss_swap").Success then
+				return { ActionType = "EXECUTE_TILE", TileId = "perion_skeleton_boss_swap", Direction = 0,
+					Reason = "COMMANDER_RELIEF", PatternId = enemy.EnemyPatternId,
+					StepIndex = patternRunner.CurrentStepIndex, PatternStepCount = #patternValidation.Data.Steps, TelegraphTurnsRemaining = 0 }
+			end
+		end
 		local summonReady = summoner ~= nil and summoner:CanSummon(self, self:GetOppositeEdgeCell(enemy.CellIndex))
 		local startStepIndex = patternRunner.CurrentStepIndex
 		if summonReady and summoner.PrioritizeSummon then
@@ -2633,7 +2641,7 @@ script BattleSessionComponent extends Component
 				return markResult
 			end
 			local queueTurnsRequired = 0
-			if intent.ActionType == "EXECUTE_TILE" and intent.TileId ~= "" then
+			if (intent.ActionType == "EXECUTE_TILE" or intent.ActionType == "CHARGE_FORWARD") and intent.TileId ~= "" then
 				local skillDefinition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(intent.TileId)
 				if skillDefinition.Success == true then
 					queueTurnsRequired = math.max(0, math.floor(tonumber(skillDefinition.EnemyQueueTurns) or 0))
@@ -4012,8 +4020,13 @@ script BattleSessionComponent extends Component
 		end
 
 		local completedIndex = self.TurnState.ExecutingTileIndex
-		local duration = actionResult.PresentationHandoffDuration or self:GetSkillActionDuration(tileId)
+		local expectedEntry = self.EntryRequestId
+		local executingQueue = self.TurnState.ExecutingTileIds
+		-- Impact time is only a lower bound: do not cut the cast short to start the next tile.
+		local duration = math.max(actionResult.PresentationHandoffDuration or 0, self:GetSkillActionDuration(tileId))
 		local complete = function()
+			if self.EntryRequestId ~= expectedEntry or self.TurnState.ExecutingTileIds ~= executingQueue
+				or self.TurnState.ExecutingTileIndex ~= completedIndex then return end
 			self.ActionTimerId = 0
 			log("[BattleTileQueue] tile completed index=" .. completedIndex .. "/" .. tileCount .. " tile=" .. tileId .. " reason=" .. actionResult.Reason)
 			if self.BattleResult ~= "" then
@@ -4026,6 +4039,8 @@ script BattleSessionComponent extends Component
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(function()
 			self.ActionTimerId = 0
+			if self.EntryRequestId ~= expectedEntry or self.TurnState.ExecutingTileIds ~= executingQueue
+				or self.TurnState.ExecutingTileIndex ~= completedIndex then return end
 			self:WaitForMotionCompletion(complete)
 		end, duration)
 	end
@@ -4042,6 +4057,15 @@ script BattleSessionComponent extends Component
 
 		if self.BattleResult ~= "" then
 			return
+		end
+		local pending = self._T.PendingClear
+		if pending ~= nil then
+			self._T.PendingClear = nil
+			if pending.Entry == self.EntryRequestId and #self.BoardState:CollectLivingEnemies() == 0 then
+				self:RecordRunConsumedPlayerTurn()
+				self:FinishEmptyBattlefield(pending.UnitId, pending.Cause, "Enemy")
+				return
+			end
 		end
 		if success then
 			self:BeginEnemyTurnFromPlayerAction("SKILL_QUEUE_COMPLETED")
@@ -4109,7 +4133,8 @@ script BattleSessionComponent extends Component
 		end
 		local definition = validation.Data.Definition
 		local speed = self:GetSkillSpeedMultiplier()
-		local authored = definition.ActionDuration / speed
+		local motion = self:GetSkillMotionProfile(definition.MotionProfileId)
+		local authored = math.max(definition.ActionDuration / speed, motion.Duration or 0)
 		if self:HasSkillProjectile(definition) == false then
 			return math.max(0.1, authored)
 		end
@@ -5181,6 +5206,56 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("Server")
+	method void RequestDiscardConsumable(string consumableId, integer requestId, integer entryId, integer inventoryRevision)
+		if not isvalid(self.PlayerEntity) or self.PlayerEntity.PlayerComponent == nil then return end
+		if self.PlayerEntity.PlayerComponent.UserId ~= senderUserId then return end
+		local result = self:TryDiscardRunConsumable(self.PlayerEntity, consumableId, requestId, entryId, inventoryRevision)
+		result.RequestId = requestId
+		result.Action = "DISCARD"
+		self:ReceiveConsumableUseResult(result, entryId, senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryDiscardRunConsumable(Entity playerEntity, string consumableId, integer requestId, integer entryId, integer inventoryRevision)
+		-- Disposal bypasses effect usability, but retains ownership, turn and revision checks.
+		local result = { Success = false, Reason = "INVALID_PLAYER", ConsumesTurn = false, ConsumedAmount = 0 }
+		if not isvalid(playerEntity) or playerEntity ~= self.PlayerEntity or playerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then return result end
+		if requestId <= 0 then result.Reason = "INVALID_REQUEST_ID"; return result end
+		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or self.TurnState.IsActionProcessing then
+			result.Reason = "INVALID_CONSUMABLE_TIMING"; return result
+		end
+		local unit = playerEntity:GetComponent("script.BattleUnitComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if unit == nil or unit.IsDead or inventory == nil or run == nil or run.RunState ~= "Active" or inventory.ActiveRunSequence ~= run.RunSequence then return result end
+		if inventory.InventoryRevision ~= inventoryRevision then result.Reason = "STALE_INVENTORY"; return result end
+		local key = tostring(run.RunSequence) .. ":" .. tostring(entryId) .. ":discard:" .. tostring(inventoryRevision) .. ":" .. tostring(requestId)
+		local consumed = inventory:Consume(consumableId, 1, key)
+		result.Success = consumed.Success
+		result.Reason = consumed.Success and "CONSUMABLE_DISCARDED" or consumed.Reason
+		result.ConsumedAmount = consumed.ConsumedAmount or 0
+		result.InventoryRevision = inventory.InventoryRevision
+		log("[BattleConsumable] discard ref=" .. consumableId .. " success=" .. tostring(result.Success) .. " amount=" .. result.ConsumedAmount)
+		return result
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean SubmitConsumableDiscard(string consumableId)
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or player.CurrentMap ~= self.Entity then return false end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then return false end
+		if self._T.ConsumablePending and self._T.ConsumablePendingEntry == self.EntryRequestId and self._T.ConsumablePendingRun == inventory.ActiveRunSequence then return false end
+		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.BattlePhase ~= "PlayerTurn" or self.IsActionProcessing then return false end
+		self.ConsumableRequestSequence = self.ConsumableRequestSequence + 1
+		self._T.ConsumablePending = true
+		self._T.ConsumablePendingEntry = self.EntryRequestId
+		self._T.ConsumablePendingRun = inventory.ActiveRunSequence
+		self:RequestDiscardConsumable(consumableId, self.ConsumableRequestSequence, self.EntryRequestId, inventory.InventoryRevision)
+		return true
+	end
+
+	@ExecSpace("Server")
 	method void RequestUseConsumable(string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Authenticates a client request before entering the server-only consumable workflow.
 		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil then
@@ -5433,6 +5508,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table RebuildBattleState(string reason)
+		self._T.PendingClear = nil
+		self._T.BossDefeated = false
 		-- Clears transient battle state, then rebuilds the selected Stage through the normal spawn path.
 		local result = {
 			Success = false,
@@ -5736,9 +5813,17 @@ script BattleSessionComponent extends Component
 		self:BeginSkillEffectPresentation(sourceUnitId, definition)
 
 		local context = contextResult.Data
+		local expectedEntry = self.EntryRequestId
 		local safeImpactDelay = math.max(0, motionProfile.ImpactDelay)
 		local resolveEffects = function()
 			self.ImpactTimerId = 0
+			-- A delayed impact belongs to this living actor and this battle entry only.
+			if self.EntryRequestId ~= expectedEntry or self.BattleResult ~= ""
+				or not isvalid(sourceEntity) or sourceUnit.IsDead or sourceUnit.CurrentHp <= 0
+				or self:FindUnitEntity(sourceUnitId) ~= sourceEntity then
+				log("[SkillExecution] stale impact cancelled source=" .. sourceUnitId .. " skill=" .. skillId)
+				return
+			end
 			local effectResult = _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
 			if effectResult.Success == false then
 				log_warning("[SkillExecution] failed skill=" .. skillId .. " source=" .. sourceUnitId .. " reason=" .. effectResult.Reason)
@@ -5794,6 +5879,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ClearSkillImpactTimers()
+		-- Clear callbacks only; pending wave completion survives between queued skills.
 		-- One battle action resolves at a time, so a new cast always supersedes any pending impact.
 		if self.ImpactTimerId > 0 then
 			_TimerService:ClearTimer(self.ImpactTimerId)
@@ -6662,6 +6748,20 @@ script BattleSessionComponent extends Component
 				log_error("[BattleDeath] drop failed unit=" .. unitId .. " reason=" .. dropResult.Reason)
 			end
 		end
+		if unit.Team == "Enemy" and unit.IsBoss then
+			self._T.BossDefeated = true
+			self:ClearPoisonMists()
+			-- Boss defeat ends the encounter; remaining adds grant no extra kills or drops.
+			for _, add in ipairs(self.BoardState:CollectLivingEnemies()) do
+				local addUnit = add:GetComponent("script.BattleUnitComponent")
+				if addUnit ~= nil then
+					addUnit:MarkDead()
+					self.BoardState:UnregisterUnit(addUnit.UnitId)
+				end
+				_EntityService:Destroy(add)
+			end
+			log("[BattleBoss] defeated; remaining enemies removed unit=" .. unitId)
+		end
 		if unit.Team == "Enemy" and self.BoardState ~= nil then
 			local livingEnemies = self.BoardState:CollectLivingEnemies()
 			if #livingEnemies > 0 then
@@ -6669,17 +6769,23 @@ script BattleSessionComponent extends Component
 				return
 			end
 		end
-		-- A successful queue can clear the wave before its completion timer reaches the handoff.
 		if unit.Team == "Enemy" and self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0 then
-			local sourceEntity = self:FindUnitEntity(sourceUnitId)
-			if isvalid(sourceEntity) and sourceEntity == self.PlayerEntity then
-				self:RecordRunConsumedPlayerTurn()
-			end
+			-- Keep the frozen queue alive so healing/buffs resolve before wave or victory settlement.
+			self:ClearForcedSpawnSchedule("QUEUE_CLEAR_PENDING")
+			self._T.PendingClear = { UnitId = unitId, Cause = cause, Entry = self.EntryRequestId }
+			log("[BattleQueueBoundary] clear deferred until queue completion unit=" .. unitId)
+			return
 		end
+		self:FinishEmptyBattlefield(unitId, cause, unit.Team)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishEmptyBattlefield(string unitId, string cause, string team)
+		self._T.PendingClear = nil
 		self:ClearForcedSpawnSchedule("ALL_ENEMIES_DEFEATED")
 		self:ClearTurnTransitionTimer("ALL_ENEMIES_DEFEATED")
 		self:ClearMotionCompletionWaits()
-		if unit.Team == "Enemy" then
+		if team == "Enemy" then
 			self:CompletePlayerCombatPresentationHandoff("ENEMIES_DEFEATED")
 		end
 		self.PlayerToEnemyBeatPending = false
@@ -6690,8 +6796,8 @@ script BattleSessionComponent extends Component
 			_TimerService:ClearTimer(self.ActionTimerId)
 			self.ActionTimerId = 0
 		end
-		if unit.Team == "Enemy" then
-			if self.CurrentWave < self.TotalWaves then
+		if team == "Enemy" then
+			if self.CurrentWave < self.TotalWaves and not self._T.BossDefeated then
 				self.TurnState:ClearActionState("WAVE_CLEARED")
 				self.TurnState:SetPhase("WaveTransition", "WAVE_CLEARED")
 				self:PublishTurnStateSnapshot("WAVE_CLEARED")
@@ -6846,6 +6952,69 @@ script BattleSessionComponent extends Component
 		if result.Success == false then
 			log_warning("[BattleQueue] rejected action=MOVE direction=" .. direction .. " reason=" .. result.Reason)
 		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean CanSkeletonSwapWithCommander(string unitId)
+		-- Only a Perion commander's summoned soldier may relieve its engaged commander.
+		if self.StageId ~= "region_04_stage_04" or self.BattleResult ~= "" or self._T.BossDefeated then
+			return false
+		end
+		local soldierEntity = self:FindUnitEntity(unitId)
+		local playerEntity = self:FindUnitEntity("player_01")
+		if not isvalid(soldierEntity) or not isvalid(playerEntity) then return false end
+		local soldier = soldierEntity:GetComponent("script.BattleUnitComponent")
+		local player = playerEntity:GetComponent("script.BattleUnitComponent")
+		if soldier == nil or player == nil then return false end
+		local commanderEntity = soldier._T.SkeletonCommander
+		if not isvalid(commanderEntity) or commanderEntity.CurrentMap ~= self.Entity then return false end
+		local commander = commanderEntity:GetComponent("script.BattleUnitComponent")
+		if commander == nil or self:FindUnitEntity(commander.UnitId) ~= commanderEntity then return false end
+		if soldier.EnemyDefinitionId ~= "region_04_skeleton_soldier" or soldier.Team ~= "Enemy"
+			or commander.EnemyDefinitionId ~= "region_04_commander_skeleton" or not commander.IsBoss or commander.Team ~= "Enemy" then
+			return false
+		end
+		for _, unit in ipairs({ soldier, commander, player }) do
+			if unit.IsDead or unit.CurrentHp <= 0 or unit.IsAirborne or not self:IsValidCell(unit.CellIndex) then return false end
+		end
+		return soldier.CellIndex ~= commander.CellIndex
+			and math.abs(soldier.CellIndex - player.CellIndex) >= 2
+			and math.abs(commander.CellIndex - player.CellIndex) == 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SwapSkeletonWithCommander(string unitId)
+		-- Revalidate a frozen plan at impact; cooldown was already consumed by skill execution.
+		if self.TurnState == nil or self.TurnState.BattlePhase ~= "EnemyTurn" or not self:CanSkeletonSwapWithCommander(unitId) then
+			return { Success = false, Reason = "COMMANDER_RELIEF_UNAVAILABLE" }
+		end
+		local soldierEntity = self:FindUnitEntity(unitId)
+		local soldier = soldierEntity:GetComponent("script.BattleUnitComponent")
+		local commanderEntity = soldier._T.SkeletonCommander
+		local commander = commanderEntity:GetComponent("script.BattleUnitComponent")
+		local soldierCell = soldier.CellIndex
+		local commanderCell = commander.CellIndex
+		-- Commit both cells before publishing movement so observers never see an occupied destination.
+		soldier:ApplyCellChange(commanderCell)
+		commander:ApplyCellChange(soldierCell)
+		local player = self:FindUnitEntity("player_01"):GetComponent("script.BattleUnitComponent")
+		soldier:ApplyFacingState(player.CellIndex > commanderCell and "Right" or "Left")
+		commander:ApplyFacingState(player.CellIndex > soldierCell and "Right" or "Left")
+		self:PlaceEntity(soldierEntity, self:GetCellPosition(commanderCell))
+		self:PlaceEntity(commanderEntity, self:GetCellPosition(soldierCell))
+		self:PlayUnitMoveHop(soldierEntity)
+		self:PlayUnitMoveHop(commanderEntity)
+		for _, move in ipairs({ { UnitId = unitId, FromCell = soldierCell, ToCell = commanderCell },
+			{ UnitId = commander.UnitId, FromCell = commanderCell, ToCell = soldierCell } }) do
+			local movedEvent = UnitMovedEvent()
+			movedEvent.UnitId = move.UnitId
+			movedEvent.FromCell = move.FromCell
+			movedEvent.ToCell = move.ToCell
+			self.Entity:SendEvent(movedEvent)
+		end
+		self:PublishEnemyPlanSnapshot("COMMANDER_RELIEF")
+		log("[BattleBoss] skeleton relief soldier=" .. unitId .. " commander=" .. commander.UnitId)
+		return { Success = true, Reason = "COMMANDER_RELIEVED" }
 	end
 
 	@ExecSpace("ServerOnly")
