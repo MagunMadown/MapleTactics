@@ -1,6 +1,8 @@
 @Component
 script BattleSessionComponent extends Component
 
+	@Sync property string PoisonMistCellSnapshot = ""
+
 	@Sync property string BattlePhase = "Setup"
 	@Sync property integer TurnNumber = 0
 	@Sync property string QueuedActionType = ""
@@ -445,6 +447,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void OnEndPlay()
+		-- Hazards belong to this battle only.
+		self:ClearPoisonMists()
 		-- Prevents a pending action callback from surviving this map-scoped battle session.
 		self:ClearMotionCompletionWaits()
 		self:ClearPrototypeBattleEntryRetry("SESSION_END")
@@ -913,6 +917,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void StartStageById(string stageId)
+		-- Hazards belong to this battle only.
+		self:ClearPoisonMists()
 		-- Starts one exact StageId. Region, order, and type always come from StageDefinitions.
 		local stageResult = self:LoadAndApplyStageDefinition(stageId)
 		if stageResult.Success == false then
@@ -1201,6 +1207,8 @@ script BattleSessionComponent extends Component
 		end
 		-- Re-apply the logical cell after the resource-specific ground offset is configured.
 		self:PlaceEntity(enemy, position)
+		log("[EnemyGround] placed unit=" .. unitId .. " map=" .. self.Entity.Name
+			.. " boardY=" .. tostring(self.UnitY) .. " placedY=" .. tostring(enemy.TransformComponent.Position.y))
 		local registration = self:RegisterConfiguredUnit(enemy)
 		if registration.Success == false then
 			log_error("[BattleWave] enemy registration failed unit=" .. unitId .. " reason=" .. registration.Reason)
@@ -1265,6 +1273,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CleanupRegisteredEnemies(string reason)
+		-- Hazards belong to this battle only.
+		self:ClearPoisonMists()
 		-- Unregisters and destroys only runtime enemy entities while preserving the stage player.
 		if self.BoardState == nil then
 			return
@@ -1601,6 +1611,13 @@ script BattleSessionComponent extends Component
 						queuedIconBackgroundColors = self:GetEnemyQueueIconBackgroundColors(plan.PlannedActionSnapshot)
 					end
 					local targetCellSnapshot = plan.TargetCellSnapshot
+					if actionType == "SUMMON_ENEMIES" then
+						local summoner = enemyEntity:GetComponent("script.FaustSummonComponent")
+						if summoner ~= nil then
+							queuedTileNames = summoner.SummonDisplayName
+							queuedIconRuids = summoner.SummonIconRuid
+						end
+					end
 					local telegraphKind = ""
 					local landingCell = -1
 					if actionType == "BOSS_JUMP_TELEGRAPH" or actionType == "BOSS_LAND_OPPOSITE" then
@@ -1955,6 +1972,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryUseUtilitySkill()
+		-- Seal leaves movement, facing, queue cleanup and consumables available.
+		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Reserves the existing immediate-action lock without consuming or rewriting queued skills.
 		if self.TurnState == nil or self.BoardState == nil or self.BattleResult ~= ""
 			or self.BattlePhase ~= "PlayerTurn" then
@@ -2213,6 +2232,10 @@ script BattleSessionComponent extends Component
 		-- The authoritative action completion has already happened. Lock the enemy phase now,
 		-- then consume only the presentation handoff that this action still needs.
 		self:RecordRunConsumedPlayerTurn()
+		local playerUnit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
+		if playerUnit ~= nil then playerUnit:AdvanceNegativeStatusTurns() end
+		self:AdvancePoisonMists()
+		if self.BattleResult ~= "" then return end
 		local handoffDelay = self.PlayerToEnemyBeatDuration
 		if completionReason == "IMMEDIATE_ACTION_COMPLETED" or completionReason == "SKILL_QUEUE_COMPLETED" then
 			handoffDelay = self.PlayerPresentationSettledBeatDuration
@@ -2419,11 +2442,16 @@ script BattleSessionComponent extends Component
 
 		local summoner = enemyEntity:GetComponent("script.FaustSummonComponent")
 		local summonReady = summoner ~= nil and summoner:CanSummon(self, self:GetOppositeEdgeCell(enemy.CellIndex))
+		local startStepIndex = patternRunner.CurrentStepIndex
+		if summonReady and summoner.PrioritizeSummon then
+			-- Only newly prepared actions may prioritize reinforcements; published plans stay frozen.
+			startStepIndex = 1
+		end
 		return _EnemyIntentResolverLogic:ResolvePatternIntent({
 			SummonReady = summonReady,
 			EnemyUnitId = enemyUnitId,
 			PatternId = enemy.EnemyPatternId,
-			StartStepIndex = patternRunner.CurrentStepIndex,
+			StartStepIndex = startStepIndex,
 			TelegraphTurnsRemaining = patternRunner.TelegraphTurnsRemaining,
 			EnemyCellIndex = enemy.CellIndex,
 			EnemyFacing = enemy.Facing,
@@ -2620,7 +2648,10 @@ script BattleSessionComponent extends Component
 				return result
 			end
 			if intent.ActionType == "SUMMON_ENEMIES" then
-				actionPlan.TargetCellSnapshot = tostring(self:GetOppositeEdgeCell(preparedEnemyUnit.CellIndex))
+				local summoner = preparedEnemyEntity:GetComponent("script.FaustSummonComponent")
+				if summoner ~= nil then
+					actionPlan.TargetCellSnapshot = summoner:PrepareSummon(self, self:GetOppositeEdgeCell(preparedEnemyUnit.CellIndex))
+				end
 			end
 			local preparedAction = actionPlan:GetCurrentAction()
 			if preparedAction.Success == true and preparedAction.ActionType == "CHARGE_FORWARD" then
@@ -2851,7 +2882,7 @@ script BattleSessionComponent extends Component
 			local summoner = executingEnemy:GetComponent("script.FaustSummonComponent")
 			actionResult = { Success = false, Reason = "SUMMON_COMPONENT_MISSING_WAIT" }
 			if summoner ~= nil then
-				actionResult = summoner:TrySummon(self, tonumber(executingPlan.TargetCellSnapshot) or -1)
+				actionResult = summoner:TryPreparedSummon(self, executingPlan.TargetCellSnapshot)
 			end
 		elseif intent.ActionType == "BOSS_JUMP_TELEGRAPH" then
 			actionResult = self:BeginBossOppositeJump(intent.EnemyId)
@@ -3349,6 +3380,10 @@ script BattleSessionComponent extends Component
 		self:ProcessAugmentTrigger("TURN_START", "TURN:" .. tostring(self.TurnNumber), 0)
 		self.LastEnemySpawnOrder = 0
 		self:EvaluateForcedSpawnAtTurnBoundary()
+		for _, enemyEntity in ipairs(self.BoardState:CollectLivingEnemies()) do
+			local phase = enemyEntity:GetComponent("script.BossPhaseStateComponent")
+			if phase ~= nil then phase:TrySpawnPhaseReinforcement(self) end
+		end
 		log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
 		log("[BattleTurnFlow] phase=PlayerTurn turn=" .. self.TurnNumber .. " stageTurn=" .. self.StageTurnNumber .. " wave=" .. self.CurrentWave)
 		self:PrepareEnemyIntent()
@@ -3866,6 +3901,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryQueueTile(string tileId)
+		-- Seal leaves movement, facing, queue cleanup and consumables available.
+		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Appends one supported tile up to the configurable queue capacity.
 		local result = {
 			Success = false,
@@ -3926,6 +3963,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryExecuteQueuedTile()
+		-- Seal leaves movement, facing, queue cleanup and consumables available.
+		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Freezes the registered queue and starts an arbitrary-length sequential execution pass.
 		local result = self.TurnState:TryFreezeSkillQueue()
 		if result.Success == false then
@@ -4768,9 +4807,9 @@ script BattleSessionComponent extends Component
 				-- Frozen summon plans are visible during the player turn before the enemy summons.
 				-- Summoning is a command without a TileId, but still occupies a monster skill queue slot.
 				if actionType == "SUMMON_ENEMIES" and (fields[3] == "PREPARED" or fields[3] == "EXECUTING") then
-					queuedTileIds = "faust_summon"
-					queuedTileNames = "좀비루팡 소환"
-					queuedIconRuids = "a878e3aa8b40480cba6f5167285a4ec4"
+					queuedTileIds = "boss_summon"
+					queuedTileNames = #fields >= 25 and self:DecodeEnemyPlanField(fields[25]) or "몬스터 소환"
+					queuedIconRuids = #fields >= 26 and self:DecodeEnemyPlanField(fields[26]) or ""
 				end
 				table.insert(plans, {
 					UnitId = unitId,
@@ -4953,9 +4992,12 @@ script BattleSessionComponent extends Component
 			})
 		end
 
+		local playerSealed = self:IsPlayerSealed()
 		return {
 			Success = true,
 			Reason = "OK",
+			PlayerSealed = playerSealed,
+			PoisonMistCells = self.PoisonMistCellSnapshot,
 			PlayerActionState = playerActionState,
 			RunStats = runStats,
 			CombatFeel = {
@@ -4977,7 +5019,7 @@ script BattleSessionComponent extends Component
 				HitFlashDuration = self.HitFlashDuration,
 				HitReactionDuration = self.HitReactionDuration
 			},
-			RevisionKey = tostring(runStats.Revision) .. ":" .. tostring(runStats.RunSequence) .. ":" .. tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.QueueOrderRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. tostring(self.UnionRewardRevision) .. ":" .. self.BattleResult,
+			RevisionKey = tostring(runStats.Revision) .. ":" .. tostring(runStats.RunSequence) .. ":" .. tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.QueueOrderRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(self.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(self.SelectedJobRevision) .. ":" .. tostring(self.JobMechanicRevision) .. ":" .. tostring(self.SkillTargetRevision) .. ":" .. tostring(self.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(self.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. tostring(self.UnionRewardRevision) .. ":" .. self.BattleResult .. ":" .. tostring(playerSealed) .. ":" .. self.PoisonMistCellSnapshot,
 			Phase = turnState.BattlePhase,
 			TurnNumber = turnState.TurnNumber,
 			IsProcessing = turnState.IsActionProcessing,
@@ -5004,8 +5046,8 @@ script BattleSessionComponent extends Component
 			Commands = {
 				CanMove = isIdlePlayerTurn,
 				CanTurn = isIdlePlayerTurn,
-				CanQueue = isIdlePlayerTurn and queueCount < effectiveCapacity,
-				CanExecute = isIdlePlayerTurn and queueCount > 0,
+				CanQueue = isIdlePlayerTurn and not playerSealed and queueCount < effectiveCapacity,
+				CanExecute = isIdlePlayerTurn and not playerSealed and queueCount > 0,
 				CanClear = isIdlePlayerTurn and queueCount > 0,
 				CanRemove = isIdlePlayerTurn and queueCount > 0,
 				CanReorder = isIdlePlayerTurn and queueCount > 1
@@ -5313,8 +5355,8 @@ script BattleSessionComponent extends Component
 				local reason = ""
 				if definition.EffectType == "HEAL" and unit.CurrentHp >= unit.MaxHp then usable = false; reason = "HP_ALREADY_FULL" end
 				if definition.EffectType == "COOLDOWN_REDUCTION" and #result.Skills == 0 then usable = false; reason = "NO_COOLDOWN_SKILLS" end
-				-- No status system exists yet; keep the future cleanse item visible but unavailable.
-				if definition.EffectType == "CLEANSE" then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
+				-- Cleanse is available while a real hostile status is active.
+				if definition.EffectType == "CLEANSE" and unit.SealTurns <= 0 then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
 				table.insert(result.Items, { ConsumableId = itemId, DisplayOrder = definition.RowIndex, DisplayName = definition.DisplayName, Count = tonumber(count), EffectType = definition.EffectType, EffectValue = definition.EffectValue, IconKey = definition.IconKey, Description = definition.Description, Usable = usable, Reason = reason })
 			end
 		end
@@ -5622,6 +5664,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryExecuteSkill(string sourceUnitId, string skillId)
+		-- Repeat the gate on the authoritative execution path, including already queued skills.
+		if sourceUnitId == "player_01" and self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
 		if validation.Success == false then
 			return {
@@ -6471,12 +6515,13 @@ script BattleSessionComponent extends Component
 		end
 		-- Self buffs live on the units, so both teams share one rule. The next-attack bonus is only read here;
 		-- SkillExecutionLogic spends it once the whole skill has landed so area skills boost every target.
-		if sourceUnit.NextAttackBonus > 0 then
+		local isMistDamage = attackId == "commander_poison_mist"
+		if sourceUnit.NextAttackBonus > 0 and not isMistDamage then
 			amount = amount + sourceUnit.NextAttackBonus
 			log("[BattleBuff] next attack bonus added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " bonus=" .. tostring(sourceUnit.NextAttackBonus) .. " amount=" .. tostring(amount))
 		end
 		-- Timed attack buffs stay active for their whole duration, so every hit in that window gets them.
-		if sourceUnit.AttackBuffAmount > 0 then
+		if sourceUnit.AttackBuffAmount > 0 and not isMistDamage then
 			amount = amount + sourceUnit.AttackBuffAmount
 			log("[BattleBuff] attack buff added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " attack=" .. tostring(sourceUnit.AttackBuffAmount) .. " amount=" .. tostring(amount))
 		end
@@ -6484,7 +6529,7 @@ script BattleSessionComponent extends Component
 			and defenderRun ~= nil and defenderEffects.ActiveRunSequence == defenderRun.RunSequence then
 			amount = math.max(1, amount - defenderEffects.DefenseBonus)
 		end
-		if targetUnit.DefenseBuffAmount > 0 then
+		if targetUnit.DefenseBuffAmount > 0 and not isMistDamage then
 			amount = math.max(1, amount - targetUnit.DefenseBuffAmount)
 			log("[BattleBuff] defense buff reduced source=" .. sourceUnitId .. " target=" .. targetUnitId .. " defense=" .. tostring(targetUnit.DefenseBuffAmount) .. " amount=" .. tostring(amount))
 		end
@@ -6556,6 +6601,11 @@ script BattleSessionComponent extends Component
 		if deathState.Success == false then
 			log_error("[BattleDeath] state transition failed unit=" .. unitId .. " reason=" .. deathState.Reason)
 			return
+		end
+		self:RemovePoisonMistsForSource(unitId)
+		if unit.Team == "Player" then
+			unit.SealTurns = 0
+			self:ClearPoisonMists()
 		end
 		if unit.Team == "Enemy" then
 			-- Plays once per confirmed death; duplicate death calls already returned above.
@@ -7076,7 +7126,7 @@ script BattleSessionComponent extends Component
 		local motionPlayRate = tonumber(presentation.AttackMotionPlayRate) or 1
 		local motionDuration = tonumber(presentation.AttackMotionDuration) or 0.35
 		local source = "ENEMY_DEFINITION"
-		if motionRuid == "" then
+		if motionRuid == "" or string.find("|" .. (definition.SkillTags or "") .. "|", "|caster_motion|", 1, true) ~= nil then
 			motionRuid = definition.CasterMotionRuid or ""
 			motionPlayRate = (tonumber(definition.CasterMotionPlayRate) or 1) * 3
 			motionDuration = tonumber(definition.CasterMotionDuration) or tonumber(definition.ActionDuration) or 0.35
@@ -7302,6 +7352,9 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void AdvanceEnemySkillCooldowns(string enemyUnitId, string reason)
 		-- Enemy cooldowns advance on that enemy's own action, independent of player queue size.
+		local enemy = self:FindUnitEntity(enemyUnitId)
+		local unit = isvalid(enemy) and enemy:GetComponent("script.BattleUnitComponent") or nil
+		if unit ~= nil then unit:AdvanceBuffTurns(reason) end
 		local runtimeState = self:GetSkillRuntimeState(enemyUnitId)
 		if runtimeState == nil then
 			return
@@ -7441,7 +7494,18 @@ script BattleSessionComponent extends Component
 		if presentation ~= nil then
 			groundVisualOffsetY = tonumber(presentation.GroundVisualOffsetY) or 0
 		end
-		targetEntity.TransformComponent.Position = Vector3(position.x, position.y + groundVisualOffsetY, current.z)
+		-- UnitY is a spawn reference; unlike players, these units have no Body to settle on the floor.
+		local groundY = self.UnitY
+		local footholds = self.Entity.FootholdComponent
+		if footholds ~= nil then
+			-- Start just above the board, below upper platforms; cover the lower battle floors too.
+			local foothold = footholds:Raycast(Vector2(position.x, self.UnitY + 0.5), Vector2(0, -1), 10)
+			if foothold ~= nil and foothold:IsVertical() == false then
+				groundY = foothold:GetYByX(position.x)
+			end
+		end
+		local hopOffsetY = position.y - self.UnitY
+		targetEntity.TransformComponent.Position = Vector3(position.x, groundY + hopOffsetY + groundVisualOffsetY, current.z)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -7990,6 +8054,108 @@ script BattleSessionComponent extends Component
 			self.ResultTransitionTimerId = 0
 			if isvalid(self.PlayerEntity) and self.PlayerEntity.CurrentMap == self.Entity and self.EntryRequestId == expectedEntry then self.ResultReady = true end
 		end, 8)
+	end
+
+	method boolean IsPlayerSealed()
+		-- Reads synchronized status on either side without exposing mutation to the client.
+		local player = self.PlayerEntity
+		if self:IsClient() then player = _UserService.LocalPlayer end
+		local unit = isvalid(player) and player:GetComponent("script.BattleUnitComponent") or nil
+		return unit ~= nil and unit.SealTurns > 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ExecuteEnemySpecialEffect(table context, table step)
+		-- Uses the shared impact-time cell/target snapshot and keeps hostile effects enemy-only.
+		local source = self:FindUnitEntity(context.SourceUnitId)
+		local unit = isvalid(source) and source:GetComponent("script.BattleUnitComponent") or nil
+		if unit == nil or unit.IsDead or unit.Team ~= "Enemy" or not self:IsTeamTurn("Enemy") then
+			return { Success = false, Reason = "INVALID_HOSTILE_EFFECT_SOURCE" }
+		end
+		local turns = math.floor(tonumber(step.ParameterA) or 0)
+		if turns < 1 then return { Success = false, Reason = "INVALID_HOSTILE_EFFECT_DURATION" } end
+		if step.EffectType == "SEAL" then
+			local hit = false
+			for _, targetId in ipairs(context.TargetUnitIds or {}) do
+				local target = self:FindUnitEntity(targetId)
+				local targetUnit = isvalid(target) and target:GetComponent("script.BattleUnitComponent") or nil
+				if targetUnit ~= nil and not targetUnit.IsDead and targetUnit.Team == "Player" then
+					targetUnit:ApplySeal(turns)
+					self:PlayActiveHitEffect(targetId)
+					hit = true
+				end
+			end
+			return { Success = true, Hit = hit, EffectType = "SEAL", Reason = hit and "SEALED" or "MISS_EMPTY" }
+		end
+		if step.EffectType ~= "POISON_MIST" or step.Value <= 0 then
+			return { Success = false, Reason = "UNKNOWN_HOSTILE_EFFECT" }
+		end
+		self:RemovePoisonMistsForSource(context.SourceUnitId)
+		local cells = {}
+		for _, cell in ipairs(context.TargetCellIndices or {}) do
+			if self:IsValidCell(cell) then table.insert(cells, cell) end
+		end
+		table.insert(self._T.PoisonMists, { SourceUnitId = context.SourceUnitId, Cells = cells, Damage = step.Value, Turns = turns })
+		self:PublishPoisonMistCells()
+		log("[PoisonMist] created source=" .. context.SourceUnitId .. " cells=" .. self.PoisonMistCellSnapshot .. " turns=" .. tostring(turns))
+		return { Success = true, EffectType = "POISON_MIST", Reason = "POISON_MIST_CREATED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearPoisonMists()
+		-- Releases all map-scoped hazards on reset, teardown or defeat.
+		self._T.PoisonMists = {}
+		self.PoisonMistCellSnapshot = ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RemovePoisonMistsForSource(string sourceUnitId)
+		-- A dying caster cannot damage players during its death presentation.
+		local remaining = {}
+		for _, mist in ipairs(self._T.PoisonMists or {}) do
+			if mist.SourceUnitId ~= sourceUnitId then table.insert(remaining, mist) end
+		end
+		self._T.PoisonMists = remaining
+		self:PublishPoisonMistCells()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishPoisonMistCells()
+		-- Existing client floor telegraphs render these occupied hazard cells until expiry.
+		local cells = {}
+		local seen = {}
+		for _, mist in ipairs(self._T.PoisonMists or {}) do
+			for _, cell in ipairs(mist.Cells) do
+				if not seen[cell] then table.insert(cells, tostring(cell)); seen[cell] = true end
+			end
+		end
+		self.PoisonMistCellSnapshot = table.concat(cells, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvancePoisonMists()
+		-- A player gets a complete movement opportunity before each fixed one-point area tick.
+		local player = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
+		if player == nil or player.IsDead or self.BattleResult ~= "" then self:ClearPoisonMists(); return end
+		local remaining = {}
+		for _, mist in ipairs(self._T.PoisonMists or {}) do
+			local source = self:FindUnitEntity(mist.SourceUnitId)
+			local unit = isvalid(source) and source:GetComponent("script.BattleUnitComponent") or nil
+			if unit ~= nil and not unit.IsDead then
+				for _, cell in ipairs(mist.Cells) do
+					if player.CellIndex == cell and not player.IsAirborne then
+						local result = self:ApplyDamage(mist.SourceUnitId, player.UnitId, mist.Damage, "commander_poison_mist")
+						log("[PoisonMist] tick cell=" .. tostring(cell) .. " damage=" .. tostring(result.AppliedAmount or 0))
+						break
+					end
+				end
+				if self.BattleResult ~= "" then self:ClearPoisonMists(); return end
+				mist.Turns = mist.Turns - 1
+				if mist.Turns > 0 then table.insert(remaining, mist) end
+			end
+		end
+		self._T.PoisonMists = remaining
+		self:PublishPoisonMistCells()
 	end
 
 end
