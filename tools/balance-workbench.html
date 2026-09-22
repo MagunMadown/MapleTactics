@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MapleTactics 밸런스 데이터 에디터</title>
+<title>MapleTactics Balance Workbench</title>
 <style>
   :root {
     --bg: #14161c;
@@ -107,6 +107,8 @@
   table.grid input[type="text"]:focus, table.grid select:focus { outline: none; border-color: var(--accent); background: #10131a; }
   table.grid td.cell-error input, table.grid td.cell-error select { border-color: var(--error); background: #2a1418; }
   table.grid td.cell-warn input, table.grid td.cell-warn select { border-color: var(--warn); background: #2a2214; }
+  input[readonly] { color: var(--dim) !important; cursor: not-allowed; font-style: italic; }
+  .card-field-widget input[readonly] { background: #0c0e13 !important; }
   .numstep { display: flex; align-items: center; gap: 2px; min-width: 90px; }
   .numstep-btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px;
     width: 18px; height: 18px; line-height: 1; padding: 0; font-size: 12px; cursor: pointer; flex: none; }
@@ -194,7 +196,7 @@
 <body>
 
 <header>
-  <h1>MapleTactics 밸런스 데이터 에디터</h1>
+  <h1>MapleTactics Balance Workbench</h1>
   <button id="btnOpenFull">폴더 열기 (읽기/쓰기)</button>
   <button id="btnOpenFallback">폴더 열기 (읽기 전용, 대체 모드)</button>
   <span id="modeBadge" class="mode-badge" style="display:none"></span>
@@ -1180,7 +1182,7 @@
   function afterLoad() {
     for (const [name, def] of state.tables) {
       def.columns = inferColumns(def.header, def.rows);
-      def.keys = detectKeyColumns(def.header);
+      def.keys = detectKeyColumns(name, def.header);
     }
     rebuildIndexAndValidateAll();
 
@@ -1400,7 +1402,45 @@
 
   // ---------- Schema inference ----------
 
-  function detectKeyColumns(header) {
+  // Explicit, hand-verified primary keys for every table — no more guessing
+  // by "leading columns ending in Id/Index". Ported from tools/balance-schema.js
+  // (an independent explicit-schema module that landed on develop at the same
+  // time as this tool was built on its own branch — see the design doc's
+  // "추후 갱신 예정" note). This fixes real cases the naming heuristic gets
+  // wrong in both directions: WeaponDefinitions/StageMapRoutes/
+  // UnionStatLevelDefinitions/UnionUpgradeLevels were under- or mis-detected
+  // (WeaponType never looked like a key at all; StatId+Level's Level doesn't
+  // end in Id/Index), while EnemyImpactPresentations/BossPhaseDefinitions
+  // were over-detected (trailing Id-shaped columns swept in that aren't
+  // actually part of the key).
+  const EXPLICIT_KEYS = {
+    JobDefinitions: ["JobId"], JobStartingSkillEntries: ["StartingSkillSetId", "SlotIndex"],
+    WeaponDefinitions: ["WeaponType"], AugmentDefinitions: ["AugmentId"], AugmentEffects: ["AugmentId", "Seq"],
+    EnemyDefinitions: ["EnemyDefinitionId"], EnemyPatternSteps: ["PatternId", "StepIndex"],
+    EnemySpawnPools: ["PoolId", "EnemyDefinitionId", "EnemyModelId"], EnemyDropDefinitions: ["DropEntryId"],
+    EnemyImpactPresentations: ["EntryId"], BossPhaseDefinitions: ["EnemyDefinitionId", "PhaseIndex"],
+    RegionDefinitions: ["RegionId"], NodeDefinitions: ["NodeGraphId", "NodeId"], StageDefinitions: ["StageId"],
+    StageMapRoutes: ["StageId"], StageEnemyWaves: ["WaveTableId", "WaveIndex"], StageRewardDefinitions: ["StageRewardEntryId"],
+    TopHudThemeDefinitions: ["RegionId"], CurrencyDefinitions: ["CurrencyId"], ShopDefinitions: ["ShopId"],
+    ShopEntries: ["ShopEntryId"], ShopNodeBindings: ["NodeGraphId", "NodeId"], RelicDefinitions: ["RelicId"],
+    ConsumableDefinitions: ["ConsumableId"], UnionRankDefinitions: ["RankId"], UnionRewardDefinitions: ["RewardId"],
+    UnionJobGradeDefinitions: ["GradeId"], UnionJobMilestoneDefinitions: ["MilestoneId"], UnionStatDefinitions: ["StatId"],
+    UnionStatLevelDefinitions: ["StatId", "Level"], UnionUpgradeDefinitions: ["UpgradeId"], UnionUpgradeLevels: ["UpgradeId", "Level"],
+    UnionBlockDefinitions: ["BlockId"], UnionBlockShapeDefinitions: ["ShapeId"], UnionBoardCellDefinitions: ["CellId"],
+    UnionSpecialZoneDefinitions: ["SpecialZoneId"], SkillEffectSteps: ["EffectSetId", "StepIndex"],
+    UtilitySkillEffectSteps: ["EffectSetId", "StepIndex"],
+    SkillDefinitions: ["SkillId"], WarriorSkillDefinitions: ["SkillId"], MageSkillDefinitions: ["SkillId"],
+    ArcherSkillDefinitions: ["SkillId"], ThiefSkillDefinitions: ["SkillId"], PirateSkillDefinitions: ["SkillId"],
+    EnemySkillDefinitions: ["SkillId"], UtilitySkillDefinitions: ["SkillId"],
+  };
+
+  function detectKeyColumns(tableName, header) {
+    if (EXPLICIT_KEYS[tableName]) {
+      // Still require the columns to actually exist (a renamed/deleted key
+      // column shouldn't silently keep claiming a stale key).
+      const keys = EXPLICIT_KEYS[tableName].filter((k) => header.includes(k));
+      if (keys.length) return keys;
+    }
     const keyPattern = /(Id|Index)$/;
     let start = 0;
     if (header[0] === "SchemaVersion") start = 1;
@@ -1422,7 +1462,7 @@
         type = "number";
       } else if (values.some((v) => v.includes("|"))) {
         type = "pipelist";
-      } else if (/(Id|Index)$/.test(name)) {
+      } else if (/(Id|Index)$/.test(name) || FORCE_IDREF_COLUMNS.has(name)) {
         type = "idref";
       }
       const distinct = [...new Set(values)];
@@ -1534,7 +1574,20 @@
   //   - EnemyPatternSteps.TileId is historically named after tiles but has
   //     always pointed at a SkillId (EnemySkillDefinitions), confirmed in
   //     Docs/Guide/Enemy-Plan-Trait-Guide.md and the validator source.
-  const FK_TARGET_COLUMN = { BaseSkillId: "SkillId", TileId: "SkillId" };
+  // Same source as EXPLICIT_KEYS (tools/balance-schema.js) — three more
+  // confirmed cases where the FK column isn't named after its target's key:
+  // RequiredJobTag (skill/utility-skill tables) really means JobDefinitions.JobId,
+  // RequiredUnionRank (several union tables) means UnionRankDefinitions.RankId,
+  // RequiredUpgradeId (UnionUpgradeLevels' self-referential prerequisite) means
+  // UnionUpgradeDefinitions.UpgradeId.
+  const FK_TARGET_COLUMN = {
+    BaseSkillId: "SkillId", TileId: "SkillId",
+    RequiredJobTag: "JobId", RequiredUnionRank: "RankId", RequiredUpgradeId: "UpgradeId",
+  };
+  // These don't end in Id/Index, so inferColumns would never classify them as
+  // idref on its own — force it so the FK_TARGET_COLUMN alias above actually
+  // gets a chance to run.
+  const FORCE_IDREF_COLUMNS = new Set(["RequiredJobTag", "RequiredUnionRank", "RequiredUpgradeId"]);
   function fkTargetColumn(colName) { return FK_TARGET_COLUMN[colName] || colName; }
 
   function resolveIdrefColumns() {
@@ -2080,7 +2133,36 @@
     return { bool: "bool", number: "number", pipelist: "list(|)", idref: "id-ref", text: "text" }[c.type] || c.type;
   }
 
+  // Columns confirmed dead or unreliable at runtime (same source as
+  // EXPLICIT_KEYS) — shown but not editable, with the reason as a tooltip,
+  // so a designer doesn't spend time tuning a value nothing reads.
+  const READONLY_COLUMNS = {
+    RelicDefinitions: {
+      EffectDescription: "런타임은 이 텍스트를 무시하고 AttackBonus/MaxHpBonus/DefenseBonus에서 설명을 자동 생성합니다.",
+    },
+    TopHudThemeDefinitions: {
+      BackdropColor: "검증은 되지만 화면 배경 렌더링에는 적용되지 않습니다.",
+      BackdropAlpha: "검증은 되지만 화면 배경 렌더링에는 적용되지 않습니다.",
+    },
+    UnionStatDefinitions: {
+      IsImplemented: "일부 스탯은 Repository가 CSV 값과 무관하게 보정합니다(예: STARTING_RANDOM_RELIC은 항상 true로 처리). CSV 값만으로 구현 여부를 단정하지 마세요.",
+    },
+  };
+  function readonlyReason(tableName, colName) {
+    const t = READONLY_COLUMNS[tableName];
+    return t ? t[colName] : undefined;
+  }
+
   function buildCellWidget(colDef, value, def, tableName, commit) {
+    const readonlyNote = readonlyReason(tableName, colDef.name);
+    if (readonlyNote) {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.value = value;
+      input.readOnly = true;
+      input.title = "읽기 전용 — " + readonlyNote;
+      return input;
+    }
     if (colDef.type === "bool") {
       const select = document.createElement("select");
       ["", "true", "false"].forEach((opt) => {
@@ -2339,7 +2421,7 @@
   function refreshTableStructure(name) {
     const def = state.tables.get(name);
     def.columns = inferColumns(def.header, def.rows);
-    def.keys = detectKeyColumns(def.header);
+    def.keys = detectKeyColumns(name, def.header);
     def.dirty = true;
     rebuildIndexAndValidateAll();
     renderTableTabs();
@@ -2451,7 +2533,7 @@
       userDatasetJson: buildUserDatasetJson(name, uuid),
     };
     def.columns = inferColumns(def.header, def.rows);
-    def.keys = detectKeyColumns(def.header);
+    def.keys = detectKeyColumns(name, def.header);
     state.tables.set(name, def);
     rebuildIndexAndValidateAll();
 
