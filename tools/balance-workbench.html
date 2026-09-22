@@ -201,6 +201,7 @@
   .bal-chip { border: 1px solid var(--border); background: var(--panel2); color: var(--dim); border-radius: 999px;
     padding: 4px 11px; font-size: 11.5px; cursor: pointer; }
   .bal-chip.active { background: var(--accent); border-color: var(--accent); color: #0b0d12; font-weight: 600; }
+  .bal-concept-toggle { margin-bottom: 12px; }
   .bal-meta { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   .bal-count { color: var(--dim); font-size: 12px; }
   .bal-toggle-all { background: none; border: none; color: var(--accent); font-size: 11.5px; cursor: pointer; padding: 0; }
@@ -1204,6 +1205,8 @@
     compareOpen: false, // Balance screen: whether the Compare panel is expanded
     balanceExpandedGroups: new Set(), // Balance screen: which job groups are expanded (empty = all collapsed)
     balanceCardExpanded: new Set(), // Balance screen: SkillIds with "더보기" open (survives edit-triggered re-renders)
+    balanceConcept: "skill", // Balance screen: 'skill' | 'enemy' — which concept's cards are shown
+    enemyExpandedGroups: new Set(), // Balance screen (enemy concept): which region groups are expanded
   };
 
   const el = (sel) => document.querySelector(sel);
@@ -1766,6 +1769,27 @@
 
   function renderBalanceView() {
     balanceAreaEl.innerHTML = "";
+
+    const conceptToggle = document.createElement("div");
+    conceptToggle.className = "bal-chips bal-concept-toggle";
+    [["skill", "스킬"], ["enemy", "적"]].forEach(([key, label]) => {
+      const chip = document.createElement("button");
+      chip.className = "bal-chip" + (state.balanceConcept === key ? " active" : "");
+      chip.textContent = label;
+      chip.addEventListener("click", () => {
+        if (state.balanceConcept === key) return;
+        state.balanceConcept = key;
+        renderBalanceView();
+      });
+      conceptToggle.appendChild(chip);
+    });
+    balanceAreaEl.appendChild(conceptToggle);
+
+    if (state.balanceConcept === "enemy") {
+      renderEnemyBalanceView();
+      return;
+    }
+
     const concepts = buildSkillConcepts();
     // Drop compare selections whose skill no longer exists (e.g. row deleted in Editor).
     const liveIds = new Set(concepts.map((c) => c.skillId));
@@ -2291,6 +2315,293 @@
     openBtn.className = "bal-open";
     openBtn.textContent = "출처 보기 →";
     openBtn.addEventListener("click", () => jumpToRow(c.tableName, c.rowIndex));
+    card.appendChild(openBtn);
+
+    return card;
+  }
+
+  // ---------- Balance view (Enemy concept) ----------
+  //
+  // Joins EnemyDefinitions with the stage(s) it actually spawns in, via the
+  // real 3-hop chain the game data uses: EnemySpawnPools.EnemyDefinitionId
+  // -> PoolId, StageEnemyWaves.EnemyPoolId -> WaveTableId,
+  // StageDefinitions.WaveTableId -> StageId/RegionId. No stage/region is
+  // guessed — an enemy with no matching pool row lands in "미배치" (unplaced)
+  // rather than being assigned a fabricated location.
+
+  function buildEnemyConcepts() {
+    const enemyDef = state.tables.get("EnemyDefinitions");
+    if (!enemyDef) return [];
+    const poolsDef = state.tables.get("EnemySpawnPools");
+    const wavesDef = state.tables.get("StageEnemyWaves");
+    const stagesDef = state.tables.get("StageDefinitions");
+    const regionDef = state.tables.get("RegionDefinitions");
+
+    const poolsByEnemy = new Map(); // EnemyDefinitionId -> Set(PoolId)
+    if (poolsDef) {
+      const pIdx = new Map(poolsDef.header.map((h, i) => [h, i]));
+      poolsDef.rows.forEach((row) => {
+        const enemyId = row[pIdx.get("EnemyDefinitionId")] || "";
+        const poolId = row[pIdx.get("PoolId")] || "";
+        if (!enemyId || !poolId) return;
+        if (!poolsByEnemy.has(enemyId)) poolsByEnemy.set(enemyId, new Set());
+        poolsByEnemy.get(enemyId).add(poolId);
+      });
+    }
+    const waveTablesByPool = new Map(); // PoolId -> Set(WaveTableId)
+    if (wavesDef) {
+      const wIdx = new Map(wavesDef.header.map((h, i) => [h, i]));
+      wavesDef.rows.forEach((row) => {
+        const poolId = row[wIdx.get("EnemyPoolId")] || "";
+        const waveTableId = row[wIdx.get("WaveTableId")] || "";
+        if (!poolId || !waveTableId) return;
+        if (!waveTablesByPool.has(poolId)) waveTablesByPool.set(poolId, new Set());
+        waveTablesByPool.get(poolId).add(waveTableId);
+      });
+    }
+    const regionInfo = new Map(); // RegionId -> {order, displayName}
+    if (regionDef) {
+      const rIdx = new Map(regionDef.header.map((h, i) => [h, i]));
+      regionDef.rows.forEach((row) => {
+        regionInfo.set(row[rIdx.get("RegionId")] || "", {
+          order: parseFloat(row[rIdx.get("RegionOrder")]) || 0,
+          displayName: row[rIdx.get("DisplayName")] || "",
+        });
+      });
+    }
+    const stagesByWaveTable = new Map(); // WaveTableId -> [stageInfo]
+    if (stagesDef) {
+      const sIdx = new Map(stagesDef.header.map((h, i) => [h, i]));
+      stagesDef.rows.forEach((row, ri) => {
+        const waveTableId = row[sIdx.get("WaveTableId")] || "";
+        if (!waveTableId) return;
+        const info = {
+          stageId: row[sIdx.get("StageId")] || "",
+          rowIndex: ri,
+          displayName: row[sIdx.get("DisplayName")] || row[sIdx.get("StageId")] || "",
+          regionId: row[sIdx.get("RegionId")] || "",
+          stageIndex: parseFloat(row[sIdx.get("StageIndex")]) || 0,
+        };
+        if (!stagesByWaveTable.has(waveTableId)) stagesByWaveTable.set(waveTableId, []);
+        stagesByWaveTable.get(waveTableId).push(info);
+      });
+    }
+
+    const header = enemyDef.header;
+    const idx = new Map(header.map((h, i) => [h, i]));
+    return enemyDef.rows.map((row, rowIndex) => {
+      const get = (col) => { const i = idx.get(col); return i === undefined ? "" : row[i] || ""; };
+      const enemyId = get("EnemyDefinitionId");
+      const poolIds = poolsByEnemy.get(enemyId) || new Set();
+      const waveTableIds = new Set();
+      poolIds.forEach((poolId) => (waveTablesByPool.get(poolId) || new Set()).forEach((wt) => waveTableIds.add(wt)));
+      const stageMap = new Map();
+      waveTableIds.forEach((wt) => (stagesByWaveTable.get(wt) || []).forEach((info) => stageMap.set(info.stageId, info)));
+      const stages = [...stageMap.values()].sort((a, b) => a.stageIndex - b.stageIndex || a.stageId.localeCompare(b.stageId));
+      const firstStage = stages[0] || null;
+      const regionId = firstStage ? firstStage.regionId : "";
+      const rInfo = regionInfo.get(regionId);
+      return {
+        rowIndex, enemyId,
+        displayName: get("DisplayName") || enemyId,
+        maxHp: get("MaxHp"), basicAttackDamage: get("BasicAttackDamage"),
+        patternId: get("PatternId"),
+        isBoss: get("IsBoss").trim().toLowerCase() === "true",
+        stages, firstStage,
+        regionId, regionLabel: rInfo ? rInfo.displayName : (regionId || "미배치"),
+        regionOrder: rInfo ? rInfo.order : 9999,
+      };
+    });
+  }
+
+  function renderEnemyBalanceView() {
+    const concepts = buildEnemyConcepts();
+
+    const toolbar = document.createElement("div");
+    toolbar.className = "bal-toolbar";
+    const search = document.createElement("input");
+    search.type = "text";
+    search.placeholder = "이름 · EnemyDefinitionId로 검색";
+    search.value = state.balanceSearch;
+    search.addEventListener("input", () => {
+      state.balanceSearch = search.value;
+      renderEnemyCards(concepts);
+    });
+    toolbar.appendChild(search);
+    balanceAreaEl.appendChild(toolbar);
+
+    const meta = document.createElement("div");
+    meta.id = "balMeta";
+    meta.className = "bal-meta";
+    balanceAreaEl.appendChild(meta);
+
+    const grid = document.createElement("div");
+    grid.id = "balGrid";
+    balanceAreaEl.appendChild(grid);
+
+    renderEnemyCards(concepts);
+  }
+
+  function renderEnemyCards(concepts) {
+    const grid = el("#balGrid");
+    const meta = el("#balMeta");
+    if (!grid || !meta) return;
+    grid.innerHTML = "";
+    meta.innerHTML = "";
+
+    const q = state.balanceSearch.trim().toLowerCase();
+    const filtered = concepts.filter((c) => !q || c.displayName.toLowerCase().includes(q) || c.enemyId.toLowerCase().includes(q));
+
+    const count = document.createElement("div");
+    count.className = "bal-count";
+    count.textContent = `${filtered.length}개 몬스터`;
+    meta.appendChild(count);
+
+    if (!filtered.length) {
+      grid.innerHTML = `<div class="bal-empty">조건에 맞는 몬스터가 없습니다.</div>`;
+      return;
+    }
+
+    const grouped = !q;
+    grid.classList.toggle("bal-grid", !grouped);
+    if (!grouped) {
+      filtered.sort((a, b) => a.displayName.localeCompare(b.displayName)).forEach((c) => grid.appendChild(buildEnemyCard(c)));
+      return;
+    }
+
+    const regionKeys = [...new Map(filtered.map((c) => [c.regionLabel, c.regionOrder])).entries()].sort((a, b) => a[1] - b[1]).map((e) => e[0]);
+    const allExpanded = regionKeys.every((k) => state.enemyExpandedGroups.has(k));
+    const toggleAllBtn = document.createElement("button");
+    toggleAllBtn.className = "bal-toggle-all";
+    toggleAllBtn.textContent = allExpanded ? "모두 접기" : "모두 펼치기";
+    toggleAllBtn.addEventListener("click", () => {
+      if (allExpanded) state.enemyExpandedGroups.clear();
+      else regionKeys.forEach((k) => state.enemyExpandedGroups.add(k));
+      renderEnemyCards(concepts);
+    });
+    meta.appendChild(toggleAllBtn);
+
+    regionKeys.forEach((regionLabel) => {
+      const items = filtered.filter((c) => c.regionLabel === regionLabel).sort((a, b) => a.displayName.localeCompare(b.displayName));
+      const expanded = state.enemyExpandedGroups.has(regionLabel);
+
+      const groupWrap = document.createElement("div");
+      groupWrap.className = "bal-group";
+      const head = document.createElement("div");
+      head.className = "bal-group-head" + (expanded ? " expanded" : "");
+      const arrow = document.createElement("span");
+      arrow.className = "arrow";
+      arrow.textContent = "▶";
+      const label = document.createElement("span");
+      label.className = "glabel";
+      label.textContent = regionLabel;
+      const cnt = document.createElement("span");
+      cnt.className = "gcount";
+      cnt.textContent = `${items.length}개`;
+      head.appendChild(arrow);
+      head.appendChild(label);
+      head.appendChild(cnt);
+      head.addEventListener("click", () => {
+        if (state.enemyExpandedGroups.has(regionLabel)) state.enemyExpandedGroups.delete(regionLabel);
+        else state.enemyExpandedGroups.add(regionLabel);
+        renderEnemyCards(concepts);
+      });
+      groupWrap.appendChild(head);
+
+      if (expanded) {
+        // Sub-group by the enemy's first stage, ordered by StageIndex — most
+        // enemies repeat across 2-3 consecutive stages of the same run, so
+        // "first appearance" is the one deterministic single-stage bucket;
+        // the card itself lists every stage it actually spawns in.
+        const stageKeys = [...new Map(items.map((c) => [c.firstStage ? c.firstStage.displayName : "미배치", c.firstStage ? c.firstStage.stageIndex : 9999])).entries()]
+          .sort((a, b) => a[1] - b[1]);
+        if (stageKeys.length > 1) {
+          stageKeys.forEach(([stageLabel]) => {
+            const stageHeader = document.createElement("div");
+            stageHeader.className = "bal-tier-label";
+            stageHeader.textContent = stageLabel;
+            groupWrap.appendChild(stageHeader);
+            const stageGrid = document.createElement("div");
+            stageGrid.className = "bal-grid bal-group-grid";
+            items.filter((c) => (c.firstStage ? c.firstStage.displayName : "미배치") === stageLabel).forEach((c) => stageGrid.appendChild(buildEnemyCard(c)));
+            groupWrap.appendChild(stageGrid);
+          });
+        } else {
+          const groupGrid = document.createElement("div");
+          groupGrid.className = "bal-grid bal-group-grid";
+          items.forEach((c) => groupGrid.appendChild(buildEnemyCard(c)));
+          groupWrap.appendChild(groupGrid);
+        }
+      }
+      grid.appendChild(groupWrap);
+    });
+  }
+
+  function buildEnemyCard(c) {
+    const card = document.createElement("div");
+    card.className = "bal-card";
+
+    const head = document.createElement("div");
+    head.className = "bal-head";
+    const nameWrap = document.createElement("div");
+    const name = document.createElement("div");
+    name.className = "bal-name";
+    name.textContent = c.displayName;
+    const id = document.createElement("div");
+    id.className = "bal-id";
+    id.textContent = c.enemyId;
+    nameWrap.appendChild(name);
+    nameWrap.appendChild(id);
+    head.appendChild(nameWrap);
+    card.appendChild(head);
+
+    const badges = document.createElement("div");
+    badges.className = "bal-badges";
+    if (c.isBoss) {
+      const bossBadge = document.createElement("span");
+      bossBadge.className = "bal-badge";
+      bossBadge.textContent = "보스";
+      badges.appendChild(bossBadge);
+    }
+    if (!c.stages.length) {
+      const unplacedBadge = document.createElement("span");
+      unplacedBadge.className = "bal-badge";
+      unplacedBadge.textContent = "미배치";
+      badges.appendChild(unplacedBadge);
+    } else {
+      c.stages.forEach((s) => {
+        const stageBadge = document.createElement("button");
+        stageBadge.className = "bal-badge";
+        stageBadge.style.cursor = "pointer";
+        stageBadge.textContent = s.displayName;
+        stageBadge.title = `${s.stageId} 열기 →`;
+        stageBadge.addEventListener("click", () => jumpToRow("StageDefinitions", s.rowIndex));
+        badges.appendChild(stageBadge);
+      });
+    }
+    card.appendChild(badges);
+
+    const stats = document.createElement("div");
+    stats.className = "bal-stats";
+    if (!buildEditableStat(stats, "MaxHp", "EnemyDefinitions", c.rowIndex, "MaxHp")) {
+      const kEl = document.createElement("div"); kEl.className = "stat-k"; kEl.textContent = "MaxHp";
+      const vEl = document.createElement("div"); vEl.className = "stat-v"; vEl.textContent = c.maxHp || "—";
+      stats.appendChild(kEl); stats.appendChild(vEl);
+    }
+    if (!buildEditableStat(stats, "BasicAttackDamage", "EnemyDefinitions", c.rowIndex, "BasicAttackDamage")) {
+      const kEl = document.createElement("div"); kEl.className = "stat-k"; kEl.textContent = "BasicAttackDamage";
+      const vEl = document.createElement("div"); vEl.className = "stat-v"; vEl.textContent = c.basicAttackDamage || "—";
+      stats.appendChild(kEl); stats.appendChild(vEl);
+    }
+    const patK = document.createElement("div"); patK.className = "stat-k"; patK.textContent = "PatternId";
+    const patV = document.createElement("div"); patV.className = "stat-v"; patV.style.fontSize = "10.5px"; patV.textContent = c.patternId || "—";
+    stats.appendChild(patK); stats.appendChild(patV);
+    card.appendChild(stats);
+
+    const openBtn = document.createElement("button");
+    openBtn.className = "bal-open";
+    openBtn.textContent = "출처 보기 →";
+    openBtn.addEventListener("click", () => jumpToRow("EnemyDefinitions", c.rowIndex));
     card.appendChild(openBtn);
 
     return card;
