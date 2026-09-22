@@ -238,6 +238,11 @@ script ContentValidatorLogic extends Logic
 			return self:RejectSkill(result, "EFFECT_STEPS_EMPTY")
 		end
 
+		if bundle.IsUtility == true then
+			local reason = self:ValidateUtilityEffect(definition, steps)
+			if reason ~= "" then return self:RejectSkill(result, reason) end
+		end
+
 		local expectedStepIndex = 1
 		for _, step in ipairs(steps) do
 			if step.SchemaVersion ~= self.SupportedSkillSchemaVersion then
@@ -250,11 +255,11 @@ script ContentValidatorLogic extends Logic
 				return self:RejectSkill(result, "INVALID_EFFECT_STEP_SEQUENCE")
 			end
 			local isBuffEffect = _BuffEffectExecutorLogic:IsBuffEffectType(step.EffectType)
-			local isMoveEffect = _MoveSelfEffectExecutorLogic:IsMoveEffectType(step.EffectType)
+			local isMoveEffect = bundle.IsUtility ~= true and _MoveSelfEffectExecutorLogic:IsMoveEffectType(step.EffectType)
 			if step.EffectType ~= "DAMAGE" and step.EffectType ~= "PUSH" and step.EffectType ~= "HEAL"
 				and step.EffectType ~= "SEAL" and step.EffectType ~= "POISON_MIST"
 				and step.EffectType ~= "BOSS_SWAP"
-				and isBuffEffect == false and isMoveEffect == false then
+				and isBuffEffect == false and isMoveEffect == false and bundle.IsUtility ~= true then
 				return self:RejectSkill(result, "UNKNOWN_EFFECT")
 			end
 			if self:IsSupportedEffectTargetSelector(step.TargetSelector) == false then
@@ -445,6 +450,141 @@ script ContentValidatorLogic extends Logic
 	method table ValidateAllContent()
 		-- Facade entry point for editor/startup audits. Cross-table traversal stays isolated.
 		return _ContentIntegrityValidatorLogic:ValidateAll()
+	end
+	@ExecSpace("ServerOnly")
+	method table ValidateUtilitySkills()
+		-- Audits the separate immediate-action catalog without adding utilities to grantable skills.
+		local result = { Success = true, Reason = "OK", Errors = {}, Bundles = {}, ValidatedCount = 0 }
+		local definitions = _DataService:GetTable("UtilitySkillDefinitions")
+		local effects = _DataService:GetTable("UtilitySkillEffectSteps")
+		local jobs = _DataService:GetTable("JobDefinitions")
+		if definitions == nil or effects == nil or jobs == nil then
+			self:AddUtilityError(result, "UtilitySkillDefinitions", 0, "", "UTILITY_DATA_MISSING")
+			return result
+		end
+		local jobIds = {}
+		for row = 1, jobs:GetRowCount() do jobIds[jobs:GetCell(row, "JobId")] = true end
+		local ordinaryIds = {}
+		for _, dataSetName in ipairs(_SkillDefinitionRepositoryLogic:GetSkillDataSetNames()) do
+			local dataSet = _DataService:GetTable(dataSetName)
+			if dataSet ~= nil then
+				for row = 1, dataSet:GetRowCount() do ordinaryIds[dataSet:GetCell(row, "SkillId")] = true end
+			else
+				self:AddUtilityError(result, dataSetName, 0, "", "DATASET_NOT_FOUND")
+			end
+		end
+		local seenIds = {}
+		local seenJobs = {}
+		local effectSets = {}
+		for row = 1, definitions:GetRowCount() do
+			local skillId = definitions:GetCell(row, "SkillId") or ""
+			local jobId = definitions:GetCell(row, "RequiredJobTag") or ""
+			local effectSetId = definitions:GetCell(row, "EffectSetId") or ""
+			local reason = self:ValidateUtilityRawNumbers(definitions, row, false)
+			if skillId == "" then reason = "INVALID_SKILL_ID"
+			elseif seenIds[skillId] then reason = "DATA_DUPLICATE_SKILL_ID"
+			elseif ordinaryIds[skillId] == true then reason = "UTILITY_SKILL_ID_COLLISION"
+			elseif jobIds[jobId] ~= true then reason = "UTILITY_JOB_REFERENCE_INVALID"
+			elseif seenJobs[jobId] then reason = "UTILITY_JOB_AMBIGUOUS" end
+			seenIds[skillId] = true
+			seenJobs[jobId] = true
+			effectSets[effectSetId] = true
+			local definition = _SkillDefinitionRepositoryLogic:ConvertSkillRow(definitions, row)
+			local steps = {}
+			for effectRow = 1, effects:GetRowCount() do
+				if effects:GetCell(effectRow, "EffectSetId") == effectSetId then
+					table.insert(steps, _SkillDefinitionRepositoryLogic:ConvertEffectStepRow(effects, effectRow))
+				end
+			end
+			if (definitions:GetCell(row, "FreePlay") or "") ~= "false" then reason = "UTILITY_FREE_PLAY_UNSUPPORTED" end
+			if reason == "" then
+				local validation = self:ValidateSkillBundle({ Definition = definition, EffectSteps = steps, IsUtility = true })
+				if validation.Success == false then reason = validation.DetailReason or validation.Reason end
+			end
+			if reason ~= "" then
+				self:AddUtilityError(result, "UtilitySkillDefinitions", row, skillId, reason)
+			else
+				result.Bundles[jobId] = { Success = true, Reason = "OK", Definition = definition, Step = steps[1] }
+				result.ValidatedCount = result.ValidatedCount + 1
+			end
+		end
+		for jobId, _ in pairs(jobIds) do
+			if seenJobs[jobId] ~= true then self:AddUtilityError(result, "UtilitySkillDefinitions", 0, jobId, "UTILITY_JOB_MISSING") end
+		end
+		local seenSteps = {}
+		for row = 1, effects:GetRowCount() do
+			local effectSetId = effects:GetCell(row, "EffectSetId") or ""
+			local stepKey = effectSetId .. "#" .. (effects:GetCell(row, "StepIndex") or "")
+			local reason = self:ValidateUtilityRawNumbers(effects, row, true)
+			if effectSetId == "" or effectSets[effectSetId] ~= true then reason = "ORPHAN_UTILITY_EFFECT_SET"
+			elseif seenSteps[stepKey] then reason = "DUPLICATE_EFFECT_STEP_INDEX" end
+			seenSteps[stepKey] = true
+			if reason ~= "" then self:AddUtilityError(result, "UtilitySkillEffectSteps", row, stepKey, reason) end
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method string ValidateUtilityRawNumbers(any dataSet, integer row, boolean isEffect)
+		-- Reject malformed values before repository defaults, clamps or flooring can hide a typo.
+		local rules = { {"SchemaVersion", 1, true, false}, {"Range", 1, true, false}, {"CooldownTurns", 0, true, false},
+			{"CostValue", 0, false, false}, {"ActionDuration", 0.000001, false, false}, {"SkillTier", 1, true, false},
+			{"EffectScale", 0.000001, false, true}, {"ProjectileSpeed", 0, false, true},
+			{"ProjectileScale", 0.000001, false, true}, {"ProjectileLaunchDelay", 0, false, true},
+			{"CasterMotionPlayRate", 0.000001, false, true}, {"CasterMotionDuration", 0.000001, false, true},
+			{"EnemyQueueTurns", 0, true, true}, {"ProjectileCount", 1, true, true},
+			{"ProjectileInterval", 0, false, true}, {"ProjectileHeight", 0, false, true} }
+		if isEffect then rules = { {"SchemaVersion", 1, true, false}, {"StepIndex", 1, true, false}, {"Value", 0, true, false} } end
+		for _, rule in ipairs(rules) do
+			local raw = dataSet:GetCell(row, rule[1]) or ""
+			if raw ~= "" or rule[4] ~= true then
+				local value = tonumber(raw)
+				if value == nil or value ~= value or value == math.huge or value < rule[2] or (rule[3] and value ~= math.floor(value)) then
+					return "INVALID_UTILITY_NUMBER:" .. rule[1]
+				end
+			end
+		end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method string ValidateUtilityEffect(table definition, table steps)
+		-- These contracts match BattleSessionComponent.ExecuteUtilityEffect, not the queued MOVE_SELF executor.
+		if #steps ~= 1 then return "UTILITY_EFFECT_COUNT_INVALID" end
+		if (definition.CostType or "") ~= "" or definition.CostValue ~= 0 then return "UTILITY_COST_UNSUPPORTED" end
+		if definition.FreePlay == true then return "UTILITY_FREE_PLAY_UNSUPPORTED" end
+		if definition.SkillTier ~= 1 or (definition.BaseSkillId or "") ~= "" then return "UTILITY_UPGRADE_UNSUPPORTED" end
+		if (definition.ProjectileRuid or "") ~= "" then return "UTILITY_PROJECTILE_UNSUPPORTED" end
+		local step = steps[1]
+		if (step.ConditionId or "") ~= "" then return "UTILITY_CONDITION_UNSUPPORTED" end
+		local a = step.ParameterA or ""
+		local b = step.ParameterB or ""
+		if step.EffectType == "GUARD" then
+			if definition.TargetingType == "SELF" and step.TargetSelector == "SELF_UNIT"
+				and step.Value == 0 and a == "UNTIL_NEXT_PLAYER_TURN" and b == "ALL_DAMAGE" then return "" end
+		elseif step.EffectType == "MOVE_SELF" then
+			if definition.TargetingType == "SELF" and step.TargetSelector == "SELF_UNIT" then
+				if a == "FARTHEST_EMPTY_FORWARD" and step.Value == 0 and b == "" then return "" end
+				if a == "BEHIND_FARTHEST_ENEMY_FORWARD" and step.Value >= 1 and step.Value == math.floor(step.Value) and b == "REQUIRE_EMPTY" then return "" end
+			end
+		elseif step.EffectType == "PUSH_DISTANCE" then
+			if definition.TargetingType ~= "SELF" and (step.TargetSelector == "PRIMARY_TARGET" or step.TargetSelector == "ALL_SKILL_TARGETS")
+				and (b == "" or b == "CARRY_CASTER") then
+				if a == "MAX" and step.Value == 0 then return "" end
+				if a == "STOP_BEFORE_BLOCKED" and step.Value >= 1 and step.Value == math.floor(step.Value) then return "" end
+			end
+		else
+			return "UNKNOWN_UTILITY_EFFECT"
+		end
+		return "INVALID_UTILITY_EFFECT_PARAMETERS"
+	end
+
+	method void AddUtilityError(table result, string dataSetName, integer rowIndex, string contentId, string reason)
+		-- Shared structured errors are consumed by the startup audit and immediate-action lookup.
+		result.Success = false
+		result.Reason = "CONTENT_VALIDATION_FAILED"
+		result.DetailReason = result.DetailReason or reason
+		table.insert(result.Errors, { DataSetName = dataSetName, RowIndex = rowIndex, ContentId = contentId, DetailReason = reason })
 	end
 
 end
