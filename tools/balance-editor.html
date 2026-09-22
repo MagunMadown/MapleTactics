@@ -139,6 +139,19 @@
   #screenTabs button.active { background: var(--accent); border-color: var(--accent); color: #0b0d12; font-weight: 600; }
   .tab-subgroup-label { flex-basis: 100%; font-size: 10px; color: var(--dim); text-transform: uppercase;
     letter-spacing: 0.03em; margin: 4px 0 -2px 2px; }
+  .back-btn { border-color: var(--accent); color: var(--accent); }
+  .ref-open-btn { background: transparent; border: none; color: var(--accent); font-size: 11px;
+    padding: 0 4px; cursor: pointer; white-space: nowrap; flex: none; }
+  .ref-open-btn:hover { text-decoration: underline; }
+  .ref-open-wrap { display: flex; align-items: center; gap: 2px; min-width: 0; }
+  .ref-open-wrap input, .ref-open-wrap select { flex: 1; min-width: 0; }
+  .impact-panel { margin: 10px 0 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel2);
+    padding: 10px 12px; }
+  .impact-panel .t { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--dim);
+    font-weight: 700; margin-bottom: 6px; }
+  .impact-panel .refs { display: flex; flex-wrap: wrap; gap: 6px; }
+  .impact-panel button { font-size: 11.5px; }
+  .impact-panel .empty { color: var(--dim); font-size: 12px; }
 
   /* ---- Status badges (live/partial/legacy) ---- */
   .status-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-left: 4px; vertical-align: middle; }
@@ -1089,6 +1102,8 @@
     idIndex: new Map(), // columnName -> Set(values) across all tables where that column is a single-column key
     screen: "guide", // 'guide' | 'editor'
     guideSelected: null, // table name currently shown in the Guide Map detail panel
+    keyIndex: new Map(), // columnName -> Map(value -> [{table, rowIndex}]) — see rebuildIndexAndValidateAll
+    navStack: [], // [{table, viewMode, rowIndex}] — back-navigation history for reference jumps
   };
 
   const el = (sel) => document.querySelector(sel);
@@ -1221,6 +1236,38 @@
     renderTableTabs();
     renderActiveTable();
     setScreen("editor");
+  }
+
+  // Jump straight to one row of another table (Reference Navigation), first
+  // pushing the current position so "← 뒤로" can return to it.
+  function jumpToRow(tableName, rowIndex) {
+    if (state.activeTable) {
+      state.navStack.push({
+        table: state.activeTable,
+        viewMode: state.viewMode,
+        rowIndex: state.cardRowIndex.get(state.activeTable) || 0,
+      });
+    }
+    state.activeCategory = CATEGORY_OF[tableName] || "etc";
+    state.activeTable = tableName;
+    state.viewMode = "card";
+    state.cardRowIndex.set(tableName, rowIndex);
+    renderCategoryTabs();
+    renderTableTabs();
+    renderActiveTable();
+    setScreen("editor");
+  }
+
+  function navigateBack() {
+    const prev = state.navStack.pop();
+    if (!prev) return;
+    state.activeCategory = CATEGORY_OF[prev.table] || "etc";
+    state.activeTable = prev.table;
+    state.viewMode = prev.viewMode;
+    state.cardRowIndex.set(prev.table, prev.rowIndex);
+    renderCategoryTabs();
+    renderTableTabs();
+    renderActiveTable();
   }
 
   function renderGuideMap() {
@@ -1415,23 +1462,63 @@
 
   function rebuildIndexAndValidateAll() {
     const idIndex = new Map();
+    // keyIndex: columnName -> Map(value -> [{table, rowIndex}, ...])
+    // Same single-column-key scan as idIndex, but keeps *where* each value
+    // lives instead of just whether it exists — this is what lets a
+    // reference cell jump straight to the row it points at (Reference
+    // Navigation) and lets a row show who points back at it (Impact
+    // Analysis). A value normally lives in exactly one table; the array
+    // form only matters in the rare case two tables reuse the same key
+    // column name for the same value.
+    const keyIndex = new Map();
     for (const [name, def] of state.tables) {
       if (def.keys && def.keys.length === 1) {
-        const colIdx = def.header.indexOf(def.keys[0]);
+        const col = def.keys[0];
+        const colIdx = def.header.indexOf(col);
         if (colIdx === -1) continue;
-        if (!idIndex.has(def.keys[0])) idIndex.set(def.keys[0], new Set());
-        const set = idIndex.get(def.keys[0]);
-        for (const row of def.rows) {
+        if (!idIndex.has(col)) idIndex.set(col, new Set());
+        if (!keyIndex.has(col)) keyIndex.set(col, new Map());
+        const set = idIndex.get(col);
+        const valMap = keyIndex.get(col);
+        def.rows.forEach((row, ri) => {
           const v = (row[colIdx] || "").trim();
-          if (v !== "") set.add(v);
-        }
+          if (v === "") return;
+          set.add(v);
+          if (!valMap.has(v)) valMap.set(v, []);
+          valMap.get(v).push({ table: name, rowIndex: ri });
+        });
       }
     }
     state.idIndex = idIndex;
+    state.keyIndex = keyIndex;
     resolveIdrefColumns();
     for (const [name, def] of state.tables) {
       def.issues = validateTable(def);
     }
+  }
+
+  // Where a single id-ref value's target row actually lives (first match).
+  function findKeyTarget(columnName, value) {
+    const m = state.keyIndex && state.keyIndex.get(columnName);
+    const arr = m && m.get(value);
+    return arr && arr.length ? arr[0] : null;
+  }
+
+  // Every (table, row) whose id-ref column named `columnName` currently
+  // holds `value` — i.e. who points at this row. Only counts columns the
+  // FK heuristic already trusts (isRealRef), so it agrees with what the
+  // cell widgets and validator already treat as a real reference.
+  function findReferencesTo(columnName, value) {
+    const refs = [];
+    for (const [tableName, def] of state.tables) {
+      (def.columns || []).forEach((colDef) => {
+        if (fkTargetColumn(colDef.name) !== columnName || !(colDef.type === "idref" && colDef.isRealRef)) return;
+        def.rows.forEach((row, ri) => {
+          if ((row[colDef.idx] || "").trim() === value) refs.push({ table: tableName, rowIndex: ri });
+        });
+      });
+    }
+    return refs;
   }
 
   // A column name ending in Id/Index does not always mean it references another
@@ -1439,11 +1526,22 @@
   // category codes like "GROWTH", unrelated to RegionDefinitions.RegionId).
   // Only treat it as a real cross-table reference if at least one existing,
   // non-wildcard value actually resolves against the candidate target set.
+  // Some FK columns are named differently from the key column they actually
+  // point at, so the default "same column name" match can't find their
+  // target at all. Verified against the real Repository/Validator code
+  // (Balance Workbench design doc §0③) rather than guessed:
+  //   - SkillTier chain: BaseSkillId always points at another row's SkillId.
+  //   - EnemyPatternSteps.TileId is historically named after tiles but has
+  //     always pointed at a SkillId (EnemySkillDefinitions), confirmed in
+  //     Docs/Guide/Enemy-Plan-Trait-Guide.md and the validator source.
+  const FK_TARGET_COLUMN = { BaseSkillId: "SkillId", TileId: "SkillId" };
+  function fkTargetColumn(colName) { return FK_TARGET_COLUMN[colName] || colName; }
+
   function resolveIdrefColumns() {
     for (const [, def] of state.tables) {
       def.columns.forEach((colDef) => {
         if (colDef.type !== "idref") { colDef.isRealRef = false; return; }
-        const targetSet = state.idIndex.get(colDef.name);
+        const targetSet = state.idIndex.get(fkTargetColumn(colDef.name));
         if (!targetSet) { colDef.isRealRef = false; return; }
         const values = def.rows
           .map((r) => (r[colDef.idx] || "").trim())
@@ -1493,7 +1591,7 @@
           issues.push({ row: ri, col: colDef.name, level: "error", msg: "비어 있는 항목이 포함된 목록입니다." });
         }
         if (colDef.type === "idref" && colDef.isRealRef && v !== "*") {
-          if (!state.idIndex.get(colDef.name).has(v)) {
+          if (!state.idIndex.get(fkTargetColumn(colDef.name)).has(v)) {
             issues.push({ row: ri, col: colDef.name, level: "warn", msg: `참조 ID '${v}'를 다른 테이블에서 찾을 수 없습니다.` });
           }
         }
@@ -1603,12 +1701,22 @@
 
     const toolbar = document.createElement("div");
     toolbar.className = "table-toolbar" + (def.dirty ? " dirty" : "");
-    toolbar.innerHTML = `
+
+    if (state.navStack.length) {
+      const backBtn = document.createElement("button");
+      backBtn.className = "back-btn";
+      backBtn.textContent = "‹ 뒤로";
+      backBtn.title = "참조를 따라오기 전 위치로 돌아갑니다";
+      backBtn.addEventListener("click", navigateBack);
+      toolbar.appendChild(backBtn);
+    }
+
+    toolbar.insertAdjacentHTML("beforeend", `
       <span class="dirty-dot" title="저장되지 않은 변경사항이 있습니다"></span>
       <strong>${escapeHtml(name)}</strong>
       <span class="fname">${escapeHtml(def.fileName)}</span>
       <span class="hint">키: ${def.keys.length ? escapeHtml(def.keys.join(", ")) : "(감지되지 않음)"} · 행 ${def.rows.length}개</span>
-    `;
+    `);
 
     const viewToggle = document.createElement("div");
     viewToggle.className = "view-toggle";
@@ -1857,6 +1965,49 @@
     nav.appendChild(delRowBtn);
     detail.appendChild(nav);
 
+    // Impact Analysis: who points at this row, before you edit it.
+    if (def.keys.length === 1) {
+      const keyCol = def.keys[0];
+      const keyVal = (row[def.header.indexOf(keyCol)] || "").trim();
+      if (keyVal !== "") {
+        const refs = findReferencesTo(keyCol, keyVal);
+        const panel = document.createElement("div");
+        panel.className = "impact-panel";
+        const title = document.createElement("div");
+        title.className = "t";
+        title.textContent = `참조됨 (Impact Analysis) — ${keyCol} = "${keyVal}"`;
+        panel.appendChild(title);
+        if (refs.length === 0) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = "이 값을 참조하는 다른 행이 없습니다. 자유롭게 수정해도 됩니다.";
+          panel.appendChild(empty);
+        } else {
+          const byTable = new Map();
+          refs.forEach((r) => {
+            if (!byTable.has(r.table)) byTable.set(r.table, []);
+            byTable.get(r.table).push(r.rowIndex);
+          });
+          const summary = document.createElement("div");
+          summary.className = "hint";
+          summary.style.marginBottom = "6px";
+          summary.textContent = `${refs.length}곳에서 참조됨 — 수정 전 아래 항목들도 함께 확인하세요.`;
+          panel.appendChild(summary);
+          const refsWrap = document.createElement("div");
+          refsWrap.className = "refs";
+          byTable.forEach((rowIndexes, refTable) => {
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.textContent = `${refTable} (${rowIndexes.length})`;
+            btn.addEventListener("click", () => jumpToRow(refTable, rowIndexes[0]));
+            refsWrap.appendChild(btn);
+          });
+          panel.appendChild(refsWrap);
+        }
+        detail.appendChild(panel);
+      }
+    }
+
     const fields = document.createElement("div");
     fields.className = "card-fields";
     const rowIssues = issuesByRow.get(ri) || [];
@@ -2099,8 +2250,8 @@
 
     let listId = null;
     let suggestions = [];
-    if (colDef.type === "idref" && colDef.isRealRef && state.idIndex.has(colDef.name)) {
-      suggestions = [...state.idIndex.get(colDef.name)];
+    if (colDef.type === "idref" && colDef.isRealRef && state.idIndex.has(fkTargetColumn(colDef.name))) {
+      suggestions = [...state.idIndex.get(fkTargetColumn(colDef.name))];
     } else if (colDef.suggestValues && colDef.suggestValues.length) {
       suggestions = colDef.suggestValues;
     }
@@ -2122,6 +2273,33 @@
     }
 
     input.addEventListener("change", () => commit(input.value));
+
+    // Reference Navigation: a real FK value gets a small "열기 →" jump button
+    // next to the input, straight to the row it points at (Inspector view).
+    if (colDef.type === "idref" && colDef.isRealRef) {
+      const wrap = document.createElement("div");
+      wrap.className = "ref-open-wrap";
+      const openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.className = "ref-open-btn";
+      openBtn.textContent = "열기 →";
+      openBtn.title = "이 값이 가리키는 행으로 이동";
+      const refreshOpenBtn = () => {
+        const target = findKeyTarget(fkTargetColumn(colDef.name), input.value.trim());
+        openBtn.disabled = !target;
+        openBtn.style.visibility = target ? "visible" : "hidden";
+      };
+      refreshOpenBtn();
+      input.addEventListener("input", refreshOpenBtn);
+      openBtn.addEventListener("click", () => {
+        const target = findKeyTarget(fkTargetColumn(colDef.name), input.value.trim());
+        if (target) jumpToRow(target.table, target.rowIndex);
+      });
+      wrap.appendChild(input);
+      wrap.appendChild(openBtn);
+      return wrap;
+    }
+
     return input;
   }
 
