@@ -267,6 +267,18 @@
   .compare-bar-track { width: 64px; height: 8px; background: var(--panel2); border-radius: 4px; overflow: hidden; }
   .compare-bar-fill { height: 100%; background: var(--accent); border-radius: 4px; }
   .compare-bar-val { font-family: "JetBrains Mono", monospace; font-size: 11px; min-width: 26px; text-align: left; }
+
+  /* ---- Node map (Stage/Node progression graph) ---- */
+  #graphArea { padding: 14px 16px 40px; display: none; }
+  .graph-legend { display: flex; gap: 14px; margin-bottom: 10px; font-size: 12px; color: var(--dim); flex-wrap: wrap; }
+  .graph-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+  .graph-scroll { overflow-x: auto; overflow-y: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+  .graph-node { cursor: pointer; }
+  .graph-node circle { stroke: var(--border); stroke-width: 2; }
+  .graph-node:hover circle { stroke: var(--accent); }
+  .graph-node.start circle { stroke: #fff; stroke-width: 3; }
+  .graph-node text { fill: var(--text); font-size: 13px; font-family: "JetBrains Mono", monospace; text-anchor: middle; pointer-events: none; }
+  .graph-edge { stroke: var(--border); stroke-width: 2; fill: none; }
 </style>
 </head>
 <body>
@@ -292,11 +304,13 @@
 <div id="screenTabs" style="display:none">
   <button id="btnScreenGuide">📖 가이드 맵</button>
   <button id="btnScreenBalance">⚖ 밸런스</button>
+  <button id="btnScreenGraph">🗺 노드맵</button>
   <button id="btnScreenEditor">✏ 데이터 에디터</button>
 </div>
 
 <div id="guideMapArea"></div>
 <div id="balanceArea"></div>
+<div id="graphArea"></div>
 <div id="catTabs" style="display:none"></div>
 <div id="tableTabs" style="display:none"></div>
 
@@ -1180,7 +1194,7 @@
     viewMode: "table", // 'table' | 'card'
     cardRowIndex: new Map(), // tableName -> currently selected row index in card view
     idIndex: new Map(), // columnName -> Set(values) across all tables where that column is a single-column key
-    screen: "guide", // 'guide' | 'editor' | 'balance'
+    screen: "guide", // 'guide' | 'editor' | 'balance' | 'graph'
     guideSelected: null, // table name currently shown in the Guide Map detail panel
     keyIndex: new Map(), // columnName -> Map(value -> [{table, rowIndex}]) — see rebuildIndexAndValidateAll
     navStack: [], // [{table, viewMode, rowIndex}] — back-navigation history for reference jumps
@@ -1203,9 +1217,11 @@
   const screenTabsEl = el("#screenTabs");
   const btnScreenGuide = el("#btnScreenGuide");
   const btnScreenBalance = el("#btnScreenBalance");
+  const btnScreenGraph = el("#btnScreenGraph");
   const btnScreenEditor = el("#btnScreenEditor");
   const guideMapAreaEl = el("#guideMapArea");
   const balanceAreaEl = el("#balanceArea");
+  const graphAreaEl = el("#graphArea");
   const catTabsEl = el("#catTabs");
   const tableTabsEl = el("#tableTabs");
   const welcomeEl = el("#welcome");
@@ -1305,21 +1321,26 @@
   function renderScreen() {
     const guide = state.screen === "guide";
     const balance = state.screen === "balance";
-    const editor = !guide && !balance;
+    const graph = state.screen === "graph";
+    const editor = !guide && !balance && !graph;
     btnScreenGuide.className = guide ? "active" : "";
     btnScreenBalance.className = balance ? "active" : "";
+    btnScreenGraph.className = graph ? "active" : "";
     btnScreenEditor.className = editor ? "active" : "";
     guideMapAreaEl.style.display = guide ? "block" : "none";
     balanceAreaEl.style.display = balance ? "block" : "none";
+    graphAreaEl.style.display = graph ? "block" : "none";
     catTabsEl.style.display = editor ? "flex" : "none";
     tableTabsEl.style.display = editor ? "flex" : "none";
     tableAreaEl.style.display = editor ? "block" : "none";
     if (guide) renderGuideMap();
     if (balance) renderBalanceView();
+    if (graph) renderGraphView();
   }
 
   btnScreenGuide.addEventListener("click", () => setScreen("guide"));
   btnScreenBalance.addEventListener("click", () => setScreen("balance"));
+  btnScreenGraph.addEventListener("click", () => setScreen("graph"));
   btnScreenEditor.addEventListener("click", () => setScreen("editor"));
 
   function openInEditor(tableName, viewMode) {
@@ -1490,6 +1511,151 @@
     return [...state.tables.keys()]
       .filter((n) => (CATEGORY_OF[n] || "etc") === catId)
       .sort((a, b) => a.localeCompare(b));
+  }
+
+  // ---------- Node map (Stage/Node progression graph) ----------
+  //
+  // NodeDefinitions already carries an authored layout (PositionX/PositionY)
+  // and its own edge list (NextNodeIds, pipe-delimited) — this is a run
+  // progression graph (à la a roguelike map), not something that needs a
+  // layout algorithm invented on top. So the graph is drawn directly from
+  // those coordinates; a BATTLE/BOSS node's label comes from
+  // StageDefinitions.DisplayName via its StageId, and a SHOP node's from
+  // ShopNodeBindings' ShopId — both real joins, not guessed content.
+  //
+  // Colors follow the dataviz skill's validated dark-mode categorical order
+  // (slots 1/2/3/4: blue/orange/aqua/yellow) rather than an invented palette.
+  const NODE_TYPE_COLOR = { BATTLE: "#3987e5", BOSS: "#d95926", REST: "#199e70", SHOP: "#c98500" };
+  const NODE_TYPE_LABEL = { BATTLE: "전투", BOSS: "보스", REST: "휴식", SHOP: "상점" };
+
+  function svgEl(tag, attrs) {
+    const e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+
+  function renderGraphView() {
+    graphAreaEl.innerHTML = "";
+    const nodeDef = state.tables.get("NodeDefinitions");
+    if (!nodeDef || !nodeDef.rows.length) {
+      graphAreaEl.innerHTML = `<div class="bal-empty">NodeDefinitions에 노드가 없습니다.</div>`;
+      return;
+    }
+    const stageDef = state.tables.get("StageDefinitions");
+    const shopBindDef = state.tables.get("ShopNodeBindings");
+
+    const nIdx = new Map(nodeDef.header.map((h, i) => [h, i]));
+    const nGet = (row, col) => { const i = nIdx.get(col); return i === undefined ? "" : row[i] || ""; };
+
+    const stageByIdMap = new Map();
+    if (stageDef) {
+      const sIdx = new Map(stageDef.header.map((h, i) => [h, i]));
+      stageDef.rows.forEach((row) => {
+        const id = row[sIdx.get("StageId")] || "";
+        if (id) stageByIdMap.set(id, { displayName: row[sIdx.get("DisplayName")] || id, regionId: row[sIdx.get("RegionId")] || "" });
+      });
+    }
+    const shopByNodeMap = new Map();
+    if (shopBindDef) {
+      const bIdx = new Map(shopBindDef.header.map((h, i) => [h, i]));
+      shopBindDef.rows.forEach((row) => {
+        const key = (row[bIdx.get("NodeGraphId")] || "") + "::" + (row[bIdx.get("NodeId")] || "");
+        shopByNodeMap.set(key, row[bIdx.get("ShopId")] || "");
+      });
+    }
+
+    const byGraph = new Map();
+    nodeDef.rows.forEach((row, ri) => {
+      const graphId = nGet(row, "NodeGraphId");
+      if (!byGraph.has(graphId)) byGraph.set(graphId, []);
+      const nodeId = nGet(row, "NodeId");
+      byGraph.get(graphId).push({
+        rowIndex: ri, nodeId,
+        nodeType: nGet(row, "NodeType"),
+        stageId: nGet(row, "StageId"),
+        isStart: nGet(row, "IsStartNode").trim().toLowerCase() === "true",
+        next: nGet(row, "NextNodeIds").split("|").map((s) => s.trim()).filter(Boolean),
+        x: parseFloat(nGet(row, "PositionX")) || 0,
+        y: parseFloat(nGet(row, "PositionY")) || 0,
+        shopKey: graphId + "::" + nodeId,
+      });
+    });
+
+    const legend = document.createElement("div");
+    legend.className = "graph-legend";
+    Object.keys(NODE_TYPE_COLOR).forEach((type) => {
+      const item = document.createElement("span");
+      const sw = document.createElement("span");
+      sw.className = "swatch";
+      sw.style.background = NODE_TYPE_COLOR[type];
+      item.appendChild(sw);
+      item.appendChild(document.createTextNode(NODE_TYPE_LABEL[type]));
+      legend.appendChild(item);
+    });
+    graphAreaEl.appendChild(legend);
+
+    const SCALE = 0.6, PAD = 60, R = 20;
+    byGraph.forEach((nodes, graphId) => {
+      const title = document.createElement("div");
+      title.className = "bal-count";
+      title.style.marginBottom = "6px";
+      title.textContent = `${graphId} (${nodes.length}개 노드)`;
+      graphAreaEl.appendChild(title);
+
+      const xs = nodes.map((n) => n.x), ys = nodes.map((n) => n.y);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const minY = Math.min(...ys), maxY = Math.max(...ys);
+      const w = (maxX - minX) * SCALE + PAD * 2;
+      const h = (maxY - minY) * SCALE + PAD * 2;
+      const px = (x) => (x - minX) * SCALE + PAD;
+      const py = (y) => (y - minY) * SCALE + PAD;
+
+      const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+
+      const scroll = document.createElement("div");
+      scroll.className = "graph-scroll";
+      const svg = svgEl("svg", { width: w, height: h, viewBox: `0 0 ${w} ${h}` });
+
+      const edgeLayer = svgEl("g", {});
+      nodes.forEach((n) => {
+        n.next.forEach((targetId) => {
+          const t = byId.get(targetId);
+          if (!t) return;
+          edgeLayer.appendChild(svgEl("line", {
+            class: "graph-edge", x1: px(n.x), y1: py(n.y), x2: px(t.x), y2: py(t.y),
+          }));
+        });
+      });
+      svg.appendChild(edgeLayer);
+
+      const nodeLayer = svgEl("g", {});
+      nodes.forEach((n) => {
+        const g = svgEl("g", { class: "graph-node" + (n.isStart ? " start" : ""), transform: `translate(${px(n.x)},${py(n.y)})` });
+        g.appendChild(svgEl("circle", { r: R, fill: NODE_TYPE_COLOR[n.nodeType] || "#666" }));
+        let label = NODE_TYPE_LABEL[n.nodeType] || n.nodeType;
+        let title = `${n.nodeId} (${n.nodeType})`;
+        if ((n.nodeType === "BATTLE" || n.nodeType === "BOSS") && n.stageId) {
+          const stage = stageByIdMap.get(n.stageId);
+          label = stage ? stage.displayName : n.stageId;
+          title = `${n.stageId}${stage ? " — " + stage.displayName : ""} (${n.nodeType})`;
+        } else if (n.nodeType === "SHOP") {
+          const shopId = shopByNodeMap.get(n.shopKey);
+          if (shopId) title = `${n.nodeId} → ${shopId}`;
+        }
+        const text = svgEl("text", { y: R + 16 });
+        text.textContent = label;
+        const titleEl = svgEl("title", {});
+        titleEl.textContent = title;
+        g.appendChild(text);
+        g.appendChild(titleEl);
+        g.addEventListener("click", () => jumpToRow("NodeDefinitions", n.rowIndex));
+        nodeLayer.appendChild(g);
+      });
+      svg.appendChild(nodeLayer);
+
+      scroll.appendChild(svg);
+      graphAreaEl.appendChild(scroll);
+    });
   }
 
   // ---------- Balance view (Skill concept) ----------
