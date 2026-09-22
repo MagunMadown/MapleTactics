@@ -37,6 +37,38 @@ script PlayerRunRelicEffectComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table GrantStartingRelics(integer amount)
+		-- Reuses frozen definitions and stable per-run receipts; map reentry never rerolls rewards.
+		local inventory = self.Entity:GetComponent("script.PlayerRunInventoryComponent")
+		if not self.IsInitialized or inventory == nil or self.ActiveRunSequence <= 0
+			or inventory.ActiveRunSequence ~= self.ActiveRunSequence then
+			return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" }
+		end
+		local candidates = {}
+		for id, _ in pairs(self.Definitions) do
+			if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) == 0 then table.insert(candidates, id) end
+		end
+		table.sort(candidates)
+		local pending = {}
+		for index = 1, math.max(0, amount) do
+			local key = "union:starting_relic:" .. self.ActiveRunSequence .. ":" .. index
+			if not inventory:ContainsDelimitedKey(inventory.AppliedRewardKeys, key) then table.insert(pending, key) end
+		end
+		if #pending > #candidates then return { Success = false, Reason = "STARTING_RELIC_POOL_EXHAUSTED" } end
+		for _, key in ipairs(pending) do
+			local index = _UtilLogic:RandomIntegerRange(1, #candidates)
+			local result = inventory:GrantRelic(candidates[index], key)
+			if result.Success == false then return result end
+			table.remove(candidates, index)
+		end
+		local result = self:Recalculate()
+		result.GrantedCount = #pending
+		log("[UnionStartingRelic] applied sequence=" .. self.ActiveRunSequence .. " granted=" .. #pending
+			.. " attack=" .. self.AttackBonus .. " hp=" .. self.MaxHpBonus .. " defense=" .. self.DefenseBonus)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method table Recalculate()
 		-- Sum unique owned relics and apply only the unapplied max-HP difference.
 		local runState = self.Entity:GetComponent("script.PlayerRunStateComponent")
@@ -58,7 +90,10 @@ script PlayerRunRelicEffectComponent extends Component
 		self.DefenseBonus = defense
 		local delta = hp - self.AppliedMaxHpBonus
 		if runState.RunHpInitialized and delta ~= 0 then
-			runState:SetRunHp(runState.RunCurrentHp + delta, runState.RunMaxHp + delta, "RELIC_EFFECT")
+			-- Removing a max-HP relic clamps current HP to the new maximum without dealing damage.
+			local nextMaxHp = math.max(1, runState.RunMaxHp + delta)
+			local nextCurrentHp = delta < 0 and math.min(runState.RunCurrentHp, nextMaxHp) or runState.RunCurrentHp + delta
+			runState:SetRunHp(nextCurrentHp, nextMaxHp, "RELIC_EFFECT")
 			self.AppliedMaxHpBonus = hp
 			local unit = self.Entity:GetComponent("script.BattleUnitComponent")
 			if unit ~= nil then
