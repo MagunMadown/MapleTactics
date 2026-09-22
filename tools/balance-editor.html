@@ -71,6 +71,14 @@
   table.grid input[type="text"]:focus, table.grid select:focus { outline: none; border-color: var(--accent); background: #10131a; }
   table.grid td.cell-error input, table.grid td.cell-error select { border-color: var(--error); background: #2a1418; }
   table.grid td.cell-warn input, table.grid td.cell-warn select { border-color: var(--warn); background: #2a2214; }
+  .numstep { display: flex; align-items: center; gap: 2px; min-width: 90px; }
+  .numstep-btn { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+    width: 18px; height: 18px; line-height: 1; padding: 0; font-size: 12px; cursor: pointer; flex: none; }
+  .numstep-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .numstep-input { flex: 1; min-width: 40px; text-align: right; }
+  .enumselect { display: flex; align-items: center; gap: 3px; min-width: 110px; }
+  .enumselect select { flex: 1; }
+  .enumselect-custom { flex: 1; }
   .chiplist { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; min-width: 140px; }
   .chip { background: var(--panel2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 6px 1px 8px;
     display: inline-flex; align-items: center; gap: 4px; font-size: 11px; }
@@ -370,7 +378,36 @@
       }
       const distinct = [...new Set(values)];
       const suggestValues = distinct.length > 0 && distinct.length <= 40 ? distinct : [];
-      return { name, idx, type, suggestValues };
+
+      let step = 1, decimals = 0;
+      if (type === "number") {
+        values.forEach((v) => {
+          const dot = v.indexOf(".");
+          if (dot !== -1) decimals = Math.max(decimals, v.length - dot - 1);
+        });
+        step = decimals > 0 ? 1 / Math.pow(10, decimals) : 1;
+      }
+
+      // A small, repeating value set on a plain text column (not an id/index
+      // reference) looks like a closed vocabulary (Rarity, TargetingType,
+      // ActionType, ...) rather than free-form prose or a resource id —
+      // offer it as a real dropdown instead of a free-text field. Columns
+      // whose name itself signals free-form/identifier content (RUID, Key,
+      // Name, Description, Color, ...) are excluded regardless of how few
+      // distinct values happen to exist, since a small table can otherwise
+      // make e.g. DisplayName look "enum-like" by accident. Verified against
+      // every column in RootDesk/MyDesk/03_Data: this keeps every genuine
+      // enum column (TargetingType, WeaponType, Rarity, RequiredUnionRank,
+      // ...) while dropping RUID/name/description/color columns.
+      const looksFreeform = /(Ruid|RUID|Key|Name|Description|Color|Desc)$/.test(name);
+      const isEnum =
+        type === "text" &&
+        !looksFreeform &&
+        distinct.length > 0 &&
+        distinct.length <= 15 &&
+        (distinct.length < values.length || (distinct.length <= 6 && values.length >= 3));
+
+      return { name, idx, type, suggestValues, step, decimals, isEnum };
     });
   }
 
@@ -585,7 +622,7 @@
       th.appendChild(headRow);
       const typeSpan = document.createElement("span");
       typeSpan.className = "coltype";
-      typeSpan.textContent = typeLabel(c.type);
+      typeSpan.textContent = typeLabel(c);
       th.appendChild(typeSpan);
       thRow.appendChild(th);
     });
@@ -661,8 +698,9 @@
     return th;
   }
 
-  function typeLabel(t) {
-    return { bool: "bool", number: "number", pipelist: "list(|)", idref: "id-ref", text: "text" }[t] || t;
+  function typeLabel(c) {
+    if (c.type === "text" && c.isEnum) return "select";
+    return { bool: "bool", number: "number", pipelist: "list(|)", idref: "id-ref", text: "text" }[c.type] || c.type;
   }
 
   function buildCellWidget(colDef, value, def, tableName, commit) {
@@ -682,6 +720,107 @@
       }
       select.addEventListener("change", () => commit(select.value));
       return select;
+    }
+
+    if (colDef.type === "number") {
+      const wrap = document.createElement("div");
+      wrap.className = "numstep";
+      const minusBtn = document.createElement("button");
+      minusBtn.type = "button";
+      minusBtn.className = "numstep-btn";
+      minusBtn.textContent = "−";
+      minusBtn.tabIndex = -1;
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "numstep-input";
+      input.value = value;
+      input.inputMode = "decimal";
+      const plusBtn = document.createElement("button");
+      plusBtn.type = "button";
+      plusBtn.className = "numstep-btn";
+      plusBtn.textContent = "+";
+      plusBtn.tabIndex = -1;
+
+      const step = colDef.step || 1;
+      const decimals = colDef.decimals || 0;
+      const adjust = (delta) => {
+        const cur = parseFloat(input.value) || 0;
+        let next = cur + delta;
+        next = Math.round(next * Math.pow(10, decimals)) / Math.pow(10, decimals);
+        input.value = String(next);
+        commit(input.value);
+      };
+      minusBtn.addEventListener("click", () => adjust(-step));
+      plusBtn.addEventListener("click", () => adjust(step));
+      input.addEventListener("change", () => commit(input.value));
+      input.addEventListener(
+        "wheel",
+        (e) => {
+          if (document.activeElement !== input) return;
+          e.preventDefault();
+          adjust(e.deltaY < 0 ? step : -step);
+        },
+        { passive: false }
+      );
+
+      wrap.appendChild(minusBtn);
+      wrap.appendChild(input);
+      wrap.appendChild(plusBtn);
+      return wrap;
+    }
+
+    if (colDef.type === "text" && colDef.isEnum) {
+      const wrap = document.createElement("div");
+      wrap.className = "enumselect";
+      const select = document.createElement("select");
+      const textInput = document.createElement("input");
+      textInput.type = "text";
+      textInput.className = "enumselect-custom";
+      textInput.style.display = "none";
+      const backBtn = document.createElement("button");
+      backBtn.type = "button";
+      backBtn.className = "colhead-btn";
+      backBtn.textContent = "▾";
+      backBtn.title = "목록에서 선택";
+      backBtn.style.display = "none";
+
+      const options = colDef.suggestValues.slice();
+      if (value !== "" && !options.includes(value)) options.unshift(value);
+      if (!options.includes("")) options.unshift("");
+      options.forEach((v) => {
+        const o = document.createElement("option");
+        o.value = v;
+        o.textContent = v === "" ? "(비어 있음)" : v;
+        if (v === value) o.selected = true;
+        select.appendChild(o);
+      });
+      const customOpt = document.createElement("option");
+      customOpt.value = "__custom__";
+      customOpt.textContent = "✎ 직접 입력...";
+      select.appendChild(customOpt);
+
+      const showCustom = () => {
+        select.style.display = "none";
+        textInput.style.display = "";
+        backBtn.style.display = "";
+        textInput.value = value;
+        textInput.focus();
+      };
+      select.addEventListener("change", () => {
+        if (select.value === "__custom__") showCustom();
+        else commit(select.value);
+      });
+      textInput.addEventListener("change", () => commit(textInput.value));
+      backBtn.addEventListener("click", () => {
+        textInput.style.display = "none";
+        backBtn.style.display = "none";
+        select.style.display = "";
+      });
+
+      wrap.appendChild(select);
+      wrap.appendChild(textInput);
+      wrap.appendChild(backBtn);
+      return wrap;
     }
 
     if (colDef.type === "pipelist") {
@@ -726,7 +865,8 @@
       return wrap;
     }
 
-    // number / idref / text share a text input, differing only in datalist suggestions
+    // idref / free-text columns share a text input with datalist suggestions
+    // (number and closed-vocabulary text columns are handled above)
     const input = document.createElement("input");
     input.type = "text";
     input.value = value;
