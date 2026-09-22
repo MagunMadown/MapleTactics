@@ -222,6 +222,8 @@
   .bal-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; font-size: 12px; margin-bottom: 8px; }
   .bal-stats .stat-k { color: var(--dim); }
   .bal-stats .stat-v { text-align: right; font-family: "JetBrains Mono", monospace; }
+  .bal-stats .stat-v .numstep { min-width: 0; justify-content: flex-end; }
+  .bal-stats .stat-v .numstep-input { min-width: 24px; font-size: 11px; padding: 1px 2px; }
   .bal-derived { border-top: 1px dashed var(--border); padding-top: 7px; margin-top: 4px; font-size: 11.5px; color: var(--dim); }
   .bal-derived div { display: flex; justify-content: space-between; cursor: help; }
   .bal-derived .stat-v { color: var(--accent); }
@@ -1184,6 +1186,7 @@
     compareIds: new Set(), // Balance screen: SkillId set selected for the Compare panel
     compareOpen: false, // Balance screen: whether the Compare panel is expanded
     balanceExpandedGroups: new Set(), // Balance screen: which job groups are expanded (empty = all collapsed)
+    balanceCardExpanded: new Set(), // Balance screen: SkillIds with "더보기" open (survives edit-triggered re-renders)
   };
 
   const el = (sel) => document.querySelector(sel);
@@ -1533,18 +1536,30 @@
     let steps = [];
     if (stepsDef && effectSetId) {
       steps = stepsDef.rows
-        .filter((r) => eGet(r, "EffectSetId") === effectSetId)
-        .sort((a, b) => (parseFloat(eGet(a, "StepIndex")) || 0) - (parseFloat(eGet(b, "StepIndex")) || 0))
-        .map((r) => ({
+        .map((r, ri) => ({ r, ri }))
+        .filter(({ r }) => eGet(r, "EffectSetId") === effectSetId)
+        .sort((a, b) => (parseFloat(eGet(a.r, "StepIndex")) || 0) - (parseFloat(eGet(b.r, "StepIndex")) || 0))
+        .map(({ r, ri }) => ({
           effectType: eGet(r, "EffectType"),
           value: parseFloat(eGet(r, "Value")),
+          rowIndex: ri,
         }));
     }
-    const totalDamage = steps.filter((s) => s.effectType === "DAMAGE").reduce((a, s) => a + (s.value || 0), 0);
-    const totalHeal = steps.filter((s) => s.effectType === "HEAL").reduce((a, s) => a + (s.value || 0), 0);
-    const hasDamage = steps.some((s) => s.effectType === "DAMAGE");
-    const hasHeal = steps.some((s) => s.effectType === "HEAL");
+    const damageSteps = steps.filter((s) => s.effectType === "DAMAGE");
+    const healSteps = steps.filter((s) => s.effectType === "HEAL");
+    const totalDamage = damageSteps.reduce((a, s) => a + (s.value || 0), 0);
+    const totalHeal = healSteps.reduce((a, s) => a + (s.value || 0), 0);
+    const hasDamage = damageSteps.length > 0;
+    const hasHeal = healSteps.length > 0;
     const otherEffectTypes = hasDamage || hasHeal ? [] : [...new Set(steps.map((s) => s.effectType))];
+    // Inline-editable only when the primary effect is exactly one step —
+    // with 2+ DAMAGE (or HEAL) steps summed together there's no single cell
+    // "the" damage value is, so editing goes through Inspector instead.
+    const primaryStepRowIndex = hasDamage
+      ? (damageSteps.length === 1 ? damageSteps[0].rowIndex : null)
+      : hasHeal
+      ? (healSteps.length === 1 ? healSteps[0].rowIndex : null)
+      : null;
 
     return {
       tableName, rowIndex, skillId,
@@ -1557,8 +1572,8 @@
       cooldown: parseFloat(get("CooldownTurns")),
       actionDuration: get("ActionDuration"),
       weaponType: get("WeaponType"),
-      effectSetId, steps, totalDamage, totalHeal, hasDamage, hasHeal,
-      otherEffectTypes,
+      effectSetId, effectTableName: effectTable, steps, totalDamage, totalHeal, hasDamage, hasHeal,
+      otherEffectTypes, primaryStepRowIndex,
     };
   }
 
@@ -1924,6 +1939,39 @@
     });
   }
 
+  // Direct editing from the Balance card — reuses the exact same widget +
+  // commit/validate/dirty pipeline the Table/Card Editor views use
+  // (buildCellWidget + rebuildIndexAndValidateAll), just aimed at a specific
+  // (tableName, rowIndex, colName) cell instead of whatever's on screen in
+  // the Editor. Returns false (caller falls back to a plain text stat) when
+  // the column doesn't exist on that table or the row target is unknown —
+  // e.g. a multi-step effect set with no single "the" Value cell to edit.
+  function buildEditableStat(target, label, tableName, rowIndex, colName) {
+    const def = tableName != null ? state.tables.get(tableName) : null;
+    const colDef = def && def.columns.find((cd) => cd.name === colName);
+    if (!def || !colDef || rowIndex === null || rowIndex === undefined || !def.rows[rowIndex]) return false;
+
+    const kEl = document.createElement("div");
+    kEl.className = "stat-k";
+    kEl.textContent = label;
+    const vEl = document.createElement("div");
+    vEl.className = "stat-v";
+
+    const value = def.rows[rowIndex][colDef.idx] || "";
+    const commit = (newVal) => {
+      def.rows[rowIndex][colDef.idx] = newVal;
+      def.dirty = true;
+      rebuildIndexAndValidateAll();
+      renderTableTabs();
+      updateSummary();
+      renderBalanceView();
+    };
+    vEl.appendChild(buildCellWidget(colDef, value, def, tableName, commit));
+    target.appendChild(kEl);
+    target.appendChild(vEl);
+    return true;
+  }
+
   function buildSkillCard(c) {
     const card = document.createElement("div");
     card.className = "bal-card" + (state.compareIds.has(c.skillId) ? " compare-selected" : "");
@@ -1983,17 +2031,24 @@
       target.appendChild(kEl);
       target.appendChild(vEl);
     };
-    if (c.hasDamage) addStat(stats, "Damage", String(c.totalDamage));
-    else if (c.hasHeal) addStat(stats, "Heal", String(c.totalHeal));
-    else if (c.otherEffectTypes.length) addStat(stats, "Effect", c.otherEffectTypes.join(", "));
+    if (c.hasDamage) {
+      if (!buildEditableStat(stats, "Damage", c.effectTableName, c.primaryStepRowIndex, "Value")) addStat(stats, "Damage", String(c.totalDamage));
+    } else if (c.hasHeal) {
+      if (!buildEditableStat(stats, "Heal", c.effectTableName, c.primaryStepRowIndex, "Value")) addStat(stats, "Heal", String(c.totalHeal));
+    } else if (c.otherEffectTypes.length) addStat(stats, "Effect", c.otherEffectTypes.join(", "));
     else addStat(stats, "Effect", "—");
-    addStat(stats, "Cooldown", Number.isFinite(c.cooldown) ? String(c.cooldown) : "—");
+    if (!buildEditableStat(stats, "Cooldown", c.tableName, c.rowIndex, "CooldownTurns")) {
+      addStat(stats, "Cooldown", Number.isFinite(c.cooldown) ? String(c.cooldown) : "—");
+    }
 
+    const cardExpanded = state.balanceCardExpanded.has(c.skillId);
     const moreStats = document.createElement("div");
-    moreStats.className = "bal-more-details";
-    addStat(moreStats, "Range", c.range || "—");
+    moreStats.className = "bal-more-details" + (cardExpanded ? " open" : "");
+    if (!buildEditableStat(moreStats, "Range", c.tableName, c.rowIndex, "Range")) addStat(moreStats, "Range", c.range || "—");
     addStat(moreStats, "Targets", c.targetCount === null ? "—" : String(c.targetCount));
-    addStat(moreStats, "ActionDuration", c.actionDuration || "—");
+    if (!buildEditableStat(moreStats, "ActionDuration", c.tableName, c.rowIndex, "ActionDuration")) {
+      addStat(moreStats, "ActionDuration", c.actionDuration || "—");
+    }
     stats.appendChild(moreStats);
     card.appendChild(stats);
 
@@ -2017,7 +2072,7 @@
 
       if (c.targetCount && c.targetCount > 1) {
         moreDerived = document.createElement("div");
-        moreDerived.className = "bal-derived-extra";
+        moreDerived.className = "bal-derived-extra" + (cardExpanded ? " open" : "");
         moreDerived.title = `전체 대상 합계 (${primaryLabel} × Targets)`;
         const taK = document.createElement("span");
         taK.textContent = "전체 대상 합계";
@@ -2034,8 +2089,10 @@
     if (moreStats.childElementCount > 0) {
       moreToggleBtn = document.createElement("button");
       moreToggleBtn.className = "bal-more-toggle";
-      moreToggleBtn.textContent = "더보기 (Range/Targets/ActionDuration) ▾";
+      moreToggleBtn.textContent = cardExpanded ? "접기 ▲" : "더보기 (Range/Targets/ActionDuration) ▾";
       moreToggleBtn.addEventListener("click", () => {
+        if (state.balanceCardExpanded.has(c.skillId)) state.balanceCardExpanded.delete(c.skillId);
+        else state.balanceCardExpanded.add(c.skillId);
         const open = moreStats.classList.toggle("open");
         if (moreDerived) moreDerived.classList.toggle("open", open);
         moreToggleBtn.textContent = open ? "접기 ▲" : "더보기 (Range/Targets/ActionDuration) ▾";
