@@ -245,6 +245,12 @@ script BattleSessionComponent extends Component
 	property string PrototypeTestLoadoutId = ""
 	-- Empty uses the lowest StageIndex routed to the current MapId. Set only for a specific shared-map Stage test.
 	property string PrototypeTestStageOverride = ""
+	-- Skill test map: one passive dummy with refilling HP, no reinforcement waves, and a test-editable skill bar.
+	property boolean SkillTestMode = false
+	property string SkillTestStageId = "henesys_stage_01"
+	property integer SkillTestDummyCell = 1
+	-- Kept small on purpose: the world HP HUD draws one pip per HP point. Lethal hits refill instead of killing.
+	property number SkillTestDummyMaxHp = 30
 	property integer PrototypeTestRunSeed = 5001
 	property integer PrototypeTestEntryRequestId = 9500001
 	property number PrototypeTestRetryInterval = 0.25
@@ -253,6 +259,7 @@ script BattleSessionComponent extends Component
 	property boolean EnablePrototypeForceStageClear = true
 	property boolean PrototypeTestEntryActive = false
 	property boolean PrototypeTestEntryPending = false
+	property boolean PrototypeTestEntryInFlight = false
 	property Entity PrototypeTestPendingPlayer = nil
 	property string PrototypeTestPendingStageId = ""
 	property number PrototypeTestRetryElapsed = 0
@@ -295,6 +302,10 @@ script BattleSessionComponent extends Component
 		-- Converts one movement/turn/attack key press into a server-authoritative request.
 		local player = _UserService.LocalPlayer
 		if isvalid(player) == false or player.CurrentMap ~= self.Entity then
+			return
+		end
+		-- Typing a stat value in the skill test panel must not move or turn the player.
+		if self.SkillTestMode == true and _SkillTestLogic.KeyboardCaptured == true then
 			return
 		end
 		-- UI clicks belong to skill selection and dragging, never to world commands.
@@ -680,6 +691,16 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table ResolvePrototypeTestStage()
 		local mapId = self.Entity.Name
+		if self.SkillTestMode == true then
+			-- The test map borrows a real stage only for board layout and job/run bootstrap; it is not routed.
+			return {
+				Success = true,
+				Reason = "OK",
+				StageId = self.SkillTestStageId,
+				MapId = mapId,
+				Source = "SKILL_TEST"
+			}
+		end
 		if self.PrototypeTestStageOverride ~= nil and self.PrototypeTestStageOverride ~= "" then
 			local overrideRoute = _StageMapRouteRepositoryLogic:GetMapRoute(self.PrototypeTestStageOverride)
 			if overrideRoute.Success == false then
@@ -735,9 +756,14 @@ script BattleSessionComponent extends Component
 				Retryable = self:IsPrototypeBattleEntryRetryableReason(unionReadiness.Reason)
 			}
 		end
+		-- Run/profile setup can yield; the retry tick must not start a second entry while one is still running.
+		if self.PrototypeTestEntryInFlight == true then
+			return { Success = false, Reason = "PROTOTYPE_ENTRY_IN_FLIGHT", Retryable = true }
+		end
 		local resolvedJobId = _RunManagerLogic:ResolveJobId(self.PrototypeTestJobId)
 		local requestId = math.max(1, self.PrototypeTestEntryRequestId)
 		local runSeed = math.max(1, self.PrototypeTestRunSeed)
+		self.PrototypeTestEntryInFlight = true
 		local result = self:InitializeFromEntry(
 			playerEntity,
 			targetStageId,
@@ -748,6 +774,7 @@ script BattleSessionComponent extends Component
 			"NEW_RUN",
 			requestId
 		)
+		self.PrototypeTestEntryInFlight = false
 		if result.Success == true then
 			local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
 			if runState ~= nil then
@@ -766,7 +793,7 @@ script BattleSessionComponent extends Component
 			log_warning("[BattlePrototypeTest] force clear rejected reason=INVALID_SENDER")
 			return
 		end
-		if self.EnablePrototypeForceStageClear == false or self.PrototypeTestEntryActive == false then
+		if self.EnablePrototypeForceStageClear == false or self.PrototypeTestEntryActive == false or self.SkillTestMode == true then
 			log_warning("[BattlePrototypeTest] force clear rejected reason=NOT_PROTOTYPE_ENTRY")
 			return
 		end
@@ -841,6 +868,7 @@ script BattleSessionComponent extends Component
 	method boolean IsPrototypeBattleEntryRetryableReason(string reason)
 		-- Restricts automatic retries to transient Union profile readiness states.
 		return reason == "PROFILE_LOAD_IN_PROGRESS"
+			or reason == "PROTOTYPE_ENTRY_IN_FLIGHT"
 			or reason == "PROFILE_NOT_LOADED"
 			or reason == "PROFILE_CACHE_MISSING"
 			or reason == "USER_DATA_STORAGE_UNAVAILABLE"
@@ -1005,16 +1033,21 @@ script BattleSessionComponent extends Component
 			log_error("[BattleWave] definition rejected stage=" .. self.StageId .. " wave=" .. waveNumber .. " reason=" .. definition.Reason)
 			return
 		end
-		if self:CanSpawnWave(definition.SpawnCount, definition.MaxConcurrent) == false then
+		local spawnCount = definition.SpawnCount
+		if self.SkillTestMode == true then
+			-- The skill test board always holds exactly one training dummy.
+			spawnCount = 1
+		end
+		if self:CanSpawnWave(spawnCount, definition.MaxConcurrent) == false then
 			self.WaveRuntime:MarkSpawnPending(waveNumber, "CAPACITY_WAIT")
 			self:PublishWaveStateSnapshot("CAPACITY_WAIT")
 			-- Capacity wait is normal back-pressure while the configured live-enemy cap is full.
-			log("[BattleWave] pending stage=" .. self.StageId .. " wave=" .. waveNumber .. " reason=CAPACITY_WAIT count=" .. definition.SpawnCount .. " maxConcurrent=" .. definition.MaxConcurrent)
+			log("[BattleWave] pending stage=" .. self.StageId .. " wave=" .. waveNumber .. " reason=CAPACITY_WAIT count=" .. spawnCount .. " maxConcurrent=" .. definition.MaxConcurrent)
 			return
 		end
 		local spawnDefinitions = {}
 		local compositionIds = {}
-		for spawnIndex = 1, definition.SpawnCount do
+		for spawnIndex = 1, spawnCount do
 			local spawnDefinition = _StageWaveRepositoryLogic:GetEnemySpawnDefinition(definition.EnemyPoolId, waveNumber, spawnIndex, self.RunSeed)
 			if spawnDefinition.Success == false then
 				self.WaveRuntime:SetWaveState("DataError", "ENEMY_DEFINITION_ERROR")
@@ -1031,7 +1064,7 @@ script BattleSessionComponent extends Component
 			definition.SpawnTriggerMode,
 			definition.ForceAfterTurns,
 			definition.ForceAfterSeconds,
-			definition.SpawnCount,
+			spawnCount,
 			definition.MaxConcurrent,
 			definition.ClearSpawnDelaySeconds,
 			math.max(1, self.StageTurnNumber)
@@ -1058,6 +1091,9 @@ script BattleSessionComponent extends Component
 			self:ResetEnemyIntentCursor("WAVE_REINFORCEMENT_SPAWN")
 		end
 		local firstSpawnDefinition = spawnDefinitions[1]
+		if self.SkillTestMode == true then
+			firstSpawnDefinition.MaxHp = math.max(1, self.SkillTestDummyMaxHp)
+		end
 		self.EnemyModelId = firstSpawnDefinition.EnemyModelId
 		self.CurrentEnemyDefinitionId = firstSpawnDefinition.EnemyDefinitionId
 		self.CurrentEnemyMaxHp = firstSpawnDefinition.MaxHp
@@ -1065,7 +1101,7 @@ script BattleSessionComponent extends Component
 		self.CurrentEnemyPatternId = firstSpawnDefinition.PatternId
 		self.CurrentEnemyMovementPolicy = firstSpawnDefinition.MovementPolicy
 		local spawnedCount = 0
-		for spawnIndex = 1, definition.SpawnCount do
+		for spawnIndex = 1, spawnCount do
 			local preferredCell = self.LeftEnemyStartCell
 			local searchDirection = 1
 			local facing = "Right"
@@ -1078,6 +1114,9 @@ script BattleSessionComponent extends Component
 			end
 			if spawnIndex > 2 then
 				side = side .. "_" .. spawnIndex
+			end
+			if self.SkillTestMode == true then
+				preferredCell = self.SkillTestDummyCell
 			end
 			local startCell = self:FindAvailableSpawnCell(preferredCell, searchDirection)
 			local enemy = self:SpawnWaveEnemy(side, startCell, facing, waveNumber * 100 + spawnIndex, spawnDefinitions[spawnIndex])
@@ -1128,6 +1167,9 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ScheduleForcedSpawnTimer()
+		if self.SkillTestMode == true then
+			return
+		end
 		self.WaveRuntime:ScheduleForcedSpawnTimer()
 	end
 
@@ -1140,6 +1182,9 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void EvaluateForcedSpawnAtTurnBoundary()
 		-- Evaluates turn pressure and consumes one pending forced wave only after the full enemy round.
+		if self.SkillTestMode == true then
+			return
+		end
 		local evaluation = self.WaveRuntime:EvaluateForcedSpawnAtTurnBoundary(self.StageTurnNumber, self.BattleResult ~= "")
 		self:PublishWaveStateSnapshot("TURN_BOUNDARY")
 		if evaluation.ShouldSpawn == false then
@@ -2272,6 +2317,13 @@ script BattleSessionComponent extends Component
 		self.EnemyToEnemyHandoffPending = false
 		self.PendingEnemyHandoffSourceId = ""
 		self.PendingEnemyHandoffActionType = ""
+		if self.SkillTestMode == true then
+			-- The dummy idles: pass through a locked enemy phase so turn counters and cooldowns still advance.
+			self.TurnState:BeginEnemyTurn("ENEMY_WAIT", 0, "SKILL_TEST_IDLE")
+			self:PublishTurnStateSnapshot("ENEMY_TURN_BEGIN")
+			self:CompleteEnemyTurn("WAIT", true, "SKILL_TEST_IDLE")
+			return
+		end
 		local preparedIntent = self:GetPreparedEnemyIntent()
 		if preparedIntent.State ~= "PREPARED" then
 			log_warning("[BattleEnemyIntent] compatibility cursor missing; selecting frozen plan turn=" .. self.TurnNumber)
@@ -2498,6 +2550,11 @@ script BattleSessionComponent extends Component
 		-- Freezes every living enemy plan while the board still represents the same player decision point.
 		self.LastEnemySpawnOrder = 0
 		self:ResetEnemyIntentCursor("PLAN_ALL_ENEMIES")
+		if self.SkillTestMode == true then
+			-- The training dummy never plans an action, so no telegraph or queue icon is shown.
+			self:PublishEnemyPlanSnapshot("SKILL_TEST_IDLE")
+			return { Success = true, Reason = "SKILL_TEST_IDLE", PreparedCount = 0, SelectionReason = "SKILL_TEST_IDLE" }
+		end
 		if self.BoardState == nil then
 			return { Success = false, Reason = "REGISTRY_MISSING" }
 		end
@@ -4518,6 +4575,77 @@ script BattleSessionComponent extends Component
 		if #presentationRuids > 0 and isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
 			self:PreloadSkillPresentation(table.concat(presentationRuids, "|"), self.PlayerEntity.PlayerComponent.UserId)
 		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TrySkillTestAssignSlot(integer slotIndex, string skillId)
+		-- Skill test map only: equips any valid player skill into one fixed battle slot.
+		if self.SkillTestMode ~= true then
+			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
+		end
+		if slotIndex ~= math.floor(slotIndex) or slotIndex < 1 or slotIndex > self.SkillSlotCount then
+			return { Success = false, Reason = "SLOT_INDEX_OUT_OF_RANGE" }
+		end
+		if isvalid(self.PlayerEntity) == false then
+			return { Success = false, Reason = "PLAYER_UNAVAILABLE" }
+		end
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then
+			return { Success = false, Reason = validation.DetailReason or validation.Reason }
+		end
+		local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then
+			return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" }
+		end
+		local applyResult = inventory:ApplySkillTestBarSlot(slotIndex, skillId)
+		if applyResult.Success == false then
+			return applyResult
+		end
+		self:RefreshSkillTestPresentation("SKILL_TEST_ASSIGN")
+		log("[SkillTest] slot assigned slot=" .. tostring(slotIndex) .. " skill=" .. skillId .. " slots=" .. self.SkillSlotIds)
+		return { Success = true, Reason = "OK", SlotIds = self.SkillSlotIds }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshSkillTestPresentation(string reason)
+		-- Forces the slot rebuild so edited names/cooldowns/icons reach the HUD even when ownership is unchanged.
+		if self.SkillTestMode ~= true or isvalid(self.PlayerEntity) == false then
+			return
+		end
+		self.SkillSlotSourceSnapshot = ""
+		self:RefreshSkillSlots(reason, self.PlayerEntity)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResetSkillTestCooldowns()
+		if self.SkillTestMode ~= true then
+			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
+		end
+		local runtimeState = self:GetSkillRuntimeState("player_01")
+		if runtimeState == nil then
+			return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" }
+		end
+		runtimeState:ResetSkillRuntimeState("SKILL_TEST_RESET")
+		self.UtilityRemainingCooldown = 0
+		log("[SkillTest] cooldowns reset")
+		return { Success = true, Reason = "OK" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RestoreSkillTestDummy()
+		if self.SkillTestMode ~= true or self.BoardState == nil then
+			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
+		end
+		local restored = 0
+		for _, enemyEntity in ipairs(self.BoardState:CollectLivingEnemies()) do
+			local unit = enemyEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then
+				unit:RestoreCurrentHp(unit.MaxHp)
+				restored = restored + 1
+			end
+		end
+		log("[SkillTest] dummy restored count=" .. tostring(restored))
+		return { Success = restored > 0, Reason = restored > 0 and "OK" or "NO_DUMMY" }
 	end
 
 	@ExecSpace("ServerOnly")
@@ -6624,6 +6752,16 @@ script BattleSessionComponent extends Component
 		if damageResult.Success == false then
 			result.Reason = damageResult.Reason
 			return result
+		end
+		if self.SkillTestMode == true and targetUnit.Team == "Enemy" then
+			-- The dummy's pips cap at its small max HP, so report the full post-buff hit separately.
+			_SkillTestLogic:RecordDummyHit(attackId, amount)
+		end
+		if self.SkillTestMode == true and targetUnit.Team == "Enemy" and damageResult.ReachedZero == true then
+			-- Training dummy: a lethal hit of any size refills HP instead of entering the death pipeline.
+			targetUnit:RestoreCurrentHp(targetUnit.MaxHp)
+			damageResult.ReachedZero = false
+			log("[SkillTest] dummy refilled after lethal hit amount=" .. tostring(damageResult.AppliedAmount))
 		end
 		result.HpBefore = damageResult.HpBefore
 		result.HpAfter = damageResult.HpAfter

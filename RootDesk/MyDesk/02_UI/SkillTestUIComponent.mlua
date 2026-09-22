@@ -1,0 +1,759 @@
+@Component
+script SkillTestUIComponent extends Component
+
+	property string SkillTestMapId = "skill_test"
+	property string RootPath = "/ui/SkillTestUI"
+	property string BattleHudControllerPath = "/ui/BattleQueueHUD/Controller"
+	property integer CellCount = 24
+	property number DragThreshold = 10
+	property number ClickSuppressionSeconds = 0.25
+	property number GhostOffsetX = 14
+	property number GhostOffsetY = 18
+	property string DefaultIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
+	property string JobFilter = "All"
+	property integer PageIndex = 1
+	property string SelectedSkillId = ""
+	property integer LastCatalogRevision = -1
+	property boolean IsOpen = false
+	property number SuppressClickUntil = 0
+	property Entity PanelEntity = nil
+	property Entity GhostEntity = nil
+	property table Catalog = nil
+	property table FilteredSkills = nil
+	property table EventBindings = nil
+	property table FieldInputs = nil
+	property table StepValueInputs = nil
+	property table StepParamInputs = nil
+	property table ShownValues = nil
+	property table UiCache = nil
+	property table CellParts = nil
+	property any KeyDownHandler = nil
+	property Entity HitReadoutEntity = nil
+	property integer LastHitRevision = -1
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Resolves the panel by path, wires every control once, and starts closed.
+		self.Catalog = {}
+		self.FilteredSkills = {}
+		self.EventBindings = {}
+		self.FieldInputs = {}
+		self.StepValueInputs = {}
+		self.StepParamInputs = {}
+		self.ShownValues = {}
+		self.UiCache = {}
+		self.CellParts = {}
+		self.PanelEntity = _EntityService:GetEntityByPath(self.RootPath .. "/Panel")
+		self.GhostEntity = _EntityService:GetEntityByPath(self.RootPath .. "/DragGhost")
+		self.HitReadoutEntity = _EntityService:GetEntityByPath(self.RootPath .. "/HitReadout")
+		self:BindControls()
+		self:WarmUiCache()
+		self:SetTargetingOptionsVisible(false)
+		self.KeyDownHandler = _InputService:ConnectEvent(KeyDownEvent, self.OnKeyDown)
+		self:SetOpen(false)
+		log("[SkillTestUI] initialized cells=" .. tostring(self.CellCount) .. " fields=" .. tostring(#self:GetFieldNames()))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		for _, binding in ipairs(self.EventBindings or {}) do
+			if isvalid(binding.Entity) and binding.Handler ~= nil then
+				binding.Entity:DisconnectEvent(binding.EventType, binding.Handler)
+			end
+		end
+		self.EventBindings = {}
+		if self.KeyDownHandler ~= nil then
+			_InputService:DisconnectEvent(KeyDownEvent, self.KeyDownHandler)
+			self.KeyDownHandler = nil
+		end
+		_SkillTestLogic.KeyboardCaptured = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Closes itself off the test map and tells the battle input to stand down while a field is being typed in.
+		if self.IsOpen == true and self:IsOnTestMap() == false then
+			self:SetOpen(false)
+		end
+		_SkillTestLogic.KeyboardCaptured = self.IsOpen == true and self:IsAnyInputFocused()
+		if self.IsOpen == true and self.LastCatalogRevision ~= _SkillTestLogic.CatalogRevision then
+			self:ReloadCatalog()
+		end
+		self:RefreshHitReadout()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshHitReadout()
+		-- Shows the last full hit on the dummy; hidden off the test map so other maps never see it.
+		if isvalid(self.HitReadoutEntity) == false then
+			return
+		end
+		local visible = self:IsOnTestMap()
+		if self.HitReadoutEntity.Enable ~= visible then
+			self.HitReadoutEntity.Enable = visible
+		end
+		if visible == false or self.LastHitRevision == _SkillTestLogic.HitRevision then
+			return
+		end
+		self.LastHitRevision = _SkillTestLogic.HitRevision
+		local text = _SkillTestLogic.LastHitText
+		if text == "" then
+			text = "I: 스킬 테스트 패널"
+		end
+		self.HitReadoutEntity.TextGUIRendererComponent.Text = text
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsOnTestMap()
+		local player = _UserService.LocalPlayer
+		return isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name == self.SkillTestMapId
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetFieldNames()
+		return { "TargetingType", "Range", "TargetOffsets", "CooldownTurns", "ActionDuration", "EffectScale", "FreePlay",
+			"ProjectileSpeed", "ProjectileScale", "ProjectileCount", "ProjectileInterval", "ProjectileLaunchDelay", "ProjectileHeight" }
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetTargetingTypes()
+		-- Mirrors ContentValidatorLogic.IsSupportedSkillTargetingType.
+		return { "SELF", "FRONT_CELL", "FIRST_ENEMY_FORWARD", "RANGE_OFFSETS" }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Bind(Entity entity, any eventType, any callback)
+		if isvalid(entity) == false then
+			return
+		end
+		local eventHandler = entity:ConnectEvent(eventType, callback)
+		table.insert(self.EventBindings, { Entity = entity, EventType = eventType, Handler = eventHandler })
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetUi(string relativePath)
+		-- Cached so rows and cells stay reachable after the panel toggles them off.
+		local cached = self.UiCache[relativePath]
+		if isvalid(cached) then
+			return cached
+		end
+		local entity = _EntityService:GetEntityByPath(self.RootPath .. "/" .. relativePath)
+		if isvalid(entity) == false then
+			log_error("[SkillTestUI] entity missing path=" .. relativePath)
+			return nil
+		end
+		self.UiCache[relativePath] = entity
+		return entity
+	end
+
+	@ExecSpace("ClientOnly")
+	method void WarmUiCache()
+		-- Resolves every runtime-touched entity while the authored panel is still enabled.
+		local paths = { "Panel/List/PageText", "Panel/Detail/Name", "Panel/Detail/Meta", "Panel/Detail/Icon", "Panel/Detail/StatusText",
+			"Panel/Detail/TargetingOptions", "Panel/Detail/Field_TargetingType/Dropdown" }
+		for _, targetingType in ipairs(self:GetTargetingTypes()) do
+			table.insert(paths, "Panel/Detail/TargetingOptions/Option_" .. targetingType)
+		end
+		for _, jobId in ipairs({ "All", "warrior", "mage", "archer", "thief", "pirate" }) do
+			table.insert(paths, "Panel/List/Tab_" .. jobId)
+		end
+		for _, field in ipairs(self:GetFieldNames()) do
+			table.insert(paths, "Panel/Detail/Field_" .. field .. "/Label")
+		end
+		for stepIndex = 1, 3 do
+			table.insert(paths, "Panel/Detail/Step_" .. stepIndex)
+			table.insert(paths, "Panel/Detail/Step_" .. stepIndex .. "/Label")
+		end
+		for _, path in ipairs(paths) do
+			self:GetUi(path)
+		end
+		for cellIndex = 1, self.CellCount do
+			local cell = self:GetCell(cellIndex)
+			if cell ~= nil then
+				self.CellParts[cellIndex] = {
+					Icon = cell:GetChildByName("Icon"),
+					Name = cell:GetChildByName("Name"),
+					Selected = cell:GetChildByName("Selected")
+				}
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindControls()
+		self:Bind(self:GetUi("Panel/CloseButton"), ButtonClickEvent, function() self:SetOpen(false) end)
+		self:Bind(self:GetUi("Panel/List/PrevPage"), ButtonClickEvent, function() self:ChangePage(-1) end)
+		self:Bind(self:GetUi("Panel/List/NextPage"), ButtonClickEvent, function() self:ChangePage(1) end)
+		for _, jobId in ipairs({ "All", "warrior", "mage", "archer", "thief", "pirate" }) do
+			local capturedJob = jobId
+			self:Bind(self:GetUi("Panel/List/Tab_" .. jobId), ButtonClickEvent, function() self:SetJobFilter(capturedJob) end)
+		end
+		for cellIndex = 1, self.CellCount do
+			local capturedIndex = cellIndex
+			local cell = self:GetCell(cellIndex)
+			self:Bind(cell, ButtonClickEvent, function() self:OnCellClicked(capturedIndex) end)
+			self:Bind(cell, UITouchBeginDragEvent, function(event) self:OnCellBeginDrag(capturedIndex, event) end)
+			self:Bind(cell, UITouchDragEvent, function(event) self:OnCellDrag(event) end)
+			self:Bind(cell, UITouchEndDragEvent, function(event) self:OnCellEndDrag(event) end)
+		end
+		self:Bind(self:GetUi("Panel/Detail/Field_TargetingType/Dropdown"), ButtonClickEvent, function() self:ToggleTargetingOptions() end)
+		for _, targetingType in ipairs(self:GetTargetingTypes()) do
+			local capturedType = targetingType
+			self:Bind(self:GetUi("Panel/Detail/TargetingOptions/Option_" .. targetingType), ButtonClickEvent, function() self:OnTargetingChosen(capturedType) end)
+		end
+		for _, field in ipairs(self:GetFieldNames()) do
+			local capturedField = field
+			local inputEntity = nil
+			if field ~= "TargetingType" then
+				inputEntity = self:GetUi("Panel/Detail/Field_" .. field .. "/Input")
+			end
+			if inputEntity ~= nil then
+				self.FieldInputs[field] = inputEntity.TextGUIRendererInputComponent
+				self:Bind(inputEntity, TextInputEndEditEvent, function(event) self:OnFieldEdited(capturedField, event.text) end)
+			end
+		end
+		for stepIndex = 1, 3 do
+			local capturedStep = stepIndex
+			local valueEntity = self:GetUi("Panel/Detail/Step_" .. stepIndex .. "/Value")
+			local paramEntity = self:GetUi("Panel/Detail/Step_" .. stepIndex .. "/Param")
+			if valueEntity ~= nil then
+				self.StepValueInputs[stepIndex] = valueEntity.TextGUIRendererInputComponent
+				self:Bind(valueEntity, TextInputEndEditEvent, function(event) self:OnStepEdited(capturedStep, "Value", event.text) end)
+			end
+			if paramEntity ~= nil then
+				self.StepParamInputs[stepIndex] = paramEntity.TextGUIRendererInputComponent
+				self:Bind(paramEntity, TextInputEndEditEvent, function(event) self:OnStepEdited(capturedStep, "ParameterA", event.text) end)
+			end
+		end
+		self:Bind(self:GetUi("Panel/Detail/ResetStatsButton"), ButtonClickEvent, function() self:OnResetStatsClicked() end)
+		self:Bind(self:GetUi("Panel/Detail/ExportButton"), ButtonClickEvent, function()
+			self:SetStatus("변경값 내보내는 중…")
+			_SkillTestLogic:RequestExportOverrides()
+		end)
+		self:Bind(self:GetUi("Panel/Detail/ResetCooldownButton"), ButtonClickEvent, function()
+			self:SetStatus("쿨타임 초기화 요청…")
+			_SkillTestLogic:RequestResetCooldowns()
+		end)
+		self:Bind(self:GetUi("Panel/Detail/RestoreDummyButton"), ButtonClickEvent, function()
+			self:SetStatus("허수아비 HP 회복 요청…")
+			_SkillTestLogic:RequestRestoreDummy()
+		end)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnKeyDown(KeyDownEvent event)
+		-- I toggles the panel, Escape closes it; both only on the skill test map and never while typing.
+		if event.key ~= KeyboardKey.I and event.key ~= KeyboardKey.Escape then
+			return
+		end
+		if self:IsOnTestMap() == false or self:IsAnyInputFocused() then
+			return
+		end
+		if event.key == KeyboardKey.Escape then
+			if self.IsOpen == true then
+				self:SetOpen(false)
+			end
+			return
+		end
+		self:SetOpen(self.IsOpen == false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetOpen(boolean open)
+		self.IsOpen = open
+		if isvalid(self.PanelEntity) then
+			self.PanelEntity.Enable = open
+		end
+		self:CancelDrag()
+		self:SetTargetingOptionsVisible(false)
+		if open == true then
+			self:ReloadCatalog()
+			if self.SelectedSkillId ~= "" then
+				_SkillTestLogic:RequestSkillDetail(self.SelectedSkillId)
+			end
+		else
+			_SkillTestLogic.KeyboardCaptured = false
+		end
+		log("[SkillTestUI] panel open=" .. tostring(open))
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsAnyInputFocused()
+		for _, input in pairs(self.FieldInputs or {}) do
+			if input ~= nil and input.IsFocused == true then
+				return true
+			end
+		end
+		for stepIndex = 1, 3 do
+			local valueInput = self.StepValueInputs[stepIndex]
+			local paramInput = self.StepParamInputs[stepIndex]
+			if (valueInput ~= nil and valueInput.IsFocused == true) or (paramInput ~= nil and paramInput.IsFocused == true) then
+				return true
+			end
+		end
+		return false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReloadCatalog()
+		self.LastCatalogRevision = _SkillTestLogic.CatalogRevision
+		self.Catalog = _SkillTestLogic:GetCatalog()
+		self:ApplyFilter()
+		log("[SkillTestUI] catalog loaded skills=" .. tostring(#self.Catalog) .. " revision=" .. tostring(self.LastCatalogRevision))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetJobFilter(string jobId)
+		self.JobFilter = jobId
+		self.PageIndex = 1
+		self:ApplyFilter()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyFilter()
+		self.FilteredSkills = {}
+		for _, skill in ipairs(self.Catalog or {}) do
+			if self.JobFilter == "All" or skill.JobId == self.JobFilter then
+				table.insert(self.FilteredSkills, skill)
+			end
+		end
+		self.PageIndex = math.max(1, math.min(self.PageIndex, self:GetPageCount()))
+		self:RenderList()
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer GetPageCount()
+		return math.max(1, math.ceil(#self.FilteredSkills / self.CellCount))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ChangePage(integer step)
+		local pageCount = self:GetPageCount()
+		self.PageIndex = self.PageIndex + step
+		if self.PageIndex < 1 then
+			self.PageIndex = pageCount
+		elseif self.PageIndex > pageCount then
+			self.PageIndex = 1
+		end
+		self:RenderList()
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetCell(integer cellIndex)
+		local suffix = cellIndex < 10 and ("0" .. tostring(cellIndex)) or tostring(cellIndex)
+		return self:GetUi("Panel/List/Cell_" .. suffix)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetCellSkill(integer cellIndex)
+		return self.FilteredSkills[(self.PageIndex - 1) * self.CellCount + cellIndex]
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderList()
+		for cellIndex = 1, self.CellCount do
+			local cell = self:GetCell(cellIndex)
+			local skill = self:GetCellSkill(cellIndex)
+			if cell ~= nil then
+				cell.Enable = skill ~= nil
+				local parts = self.CellParts[cellIndex] or {}
+				if skill ~= nil then
+					local icon = parts.Icon
+					if isvalid(icon) then
+						icon.SpriteGUIRendererComponent.ImageRUID = DataRef(skill.IconRuid ~= "" and skill.IconRuid or self.DefaultIconRuid)
+					end
+					local nameEntity = parts.Name
+					if isvalid(nameEntity) then
+						local label = skill.DisplayName
+						if skill.Tier > 1 then
+							label = label .. " (" .. tostring(skill.Tier) .. "단계)"
+						end
+						nameEntity.TextGUIRendererComponent.Text = label
+					end
+					local selected = parts.Selected
+					if isvalid(selected) then
+						selected.Enable = skill.SkillId == self.SelectedSkillId
+					end
+				end
+			end
+		end
+		local pageText = self:GetUi("Panel/List/PageText")
+		if pageText ~= nil then
+			pageText.TextGUIRendererComponent.Text = tostring(self.PageIndex) .. " / " .. tostring(self:GetPageCount()) .. "   (" .. tostring(#self.FilteredSkills) .. "개)"
+		end
+		for _, jobId in ipairs({ "All", "warrior", "mage", "archer", "thief", "pirate" }) do
+			local tab = self:GetUi("Panel/List/Tab_" .. jobId)
+			if tab ~= nil then
+				if jobId == self.JobFilter then
+					tab.SpriteGUIRendererComponent.Color = Color(0.95, 0.72, 0.25, 1)
+					tab.TextGUIRendererComponent.FontColor = Color(0.1, 0.1, 0.12, 1)
+				else
+					tab.SpriteGUIRendererComponent.Color = Color(0.2, 0.23, 0.32, 1)
+					tab.TextGUIRendererComponent.FontColor = Color(1, 1, 1, 1)
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCellClicked(integer cellIndex)
+		-- A release that ended a drag must not also select; the drag already did its job.
+		if _UtilLogic.ElapsedSeconds < self.SuppressClickUntil or self._T.DragActive == true then
+			return
+		end
+		local skill = self:GetCellSkill(cellIndex)
+		if skill == nil then
+			return
+		end
+		self.SelectedSkillId = skill.SkillId
+		self:SetTargetingOptionsVisible(false)
+		self:RenderList()
+		self:SetStatus("불러오는 중: " .. skill.DisplayName)
+		_SkillTestLogic:RequestSkillDetail(skill.SkillId)
+		log("[SkillTestUI] skill selected skill=" .. skill.SkillId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCellBeginDrag(integer cellIndex, UITouchBeginDragEvent event)
+		local skill = self:GetCellSkill(cellIndex)
+		if skill == nil then
+			return
+		end
+		self._T.DragSkill = skill
+		self._T.DragDistance = 0
+		self._T.DragCandidate = true
+		self._T.DragActive = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCellDrag(UITouchDragEvent event)
+		if self._T.DragCandidate ~= true then
+			return
+		end
+		if self._T.DragActive ~= true then
+			local delta = event.TouchDelta
+			self._T.DragDistance = (self._T.DragDistance or 0) + math.sqrt(delta.x * delta.x + delta.y * delta.y)
+			if self._T.DragDistance < self.DragThreshold then
+				return
+			end
+			self._T.DragActive = true
+			self.SuppressClickUntil = _UtilLogic.ElapsedSeconds + 3600
+			if isvalid(self.GhostEntity) then
+				local skill = self._T.DragSkill
+				self.GhostEntity.SpriteGUIRendererComponent.ImageRUID = DataRef(skill.IconRuid ~= "" and skill.IconRuid or self.DefaultIconRuid)
+				self.GhostEntity.Enable = true
+			end
+			log("[SkillTestUI] drag started skill=" .. self._T.DragSkill.SkillId)
+		end
+		self:UpdateGhost(event.TouchPoint)
+		self:SetSlotHighlight(self:ResolveBattleSlot(event.TouchPoint))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCellEndDrag(UITouchEndDragEvent event)
+		if self._T.DragCandidate ~= true then
+			return
+		end
+		local wasActive = self._T.DragActive == true
+		local skill = self._T.DragSkill
+		local slotIndex = 0
+		if wasActive == true then
+			slotIndex = self:ResolveBattleSlot(event.TouchPoint)
+		end
+		self:CancelDrag()
+		if wasActive == false or skill == nil then
+			return
+		end
+		self.SuppressClickUntil = _UtilLogic.ElapsedSeconds + self.ClickSuppressionSeconds
+		if slotIndex <= 0 then
+			self:SetStatus("스킬 슬롯 위에 놓아야 장착됩니다.")
+			log("[SkillTestUI] drop cancelled skill=" .. skill.SkillId .. " reason=OUTSIDE_SLOT")
+			return
+		end
+		self:SetStatus(tostring(slotIndex) .. "번 슬롯에 장착 중: " .. skill.DisplayName)
+		log("[SkillTestUI] drop requested skill=" .. skill.SkillId .. " slot=" .. tostring(slotIndex))
+		_SkillTestLogic:RequestAssignSlot(slotIndex, skill.SkillId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelDrag()
+		self._T.DragCandidate = false
+		self._T.DragActive = false
+		self._T.DragSkill = nil
+		self._T.DragDistance = 0
+		if isvalid(self.GhostEntity) then
+			self.GhostEntity.Enable = false
+		end
+		self:SetSlotHighlight(0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateGhost(Vector2 touchPoint)
+		if isvalid(self.GhostEntity) == false then
+			return
+		end
+		local uiPosition = _UILogic:ScreenToUIPosition(touchPoint)
+		local ghostX = math.max(-924, math.min(924, uiPosition.x + self.GhostOffsetX))
+		local ghostY = math.max(-504, math.min(504, uiPosition.y + self.GhostOffsetY))
+		self.GhostEntity.UITransformComponent.anchoredPosition = Vector2(ghostX, ghostY)
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetBattleHud()
+		local controller = _EntityService:GetEntityByPath(self.BattleHudControllerPath)
+		if isvalid(controller) == false then
+			return nil
+		end
+		return controller:GetComponent("script.BattleQueueHudComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer ResolveBattleSlot(Vector2 touchPoint)
+		-- Reuses the battle bar's own hit test so the drop area matches its drag-reorder behavior exactly.
+		---@type BattleQueueHudComponent
+		local hud = self:GetBattleHud()
+		if hud == nil then
+			return 0
+		end
+		return hud:ResolveSkillSlotAtTouchPoint(touchPoint)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetSlotHighlight(integer targetIndex)
+		---@type BattleQueueHudComponent
+		local hud = self:GetBattleHud()
+		if hud == nil then
+			return
+		end
+		for slotIndex = 1, 6 do
+			local highlight = hud:GetSkillSlotDragTargetHighlight(slotIndex)
+			if highlight ~= nil then
+				local active = slotIndex == targetIndex
+				if active == true then
+					highlight.Color = Color(0.45, 0.85, 1.0, 0.9)
+				end
+				highlight.Entity.Enable = active
+				highlight.Enable = active
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnFieldEdited(string field, string text)
+		if self.SelectedSkillId == "" then
+			return
+		end
+		if self.ShownValues["F_" .. field] == text then
+			return
+		end
+		self.ShownValues["F_" .. field] = text
+		self:SetStatus(field .. " = " .. text .. " 적용 중…")
+		log("[SkillTestUI] stat edit skill=" .. self.SelectedSkillId .. " field=" .. field .. " value=" .. text)
+		_SkillTestLogic:RequestSetDefinitionStat(self.SelectedSkillId, field, text)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnStepEdited(integer stepIndex, string field, string text)
+		if self.SelectedSkillId == "" then
+			return
+		end
+		local key = "S" .. tostring(stepIndex) .. "." .. field
+		if self.ShownValues[key] == text then
+			return
+		end
+		self.ShownValues[key] = text
+		self:SetStatus("효과 " .. tostring(stepIndex) .. " " .. field .. " = " .. text .. " 적용 중…")
+		log("[SkillTestUI] effect edit skill=" .. self.SelectedSkillId .. " step=" .. tostring(stepIndex) .. " field=" .. field .. " value=" .. text)
+		_SkillTestLogic:RequestSetEffectStat(self.SelectedSkillId, stepIndex, field, text)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnResetStatsClicked()
+		if self.SelectedSkillId == "" then
+			self:SetStatus("먼저 스킬을 선택하세요.")
+			return
+		end
+		self:SetStatus("기본값 복원 중…")
+		_SkillTestLogic:RequestResetSkillStats(self.SelectedSkillId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleServerResult(string action, boolean success, string reason, table detail)
+		log("[SkillTestUI] result action=" .. action .. " success=" .. tostring(success) .. " reason=" .. reason)
+		if detail ~= nil and detail.SkillId ~= nil and detail.SkillId == self.SelectedSkillId and detail.DisplayName ~= nil then
+			self:ApplyDetail(detail)
+		end
+		if action == "ASSIGN" then
+			if success then
+				self:SetStatus((detail.SlotIndex or "?") .. "번 슬롯에 장착했습니다.")
+			else
+				self:SetStatus("장착 실패: " .. reason)
+			end
+		elseif action == "SET_STAT" then
+			self:SetStatus(success and "적용했습니다. 다음 사용부터 반영됩니다." or ("적용 실패(되돌림): " .. reason))
+		elseif action == "RESET_STATS" then
+			self:SetStatus(success and "기본값으로 복원했습니다." or ("복원 실패: " .. reason))
+		elseif action == "EXPORT" then
+			if success == false then
+				self:SetStatus("내보내기 실패: " .. reason)
+			elseif reason == "0" then
+				self:SetStatus("기본값과 다른 변경 사항이 없습니다.")
+			else
+				self:SetStatus("변경 " .. reason .. "건을 [SkillTestExport] 로그로 내보냈습니다. CSV 반영을 요청하세요.")
+			end
+		elseif action == "RESET_COOLDOWN" then
+			self:SetStatus(success and "쿨타임을 초기화했습니다." or ("초기화 실패: " .. reason))
+		elseif action == "RESTORE_DUMMY" then
+			self:SetStatus(success and "허수아비 HP와 누적 피해를 초기화했습니다." or ("초기화 실패: " .. reason))
+		elseif action == "DETAIL" then
+			if success == false then
+				self:SetStatus("불러오기 실패: " .. reason)
+			else
+				self:SetStatus("값을 입력하고 Enter 또는 다른 곳을 클릭하면 바로 적용됩니다.")
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyDetail(table detail)
+		-- Writes the effective values; ShownValues is updated first so the writes are not echoed back as edits.
+		local nameEntity = self:GetUi("Panel/Detail/Name")
+		if nameEntity ~= nil then
+			nameEntity.TextGUIRendererComponent.Text = detail.DisplayName
+		end
+		local metaEntity = self:GetUi("Panel/Detail/Meta")
+		if metaEntity ~= nil then
+			local projectileText = detail.HasProjectile == "true" and "투사체 있음" or "투사체 없음"
+			metaEntity.TextGUIRendererComponent.Text = detail.SkillId .. " · " .. detail.JobId .. " · " .. detail.Tier .. "단계 · " .. projectileText
+		end
+		local iconEntity = self:GetUi("Panel/Detail/Icon")
+		if iconEntity ~= nil then
+			iconEntity.SpriteGUIRendererComponent.ImageRUID = DataRef(detail.IconRuid ~= "" and detail.IconRuid or self.DefaultIconRuid)
+		end
+		local overridden = {}
+		for token in string.gmatch(detail.Overridden or "", "[^|]+") do
+			overridden[token] = true
+		end
+		for _, field in ipairs(self:GetFieldNames()) do
+			local value = detail["F_" .. field] or ""
+			self.ShownValues["F_" .. field] = value
+			local input = self.FieldInputs[field]
+			if input ~= nil then
+				input.Text = value
+			end
+			if field == "TargetingType" then
+				self:RefreshTargetingDropdown(value)
+			end
+			self:SetLabelOverridden("Panel/Detail/Field_" .. field .. "/Label", overridden[field] == true)
+		end
+		local steps = {}
+		for record in string.gmatch(detail.Steps or "", "[^|]+") do
+			local fields = {}
+			for part in string.gmatch(record .. "~", "([^~]*)~") do
+				table.insert(fields, part)
+			end
+			table.insert(steps, fields)
+		end
+		for stepIndex = 1, 3 do
+			local row = self:GetUi("Panel/Detail/Step_" .. stepIndex)
+			local fields = steps[stepIndex]
+			if row ~= nil then
+				row.Enable = fields ~= nil
+			end
+			if fields ~= nil then
+				local label = self:GetUi("Panel/Detail/Step_" .. stepIndex .. "/Label")
+				if label ~= nil then
+					label.TextGUIRendererComponent.Text = fields[1] .. ". " .. fields[2] .. " (" .. fields[3] .. ")"
+				end
+				local valueKey = "S" .. tostring(stepIndex) .. ".Value"
+				local paramKey = "S" .. tostring(stepIndex) .. ".ParameterA"
+				self.ShownValues[valueKey] = fields[4] or ""
+				self.ShownValues[paramKey] = fields[5] or ""
+				if self.StepValueInputs[stepIndex] ~= nil then
+					self.StepValueInputs[stepIndex].Text = fields[4] or ""
+				end
+				if self.StepParamInputs[stepIndex] ~= nil then
+					self.StepParamInputs[stepIndex].Text = fields[5] or ""
+				end
+				self:SetLabelOverridden("Panel/Detail/Step_" .. stepIndex .. "/Label", overridden[valueKey] == true or overridden[paramKey] == true)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetTargetingOptionsVisible(boolean visible)
+		local options = self:GetUi("Panel/Detail/TargetingOptions")
+		if options ~= nil then
+			options.Enable = visible
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ToggleTargetingOptions()
+		if self.SelectedSkillId == "" then
+			self:SetStatus("먼저 스킬을 선택하세요.")
+			return
+		end
+		local options = self:GetUi("Panel/Detail/TargetingOptions")
+		if options ~= nil then
+			self:SetTargetingOptionsVisible(options.Enable == false)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnTargetingChosen(string targetingType)
+		-- Sends the choice through the same validated stat path as the text fields.
+		self:SetTargetingOptionsVisible(false)
+		if self.SelectedSkillId == "" or self.ShownValues["F_TargetingType"] == targetingType then
+			return
+		end
+		self.ShownValues["F_TargetingType"] = targetingType
+		self:RefreshTargetingDropdown(targetingType)
+		self:SetStatus("타겟팅 = " .. targetingType .. " 적용 중…")
+		log("[SkillTestUI] stat edit skill=" .. self.SelectedSkillId .. " field=TargetingType value=" .. targetingType)
+		_SkillTestLogic:RequestSetDefinitionStat(self.SelectedSkillId, "TargetingType", targetingType)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshTargetingDropdown(string current)
+		local dropdown = self:GetUi("Panel/Detail/Field_TargetingType/Dropdown")
+		if dropdown ~= nil then
+			dropdown.TextGUIRendererComponent.Text = (current ~= "" and current or "-") .. "  ▼"
+		end
+		for _, targetingType in ipairs(self:GetTargetingTypes()) do
+			local option = self:GetUi("Panel/Detail/TargetingOptions/Option_" .. targetingType)
+			if option ~= nil then
+				if targetingType == current then
+					option.SpriteGUIRendererComponent.Color = Color(0.95, 0.72, 0.25, 1)
+					option.TextGUIRendererComponent.FontColor = Color(0.1, 0.1, 0.12, 1)
+				else
+					option.SpriteGUIRendererComponent.Color = Color(0.2, 0.23, 0.32, 1)
+					option.TextGUIRendererComponent.FontColor = Color(1, 1, 1, 1)
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetLabelOverridden(string path, boolean overridden)
+		-- Edited values show their label in gold so it is obvious what differs from the dataset.
+		local label = self:GetUi(path)
+		if label == nil then
+			return
+		end
+		if overridden == true then
+			label.TextGUIRendererComponent.FontColor = Color(0.95, 0.72, 0.25, 1)
+		else
+			label.TextGUIRendererComponent.FontColor = Color(0.79, 0.82, 0.87, 1)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetStatus(string text)
+		local status = self:GetUi("Panel/Detail/StatusText")
+		if status ~= nil then
+			status.TextGUIRendererComponent.Text = text
+		end
+	end
+
+end
