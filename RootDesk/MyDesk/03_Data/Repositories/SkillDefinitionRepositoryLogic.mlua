@@ -5,34 +5,20 @@ script SkillDefinitionRepositoryLogic extends Logic
 	property string JobSkillDataSetNames = "WarriorSkillDefinitions,MageSkillDefinitions,ArcherSkillDefinitions,ThiefSkillDefinitions,PirateSkillDefinitions"
 	property string EnemySkillDataSetName = "EnemySkillDefinitions"
 	property string EffectStepDataSetName = "SkillEffectSteps"
+	-- Skill test map only: SkillTestLogic writes these and clears them once nobody is on the test map.
+	-- skillId -> { Field = typedValue }, and effectSetId -> { [stepIndex] = { Field = typedValue } }.
+	property table TestDefinitionOverrides = {}
+	property table TestEffectOverrides = {}
+	property integer TestOverrideCount = 0
+	-- True only while SkillTestLogic reads the original dataset values for an export.
+	property boolean TestOverridesSuspended = false
 
 	@ExecSpace("ServerOnly")
 	method table GetUtilitySkillBundle(string jobId)
-		-- Utility skills remain separate from grantable skills and the reservation queue.
-		local definitions = _DataService:GetTable("UtilitySkillDefinitions")
-		local effects = _DataService:GetTable("UtilitySkillEffectSteps")
-		if definitions == nil or effects == nil then
-			return { Success = false, Reason = "UTILITY_DATA_MISSING" }
-		end
-		local definition = nil
-		for row = 1, definitions:GetRowCount() do
-			if definitions:GetCell(row, "RequiredJobTag") == jobId then
-				if definition ~= nil then
-					return { Success = false, Reason = "UTILITY_JOB_AMBIGUOUS" }
-				end
-				definition = self:ConvertSkillRow(definitions, row)
-			end
-		end
-		if definition == nil then return { Success = false, Reason = "UTILITY_JOB_MISSING" } end
-		local steps = {}
-		for row = 1, effects:GetRowCount() do
-			if effects:GetCell(row, "EffectSetId") == definition.EffectSetId then
-				table.insert(steps, self:ConvertEffectStepRow(effects, row))
-			end
-		end
-		-- All authored utilities have one atomic effect; reject unsupported bundles before mutation.
-		if #steps ~= 1 then return { Success = false, Reason = "UTILITY_EFFECT_COUNT_INVALID" } end
-		return { Success = true, Reason = "OK", Definition = definition, Step = steps[1] }
+		-- Validation happens before TryUseUtilitySkill reserves an action or mutates combat state.
+		local catalog = _ContentValidatorLogic:ValidateUtilitySkills()
+		if catalog.Success == false then return catalog end
+		return catalog.Bundles[jobId] or { Success = false, Reason = "UTILITY_JOB_MISSING" }
 	end
 
 	@ExecSpace("ServerOnly")
@@ -206,6 +192,7 @@ script SkillDefinitionRepositoryLogic extends Logic
 		end
 		if matchedDefinition ~= nil then
 			matchedDefinition.MatchCount = matchCount
+			self:ApplyTestDefinitionOverrides(matchedDefinition)
 			return matchedDefinition
 		end
 
@@ -243,9 +230,156 @@ script SkillDefinitionRepositoryLogic extends Logic
 		table.sort(result.Steps, function(left, right)
 			return left.StepIndex < right.StepIndex
 		end)
+		self:ApplyTestEffectOverrides(effectSetId, result.Steps)
 		result.Success = true
 		result.Reason = "OK"
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyTestDefinitionOverrides(table definition)
+		-- Layers skill-test edits over a freshly converted row; the dataset itself is never modified.
+		if self.TestOverrideCount <= 0 or self.TestOverridesSuspended == true then
+			return
+		end
+		local overrides = self.TestDefinitionOverrides[definition.SkillId]
+		if overrides == nil then
+			return
+		end
+		for field, value in pairs(overrides) do
+			definition[field] = value
+		end
+		definition.Source = "SKILL_TEST_OVERRIDE"
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyTestEffectOverrides(string effectSetId, table steps)
+		-- Same as the definition layer, keyed by effect set and step index.
+		if self.TestOverrideCount <= 0 or self.TestOverridesSuspended == true then
+			return
+		end
+		local setOverrides = self.TestEffectOverrides[effectSetId]
+		if setOverrides == nil then
+			return
+		end
+		for _, step in ipairs(steps) do
+			local stepOverrides = setOverrides[step.StepIndex]
+			if stepOverrides ~= nil then
+				for field, value in pairs(stepOverrides) do
+					step[field] = value
+				end
+				step.Source = "SKILL_TEST_OVERRIDE"
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetTestDefinitionOverride(string skillId, string field)
+		local overrides = self.TestDefinitionOverrides[skillId]
+		if overrides == nil then
+			return nil
+		end
+		return overrides[field]
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SetTestDefinitionOverride(string skillId, string field, any value)
+		-- nil removes the field so a rejected edit can restore the previous state exactly.
+		local overrides = self.TestDefinitionOverrides[skillId]
+		if overrides == nil then
+			if value == nil then
+				return
+			end
+			overrides = {}
+			self.TestDefinitionOverrides[skillId] = overrides
+		end
+		overrides[field] = value
+		self:RecountTestOverrides()
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetTestEffectOverride(string effectSetId, integer stepIndex, string field)
+		local setOverrides = self.TestEffectOverrides[effectSetId]
+		if setOverrides == nil or setOverrides[stepIndex] == nil then
+			return nil
+		end
+		return setOverrides[stepIndex][field]
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SetTestEffectOverride(string effectSetId, integer stepIndex, string field, any value)
+		local setOverrides = self.TestEffectOverrides[effectSetId]
+		if setOverrides == nil then
+			if value == nil then
+				return
+			end
+			setOverrides = {}
+			self.TestEffectOverrides[effectSetId] = setOverrides
+		end
+		local stepOverrides = setOverrides[stepIndex]
+		if stepOverrides == nil then
+			if value == nil then
+				return
+			end
+			stepOverrides = {}
+			setOverrides[stepIndex] = stepOverrides
+		end
+		stepOverrides[field] = value
+		self:RecountTestOverrides()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearTestOverridesForSkill(string skillId, string effectSetId)
+		self.TestDefinitionOverrides[skillId] = nil
+		if effectSetId ~= nil and effectSetId ~= "" then
+			self.TestEffectOverrides[effectSetId] = nil
+		end
+		self:RecountTestOverrides()
+		log("[SkillTestOverride] cleared skill=" .. skillId .. " remaining=" .. tostring(self.TestOverrideCount))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearAllTestOverrides(string reason)
+		if self.TestOverrideCount > 0 then
+			log("[SkillTestOverride] cleared all reason=" .. reason .. " count=" .. tostring(self.TestOverrideCount))
+		end
+		self.TestDefinitionOverrides = {}
+		self.TestEffectOverrides = {}
+		self.TestOverrideCount = 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RecountTestOverrides()
+		-- Counts individual field overrides; empty containers are dropped so the fast path stays exact.
+		local count = 0
+		for skillId, overrides in pairs(self.TestDefinitionOverrides) do
+			local fieldCount = 0
+			for _, _ in pairs(overrides) do
+				fieldCount = fieldCount + 1
+			end
+			if fieldCount == 0 then
+				self.TestDefinitionOverrides[skillId] = nil
+			end
+			count = count + fieldCount
+		end
+		for effectSetId, setOverrides in pairs(self.TestEffectOverrides) do
+			local setCount = 0
+			for stepIndex, stepOverrides in pairs(setOverrides) do
+				local fieldCount = 0
+				for _, _ in pairs(stepOverrides) do
+					fieldCount = fieldCount + 1
+				end
+				if fieldCount == 0 then
+					setOverrides[stepIndex] = nil
+				end
+				setCount = setCount + fieldCount
+			end
+			if setCount == 0 then
+				self.TestEffectOverrides[effectSetId] = nil
+			end
+			count = count + setCount
+		end
+		self.TestOverrideCount = count
 	end
 
 	@ExecSpace("ServerOnly")
