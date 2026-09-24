@@ -2109,6 +2109,13 @@ script BattleSessionComponent extends Component
 			or (step.TargetSelector ~= "PRIMARY_TARGET" and step.TargetSelector ~= "ALL_SKILL_TARGETS") then
 			return { Success = false, Reason = "UTILITY_EFFECT_UNSUPPORTED" }
 		end
+		-- ParameterB is a token set so one push row can both carry the caster and cancel what it hits.
+		local carryCaster = false
+		local cancelQueue = false
+		for token in string.gmatch(step.ParameterB or "", "([^|]+)") do
+			if token == "CARRY_CASTER" then carryCaster = true end
+			if token == "CANCEL_QUEUE" then cancelQueue = true end
+		end
 		local targets = _SkillTargetResolverLogic:Resolve(self, sourceUnit.UnitId, definition)
 		if targets.Success == false then return targets end
 		local targetIds = step.TargetSelector == "PRIMARY_TARGET" and { targets.PrimaryTargetUnitId } or targets.TargetUnitIds
@@ -2121,14 +2128,22 @@ script BattleSessionComponent extends Component
 		end)
 		local maxSteps = step.ParameterA == "MAX" and self.CellCount or math.max(0, math.floor(step.Value))
 		local moved = 0
+		local cancelled = 0
 		for _, targetId in ipairs(targetIds) do
 			for distance = 1, maxSteps do
 				local pushed = self:ResolvePushImpactOnTarget(sourceUnit.UnitId, targetId)
 				if pushed.Success == false or pushed.Reason ~= "PUSHED" then break end
 				moved = moved + 1
 			end
+			-- Being inside the skill's range is enough: a target that cannot be displaced still loses its queue.
+			if cancelQueue == true then
+				local cancelResult = self:CancelEnemyQueuedSkills(targetId, "UTILITY_" .. definition.SkillId)
+				if cancelResult.Success == true then
+					cancelled = cancelled + 1
+				end
+			end
 		end
-		if step.ParameterB == "CARRY_CASTER" and moved > 0 then
+		if carryCaster == true and moved > 0 then
 			local destination = sourceCell
 			for distance = 1, self.CellCount do
 				local cell = sourceCell + direction * distance
@@ -2139,7 +2154,10 @@ script BattleSessionComponent extends Component
 				self:RelocateUnitForMechanic(sourceUnit.UnitId, destination, definition.SkillId)
 			end
 		end
-		log("[UtilitySkill] pushed skill=" .. definition.SkillId .. " cells=" .. tostring(moved))
+		log("[UtilitySkill] pushed skill=" .. definition.SkillId .. " cells=" .. tostring(moved) .. " cancelledQueues=" .. tostring(cancelled))
+		if moved == 0 and cancelled > 0 then
+			return { Success = true, Reason = "UTILITY_QUEUE_CANCELLED" }
+		end
 		return { Success = true, Reason = moved > 0 and "UTILITY_PUSHED" or "UTILITY_PUSH_BLOCKED" }
 	end
 
@@ -3341,6 +3359,45 @@ script BattleSessionComponent extends Component
 			stepResult.StepCount,
 			stepResult.Step.ActionType
 		)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CancelEnemyQueuedSkills(string enemyUnitId, string reason)
+		-- Drops one enemy's queued/charging attacks. The pattern runner releases the same step so the enemy
+		-- plans it again from scratch instead of resuming a half-consumed telegraph.
+		local enemyEntity = self:FindUnitEntity(enemyUnitId)
+		if isvalid(enemyEntity) == false then
+			return { Success = false, Reason = "ENEMY_NOT_FOUND", CancelledSkillIds = "" }
+		end
+		local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+		if actionPlan == nil then
+			return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING", CancelledSkillIds = "" }
+		end
+		local currentAction = actionPlan:GetCurrentAction()
+		local result = actionPlan:CancelQueuedSkills(reason)
+		if result.Success == false then
+			return result
+		end
+		local patternRunner = enemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
+		if patternRunner ~= nil and currentAction.Success == true then
+			patternRunner:CancelPreparedStep(currentAction.PatternId, currentAction.StepIndex, reason)
+		end
+		-- The compatibility cursor may already point at this enemy; release it so the enemy round skips it.
+		if self.PreparedEnemyId == enemyUnitId then
+			local intentRuntime = self.EnemyIntentRuntime
+			if intentRuntime == nil then
+				intentRuntime = self:EnsureEnemyIntentComponent()
+			end
+			if intentRuntime ~= nil then
+				intentRuntime:ResetIntent(reason)
+			end
+			-- Hand the cursor to another enemy that is still holding a frozen plan, so the round keeps its order.
+			self:PrepareNextEnemyIntent()
+			self:PublishEnemyIntentSnapshot(reason)
+		end
+		self:PublishEnemyPlanSnapshot(reason)
+		log("[BattleEnemyIntent] queue cancelled enemy=" .. enemyUnitId .. " skills=" .. result.CancelledSkillIds .. " reason=" .. (reason or ""))
+		return result
 	end
 
 	@ExecSpace("ServerOnly")

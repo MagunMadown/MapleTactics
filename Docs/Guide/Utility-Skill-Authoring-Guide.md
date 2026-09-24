@@ -34,7 +34,7 @@
 | teleport | mage | 전방의 빈 칸 중 가장 먼 칸으로 이동 |
 | fairy_turn | archer | 바로 앞 적을 최대 2칸 밀며 막히면 중단 |
 | rapid_evasion | thief | 전방에서 가장 먼 적의 1칸 뒤로 이동. 경계 밖·점유 시 실패 |
-| tidal_wave | pirate | 범위 내 적들을 먼 순서로 끝까지 민 뒤 시전자를 전방의 연속된 빈 칸 끝으로 이동 |
+| tidal_wave | pirate | 범위 내 적들을 먼 순서로 끝까지 밀고 맞은 적의 장전 중인 스킬을 취소한 뒤, 시전자를 전방의 연속된 빈 칸 끝으로 이동 |
 
 파도는 적과 시전자가 동일 거리로 함께 이동하는 원자 연산이 아니다. 현재 구현은 각 이동을 순서대로 해결한다. 기존 문서의 대열 간격 보존 설명은 구현과 달랐다.
 
@@ -48,8 +48,20 @@
 | GUARD | SELF_UNIT / SELF | 0 | UNTIL_NEXT_PLAYER_TURN | ALL_DAMAGE |
 | MOVE_SELF | SELF_UNIT / SELF | 0 | FARTHEST_EMPTY_FORWARD | 비움 |
 | MOVE_SELF | SELF_UNIT / SELF | 양의 정수 | BEHIND_FARTHEST_ENEMY_FORWARD | REQUIRE_EMPTY |
-| PUSH_DISTANCE | PRIMARY_TARGET 또는 ALL_SKILL_TARGETS / SELF 제외 | 양의 정수 | STOP_BEFORE_BLOCKED | 비움 또는 CARRY_CASTER |
-| PUSH_DISTANCE | PRIMARY_TARGET 또는 ALL_SKILL_TARGETS / SELF 제외 | 0 | MAX | 비움 또는 CARRY_CASTER |
+| PUSH_DISTANCE | PRIMARY_TARGET 또는 ALL_SKILL_TARGETS / SELF 제외 | 양의 정수 | STOP_BEFORE_BLOCKED | 비움 또는 아래 토큰 조합 |
+| PUSH_DISTANCE | PRIMARY_TARGET 또는 ALL_SKILL_TARGETS / SELF 제외 | 0 | MAX | 비움 또는 아래 토큰 조합 |
+
+PUSH_DISTANCE의 `ParameterB`는 `|`로 구분한 토큰 집합이며 중복은 거부한다.
+
+| 토큰 | 효과 |
+|---|---|
+| CARRY_CASTER | 한 칸이라도 밀었으면 시전자를 전방의 연속된 빈 칸 끝으로 이동 |
+| CANCEL_QUEUE | 사거리 안 대상이 장전(예약·예고·시전) 중인 스킬을 모두 취소 |
+
+`CANCEL_QUEUE`는 밀기 성공 여부와 무관하게 사거리 안의 모든 대상에 적용한다(벽·다른 유닛·`HEAVY` 특성으로 한 칸도 밀리지 않아도 취소된다). 취소는 그 적의 `EnemyActionPlanComponent`
+계획과 진행 중인 Interruptible Cast를 함께 비우고, Pattern Runner의 준비 단계도 해제하므로 적은
+다음 턴에 같은 패턴 단계를 처음부터 다시 장전한다. 이미 실행 중(`EXECUTING`)인 계획은 취소하지 않는다.
+밀기는 0칸이어도 취소가 하나라도 발생하면 결과는 `Success=true / UTILITY_QUEUE_CANCELLED`다.
 
 `ConditionId`는 실행 코드에서 평가하지 않으므로 비워야 한다.
 비용 차감·유틸리티 강화·투사체는 지원하지 않으므로 `CostType=""`, `CostValue=0`, `SkillTier=1`, `BaseSkillId=""`, `ProjectileRuid=""`을 유지한다. FreePlay는 false만 허용한다.
