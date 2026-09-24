@@ -217,6 +217,17 @@
   .enemy-strip-row figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 4px; width: 64px; }
   .enemy-strip-row figcaption { font-size: var(--fs-2xs); color: var(--dim); max-width: 64px; text-align: center;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skill-motion-row figure { width: 84px; }
+  .skill-motion-row figcaption { max-width: 84px; }
+  .skill-motion { display: flex; flex-direction: column; align-items: center; gap: 3px; margin-top: 4px;
+    padding-top: 6px; border-top: 1px dashed var(--border); width: 100%; }
+  .skill-motion-src { font-size: var(--fs-2xs); color: var(--dim); white-space: nowrap; }
+  .skill-motion-src.src-skill { color: var(--ok); }
+  .skill-motion-src.src-move, .skill-motion-src.src-idle, .skill-motion-src.src-none { color: var(--dimmer); }
+  .skill-motion-src.hidden-clip { color: var(--warn); }
+  .skill-motion-tag { display: inline-flex; align-items: center; gap: 3px; font-size: var(--fs-2xs); color: var(--dim);
+    cursor: pointer; white-space: nowrap; }
+  .skill-motion-tag input { margin: 0; }
   .pattern-detail .tile-cell { display: inline-flex; align-items: center; gap: 6px; }
   .anim-toggle { margin-top: 8px; }
   .anim-panel { overflow: visible; }
@@ -3830,6 +3841,77 @@
     HitMotionRuid: "비어 있으면 피격 모션 없음",
     DeathMotionRuid: "비어 있으면 사망 모션 없음",
   };
+  function skillHasTag(sk, tag) {
+    return `|${tableCellValue(sk.tableName, sk.rowIndex, "SkillTags")}|`.includes(`|${tag}|`);
+  }
+
+  // The clip PlayEnemyAttackMotion picks when enemy `c` uses skill `sk`:
+  // enemy AttackMotionRuid, unless it's empty or the skill has caster_motion
+  // -> skill CasterMotionRuid -> MoveMotionRuid -> IdleMotionRuid. Base
+  // EnemyDefinitions values (boss phase Move/Idle overrides only matter when
+  // it falls all the way through). `hidden`: the skill has its own clip but
+  // the enemy's attack clip wins over it.
+  const SKILL_MOTION_SOURCES = {
+    enemy: ["적 공통", "EnemyDefinitions · AttackMotionRuid"],
+    skill: ["스킬 전용", "EnemySkillDefinitions · CasterMotionRuid"],
+    move: ["이동 대체", "EnemyDefinitions · MoveMotionRuid"],
+    idle: ["대기 대체", "EnemyDefinitions · IdleMotionRuid"],
+    none: ["모션 없음", ""],
+  };
+  function enemySkillMotion(c, sk) {
+    const motion = (col) => (c.motions.find((m) => m.col === col) || {}).ruid || "";
+    const attack = motion("AttackMotionRuid").trim();
+    const casterRuid = tableCellValue(sk.tableName, sk.rowIndex, "CasterMotionRuid");
+    const tagged = skillHasTag(sk, "caster_motion");
+    const base = { tagged, casterRuid, hidden: false };
+    if (attack && !tagged) {
+      return { ...base, source: "enemy", ruid: attack, table: "EnemyDefinitions", rowIndex: c.rowIndex, col: "AttackMotionRuid",
+        hidden: !!casterRuid && casterRuid !== attack };
+    }
+    if (casterRuid) return { ...base, source: "skill", ruid: casterRuid, table: sk.tableName, rowIndex: sk.rowIndex, col: "CasterMotionRuid" };
+    if (motion("MoveMotionRuid").trim()) return { ...base, source: "move", ruid: motion("MoveMotionRuid"), table: "EnemyDefinitions", rowIndex: c.rowIndex, col: "MoveMotionRuid" };
+    if (motion("IdleMotionRuid").trim()) return { ...base, source: "idle", ruid: motion("IdleMotionRuid"), table: "EnemyDefinitions", rowIndex: c.rowIndex, col: "IdleMotionRuid" };
+    return { ...base, source: "none", ruid: "", table: sk.tableName, rowIndex: sk.rowIndex, col: "CasterMotionRuid" };
+  }
+
+  function setSkillTag(sk, tag, on) {
+    const tags = tableCellValue(sk.tableName, sk.rowIndex, "SkillTags").split("|").map((t) => t.trim()).filter(Boolean);
+    const next = on ? (tags.includes(tag) ? tags : [...tags, tag]) : tags.filter((t) => t !== tag);
+    commitCellValue(sk.tableName, sk.rowIndex, "SkillTags", next.join("|"));
+  }
+
+  function buildSkillMotionCell(c, sk, m) {
+    const wrap = document.createElement("div");
+    wrap.className = "skill-motion";
+    const [srcLabel, srcCol] = SKILL_MOTION_SOURCES[m.source];
+    const tip = [`${sk.displayName} 사용 시 재생 모션: ${srcLabel}`, srcCol,
+      m.hidden ? "이 스킬에도 전용 CasterMotionRuid가 있지만 적 공통 공격 모션이 우선이라 재생되지 않습니다." : "",
+      m.tagged ? "caster_motion 태그: 적 공통 공격 모션보다 스킬 전용 모션을 먼저 씁니다." : ""].filter(Boolean).join("\n");
+    wrap.appendChild(ruidThumb(m.ruid, 40,
+      cellRuidPicker(m.table, m.rowIndex, m.col, `${c.displayName} — ${sk.displayName} 공격 모션 (${srcLabel})`, c.displayName), "", tip));
+    const badge = document.createElement("span");
+    badge.className = `skill-motion-src src-${m.source}` + (m.hidden ? " hidden-clip" : "");
+    badge.textContent = m.hidden ? "전용 모션 가려짐" : srcLabel;
+    badge.title = tip;
+    wrap.appendChild(badge);
+    // The tag is what flips enemy-vs-skill priority; only offer it where it
+    // changes something (skill has its own clip) or is already set.
+    if (m.casterRuid || m.tagged) {
+      const lbl = document.createElement("label");
+      lbl.className = "skill-motion-tag";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = m.tagged;
+      const users = (getCasterMotionUsage().get(sk.skillId) || { users: [] }).users.length;
+      lbl.title = `SkillTags에 caster_motion ${m.tagged ? "제거" : "추가"}` +
+        (users > 1 ? `\n이 스킬을 쓰는 적 ${users}명 모두에게 적용됩니다.` : "");
+      cb.addEventListener("change", () => setSkillTag(sk, "caster_motion", cb.checked));
+      lbl.append(cb, document.createTextNode("전용 우선"));
+      wrap.appendChild(lbl);
+    }
+    return wrap;
+  }
+
   function appendEnemyAnimPanel(card, c) {
     // BossPhaseDefinitions has no attack column: phases swap Idle/Move/Hit/Death only.
     const BOSS_PHASE_MOTIONS = ENEMY_MOTIONS.filter(([col]) => col !== "AttackMotionRuid");
@@ -4207,17 +4289,24 @@
     // Pattern skill icons: what this monster actually queues, drawn like the
     // in-game queue icon (HudIconRuid on HudIconBackgroundColor). Clicking one
     // edits that skill's icon.
+    // Under each icon: the attack motion the game actually plays for that
+    // skill on this enemy (enemySkillMotion mirrors PlayEnemyAttackMotion).
     const patternSkills = enemyPatternSkills(c);
     if (ruidPreview.enabled && patternSkills.length) {
+      const motionsBySkill = patternSkills.map((ps) => ps.skill ? enemySkillMotion(c, ps.skill) : null);
+      const distinct = new Set(motionsBySkill.filter((m) => m && m.ruid).map((m) => m.ruid)).size;
+      const hiddenCount = motionsBySkill.filter((m) => m && m.hidden).length;
       const strip = document.createElement("div");
       strip.className = "enemy-strip";
       const cap = document.createElement("div");
       cap.className = "enemy-strip-cap";
-      cap.textContent = `패턴 스킬 ${patternSkills.length}`;
+      cap.textContent = `패턴 스킬 ${patternSkills.length} · 공격 모션 ${distinct}종` + (hiddenCount ? ` · 가려진 전용 모션 ${hiddenCount}` : "");
+      cap.title = "아이콘 아래는 이 적이 그 스킬을 쓸 때 실제로 재생되는 모션입니다.\n" +
+        "순서: 적 AttackMotionRuid → (비어 있거나 caster_motion 태그면) 스킬 CasterMotionRuid → 이동 → 대기";
       strip.appendChild(cap);
       const row = document.createElement("div");
-      row.className = "enemy-strip-row";
-      patternSkills.forEach((ps) => {
+      row.className = "enemy-strip-row skill-motion-row";
+      patternSkills.forEach((ps, i) => {
         const fig = document.createElement("figure");
         const sk = ps.skill;
         const info = [
@@ -4233,6 +4322,8 @@
         name.textContent = sk ? sk.displayName : ps.skillId;
         fig.appendChild(name);
         fig.title = info;
+        const m = motionsBySkill[i];
+        if (m) fig.appendChild(buildSkillMotionCell(c, sk, m));
         row.appendChild(fig);
       });
       strip.appendChild(row);
