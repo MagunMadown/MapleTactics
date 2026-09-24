@@ -339,6 +339,52 @@ script EnemyActionPlanComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method string CollectPendingAttackSkillIds()
+		-- Attack-shaped actions this enemy has queued but not executed yet, plus an active interruptible cast.
+		local skillIds = {}
+		local seen = {}
+		local sources = { self.PlannedActions, self.PendingQueueActions }
+		for _, actions in ipairs(sources) do
+			if actions ~= nil then
+				for actionIndex, action in ipairs(actions) do
+					local isPending = actions == self.PendingQueueActions or actionIndex >= self.CurrentActionIndex
+					local isAttack = action.ActionType == "EXECUTE_TILE" or action.ActionType == "CHARGE_FORWARD"
+						or action.ActionType == "TELEGRAPH_TILE" or action.ActionType == "CAST_INTERRUPTIBLE"
+						or action.ActionType == "BOSS_JUMP_TELEGRAPH" or action.ActionType == "BOSS_LAND_OPPOSITE"
+					if isPending and isAttack then
+						local skillId = action.TileId ~= "" and action.TileId or action.ActionType
+						if seen[skillId] ~= true then
+							seen[skillId] = true
+							table.insert(skillIds, skillId)
+						end
+					end
+				end
+			end
+		end
+		if self.CastState == "CASTING" and self.CastingSkillId ~= "" and seen[self.CastingSkillId] ~= true then
+			table.insert(skillIds, self.CastingSkillId)
+		end
+		return table.concat(skillIds, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CancelQueuedSkills(string reason)
+		-- Drops every queued attack and any active cast so the enemy must plan again from its pattern.
+		if self.PlanState == "EXECUTING" then
+			return { Success = false, Reason = "PLAN_EXECUTING", CancelledSkillIds = "" }
+		end
+		local cancelledSkillIds = self:CollectPendingAttackSkillIds()
+		if cancelledSkillIds == "" then
+			return { Success = false, Reason = "NO_QUEUED_SKILL", CancelledSkillIds = "" }
+		end
+		self:ClearInterruptibleCast(reason or "QUEUE_CANCELLED")
+		self:ResetPlan(reason or "QUEUE_CANCELLED")
+		self:PublishSnapshot()
+		log("[EnemyActionPlan] queue cancelled enemy=" .. self.OwnerUnitId .. " skills=" .. cancelledSkillIds .. " reason=" .. (reason or "") .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = "QUEUE_CANCELLED", CancelledSkillIds = cancelledSkillIds, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ResetPlan(string reason)
 		-- Discards both registered skills and pending insertions at the existing plan boundaries.
 		if self.PlanState ~= "EMPTY" then
