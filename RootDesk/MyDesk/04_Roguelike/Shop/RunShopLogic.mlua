@@ -29,7 +29,7 @@ script RunShopLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table OpenShop(Entity playerEntity, string shopId)
-		-- Keep an existing visit or draw one unowned relic from its frozen run catalog.
+		-- Keep an existing visit or draw up to three distinct unowned relics with shared rarity weights.
 		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
 		local shopState = self:GetOrCreateShopState(playerEntity)
 		if runState == nil or shopState == nil then
@@ -51,6 +51,9 @@ script RunShopLogic extends Logic
 		end
 		local bundle = relics.ShopBundle
 		if bundle.Definition.ShopId ~= shopId then return { Success = false, Reason = "INVALID_SHOP_ID" } end
+		local nextVisit = shopState.ActiveRunSequence == runState.RunSequence and shopState.VisitSequence + 1 or 1
+		local potions = self:BuildPotionOffers(shopId, runState.RunSequence, nextVisit)
+		if not potions.Success then return potions end
 		local candidates = {}
 		for _, entry in ipairs(bundle.Entries) do
 			if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, entry.RewardRefId) == 0 and not shopState:IsOfferPurchased(entry.ShopEntryId) then
@@ -58,22 +61,59 @@ script RunShopLogic extends Logic
 			end
 		end
 		table.sort(candidates, function(left, right) return left.ShopEntryId < right.ShopEntryId end)
-		local index = self:SelectOfferIndex(#candidates)
-		local offered = index > 0 and candidates[index] or nil
+		local relicIds = {}
+		for _, entry in ipairs(candidates) do table.insert(relicIds, entry.RewardRefId) end
 		local snapshot = ""
-		if offered ~= nil then
+		local offeredEntries = {}
+		local firstOffered = nil
+		for slot = 1, math.min(3, #candidates) do
+			local index = relics:SelectRelicIndex(relicIds)
+			if index <= 0 then return { Success = false, Reason = "INVALID_RELIC_OFFER_POOL" } end
+			local offered = candidates[index]
+			if firstOffered == nil then firstOffered = offered end
+			offeredEntries[offered.ShopEntryId] = offered
 			local definition = relics.Definitions[offered.RewardRefId]
-			snapshot = table.concat({ offered.ShopEntryId, definition.DisplayName, offered.RewardType, offered.RewardRefId,
+			local row = table.concat({ offered.ShopEntryId, definition.DisplayName, offered.RewardType, offered.RewardRefId,
 				tostring(offered.RewardAmount), offered.PriceCurrencyId, tostring(offered.PriceAmount), tostring(offered.DisplayOrder),
 				offered.IconImageRUID, offered.ItemCategory, tostring(definition.AttackBonus), tostring(definition.MaxHpBonus),
 				tostring(definition.DefenseBonus), definition.EffectDescription }, "~")
+			snapshot = snapshot == "" and row or snapshot .. "|" .. row
+			table.remove(candidates, index)
+			table.remove(relicIds, index)
+		end
+		for _, entry in ipairs(potions.Entries) do
+			offeredEntries[entry.ShopEntryId] = entry
+			local row = table.concat({ entry.ShopEntryId, entry.DisplayName, entry.RewardType, entry.RewardRefId,
+				"1", entry.PriceCurrencyId, tostring(entry.PriceAmount), tostring(entry.DisplayOrder), entry.IconImageRUID,
+				"물약", "0", "0", "0", entry.EffectDescription }, "~")
+			snapshot = snapshot == "" and row or snapshot .. "|" .. row
 		end
 		local opened = shopState:Open(runState.RunSequence, shopId, runState.SelectedNodeId, bundle.Definition.DisplayName, runState.LastContentSelectionKey, snapshot)
 		if opened.Success then
-			shopState.OfferedEntry = offered or {}
+			shopState.OfferedEntry = firstOffered or {}
+			shopState.OfferedEntries = offeredEntries
 			self:CaptureSellCatalog(shopState, relics)
 		end
 		return opened
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildPotionOffers(string shopId, integer runSequence, integer visitSequence)
+		-- Freeze three potion offers per visit; visit-specific IDs prevent replay and reopen restocking.
+		local entries = {}
+		for index, id in ipairs({ "red_potion", "orange_potion", "white_potion" }) do
+			local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(id)
+			if not definition.Success then return definition end
+			local price = _ConsumableDefinitionRepositoryLogic.ShopBasePrices[id] or 0
+			if price <= 0 then return { Success = false, Reason = "INVALID_POTION_PRICE" } end
+			local displayName = string.gsub(definition.DisplayName, "[~|]", " ")
+			local description = string.gsub(definition.Description, "[~|]", " ")
+			table.insert(entries, { Success = true, ShopId = shopId, ShopEntryId = "potion:" .. runSequence .. ":" .. visitSequence .. ":" .. id,
+				DisplayName = displayName, RewardType = "CONSUMABLE", RewardRefId = id, RewardAmount = 1,
+				PriceCurrencyId = "gold", PriceAmount = price, DisplayOrder = 100 + index,
+				IconImageRUID = definition.IconKey, EffectDescription = description })
+		end
+		return { Success = true, Entries = entries }
 	end
 
 	@ExecSpace("ServerOnly")
@@ -178,7 +218,8 @@ script RunShopLogic extends Logic
 			shopState:PublishPurchaseResult(shopEntryId, false, "SHOP_NOT_OPEN")
 			return { Success = false, Reason = "SHOP_NOT_OPEN" }
 		end
-		if shopState.OfferedEntry.ShopEntryId == nil or shopState.OfferedEntry.ShopEntryId ~= shopEntryId then
+		local entry = shopState.OfferedEntries[shopEntryId]
+		if entry == nil then
 			shopState:PublishPurchaseResult(shopEntryId, false, "SHOP_OFFER_MISMATCH")
 			return { Success = false, Reason = "SHOP_OFFER_MISMATCH" }
 		end
@@ -191,7 +232,6 @@ script RunShopLogic extends Logic
 			shopState:PublishPurchaseResult(shopEntryId, true, "DUPLICATE_PURCHASE_IGNORED")
 			return { Success = true, Reason = "DUPLICATE_PURCHASE_IGNORED", ShopEntryId = shopEntryId, Revision = shopState.ShopRevision }
 		end
-		local entry = shopState.OfferedEntry
 		if entry.Success == false then
 			shopState:PublishPurchaseResult(shopEntryId, false, entry.Reason)
 			return entry
@@ -319,8 +359,11 @@ script RunShopLogic extends Logic
 		if shopState == nil or inventory == nil or runState == nil then
 			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
 		end
-		local offerId = string.match(shopState.OfferSnapshot, "^([^~]+)~")
-		local sold = offerId ~= nil and string.find("|" .. shopState.PurchasedOfferIds .. "|", "|" .. offerId .. "|", 1, true) ~= nil
+		local hasAvailableOffer = false
+		for row in string.gmatch(shopState.OfferSnapshot, "([^|]+)") do
+			local offerId = string.match(row, "^([^~]+)~")
+			if offerId ~= nil and string.find("|" .. shopState.PurchasedOfferIds .. "|", "|" .. offerId .. "|", 1, true) == nil then hasAvailableOffer = true end
+		end
 		return {
 			Success = true,
 			Reason = shopState.ShopState == "CLOSED" and shopState.LastCloseReason or shopState.LastPurchaseReason,
@@ -353,7 +396,7 @@ script RunShopLogic extends Logic
 			},
 			Commands = {
 				CanOpenUi = runState.RunFlowState == "AWAITING_SHOP" and runState.SelectedContentType == "SHOP",
-				CanPurchase = shopState.ShopState == "OPEN" and offerId ~= nil and not sold,
+				CanPurchase = shopState.ShopState == "OPEN" and hasAvailableOffer,
 				CanClose = shopState.ShopState == "OPEN",
 				CanSkip = shopState.ShopState == "OPEN"
 			}
@@ -367,13 +410,6 @@ script RunShopLogic extends Logic
 		local effects = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		if effects == nil then effects = playerEntity:AddComponent("PlayerRunRelicEffectComponent") end
 		return effects
-	end
-
-	@ExecSpace("ServerOnly")
-	method integer SelectOfferIndex(integer count)
-		-- Draw a fresh offer for each new visit; OpenShop reuses the saved offer on reopen.
-		if count <= 0 then return 0 end
-		return _UtilLogic:RandomIntegerRange(1, count)
 	end
 
 end
