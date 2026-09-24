@@ -13,3 +13,17 @@
 검증: `node --test tools/balance-schema.test.cjs`
 
 브라우저 화면·파일 선택 동작은 자동화 보안 정책으로 확인하지 못했습니다. CSV 모듈과 스크립트 구문은 Node 테스트로 검증합니다.
+
+---
+
+# Balance Studio
+
+`balance-studio.html`은 위 Balance Workbench와 별개인, 밸런스를 "보면서" 조정하기 위한 도구입니다. 같은 `RootDesk/MyDesk/03_Data` 폴더를 엽니다.
+
+- **대시보드**: 직업별 스킬 수·평균 피해·평균 쿨다운·턴당 기대치, 직업별 특수 효과 분포, 지역별 몬스터 수·평균 HP/공격력, 보스 목록.
+- **밸런스 뷰**: 스킬·몬스터를 카드/리스트로 보고 수치를 바로 수정, 스킬 비교, 몬스터 패턴 상세.
+- **노드맵**: `NodeDefinitions`의 런 진행 그래프.
+- **데이터 에디터**: 46개 CSV 원본 편집(표/인스펙터), 참조 이동, 영향 분석.
+- **RUID 미리보기·변경**: MSW 리소스 검색 API로 이미지를 보여주고, 검색/비슷한 리소스로 바꿀 수 있습니다. 이 기능만 인터넷을 사용하며 상단 🖼 버튼으로 끌 수 있습니다.
+
+`file://`로 열면 읽기 전용(저장은 테이블별 다운로드), `http://localhost`에서 Chrome/Edge로 열면 폴더에 바로 저장합니다. 저장 후 Maker Refresh와 `_ContentValidatorLogic:ValidateAllContent()`로 교차 확인하세요.
