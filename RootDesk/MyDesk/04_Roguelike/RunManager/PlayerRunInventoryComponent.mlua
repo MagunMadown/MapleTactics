@@ -37,6 +37,7 @@ script PlayerRunInventoryComponent extends Component
 		self.RunSkillBarSlotIds = ""
 		self.RunItemSnapshot = ""
 		self.AppliedRewardKeys = ""
+		self._T.NewSkillRewardReceipts = {}
 		self.AppliedUseKeys = ""
 		self.AppliedPurchaseKeys = ""
 		self.InventoryRevision = self.InventoryRevision + 1
@@ -238,6 +239,43 @@ script PlayerRunInventoryComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ApplySkillTestBarSlot(integer slotIndex, string skillId)
+		-- Skill test map only (BattleSessionComponent.SkillTestMode gates the caller). Places one SkillId in a
+		-- fixed slot, moving it if it is already on the bar, and makes the owned set equal the bar so the
+		-- unchanged ownership checks in queue/reorder accept any skill the tester equips.
+		if self.ActiveRunSequence <= 0 then
+			return { Success = false, Reason = "RUN_NOT_STARTED" }
+		end
+		if slotIndex < 1 or slotIndex > self.RunSkillBarSlotCount then
+			return { Success = false, Reason = "SLOT_INDEX_OUT_OF_RANGE" }
+		end
+		if self:IsSafeToken(skillId) == false then
+			return { Success = false, Reason = "INVALID_SKILL_ID" }
+		end
+		local slots = self:ParseRunSkillBarSlotPipe(self.RunSkillBarSlotIds)
+		for index = 1, self.RunSkillBarSlotCount do
+			if slots[index] == skillId then
+				slots[index] = ""
+			end
+		end
+		slots[slotIndex] = skillId
+		local ownedSnapshot = ""
+		for index = 1, self.RunSkillBarSlotCount do
+			local slotSkillId = slots[index] or ""
+			if slotSkillId ~= "" then
+				ownedSnapshot = self:SetSnapshotAmount(ownedSnapshot, slotSkillId, 1)
+			end
+		end
+		self.RunSkillSnapshot = ownedSnapshot
+		self.RunSkillBarSlotIds = self:SerializeRunSkillBarSlotPipe(slots)
+		self.RunSkillBarRevision = self.RunSkillBarRevision + 1
+		self.InventoryRevision = self.InventoryRevision + 1
+		self.SkillInventoryRevision = self.SkillInventoryRevision + 1
+		log("[SkillTestBar] slot applied slot=" .. tostring(slotIndex) .. " skill=" .. skillId .. " slots=" .. self.RunSkillBarSlotIds .. " owned=" .. self.RunSkillSnapshot)
+		return { Success = true, Reason = "OK", SlotIds = self.RunSkillBarSlotIds }
+	end
+
+	@ExecSpace("ServerOnly")
 	method table ReplaceRunSkillBarUpgrade(string baseSkillId, string upgradeSkillId)
 		-- Replaces a removed base SkillId in its exact slot using the validated upgrade relationship.
 		if self.RunSkillBarSlotIds == "" then
@@ -341,6 +379,73 @@ script PlayerRunInventoryComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table CommitNewSkillReward(string skillId, string replacedSkillId, boolean skip, string rewardKey, integer expectedRevision, string expectedSlots, string nextMap)
+		-- Commits one stage choice atomically; retries return the original receipt before checking ownership.
+		if self.ActiveRunSequence <= 0 or self:IsSafeToken(rewardKey) == false or self:IsSafeToken(skillId) == false or nextMap == "" then
+			return { Success = false, Reason = "INVALID_SKILL_REWARD_KEY" }
+		end
+		self._T.NewSkillRewardReceipts = self._T.NewSkillRewardReceipts or {}
+		local receipt = self._T.NewSkillRewardReceipts[rewardKey]
+		if receipt ~= nil then return receipt end
+		if self:ContainsDelimitedKey(self.AppliedRewardKeys, rewardKey) then
+			return { Success = false, Reason = "REWARD_ALREADY_PROCESSED" }
+		end
+		if expectedRevision ~= self.SkillInventoryRevision or expectedSlots ~= self.RunSkillBarSlotIds then
+			return { Success = false, Reason = "STALE_SKILL_INVENTORY" }
+		end
+		local owned = self:GetDistinctOwnedSkillIds()
+		local snapshot = self.RunSkillSnapshot
+		local slotIds = self.RunSkillBarSlotIds
+		local reason = "SKIPPED"
+		if skip == false then
+			if self:GetSnapshotAmount(snapshot, skillId) > 0 then return { Success = false, Reason = "SKILL_ALREADY_OWNED" } end
+			local slots = self:ParseRunSkillBarSlotPipe(slotIds)
+			if replacedSkillId ~= "" then
+				if #owned ~= self.RunSkillBarSlotCount then return { Success = false, Reason = "INVALID_REPLACEMENT_COUNT" } end
+				local replacedSlot = 0
+				local seen = {}
+				for index = 1, self.RunSkillBarSlotCount do
+					local id = slots[index]
+					if id == "" or seen[id] or self:GetSnapshotAmount(snapshot, id) <= 0 then
+						return { Success = false, Reason = "STALE_SKILL_INVENTORY" }
+					end
+					seen[id] = true
+					if id == replacedSkillId then replacedSlot = index end
+				end
+				if replacedSlot == 0 then return { Success = false, Reason = "REPLACEMENT_NOT_OWNED" } end
+				snapshot = self:SetSnapshotAmount(snapshot, replacedSkillId, 0)
+				slots[replacedSlot] = skillId
+				slotIds = self:SerializeRunSkillBarSlotPipe(slots)
+				reason = "REPLACED"
+			else
+				if #owned >= self.RunSkillBarSlotCount then return { Success = false, Reason = "REPLACEMENT_REQUIRED" } end
+				if slotIds ~= "" then
+					local emptySlot = self:FindFirstEmptyRunSkillBarSlot(slots)
+					if emptySlot == 0 then return { Success = false, Reason = "STALE_SKILL_INVENTORY" } end
+					slots[emptySlot] = skillId
+					slotIds = self:SerializeRunSkillBarSlotPipe(slots)
+				end
+				reason = "APPLIED"
+			end
+			snapshot = self:AddSnapshotAmount(snapshot, skillId, 1)
+		end
+		-- No waits or external calls between the staged values and the receipt commit.
+		self.RunSkillSnapshot = snapshot
+		if slotIds ~= self.RunSkillBarSlotIds then
+			self.RunSkillBarSlotIds = slotIds
+			self.RunSkillBarRevision = self.RunSkillBarRevision + 1
+		end
+		self.AppliedRewardKeys = self:AppendDelimitedKey(self.AppliedRewardKeys, rewardKey)
+		self.InventoryRevision = self.InventoryRevision + 1
+		if skip == false then self.SkillInventoryRevision = self.SkillInventoryRevision + 1 end
+		receipt = { Success = true, Reason = reason, SkillId = skillId, ReplacedSkillId = replacedSkillId,
+			RunSequence = self.ActiveRunSequence, RewardKey = rewardKey, NextStageMapName = nextMap, Revision = self.SkillInventoryRevision }
+		self._T.NewSkillRewardReceipts[rewardKey] = receipt
+		log("[NewSkillReward] committed key=" .. rewardKey .. " result=" .. reason .. " old=" .. replacedSkillId .. " new=" .. skillId .. " owned=" .. snapshot .. " slots=" .. slotIds)
+		return receipt
+	end
+
+	@ExecSpace("ServerOnly")
 	method table UpgradeSkill(string baseSkillId, string upgradeSkillId, string rewardKey)
 		-- Atomically replaces one owned base-skill copy with its validated next-tier skill.
 		if self.ActiveRunSequence <= 0 then
@@ -433,6 +538,30 @@ script PlayerRunInventoryComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table GrantRelic(string relicId, string rewardKey)
+		-- Adds one catalog-validated relic once without a shop charge or currency mutation.
+		local effects = self.Entity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if self.ActiveRunSequence <= 0 or effects == nil or not effects.IsInitialized
+			or effects.ActiveRunSequence ~= self.ActiveRunSequence then
+			return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" }
+		end
+		if not self:IsSafeToken(rewardKey) or effects.Definitions[relicId] == nil then
+			return { Success = false, Reason = "INVALID_RELIC_REWARD" }
+		end
+		if self:ContainsDelimitedKey(self.AppliedRewardKeys, rewardKey) then
+			return { Success = true, Reason = "DUPLICATE_REWARD_IGNORED" }
+		end
+		if self:GetSnapshotAmount(self.RunItemSnapshot, relicId) > 0 then
+			return { Success = false, Reason = "RELIC_ALREADY_OWNED" }
+		end
+		self.RunItemSnapshot = self:AddSnapshotAmount(self.RunItemSnapshot, relicId, 1)
+		self.AppliedRewardKeys = self:AppendDelimitedKey(self.AppliedRewardKeys, rewardKey)
+		self.InventoryRevision = self.InventoryRevision + 1
+		log("[UnionStartingRelic] granted sequence=" .. self.ActiveRunSequence .. " relic=" .. relicId .. " key=" .. rewardKey)
+		return { Success = true, Reason = "RELIC_GRANTED", RelicId = relicId }
+	end
+
+	@ExecSpace("ServerOnly")
 	method table ApplyShopPurchase(string priceCurrencyId, integer priceAmount, string rewardType, string rewardRefId, integer rewardAmount, string purchaseKey)
 		-- Owns the atomic currency deduction and reward mutation for one validated run-shop offer.
 		if rewardType == "CONSUMABLE" then
@@ -508,6 +637,28 @@ script PlayerRunInventoryComponent extends Component
 		result.Revision = self.InventoryRevision
 		log("[RunInventory] purchase applied key=" .. purchaseKey .. " price=" .. priceCurrencyId .. ":" .. priceAmount .. " balance=" .. result.BalanceBefore .. "->" .. result.BalanceAfter .. " reward=" .. rewardType .. ":" .. rewardRefId .. " amount=" .. result.AcceptedAmount .. " overflow=" .. result.OverflowAmount .. " revision=" .. self.InventoryRevision)
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyShopSale(string consumableId, string itemType, integer unitPrice, integer expectedRevision)
+		-- Atomically exchanges one owned item for server-validated gold; stale retries cannot sell twice.
+		if itemType ~= "CONSUMABLE" and itemType ~= "ITEM" then return { Success = false, Reason = "ITEM_NOT_SELLABLE" } end
+		if self.ActiveRunSequence <= 0 or unitPrice <= 0 or not self:IsSafeToken(consumableId) then
+			return { Success = false, Reason = "INVALID_SHOP_SALE" }
+		end
+		if expectedRevision ~= self.InventoryRevision then
+			return { Success = false, Reason = "INVENTORY_CHANGED" }
+		end
+		local snapshot = itemType == "ITEM" and self.RunItemSnapshot or self.RunConsumableSnapshot
+		local owned = self:GetSnapshotAmount(snapshot, consumableId)
+		if owned <= 0 then return { Success = false, Reason = "ITEM_NOT_OWNED" } end
+		local nextItems = self:SetSnapshotAmount(snapshot, consumableId, owned - 1)
+		local nextGold = self:AddSnapshotAmount(self.RunCurrencySnapshot, "gold", unitPrice)
+		if itemType == "ITEM" then self.RunItemSnapshot = nextItems else self.RunConsumableSnapshot = nextItems end
+		self.RunCurrencySnapshot = nextGold
+		self.InventoryRevision = self.InventoryRevision + 1
+		log("[RunShopSale] applied item=" .. consumableId .. " gold=" .. tostring(unitPrice) .. " remaining=" .. tostring(owned - 1))
+		return { Success = true, Reason = "SALE_APPLIED", Gold = unitPrice, RemainingAmount = owned - 1 }
 	end
 
 	@ExecSpace("ServerOnly")
