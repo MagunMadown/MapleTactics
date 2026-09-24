@@ -914,6 +914,14 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 
 ## 21. 규격 변경 절차
 
+### 유물 특수능력 확장 (2026-09-24)
+
+- `RelicDefinitions`는 기존 능력치 열을 유지하고 선택 열 `SpecialEffectType`, `SpecialEffectValue`를 추가한다. 빈 효과는 기존 능력치 유물로 읽는다.
+- `PlayerRunRelicEffectComponent`가 런에 고정된 정의·합산 효과와 전투별 발동 횟수를 소유한다. HP·Cooldown·재화 원본은 기존 소유자에 남는다.
+- Session의 전투 시작·처치 확정 → 유물 API → Unit/SkillRuntime 공개 API, RunManager의 승리 처리 → 유물 API → 보상 Facade 순서로 호출한다.
+- 특정 RelicId 분기는 전투 코어에 추가하지 않는다. 상점·HUD는 Repository가 생성한 동일한 설명을 사용한다.
+- 구현 및 검증 범위와 초기 수치는 `Run-Shop-Authoring-Guide.md`의 유물 특수능력 규격을 따른다. Maker 미검증 상태는 구현 완료와 구별한다.
+
 1. 변경 이유와 영향을 받는 Definition/Component를 기록한다.
 2. 기존 Stage 1 데이터가 새 Repository에서 계속 읽히는지 확인한다.
 3. 가능하면 필드 추가 방식으로 변경한다.

@@ -64,7 +64,7 @@ Node 선택 → OPEN_SHOP
 | `MaxPurchasesPerRun` | 현재 규격은 `1`만 지원 |
 | `Enabled` | 활성 여부 |
 
-현재 33종 유물은 모두 1골드다. `RelicDefinitions`에 같은 RewardRefId와 세 보너스(0 이상의 정수)를 등록한다. 기존 ItemCategory·IconImageRUID는 유지한다. 미보유 활성 유물 중 한 개만 진열하며 재열기·구매 후 재추첨하지 않는다. 전체 보유 시 빈 상점에서도 퇴장할 수 있다.
+현재 33종 유물은 모두 1골드다. `RelicDefinitions`에 같은 RewardRefId와 세 보너스(0 이상의 정수), 선택적인 특수능력을 등록한다. 기존 ItemCategory·IconImageRUID는 유지한다. 미보유 활성 유물 중 한 개만 진열하며 재열기·구매 후 재추첨하지 않는다. 전체 보유 시 빈 상점에서도 퇴장할 수 있다.
 기존 스킬·포션 상품 예시는 초기 프로토타입 기록이다. 현재 `ShopEntries.csv`는 장비 상품이며 소비 아이템 상품은 없다. 소비 아이템 추가 시 현재 5종 ID와 기존 구매 API를 사용하고, 총 수량 3~5칸 및 초과 재화 정책을 따른다. 이번 소비 HUD 작업에서는 상품 행을 추가하지 않았다.
 
 ## 서버 API
@@ -116,7 +116,7 @@ UI는 표를 직접 읽거나 잔액을 차감하지 않는다. Snapshot은 `|`,
 
 ## 확장 규칙
 
-1. 상품 추가는 ShopEntries와 RelicDefinitions에 동일 ID의 행을 추가한다. 능력치 변경은 RelicDefinitions 세 수치를 수정하고 새 런에서 확인한다.
+1. 상품 추가는 ShopEntries와 RelicDefinitions에 동일 ID의 행을 추가한다. 능력치·특수능력 변경은 RelicDefinitions 수치를 수정하고 새 런에서 확인한다.
 2. 새 RewardType은 전용 상태 소유자와 원자적 거래 경계를 먼저 설계한다.
 3. Run당 2회 이상 구매나 재입고가 필요하면 숫자를 먼저 풀지 말고 Shop State의 구매 수량
    Snapshot과 Validator를 함께 확장한다.
@@ -127,3 +127,39 @@ UI는 표를 직접 읽거나 잔액을 차감하지 않는다. Snapshot은 `|`,
    추가한다. 재방문은 새 고유 `NodeId`를 만들고 기존 `ShopId`에 바인딩한다.
 
 경로는 shop_upper/shop_lower NodeId로 구분하며 두 바인딩의 ShopId는 shop_relic이다. 퇴장 UI도 NodeId로 다음 경로를 선택한다.
+
+## 유물 특수능력 (2026-09-24)
+
+기존 33종 중 아래 8종의 능력치 보너스를 0으로 바꾸고 특수능력으로 대체한다. 나머지 25종은 그대로다.
+
+| RelicId | SpecialEffectType | SpecialEffectValue | 효과 |
+|---|---|---:|---|
+| romeo_pendant | KILL_HEAL | 1 | 플레이어가 적을 처치하면 HP 1 회복 |
+| juliet_pendant | VICTORY_HEAL | 2 | 최종 전투 승리 시 HP 2 회복 |
+| ice_knight_shoulder | FIRST_HIT_GUARD | 1 | 전투마다 첫 유효 피격 1회 무효화 |
+| von_leon_war_belt | LETHAL_SURVIVAL | 1 | 전투마다 치명적인 피해 1회를 HP 1로 버팀 |
+| rice_cake_one | BATTLE_START_HEAL | 1 | 전투 시작 시 HP 1 회복 |
+| tangyoon_chef_hat | CONSUMABLE_HEAL_BONUS | 1 | HEAL 소모품 회복량 +1 |
+| altaire_earring | FIRST_KILL_COOLDOWN | 1 | 전투마다 첫 처치 시 전체 스킬 쿨다운 1 감소 |
+| greedy_davy_john_hat | VICTORY_MESO | 5 | 최종 전투 승리 시 기본 추가 메소 5 지급 |
+
+### 데이터·수명 계약
+
+- `SpecialEffectType`은 위 열거값 또는 빈 문자열, `SpecialEffectValue`는 양의 정수다. 효과가 없으면 0/빈칸이며 열이 없는 구형 표도 허용한다. 방어·생존 효과 값은 1만 허용한다.
+- `EffectDescription`은 편집용 참고값이며 런타임 설명은 검증된 능력치·특수능력에서 생성한다. 설명은 기존 상점 Snapshot과 전투 HUD DTO로 전달한다.
+- 보유 수량과 무관하게 유물별 1회 합산한다. 동일 효과 종류의 수치형 효과는 합산한다. 정의는 새 Run 시작 시 캡처되므로 변경 확인은 새 런에서 한다.
+- 전투 키는 `RunSequence:StageId:EntryRequestId`다. 같은 전투 재초기화·재진입과 웨이브 전환은 횟수를 충전하지 않는다. 다른 전투 키·새 런에서는 초기화한다.
+- 유틸리티 가드와 GUARD 버프가 먼저 막는다. 막힌 공격은 유물 방어/생존을 소비하지 않는다. 유물 첫 피격 무효가 생존보다 우선하며, HP 1에서도 생존 효과는 정상 발동한다.
+- 다단히트는 피해 적용 1회를 피격 1회로 본다. 처치는 확정된 적 사망마다 1회이며, 보스 처치 후 제거되는 잡몹은 추가 처치가 아니다.
+- 첫 처치에 감소할 쿨다운이 없어도 첫 처치 기회는 소비한다. HP가 가득 차면 회복은 무효이며 부활시키지 않는다.
+- 승리 효과는 웨이브 클리어나 패배에 발동하지 않는다. 메소는 RunManager 보상 Facade와 기존 멱등 키를 사용하며 유니온 메소 보너스가 적용된다. 결과 재시도에서 회복·재화를 중복 지급하지 않는다.
+
+### 변경 영향 및 검증
+
+- `[CORE-LOCK] BattleSession` 작업 종료·잠금 해제: 수정 지점은 `TryStartBattle`, `HandleUnitDiedFromSource`의 유물 호출이며 기존 턴·웨이브 순서는 유지한다.
+- 피해 방어는 `BattleUnit.ApplyDamage`에서 HP 변경 전 처리하고, 포션 보너스는 `ConsumableHealEffectLogic.Execute`에 연결한다. 승리 효과는 `RunManager.RecordBattleResult`에 연결한다.
+- 기존 저장 데이터 형식과 유물 ID는 유지한다. 새 모델·맵·UI 파일이나 코드블록 수동 변경은 없다.
+- 검증 대상: 8종 단독/동시 보유, 만피/치명상/HP 1, 기존 가드, 중복 처치/승리/진입, 웨이브 유지, 런 초기화, 잘못된 정의 거부, 기존 능력치 유물 회귀.
+- Maker Build/Play 검증은 연결된 Maker MCP가 없어 미실행. 로컬 메서드 테스트는 엔진·동기화 검증을 대체하지 않는다.
+- 로컬 검증: `node Artifacts/tests/relic-special-effects-test.cjs`에서 실제 mLua 메서드 146개 assertion 통과. `node --test tools/balance-schema.test.cjs` 23개 테스트 통과. 기존 25종은 변경 전 데이터와 모든 기존 열이 동일함을 비교한다.
+- Maker 후속 확인: 편집 모드 Refresh → Build/Normal 로그 확인 → 새 런 시작 → 각 유물 보유 상태에서 위 효과 및 전투 간 초기화 확인 → `[RunRelic] triggered` 로그와 실제 HP/쿨다운/메소 대조 → Stop.
