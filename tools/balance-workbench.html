@@ -12,6 +12,7 @@
     --border: #333849;
     --text: #e6e8ee;
     --dim: #9aa0b0;
+    --dimmer: #6c7285;
     --accent: #5b8cff;
     --error: #ff5d6c;
     --warn: #ffb347;
@@ -139,6 +140,32 @@
   #screenTabs { display: flex; gap: 4px; padding: 8px 16px; background: #10121a; border-bottom: 1px solid var(--border); }
   #screenTabs button { font-size: 12.5px; }
   #screenTabs button.active { background: var(--accent); border-color: var(--accent); color: #0b0d12; font-weight: 600; }
+  #screenTabs .spacer { flex: 1; }
+  #screenTabs #btnRuidPreview { font-size: 12px; color: var(--dim); }
+  #screenTabs #btnRuidPreview.on { color: var(--text); }
+
+  /* ---- RUID image previews ---- */
+  .ruid-thumb { display: inline-flex; align-items: center; justify-content: center; flex: none; position: relative;
+    border: 1px solid var(--border); border-radius: 6px; background: #0e1016; overflow: hidden;
+    color: var(--dimmer); font-size: 10px; line-height: 1; vertical-align: middle; }
+  .ruid-thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .ruid-thumb.ok { cursor: zoom-in; }
+  .ruid-thumb.ok:hover { border-color: var(--accent); }
+  .ruid-thumb.loading { background: linear-gradient(90deg, var(--panel2) 25%, #2c3140 50%, var(--panel2) 75%);
+    background-size: 200% 100%; animation: ruid-shimmer 1.2s linear infinite; }
+  .ruid-thumb.error { color: var(--warn); cursor: pointer; }
+  .ruid-thumb.empty { opacity: .45; }
+  .ruid-thumb.off { display: none; }
+  @keyframes ruid-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  @media (prefers-reduced-motion: reduce) { .ruid-thumb.loading { animation: none; } }
+  .ruid-field { display: flex; align-items: center; gap: 6px; }
+  .ruid-field > input { flex: 1; min-width: 0; }
+  .ruid-field-thumb:empty { display: none; }
+  .bal-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .bal-effect-strip { grid-column: 1 / -1; display: flex; gap: 10px; flex-wrap: wrap; padding-top: 4px; }
+  .bal-effect-strip figure { margin: 0; display: flex; flex-direction: column; align-items: center; gap: 3px;
+    font-size: 10.5px; color: var(--dim); }
+  table.bal-list td.list-thumb { width: 1%; padding-right: 0; }
   .tab-subgroup-label { flex-basis: 100%; font-size: 10px; color: var(--dim); text-transform: uppercase;
     letter-spacing: 0.03em; margin: 4px 0 -2px 2px; }
   .back-btn { border-color: var(--accent); color: var(--accent); }
@@ -231,8 +258,9 @@
   .bal-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 12.5px; margin-bottom: 10px; }
   .bal-stats .stat-k { color: var(--dim); }
   .bal-stats .stat-v { text-align: right; font-family: "JetBrains Mono", monospace; }
+  .bal-stats > * { min-width: 0; }
   .bal-stats .stat-v .numstep { min-width: 0; justify-content: flex-end; }
-  .bal-stats .stat-v .numstep-input { min-width: 26px; font-size: 12px; padding: 2px 3px; }
+  .bal-stats .stat-v .numstep-input { width: 0; min-width: 26px; font-size: 12px; padding: 2px 3px; }
   .bal-stats .stat-v .numstep-btn { width: 20px; height: 20px; font-size: 13px; }
   .bal-derived { border-top: 1px dashed var(--border); padding-top: 9px; margin-top: 6px; font-size: 12px; color: var(--dim); }
   .bal-derived div { display: flex; justify-content: space-between; cursor: help; padding: 1px 0; }
@@ -340,6 +368,8 @@
   <button id="btnScreenBalance">⚖ 밸런스</button>
   <button id="btnScreenGraph">🗺 노드맵</button>
   <button id="btnScreenEditor">✏ 데이터 에디터</button>
+  <span class="spacer"></span>
+  <button id="btnRuidPreview" title="RUID 이미지 미리보기 (MSW 리소스 검색 API 사용, 인터넷 연결 필요)">🖼 미리보기</button>
 </div>
 
 <div id="guideMapArea"></div>
@@ -1258,6 +1288,7 @@
   const btnScreenBalance = el("#btnScreenBalance");
   const btnScreenGraph = el("#btnScreenGraph");
   const btnScreenEditor = el("#btnScreenEditor");
+  const btnRuidPreview = el("#btnRuidPreview");
   const guideMapAreaEl = el("#guideMapArea");
   const balanceAreaEl = el("#balanceArea");
   const graphAreaEl = el("#graphArea");
@@ -1697,6 +1728,323 @@
     });
   }
 
+  // ---------- RUID image previews ----------
+  //
+  // Resolves a resource RUID to a preview image through MSW's public resource
+  // search API: GET /v3/resources/{ruid} -> payload.thumbnail (a plain CDN
+  // image URL). Verified from a real browser that this GET isn't CORS-blocked
+  // and that animationclip/sprite resources return a thumbnail, while some
+  // avataritems return payload: null — that's "no preview exists", not an error.
+  //
+  // Lazy: nothing is requested until a thumbnail scrolls near the viewport
+  // (collapsed groups and closed "더보기" sections never request at all).
+  // Batched: RUIDs that become visible in the same tick go out as one
+  // POST /v3/resources/batch. That's a JSON POST, which (unlike the verified
+  // GET) needs a CORS preflight nobody has checked — so if it fails once,
+  // batching is switched off for the session and the same ids fall back to
+  // individual GETs, at most RUID_GET_CONCURRENCY in flight.
+  // Cached: every screen rebuilds its DOM on each edit, so resolved entries
+  // are kept in memory, and in localStorage (with a TTL) across reloads.
+  const RUID_API = "https://maplestoryworlds-resourcesearch-new.nexon.com/api/v3";
+  const RUID_HEX = /^[0-9a-f]{32}$/;
+  const RUID_CACHE_KEY = "mt-bw-ruid-thumbs-v1";
+  const RUID_PREF_KEY = "mt-bw-ruid-previews";
+  const RUID_TTL_OK = 7 * 24 * 3600 * 1000;
+  const RUID_TTL_NONE = 24 * 3600 * 1000;
+  const RUID_ERROR_RETRY_MS = 60 * 1000;
+  const RUID_BATCH_MAX = 50;
+  const RUID_GET_CONCURRENCY = 4;
+
+  const ruidPreview = {
+    enabled: true,
+    cache: new Map(), // ruid -> { s: 'ok'|'none'|'error', u: url, t: type, n: name, ts }
+    inflight: new Set(),
+    queue: new Set(),
+    getQueue: [],
+    activeGets: 0,
+    subscribers: new Map(), // ruid -> Set<thumb element> waiting on it
+    observed: new Set(),
+    batchSupported: true,
+    flushTimer: null,
+    persistTimer: null,
+  };
+
+  (function loadRuidPreviewState() {
+    try {
+      if (localStorage.getItem(RUID_PREF_KEY) === "off") ruidPreview.enabled = false;
+      const raw = localStorage.getItem(RUID_CACHE_KEY);
+      if (!raw) return;
+      const now = Date.now();
+      const stored = JSON.parse(raw);
+      for (const ruid in stored) {
+        const e = stored[ruid];
+        if (!e || (e.s !== "ok" && e.s !== "none")) continue;
+        if (now - e.ts < (e.s === "ok" ? RUID_TTL_OK : RUID_TTL_NONE)) ruidPreview.cache.set(ruid, e);
+      }
+    } catch (_) {
+      // Storage blocked (private window, file:// policy, ...): memory cache only.
+    }
+  })();
+
+  function persistRuidCache() {
+    clearTimeout(ruidPreview.persistTimer);
+    ruidPreview.persistTimer = setTimeout(() => {
+      try {
+        const out = {};
+        ruidPreview.cache.forEach((e, ruid) => { if (e.s === "ok" || e.s === "none") out[ruid] = e; });
+        localStorage.setItem(RUID_CACHE_KEY, JSON.stringify(out));
+      } catch (_) {}
+    }, 500);
+  }
+
+  // Relic/Shop icons store the in-engine "thumbnail://<ruid>" form; the
+  // prefix is a render instruction for the MSW client, the RUID is the same.
+  function normalizeRuid(value) {
+    const v = (value || "").trim().toLowerCase().replace(/^thumbnail:\/\//, "");
+    return RUID_HEX.test(v) ? v : "";
+  }
+
+  // Image-bearing RUID columns. Sound columns (CastSoundRuid, DamageSoundRuid,
+  // ...) are audio and have no thumbnail, so they're never requested.
+  function isImageRuidColumn(colName) {
+    return (/(Ruid|RUID)$/.test(colName) || colName === "IconKey") && !/Sound/i.test(colName);
+  }
+
+  function ruidEntryFromResource(res) {
+    const thumb = res && res.payload && res.payload.thumbnail;
+    const names = (res && res.names) || {};
+    return {
+      s: typeof thumb === "string" && /^https:\/\//.test(thumb) ? "ok" : "none",
+      u: typeof thumb === "string" && /^https:\/\//.test(thumb) ? thumb : "",
+      t: (res && res.type) || "",
+      n: (names.ko && names.ko[0]) || (names.en && names.en[0]) || "",
+      ts: Date.now(),
+    };
+  }
+
+  function settleRuid(ruid, entry) {
+    ruidPreview.inflight.delete(ruid);
+    ruidPreview.cache.set(ruid, entry);
+    if (entry.s !== "error") persistRuidCache();
+    const subs = ruidPreview.subscribers.get(ruid);
+    if (!subs) return;
+    ruidPreview.subscribers.delete(ruid);
+    subs.forEach((box) => { if (box.isConnected) paintRuidThumb(box, ruid); });
+  }
+
+  function isRuidResolved(ruid) {
+    const e = ruidPreview.cache.get(ruid);
+    if (!e) return false;
+    if (e.s === "error" && Date.now() - e.ts > RUID_ERROR_RETRY_MS) {
+      ruidPreview.cache.delete(ruid);
+      return false;
+    }
+    return true;
+  }
+
+  function requestRuid(ruid) {
+    if (isRuidResolved(ruid) || ruidPreview.inflight.has(ruid)) return;
+    ruidPreview.queue.add(ruid);
+    if (!ruidPreview.flushTimer) ruidPreview.flushTimer = setTimeout(flushRuidQueue, 30);
+  }
+
+  async function flushRuidQueue() {
+    ruidPreview.flushTimer = null;
+    const ids = [...ruidPreview.queue];
+    ruidPreview.queue.clear();
+    ids.forEach((id) => ruidPreview.inflight.add(id));
+    for (let i = 0; i < ids.length; i += RUID_BATCH_MAX) {
+      const chunk = ids.slice(i, i + RUID_BATCH_MAX);
+      if (ruidPreview.batchSupported && chunk.length > 1 && (await fetchRuidBatch(chunk))) continue;
+      enqueueRuidGets(chunk);
+    }
+  }
+
+  async function fetchRuidBatch(ids) {
+    try {
+      const res = await fetch(`${RUID_API}/resources/batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ ids }),
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      const list = Array.isArray(data) ? data : data && (data.items || data.resources || data.results);
+      if (!Array.isArray(list)) throw new Error("unexpected batch response shape");
+      const byId = new Map(list.filter((r) => r && r.id).map((r) => [String(r.id).toLowerCase(), r]));
+      ids.forEach((id) => settleRuid(id, ruidEntryFromResource(byId.get(id))));
+      return true;
+    } catch (_) {
+      ruidPreview.batchSupported = false;
+      return false;
+    }
+  }
+
+  function enqueueRuidGets(ids) {
+    ruidPreview.getQueue.push(...ids);
+    while (ruidPreview.activeGets < RUID_GET_CONCURRENCY && ruidPreview.getQueue.length) runRuidGetWorker();
+  }
+
+  async function runRuidGetWorker() {
+    ruidPreview.activeGets++;
+    while (ruidPreview.getQueue.length) {
+      const id = ruidPreview.getQueue.shift();
+      try {
+        const res = await fetch(`${RUID_API}/resources/${id}`);
+        if (res.status === 404) settleRuid(id, ruidEntryFromResource(null));
+        else if (!res.ok) throw new Error("HTTP " + res.status);
+        else settleRuid(id, ruidEntryFromResource(await res.json()));
+      } catch (_) {
+        settleRuid(id, { s: "error", u: "", t: "", n: "", ts: Date.now() });
+      }
+    }
+    ruidPreview.activeGets--;
+  }
+
+  const ruidObserver = typeof IntersectionObserver === "function"
+    ? new IntersectionObserver((entries) => {
+        entries.forEach((en) => {
+          if (!en.isIntersecting) return;
+          ruidObserver.unobserve(en.target);
+          ruidPreview.observed.delete(en.target);
+          requestRuid(en.target.dataset.ruid);
+        });
+      }, { rootMargin: "200px" })
+    : null;
+
+  // Screens rebuild their DOM wholesale, so thumbs that were observed but
+  // never scrolled into view get detached without ever firing. Sweep those
+  // periodically rather than leaking them in the observer.
+  function sweepDetachedRuidThumbs() {
+    ruidPreview.observed.forEach((box) => {
+      if (box.isConnected) return;
+      ruidObserver.unobserve(box);
+      ruidPreview.observed.delete(box);
+    });
+    ruidPreview.subscribers.forEach((boxes, ruid) => {
+      boxes.forEach((box) => { if (!box.isConnected) boxes.delete(box); });
+      if (!boxes.size) ruidPreview.subscribers.delete(ruid);
+    });
+  }
+
+  function paintRuidThumb(box, ruid) {
+    const e = ruidPreview.cache.get(ruid);
+    box.textContent = "";
+    box.classList.remove("loading", "ok", "none", "error");
+    box.onclick = null;
+    const label = e ? [e.n, e.t].filter(Boolean).join(" · ") : "";
+    if (!e) {
+      box.classList.add("loading");
+      box.title = `${ruid}\n불러오는 중…`;
+    } else if (e.s === "ok") {
+      box.classList.add("ok");
+      const img = document.createElement("img");
+      img.alt = e.n || ruid;
+      img.decoding = "async";
+      img.addEventListener("error", () => {
+        box.classList.remove("ok");
+        box.classList.add("error");
+        box.textContent = "!";
+        box.title = `${label ? label + "\n" : ""}${ruid}\n이미지를 불러오지 못했습니다.`;
+        box.onclick = null;
+      });
+      img.src = e.u;
+      box.appendChild(img);
+      box.title = `${label ? label + "\n" : ""}${ruid}\n클릭하면 원본 이미지를 새 탭에서 엽니다.`;
+      box.onclick = (ev) => {
+        ev.stopPropagation();
+        window.open(e.u, "_blank", "noopener");
+      };
+    } else if (e.s === "none") {
+      box.classList.add("none");
+      box.textContent = "—";
+      box.title = `${label ? label + "\n" : ""}${ruid}\n미리보기 없음 (리소스 검색 API에 썸네일이 없는 리소스)`;
+    } else {
+      box.classList.add("error");
+      box.textContent = "!";
+      box.title = `${ruid}\n불러오기 실패 — 클릭하면 다시 시도합니다.`;
+      box.onclick = (ev) => {
+        ev.stopPropagation();
+        ruidPreview.cache.delete(ruid);
+        subscribeRuidThumb(box, ruid);
+        paintRuidThumb(box, ruid);
+        requestRuid(ruid);
+      };
+    }
+  }
+
+  function subscribeRuidThumb(box, ruid) {
+    if (!ruidPreview.subscribers.has(ruid)) ruidPreview.subscribers.set(ruid, new Set());
+    ruidPreview.subscribers.get(ruid).add(box);
+  }
+
+  // A preview box for one RUID. Already-resolved RUIDs paint immediately
+  // (so re-renders don't flicker); unknown ones show a loading state and are
+  // only requested once the box nears the viewport. An empty/invalid value
+  // renders a dim placeholder so card layouts stay aligned.
+  function ruidThumb(value, size) {
+    const box = document.createElement("span");
+    box.className = "ruid-thumb";
+    box.style.width = box.style.height = size + "px";
+    if (!ruidPreview.enabled) {
+      box.classList.add("off");
+      return box;
+    }
+    const ruid = normalizeRuid(value);
+    if (!ruid) {
+      box.classList.add("empty");
+      return box;
+    }
+    box.dataset.ruid = ruid;
+    if (isRuidResolved(ruid)) {
+      paintRuidThumb(box, ruid);
+      return box;
+    }
+    ruidPreview.cache.delete(ruid);
+    paintRuidThumb(box, ruid);
+    subscribeRuidThumb(box, ruid);
+    if (!ruidObserver) {
+      requestRuid(ruid);
+    } else {
+      if (ruidPreview.observed.size > 400) sweepDetachedRuidThumbs();
+      ruidPreview.observed.add(box);
+      ruidObserver.observe(box);
+    }
+    return box;
+  }
+
+  // Editor text cell for an image RUID column: the input plus a live preview
+  // that follows what's typed/pasted, before the value is even committed.
+  function wrapWithRuidThumb(input, size) {
+    const wrap = document.createElement("div");
+    wrap.className = "ruid-field";
+    const host = document.createElement("span");
+    host.className = "ruid-field-thumb";
+    const refresh = () => {
+      host.textContent = "";
+      if (ruidPreview.enabled && normalizeRuid(input.value)) host.appendChild(ruidThumb(input.value, size));
+    };
+    refresh();
+    input.addEventListener("input", refresh);
+    wrap.appendChild(host);
+    wrap.appendChild(input);
+    return wrap;
+  }
+
+  function renderRuidPreviewToggle() {
+    btnRuidPreview.classList.toggle("on", ruidPreview.enabled);
+    btnRuidPreview.textContent = ruidPreview.enabled ? "🖼 미리보기 켜짐" : "🖼 미리보기 꺼짐";
+  }
+
+  btnRuidPreview.addEventListener("click", () => {
+    ruidPreview.enabled = !ruidPreview.enabled;
+    try { localStorage.setItem(RUID_PREF_KEY, ruidPreview.enabled ? "on" : "off"); } catch (_) {}
+    renderRuidPreviewToggle();
+    renderScreen();
+    if (state.screen === "editor") renderActiveTable();
+  });
+  renderRuidPreviewToggle();
+
   // ---------- Balance view (Skill concept) ----------
   //
   // Joins one row of a SKILL_SCHEMA_TABLES table with its effect-set rows
@@ -1782,6 +2130,12 @@
       weaponType: get("WeaponType"),
       effectSetId, effectTableName: effectTable, steps, totalDamage, totalHeal, hasDamage, hasHeal,
       otherEffectTypes, primaryStepRowIndex,
+      // Enemy skills mostly carry HudIconRuid instead of IconRuid (57 vs 14
+      // of 59 rows), so fall back to it for the card icon.
+      iconRuid: get("IconRuid") || get("HudIconRuid"),
+      castEffectRuid: get("CastEffectRuid"),
+      hitEffectRuid: get("HitEffectRuid"),
+      projectileRuid: get("ProjectileRuid"),
     };
   }
 
@@ -2003,7 +2357,7 @@
       if (state.balanceSort.key === key) state.balanceSort.dir *= -1;
       else state.balanceSort = { key, dir: 1 };
       renderSkillListView(concepts);
-    }, ["비교"], ["출처"]));
+    }, ruidPreview.enabled ? ["비교", ""] : ["비교"], ["출처"]));
 
     const tbody = document.createElement("tbody");
     sorted.forEach((c) => tbody.appendChild(buildSkillListRow(c)));
@@ -2021,6 +2375,13 @@
     cb.addEventListener("change", () => toggleCompare(c.skillId));
     tdCompare.appendChild(cb);
     tr.appendChild(tdCompare);
+
+    if (ruidPreview.enabled) {
+      const tdThumb = document.createElement("td");
+      tdThumb.className = "list-thumb";
+      tdThumb.appendChild(ruidThumb(c.iconRuid, 28));
+      tr.appendChild(tdThumb);
+    }
 
     const tdName = document.createElement("td");
     tdName.className = "list-name";
@@ -2426,7 +2787,11 @@
     id.textContent = c.skillId;
     nameWrap.appendChild(name);
     nameWrap.appendChild(id);
-    head.appendChild(nameWrap);
+    const title = document.createElement("div");
+    title.className = "bal-title";
+    title.appendChild(ruidThumb(c.iconRuid, 36));
+    title.appendChild(nameWrap);
+    head.appendChild(title);
 
     const compareLabel = document.createElement("label");
     compareLabel.className = "bal-compare-check";
@@ -2488,6 +2853,21 @@
     if (!buildEditableStat(moreStats, "ActionDuration", c.tableName, c.rowIndex, "ActionDuration")) {
       addStat(moreStats, "ActionDuration", c.actionDuration || "—");
     }
+    const effectRuids = [["시전", c.castEffectRuid], ["피격", c.hitEffectRuid], ["투사체", c.projectileRuid]]
+      .filter(([, ruid]) => normalizeRuid(ruid));
+    if (ruidPreview.enabled && effectRuids.length) {
+      const strip = document.createElement("div");
+      strip.className = "bal-effect-strip";
+      effectRuids.forEach(([label, ruid]) => {
+        const fig = document.createElement("figure");
+        fig.appendChild(ruidThumb(ruid, 56));
+        const cap = document.createElement("figcaption");
+        cap.textContent = label;
+        fig.appendChild(cap);
+        strip.appendChild(fig);
+      });
+      moreStats.appendChild(strip);
+    }
     stats.appendChild(moreStats);
     card.appendChild(stats);
 
@@ -2526,15 +2906,18 @@
     }
 
     if (moreStats.childElementCount > 0) {
+      const moreLabel = moreStats.querySelector(".bal-effect-strip")
+        ? "더보기 (Range/Targets/ActionDuration/이펙트) ▾"
+        : "더보기 (Range/Targets/ActionDuration) ▾";
       moreToggleBtn = document.createElement("button");
       moreToggleBtn.className = "bal-more-toggle";
-      moreToggleBtn.textContent = cardExpanded ? "접기 ▲" : "더보기 (Range/Targets/ActionDuration) ▾";
+      moreToggleBtn.textContent = cardExpanded ? "접기 ▲" : moreLabel;
       moreToggleBtn.addEventListener("click", () => {
         if (state.balanceCardExpanded.has(c.skillId)) state.balanceCardExpanded.delete(c.skillId);
         else state.balanceCardExpanded.add(c.skillId);
         const open = moreStats.classList.toggle("open");
         if (moreDerived) moreDerived.classList.toggle("open", open);
-        moreToggleBtn.textContent = open ? "접기 ▲" : "더보기 (Range/Targets/ActionDuration) ▾";
+        moreToggleBtn.textContent = open ? "접기 ▲" : moreLabel;
       });
       stats.appendChild(moreToggleBtn);
     }
@@ -2638,6 +3021,8 @@
         stages, firstStage,
         regionId, regionLabel: rInfo ? rInfo.displayName : (regionId || "미배치"),
         regionOrder: rInfo ? rInfo.order : 9999,
+        // Idle is the natural portrait; 8 enemies only have a move clip.
+        portraitRuid: get("IdleMotionRuid") || get("MoveMotionRuid"),
       };
     });
   }
@@ -2786,7 +3171,11 @@
     id.textContent = c.enemyId;
     nameWrap.appendChild(name);
     nameWrap.appendChild(id);
-    head.appendChild(nameWrap);
+    const title = document.createElement("div");
+    title.className = "bal-title";
+    title.appendChild(ruidThumb(c.portraitRuid, 56));
+    title.appendChild(nameWrap);
+    head.appendChild(title);
     card.appendChild(head);
 
     const badges = document.createElement("div");
@@ -2898,7 +3287,7 @@
       if (state.balanceSort.key === key) state.balanceSort.dir *= -1;
       else state.balanceSort = { key, dir: 1 };
       renderEnemyListView(concepts);
-    }, [], ["스테이지", "PatternId", "출처"]));
+    }, ruidPreview.enabled ? [""] : [], ["스테이지", "PatternId", "출처"]));
 
     const tbody = document.createElement("tbody");
     sorted.forEach((c) => tbody.appendChild(buildEnemyListRow(c)));
@@ -2909,6 +3298,13 @@
 
   function buildEnemyListRow(c) {
     const tr = document.createElement("tr");
+
+    if (ruidPreview.enabled) {
+      const tdThumb = document.createElement("td");
+      tdThumb.className = "list-thumb";
+      tdThumb.appendChild(ruidThumb(c.portraitRuid, 36));
+      tr.appendChild(tdThumb);
+    }
 
     const tdName = document.createElement("td");
     tdName.className = "list-name";
@@ -3740,7 +4136,7 @@
       };
       const widgetWrap = document.createElement("div");
       widgetWrap.className = "card-field-widget";
-      widgetWrap.appendChild(buildCellWidget(colDef, row[colDef.idx] || "", def, name, commit));
+      widgetWrap.appendChild(buildCellWidget(colDef, row[colDef.idx] || "", def, name, commit, { thumbSize: 64 }));
       field.appendChild(widgetWrap);
 
       if (colIssues.length) {
@@ -3790,7 +4186,7 @@
     return t ? t[colName] : undefined;
   }
 
-  function buildCellWidget(colDef, value, def, tableName, commit) {
+  function buildCellWidget(colDef, value, def, tableName, commit, opts) {
     const readonlyNote = readonlyReason(tableName, colDef.name);
     if (readonlyNote) {
       const input = document.createElement("input");
@@ -4019,6 +4415,7 @@
       return wrap;
     }
 
+    if (isImageRuidColumn(colDef.name)) return wrapWithRuidThumb(input, (opts && opts.thumbSize) || 22);
     return input;
   }
 
