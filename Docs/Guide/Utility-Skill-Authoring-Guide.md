@@ -34,9 +34,10 @@
 | teleport | mage | 전방의 빈 칸 중 가장 먼 칸으로 이동 |
 | fairy_turn | archer | 바로 앞 적을 최대 2칸 밀며 막히면 중단 |
 | rapid_evasion | thief | 전방에서 가장 먼 적의 1칸 뒤로 이동. 경계 밖·점유 시 실패 |
-| tidal_wave | pirate | 범위 내 적들을 먼 순서로 끝까지 밀고 맞은 적의 장전 중인 스킬을 취소한 뒤, 시전자를 전방의 연속된 빈 칸 끝으로 이동 |
+| somersault_kick | pirate | 바로 앞 적을 붙잡아 시전자 바로 뒤 칸으로 넘긴다. 대상 없음·HEAVY·뒤 칸이 막히거나 보드 밖이면 실패(쿨다운 미소모) |
 
-파도는 적과 시전자가 동일 거리로 함께 이동하는 원자 연산이 아니다. 현재 구현은 각 이동을 순서대로 해결한다. 기존 문서의 대열 간격 보존 설명은 구현과 달랐다.
+해적 유틸은 파도(`tidal_wave`, 밀기 + 장전 취소)에서 써머솔트 킥으로 교체됐다. 파도가 쓰던 `PUSH_DISTANCE`
+토큰(`CARRY_CASTER`, `CANCEL_QUEUE`)은 코드와 계약에 그대로 남아 있어 다른 유틸에서 다시 쓸 수 있다.
 
 현재 5개 모두 `CooldownTurns=4`, `FreePlay=false`, `SkillTier=1`이다.
 `SELF`의 Range도 공통 검증상 양수여야 한다. 이동 스캔은 보드 전체를 기준으로 한다.
@@ -50,6 +51,7 @@
 | MOVE_SELF | SELF_UNIT / SELF | 양의 정수 | BEHIND_FARTHEST_ENEMY_FORWARD | REQUIRE_EMPTY |
 | PUSH_DISTANCE | PRIMARY_TARGET 또는 ALL_SKILL_TARGETS / SELF 제외 | 양의 정수 | STOP_BEFORE_BLOCKED | 비움 또는 아래 토큰 조합 |
 | PUSH_DISTANCE | PRIMARY_TARGET 또는 ALL_SKILL_TARGETS / SELF 제외 | 0 | MAX | 비움 또는 아래 토큰 조합 |
+| THROW_BEHIND | PRIMARY_TARGET / SELF 제외 | 양의 정수(시전자 뒤 몇 번째 칸) | 비움 | 비움 |
 
 PUSH_DISTANCE의 `ParameterB`는 `|`로 구분한 토큰 집합이며 중복은 거부한다.
 

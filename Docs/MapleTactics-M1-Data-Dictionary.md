@@ -169,7 +169,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal`, `magic_guard`, `meditation`, `bless` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
 | 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift`, `double_shot`, `bolt_rupture`, `retreat_shot` / `enhanced_piercing`, `arrow_rain`, `cardinal_discharge_ii`, `strafe` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow`, `dark_sight`, `wind_talisman`, `muspelheim`, `tornado_spin`, `slash_storm`, `lucky_seven`, `venom`, `chain_hell`, `flying_assaulter` / `triple_throw`, `edge_carnival`, `bloody_storm` |
-| 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot`, `swift_fire`, `backstep_shot`, `bullet_smash`, `monkey_rush_boom`, `monkey_magic` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
+| 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot`, `swift_fire`, `backstep_shot`, `monkey_rush_boom`, `monkey_magic`, `sea_serpent_burst` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
 
 2단계 스킬의 원본 연결은 §4.7 `BaseSkillId`가 소유한다. `thunder_bolt`와 `heal`은
@@ -599,8 +599,8 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
   [`Skill-Authoring-Guide.md`](./Guide/Skill-Authoring-Guide.md) "저작값 규칙"이 소유한다.
 - **피해는 원본 +2 고정**이다. 배율이 아니라 고정값이라 원래 2였던 광역기는 4로 두 배가 되고
   2였던 `slash_storm`은 `bloody_storm`에서 4로 두 배가 된다. 밸런스를 만지게 되면 여기부터 본다.
-- **`PUSH`를 함께 갖던 해적 2종은 그 구성을 유지한다**(`double_barrel_shot`,
-  `screw_punch` — 피해 + 밀치기 1).
+- 해적 `magnum_shot`·`shock_wave`·`double_barrel_shot`·`screw_punch`의 밀치기는 삭제했다. `screw_punch`는 대신
+  `MOVE_SELF` `BEFORE_FIRST_ENEMY`로 최대 2칸 돌진한 뒤 전방 1칸을 친다.
 - **이펙트·아이콘은 그 스킬 자기 리소스 팩에서만 가져온다.** 팩에 `effect`/`hit/0`가 없으면
   같은 팩의 대체 엘리먼트를 쓴다 — `divine_charge`는 `effect/1`, `explosion`은 `special/1`,
   `poison_mist`는 `mob`, `screw_punch`는 `hit`를 시전 이펙트로

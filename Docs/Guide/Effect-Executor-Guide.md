@@ -120,6 +120,7 @@ method table Execute(table context, table effectStep)
 | `BACKWARD_OFFSET` | 시전자 기준 뒤로 `Value`칸(방향 전환 없음) | 후퇴 칸 수 |
 | `BACKWARD_OVER_ENEMY` | 뒤로 `Value`칸. 그 칸에 살아 있는 적이 있으면 한 칸 더 뒤(적 하나만 넘는다) | 후퇴 칸 수 |
 | `BEHIND_FARTHEST_TARGET` | 그 스킬이 맞힌 적 중 가장 먼 적의 `Value`칸 뒤 | 적 뒤로 몇 칸인지(`1`이면 바로 뒤) |
+| `BEFORE_FIRST_ENEMY` | 앞으로 `Value + 1`칸 안의 첫 적 바로 앞 칸(최대 `Value`칸 전진). 이미 붙어 있거나 적이 없으면 이동 안 함 | 최대 전진 칸 수. 해적 `screw_punch`는 `2` |
 
 - `BEHIND_FARTHEST_TARGET`은 스킬이 실제로 맞힌 대상 스냅샷(`TargetCellsByUnitId`)에서 가장 먼 칸을 고르므로,
   맞힌 적이 하나도 없으면 `MOVE_NO_TARGET`으로 이동하지 않는다. 앞쪽 대상만 계산에 넣는다.

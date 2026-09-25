@@ -158,8 +158,9 @@ SkillDefinition.WeaponType
   먼 적은 늦게 맞는다.
 - 큐 슬롯 시간은 `max(ActionDuration, 발사지연 + 최대사거리 비행시간)`으로 자동 보정되므로
   `ActionDuration`을 직접 늘리지 않아도 피해보다 먼저 끝나지 않는다.
-- 조준 셀은 Target Resolver가 돌려준 마지막 대상 칸이다. 적이 없으면 사거리 끝까지 날아가고
-  사라지며 Effect Step은 그대로 `NO_TARGET`이 된다.
+- 조준 셀은 Target Resolver가 돌려준 대상 칸 중 **`Range` 안에서 가장 먼 칸**이다. 적이 없으면 사거리 끝까지 날아가고
+  사라지며 Effect Step은 그대로 `NO_TARGET`이 된다. 타기팅이 `Range` 밖까지 닿아도(`FIRST_ENEMY_PIERCE`의 뒤 칸)
+  투사체는 사거리 끝에서 사라지고, 피해는 그대로 뒤 칸까지 들어간다.
 - `TargetingType=SELF`에는 쓸 수 없다.
 - **투사체 이미지는 그 스킬 리소스 팩에 실제로 날아가는 물체(`ball` 등)가 있을 때만 쓴다**
   (`effect`=시전, `hit`=피격과 같은 팩). 팩에 없다고 다른 스킬 것을 빌려오면 서로 같은
@@ -260,8 +261,8 @@ SchemaVersion,SkillId,...,WeaponType,ProjectileRuid,ProjectileSpeed,ProjectileSc
 ```csv
 SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,ParameterB,ConditionId
 1,enemy_basic_attack_effects,1,DAMAGE,FRONT_TARGET,3,SOURCE_BASIC_ATTACK,,
-1,magnum_shot_effects,1,DAMAGE,PRIMARY_TARGET,4,,,
-1,magnum_shot_effects,2,PUSH,PRIMARY_TARGET,1,,,
+1,wind_talisman_effects,1,DAMAGE,PRIMARY_TARGET,1,,,
+1,wind_talisman_effects,2,PUSH,PRIMARY_TARGET,1,,,
 ```
 
 현재 지원 `EffectType`은 `DAMAGE`, `PUSH`, `PULL`, `HEAL`, 자기 버프 6종
