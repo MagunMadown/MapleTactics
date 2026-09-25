@@ -205,6 +205,12 @@
   .ruid-thumb.error { color: var(--warn); cursor: pointer; }
   .ruid-thumb.empty { opacity: .45; }
   .ruid-thumb.off { display: none; }
+  .ruid-thumb.avatar { flex-direction: column; gap: 3px; color: var(--dim); }
+  .ruid-thumb .avatar-swatch { width: 46%; height: 46%; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(255,255,255,.18); }
+  .ruid-thumb .avatar-slot { font-size: 10px; white-space: nowrap; }
+  .ruid-thumb.small .avatar-slot { display: none; }
+  .ruid-thumb.small .avatar-swatch { width: 60%; height: 60%; }
+  .ruid-thumb.needs-prefix { border-color: var(--warn); box-shadow: inset 0 0 0 1px var(--warn); }
   @keyframes ruid-shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
   @media (prefers-reduced-motion: reduce) { .ruid-thumb.loading { animation: none; } }
   .ruid-field { display: flex; align-items: center; gap: 6px; }
@@ -1996,7 +2002,7 @@
   // are kept in memory, and in localStorage (with a TTL) across reloads.
   const RUID_API = "https://maplestoryworlds-resourcesearch-new.nexon.com/api/v3";
   const RUID_HEX = /^[0-9a-f]{32}$/;
-  const RUID_CACHE_KEY = "mt-bw-ruid-thumbs-v1";
+  const RUID_CACHE_KEY = "mt-bw-ruid-thumbs-v2"; // v2: avatar items also cache color_hex
   const RUID_PREF_KEY = "mt-bw-ruid-previews";
   const RUID_TTL_OK = 7 * 24 * 3600 * 1000;
   const RUID_TTL_NONE = 24 * 3600 * 1000;
@@ -2006,7 +2012,7 @@
 
   const ruidPreview = {
     enabled: true,
-    cache: new Map(), // ruid -> { s: 'ok'|'none'|'error', u: url, t: type, n: name, ts }
+    cache: new Map(), // ruid -> { s: 'ok'|'none'|'error', u: url, t: type, c: category, n: name, h: color_hex, ts }
     inflight: new Set(),
     queue: new Set(),
     getQueue: [],
@@ -2046,6 +2052,12 @@
     }, 500);
   }
 
+  const AVATAR_SLOT_LABEL = {
+    cap: "모자", hair: "헤어", face: "얼굴", faceaccessory: "얼굴장식", eyeaccessory: "눈장식", earaccessory: "귀고리",
+    coat: "상의", longcoat: "한벌옷", pants: "하의", shoes: "신발", glove: "장갑", cape: "망토",
+    weapon: "무기", twohandweapon: "두손무기", subweapon: "보조무기", shield: "방패",
+  };
+
   // Relic/Shop icons store the in-engine "thumbnail://<ruid>" form; the
   // prefix is a render instruction for the MSW client, the RUID is the same.
   function normalizeRuid(value) {
@@ -2068,6 +2080,9 @@
       t: (res && res.type) || "",
       c: (res && res.category) || "",
       n: (names.ko && names.ko[0]) || (names.en && names.en[0]) || (res && res.dname) || "",
+      // Avatar items come with no image at all (payload has only color_hex /
+      // group meta), so their dominant color is what the preview can show.
+      h: res && res.payload && /^#[0-9a-f]{6}$/i.test(res.payload.color_hex || "") ? res.payload.color_hex : "",
       ts: Date.now(),
     };
   }
@@ -2206,6 +2221,20 @@
         ev.stopPropagation();
         window.open(e.u, "_blank", "noopener");
       };
+    } else if (e.s === "none" && e.t === "avataritem") {
+      // The resource API never returns an image for avatar items (only the
+      // MSW client renders them, via "thumbnail://<ruid>"), so show what the
+      // API does give: dominant color + equip slot.
+      box.classList.add("none", "avatar");
+      const sw = document.createElement("span");
+      sw.className = "avatar-swatch";
+      sw.style.background = e.h || "var(--dimmer)";
+      box.appendChild(sw);
+      const slot = document.createElement("span");
+      slot.className = "avatar-slot";
+      slot.textContent = AVATAR_SLOT_LABEL[e.c] || e.c || "아바타";
+      box.appendChild(slot);
+      box.title = `${label ? label + "\n" : ""}${ruid}\n아바타 아이템 — 리소스 API가 이미지를 주지 않아 대표 색상과 부위로 표시합니다.`;
     } else if (e.s === "none") {
       box.classList.add("none");
       box.textContent = "—";
@@ -2221,6 +2250,13 @@
         paintRuidThumb(box, ruid);
         requestRuid(ruid);
       };
+    }
+    // An avatar item in an image slot (icon cells drawn by SpriteGUIRenderer
+    // .ImageRUID) only renders in-game with the "thumbnail://" prefix; a bare
+    // avatar RUID fails silently (msw-search / msw-sprite-ruid rule).
+    box.classList.toggle("needs-prefix", !!(e && e.t === "avataritem" && box.dataset.imageSlot && !/^thumbnail:\/\//i.test(box.dataset.raw || "")));
+    if (box.classList.contains("needs-prefix")) {
+      box.title += "\n⚠ 아바타 아이템인데 thumbnail:// 접두사가 없어 게임 화면(아이콘)에 표시되지 않습니다.";
     }
     if (box.dataset.label) box.title = `${box.dataset.label}\n${box.title}`;
     if (box._pick) makeRuidThumbPickable(box);
@@ -2248,10 +2284,14 @@
   // (so re-renders don't flicker); unknown ones show a loading state and are
   // only requested once the box nears the viewport. An empty/invalid value
   // renders a dim placeholder so card layouts stay aligned.
-  function ruidThumb(value, size, pick, bg, label) {
+  // opts.imageSlot: the cell is drawn as a UI/sprite image in-game (icons),
+  // so an avatar item there needs the thumbnail:// prefix — flagged if not.
+  function ruidThumb(value, size, pick, bg, label, opts) {
     const box = document.createElement("span");
-    box.className = "ruid-thumb";
+    box.className = "ruid-thumb" + (size < 40 ? " small" : "");
     box.style.width = box.style.height = size + "px";
+    box.dataset.raw = (value || "").trim();
+    if (opts && opts.imageSlot) box.dataset.imageSlot = "1";
     if (!ruidPreview.enabled) {
       box.classList.add("off");
       return box;
@@ -3139,7 +3179,7 @@
       const tdThumb = document.createElement("td");
       tdThumb.className = "list-thumb";
       tdThumb.appendChild(ruidThumb(c.iconRuid, 28,
-        cellRuidPicker(c.tableName, c.rowIndex, c.iconColumn, `${c.displayName} 아이콘`, c.displayName), c.iconBg));
+        cellRuidPicker(c.tableName, c.rowIndex, c.iconColumn, `${c.displayName} 아이콘`, c.displayName), c.iconBg, "", { imageSlot: true }));
       tr.appendChild(tdThumb);
     }
 
@@ -3550,7 +3590,7 @@
     const title = document.createElement("div");
     title.className = "bal-title";
     title.appendChild(ruidThumb(c.iconRuid, 36,
-      cellRuidPicker(c.tableName, c.rowIndex, c.iconColumn, `${c.displayName} 아이콘`, c.displayName), c.iconBg));
+      cellRuidPicker(c.tableName, c.rowIndex, c.iconColumn, `${c.displayName} 아이콘`, c.displayName), c.iconBg, "", { imageSlot: true }));
     title.appendChild(nameWrap);
     head.appendChild(title);
 
@@ -5225,6 +5265,8 @@
     if (c.shop && !c.shop.enabled) out.push(["warn", "상점 행이 비활성(Enabled=false) — 상점에 나오지 않습니다."]);
     if (c.shop && c.shop.icon && normalizeRuid(c.shop.icon) !== normalizeRuid(c.icon)) {
       out.push(["warn", "상점 아이콘과 유물 아이콘이 다릅니다 — 상점 목록(ShopEntries)과 전투 HUD(RelicDefinitions)에 다른 그림이 나옵니다."]);
+    } else if (c.shop && c.shop.icon && /^thumbnail:\/\//i.test(c.shop.icon) !== /^thumbnail:\/\//i.test(c.icon)) {
+      out.push(["warn", "같은 RUID인데 한쪽만 thumbnail:// 접두사가 있습니다 — 아바타 아이템이면 접두사가 없는 쪽(상점 또는 HUD)에서 아이콘이 안 보입니다."]);
     }
     if (c.specialType && !RELIC_SPECIAL_MAP.has(c.specialType)) out.push(["error", `지원하지 않는 특수 효과 '${c.specialType}' (게임 검증: UNSUPPORTED_RELIC_SPECIAL_EFFECT)`]);
     return out;
@@ -5237,7 +5279,7 @@
     head.className = "bal-head";
     const title = document.createElement("div");
     title.className = "bal-title";
-    title.appendChild(ruidThumb(c.icon, 44, relicIconPicker(c), "", "유물 아이콘 (전투 HUD · 상점)"));
+    title.appendChild(ruidThumb(c.icon, 44, relicIconPicker(c), "", "유물 아이콘 (전투 HUD · 상점)", { imageSlot: true }));
     const nameWrap = document.createElement("div");
     const name = document.createElement("div");
     name.className = "bal-name";
@@ -5357,7 +5399,7 @@
     head.className = "bal-head";
     const title = document.createElement("div");
     title.className = "bal-title";
-    title.appendChild(ruidThumb(c.icon, 44, cellRuidPicker("ConsumableDefinitions", c.rowIndex, "IconKey", `${c.displayName} 아이콘`, c.displayName)));
+    title.appendChild(ruidThumb(c.icon, 44, cellRuidPicker("ConsumableDefinitions", c.rowIndex, "IconKey", `${c.displayName} 아이콘`, c.displayName), "", "", { imageSlot: true }));
     const nameWrap = document.createElement("div");
     const name = document.createElement("div");
     name.className = "bal-name";
@@ -5506,7 +5548,7 @@
     renderItemListTable(grid, RELIC_LIST_COLUMNS, list, relics, consumables, (c) => {
       const tr = document.createElement("tr");
       if (ruidPreview.enabled) {
-        const td = listCell(tr, ruidThumb(c.icon, 32, relicIconPicker(c)));
+        const td = listCell(tr, ruidThumb(c.icon, 32, relicIconPicker(c), "", "", { imageSlot: true }));
         td.className = "list-thumb";
       }
       listCell(tr, c.displayName).className = "list-name";
@@ -5532,7 +5574,7 @@
     renderItemListTable(grid, CONSUMABLE_LIST_COLUMNS, list, relics, consumables, (c) => {
       const tr = document.createElement("tr");
       if (ruidPreview.enabled) {
-        const td = listCell(tr, ruidThumb(c.icon, 32, cellRuidPicker("ConsumableDefinitions", c.rowIndex, "IconKey", `${c.displayName} 아이콘`, c.displayName)));
+        const td = listCell(tr, ruidThumb(c.icon, 32, cellRuidPicker("ConsumableDefinitions", c.rowIndex, "IconKey", `${c.displayName} 아이콘`, c.displayName), "", "", { imageSlot: true }));
         td.className = "list-thumb";
       }
       listCell(tr, c.displayName).className = "list-name";
