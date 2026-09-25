@@ -263,3 +263,25 @@ If none of the above resolves the issue, tell the user:
 >
 > **https://discord.com/invite/maplestoryworlds**
 <!-- <<< managed by mswai <<< -->
+
+# PROJECT RULES (MapleTactics — kept outside the mswai-managed block)
+
+## Balance Studio vocabulary catalog (`tools/balance-studio.html`)
+
+Balance Studio builds its selects, per-type parameter inputs and checks for the balance CSVs from the
+`#vocabCatalog` JSON block in `tools/balance-studio.html`. Whenever a change adds, renames or removes a
+closed value that a CSV cell can hold, update that catalog **in the same change**:
+
+- `SkillEffectSteps.EffectType` / `UtilitySkillEffectSteps.EffectType` (new effect, buff, status, move type)
+- what `Value` / `ParameterA` / `ParameterB` mean for an effect (e.g. a new `MULTI_HIT`-style damage mode, a new `MOVE_SELF` mode)
+- `ConditionId`, `TargetSelector`, `TargetingType`, `CostType`
+- `EnemyPatternSteps.ActionType` / `ConditionType` / `CELL_FREE` selectors, and what `ParamA` means for them
+
+Transcribe labels and rules from the code (validator + executor), never guess. Then run:
+
+```bash
+node tools/check-balance-vocab.cjs   # exit 1 lists values the code/CSVs use that the catalog lacks
+```
+
+Until the catalog is updated the tool still offers the new value (flagged "카탈로그 미등록") because it reads
+the validator code and CSVs on load, but without description, per-type inputs or checks.
