@@ -1670,6 +1670,7 @@ script BattleSessionComponent extends Component
 					local hasVisibleQueue = plan.PlanState == "TRACKING"
 						or plan.PlanState == "ATTACK_READY"
 						or plan.PlanState == "EXECUTING"
+						or (plan.PlanState == "PREPARED" and tileId ~= "" and plan.QueueTurnsRequired > 0 and plan.QueueTurnsElapsed >= plan.QueueTurnsRequired)
 						or (plan.PlanState == "INSERTING" and plan.QueueSkillsIndividually and plan.PlannedActionCount > 0)
 					local queuedTileNames = ""
 					local queuedIconRuids = ""
@@ -2772,13 +2773,13 @@ script BattleSessionComponent extends Component
 				return markResult
 			end
 			local queueTurnsRequired = 0
-			if (intent.ActionType == "EXECUTE_TILE" or intent.ActionType == "CHARGE_FORWARD") and intent.TileId ~= "" then
+			if intent.TileId ~= nil and intent.TileId ~= "" then
 				local skillDefinition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(intent.TileId)
 				if skillDefinition.Success == true then
-					queueTurnsRequired = math.max(0, math.floor(tonumber(skillDefinition.EnemyQueueTurns) or 0))
-				end
-				if _EnemyTraitRouterLogic:HasTrait(preparedEnemyUnit.EnemyTraitIds, "QUICK") then
-					queueTurnsRequired = 0
+					queueTurnsRequired = math.max(1, math.floor(tonumber(skillDefinition.EnemyQueueTurns) or 1))
+				else
+					patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, "QUEUE_SKILL_MISSING")
+					return { Success = false, Reason = "QUEUE_SKILL_MISSING" }
 				end
 			end
 			result = actionPlan:ReplacePlan(enemyUnitId, traitPlan.Actions, self.TurnNumber, preparedEnemyUnit.EnemyTraitIds, intent.Reason, queueTurnsRequired)
@@ -5046,6 +5047,7 @@ script BattleSessionComponent extends Component
 				local hasInsertedQueue = planState == "TRACKING"
 					or planState == "ATTACK_READY"
 					or planState == "EXECUTING"
+					or (planState == "PREPARED" and tileId ~= "" and queueTurnsRequired > 0 and queueTurnsElapsed >= queueTurnsRequired)
 					or (planState == "INSERTING" and queueTurnsElapsed > 0 and string.find("|" .. traitIds .. "|", "|DOUBLE_STRIKE|", 1, true) ~= nil)
 				if hasInsertedQueue then
 					for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
@@ -7076,6 +7078,11 @@ script BattleSessionComponent extends Component
 		if unit.Team == "Enemy" and isvalid(self.PlayerEntity) then
 			self.ResultKillCount = self.ResultKillCount + 1
 			_MonsterCollectionLogic:RecordDefeat(self.PlayerEntity, unit.EnemyDefinitionId)
+			local sourceEntity = self:FindUnitEntity(sourceUnitId)
+			if sourceEntity == self.PlayerEntity then
+				local relics = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+				if relics ~= nil then relics:OnEnemyKilled(unitId) end
+			end
 		end
 		local summoner = unitEntity:GetComponent("script.FaustSummonComponent")
 		if summoner ~= nil then
@@ -7792,6 +7799,21 @@ script BattleSessionComponent extends Component
 			result.Reason = cellChange.Reason
 			return result
 		end
+		-- Voluntary enemy movement always faces its destination before starting the visual tween.
+		-- Player strafing and forced displacement keep their existing facing rules.
+		if unit.Team == "Enemy" then
+			local previousFacing = unit.Facing
+			local moveFacing = direction > 0 and "Right" or "Left"
+			unit:ApplyFacingState(moveFacing)
+			self:ApplyFacing(unitEntity, unit.Facing)
+			if previousFacing ~= unit.Facing then
+				local turnedEvent = UnitTurnedEvent()
+				turnedEvent.UnitId = unit.UnitId
+				turnedEvent.PreviousFacing = previousFacing
+				turnedEvent.CurrentFacing = unit.Facing
+				self.Entity:SendEvent(turnedEvent)
+			end
+		end
 		local position = self:GetCellPosition(result.ToCell)
 		if unit.Team == "Player" and unit.UnitId == "player_01" then
 			local started = self:StartPlayerGridMovePresentation(unitEntity, result.FromCell, result.ToCell)
@@ -8401,6 +8423,8 @@ script BattleSessionComponent extends Component
 		self.WaveRuntime:MarkWaveActive("BATTLE_READY")
 		self:PublishWaveStateSnapshot("BATTLE_READY")
 		self.StageTurnNumber = 1
+		local relics = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relics ~= nil then relics:BeginBattle(self.StageId, self.EntryRequestId) end
 		self:ProcessAugmentTrigger("TURN_START", "TURN:1", 0)
 		log("[BattleSession] ready phase=" .. self.BattlePhase .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " playerCell=" .. self.PlayerStartCell .. " livingEnemies=" .. #livingEnemies .. " enemyHp=" .. self.CurrentEnemyMaxHp)
 		log("[BattleSession] battle started stageId=" .. self.StageId .. " wave=" .. self.CurrentWave)
