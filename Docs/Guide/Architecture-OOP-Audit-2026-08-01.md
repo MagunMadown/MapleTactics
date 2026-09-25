@@ -32,7 +32,7 @@ Definition/Repository, Facade/DTO를 사용한 방향은 유지한다.
 |---|---|---|
 | P1 | `BattleSessionComponent`가 여전히 큰 조정자 | 새 기능을 더 넣지 말고 Enemy Intent, Spawn, Action 조정을 검증 가능한 Slice로 이동 |
 | P1 | 범용 Modifier 파이프라인 미구현 | 실제 피해/비용/타깃 Modifier 요구가 생길 때 Context와 순서를 먼저 규격화 |
-| P1 | 실제 Stage/Node Dataset 일부 미이관 | 호환 fallback을 복제하지 않고 실제 Dataset 페어로 전환 |
+| ~~P1~~ | ~~실제 Stage/Node Dataset 일부 미이관~~ — **2026-08-15 해소**: `RegionDefinitions`/`NodeDefinitions` Repository·Validator, `BossPhaseDefinitions` 전환 완료(PR #9) | (해소됨) |
 | P2 | 문자열 Snapshot 공용 Codec 없음 | 두 번째 소비자가 직접 파서를 요구할 때 Codec 객체로 추출 |
 | P2 | 자동 회귀 테스트 없음 | 현재 Maker 검증 스크립트를 Stage/Drop/Consumable 회귀 묶음으로 고정 |
 
