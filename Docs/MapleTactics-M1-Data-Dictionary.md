@@ -167,7 +167,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling`, `flash_slash`, `spirit_blade`, `hyper_body`, `iron_wall` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal`, `magic_guard`, `meditation`, `bless` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
-| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift` / `enhanced_piercing`, `arrow_stream`, `cardinal_discharge_ii` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift` / `enhanced_piercing`, `arrow_rain`, `cardinal_discharge_ii` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow`, `dark_sight`, `wind_talisman`, `muspelheim`, `tornado_spin`, `slash_storm`, `blade_ascension` / `triple_throw`, `edge_carnival`, `bloody_storm` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot`, `swift_fire`, `backstep_shot`, `bullet_smash`, `monkey_rush_boom`, `monkey_magic` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
@@ -383,26 +383,21 @@ SkillDefinition.ProjectileRuid
 | `poison_breath` | 1 | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
 | `slug_shot` | 1 | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
 | `enhanced_piercing` | 2 | 궁수 | 인핸스 피어싱 팩 `shootobj/layerList/b1` | 14 | 0.5 | 0 |
-| `arrow_stream` | 2 | 궁수 | 폭풍의 시 팩 `ball` | 14 | 1.8 | 0.15 |
 | `triple_throw` | 2 | 도적 | 트리플 스로우 팩 `ball` | 14 | 1.2 | 0 |
 | `cannon_spike` | 2 | 해적 | 캐논 스파이크 팩 `ball` | 16 | 0.85 | 0 |
 
-2단계 4종은 모두 **자기 팩에 실제로 날아가는 물체가 있어서** 붙였다. 반대로 상위 단계인데
+2단계 3종은 모두 **자기 팩에 실제로 날아가는 물체가 있어서** 붙였다. 반대로 상위 단계인데
 투사체가 없는 경우도 있다 — `explosion`(원본 `flame_orb`는 투사체 있음)과
-`poison_mist`(원본 `poison_breath`는 투사체 있음)는 자기 팩에 `ball`이 없어 즉발로 뒀다.
+`poison_mist`(원본 `poison_breath`는 투사체 있음), `arrow_rain`(원본 `arrow_bomb`은 투사체 있음)은 자기 팩에 `ball`이 없어 즉발로 뒀다.
 기준은 단계가 아니라 팩 내용이다. `triple_throw`는 반대 방향으로, 원본 `shuriken_burst`에는
 없던 투사체가 자기 팩에는 있어서 새로 생겼다.
 
-발사 지연은 `poison_breath`(`0.25`)와 `arrow_stream`(`0.15`) 둘뿐이다. 둘 다 **플레이 확인에서
+발사 지연은 `poison_breath`(`0.25`) 하나뿐이다. **플레이 확인에서
 "시전 이펙트보다 투사체가 먼저 튀어나온다"는 피드백**을 받아 넣은 값이며, 이론이 아니라
 눈으로 정했다.
 
 - `poison_breath`: 0.15 → 0.25로 두 번 조정(배속 적용 후 0.2초). 피해가 밀려
   `0.2 + 0.224 = 0.424초`가 되지만 `ActionDuration` 0.65초 안이라 큐 슬롯은 그대로다.
-- `arrow_stream`: `0.15`(배속 적용 후 0.12초). 연발이라 총 지연이
-  `0.12 + 0.144(연발) + 0.192(비행) = 0.456초`이고, 이건 `ActionDuration`을 배속으로 나눈
-  `0.55 / 1.25 = 0.44초`를 **넘긴다.** 그래서 큐 슬롯이 `0.44 → 0.456`으로 0.016초 늘어난다
-  (`GetSkillActionDuration`이 둘 중 큰 값을 쓴다). 체감되지 않는 차이라 그대로 뒀다.
 
 > ⚠️ **예산 비교 대상은 원본 `ActionDuration`이 아니라 `ActionDuration / 배속`이다.**
 > `GetSkillActionDuration`은 저작값도 배속으로 나눈 뒤 투사체 예산과 비교하므로, 0.55초를
@@ -442,7 +437,7 @@ SkillDefinition.ProjectileRuid
 - 출발점과 착탄점을 **같이** 올리므로 거리와 비행시간은 변하지 않는다. 임팩트 시점도 그대로다.
 - 투사체가 없는 행에 값을 넣으면 아무 일도 일어나지 않으므로 Validator가
   `PROJECTILE_HEIGHT_WITHOUT_PROJECTILE`로 거절한다.
-- 현재 사용하는 스킬은 `arrow_stream`(`0.25`) 하나다. 나머지 8종은 `0`이라 예전 그대로 셀
+- 현재 사용하는 스킬은 없다(폭풍의 시 `0.25`가 유일했으나 스킬이 삭제됐다). 모든 행이 `0`이라 셀
   높이에서 날아간다 — 필요해지면 그 행만 채우면 된다.
 - 값 감각: 캐릭터 키가 대략 1유닛이다. `0`은 발밑, `0.5`는 어깨 위로 떠 보였고 그 중간인
   `0.25`가 활을 든 높이에 맞았다.
@@ -470,7 +465,7 @@ SkillDefinition.ProjectileRuid
   Step을 늘리는 것이지 이 컬럼이 하는 일이 아니다.
 - 취소 처리도 발수만큼 필요하다. `ClearSkillImpactTimers`는 예약된 **모든** 발사 타이머를
   지운다. 마지막 하나만 지우면 대체된 시전이 다음 액션까지 화살을 계속 뱉는다.
-- 현재 사용하는 스킬은 `arrow_stream`(4발 / 0.06초) 하나다. 나머지 8종은 `1` / `0`이다.
+- 현재 사용하는 스킬은 없다(폭풍의 시 4발 / 0.06초가 유일했으나 스킬이 삭제됐다). 모든 행이 `1` / `0`이다.
 
 `SkillProjectileComponent`는 `Translate` 누적이 아니라 **매 프레임 직선 위의 절대 위치를
 계산**한다. 프레임마다 이동량을 더하면 긴 비행에서 오차가 쌓이기 때문이다. 투사체는 회전하지
@@ -601,7 +596,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
   `screw_punch` — 피해 + 밀치기 1).
 - **이펙트·아이콘은 그 스킬 자기 리소스 팩에서만 가져온다.** 팩에 `effect`/`hit/0`가 없으면
   같은 팩의 대체 엘리먼트를 쓴다 — `divine_charge`는 `effect/1`, `explosion`은 `special/1`,
-  `poison_mist`는 `mob`, `screw_punch`는 `hit`, `arrow_stream`은 `prepare`를 시전 이펙트로
+  `poison_mist`는 `mob`, `screw_punch`는 `hit`를 시전 이펙트로
   쓴다. 다른 스킬 팩에서 빌려오지 않는다(§4.5 투사체 기준과 같은 원칙).
 
 > 아직 **획득 경로는 단계를 구분하지 않는다.** `GetJobSkillDefinitions`는 `RequiredJobTag`로만
