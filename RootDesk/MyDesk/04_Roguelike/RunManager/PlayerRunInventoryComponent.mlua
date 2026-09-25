@@ -4,6 +4,7 @@ script PlayerRunInventoryComponent extends Component
 	@TargetUserSync property integer ActiveRunSequence = 0
 	@TargetUserSync property string RunCurrencySnapshot = ""
 	@TargetUserSync property string RunConsumableSnapshot = ""
+	@TargetUserSync property integer HealCharges = -1
 	@TargetUserSync property string RunSkillSnapshot = ""
 	@TargetUserSync property string RunSkillBarSlotIds = ""
 	@TargetUserSync property string RunItemSnapshot = ""
@@ -33,6 +34,8 @@ script PlayerRunInventoryComponent extends Component
 		self.ConsumableCapacity = 3 + math.min(2, math.max(0, math.floor(tonumber(inventorySlotBonus) or 0)))
 		self.RunCurrencySnapshot = ""
 		self.RunConsumableSnapshot = ""
+		self.HealCharges = -1
+		self._T.BossHealChargeKeys = {}
 		self.RunSkillSnapshot = ""
 		self.RunSkillBarSlotIds = ""
 		self.RunItemSnapshot = ""
@@ -63,6 +66,7 @@ script PlayerRunInventoryComponent extends Component
 			return { Success = false, Reason = "STARTING_SKILL_SET_EMPTY" }
 		end
 		self.RunSkillSnapshot = snapshot
+		self:RefreshHealChargeOwnership()
 		self.InventoryRevision = self.InventoryRevision + 1
 		self.SkillInventoryRevision = self.SkillInventoryRevision + 1
 		log("[RunSkillInventory] initialized runSequence=" .. self.ActiveRunSequence .. " skills=" .. self.RunSkillSnapshot .. " revision=" .. self.SkillInventoryRevision)
@@ -267,6 +271,7 @@ script PlayerRunInventoryComponent extends Component
 			end
 		end
 		self.RunSkillSnapshot = ownedSnapshot
+		self:RefreshHealChargeOwnership()
 		self.RunSkillBarSlotIds = self:SerializeRunSkillBarSlotPipe(slots)
 		self.RunSkillBarRevision = self.RunSkillBarRevision + 1
 		self.InventoryRevision = self.InventoryRevision + 1
@@ -320,6 +325,10 @@ script PlayerRunInventoryComponent extends Component
 		if ownedAmount <= 0 then
 			return { Success = false, Reason = "SKILL_NOT_OWNED", SkillId = skillId, OwnedAmount = 0 }
 		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success and definition.CostType == "HEAL_CHARGE" and self:GetHealCharges() < definition.CostValue then
+			return { Success = false, Reason = "HEAL_CHARGES_EMPTY", SkillId = skillId, OwnedAmount = ownedAmount }
+		end
 		return { Success = true, Reason = "SKILL_OWNED", SkillId = skillId, OwnedAmount = ownedAmount }
 	end
 
@@ -368,6 +377,7 @@ script PlayerRunInventoryComponent extends Component
 		end
 		local previousOwnedAmount = self:GetSnapshotAmount(self.RunSkillSnapshot, skillId)
 		self.RunSkillSnapshot = self:AddSnapshotAmount(self.RunSkillSnapshot, skillId, amount)
+		self:RefreshHealChargeOwnership()
 		self.AppliedRewardKeys = self:AppendDelimitedKey(self.AppliedRewardKeys, rewardKey)
 		self.InventoryRevision = self.InventoryRevision + 1
 		self.SkillInventoryRevision = self.SkillInventoryRevision + 1
@@ -431,6 +441,7 @@ script PlayerRunInventoryComponent extends Component
 		end
 		-- No waits or external calls between the staged values and the receipt commit.
 		self.RunSkillSnapshot = snapshot
+		self:RefreshHealChargeOwnership()
 		if slotIds ~= self.RunSkillBarSlotIds then
 			self.RunSkillBarSlotIds = slotIds
 			self.RunSkillBarRevision = self.RunSkillBarRevision + 1
@@ -469,6 +480,11 @@ script PlayerRunInventoryComponent extends Component
 		self.AppliedRewardKeys = self:AppendDelimitedKey(self.AppliedRewardKeys, rewardKey)
 		self.InventoryRevision = self.InventoryRevision + 1
 		self.SkillInventoryRevision = self.SkillInventoryRevision + 1
+		self:RefreshHealChargeOwnership()
+		local upgradedDefinition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(upgradeSkillId)
+		if upgradedDefinition.Success and upgradedDefinition.CostType == "HEAL_CHARGE" then
+			self.HealCharges = math.min(5, self.HealCharges + 1)
+		end
 		self:ReplaceRunSkillBarUpgrade(baseSkillId, upgradeSkillId)
 		local upgradedOwnedAmount = self:GetSnapshotAmount(self.RunSkillSnapshot, upgradeSkillId)
 		log("[RunSkillInventory] upgraded key=" .. rewardKey .. " base=" .. baseSkillId .. " remaining=" .. (baseOwnedAmount - 1) .. " upgrade=" .. upgradeSkillId .. " owned=" .. upgradedOwnedAmount .. " revision=" .. self.SkillInventoryRevision)
@@ -615,6 +631,7 @@ script PlayerRunInventoryComponent extends Component
 		if rewardType == "SKILL" then
 			local previousOwnedAmount = self:GetSnapshotAmount(self.RunSkillSnapshot, rewardRefId)
 			self.RunSkillSnapshot = self:AddSnapshotAmount(self.RunSkillSnapshot, rewardRefId, rewardAmount)
+			self:RefreshHealChargeOwnership()
 			result.AcceptedAmount = rewardAmount
 			self.SkillInventoryRevision = self.SkillInventoryRevision + 1
 			if previousOwnedAmount <= 0 and self.RunSkillBarSlotIds ~= "" then
@@ -886,6 +903,51 @@ script PlayerRunInventoryComponent extends Component
 			table.insert(entries, entryId .. "~" .. tostring(amounts[entryId]))
 		end
 		return table.concat(entries, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshHealChargeOwnership()
+		-- Heal charges belong to the run inventory, surviving battle/map transitions and upgrades.
+		local ownsHeal = false
+		for _, id in ipairs(self:GetDistinctOwnedSkillIds()) do
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(id)
+			if definition.Success and definition.CostType == "HEAL_CHARGE" then ownsHeal = true end
+		end
+		if ownsHeal then
+			if self.HealCharges < 0 then self.HealCharges = 2 end
+		else
+			self.HealCharges = -1
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer GetHealCharges()
+		-- The authoritative acceptance check uses ownership plus the current run's remaining charges.
+		self:RefreshHealChargeOwnership()
+		return math.max(0, self.HealCharges)
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean SpendHealCharge(integer amount)
+		-- Consumes only an accepted cast; invalid amounts and depleted charges leave state unchanged.
+		if amount < 1 or self:GetHealCharges() < amount then return false end
+		self.HealCharges = self.HealCharges - amount
+		self.InventoryRevision = self.InventoryRevision + 1
+		log("[HealCharges] spent=" .. amount .. " remaining=" .. self.HealCharges)
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void GrantBossHealCharge(string completionKey)
+		-- Only the successfully recorded boss victory path calls this, once per battle completion.
+		self._T.BossHealChargeKeys = self._T.BossHealChargeKeys or {}
+		if self._T.BossHealChargeKeys[completionKey] then return end
+		self._T.BossHealChargeKeys[completionKey] = true
+		self:RefreshHealChargeOwnership()
+		if self.HealCharges < 0 then return end
+		self.HealCharges = math.min(5, self.HealCharges + 1)
+		self.InventoryRevision = self.InventoryRevision + 1
+		log("[HealCharges] boss clear key=" .. completionKey .. " charges=" .. self.HealCharges)
 	end
 
 end

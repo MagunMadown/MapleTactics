@@ -418,7 +418,7 @@ script BattleSessionComponent extends Component
 		if unit == nil or unit.IsDead == true or unit.PoisonDamage <= 0 then
 			return
 		end
-		local damage = self:ApplyDamage(unit.PoisonSourceUnitId, unitId, unit.PoisonDamage, self.VenomPoisonAttackId)
+		local damage = self:ApplyStatusDamage(unitId, unit.PoisonDamage, unit.PoisonSourceUnitId, "POISON_MOVE")
 		log("[BattlePoison] tick unit=" .. unitId .. " source=" .. unit.PoisonSourceUnitId .. " damage=" .. tostring(unit.PoisonDamage) .. " success=" .. tostring(damage.Success) .. " reason=" .. tostring(damage.Reason))
 	end
 
@@ -1598,7 +1598,7 @@ script BattleSessionComponent extends Component
 			local occupantEntity = self.BoardState:FindAtCell(cellIndex, unit.UnitId)
 			if isvalid(occupantEntity) then
 				local occupantUnit = occupantEntity:GetComponent("script.BattleUnitComponent")
-				if occupantUnit ~= nil and occupantUnit.IsDead == false and occupantUnit.Team ~= unit.Team then
+				if occupantUnit ~= nil and occupantUnit.IsDead == false and (occupantUnit.Team ~= unit.Team or unit.Team == "Enemy") then
 					table.insert(cells, tostring(cellIndex))
 				end
 				break
@@ -2068,6 +2068,11 @@ script BattleSessionComponent extends Component
 			self:CompleteQueuedAction("UTILITY", false, result.Reason)
 			return result
 		end
+		unit.PreviousSkillWasAttack = false
+		if unit.BurnDamage > 0 then
+			self:ApplyStatusDamage(unit.UnitId, unit.BurnDamage, unit.BurnSourceUnitId, "BURN_CAST")
+			if unit.IsDead or self.BattleResult ~= "" then return { Success = true, Reason = "BURN_LETHAL" } end
+		end
 		-- A utility effect resolves synchronously, so this is still cast time; arming the presentation only
 		-- after acceptance keeps a rejected cast (no target, blocked destination) silent. Utility rows author
 		-- no cast/hit clip today, so in practice this presents the authored cast sound alone.
@@ -2112,7 +2117,7 @@ script BattleSessionComponent extends Component
 						local entity = self.BoardState:FindAtCell(cell, sourceUnit.UnitId)
 						if isvalid(entity) then
 							local target = entity:GetComponent("script.BattleUnitComponent")
-							if target ~= nil and target.Team ~= sourceUnit.Team and not target.IsDead and not target.IsAirborne then
+							if target ~= nil and (target.Team ~= sourceUnit.Team or sourceUnit.Team == "Enemy") and not target.IsDead and not target.IsAirborne then
 								farthestEnemy = cell
 							end
 						end
@@ -2427,6 +2432,14 @@ script BattleSessionComponent extends Component
 		log("[BattleTurnFlow] phase=EnemyTurn turn=" .. self.TurnNumber)
 
 		local execute = function()
+			local enemyUnit = isvalid(enemyEntity) and enemyEntity:GetComponent("script.BattleUnitComponent") or nil
+			if enemyUnit ~= nil and enemyUnit.StopActionTurns > 0 then
+				enemyUnit.StopActionTurns = enemyUnit.StopActionTurns - 1
+				if enemyUnit.StopActionTurns == 0 then enemyUnit.StopMarkerRuid = "" end
+				log("[BattleStatus] enemy turn skipped unit=" .. preparedIntent.EnemyId)
+				self:CompleteQueuedAttackTrackingCommand(preparedIntent.EnemyId, "WAIT", true, "CONTROL_STATUS")
+				return
+			end
 			if isQueueingAttack then
 				self:AdvancePreparedEnemyQueue()
 				return
@@ -3003,8 +3016,19 @@ script BattleSessionComponent extends Component
 		self:PublishTurnStateSnapshot("ENEMY_ACTION")
 		log("[BattleEnemyIntent] execute enemy=" .. intent.EnemyId .. " pattern=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " action=" .. intent.ActionType .. " tile=" .. intent.TileId .. " telegraphRemaining=" .. intent.TelegraphTurnsRemaining .. " preparedTurn=" .. intent.PreparedTurn .. " currentTurn=" .. self.TurnNumber)
 
+		local burnKilled = false
+		if intent.ActionType == "CHARGE_FORWARD" or intent.ActionType == "SUMMON_ENEMIES" or intent.ActionType == "BOSS_LAND_OPPOSITE" then
+			-- These skill actions bypass TryExecuteSkill; charge burn once on their committed execution.
+			local caster = executingEnemy:GetComponent("script.BattleUnitComponent")
+			if caster ~= nil and caster.BurnDamage > 0 then
+				self:ApplyStatusDamage(caster.UnitId, caster.BurnDamage, caster.BurnSourceUnitId, "BURN_CAST")
+				burnKilled = caster.IsDead or self.BattleResult ~= ""
+			end
+		end
 		local actionResult = nil
-		if intent.ActionType == "MOVE_TOWARD" then
+		if burnKilled then
+			actionResult = { Success = true, Reason = "BURN_LETHAL" }
+		elseif intent.ActionType == "MOVE_TOWARD" then
 			actionResult = self:TryMoveInternal(intent.EnemyId, actionDirection, true)
 		elseif intent.ActionType == "MOVE_AWAY" then
 			actionResult = self:TryMoveAwayInternal(intent.EnemyId, actionDirection, true)
@@ -5170,6 +5194,7 @@ script BattleSessionComponent extends Component
 		local runCurrencySnapshot = ""
 		local runSkillSnapshot = ""
 		local runInventoryRevision = 0
+		local runHealCharges = -1
 		local runSkillInventoryRevision = 0
 		local runConsumableCapacity = 0
 		local ownedAugmentSnapshot = ""
@@ -5187,6 +5212,7 @@ script BattleSessionComponent extends Component
 				runCurrencySnapshot = runInventory.RunCurrencySnapshot
 				runSkillSnapshot = runInventory.RunSkillSnapshot
 				runInventoryRevision = runInventory.InventoryRevision
+				runHealCharges = runInventory.HealCharges
 				runSkillInventoryRevision = runInventory.SkillInventoryRevision
 				runConsumableCapacity = runInventory.ConsumableCapacity
 			end
@@ -5404,6 +5430,7 @@ script BattleSessionComponent extends Component
 				SkillSnapshot = runSkillSnapshot,
 				ConsumableCapacity = runConsumableCapacity,
 				SkillRevision = runSkillInventoryRevision,
+				HealCharges = runHealCharges,
 				Revision = runInventoryRevision
 			},
 			Drops = {
@@ -5936,7 +5963,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "UNIT_DEAD"
 			return result
 		end
-		if sourceUnit.Team == targetUnit.Team then
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
 			result.Reason = "TARGET_SAME_TEAM"
 			return result
 		end
@@ -6009,7 +6036,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "UNIT_DEAD"
 			return result
 		end
-		if sourceUnit.Team == targetUnit.Team then
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
 			result.Reason = "TARGET_SAME_TEAM"
 			return result
 		end
@@ -6089,7 +6116,8 @@ script BattleSessionComponent extends Component
 		end
 
 		local bundle = validation.Data
-		local definition = bundle.Definition
+		local definition = {}
+		for key, value in pairs(bundle.Definition) do definition[key] = value end
 		local effectSteps = bundle.EffectSteps
 		local contextResult = _SkillExecutionLogic:BuildContext(self, sourceUnitId, skillId, definition)
 		if contextResult.Success == false then
@@ -6123,6 +6151,39 @@ script BattleSessionComponent extends Component
 				SourceUnitId = sourceUnitId,
 				SkillId = skillId
 			}
+		end
+		local inventory = sourceEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if definition.CostType == "HEAL_CHARGE" then
+			if inventory == nil or inventory:GetHealCharges() < definition.CostValue then
+				return { Success = false, Reason = "HEAL_CHARGES_EMPTY" }
+			end
+			if sourceUnit.CurrentHp >= sourceUnit.MaxHp then return { Success = false, Reason = "HP_FULL" } end
+		end
+		if sourceUnit.BurnDamage > 0 then
+			self:ApplyStatusDamage(sourceUnitId, sourceUnit.BurnDamage, sourceUnit.BurnSourceUnitId, "BURN_CAST")
+			if sourceUnit.IsDead or self.BattleResult ~= "" then return { Success = true, Reason = "BURN_LETHAL", PresentationHandoffDuration = 0.01 } end
+		end
+		if definition.CostType == "HEAL_CHARGE" then inventory:SpendHealCharge(definition.CostValue) end
+		local isAttack = false
+		for _, step in ipairs(effectSteps) do
+			if step.EffectType == "DAMAGE" then isAttack = true end
+		end
+		contextResult.Data.PreviousSkillWasAttack = sourceUnit.PreviousSkillWasAttack
+		sourceUnit.PreviousSkillWasAttack = isAttack
+		if isAttack and sourceUnit.NextArrowCount > 0 then
+			contextResult.Data.ExtraArrowCount = sourceUnit.NextArrowCount
+			if not self:HasSkillProjectile(definition) then
+				local arrow = _SkillDefinitionRepositoryLogic:GetSkillDefinition(sourceUnit.NextArrowSkillId)
+				definition.ProjectileRuid = arrow.ProjectileRuid
+				definition.ProjectileSpeed = arrow.ProjectileSpeed
+				definition.ProjectileScale = arrow.ProjectileScale
+				definition.ProjectileHeight = arrow.ProjectileHeight
+				definition.ProjectileCount = 0
+			end
+			definition.ProjectileCount = (definition.ProjectileCount or 1) + sourceUnit.NextArrowCount
+			definition.ProjectileInterval = math.max(0.06, definition.ProjectileInterval or 0)
+			sourceUnit.NextArrowCount = 0
+			sourceUnit.NextArrowSkillId = ""
 		end
 		runtimeState:StartCooldown(skillId, definition.CooldownTurns)
 
@@ -6846,7 +6907,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "UNIT_DEAD"
 			return result
 		end
-		if sourceUnit.Team == targetUnit.Team then
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
 			result.Reason = "TARGET_SAME_TEAM"
 			return result
 		end
@@ -6939,7 +7000,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "UNIT_COMPONENT_MISSING"
 			return result
 		end
-		if sourceUnit.Team == targetUnit.Team then
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
 			result.Reason = "SAME_TEAM"
 			return result
 		end
@@ -6977,6 +7038,9 @@ script BattleSessionComponent extends Component
 		if targetUnit.DefenseBuffAmount > 0 and not ignoresBuffs then
 			amount = math.max(1, amount - targetUnit.DefenseBuffAmount)
 			log("[BattleBuff] defense buff reduced source=" .. sourceUnitId .. " target=" .. targetUnitId .. " defense=" .. tostring(targetUnit.DefenseBuffAmount) .. " amount=" .. tostring(amount))
+		end
+		if targetUnit.AttackDamageCap > 0 and not ignoresBuffs then
+			amount = math.min(amount, targetUnit.AttackDamageCap)
 		end
 		-- BattleUnit retains the full UtilityGuardActive block, including zero damage.
 		local damageResult = targetUnit:ApplyDamage(amount)
@@ -7223,6 +7287,10 @@ script BattleSessionComponent extends Component
 			end
 			runResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
 			if runResultRecorded == true then
+				if self.BattleResult == "Victory" and self._T.BossDefeated == true then
+					local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+					if inventory ~= nil then inventory:GrantBossHealCharge(self.StageId .. ":" .. tostring(self.EntryRequestId)) end
+				end
 				self:RefreshUnionRewardPresentation()
 			end
 		end
@@ -7299,7 +7367,7 @@ script BattleSessionComponent extends Component
 		local candidate = self.BoardState:FindAtCell(targetCell, sourceUnitId)
 		if isvalid(candidate) then
 			local unit = candidate:GetComponent("script.BattleUnitComponent")
-			if unit ~= nil and unit.Team ~= sourceUnit.Team then
+			if unit ~= nil and (unit.Team ~= sourceUnit.Team or sourceUnit.Team == "Enemy") then
 				return candidate
 			end
 		end
@@ -7614,7 +7682,7 @@ script BattleSessionComponent extends Component
 			if isvalid(occupantEntity) then
 				local occupantUnit = occupantEntity:GetComponent("script.BattleUnitComponent")
 				result.StopReason = "CELL_OCCUPIED"
-				if occupantUnit ~= nil and occupantUnit.IsDead == false and occupantUnit.Team ~= unit.Team then
+				if occupantUnit ~= nil and occupantUnit.IsDead == false and (occupantUnit.Team ~= unit.Team or unit.Team == "Enemy") then
 					self:BeginSkillEffectPresentation(unitId, definition)
 					local damage = self:ResolveSkillDamageImpact(unitId, skillId, occupantUnit.UnitId, nextCell, unit.BasicAttackDamage)
 					result.Success = damage.Success == true
@@ -8721,6 +8789,74 @@ script BattleSessionComponent extends Component
 		end
 		self._T.PoisonMists = remaining
 		self:PublishPoisonMistCells()
+	end
+
+	method boolean IsCombatModifierEffect(string effectType)
+		-- Data-driven status and combo effects share the existing session and target snapshot.
+		return effectType == "FREEZE" or effectType == "STUN" or effectType == "POISON" or effectType == "BURN"
+			or effectType == "NEXT_ARROW" or effectType == "REDUCE_OWN_COOLDOWN" or effectType == "PUSH_ADJACENT"
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ExecuteCombatModifier(table context, table step)
+		-- Applies modifiers only to surviving snapshot targets; self support uses the same caster owner.
+		local sourceEntity = self:FindUnitEntity(context.SourceUnitId)
+		local source = isvalid(sourceEntity) and sourceEntity:GetComponent("script.BattleUnitComponent") or nil
+		if source == nil or source.IsDead then return { Success = false, Reason = "SOURCE_DEAD" } end
+		local kind = step.EffectType
+		if kind == "NEXT_ARROW" then
+			source.NextArrowCount = math.max(source.NextArrowCount, math.floor(step.Value))
+			source.NextArrowSkillId = context.SkillId
+			return { Success = true, Hit = true, Reason = "NEXT_ARROW_ARMED" }
+		elseif kind == "REDUCE_OWN_COOLDOWN" then
+			local runtime = self:GetSkillRuntimeState(context.SourceUnitId)
+			if runtime ~= nil then runtime:ReduceCooldown(context.SkillId, step.Value) end
+			return { Success = true, Hit = true, Reason = "COMBO_COOLDOWN_REDUCED" }
+		end
+		local targets = _SkillTargetResolverLogic:SelectEffectTargets(context, step.TargetSelector)
+		local applied = false
+		for _, id in ipairs(targets) do
+			local entity = self:FindUnitEntity(id)
+			local unit = isvalid(entity) and entity:GetComponent("script.BattleUnitComponent") or nil
+			if unit ~= nil and not unit.IsDead and unit.CurrentHp > 0 and id ~= context.SourceUnitId then
+				if kind == "FREEZE" or kind == "STUN" then
+					if step.Value >= 100 or _UtilLogic:RandomIntegerRange(1, 100) <= step.Value then
+						unit.StopActionTurns = math.max(unit.StopActionTurns, tonumber(step.ParameterA) or 1)
+						unit.StopMarkerRuid = step.ParameterB or ""
+						applied = true
+					end
+				elseif kind == "POISON" then
+					unit:ApplyPoison(context.SourceUnitId, step.Value, step.ParameterB or "")
+					applied = true
+				elseif kind == "BURN" then
+					unit.BurnDamage = math.max(unit.BurnDamage, step.Value)
+					unit.BurnSourceUnitId = context.SourceUnitId
+					applied = true
+				elseif kind == "PUSH_ADJACENT" and math.abs(unit.CellIndex - source.CellIndex) == 1 then
+					local pushed = self:ResolvePushImpactOnTarget(context.SourceUnitId, id)
+					applied = applied or pushed.Hit == true
+				end
+			end
+		end
+		log("[BattleStatus] effect=" .. kind .. " skill=" .. context.SkillId .. " applied=" .. tostring(applied))
+		return { Success = true, Hit = applied, Reason = applied and "MODIFIER_APPLIED" or "NO_STATUS_TARGET" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyStatusDamage(string targetUnitId, number amount, string sourceUnitId, string status)
+		-- Ongoing poison/burn survive their caster's death and never inherit attack bonuses or attack-only caps.
+		local entity = self:FindUnitEntity(targetUnitId)
+		local unit = isvalid(entity) and entity:GetComponent("script.BattleUnitComponent") or nil
+		if unit == nil or unit.IsDead then return { Success = false, Reason = "TARGET_DEAD" } end
+		local result = unit:ApplyDamage(amount)
+		if result.Success and result.AppliedAmount > 0 then
+			local presentation = entity:GetComponent("script.BattleUnitPresentationComponent")
+			if presentation ~= nil then presentation:PlayHitImpact(targetUnitId, false, self.NormalHitStopDuration, self.StrongHitStopDuration, self.HitReactionDuration, self.HitFlashDuration) end
+			if unit.Team == "Player" then self:RefreshPlayerHpSnapshot(status) end
+			if result.ReachedZero then self:HandleUnitDiedFromSource(targetUnitId, status, sourceUnitId) end
+		end
+		log("[BattleStatus] tick=" .. status .. " unit=" .. targetUnitId .. " damage=" .. tostring(result.AppliedAmount or 0))
+		return result
 	end
 
 end
