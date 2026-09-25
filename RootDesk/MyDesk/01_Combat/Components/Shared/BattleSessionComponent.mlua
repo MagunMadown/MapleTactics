@@ -222,6 +222,8 @@ script BattleSessionComponent extends Component
 	@Sync property number NormalCameraShakeAmplitude = 0.025
 	@Sync property number StrongCameraShakeAmplitude = 0.045
 	@Sync property number ImpactCameraShakeDuration = 0.08
+	property number PushCollisionDamage = 1
+	property string PushCollisionAttackId = "push_collision"
 
 	property number PlayerTurnActionDuration = 0.06
 	property number TurnActionDuration = 0.12
@@ -5827,6 +5829,7 @@ script BattleSessionComponent extends Component
 			result.Success = true
 			result.Reason = "PUSH_BLOCKED_OCCUPIED"
 			log("[BattlePush] resolved source=" .. sourceUnitId .. " target=" .. result.TargetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+			self:ApplyPushCollisionDamage(sourceUnitId, targetUnit, result.ToCell)
 			return result
 		end
 
@@ -5882,7 +5885,11 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
+		-- Push away from the caster, so a target behind it (a negative RANGE_OFFSETS entry) is not pushed into the caster.
 		local direction = sourceUnit.Facing == "Right" and 1 or -1
+		if targetUnit.CellIndex ~= sourceUnit.CellIndex then
+			direction = targetUnit.CellIndex > sourceUnit.CellIndex and 1 or -1
+		end
 		result.Hit = true
 		result.TargetCell = targetUnit.CellIndex
 		result.FromCell = targetUnit.CellIndex
@@ -5904,6 +5911,7 @@ script BattleSessionComponent extends Component
 		if self:IsCellOccupied(result.ToCell, targetUnitId) then
 			result.Success = true
 			result.Reason = "PUSH_BLOCKED_OCCUPIED"
+			self:ApplyPushCollisionDamage(sourceUnitId, targetUnit, result.ToCell)
 			return result
 		end
 
@@ -5922,6 +5930,29 @@ script BattleSessionComponent extends Component
 		result.Reason = "PUSHED"
 		log("[BattlePushTarget] resolved source=" .. sourceUnitId .. " target=" .. targetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyPushCollisionDamage(string sourceUnitId, any pushedUnit, integer blockedCell)
+		-- A pushed monster slamming into another monster hurts both by a fixed amount, separate from the
+		-- skill's own damage. Walls, the player and HEAVY monsters that refuse to move do not count.
+		if pushedUnit == nil or pushedUnit.IsDead == true or pushedUnit.Team ~= "Enemy" then
+			return
+		end
+		local blockerEntity = self.BoardState:FindAtCell(blockedCell, pushedUnit.UnitId)
+		if isvalid(blockerEntity) == false then
+			return
+		end
+		local blockerUnit = blockerEntity:GetComponent("script.BattleUnitComponent")
+		if blockerUnit == nil or blockerUnit.IsDead == true or blockerUnit.Team ~= "Enemy" then
+			return
+		end
+		-- Capture both ids first: the first hit can kill its target and change the board.
+		local pushedUnitId = pushedUnit.UnitId
+		local blockerUnitId = blockerUnit.UnitId
+		log("[BattlePushCollision] source=" .. sourceUnitId .. " pushed=" .. pushedUnitId .. " blocker=" .. blockerUnitId .. " cell=" .. tostring(blockedCell) .. " damage=" .. tostring(self.PushCollisionDamage))
+		self:ApplyDamage(sourceUnitId, pushedUnitId, self.PushCollisionDamage, self.PushCollisionAttackId)
+		self:ApplyDamage(sourceUnitId, blockerUnitId, self.PushCollisionDamage, self.PushCollisionAttackId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -6780,19 +6811,21 @@ script BattleSessionComponent extends Component
 		local defenderEffects = targetEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		local attackerRun = sourceEntity:GetComponent("script.PlayerRunStateComponent")
 		local defenderRun = targetEntity:GetComponent("script.PlayerRunStateComponent")
-		if sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
+		-- Push collisions are a fixed environmental hit, so the caster's attack bonuses never scale them.
+		local isFixedDamage = attackId == self.PushCollisionAttackId
+		if isFixedDamage == false and sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
 			and attackerRun ~= nil and attackerEffects.ActiveRunSequence == attackerRun.RunSequence then
 			amount = amount + attackerEffects.AttackBonus
 		end
 		-- Self buffs live on the units, so both teams share one rule. The next-attack bonus is only read here;
 		-- SkillExecutionLogic spends it once the whole skill has landed so area skills boost every target.
-		local isMistDamage = attackId == "commander_poison_mist"
-		if sourceUnit.NextAttackBonus > 0 and not isMistDamage then
+		local ignoresBuffs = attackId == "commander_poison_mist" or isFixedDamage
+		if sourceUnit.NextAttackBonus > 0 and not ignoresBuffs then
 			amount = amount + sourceUnit.NextAttackBonus
 			log("[BattleBuff] next attack bonus added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " bonus=" .. tostring(sourceUnit.NextAttackBonus) .. " amount=" .. tostring(amount))
 		end
 		-- Timed attack buffs stay active for their whole duration, so every hit in that window gets them.
-		if sourceUnit.AttackBuffAmount > 0 and not isMistDamage then
+		if sourceUnit.AttackBuffAmount > 0 and not ignoresBuffs then
 			amount = amount + sourceUnit.AttackBuffAmount
 			log("[BattleBuff] attack buff added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " attack=" .. tostring(sourceUnit.AttackBuffAmount) .. " amount=" .. tostring(amount))
 		end
@@ -6800,7 +6833,7 @@ script BattleSessionComponent extends Component
 			and defenderRun ~= nil and defenderEffects.ActiveRunSequence == defenderRun.RunSequence then
 			amount = math.max(1, amount - defenderEffects.DefenseBonus)
 		end
-		if targetUnit.DefenseBuffAmount > 0 and not isMistDamage then
+		if targetUnit.DefenseBuffAmount > 0 and not ignoresBuffs then
 			amount = math.max(1, amount - targetUnit.DefenseBuffAmount)
 			log("[BattleBuff] defense buff reduced source=" .. sourceUnitId .. " target=" .. targetUnitId .. " defense=" .. tostring(targetUnit.DefenseBuffAmount) .. " amount=" .. tostring(amount))
 		end
