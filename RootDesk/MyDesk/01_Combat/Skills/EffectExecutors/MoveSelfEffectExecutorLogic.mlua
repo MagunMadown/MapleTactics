@@ -21,6 +21,16 @@ script MoveSelfEffectExecutorLogic extends Logic
 			result.Reason = "SESSION_MISSING"
 			return result
 		end
+		if effectStep.EffectType == "TURN_SELF" then
+			-- Reverses the caster in place, normally as the last step of a skill that dashes past its targets.
+			result.EffectType = "TURN_SELF"
+			local turnResult = battleSession:TryTurn(context.SourceUnitId)
+			table.insert(result.Results, turnResult)
+			result.Success = turnResult.Success
+			result.Hit = turnResult.Success
+			result.Reason = turnResult.Success and "TURNED" or turnResult.Reason
+			return result
+		end
 
 		local targetUnitIds = _SkillTargetResolverLogic:SelectEffectTargets(context, effectStep.TargetSelector)
 		if #targetUnitIds == 0 then
@@ -109,6 +119,10 @@ script MoveSelfEffectExecutorLogic extends Logic
 			end
 		end
 		if farthestDistance <= 0 then
+			if self:HasParameterBToken(effectStep, "FALLBACK_FARTHEST_EMPTY") then
+				-- No enemy to land behind: dash to the farthest empty cell the skill could ever reach instead.
+				return self:ResolveFarthestEmptyForward(context, sourceUnit, direction, value)
+			end
 			-- The skill hit nothing ahead, so there is no enemy to land behind.
 			result.Reason = "MOVE_NO_TARGET"
 			return result
@@ -150,9 +164,37 @@ script MoveSelfEffectExecutorLogic extends Logic
 		return result
 	end
 
+	@ExecSpace("ServerOnly")
+	method table ResolveFarthestEmptyForward(table context, any sourceUnit, integer direction, integer value)
+		-- The reach is the skill's Range plus the behind distance, i.e. the farthest cell the normal landing could be.
+		local result = { Success = false, Reason = "MOVE_NO_EMPTY_CELL", ForwardOffset = 0 }
+		local definition = context.Definition or {}
+		local reach = math.max(1, math.floor(tonumber(definition.Range) or 0) + value)
+		for offset = reach, 1, -1 do
+			local cell = sourceUnit.CellIndex + direction * offset
+			if context.BattleSession:IsValidCell(cell) and context.BattleSession:IsCellOccupied(cell, sourceUnit.UnitId) == false then
+				result.Success = true
+				result.Reason = "OK"
+				result.ForwardOffset = offset
+				return result
+			end
+		end
+		return result
+	end
+
+	method boolean HasParameterBToken(table effectStep, string token)
+		-- ParameterB is a `|`-separated modifier list shared by the move modes.
+		for part in string.gmatch(effectStep.ParameterB or "", "([^|]+)") do
+			if part == token then
+				return true
+			end
+		end
+		return false
+	end
+
 	method boolean IsMoveEffectType(string effectType)
 		-- Single source of truth for which EffectTypes this executor owns; the Router and Validator both ask here.
-		return effectType == "MOVE_SELF"
+		return effectType == "MOVE_SELF" or effectType == "TURN_SELF"
 	end
 
 	method integer ParseMoveValue(table effectStep)
@@ -175,6 +217,9 @@ script MoveSelfEffectExecutorLogic extends Logic
 
 	method string DescribeMoveStep(table effectStep)
 		-- Player-facing summary appended to skill tooltips next to the buff lines.
+		if effectStep.EffectType == "TURN_SELF" then
+			return "시전 후 방향 전환"
+		end
 		local mode = effectStep.ParameterA or ""
 		if mode == "FORWARD_OFFSET" then
 			return "시전 후 " .. tostring(self:ParseMoveValue(effectStep)) .. "칸 전진"

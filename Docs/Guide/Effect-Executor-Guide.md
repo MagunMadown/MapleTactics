@@ -103,6 +103,9 @@ method table Execute(table context, table effectStep)
 | `DEFENSE_BUFF` | `BuffEffectExecutorLogic` | 시전자가 받는 피해 -`Value`(최소 1), `ParameterA`턴 |
 | `GUARD_BUFF` | `BuffEffectExecutorLogic` | 시전자가 받는 피해를 전부 무효, `ParameterA`턴 |
 | `MOVE_SELF` | `MoveSelfEffectExecutorLogic` | 시전자를 바라보는 방향으로 이동. 착지 칸은 `ParameterA` 모드가 정한다 |
+| `TURN_SELF` | `MoveSelfEffectExecutorLogic` | 시전자 방향 전환(`TryTurn`). `SELF_UNIT` 전용, `Value`는 쓰지 않는다(`0`). 도적 `tornado_spin` 마지막 스텝 |
+| `PULL` | `PushEffectExecutorLogic` | `PRIMARY_TARGET`을 시전자 앞 `Value`칸으로 끌어온다. 그 칸이 차 있으면 오는 길의 가장 가까운 빈 칸, 이미 가까우면·HEAVY면 제자리. 도적 `chain_hell` |
+| `VENOM_BUFF` | `BuffEffectExecutorLogic` | `ParameterA`턴 동안 시전자가 피해를 준 적을 중독시킨다. 중독된 적은 칸을 옮길 때마다 `Value` 고정 피해(죽을 때까지). `ParameterB`는 중독된 적 머리 위 루프 이펙트 RUID. 도적 `venom` |
 
 ### `MOVE_SELF` 규칙
 
@@ -123,6 +126,10 @@ method table Execute(table context, table effectStep)
 - `BACKWARD_OVER_ENEMY`는 적을 하나만 넘는다. 넘은 뒤의 칸도 막혀 있거나 보드 밖이면 아래 규칙대로 이동하지 않는다
   (궁수 `retreat_shot`).
 - `ParameterB=ALLOW_OCCUPIED`이면 점유 칸도 허용한다. 비우면 빈 칸일 때만 이동한다.
+- `ParameterB=FALLBACK_FARTHEST_EMPTY`(`BEHIND_FARTHEST_TARGET` 전용)이면 맞힌 적이 없을 때 이동을 생략하지 않고,
+  `Range + Value`칸 이내에서 가장 먼 빈 칸으로 간다(도적 `muspelheim`: 사거리 2 + 1 = 3칸).
+- `MOVE_SELF`가 실제로 이동했고 뒤에 스텝이 남아 있으면 대상 스냅샷을 **새 위치에서 다시 잡는다**. 그래서
+  `MOVE_SELF` → `DAMAGE` 순서로 "돌진 후 타격"을 만들 수 있다(도적 `flying_assaulter`). 이동이 막히면 원래 스냅샷을 쓴다.
 - 이동은 `BattleSessionComponent.ResolveSkillMoveImpact` → `RelocateUnitForMechanic`을 통과하므로 칸 검증·점유
   검사·드롭 회수·`UnitMovedEvent`가 그대로 적용된다. 플레이어는 그 위에 기존 이동 연출을 얹는다.
 - 보드 밖(`MOVE_OUT_OF_BOUNDS`)이거나 칸이 차 있으면(`MOVE_CELL_OCCUPIED`) `Success=true`로 끝난다. 즉 스킬의

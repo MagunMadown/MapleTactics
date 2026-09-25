@@ -224,6 +224,9 @@ script BattleSessionComponent extends Component
 	@Sync property number ImpactCameraShakeDuration = 0.08
 	property number PushCollisionDamage = 1
 	property string PushCollisionAttackId = "push_collision"
+	property string VenomPoisonAttackId = "venom_poison"
+	-- Seconds each frame of a `|`-separated cast frame list stays on screen (1x speed).
+	property number CastEffectFrameDuration = 0.12
 
 	property number PlayerTurnActionDuration = 0.06
 	property number TurnActionDuration = 0.12
@@ -396,8 +399,27 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	@EventSender("Self")
 	handler HandleUnitMovedEvent(UnitMovedEvent event)
-		-- Confirms that subscribers can observe a completed logical move.
+		-- Confirms that subscribers can observe a completed logical move, then ticks venom poison on the mover.
 		log("[BattleEvent] UnitMovedEvent received unit=" .. event.UnitId .. " from=" .. event.FromCell .. " to=" .. event.ToCell)
+		self:ApplyPoisonOnMove(event.UnitId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyPoisonOnMove(string unitId)
+		-- A poisoned unit takes its poison damage every time it changes cells, however it was moved.
+		if self.BattleResult ~= "" then
+			return
+		end
+		local unitEntity = self:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			return
+		end
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead == true or unit.PoisonDamage <= 0 then
+			return
+		end
+		local damage = self:ApplyDamage(unit.PoisonSourceUnitId, unitId, unit.PoisonDamage, self.VenomPoisonAttackId)
+		log("[BattlePoison] tick unit=" .. unitId .. " source=" .. unit.PoisonSourceUnitId .. " damage=" .. tostring(unit.PoisonDamage) .. " success=" .. tostring(damage.Success) .. " reason=" .. tostring(damage.Reason))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -5933,6 +5955,68 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ResolvePullImpactOnTarget(string sourceUnitId, string targetUnitId, integer landingDistance)
+		-- Drags a target toward the caster until it stands landingDistance cells in front of it. If that cell is
+		-- taken, it stops at the closest free cell on the way; a target already that close, or HEAVY, stays put.
+		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, TargetUnitId = targetUnitId, FromCell = -1, ToCell = -1 }
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		local targetEntity = self:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false or isvalid(targetEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		if sourceUnit.Team == targetUnit.Team then
+			result.Reason = "TARGET_SAME_TEAM"
+			return result
+		end
+
+		local direction = targetUnit.CellIndex > sourceUnit.CellIndex and 1 or -1
+		local distance = math.abs(targetUnit.CellIndex - sourceUnit.CellIndex)
+		result.Hit = true
+		result.FromCell = targetUnit.CellIndex
+		result.ToCell = targetUnit.CellIndex
+		result.Success = true
+		if targetUnit.Team == "Enemy" and _EnemyTraitRouterLogic:BlocksForcedDisplacement(targetUnit.EnemyTraitIds) then
+			result.Reason = "PULL_BLOCKED_HEAVY_TRAIT"
+			log("[EnemyTrait] HEAVY blocked pull target=" .. targetUnitId .. " cell=" .. result.FromCell)
+			return result
+		end
+		local landing = -1
+		for step = math.max(1, landingDistance), distance - 1 do
+			local cell = sourceUnit.CellIndex + direction * step
+			if self:IsValidCell(cell) and self:IsCellOccupied(cell, targetUnitId) == false then
+				landing = cell
+				break
+			end
+		end
+		if landing < 0 then
+			result.Reason = distance <= landingDistance and "PULL_ALREADY_CLOSE" or "PULL_BLOCKED_OCCUPIED"
+			log("[BattlePull] resolved source=" .. sourceUnitId .. " target=" .. targetUnitId .. " from=" .. result.FromCell .. " reason=" .. result.Reason)
+			return result
+		end
+		-- The relocation boundary owns occupancy, drop pickup and the moved event (which also ticks poison).
+		local relocation = self:RelocateUnitForMechanic(targetUnitId, landing, "SKILL_PULL")
+		if relocation.Success == false then
+			result.Reason = "PULL_BLOCKED_" .. tostring(relocation.Reason)
+			return result
+		end
+		result.ToCell = landing
+		result.Reason = "PULLED"
+		log("[BattlePull] resolved source=" .. sourceUnitId .. " target=" .. targetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ApplyPushCollisionDamage(string sourceUnitId, any pushedUnit, integer blockedCell)
 		-- A pushed monster slamming into another monster hurts both by a fixed amount, separate from the
 		-- skill's own damage. Walls, the player and HEAVY monsters that refuse to move do not count.
@@ -6299,7 +6383,13 @@ script BattleSessionComponent extends Component
 		end
 		-- The sound is authored independently of the clip, so a skill with only one of the two still
 		-- presents that half; both calls no-op on an empty RUID.
-		sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
+		local castFrames = definition.CastEffectFrames or ""
+		if castEffectRuid ~= "" and string.find(castFrames, "|", 1, true) ~= nil then
+			-- A frame list is a hand-built flipbook of static sprites, shown one after another on the caster.
+			sourcePresentation:PlaySkillEffectFrames(sourceUnitId, "CAST", castFrames, self.ActiveEffectScale, self.ActiveEffectFlipX, self.CastEffectFrameDuration / self:GetSkillSpeedMultiplier())
+		else
+			sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
+		end
 		sourcePresentation:PlaySkillSound(sourceUnitId, "CAST", castSoundRuid, self:GetSkillSoundVolume())
 	end
 
@@ -6811,8 +6901,8 @@ script BattleSessionComponent extends Component
 		local defenderEffects = targetEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		local attackerRun = sourceEntity:GetComponent("script.PlayerRunStateComponent")
 		local defenderRun = targetEntity:GetComponent("script.PlayerRunStateComponent")
-		-- Push collisions are a fixed environmental hit, so the caster's attack bonuses never scale them.
-		local isFixedDamage = attackId == self.PushCollisionAttackId
+		-- Push collisions and poison ticks are fixed hits, so the caster's attack bonuses never scale them.
+		local isFixedDamage = attackId == self.PushCollisionAttackId or attackId == self.VenomPoisonAttackId
 		if isFixedDamage == false and sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
 			and attackerRun ~= nil and attackerEffects.ActiveRunSequence == attackerRun.RunSequence then
 			amount = amount + attackerEffects.AttackBonus
@@ -6871,6 +6961,11 @@ script BattleSessionComponent extends Component
 		self:PlayImpactCameraShake(strongHit)
 		if targetUnit.Team == "Player" then
 			self:RefreshPlayerHpSnapshot("DAMAGE_APPLIED")
+		end
+		-- An attacker under Venom poisons every enemy its attacks land on; fixed hits (collisions, poison) never do.
+		if isFixedDamage == false and sourceUnit.VenomBuffAmount > 0 and targetUnit.Team == "Enemy"
+			and damageResult.ReachedZero ~= true then
+			targetUnit:ApplyPoison(sourceUnitId, sourceUnit.VenomBuffAmount, sourceUnit.VenomMarkerRuid)
 		end
 		if damageResult.ReachedZero == true then
 			self:HandleUnitDiedFromSource(targetUnitId, "DAMAGE", sourceUnitId)

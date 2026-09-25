@@ -36,6 +36,14 @@ script BattleUnitComponent extends Component
 	-- A guard buff ignores incoming damage outright; the amount is a flag, not a reduction.
 	@Sync property number GuardBuffAmount = 0
 	@Sync property integer GuardBuffTurns = 0
+	-- Venom: while active, every enemy this unit damages is poisoned for VenomBuffAmount per move.
+	@Sync property number VenomBuffAmount = 0
+	@Sync property integer VenomBuffTurns = 0
+	property string VenomMarkerRuid = ""
+	-- Hostile poison applied by an enemy's venom. It lasts until the unit dies and costs PoisonDamage per move.
+	property number PoisonDamage = 0
+	property string PoisonSourceUnitId = ""
+	@Sync property string PoisonMarkerRuid = ""
 	-- Different skills stack; recasting the same skill refreshes its own entry instead of adding a second one.
 	property table NextAttackBonusBySkill = {}
 	property table TimedBuffEntries = {}
@@ -58,6 +66,7 @@ script BattleUnitComponent extends Component
 		if self:IsClient() then
 			self:RefreshPresentation()
 			self:RefreshFacingPresentation()
+			self:RefreshStatusMarker()
 		end
 	end
 
@@ -76,6 +85,9 @@ script BattleUnitComponent extends Component
 		self.UtilityGuardActive = false
 		self:ClearBattleBuffs()
 		self.SealTurns = 0
+		self.PoisonDamage = 0
+		self.PoisonSourceUnitId = ""
+		self.PoisonMarkerRuid = ""
 		self.IsBoss = false
 		self.IsAirborne = false
 		self.PendingLandingCell = -1
@@ -89,6 +101,20 @@ script BattleUnitComponent extends Component
 		self.SealTurns = math.max(self.SealTurns, turns)
 		log("[BattleStatus] sealed unit=" .. self.UnitId .. " turns=" .. tostring(self.SealTurns))
 		return { Success = true, Hit = true, Reason = "SEALED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyPoison(string sourceUnitId, number damagePerMove, string markerRuid)
+		-- Poisons this unit until it dies; a stronger venom replaces a weaker one, re-poisoning only refreshes.
+		if self.IsDead or damagePerMove <= 0 then return { Success = false, Reason = "INVALID_STATUS_TARGET" } end
+		local refreshed = self.PoisonDamage > 0
+		self.PoisonDamage = math.max(self.PoisonDamage, damagePerMove)
+		self.PoisonSourceUnitId = sourceUnitId
+		self.PoisonMarkerRuid = markerRuid or ""
+		if refreshed == false then
+			log("[BattleStatus] poisoned unit=" .. self.UnitId .. " source=" .. sourceUnitId .. " damagePerMove=" .. tostring(self.PoisonDamage))
+		end
+		return { Success = true, Hit = true, Reason = refreshed and "POISON_REFRESHED" or "POISONED" }
 	end
 
 	@ExecSpace("ServerOnly")
@@ -111,6 +137,9 @@ script BattleUnitComponent extends Component
 		self.MaxHpBuffTurns = 0
 		self.GuardBuffAmount = 0
 		self.GuardBuffTurns = 0
+		self.VenomBuffAmount = 0
+		self.VenomBuffTurns = 0
+		self.VenomMarkerRuid = ""
 	end
 
 	@ExecSpace("ServerOnly")
@@ -296,7 +325,7 @@ script BattleUnitComponent extends Component
 	method table ApplyTimedBuff(string skillId, string stat, number amount, integer turns)
 		-- Adds or refreshes one skill's timed stat buff (ATTACK / DEFENSE / MAX_HP / GUARD). Entries from different
 		-- skills stack; the same skill keeps the larger amount and the longer duration.
-		if stat ~= "ATTACK" and stat ~= "DEFENSE" and stat ~= "MAX_HP" and stat ~= "GUARD" then
+		if stat ~= "ATTACK" and stat ~= "DEFENSE" and stat ~= "MAX_HP" and stat ~= "GUARD" and stat ~= "VENOM" then
 			return { Success = false, Reason = "UNSUPPORTED_BUFF_STAT" }
 		end
 		if amount <= 0 or turns <= 0 then
@@ -356,8 +385,8 @@ script BattleUnitComponent extends Component
 	@ExecSpace("ServerOnly")
 	method number RecomputeBuffTotals(string reason)
 		-- Rebuilds the synced totals from the per-skill entries and applies any max-HP change; returns that change.
-		local totals = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0 }
-		local longest = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0 }
+		local totals = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0, VENOM = 0 }
+		local longest = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0, VENOM = 0 }
 		for _, entry in pairs(self.TimedBuffEntries) do
 			totals[entry.Stat] = totals[entry.Stat] + entry.Amount
 			longest[entry.Stat] = math.max(longest[entry.Stat], entry.Turns)
@@ -368,6 +397,9 @@ script BattleUnitComponent extends Component
 		self.DefenseBuffTurns = longest.DEFENSE
 		self.GuardBuffAmount = totals.GUARD
 		self.GuardBuffTurns = longest.GUARD
+		-- Venom does not stack across skills in practice (one skill grants it); the total is the poison per move.
+		self.VenomBuffAmount = totals.VENOM
+		self.VenomBuffTurns = longest.VENOM
 		self.MaxHpBuffTurns = longest.MAX_HP
 		local maxHpDelta = totals.MAX_HP - self.MaxHpBuffAmount
 		if maxHpDelta == 0 then
@@ -460,6 +492,19 @@ script BattleUnitComponent extends Component
 		if name == "Facing" then
 			self:RefreshFacingPresentation()
 		end
+		if name == "PoisonMarkerRuid" or name == "IsDead" then
+			self:RefreshStatusMarker()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshStatusMarker()
+		-- The marker follows the synced poison RUID and disappears with the unit's death.
+		local presentation = self.Entity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			return
+		end
+		presentation:RefreshStatusMarker(self.UnitId, self.PoisonMarkerRuid, self.PoisonMarkerRuid ~= "" and self.IsDead == false)
 	end
 
 	@ExecSpace("ClientOnly")

@@ -168,7 +168,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling`, `flash_slash`, `spirit_blade`, `hyper_body`, `iron_wall` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal`, `magic_guard`, `meditation`, `bless` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
 | 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift`, `double_shot`, `bolt_rupture`, `retreat_shot` / `enhanced_piercing`, `arrow_rain`, `cardinal_discharge_ii`, `strafe` |
-| 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow`, `dark_sight`, `wind_talisman`, `muspelheim`, `tornado_spin`, `slash_storm`, `blade_ascension` / `triple_throw`, `edge_carnival`, `bloody_storm` |
+| 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow`, `dark_sight`, `wind_talisman`, `muspelheim`, `tornado_spin`, `slash_storm`, `lucky_seven`, `venom`, `chain_hell`, `flying_assaulter` / `triple_throw`, `edge_carnival`, `bloody_storm` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot`, `swift_fire`, `backstep_shot`, `bullet_smash`, `monkey_rush_boom`, `monkey_magic` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
 
@@ -282,7 +282,7 @@ CSV와 모션 프로필의 값은 **1배속 기준 원본 그대로** 두고, �
 #### 이도류 (SubWeaponRuid)
 
 `SubWeaponRuid`를 채우면 주 손 무기와 보조무기를 **동시에** 장착한다. 현재 유일한 사례는
-`DUAL_BLADE`(단검 + 블레이드)이고 도적의 `fatal_blow`·`bloody_storm`·`slash_storm`·`blade_ascension`·`muspelheim`·`tornado_spin`이 쓴다.
+`DUAL_BLADE`(단검 + 블레이드)이고 도적의 `fatal_blow`·`bloody_storm`·`slash_storm`·`flying_assaulter`·`muspelheim`·`tornado_spin`이 쓴다.
 
 - **`EquipSlot=ONE_HANDED`일 때만 유효하다.** 두손무기는 이미 보조무기 슬롯을 점유하므로
   같이 지정하면 조용히 무시된다 — Validator가 `SUB_WEAPON_ON_TWO_HANDED`로 거절한다.
@@ -382,19 +382,22 @@ SkillDefinition.ProjectileRuid
 | `flame_orb` | 1 | 마법사 | 플레임 오브 팩 `ball` | 12 | 0.7 | 0 |
 | `poison_breath` | 1 | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
 | `slug_shot` | 1 | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
+| `shuriken_burst` | 1 | 도적 | 지정 clip `f4e7fd66…` (204×61) | 14 | 0.55 | 0 |
+| `lucky_seven` | 1 | 도적 | 지정 수리검 `2fc1bc6b…` (48×12), 2발 | 14 | 1.6 | 0 |
+| `chain_hell` | 1 | 도적 | 사슬지옥 팩 `ball/0/0` (sprite 104×36) | 14 | 1 | 0 |
 | `double_shot` | 1 | 궁수 | 더블 샷 팩 `ball/0` (sprite 60×20) | 14 | 2 | 0 |
 | `bolt_rupture` | 1 | 궁수 | 볼트 럽쳐 강화 팩 `ball/0` (157×37) | 14 | 0.7 | 0 |
 | `retreat_shot` | 1 | 궁수 | 리트리트 샷 팩 `ball` (110×22) | 14 | 1 | 0 |
 | `enhanced_piercing` | 2 | 궁수 | 인핸스 피어싱 팩 `shootobj/layerList/b1` | 14 | 0.5 | 0 |
 | `strafe` | 2 | 궁수 | 스트레이프 팩 `ball/0` (sprite 68×12) | 14 | 1.8 | 0 |
-| `triple_throw` | 2 | 도적 | 트리플 스로우 팩 `ball` | 14 | 1.2 | 0 |
+| `triple_throw` | 2 | 도적 | 지정 수리검 `2fc1bc6b…` (48×12), 3발 | 14 | 1.6 | 0 |
 | `cannon_spike` | 2 | 해적 | 캐논 스파이크 팩 `ball` | 16 | 0.85 | 0 |
 
 2단계 4종은 모두 **자기 팩에 실제로 날아가는 물체가 있어서** 붙였다. 반대로 상위 단계인데
 투사체가 없는 경우도 있다 — `explosion`(원본 `flame_orb`는 투사체 있음)과
 `poison_mist`(원본 `poison_breath`는 투사체 있음), `arrow_rain`(원본 `arrow_bomb`은 투사체 있음)은 자기 팩에 `ball`이 없어 즉발로 뒀다.
-기준은 단계가 아니라 팩 내용이다. `triple_throw`는 반대 방향으로, 원본 `shuriken_burst`에는
-없던 투사체가 자기 팩에는 있어서 새로 생겼다.
+기준은 단계가 아니라 팩 내용이다. 예외는 사용자가 투사체를 직접 지정한 도적 수리검 계열이다 —
+`shuriken_burst`, `lucky_seven`, `triple_throw`는 지정 RUID를 쓰고, `triple_throw`는 이제 `lucky_seven`의 상위 단계다.
 
 발사 지연은 `poison_breath`(`0.25`) 하나뿐이다. **플레이 확인에서
 "시전 이펙트보다 투사체가 먼저 튀어나온다"는 피드백**을 받아 넣은 값이며, 이론이 아니라
@@ -580,7 +583,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 플레이어 스킬은 1단계 39행 + 2단계 16행 = 55행이고, 적 전용 행은 모두 1단계다.
 `thunder_bolt`, `heal`, 전사 `flash_slash`·`spirit_blade`·`hyper_body`·`iron_wall`,
 마법사 `magic_guard`·`meditation`·`bless`, 궁수 `split_mistel`·`cardinal_transition`·`bolt_swift`,
-도적 `dark_sight`·`wind_talisman`·`muspelheim`·`tornado_spin`·`blade_ascension`과 `fatal_blow`는
+도적 `dark_sight`·`wind_talisman`·`muspelheim`·`tornado_spin`·`shuriken_burst`·`venom`·`chain_hell`·`flying_assaulter`와 `fatal_blow`는
 아직 상위 단계가 없다. `bloody_storm`의 원본은 `fatal_blow`가 아니라 `slash_storm`이다. 적 스킬은 강화 대상이 아니지만
 `ConvertSkillRow`가 모든 스킬 테이블에 공용이라 스키마를 맞추기 위해 같은 두 컬럼을 갖는다.
 
@@ -622,8 +625,8 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 | ParameterB | string | - | 효과별 확장 값 |
 | ConditionId | string | - | 조건 규격 참조용 예약 필드 |
 
-현재 구현 EffectType M1: `DAMAGE`, `PUSH`, `HEAL`, `NEXT_ATTACK_BONUS`, `ATTACK_BUFF`,
-`MAX_HP_BUFF`, `DEFENSE_BUFF`, `GUARD_BUFF`, `MOVE_SELF`. 새 타입은 Executor, Router, Validator,
+현재 구현 EffectType M1: `DAMAGE`, `PUSH`, `PULL`, `HEAL`, `NEXT_ATTACK_BONUS`, `ATTACK_BUFF`,
+`MAX_HP_BUFF`, `DEFENSE_BUFF`, `GUARD_BUFF`, `VENOM_BUFF`, `MOVE_SELF`, `TURN_SELF`. 새 타입은 Executor, Router, Validator,
 데이터 사전을 함께 수정한 뒤 사용한다.
 
 `GUARD_BUFF`는 받는 피해를 전부 무효로 만들고(도적 `dark_sight`), `MOVE_SELF`는 피해 스텝 뒤에 시전자를
@@ -631,6 +634,8 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 `BACKWARD_OFFSET`은 방향 전환 없이 `Value`칸 후퇴(해적 `backstep_shot`),
 `BACKWARD_OVER_ENEMY`는 같은 후퇴이되 그 칸에 적이 있으면 그 적 바로 뒤로 넘어간다(궁수 `retreat_shot`),
 `BEHIND_FARTHEST_TARGET`은 그 스킬이 맞힌 적 중 가장 먼 적의 `Value`칸 뒤다(도적 `muspelheim`·`tornado_spin`).
+`muspelheim`은 `ParameterB=FALLBACK_FARTHEST_EMPTY`로 맞힌 적이 없어도 3칸 이내 가장 먼 빈 칸으로 가고,
+`tornado_spin`은 마지막 `TURN_SELF` 스텝으로 방향을 돌린다. `PULL`(`chain_hell`)과 `VENOM_BUFF`(`venom`) 규칙도 같은 가이드가 소유한다.
 이동이 막히거나 맞힌 적이 없으면 피해만 남고 이동만 생략된다.
 규칙은 [`Effect-Executor-Guide.md`](./Guide/Effect-Executor-Guide.md)가 소유한다.
 
