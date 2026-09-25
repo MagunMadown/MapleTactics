@@ -167,7 +167,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling`, `flash_slash`, `spirit_blade`, `hyper_body`, `iron_wall` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal`, `magic_guard`, `meditation`, `bless` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
-| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift` / `enhanced_piercing`, `arrow_rain`, `cardinal_discharge_ii` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift`, `double_shot` / `enhanced_piercing`, `arrow_rain`, `cardinal_discharge_ii`, `strafe` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow`, `dark_sight`, `wind_talisman`, `muspelheim`, `tornado_spin`, `slash_storm`, `blade_ascension` / `triple_throw`, `edge_carnival`, `bloody_storm` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot`, `swift_fire`, `backstep_shot`, `bullet_smash`, `monkey_rush_boom`, `monkey_magic` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
@@ -382,11 +382,13 @@ SkillDefinition.ProjectileRuid
 | `flame_orb` | 1 | 마법사 | 플레임 오브 팩 `ball` | 12 | 0.7 | 0 |
 | `poison_breath` | 1 | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
 | `slug_shot` | 1 | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
+| `double_shot` | 1 | 궁수 | 더블 샷 팩 `ball/0` (sprite 60×20) | 14 | 2 | 0 |
 | `enhanced_piercing` | 2 | 궁수 | 인핸스 피어싱 팩 `shootobj/layerList/b1` | 14 | 0.5 | 0 |
+| `strafe` | 2 | 궁수 | 스트레이프 팩 `ball/0` (sprite 68×12) | 14 | 1.8 | 0 |
 | `triple_throw` | 2 | 도적 | 트리플 스로우 팩 `ball` | 14 | 1.2 | 0 |
 | `cannon_spike` | 2 | 해적 | 캐논 스파이크 팩 `ball` | 16 | 0.85 | 0 |
 
-2단계 3종은 모두 **자기 팩에 실제로 날아가는 물체가 있어서** 붙였다. 반대로 상위 단계인데
+2단계 4종은 모두 **자기 팩에 실제로 날아가는 물체가 있어서** 붙였다. 반대로 상위 단계인데
 투사체가 없는 경우도 있다 — `explosion`(원본 `flame_orb`는 투사체 있음)과
 `poison_mist`(원본 `poison_breath`는 투사체 있음), `arrow_rain`(원본 `arrow_bomb`은 투사체 있음)은 자기 팩에 `ball`이 없어 즉발로 뒀다.
 기준은 단계가 아니라 팩 내용이다. `triple_throw`는 반대 방향으로, 원본 `shuriken_burst`에는
@@ -437,8 +439,8 @@ SkillDefinition.ProjectileRuid
 - 출발점과 착탄점을 **같이** 올리므로 거리와 비행시간은 변하지 않는다. 임팩트 시점도 그대로다.
 - 투사체가 없는 행에 값을 넣으면 아무 일도 일어나지 않으므로 Validator가
   `PROJECTILE_HEIGHT_WITHOUT_PROJECTILE`로 거절한다.
-- 현재 사용하는 스킬은 없다(폭풍의 시 `0.25`가 유일했으나 스킬이 삭제됐다). 모든 행이 `0`이라 셀
-  높이에서 날아간다 — 필요해지면 그 행만 채우면 된다.
+- 현재 사용하는 스킬은 `double_shot`·`strafe`(`0.25`)다. 나머지는 `0`이라 셀 높이에서
+  날아간다 — 필요해지면 그 행만 채우면 된다.
 - 값 감각: 캐릭터 키가 대략 1유닛이다. `0`은 발밑, `0.5`는 어깨 위로 떠 보였고 그 중간인
   `0.25`가 활을 든 높이에 맞았다.
 
@@ -465,7 +467,7 @@ SkillDefinition.ProjectileRuid
   Step을 늘리는 것이지 이 컬럼이 하는 일이 아니다.
 - 취소 처리도 발수만큼 필요하다. `ClearSkillImpactTimers`는 예약된 **모든** 발사 타이머를
   지운다. 마지막 하나만 지우면 대체된 시전이 다음 액션까지 화살을 계속 뱉는다.
-- 현재 사용하는 스킬은 없다(폭풍의 시 4발 / 0.06초가 유일했으나 스킬이 삭제됐다). 모든 행이 `1` / `0`이다.
+- 현재 사용하는 스킬은 `double_shot`(2발 / 0.06초)과 `strafe`(4발 / 0.06초)다. 나머지는 `1` / `0`이다.
 
 `SkillProjectileComponent`는 `Translate` 누적이 아니라 **매 프레임 직선 위의 절대 위치를
 계산**한다. 프레임마다 이동량을 더하면 긴 비행에서 오차가 쌓이기 때문이다. 투사체는 회전하지
