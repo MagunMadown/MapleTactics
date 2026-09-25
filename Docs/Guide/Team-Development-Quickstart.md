@@ -1,5 +1,31 @@
 # MapleTactics 팀 개발 빠른 시작 가이드
 
+## 0. AI 코딩 도구 설정 (최초 1회, clone 직후)
+
+Claude Code / Codex / Cursor / GitHub Copilot용 스킬·훅·MCP 설정(`.claude/`, `.codex/`,
+`.agents/`, `.mcp.json`)은 저장소에 커밋돼 있지 않다(`.gitignore` 처리됨) — 전부 공식 CLI
+`@maplestoryworlds/ai-cli`(`mswai`)가 `skills-lock.json`(추적됨, 버전 고정 lockfile)을 기준으로
+생성하는 산출물이다. AI 도구로 이 저장소를 열기 전에 한 번 실행한다.
+
+```bash
+npm i -g @maplestoryworlds/ai-cli
+cd MapleTactics
+mswai init          # AGENTS.md는 이미 있으므로 보존, hooks + skills + MCP 설정만 생성
+mswai status         # 각 에이전트 plugin/mcp 상태 확인
+```
+
+`msw-mcp` MCP 서버는 개인별 API 키가 필요하다 — 발급 후 아래처럼 주입하거나, 생성된
+`.mcp.json`(또는 `.cursor/mcp.json` / `.codex/config.toml`)의 `Authorization` 헤더에 안내된
+발급 URL로 직접 키를 받아 교체한다.
+
+```bash
+mswai mcp --mcp-var MSW_MCP_TOKEN=<발급받은 키>
+```
+
+이후 CLI가 업데이트되면 `npm i -g @maplestoryworlds/ai-cli@latest && mswai update`로 동기화한다.
+`AGENTS.md`·`CLAUDE.md`·`.cursorrules`·`skills-lock.json`은 저장소에 계속 커밋돼 있으니 직접
+clone/pull로 받아진다 — `mswai init`은 이 파일들이 아니라 나머지 도구별 산출물만 다시 만든다.
+
 ## 1. 먼저 읽을 문서
 
 새 작업자는 다음 순서만 먼저 읽는다.

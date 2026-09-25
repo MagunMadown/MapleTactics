@@ -195,21 +195,35 @@ RootDesk/MyDesk/
 │   ├── Jobs/
 │   │   └── JobMechanicRouterLogic.mlua
 │   └── Events/
+├── 00_Core/
+│   └── Lobby/
+│       ├── LobbyCharacterSelectionLogic.mlua
+│       ├── LobbyJobSelectionProvider.mlua
+│       ├── LobbyCodexLogic.mlua (+ Monster/Skill/ItemCodexProvider)
+│       └── LobbyInteractionComponent.mlua
 ├── 02_UI/
-│   └── BattleQueueHudComponent.mlua
+│   ├── BattleHudPresenterLogic.mlua
+│   ├── BattleQueueHudComponent.mlua (대체됨 — §20 참고, 삭제 예정)
+│   ├── MapTeleportManager.mlua / MapTeleportButton.mlua
+│   └── MinimapUI.mlua
 ├── 03_Data/
 │   ├── Repositories/
 │   ├── StageDefinitions.userdataset
+│   ├── RegionDefinitions.userdataset
 │   ├── StageEnemyWaves.userdataset
 │   ├── EnemyDefinitions.userdataset
 │   ├── EnemySpawnPools.userdataset
-│   ├── SkillDefinitions.userdataset
-│   ├── SkillEffectSteps.userdataset
 │   ├── EnemyPatternSteps.userdataset
+│   ├── BossPhaseDefinitions.userdataset
+│   ├── SkillDefinitions.userdataset (공용, 현재 0행 — 실제 스킬은 §11.2 참고)
+│   ├── {Warrior,Mage,Archer,Thief,Pirate,Enemy}SkillDefinitions.userdataset
+│   ├── SkillEffectSteps.userdataset
 │   ├── JobDefinitions.userdataset
 │   ├── JobStartingSkillEntries.userdataset
 │   ├── AugmentDefinitions.userdataset
-│   └── ItemDefinitions.userdataset
+│   ├── ConsumableDefinitions.userdataset (§12.2의 옛 ItemDefinitions 계획을 대체)
+│   ├── CurrencyDefinitions.userdataset
+│   └── StageRewardDefinitions.userdataset
 └── 04_Roguelike/
     └── RunManager/
 ```
@@ -220,10 +234,16 @@ MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은
 
 폴더 이동은 기능 마이그레이션과 동시에 수행한다. 빈 폴더를 먼저 대량 생성하지 않는다.
 
-`02_UI/`를 런타임 UI 스크립트의 단일 진입 폴더로 사용한다. Deck은 현재 범위에 포함하지
-않으며, 보유 타일·장착 구성·드로우/셔플 같은 독립 덱 기능을 실제로 개발할 때만
-`05_Deck/`을 생성한다. 전투 행동 큐의 실행 상태는 Deck이 아니라 Combat Runtime이
-소유한다.
+`02_UI/`를 런타임 UI 스크립트의 단일 진입 폴더로 사용한다(`05_UI`는 2026-08 중 여기로
+통합·삭제됐다). Deck은 현재 범위에 포함하지 않으며, 보유 타일·장착 구성·드로우/셔플 같은
+독립 덱 기능을 실제로 개발할 때만 `05_Deck/`을 생성한다. 전투 행동 큐의 실행 상태는 Deck이
+아니라 Combat Runtime이 소유한다.
+
+로비(캐릭터/직업 선택, 도감)는 `00_Core/Lobby/` 아래에서 전투와 분리된 자체 컴포넌트로
+구현한다. 로비 이동 `00_Core/LobbyGridMovementComponent`는 `BoardStateComponent`나
+`BattleSessionComponent.TryMove()`의 논리 Cell/점유 판정을 쓰지 않고 `MinX`/`MaxX` 범위로만
+제한하지만, 방향 입력·이동 시간·곡선·홉 연출은 전투와 같은 `00_Core/Movement/PlayerGridMovementLogic`
+을 공유한다(2026-09-05 통합).
 
 ---
 
@@ -555,6 +575,14 @@ SkillDefinition
 `SkillTargetResolverLogic`이 실제 타격 시점에 대상 Snapshot을 한 번 만들고, 모든 Effect
 Executor와 UI DTO는 이 결과를 공유한다. Session이나 UI에서 별도로 사거리 판정을 복제하지 않는다.
 
+위 필드 스키마는 **같은 열 구성을 가진 7개 Dataset**(`SkillDefinitions`, `{Warrior,Mage,
+Archer,Thief,Pirate}SkillDefinitions`, `EnemySkillDefinitions`)에 공통으로 적용된다 — 스킬은
+직업별 테이블로 분리돼 있고 공용 `SkillDefinitions`는 현재 헤더만 있는 빈 테이블이다. 어느
+테이블에 있는지는 호출부가 알 필요 없이 `SkillDefinitionRepositoryLogic`이 전체를 순회해서
+찾는다. 정확한 테이블 목록·조회 경로·플레이어 지급 가능 스킬 구분은
+[`MapleTactics-M1-Data-Dictionary.md` §4.1](../MapleTactics-M1-Data-Dictionary.md)을 단일
+기준으로 한다.
+
 ### 11.3 SkillEffectSteps — 실제 Dataset 전환 완료
 
 | 필드 | 타입 | 필수 | 설명 |
@@ -668,7 +696,13 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 `JobMechanic`은 `SkillDefinitions`가 아니므로 스킬 큐·스킬 쿨타임·EffectSet을 자동 적용하지
 않는다. 턴 소비 여부는 실행 결과의 `ConsumedTurn`, UI 표시는 `GetUiState`로 명시한다.
 
-### 12.2 ItemDefinitions
+### 12.2 ItemDefinitions — 계획됨(미구현), 실제로는 ConsumableDefinitions로 대체됨
+
+아래 표는 v0.1 초안 당시의 장비·소비 통합 계획이며 `ItemDefinitions` Dataset은 실제로 만들어진
+적이 없다. 실제 소비 아이템 파이프라인은 `ConsumableDefinitions`(사용 시점·턴 소비·효과 DTO)
++ `ConsumableEffectRouterLogic`(원시 EffectType Router) + `ConsumableHealEffectLogic` 등
+독립 Handler로 §6.11에 이미 **구현됨** 상태로 존재한다. 장비(EquipSlot 개념)는 아직 어떤
+형태로도 구현되지 않았다.
 
 | 필드 | 설명 |
 |---|---|
@@ -908,7 +942,12 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 | `ConsumableDefinitionRepositoryLogic` | Consumable Definition Repository | 구현됨 |
 | `ConsumableEffectRouterLogic` | Consumable primitive effect Router | HEAL Handler 구현됨 |
 | `RunManagerLogic` | Run Coordinator | 유지 |
-| `BattleQueueHudComponent` | HUD Request/Presentation | 유지 후 Skill Definition 표시 연결 |
+| `BattleQueueHudComponent` | (구) HUD Request/Presentation | **대체됨** — 아래 `BattleHudPresenterLogic`으로 교체된 뒤 `AddComponent`/`.map` 어디에도 붙지 않는 죽은 코드로 남음. 삭제 대상 |
+| `BattleHudPresenterLogic` | 전투 HUD 상태를 Event(`BattleHudStateChangedEvent`/`BattleHudCommandResultEvent`)로 발행하는 Client 전용 Presenter | 구현됨 |
+| `RegionDefinitionRepositoryLogic` | Region Definition Repository | 구현됨 |
+| `BossPhaseDefinitionRepositoryLogic` | 보스 Phase 임계치·Pattern 교체 Repository | 구현됨 |
+| `LobbyCharacterSelectionLogic` / `LobbyJobSelectionProvider` / `LobbyCodexLogic` | 로비 캐릭터·직업 선택, 도감(Codex) | 구현됨, 규격 문서화는 미완 |
+| `LobbyGridMovementComponent` | 로비 좌우 이동(전투 Board 점유 판정 없음, 이동 연출은 `PlayerGridMovementLogic` 공유) | 구현됨 |
 
 ---
 
