@@ -98,7 +98,7 @@
 | SkillId | string | O | 큐에 넣어 실행하는 일반 스킬 ID |
 | DisplayName | string | O | 표시 이름 |
 | SkillTags | string | - | `attack\|starter` 형식 태그 |
-| TargetingType | enum | O | `SELF`, `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS` |
+| TargetingType | enum | O | `SELF`, `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `FIRST_ENEMY_PIERCE`, `RANGE_OFFSETS` |
 | Range | integer | O | Cell 기준 최대 사거리, 1 이상. `SELF`도 Validator 규칙상 1 이상을 넣는다 |
 | TargetOffsets | string | 조건부 | `RANGE_OFFSETS`일 때 필수. Facing 기준 정수 오프셋을 `|`로 구분 |
 | CooldownTurns | integer | O | 실행 후 쿨다운 턴, 0 이상. 저작값은 §4.7 계단(1단계 `1` / 2단계 `2` / 유틸리티 `4`)을 따른다 |
@@ -167,7 +167,7 @@ TargetSelector로 정해지므로, 사거리 안에 적이 없어도 시전할 �
 | 무기 카탈로그 | `WeaponDefinitions` | (SkillId 아님 — §4.4 참조) |
 | 전사 | `WarriorSkillDefinitions` | `brandish`, `divine_swing`, `spear_pulling`, `flash_slash`, `spirit_blade`, `hyper_body`, `iron_wall` / `brave_slash`, `divine_charge`, `la_mancha_spear` |
 | 마법사 | `MageSkillDefinitions` | `cold_beam`, `thunder_bolt`, `flame_orb`, `poison_breath`, `holy_arrow`, `heal`, `magic_guard`, `meditation`, `bless` / `ice_strike`, `explosion`, `poison_mist`, `shining_ray` |
-| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift`, `double_shot` / `enhanced_piercing`, `arrow_rain`, `cardinal_discharge_ii`, `strafe` |
+| 궁수 | `ArcherSkillDefinitions` | `piercing`, `arrow_bomb`, `cardinal_discharge`, `split_mistel`, `cardinal_transition`, `bolt_swift`, `double_shot`, `bolt_rupture`, `retreat_shot` / `enhanced_piercing`, `arrow_rain`, `cardinal_discharge_ii`, `strafe` |
 | 도적 | `ThiefSkillDefinitions` | `shuriken_burst`, `savage_blow`, `fatal_blow`, `dark_sight`, `wind_talisman`, `muspelheim`, `tornado_spin`, `slash_storm`, `blade_ascension` / `triple_throw`, `edge_carnival`, `bloody_storm` |
 | 해적 | `PirateSkillDefinitions` | `magnum_shot`, `shock_wave`, `slug_shot`, `swift_fire`, `backstep_shot`, `bullet_smash`, `monkey_rush_boom`, `monkey_magic` / `double_barrel_shot`, `screw_punch`, `cannon_spike` |
 | 적 전용 | `EnemySkillDefinitions` | `enemy_basic_attack`, `enemy_ranged_shot`, `boss_sweeping_strike` (전부 1단계) |
@@ -383,6 +383,8 @@ SkillDefinition.ProjectileRuid
 | `poison_breath` | 1 | 마법사 | 포이즌 브레스 팩 `ball` | 12 | 1 | 0.25 |
 | `slug_shot` | 1 | 해적 | 슬러그 샷 팩 `ball` | 16 | 1 | 0 |
 | `double_shot` | 1 | 궁수 | 더블 샷 팩 `ball/0` (sprite 60×20) | 14 | 2 | 0 |
+| `bolt_rupture` | 1 | 궁수 | 볼트 럽쳐 강화 팩 `ball/0` (157×37) | 14 | 0.7 | 0 |
+| `retreat_shot` | 1 | 궁수 | 리트리트 샷 팩 `ball` (110×22) | 14 | 1 | 0 |
 | `enhanced_piercing` | 2 | 궁수 | 인핸스 피어싱 팩 `shootobj/layerList/b1` | 14 | 0.5 | 0 |
 | `strafe` | 2 | 궁수 | 스트레이프 팩 `ball/0` (sprite 68×12) | 14 | 1.8 | 0 |
 | `triple_throw` | 2 | 도적 | 트리플 스로우 팩 `ball` | 14 | 1.2 | 0 |
@@ -439,7 +441,7 @@ SkillDefinition.ProjectileRuid
 - 출발점과 착탄점을 **같이** 올리므로 거리와 비행시간은 변하지 않는다. 임팩트 시점도 그대로다.
 - 투사체가 없는 행에 값을 넣으면 아무 일도 일어나지 않으므로 Validator가
   `PROJECTILE_HEIGHT_WITHOUT_PROJECTILE`로 거절한다.
-- 현재 사용하는 스킬은 `double_shot`·`strafe`(`0.25`)다. 나머지는 `0`이라 셀 높이에서
+- 현재 사용하는 스킬은 `double_shot`·`strafe`·`bolt_rupture`·`retreat_shot`(`0.25`)다. 나머지는 `0`이라 셀 높이에서
   날아간다 — 필요해지면 그 행만 채우면 된다.
 - 값 감각: 캐릭터 키가 대략 1유닛이다. `0`은 발밑, `0.5`는 어깨 위로 떠 보였고 그 중간인
   `0.25`가 활을 든 높이에 맞았다.
@@ -627,6 +629,7 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 `GUARD_BUFF`는 받는 피해를 전부 무효로 만들고(도적 `dark_sight`), `MOVE_SELF`는 피해 스텝 뒤에 시전자를
 `ParameterA` 모드가 정한 칸으로 이동시킨다 — `FORWARD_OFFSET`은 `Value`칸 전진,
 `BACKWARD_OFFSET`은 방향 전환 없이 `Value`칸 후퇴(해적 `backstep_shot`),
+`BACKWARD_OVER_ENEMY`는 같은 후퇴이되 그 칸에 적이 있으면 그 적 바로 뒤로 넘어간다(궁수 `retreat_shot`),
 `BEHIND_FARTHEST_TARGET`은 그 스킬이 맞힌 적 중 가장 먼 적의 `Value`칸 뒤다(도적 `muspelheim`·`tornado_spin`).
 이동이 막히거나 맞힌 적이 없으면 피해만 남고 이동만 생략된다.
 규칙은 [`Effect-Executor-Guide.md`](./Guide/Effect-Executor-Guide.md)가 소유한다.

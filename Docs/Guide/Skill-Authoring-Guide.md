@@ -67,7 +67,7 @@ TryQueueTile
 | `SkillId` | string | `basic_slash` | 고유 `lower_snake_case` ID |
 | `DisplayName` | string | `기본 베기` | 빈 문자열 금지 |
 | `SkillTags` | string | `attack|starter` | `|`로 구분 |
-| `TargetingType` | string | `FRONT_CELL` | `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS` |
+| `TargetingType` | string | `FRONT_CELL` | `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `FIRST_ENEMY_PIERCE`, `RANGE_OFFSETS` |
 | `Range` | integer | `1` | 1 이상, Cell 기준 최대 사거리 |
 | `TargetOffsets` | string | `1|2` | `RANGE_OFFSETS` 전용, Facing 기준 칸 오프셋을 `|`로 구분. 음수는 뒤쪽 칸(`1|-1` = 앞뒤 한 칸씩) |
 | `CooldownTurns` | integer | `1` | 0 이상. 저작값은 위 "저작값 규칙" 표가 소유한다 |
@@ -316,6 +316,7 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 |---|---|---|
 | 바로 앞 한 칸 공격 | `FRONT_CELL` | Facing 앞의 한 칸만 검사 |
 | 빈칸을 넘어 가장 가까운 적 공격 | `FIRST_ENEMY_FORWARD` | 1칸부터 `Range`까지 순서대로 찾아 첫 적 선택 |
+| 가장 가까운 적과 그 뒤 한 칸 관통 | `FIRST_ENEMY_PIERCE` | `FIRST_ENEMY_FORWARD`처럼 첫 적을 찾고, 그 바로 뒤 한 칸(`Range` 밖이어도)까지 대상에 넣는다. 적이 없으면 `Range`까지 빈 칸만. 투사체는 뒤 칸까지 날아간다 |
 | 정해진 여러 칸 범위 공격 | `RANGE_OFFSETS` | `TargetOffsets`의 모든 칸 검사. 예: `1|2` |
 
 `TargetSelector`는 한 Effect가 확정된 대상 중 누구에게 적용되는지 정한다.
@@ -326,7 +327,7 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 
 다음 중 하나라면 현재 데이터 행만으로는 추가할 수 없다.
 
-- 위 세 종류 이외의 타기팅
+- 위 네 종류 이외의 타기팅
 - `DAMAGE`, `PUSH` 이외의 EffectType
 - 새로운 Motion Profile
 - 조건식 또는 비용 소비
