@@ -1,0 +1,203 @@
+@Logic
+script UnionRewardServiceLogic extends Logic
+
+	property boolean DefinitionValidationAttempted = false
+	property boolean DefinitionsValid = false
+	property string DefinitionValidationReason = "NOT_VALIDATED"
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		local validation = self:EnsureDefinitionsValid()
+		if validation.Success == true then
+			log("[UnionReward] service ready definitions=" .. tostring(validation.CheckedRewardCount or 0))
+		else
+			log_error("[UnionReward] service unavailable reason=" .. validation.Reason .. " detail=" .. (validation.ErrorSnapshot or ""))
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BeginRun(Entity userEntity, integer runSequence)
+		-- Allocates a persistent monotonic reward run ID so reconnects cannot reuse an old commit key.
+		local validation = self:EnsureDefinitionsValid()
+		if validation.Success == false then
+			return validation
+		end
+		if isvalid(userEntity) == false or runSequence == nil or runSequence <= 0 then
+			return { Success = false, Reason = "INVALID_REWARD_RUN_CONTEXT" }
+		end
+		local unionState = userEntity:GetComponent("script.PlayerRunUnionEffectComponent")
+		if unionState == nil or unionState.IsInitialized == false or unionState.ActiveRunSequence ~= runSequence then
+			return { Success = false, Reason = "RUN_UNION_SEQUENCE_MISMATCH" }
+		end
+		local allocation = _UnionProfileRepositoryLogic:AllocateUnionRewardRunId(userEntity, "RUN_START")
+		if allocation.Success == false then
+			return allocation
+		end
+		return unionState:BeginUnionRewardRun(runSequence, allocation.RewardRunId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ProcessBattleResult(Entity userEntity, string stageId, string stageType, string battleResult, string battleRecordKey, table flowResult)
+		-- Accumulates battle definitions and commits only when the authoritative run ends.
+		local validation = self:EnsureDefinitionsValid()
+		if validation.Success == false then
+			return validation
+		end
+		if isvalid(userEntity) == false then
+			return { Success = false, Reason = "INVALID_PLAYER" }
+		end
+		if battleResult ~= "Victory" and battleResult ~= "Defeat" then
+			return { Success = false, Reason = "INVALID_BATTLE_RESULT" }
+		end
+		if stageId == nil or stageId == "" or battleRecordKey == nil or battleRecordKey == "" then
+			return { Success = false, Reason = "INVALID_BATTLE_REWARD_CONTEXT" }
+		end
+		local unionState = userEntity:GetComponent("script.PlayerRunUnionEffectComponent")
+		if unionState == nil or unionState.IsInitialized == false or unionState.RewardRunId <= 0 then
+			return { Success = false, Reason = "UNION_REWARD_RUN_NOT_INITIALIZED" }
+		end
+
+		local runClear = false
+		if battleResult == "Victory" then
+			local stageReward = self:AccumulateTrigger(unionState, "StageClear", stageId, "battle:" .. battleRecordKey .. ":stage")
+			if stageReward.Success == false then
+				return stageReward
+			end
+			if stageType == "BOSS" then
+				local bossReward = self:AccumulateTrigger(unionState, "BossClear", stageId, "battle:" .. battleRecordKey .. ":boss")
+				if bossReward.Success == false then
+					return bossReward
+				end
+			end
+			runClear = (flowResult ~= nil and flowResult.FlowState == "RUN_COMPLETED") or self:IsTerminalBattleStage(stageId)
+			if runClear == true then
+				local runReward = self:AccumulateTrigger(unionState, "RunClear", stageId, "run:" .. tostring(unionState.RewardRunId) .. ":clear")
+				if runReward.Success == false then
+					return runReward
+				end
+			end
+		end
+
+		local runEnded = battleResult == "Defeat" or runClear == true
+		unionState:MarkUnionRewardRunEnded(runEnded, battleResult == "Defeat" and "DEFEAT" or (runClear and "RUN_CLEAR" or "CONTINUE"))
+		if runEnded == false then
+			local pending = unionState:GetRewardSnapshot()
+			pending.Reason = "PENDING_RUN_REWARD_UPDATED"
+			return pending
+		end
+		return self:CommitPendingRunReward(userEntity, battleResult == "Defeat" and "RUN_DEFEAT" or "RUN_CLEAR")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ProcessTerminalContentCompletion(Entity userEntity, integer runSequence, string lastStageId)
+		-- Commit pending rewards at a terminal shop, using the same idempotent run-clear key.
+		if not isvalid(userEntity) then return { Success = false, Reason = "INVALID_PLAYER" } end
+		local unionState = userEntity:GetComponent("script.PlayerRunUnionEffectComponent")
+		if unionState == nil or not unionState.IsInitialized or unionState.ActiveRunSequence ~= runSequence or unionState.RewardRunId <= 0 then
+			return { Success = false, Reason = "RUN_UNION_SEQUENCE_MISMATCH" }
+		end
+		if unionState.LastRewardWasCommitted then return unionState:GetRewardSnapshot() end
+		local validation = self:EnsureDefinitionsValid()
+		if validation.Success == false then return validation end
+		local reward = self:AccumulateTrigger(unionState, "RunClear", lastStageId, "run:" .. tostring(unionState.RewardRunId) .. ":clear")
+		if reward.Success == false then return reward end
+		unionState:MarkUnionRewardRunEnded(true, "RUN_CLEAR")
+		return self:CommitPendingRunReward(userEntity, "TERMINAL_CONTENT_CLEAR")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CommitPendingRunReward(Entity userEntity, string reason)
+		local unionState = userEntity:GetComponent("script.PlayerRunUnionEffectComponent")
+		if unionState == nil or unionState.RewardRunId <= 0 then
+			return { Success = false, Reason = "UNION_REWARD_RUN_NOT_INITIALIZED" }
+		end
+		local commitKey = "union_run:" .. tostring(unionState.RewardRunId)
+		local commit = _UnionProfileRepositoryLogic:TryCommitUnionReward(
+			userEntity,
+			unionState.PendingUnionPoints,
+			commitKey,
+			reason or "RUN_END"
+		)
+		if commit.Success == false then
+			return commit
+		end
+		local applied = unionState:ApplyUnionRewardCommit(commitKey, commit.CommittedAmount or unionState.PendingUnionPoints, commit.WasDuplicate == true)
+		applied.ProfileSnapshot = commit.Snapshot
+		log("[UnionReward] committed runId=" .. unionState.RewardRunId
+			.. " base=" .. applied.BaseUnionPoints
+			.. " bonus=" .. applied.BonusUnionPoints
+			.. " final=" .. applied.FinalUnionPoints
+			.. " duplicate=" .. tostring(applied.WasDuplicate))
+		return applied
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunRewardSnapshot(Entity userEntity)
+		if isvalid(userEntity) == false then
+			return { Success = false, Reason = "INVALID_PLAYER" }
+		end
+		local unionState = userEntity:GetComponent("script.PlayerRunUnionEffectComponent")
+		if unionState == nil then
+			return { Success = false, Reason = "RUN_UNION_STATE_UNAVAILABLE" }
+		end
+		return unionState:GetRewardSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table AccumulateTrigger(any unionState, string triggerType, string targetId, string eventKey)
+		local definitions = _UnionRewardDefinitionRepositoryLogic:GetDefinitionsForTrigger(triggerType, targetId)
+		if definitions.Success == false then
+			return definitions
+		end
+		local result = { Success = true, Reason = "OK", TriggerType = triggerType, TargetId = targetId, AppliedCount = 0, DuplicateCount = 0, BaseUnionPoints = 0 }
+		for _, definition in ipairs(definitions.Definitions) do
+			local rewardKey = eventKey .. ":" .. definition.RewardId
+			local applied = unionState:AccumulateUnionReward(definition.BaseUnionPoints, rewardKey)
+			if applied.Success == false then
+				return applied
+			end
+			if applied.WasDuplicate == true then
+				result.DuplicateCount = result.DuplicateCount + 1
+			else
+				result.AppliedCount = result.AppliedCount + 1
+				result.BaseUnionPoints = result.BaseUnionPoints + definition.BaseUnionPoints
+			end
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsTerminalBattleStage(string stageId)
+		-- The prototype graph ends with a REST reward node. Its preceding battle is the real run-clear boundary.
+		local battleNode = _NodeDefinitionRepositoryLogic:FindNodeByStageId(stageId)
+		if battleNode.Success == false then
+			return false
+		end
+		if battleNode.NextNodeIds == nil or battleNode.NextNodeIds == "" then
+			return true
+		end
+		local nextCount = 0
+		local terminalRewardCount = 0
+		for nextNodeId in string.gmatch(battleNode.NextNodeIds, "([^|]+)") do
+			nextCount = nextCount + 1
+			local nextNode = _NodeDefinitionRepositoryLogic:GetNodeDefinition(battleNode.NodeGraphId, nextNodeId)
+			if nextNode.Success == true and nextNode.NodeType == "REST" and (nextNode.NextNodeIds == nil or nextNode.NextNodeIds == "") then
+				terminalRewardCount = terminalRewardCount + 1
+			end
+		end
+		return nextCount > 0 and nextCount == terminalRewardCount
+	end
+
+	@ExecSpace("ServerOnly")
+	method table EnsureDefinitionsValid()
+		if self.DefinitionValidationAttempted == false then
+			self.DefinitionValidationAttempted = true
+			local validation = _UnionRewardDefinitionRepositoryLogic:ValidateDefinitions()
+			self.DefinitionsValid = validation.Success == true
+			self.DefinitionValidationReason = validation.Reason or "CONTENT_VALIDATION_FAILED"
+			return validation
+		end
+		return { Success = self.DefinitionsValid, Reason = self.DefinitionValidationReason }
+	end
+
+end

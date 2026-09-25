@@ -23,8 +23,8 @@ mswai mcp --mcp-var MSW_MCP_TOKEN=<발급받은 키>
 ```
 
 이후 CLI가 업데이트되면 `npm i -g @maplestoryworlds/ai-cli@latest && mswai update`로 동기화한다.
-`AGENTS.md`·`CLAUDE.md`·`skills-lock.json`은 저장소에 계속 커밋돼 있으니 직접 clone/pull로
-받아진다 — `mswai init`은 이 세 파일이 아니라 나머지 도구별 산출물만 다시 만든다.
+`AGENTS.md`·`CLAUDE.md`·`.cursorrules`·`skills-lock.json`은 저장소에 계속 커밋돼 있으니 직접
+clone/pull로 받아진다 — `mswai init`은 이 파일들이 아니라 나머지 도구별 산출물만 다시 만든다.
 
 ## 1. 먼저 읽을 문서
 

@@ -1,0 +1,90 @@
+@Logic
+script RelicDefinitionRepositoryLogic extends Logic
+
+	property string DataSetName = "RelicDefinitions"
+
+	@ExecSpace("ServerOnly")
+	method table GetAllDefinitions()
+		-- Validate every numeric effect before a run captures the catalog.
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		if dataSet == nil then return { Success = false, Reason = "RELIC_DATASET_MISSING" } end
+		local definitions = {}
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local id = dataSet:GetCell(rowIndex, "RelicId") or ""
+			if id == "" or string.find(id, "[~|]") ~= nil or definitions[id] ~= nil then
+				return { Success = false, Reason = "INVALID_OR_DUPLICATE_RELIC_ID", RowIndex = rowIndex }
+			end
+			local definition = { Success = true, Reason = "OK", RelicId = id, Source = "DATASET",
+				DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+				IconImageRUID = dataSet:GetCell(rowIndex, "IconImageRUID") or "" }
+			for _, field in ipairs({ "AttackBonus", "MaxHpBonus", "DefenseBonus" }) do
+				local value = tonumber(dataSet:GetCell(rowIndex, field))
+				if value == nil or value ~= value or value == math.huge or value < 0 or value ~= math.floor(value) then
+					return { Success = false, Reason = "INVALID_RELIC_STAT", RelicId = id, Field = field }
+				end
+				definition[field] = value
+			end
+			if definition.DisplayName == "" or definition.IconImageRUID == ""
+				or string.find(definition.DisplayName .. definition.IconImageRUID, "[~|]") ~= nil then
+				return { Success = false, Reason = "INVALID_RELIC_PRESENTATION", RelicId = id }
+			end
+			definition.SpecialEffectType = dataSet:GetCell(rowIndex, "SpecialEffectType") or ""
+			local rawValue = dataSet:GetCell(rowIndex, "SpecialEffectValue") or ""
+			local value = rawValue == "" and 0 or tonumber(rawValue)
+			local effectType = definition.SpecialEffectType
+			if value == nil or value ~= value or value == math.huge or value < 0 or value ~= math.floor(value)
+				or (effectType == "" and value ~= 0) or (effectType ~= "" and value <= 0)
+				or ((effectType == "FIRST_HIT_GUARD" or effectType == "LETHAL_SURVIVAL") and value ~= 1) then
+				return { Success = false, Reason = "INVALID_RELIC_SPECIAL_VALUE", RelicId = id }
+			end
+			definition.SpecialEffectValue = value
+			local specialDescription = self:DescribeSpecialEffect(effectType, value)
+			if effectType ~= "" and specialDescription == "" then
+				return { Success = false, Reason = "UNSUPPORTED_RELIC_SPECIAL_EFFECT", RelicId = id }
+			end
+			local statDescription = self:DescribeEffects(definition.AttackBonus, definition.MaxHpBonus, definition.DefenseBonus)
+			if specialDescription ~= "" then
+				local hasStats = definition.AttackBonus + definition.MaxHpBonus + definition.DefenseBonus > 0
+				definition.EffectDescription = hasStats and statDescription .. " / " .. specialDescription or specialDescription
+			else
+				definition.EffectDescription = statDescription
+			end
+			definitions[id] = definition
+		end
+		return { Success = true, Reason = "OK", Definitions = definitions }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRelicDefinition(string relicId)
+		-- Exact membership lookup; numeric columns own the effects.
+		local catalog = self:GetAllDefinitions()
+		if catalog.Success == false then return catalog end
+		return catalog.Definitions[relicId or ""] or { Success = false, Reason = "RELIC_DEFINITION_NOT_FOUND" }
+	end
+
+	method string DescribeEffects(number attack, number hp, number defense)
+		-- Share wording between the shop and combat HUD.
+		local parts = {}
+		if attack > 0 then table.insert(parts, "공격력 +" .. tostring(attack)) end
+		if hp > 0 then table.insert(parts, "최대 체력 +" .. tostring(hp)) end
+		if defense > 0 then table.insert(parts, "방어력 +" .. tostring(defense)) end
+		return #parts > 0 and table.concat(parts, " / ") or "능력치 증가 없음"
+	end
+
+	method string DescribeSpecialEffect(string effectType, number value)
+		-- One supported-effect catalog owns both validation and the shop/HUD wording.
+		local descriptions = {
+			KILL_HEAL = "적 처치 시 체력 %d 회복",
+			VICTORY_HEAL = "전투 승리 시 체력 %d 회복",
+			FIRST_HIT_GUARD = "전투마다 첫 피격 피해 1회 무효화",
+			LETHAL_SURVIVAL = "전투마다 치명적인 피해를 1회 체력 1로 버팀",
+			BATTLE_START_HEAL = "전투 시작 시 체력 %d 회복",
+			CONSUMABLE_HEAL_BONUS = "회복 소모품 회복량 +%d",
+			FIRST_KILL_COOLDOWN = "전투마다 첫 적 처치 시 모든 스킬 쿨다운 %d 감소",
+			VICTORY_MESO = "전투 승리 시 추가 메소 %d 획득 (유니온 보너스 적용)"
+		}
+		local description = descriptions[effectType]
+		return description ~= nil and string.format(description, value) or ""
+	end
+
+end

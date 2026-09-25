@@ -4,6 +4,34 @@
 목표: 복잡한 프레임워크를 먼저 만들지 않고, Maker 화면에서 직접 확인할 수 있는 작은 전투 기능을 하나씩 완성한다.  
 진행 원칙: 한 Slice를 구현하고 실제 화면과 로그로 검증한 뒤에만 다음 Slice로 넘어간다.
 
+## 2026-09-12 — 통합 유물 상점과 런 능력치
+
+- 🟡 Implemented (untested): 위·아래 NodeId 유지, 공통 shop_relic의 33종 중 미보유 유물 하나를 결정적으로 추첨. 재열기 유지, 판매 완료, 전체 보유 시 빈 상점.
+- 🟡 Implemented (untested): RelicDefinitions 세 정수 보너스, 새 런 정의 캡처, 구매 즉시 합산 및 HP 차이 적용, 전투 진입 복구·새 런 초기화.
+- 🟡 Implemented (untested): 실제 타격별 공격력·방어력, 최소 피해 1, 완전 방어 0. 상점 단일 행·효과 설명·전투 HUD 연결.
+- 로컬 Lua 테스트: 실제 mLua 메서드로 추첨 재현성·구매 거절·중복 처리·HP 5/10→6/11·전투 피해를 검증. 엔진 서비스와 UI 렌더링은 모의 객체이므로 Maker 검증을 대체하지 않는다.
+- 남은 Verify: Maker Refresh → build/normal 로그 → Play에서 양쪽 경로, 실제 구매·퇴장·다음 전투·새 런 검증. 현재 세션에 Maker MCP 실행 도구가 없어 런타임 증거 미수집.
+
+## 2026-08-29 — 헤네시스 이후 분기형 런 상점
+
+- 🟡 상태: Implemented (Maker runtime verification pending)
+- 헤네시스 보스 승리 뒤 월드맵을 `SHOP_CHOICE`로 열고 위·아래 상점 중 하나를 선택한다.
+- `TravelAvatar`의 걷기 연출이 끝난 뒤 서버가 노드를 승인하고, 두 분기가 공유하는 `shop.map`으로 이동한다.
+- NPC 상점은 공통 33종 중 미보유 유물 하나를 표시하고, 1골드 구매 결과를 `RunItemSnapshot`에 저장하며 런 능력치를 적용한다.
+- 상점 UI의 X는 팝업만 닫고, 맵 NameTag 대신 화면 오른쪽 아래의 일반 `출발` 버튼이 구매 여부와 무관하게 상점 노드를 완료한다.
+- `출발` 요청은 서버의 `ShopState=CLOSED` 승인을 기다린 뒤 상점 UI를 닫고 `POST_SHOP_ROUTE` 월드맵을 다시 연다.
+- UIGroup 순서는 전투 HUD < `출발` 버튼 < 상점 UI < 월드맵으로 고정해, 월드맵이 열리면 스킬·스킬 큐·HP UI보다 항상 위에 표시한다.
+- 완료 뒤 `POST_SHOP_ROUTE` 월드맵에서 선택한 엘리니아 또는 커닝시티 경로만 활성화한다.
+- 완료 기준: 데이터·중복·권한 검증, UIBuilder strict lint, Maker build 오류 0, 위/아래 선택·구매·무구매 퇴장·반대 경로 잠금 positive log.
+
+## 2026-08-30 — 엘리니아 전투 무대 1차 시각 패스
+
+- 🟡 상태: Implemented (MapBuilder 정적 검증 및 Maker 화면 검토 대기)
+- 대상: `map/ellinia_battle.map`의 전투 구조·foothold·Battle 컴포넌트는 유지하고, 헤네시스 복제 장식만 엘리니아 숲 테마로 교체한다.
+- 시각 기준: 짙은 청록 배경, 푸른 마력 나무, 매달린 덩굴, 나무집, 숲 등불, 발광 식물로 헤네시스의 밝은 들판과 즉시 구분한다.
+- 실제 Stage 연결은 별도 범위다. 아래쪽 상점 완료 후 `region_03`/엘리니아 첫 Stage로 라우팅하는 데이터·게이트 작업은 Roadmap Backlog에 유지한다.
+- 완료 기준: `TileMapMode=0`, foothold 48개와 전투 컴포넌트가 보존되고 모든 신규 `SpriteRUID`가 비어 있지 않으며, Maker에서 전투 셀·플레이어·적을 가리지 않는지 확인한다.
+
 ## Skills to reference (this Phase)
 
 - `msw-general`: `platform.md`, 확정 맵 타입의 `platform-*.md`, `workspace.md`, `entity.md`, `authoring.md`, `builder-protocol.md`, `model.md`
@@ -290,6 +318,34 @@
   - HUD 표시 ActionType/TileId와 실제 실행 값이 일치
   - `Prepare → Hold → Execute → Complete` positive log 순서가 한 번씩만 출력
 
+### Slice 10.6 - 공격 타일 보유 상태와 사거리 추적 분리
+
+- ✅ 상태: Tested — Maker에서 근접 등록·접근·예고·회피 Miss, 반대 방향 `NEEDS_TURN`, 2칸 Spore 접근·동시 예고·회피 Miss, QUICK 원거리 추적/사거리 내 즉시 준비, 다중 적·강제 증원·Client DTO를 검증
+- 화면 결과: 적은 공격 타일을 먼저 보유하고 접근하며, 공격 가능한 위치에서만 위험 범위를 예고한다. 예고 후 플레이어가 피하면 적은 다시 추적하지 않고 예고 공격을 실행해 빗나간다.
+- 목적:
+  - 현재 `사거리 확인 → 공격 타일 등록` 순서를 `공격 타일 등록 → 사거리 추적 → 공격 예고 → 고정 실행`으로 교정
+  - 공격 큐 보유 상태와 플레이어가 대응해야 하는 `ATTACK_READY` 상태를 분리
+  - 근접 Orange Mushroom과 2칸 원거리 Spore가 같은 런타임 규격을 사용하도록 구성
+- 최소 상태:
+  - `INSERTING`: 기존 `EnemyQueueTurns`만큼 공격 타일 등록 진행
+  - `TRACKING`: 타일을 보유한 채 사거리·방향을 맞추는 중
+  - `ATTACK_READY`: 공격 예고 완료, 플레이어 대응 Command 뒤 실행
+  - `EXECUTING`: 예고한 타일을 현재 Cell/Facing 기준으로 실행
+- 최소 인터페이스:
+  - `EnemyActionPlanComponent`의 타일 보유 상태와 임시 추적 Command 분리
+  - 무상태 Readiness 판정 `READY/NEEDS_TURN/NEEDS_MOVE/BLOCKED`
+  - UI DTO `QueueState`, `QueuedTileId`, `ReadinessReason`, `NextCommandType`, `TargetCells`
+- 데이터 원칙:
+  - 첫 구현에서는 새 CSV 컬럼을 추가하지 않는다.
+  - 사거리는 기존 Skill Target 규칙, 등록 시간은 `EnemyQueueTurns`, 빠른 준비는 `QUICK`을 재사용한다.
+  - 공격 추적 중에는 Pattern Step을 완료하지 않고, 실제 공격 완료 뒤에만 StepIndex를 전진한다.
+- 완료 기준:
+  - 근접 적과 Spore가 사거리 밖에서 공격 타일을 잃지 않고 추적한다.
+  - 사거리 진입 시 즉시 피해 없이 `ATTACK_READY`가 표시된다.
+  - 플레이어가 예고 뒤 벗어나도 적은 재추적하지 않고 공격해 Miss가 발생한다.
+  - QUICK은 사거리 안에서만 등록과 준비를 같은 적 행동에 처리한다.
+  - 강제 증원·다중 적·Wave·Victory/Defeat/Reset 회귀를 통과한다.
+
 ### Slice 11 - 단일 적의 추적 이동과 고정 방향 이동 분리
 
 - ✅ 상태: Tested — 추적 방향 전환, 고정 방향 이동, 경계·점유 WAIT를 Maker 런타임에서 검증 완료
@@ -340,6 +396,40 @@
   - 생존 적 두 명의 행동 순서가 매 실행 동일
   - 첫 적 사망 시 Victory가 발생하지 않고 두 번째 적 사망 시 한 번만 발생
 
+### Slice 14 - CSV 기반 일반전 맵 재사용과 보스 맵 분리
+
+- ✅ 상태: Verified — `region_01_boss` 생성, 1-4 CSV 라우팅, 서버 런타임 맵 전환과 콘텐츠 검증 통과.
+- 화면 결과: 1-1~1-3은 같은 `region_01_battle` 물리 맵을 재사용하고 1-4는 `region_01_boss`로 이동하며, 각 StageDefinitions·Wave 데이터로 독립 초기화된다.
+- 최소 구현:
+  - `StageMapRoutes.csv`의 1-1~1-3은 `MapId=region_01_battle`, 1-4는 `MapId=region_01_boss`로 설정
+  - 월드맵 지연 진입 요청의 현재 맵 검사를 실제 로비 맵명 `lobby`로 통일
+  - 공용 맵의 `BattleSessionComponent.AutoStartPrototypeBattle=false`
+  - Static Map 격리를 위해 `sector01.maxUserNo=1`
+  - 일반전 공용 물리 맵 `region_01_battle`을 복제해 전투 컴포넌트 계약이 같은 `region_01_boss` 생성
+- 불변식:
+  - `StageId`는 콘텐츠 식별자이고 `MapId`는 물리 이동 대상이다.
+  - 준비된 BattleEntry가 없는 직접 맵 진입은 전투를 자동 시작하지 않는다.
+  - 공용 맵 재진입마다 Registry·Turn·Wave·Queue·Drop·BattleResult를 새 StageId 기준으로 초기화한다.
+- 완료 기준:
+  - 1-1~1-3은 일반전 공용 맵, 1-4는 보스 전용 맵을 반환하고 기존 중복·누락·비활성 검증이 유지됨
+  - Stage 1 클리어 후 보상 맵을 거쳐 같은 물리 맵에 Stage 2로 재진입하며 RequestId와 StageId가 갱신됨
+  - Stage 3은 일반전 공용 맵, Stage 4는 보스 전용 맵으로 진입함
+  - 중복 맵 삭제 후 Sector의 모든 map entry가 실제 파일과 일치하고 build/runtime Error·Warning이 없음
+
+### Slice 15 - 헤네시스 일반전·머쉬맘 보스전 배경 구성
+
+- ✅ 상태: Verified — 교체 가능한 장식 모델과 일반전·보스전 배치 완료, 두 맵의 플레이 카메라 가독성과 오류·경고 0건 확인.
+- 화면 결과: 일반전은 밝은 헤네시스 외곽 사냥터, 보스전은 같은 지역의 더 울창한 버섯 숲으로 구분되며 6칸 전투 정보는 가려지지 않는다.
+- 최소 구현:
+  - 장식 SpriteRUID를 교체 가능한 `.model`로 분리
+  - 일반전에는 표지판·관목·나무를 가장자리와 후경에 배치하고, 오른쪽에는 보스전 왼쪽과 같은 나무·버섯 군락으로 이어지는 숲길을 암시
+  - 보스전에는 큰 수풀·나무 군락을 배치하고 중앙 전투선과 착지 전조 영역은 비움
+  - 기존 `BattleCell1~6`, 카메라, Foothold, 전투 상태 컴포넌트는 변경하지 않음
+- 완료 기준:
+  - 두 맵 모두 6개 셀·플레이어·적·Intent UI 가독성을 유지함
+  - 장식 모델의 SpriteRUID를 한 곳에서 교체할 수 있음
+  - 1-1과 1-4 진입 화면이 명확히 구분되고 build/runtime Error·Warning이 없음
+
 ## 5. 이후 Phase로 넘길 것
 
 Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
@@ -352,6 +442,45 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 6. 증강 3택
 7. 직업과 콘텐츠 수량 확장
 8. 연출, 저장, 재접속
+9. 6개 마을의 독립 Region/Stage 데이터 추가
+10. 모든 마을 연결 Edge에 공통 상점 노드 추가
+
+### 월드맵 지역 확장 순서
+
+Phase 1의 헤네시스 첫 분기는 이후 지역을 추가하기 위한 기준 구현이다. 후속 콘텐츠는 아래 순서와 계약을 유지한다.
+
+| RegionId | 마을 | 물리 맵 세트 | 연결 |
+|---|---|---|---|
+| `region_01` | 헤네시스 | `region_01_battle`, `region_01_boss` | 시작 |
+| `region_02` | 커닝시티 | `region_02_battle`, `region_02_boss` | `region_01 → region_02 → region_04 → region_06` |
+| `region_03` | 엘리니아 | `region_03_battle`, `region_03_boss` | `region_01 → region_03 → region_05 → region_06` |
+| `region_04` | 페리온 | `region_04_battle`, `region_04_boss` | 위쪽 중간 지역 |
+| `region_05` | 노틸러스 | `nautilus_battle`, `nautilus_boss` | 아래쪽 중간 지역 |
+| `region_06` | 슬리피우드 | `sleepywood_ant_tunnel`, `sleepywood_food_cart_boss` | 양쪽 경로 합류 |
+
+```text
+로비
+└─ 헤네시스
+   ├─ 상점(Henesys→Kerning) → 커닝시티 → 상점(Kerning→Perion) → 페리온 → 상점(Perion→Sleepywood) ┐
+   └─ 상점(Henesys→Ellinia) → 엘리니아 → 상점(Ellinia→Nautilus) → 노틸러스 → 상점(Nautilus→Sleepywood) ┘
+                                                                                                      ↓
+                                                                                                  슬리피우드
+```
+
+후속 구현 체크리스트:
+
+- [ ] `RegionDefinitions`에 커닝시티·엘리니아·페리온·노틸러스·슬리피우드 추가
+- [ ] Region마다 `region_XX_battle.map`과 `region_XX_boss.map`을 별도 생성
+- [ ] 같은 Region의 일반 Stage만 해당 `region_XX_battle`을 재사용하고 다른 마을 맵은 공유하지 않음
+- [ ] `StageMapRoutes`의 모든 StageId를 소속 Region의 일반전/보스전 MapId로 연결
+- [ ] `NodeDefinitions`에 도시별 전투/보스 노드와 6개 Edge 상점 노드 추가
+- [ ] 모든 상점 표시와 클릭은 공통 `ShopVisitBtn` 및 Shop Controller 사용
+- [ ] Edge별 `ShopId`, 출발 `RegionId`, 도착 `RegionId`, 해금 조건을 데이터로 정의
+- [ ] 마을 클리어 전에는 다음 상점과 도시를 클릭할 수 없도록 서버 Run Snapshot으로 게이트
+- [ ] 상점 방문 완료 후에만 해당 Edge의 다음 마을을 클릭 가능하게 전환
+- [ ] `UPPER`/`LOWER` 최초 선택을 Run 동안 유지하고 반대 경로를 비활성화
+- [ ] 두 경로가 슬리피우드에서 동일한 진행 상태로 합류하는지 검증
+- [ ] UI 코드에 도시별 `if`를 늘리지 않고 Dataset 행 추가만으로 노드를 확장
 
 ## 6. 사용자와 함께 확인할 화면 체크포인트
 
@@ -762,7 +891,7 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 
 - 상태: ✅ Tested (prototype fallback), 실제 `NodeDefinitions` Dataset 이관은 P0
 - 새 파일: `03_Data/Repositories/NodeDefinitionRepositoryLogic.mlua`
-- 상위 흐름 원본: `StageDefinitions.NextStageId`가 아니라 `NodeDefinitions.NextNodeIds`
+- 상위 흐름 원본: `NodeDefinitions.NextNodeIds` 단일 원본
 - 공통 결과 DTO: `NextNodeIds`, `NextContentTypes`, `NextContentIds`
   - `BATTLE/BOSS`: ContentId는 StageId
   - `SHOP/EVENT/REST`: ContentId는 NodeId
@@ -839,3 +968,40 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 - 실제 실행: `slash_push_combo`가 Step 1 DAMAGE `HP 6→5`, Step 2 PUSH `Cell 3→4` 순서로 처리
 - Cooldown: 실행 직후 `slash_push_combo:2` 확인
 - Build Warning/Error/Fatal 0; Runtime Warning/Error/Fatal 0
+
+### 2026-08-25 — Slice 16: 도시 경로형 월드맵·클리어 게이트·노란 상점 방문
+
+- 상태: 🟡 Implemented (UIBuilder·정적 계약 검증 완료, Maker 런타임 검증 대기)
+- `PopupGroup.ui`를 양피지형 전체 화면 지도판으로 재배치하고 지정 `sprite/Object` RUID로 통일
+  - 경로·상점: `7e33c3b2fa244e938d425f7b2eef68a1` (`01_yellow_button`)
+  - 잠금 도시 노드: `e4c9511644314491a68cd26eecc0a47f` (`02_purple_button`)
+  - 6개 도시 오브젝트·전용 명패: 헤네시스, 커닝시티, 페리온, 엘리니아, 노틸러스, 슬리피우드
+  - 지도 배경·경로: `01_repaired_base_map_background`, `01_yellow_path_network`
+  - 상점 창·상품 카드·제목판: `menu_bg`, `paper`, `shopslot_bg`, `gauge_titlebg` 등록 자산 재사용
+- 헤네시스 `1-1` 클리어 후 위·아래 노란 상점 버튼을 동시에 해금하고 최초 선택을 서버 Run 상태의 `SelectedWorldMapBranch`에 고정
+- 위쪽 상점 `UPPER`는 커닝시티 `1-2`, 아래쪽 상점 `LOWER`는 엘리니아 `1-2`로 연결하며 선택하지 않은 상점·도시는 비활성
+- 페리온·노틸러스·슬리피우드는 다음 지역용 잠금 도시로 표시
+- 잠금 안내, 헤네시스 `CLEAR` 배지, 진행 가이드 문구를 동기화된 플레이어 Run 상태에서 갱신
+- 공식 `yellow_button` RUID `4d0973b97a1e40f79ecf586592705f76`로 선택 상점 방문 버튼과 닫기 동작 구성
+- 상점 방문 패널은 다음 도시 진입 전 선택 동선이며 진행도나 전투 상태를 소비하지 않음
+- 선택 도시별 이동 아바타 목표 좌표와 Battle Gateway 결과 수신 노드를 분리
+- UIBuilder 계약 검증: 35 Entity, Ellinia gate/StageId/yellow_button/초기 숨김 상태 확인, schema error 0
+- 남은 Verify: Maker Refresh → Build log → lobby Play → 클리어 전 잠금 → 1-1 승리 후 해금 → 상점 열기/닫기 → 엘리니아 클릭 및 전환 로그
+
+### 2026-08-26 — 6개 마을·마을 간 상점 확장 기준
+
+- 상태: 📋 Planned — Phase 1 이후 콘텐츠 확장 계약 확정
+- 현재 Slice 16의 헤네시스 `1-1 → 상점 → 커닝시티/엘리니아` 흐름을 모든 도시 연결의 기준으로 재사용
+- 현재 커닝시티/엘리니아가 헤네시스 전투 Stage를 임시 재사용하는 연결은 프로토타입 전용이며, 지역 콘텐츠 추가 시 각각 `region_02_*`, `region_03_*` 맵과 Stage 데이터로 교체
+- 위쪽 경로: `헤네시스 → 상점 → 커닝시티 → 상점 → 페리온 → 상점 → 슬리피우드`
+- 아래쪽 경로: `헤네시스 → 상점 → 엘리니아 → 상점 → 노틸러스 → 상점 → 슬리피우드`
+- Region/MapId 규칙: 헤네시스 `region_01`, 커닝시티 `region_02`, 엘리니아 `region_03`, 페리온 `region_04`, 노틸러스 `region_05`, 슬리피우드 `region_06`
+- 각 Region은 자체 `region_XX_battle`과 `region_XX_boss` 물리 맵을 가지며 같은 Region 내부 Stage만 일반전 맵을 재사용
+- 각 상점 방문은 독립 `NodeId`를 가지며 공통 `shop_relic`을 참조하고 UI는 `ShopVisitBtn`, 로직은 공통 Shop Controller를 사용
+- 각 마을의 최종 전투/보스 클리어가 다음 Edge 상점 해금의 기본 조건이며, 현재 헤네시스 `1-1` 게이트는 프로토타입 예외
+- 선택 경로·상점 방문·다음 도시 해금은 `PlayerRunStateComponent`의 서버 권위 상태로 관리
+- 구현 완료 기준:
+  - 새 도시와 상점이 UI 스크립트의 도시별 분기 추가 없이 데이터 행으로 생성·게이트됨
+  - 각 도시 StageId가 다른 도시의 MapId가 아닌 자신의 `region_XX_battle/boss`로 라우팅됨
+  - 각 마을 클리어 전 상점/다음 도시 클릭 차단, 클리어 후 상점 해금, 상점 방문 후 다음 도시 해금 순서가 유지됨
+  - 반대 경로는 같은 Run에서 계속 잠기며 두 경로 모두 슬리피우드에 정상 합류함

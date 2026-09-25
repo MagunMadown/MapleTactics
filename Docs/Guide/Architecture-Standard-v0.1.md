@@ -239,10 +239,11 @@ MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은
 독립 덱 기능을 실제로 개발할 때만 `05_Deck/`을 생성한다. 전투 행동 큐의 실행 상태는 Deck이
 아니라 Combat Runtime이 소유한다.
 
-로비(캐릭터/직업 선택, 도감, 로비 전용 이동)는 `00_Core/Lobby/` 아래에서 전투와 분리된
-자체 컴포넌트로 구현한다. `LobbyGridMovementComponent`(로비 이동)는 `BoardStateComponent`나
-`BattleSessionComponent.TryMove()`를 재사용하지 않는 별개의 단순 구현이다 — 전투의 논리
-Cell/점유 판정과 섞이지 않는다.
+로비(캐릭터/직업 선택, 도감)는 `00_Core/Lobby/` 아래에서 전투와 분리된 자체 컴포넌트로
+구현한다. 로비 이동 `00_Core/LobbyGridMovementComponent`는 `BoardStateComponent`나
+`BattleSessionComponent.TryMove()`의 논리 Cell/점유 판정을 쓰지 않고 `MinX`/`MaxX` 범위로만
+제한하지만, 방향 입력·이동 시간·곡선·홉 연출은 전투와 같은 `00_Core/Movement/PlayerGridMovementLogic`
+을 공유한다(2026-09-05 통합).
 
 ---
 
@@ -499,7 +500,6 @@ UI 표시 문구는 Reason ID와 분리한다. 서버 Reason을 그대로 사용
 | `PlayerStartCell` | integer | O | Player 시작 Cell |
 | `QueueCapacity` | integer | O | 기본 타일 큐 용량 |
 | `WaveTableId` | string | O | Wave 묶음 ID |
-| `NextStageId` | string |  | 마지막이면 빈 문자열 |
 | `StageRuleId` | string |  | 특수 규칙 Handler ID |
 
 Map Entity에는 가능하면 `StageId`만 설정하고 세부 값은 Repository에서 읽는다.
@@ -755,7 +755,7 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 | `PatternId` | 패턴 ID |
 | `StepIndex` | 실행 순서 |
 | `ConditionType` | `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE` |
-| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE` |
+| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `CAST_INTERRUPTIBLE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE` |
 | `TileId` | 예고·실행할 스킬 타일 ID |
 | `TelegraphTurns` | `TELEGRAPH_TILE` 예고 턴 수, 1 이상 |
 | `ParamA/B/C` | 조건·행동별 인자 |
@@ -768,6 +768,8 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 `BattleSessionComponent`는 준비·실행·완료 순서와 실제 보드 명령만 조정한다.
 
 UI는 Pattern 조건을 다시 계산하지 않고 Prepared Intent Snapshot만 표시한다.
+보스 점프의 공중 여부와 고정 착지 칸은 보스의 `BattleUnitComponent`가 소유하며,
+`BoardStateComponent`는 공중 보스를 Cell 점유·공격 대상으로 노출하지 않는다.
 
 ---
 
@@ -945,11 +947,19 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 | `RegionDefinitionRepositoryLogic` | Region Definition Repository | 구현됨 |
 | `BossPhaseDefinitionRepositoryLogic` | 보스 Phase 임계치·Pattern 교체 Repository | 구현됨 |
 | `LobbyCharacterSelectionLogic` / `LobbyJobSelectionProvider` / `LobbyCodexLogic` | 로비 캐릭터·직업 선택, 도감(Codex) | 구현됨, 규격 문서화는 미완 |
-| `LobbyGridMovementComponent` | 로비 전용 좌우 이동(전투 Board와 분리된 단순 구현) | 구현됨 |
+| `LobbyGridMovementComponent` | 로비 좌우 이동(전투 Board 점유 판정 없음, 이동 연출은 `PlayerGridMovementLogic` 공유) | 구현됨 |
 
 ---
 
 ## 21. 규격 변경 절차
+
+### 유물 특수능력 확장 (2026-09-24)
+
+- `RelicDefinitions`는 기존 능력치 열을 유지하고 선택 열 `SpecialEffectType`, `SpecialEffectValue`를 추가한다. 빈 효과는 기존 능력치 유물로 읽는다.
+- `PlayerRunRelicEffectComponent`가 런에 고정된 정의·합산 효과와 전투별 발동 횟수를 소유한다. HP·Cooldown·재화 원본은 기존 소유자에 남는다.
+- Session의 전투 시작·처치 확정 → 유물 API → Unit/SkillRuntime 공개 API, RunManager의 승리 처리 → 유물 API → 보상 Facade 순서로 호출한다.
+- 특정 RelicId 분기는 전투 코어에 추가하지 않는다. 상점·HUD는 Repository가 생성한 동일한 설명을 사용한다.
+- 구현 및 검증 범위와 초기 수치는 `Run-Shop-Authoring-Guide.md`의 유물 특수능력 규격을 따른다. Maker 미검증 상태는 구현 완료와 구별한다.
 
 1. 변경 이유와 영향을 받는 Definition/Component를 기록한다.
 2. 기존 Stage 1 데이터가 새 Repository에서 계속 읽히는지 확인한다.

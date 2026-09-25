@@ -1,0 +1,125 @@
+@Logic
+script EnemyImpactPresentationRepositoryLogic extends Logic
+
+	property string DataSetName = "EnemyImpactPresentations"
+	property integer SupportedSchemaVersion = 1
+
+	@ExecSpace("ServerOnly")
+	method table GetAllEntries()
+		-- Validate dataset rows before publishing a session-local cache; failed loads can be retried.
+		if self._T.entries ~= nil then
+			return { Success = true, Reason = "OK", Entries = self._T.entries, Source = "DATASET" }
+		end
+		local result = { Success = false, Reason = "IMPACT_DATASET_MISSING", Entries = {}, Source = "DATASET" }
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		if dataSet == nil then
+			log_error("[EnemyImpactData] missing dataset=" .. self.DataSetName)
+			return result
+		end
+		local seen = {}
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local entry = self:ConvertRow(dataSet, rowIndex)
+			local validation = self:ValidateEntry(entry)
+			if validation.Success == false or seen[entry.EntryId] then
+				result.Reason = validation.Success == false and validation.Reason or "DUPLICATE_IMPACT_ENTRY"
+				log_error("[EnemyImpactData] rejected row=" .. tostring(rowIndex) .. " reason=" .. result.Reason)
+				return result
+			end
+			seen[entry.EntryId] = true
+			table.insert(result.Entries, entry)
+		end
+		if #result.Entries == 0 then
+			result.Reason = "IMPACT_DATASET_EMPTY"
+			return result
+		end
+		table.sort(result.Entries, function(left, right)
+			if left.Priority ~= right.Priority then return left.Priority > right.Priority end
+			return left.EntryId < right.EntryId
+		end)
+		self._T.entries = result.Entries
+		result.Success = true
+		result.Reason = "OK"
+		log("[EnemyImpactData] loaded entries=" .. tostring(#result.Entries))
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConvertRow(any dataSet, integer rowIndex)
+		-- Wildcard selectors apply to any enemy or skill; empty resources defer to a lower-priority row.
+		return {
+			SchemaVersion = tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")),
+			EntryId = dataSet:GetCell(rowIndex, "EntryId") or "",
+			EnemyDefinitionId = dataSet:GetCell(rowIndex, "EnemyDefinitionId") or "",
+			SkillId = dataSet:GetCell(rowIndex, "SkillId") or "",
+			Priority = tonumber(dataSet:GetCell(rowIndex, "Priority")),
+			DamageSoundRuid = dataSet:GetCell(rowIndex, "DamageSoundRuid") or "",
+			ImpactSoundRuid = dataSet:GetCell(rowIndex, "ImpactSoundRuid") or "",
+			HitEffectRuid = dataSet:GetCell(rowIndex, "HitEffectRuid") or "",
+			DeathSoundRuid = dataSet:GetCell(rowIndex, "DeathSoundRuid") or ""
+		}
+	end
+
+	method table ValidateEntry(table entry)
+		-- Keep malformed resource ids and unsupported schemas out of runtime presentation.
+		if entry.SchemaVersion ~= self.SupportedSchemaVersion then
+			return { Success = false, Reason = "UNSUPPORTED_IMPACT_SCHEMA" }
+		end
+		if entry.EntryId == "" or entry.EnemyDefinitionId == "" or entry.SkillId == "" then
+			return { Success = false, Reason = "IMPACT_SELECTOR_MISSING" }
+		end
+		if entry.Priority == nil or entry.Priority < 0 or entry.Priority ~= math.floor(entry.Priority) then
+			return { Success = false, Reason = "INVALID_IMPACT_PRIORITY" }
+		end
+		local hasResource = false
+		for _, field in ipairs({ "DamageSoundRuid", "ImpactSoundRuid", "HitEffectRuid", "DeathSoundRuid" }) do
+			local ruid = entry[field]
+			if ruid ~= "" then
+				hasResource = true
+				if string.len(ruid) ~= 32 or string.match(ruid, "^%x+$") == nil then
+					return { Success = false, Reason = "INVALID_IMPACT_RUID" }
+				end
+			end
+		end
+		return { Success = hasResource, Reason = hasResource and "OK" or "IMPACT_RESOURCE_MISSING" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method string ResolveResource(string enemyDefinitionId, string skillId, string field)
+		-- Highest-priority matching nonempty field wins, independently for sound and effect.
+		local result = self:GetAllEntries()
+		if result.Success == false then return "" end
+		for _, entry in ipairs(result.Entries) do
+			if (entry.EnemyDefinitionId == "*" or entry.EnemyDefinitionId == enemyDefinitionId)
+				and (entry.SkillId == "*" or entry.SkillId == skillId) then
+				local ruid = entry[field]
+				if ruid ~= nil and ruid ~= "" then return ruid end
+			end
+		end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetResourceRuids()
+		-- Preload comes from the same validated rows used by playback.
+		local result = self:GetAllEntries()
+		local ruids = {}
+		local seen = {}
+		if result.Success == false then return ruids end
+		for _, entry in ipairs(result.Entries) do
+			for _, field in ipairs({ "DamageSoundRuid", "ImpactSoundRuid", "HitEffectRuid", "DeathSoundRuid" }) do
+				local ruid = entry[field]
+				if ruid ~= "" and seen[ruid] ~= true then
+					seen[ruid] = true
+					table.insert(ruids, ruid)
+				end
+			end
+		end
+		return ruids
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Reload edited CSV data for the next play session.
+		self._T.entries = nil
+	end
+end

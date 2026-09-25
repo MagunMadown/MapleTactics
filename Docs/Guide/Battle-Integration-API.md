@@ -256,8 +256,8 @@ TotalWaves
 `InitializeFromEntry(...)`는 공개된 형태이지만 Gateway 전용이다. UI나 Stage 스크립트가
 직접 호출하지 않는다.
 
-전투가 끝난 뒤 다음 화면은 Battle Snapshot의 `NextStageId`를 해석하지 않는다.
-서버 Flow Controller는 다음 API로 플레이어별 Run Flow Snapshot을 읽는다.
+전투가 끝난 뒤 다음 화면은 Battle Snapshot이 아니라 서버 Flow Controller의
+플레이어별 Run Flow Snapshot에서 다음 콘텐츠를 읽는다.
 
 ```lua
 local flow = _RunManagerLogic:GetRunFlowSnapshot(playerEntity)
@@ -333,16 +333,23 @@ local snapshot = _RunManagerLogic:GetRunAugmentSnapshot(playerEntity)
 최종 UI는 이를 표시만 하고 Trigger/Condition을 다시 계산하지 않는다. `LastTrigger*` 값은 현재
 디버깅·기능 검증용이며 연출 타이밍의 영구 이벤트 스트림 계약은 아니다.
 
-소모품 사용 요청은 다음 메서드만 호출한다.
+소비 HUD의 클라이언트 어댑터는 다음 메서드로 요청한다.
 
 ```lua
-session:RequestUseConsumable("potion_hp_small", clientRequestId)
+session:SubmitConsumableUse("red_potion", "")
+session:SubmitConsumableUse("time_sand", selectedOwnedSkillId)
 ```
 
-`clientRequestId`는 한 전투 UI 세션에서 증가시킨다. 서버는 RunSequence와 StageId를
-결합해 UseKey를 만들므로 같은 요청 재전송은 효과·소비 모두 무시한다. UI는 HP 회복량,
-턴 소비 여부, 보유 수량을 직접 계산하지 않는다. 현재 `H` 키와 HUD 문구는 기능 검증용
-어댑터이며 최종 UI 호환 대상이 아니다.
+어댑터가 증가하는 요청 ID와 현재 EntryId·InventoryRevision을 넣어
+`RequestUseConsumable(consumableId, requestId, targetSkillId, entryId, inventoryRevision)`로 전달한다.
+서버는 소유자·현재 맵·진입 세대·플레이어 턴·보유량을 검증하고, 효과가 적용된 뒤 1개만 소비한다.
+UseKey는 RunSequence·StageId·EntryId·InventoryRevision·requestId를 포함한다.
+같은 성공 요청의 재전송은 효과와 소비를 반복하지 않는다. 사용 실패나 대상 선택 취소는 소비하지 않는다.
+5종 모두 턴을 소모하지 않으며 HP·쿨다운은 기존 서버 API가 변경한다.
+
+인벤토리 저장 형식은 `id~count`를 유지한다. HUD는 수량을 개별 아이콘으로 펼치고,
+기본 3칸에 런 시작 시 캡처한 Union 보너스 +0~2를 더한다. 한 칸에 한 개만 표시하며 스택 숫자는 없다.
+초과 수량은 기존 OverflowCurrencyId/OverflowCurrencyPerItem 정책으로 처리한다.
 
 ## 9. 공통 결과
 

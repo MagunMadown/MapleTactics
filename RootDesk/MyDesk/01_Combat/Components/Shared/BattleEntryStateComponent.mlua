@@ -3,7 +3,7 @@ script BattleEntryStateComponent extends Component
 
 	@Sync property string EntryState = "IDLE"
 	@Sync property integer RequestId = 0
-	@Sync property string StageId = "region_01_stage_01"
+	@Sync property string StageId = "henesys_stage_01"
 	@Sync property string CharacterId = ""
 	@Sync property string JobId = ""
 	@Sync property string LoadoutId = ""
@@ -11,6 +11,7 @@ script BattleEntryStateComponent extends Component
 	@Sync property string EntryMode = "NEW_RUN"
 	@Sync property string LastReason = ""
 	@Sync property integer LastTransferRequestId = 0
+	@Sync property boolean PrototypeTestEntry = false
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
@@ -19,11 +20,16 @@ script BattleEntryStateComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table Prepare(string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode)
+		-- Creates a fresh entry request unless the current request is already being consumed.
 		local result = {
 			Success = false,
 			Reason = "UNKNOWN",
 			RequestId = self.RequestId
 		}
+		if self.EntryState == "INITIALIZING" then
+			result.Reason = "ENTRY_INITIALIZATION_IN_PROGRESS"
+			return result
+		end
 		if stageId == nil or stageId == "" then
 			result.Reason = "INVALID_STAGE_ID"
 			return result
@@ -43,6 +49,7 @@ script BattleEntryStateComponent extends Component
 		self.EntryMode = entryMode
 		self.EntryState = "PREPARED"
 		self.LastReason = "PREPARED"
+		self.PrototypeTestEntry = false
 
 		result.Success = true
 		result.Reason = "PREPARED"
@@ -52,11 +59,43 @@ script BattleEntryStateComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method table MarkStarted()
+	method table MarkPrototypeTest(integer requestId)
+		if self.EntryState ~= "PREPARED" or requestId <= 0 or requestId ~= self.RequestId then
+			return { Success = false, Reason = "PROTOTYPE_ENTRY_REQUEST_MISMATCH", RequestId = self.RequestId }
+		end
+		self.PrototypeTestEntry = true
+		log("[BattleEntryState] prototype marked request=" .. tostring(requestId) .. " stage=" .. self.StageId)
+		return { Success = true, Reason = "PROTOTYPE_MARKED", RequestId = requestId }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BeginInitialization()
+		-- Atomically claims the prepared request before any yielding run initialization begins.
 		if self.EntryState ~= "PREPARED" then
 			return {
 				Success = false,
-				Reason = "ENTRY_NOT_PREPARED",
+				Reason = self.EntryState == "INITIALIZING" and "ENTRY_INITIALIZATION_IN_PROGRESS" or "ENTRY_NOT_PREPARED",
+				RequestId = self.RequestId
+			}
+		end
+
+		self.EntryState = "INITIALIZING"
+		self.LastReason = "INITIALIZING"
+		log("[BattleEntryState] initialization claimed request=" .. self.RequestId .. " stage=" .. self.StageId)
+		return {
+			Success = true,
+			Reason = "INITIALIZING",
+			RequestId = self.RequestId
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table MarkStarted()
+		-- Commits only the request that previously claimed the initialization boundary.
+		if self.EntryState ~= "INITIALIZING" then
+			return {
+				Success = false,
+				Reason = "ENTRY_NOT_INITIALIZING",
 				RequestId = self.RequestId
 			}
 		end
@@ -86,9 +125,13 @@ script BattleEntryStateComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table RecordFailure(string reason)
+		-- Releases a claimed request for an explicit retry while preserving its payload.
 		local failureReason = reason
 		if failureReason == nil or failureReason == "" then
 			failureReason = "UNKNOWN"
+		end
+		if self.EntryState == "INITIALIZING" then
+			self.EntryState = "PREPARED"
 		end
 		self.LastReason = failureReason
 		log_warning("[BattleEntryState] pending request=" .. self.RequestId .. " reason=" .. failureReason)
@@ -116,6 +159,27 @@ script BattleEntryStateComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ResetToIdle(string reason)
+		-- Clears the consumed battle-entry payload so the lobby must prepare a fresh new-run request.
+		local resetReason = reason
+		if resetReason == nil or resetReason == "" then
+			resetReason = "RESET_TO_IDLE"
+		end
+		self.EntryState = "IDLE"
+		self.StageId = ""
+		self.CharacterId = ""
+		self.JobId = ""
+		self.LoadoutId = ""
+		self.RunSeed = 0
+		self.EntryMode = "NEW_RUN"
+		self.LastReason = resetReason
+		self.LastTransferRequestId = 0
+		self.PrototypeTestEntry = false
+		log("[BattleEntryState] reset request=" .. self.RequestId .. " state=" .. self.EntryState .. " reason=" .. resetReason)
+		return { Success = true, Reason = resetReason, RequestId = self.RequestId }
+	end
+
+	@ExecSpace("ServerOnly")
 	method table GetSnapshot()
 		return {
 			Success = true,
@@ -128,7 +192,8 @@ script BattleEntryStateComponent extends Component
 			LoadoutId = self.LoadoutId,
 			RunSeed = self.RunSeed,
 			EntryMode = self.EntryMode,
-			LastTransferRequestId = self.LastTransferRequestId
+			LastTransferRequestId = self.LastTransferRequestId,
+			PrototypeTestEntry = self.PrototypeTestEntry
 		}
 	end
 

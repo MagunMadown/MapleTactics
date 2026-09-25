@@ -1,0 +1,126 @@
+@Component
+script WorldMapFutureRegionButtonComponent extends Component
+
+	property string RequiredRouteId = ""
+	property string TargetNodeId = ""
+	property integer RequestId = 200000
+	property boolean RequestPending = false
+	property integer EntryDelayTimerId = 0
+	property string ClickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+	property integer NoticeTimerId = 0
+	property any ClickHandler = nil
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self:EnsureClickHandler("BEGIN_PLAY")
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureClickHandler(string reason)
+		if self.Entity.ButtonComponent == nil then
+			log_error("[WorldMapRegion] button missing node=" .. self.TargetNodeId)
+			return false
+		end
+		if self.ClickHandler == nil then
+			self.ClickHandler = self.Entity:ConnectEvent(ButtonClickEvent, self.OnClicked)
+		end
+		log("[WorldMapRegion] click handler ready node=" .. self.TargetNodeId .. " reason=" .. reason)
+		return self.ClickHandler ~= nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean RebindClickHandler(string reason)
+		if self.ClickHandler ~= nil then self.Entity:DisconnectEvent(ButtonClickEvent, self.ClickHandler) end
+		self.ClickHandler = nil
+		return self:EnsureClickHandler(reason or "REBIND")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetForRoute()
+		self:RebindClickHandler("RESET_FOR_ROUTE")
+		self.RequestPending = false
+		if self.Entity.ButtonComponent ~= nil then self.Entity.ButtonComponent.Enable = true end
+		local presentation = self:GetPresentation()
+		if presentation ~= nil then
+			local tooltipText = string.gsub(presentation.DefaultTooltipText or "", " · 잠김", "")
+			presentation:ApplyState("AVAILABLE", tooltipText)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnClicked()
+		if self.RequestPending then return end
+		local presentation = self:GetPresentation()
+		if presentation ~= nil and presentation:CanActivate() == false then
+			presentation:ShowTooltip()
+			return
+		end
+		local uiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		local minimap = isvalid(uiRoot) and uiRoot:GetComponent("script.MinimapUI") or nil
+		if minimap == nil or minimap.CurrentMode ~= "POST_SHOP_ROUTE" or minimap.SelectedRouteId ~= self.RequiredRouteId then
+			log_warning("[WorldMapRegion] entry rejected node=" .. self.TargetNodeId .. " reason=ROUTE_CONTEXT_MISMATCH required=" .. self.RequiredRouteId)
+			return
+		end
+		_SoundService:PlaySound(self.ClickSoundRUID, 1)
+		if self.TargetNodeId == "" then
+			self:ShowFutureNotice()
+			return
+		end
+		self.RequestPending = true
+		self.Entity.ButtonComponent.Enable = false
+		self.RequestId = self.RequestId + 1
+		minimap:PlayTravelAnimationTo(self.Entity.Name, self.TargetNodeId)
+		self.EntryDelayTimerId = _TimerService:SetTimerOnce(function()
+			self.EntryDelayTimerId = 0
+			self:RequestEntryAfterTravel(minimap)
+		end, minimap.TravelDuration + 0.25)
+		if self.EntryDelayTimerId == 0 then self:RequestEntryAfterTravel(minimap) end
+		log("[WorldMapRegion] travel started node=" .. self.TargetNodeId .. " from=" .. self.RequiredRouteId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestEntryAfterTravel(any minimap)
+		minimap:CloseWorldMapForTransfer(self.TargetNodeId)
+		log("[WorldMapRegion] requesting battle node=" .. self.TargetNodeId .. " request=" .. self.RequestId)
+		_RunManagerLogic:RequestSelectNextContent(self.TargetNodeId, self.RequestId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowFutureNotice()
+		local notice = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/WorldMapNotice")
+		if isvalid(notice) and notice.TextGUIRendererComponent ~= nil then
+			notice.TextGUIRendererComponent.Text = "다음 지역 맵 준비 중"
+			notice.Enable = true
+			if self.NoticeTimerId > 0 then _TimerService:ClearTimer(self.NoticeTimerId) end
+			self.NoticeTimerId = _TimerService:SetTimerOnce(function()
+				self.NoticeTimerId = 0
+				if isvalid(notice) then notice.Enable = false end
+			end, 2)
+		end
+		log("[WorldMapRegion] future region requested route=" .. self.RequiredRouteId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleEntryResult(boolean success, string reason)
+		if success then return end
+		self.RequestPending = false
+		if self.Entity.ButtonComponent ~= nil then self.Entity.ButtonComponent.Enable = true end
+		local root = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		local minimap = isvalid(root) and root:GetComponent("script.MinimapUI") or nil
+		if minimap ~= nil then minimap:OpenWorldMapMode("POST_SHOP_ROUTE", "ENTRY_REJECTED:" .. reason, self.RequiredRouteId) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetPresentation()
+		return self.Entity:GetComponent("script.WorldMapButtonPresentationComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		if self.NoticeTimerId > 0 then _TimerService:ClearTimer(self.NoticeTimerId) end
+		if self.EntryDelayTimerId > 0 then _TimerService:ClearTimer(self.EntryDelayTimerId) end
+		if self.ClickHandler ~= nil then self.Entity:DisconnectEvent(ButtonClickEvent, self.ClickHandler) end
+		self.ClickHandler = nil
+	end
+
+end

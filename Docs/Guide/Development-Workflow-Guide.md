@@ -40,6 +40,7 @@
 | 전투 후 상점·이벤트·다음 전투 전환 | [`Run-Content-Flow-Guide.md`](./Run-Content-Flow-Guide.md) |
 | 런 상점 상품·구매 | [`Run-Shop-Authoring-Guide.md`](./Run-Shop-Authoring-Guide.md) |
 | Skill·Effect Step | [`Skill-Authoring-Guide.md`](./Skill-Authoring-Guide.md) |
+| 직업별 유틸리티 스킬 | [`Utility-Skill-Authoring-Guide.md`](./Utility-Skill-Authoring-Guide.md) |
 | 직업 패시브·증강 | [`Job-Authoring-Guide.md`](./Job-Authoring-Guide.md), [`Augment-Authoring-Guide.md`](./Augment-Authoring-Guide.md) |
 | 새 EffectType | [`Effect-Executor-Guide.md`](./Effect-Executor-Guide.md) |
 | Turn·행동 큐 | [`Battle-Turn-Guide.md`](./Battle-Turn-Guide.md) |
@@ -78,11 +79,12 @@
 | 완료 | Stage 클리어 보상 | `StageRewardDefinitions`의 재화·소모품 보상을 승리 결과에서 멱등 지급 | 새 보상은 표 행으로 추가하고 런 전용 참조 정책과 중복 지급 회귀를 통과 |
 | 완료 | ContentType 전환 준비 계약 | 노드 선택을 BATTLE·SHOP·EVENT·REST Handler에 분배하고 플레이어별 READY Snapshot 제공 | 실제 UI·맵 Adapter는 `RouteAction`과 `DestinationId`만 소비 |
 | 완료 | 최소 런 상점 백엔드 | SHOP Node 연결, 고정 상품 DTO, RUN_SCOPED 골드 차감, 스킬·소모품 지급과 방문/요청 멱등성 | 상품은 CSV로 추가하고 UI는 RunShop DTO/Request만 사용 |
-| 완료 | 적별 동시 계획·행동 Queue·Trait 규격 | 각 적의 `EnemyActionPlanComponent`가 플레이어 행동 전 고정 계획을 소유하고 Session은 순차 실행. `TraitIds`와 Router로 HEAVY·DOUBLE_STRIKE·QUICK 확장 | 다중 적 계획 Snapshot과 Client DTO 2건, 계획 불변성, HEAVY Cell 유지, DOUBLE_STRIKE `1→2`, Build/Runtime 오류 0 검증 완료 |
+| 완료 | 적별 사거리 추적형 Queue·Trait 규격 | 각 적의 `EnemyActionPlanComponent`가 `INSERTING→TRACKING→ATTACK_READY→EXECUTING`을 소유. 기존 Intent Resolver가 방향 전환·접근·준비 완료를 판정 | 다중 적 전체 준비도를 플레이어 턴 전에 동결, QUICK 0턴, 근접/2칸 원거리 회피 Miss, 증원 후 Queue 보존, Client DTO, Build/Runtime 오류 0 검증 완료 |
 | 완료 | `EnemyPatternSteps` 실제 Dataset | 전용 Repository/Validator, Resolver 연결과 fallback 비활성 | 추적·고정·후퇴·2턴 예고 샘플을 포함한 12행. 예고 카운트와 기존 전투 회귀까지 Maker 검증 |
 | 완료 | `TELEGRAPH_TILE` Action | 적별 Runner 카운트다운, 취소 시 미소비, TileId/남은 턴 PreparedIntent 고정 | `prototype_telegraph`의 `2→1→EXECUTE_TILE` 전이와 UI DTO 남은 턴 검증 |
 | 완료 | `MOVE_AWAY` Action | 플레이어 반대 방향 계산, 원자적 Facing·이동, 막힘 시 상태 유지, `prototype_retreat` | Cell `3→4`, Facing `Left→Right`, 점유 실패 시 상태 유지와 Runner `1→2`, 기존 Stage PlayerTurn 2 복귀, 빌드·런타임 Warning/Error 0건 검증 완료 |
 | 완료 | `CELL_FREE` Condition | 네 Selector의 BoardState 점유 Snapshot과 실행 시 TryMove 재검사 | Selector 등록/미등록 값 거부, 빈칸/점유/경계, 명시적 WAIT, 준비 후 점유 변경 `3→4`, 정상 두 적 전투, 빌드·런타임 Warning/Error 0건 검증 완료 |
+| 완료 | 머쉬맘 반대편 점프 패턴 | 예고 실행 후 한 플레이어 턴 동안 공중 상태, 반대편 착지와 중앙 우선 겹침 해소 | Phase 1·2 패턴 검증, 공중 타깃 제외, 겹침 `0→1`, 페이즈 교체 착지 복구, HUD DTO와 착지 후 `WAIT` 전이를 Maker에서 검증 |
 | 완료 | 적별 Pattern Runner | 적 Entity가 Current/Prepared Step을 소유하고 Resolver 실패 분기와 실행 완료·취소 전이를 연결 | 두 적 독립 상태, 성공 `3→1`·`2→1`, 실패 `1→2`, 취소 해제, Current Step 기반 Resolver, 빌드·런타임 Warning/Error 0건 검증 완료 |
 | P1 | `BattleSessionComponent`가 3,300줄 이상 | 이동·공격·Spawn 실행 조정 변경 충돌 가능성이 큼 | 행동 조정·Spawn 책임을 공개 계약 단위로 단계적 분리 |
 | 완료 | 공용 Client 전투 상태 접근 API | `GetBattleUiState()` DTO와 `RevisionKey`로 HUD의 상태 경로 반복을 제거함 | 신규 UI는 DTO만 읽고 서버 Request API만 호출 |
@@ -122,7 +124,7 @@
 - 플레이어별 Run 진행과 다음 콘텐츠 후보는 `PlayerRunStateComponent`가 소유하고,
   `RunManagerLogic`과 `NodeDefinitionRepositoryLogic`만 갱신한다.
 - 전투 중 미회수 드롭은 맵의 `BattleDropComponent`, 회수된 런 재화·소모품은 플레이어의 `PlayerRunInventoryComponent`만 소유한다. 진행 상태는 `PlayerRunStateComponent`와 섞지 않으며 지급·사용은 `RunManagerLogic` Facade를 통과해야 한다.
-- 플레이어가 드롭이 놓인 Cell로 이동하면 `BattleDropComponent.CollectAtCell()`이 Pending Drop을 즉시 런 인벤토리로 옮긴다. 전투 종료까지 밟지 않은 드롭은 최종 승리 시 자동 회수한다. 회수된 `potion_hp_small`은 `PlayerTurn`에서 HP가 감소한 상태일 때 `H` 키 또는 `RequestUseConsumable()`로 사용하며 턴을 소비하지 않는다.
+- 플레이어가 드롭이 놓인 Cell로 이동하면 `BattleDropComponent.CollectAtCell()`이 Pending Drop을 즉시 런 인벤토리로 옮긴다. 전투 종료까지 밟지 않은 드롭은 최종 승리 시 자동 회수한다. 회수된 소비 아이템은 좌측 하단 전투 HUD의 개별 슬롯으로 표시된다. `PlayerTurn`에서 슬롯을 클릭하면 `SubmitConsumableUse()`가 기존 서버 사용 API로 전달하며 턴을 소비하지 않는다. 빨강/주황/하양 포션은 HP를 2/4/6 회복하고 시간의 모래는 보유 중인 쿨다운 스킬을 선택한다. 가득 찬 3~5칸의 초과 수량은 기존 골드 정책으로 전환된다.
 
 Session의 기존 Turn/Wave `@Sync` 필드는 호환 Snapshot이다. 신규 기능은 이 필드를 직접
 대입하지 않는다. 반드시 소유 컴포넌트의 공개 메서드를 호출하고 필요한 경우 Session의

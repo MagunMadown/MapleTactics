@@ -1,0 +1,115 @@
+@Component
+script ShopExitButtonComponent extends Component
+
+	property ButtonComponent DepartureButton = "7baf50f5-49db-4930-b2f6-3670055c4f2f"
+	property any ClickHandler = nil
+	property boolean ClosePending = false
+	property integer CloseRequestId = 300000
+	property string ClickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Connects the screen-space departure button while keeping this controller active.
+		if self.Entity.Name ~= "Controller" then
+			self.Entity.Enable = false
+			log("[RunShopExit] legacy world NameTag button disabled")
+			return
+		end
+		if self.DepartureButton == nil or isvalid(self.DepartureButton.Entity) == false then
+			log_warning("[RunShopExit] departure button binding unavailable")
+			return
+		end
+		self.ClickHandler = self.DepartureButton.Entity:ConnectEvent(ButtonClickEvent, self.OnClicked)
+		self:SetButtonState(false, false)
+		log("[RunShopExit] ui button ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnClicked(ButtonClickEvent event)
+		-- Requests server-authoritative shop completion without hiding the UI prematurely.
+		if self.ClosePending then return end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success ~= true or state.ShopState ~= "OPEN" or state.Commands.CanClose ~= true then return end
+		self.ClosePending = true
+		self:SetButtonState(true, false)
+		_SoundService:PlaySound(self.ClickSoundRUID, 1)
+		self.CloseRequestId = self.CloseRequestId + 1
+		_RunShopLogic:RequestCloseShop(self.CloseRequestId)
+		log("[RunShopExit] close requested request=" .. self.CloseRequestId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Shows the button only in the active shop and opens the route map after confirmed closure.
+		if self.ClosePending then
+			local state = _RunShopLogic:GetLocalShopUiState()
+			if state.Success ~= true or state.ShopState ~= "CLOSED"
+				or state.Completion.LastCompletedContentType ~= "SHOP"
+				or state.NodeId == "" then return end
+
+			local uiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+			local minimap = isvalid(uiRoot) and uiRoot:GetComponent("script.MinimapUI") or nil
+			if minimap == nil then
+				log_warning("[RunShopExit] world map controller unavailable; retrying")
+				return
+			end
+			local opened = true
+			if state.Completion.RunState == "Completed" then
+				minimap:CloseWorldMapForTransfer("lobby")
+			else
+				opened = minimap:OpenWorldMapMode("POST_SHOP_ROUTE", "SHOP_EXIT", state.NodeId)
+			end
+			if opened ~= true then
+				log_warning("[RunShopExit] world map open rejected; retrying")
+				return
+			end
+
+			self.ClosePending = false
+			self:SetButtonState(false, false)
+			local shopUi = _EntityService:GetEntityByPath("/ui/RunShopUI")
+			local controller = isvalid(shopUi) and shopUi:GetComponent("script.RunShopUIComponent") or nil
+			if controller ~= nil then controller:CloseUi() end
+			log("[RunShopExit] completed route=" .. state.NodeId)
+			return
+		end
+
+		local player = _UserService.LocalPlayer
+		local currentMap = isvalid(player) and player.CurrentMap or nil
+		local state = _RunShopLogic:GetLocalShopUiState()
+		local show = isvalid(currentMap) and currentMap.Name == "shop"
+			and state.Success == true and state.ShopState == "OPEN" and state.Commands.CanClose == true
+		self:SetButtonState(show, show)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetButtonState(boolean visible, boolean interactable)
+		-- Updates both rendering and clickability without disabling this controller entity.
+		if self.DepartureButton == nil or isvalid(self.DepartureButton.Entity) == false then return end
+		self.DepartureButton.Entity.Visible = visible
+		self.DepartureButton.Enable = interactable
+		local label = self.DepartureButton.Entity.TextGUIRendererComponent
+		if label ~= nil then
+			local state = _RunShopLogic:GetLocalShopUiState()
+			local terminalShop = state.Success and state.Completion.RunState == "Completed"
+			label.Text = self.ClosePending and "이동 중..." or (terminalShop and "모험 완료" or "출발")
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleCloseResult(boolean success, string reason)
+		-- Restores the button when the server rejects the close request.
+		if success then return end
+		self.ClosePending = false
+		self:SetButtonState(true, true)
+		log_warning("[RunShopExit] close rejected reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Releases the button click subscription with the UI controller.
+		if self.ClickHandler ~= nil and self.DepartureButton ~= nil and isvalid(self.DepartureButton.Entity) then
+			self.DepartureButton.Entity:DisconnectEvent(ButtonClickEvent, self.ClickHandler)
+		end
+	end
+
+end

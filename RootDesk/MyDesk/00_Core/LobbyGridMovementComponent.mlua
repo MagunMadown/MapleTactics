@@ -1,7 +1,7 @@
 @Component
 script LobbyGridMovementComponent extends Component
 
-	-- Keeps lobby movement on the same logical step size used by map01.
+	-- Map bounds remain local; input, interpolation and hop use the battle movement pipeline.
 	property number CellSize = 1.12
 	property number MinX = -29.46
 	property number MaxX = -22.74
@@ -9,24 +9,26 @@ script LobbyGridMovementComponent extends Component
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
 	handler HandleMoveKeyDown(KeyDownEvent event)
-		-- The selection popup owns keyboard focus while open; normal grid input resumes on close.
-		if _LobbyCharacterSelectionLogic:IsOpen() then
-			return
-		end
-
-		local direction = 0
-		if event.key == KeyboardKey.LeftArrow or event.key == KeyboardKey.A then
-			direction = -1
-		elseif event.key == KeyboardKey.RightArrow or event.key == KeyboardKey.D then
-			direction = 1
-		end
-
-		if direction == 0 then
+		-- Lobby modal services own keyboard focus while open; normal grid input resumes on close.
+		if _LobbyCharacterSelectionLogic:IsOpen() or _LobbyCodexLogic:IsOpen() or _UnionSystemUILogic:IsOpen() then
 			return
 		end
 
 		local player = _UserService.LocalPlayer
 		if isvalid(player) == false or player.CurrentMap ~= self.Entity then
+			return
+		end
+
+		if event.key == KeyboardKey.W or event.key == KeyboardKey.Mouse2 or event.key == KeyboardKey.UpArrow then
+			if event.key == KeyboardKey.Mouse2 and _InputService:IsPointerOverUI() then
+				return
+			end
+			self:RequestTurn()
+			return
+		end
+
+		local direction = _PlayerGridMovementLogic:GetDirection(event.key)
+		if direction == 0 then
 			return
 		end
 
@@ -36,6 +38,10 @@ script LobbyGridMovementComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
+		-- Tracks each lobby player independently; no movement state lives in the shared Logic.
+		self._T.gridMoves = {}
+		self._T.gridPlayers = {}
+		self._T.playerScanRemaining = 0
 		log("[LobbyGridMove] begin map=" .. self.Entity.Name .. " cellSize=" .. self.CellSize)
 		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
 		if users == nil then
@@ -49,16 +55,23 @@ script LobbyGridMovementComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void OnMapEnter(Entity enteredEntity)
+		-- Applies grid control when this lifecycle callback provides a player entity.
 		self:SetGridControl(enteredEntity, true)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void OnMapLeave(Entity leftEntity)
+		-- Discard the old map's target before another map can take control of this player.
+		if isvalid(leftEntity) and leftEntity.PlayerComponent ~= nil and self._T.gridMoves ~= nil then
+			self._T.gridMoves[leftEntity.PlayerComponent.UserId] = nil
+		end
 		self:SetGridControl(leftEntity, false)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void OnEndPlay()
+		-- Release map-owned movement state at shutdown.
+		self._T.gridMoves = {}
 		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
 		if users == nil then
 			return
@@ -71,6 +84,7 @@ script LobbyGridMovementComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void SetGridControl(Entity player, boolean enabled)
+		-- Reuses the battle visual component, without registering a battle unit or starting a battle.
 		if isvalid(player) == false or player.PlayerComponent == nil then
 			return
 		end
@@ -82,12 +96,16 @@ script LobbyGridMovementComponent extends Component
 		if player.MovementComponent ~= nil then
 			player.MovementComponent:Stop()
 		end
+		if enabled and player:GetComponent("script.BattleUnitPresentationComponent") == nil then
+			player:AddComponent("BattleUnitPresentationComponent")
+		end
 
 		log("[LobbyGridMove] control player=" .. player.Name .. " grid=" .. tostring(enabled))
 	end
 
 	@ExecSpace("Server")
 	method void RequestMove(integer direction)
+		-- Validates ownership and accepts only one in-flight battle-style step per player.
 		if direction ~= -1 and direction ~= 1 then
 			log_warning("[LobbyGridMove] rejected reason=INVALID_DIRECTION")
 			return
@@ -101,6 +119,11 @@ script LobbyGridMovementComponent extends Component
 
 		if player.TransformComponent == nil or player.MovementComponent == nil then
 			log_warning("[LobbyGridMove] rejected reason=MOVEMENT_COMPONENT_MISSING")
+			return
+		end
+		if self._T.gridMoves == nil then self._T.gridMoves = {} end
+		if self._T.gridMoves[senderUserId] ~= nil then
+			log("[LobbyGridMove] blocked reason=MOVE_IN_PROGRESS")
 			return
 		end
 
@@ -118,11 +141,81 @@ script LobbyGridMovementComponent extends Component
 		end
 
 		player.MovementComponent:Stop()
-		player.MovementComponent:SetWorldPosition(Vector2(targetX, current.y))
-		if player.PlayerControllerComponent ~= nil then
-			player.PlayerControllerComponent.LookDirectionX = direction
+		local profile = _PlayerGridMovementLogic:GetProfile(nil)
+		self._T.gridMoves[senderUserId] = {
+			Entity = player, StartPosition = Vector2(current.x, current.y),
+			TargetPosition = Vector2(targetX, current.y), Elapsed = 0,
+			Duration = _PlayerGridMovementLogic:GetDuration(profile), Profile = profile
+		}
+		_PlayerGridMovementLogic:PlayHop(player, senderUserId, profile)
+		log("[LobbyGridMove] started pipeline=PlayerGridMovementLogic user=" .. senderUserId .. " from=" .. current.x .. " to=" .. targetX .. " duration=" .. tostring(self._T.gridMoves[senderUserId].Duration))
+	end
+
+	@ExecSpace("Server")
+	method void RequestTurn()
+		-- Turns in place with W, Up Arrow or middle click; movement preserves the chosen facing.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if isvalid(player) == false or player.CurrentMap ~= self.Entity then
+			return
 		end
-		log("[LobbyGridMove] moved user=" .. senderUserId .. " from=" .. current.x .. " to=" .. targetX)
+		local controller = player.PlayerControllerComponent
+		if controller == nil then return end
+		if self._T.gridMoves ~= nil and self._T.gridMoves[senderUserId] ~= nil then
+			return
+		end
+		if controller.LookDirectionX >= 0 then
+			controller.LookDirectionX = -1
+		else
+			controller.LookDirectionX = 1
+		end
+		log("[LobbyGridTurn] turned user=" .. senderUserId .. " direction=" .. tostring(controller.LookDirectionX))
+	end
+
+	method void OnUpdate(number delta)
+		-- Advances lobby steps through the same easing and exact endpoint snap used by battle.
+		if self:IsClient() then
+			local localPlayer = _UserService.LocalPlayer
+			if isvalid(localPlayer) and localPlayer.CurrentMap == self.Entity then
+				if localPlayer.PlayerControllerComponent ~= nil then
+					localPlayer.PlayerControllerComponent.Enable = false
+				end
+			end
+			return
+		end
+		-- Map-root OnMapEnter is not a player-join subscription. Reconcile users after spawn/transfer.
+		if self._T.gridPlayers == nil then self._T.gridPlayers = {} end
+		self._T.playerScanRemaining = (self._T.playerScanRemaining or 0) - delta
+		if self._T.playerScanRemaining <= 0 then
+			self._T.playerScanRemaining = 0.1
+			local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
+			for _, player in ipairs(users or {}) do
+				local userId = player.PlayerComponent.UserId
+				if self._T.gridPlayers[userId] ~= player then
+					self._T.gridPlayers[userId] = player
+					self:SetGridControl(player, true)
+				end
+			end
+			for userId, player in pairs(self._T.gridPlayers) do
+				if isvalid(player) == false or player.CurrentMap ~= self.Entity then
+					self._T.gridPlayers[userId] = nil
+				end
+			end
+		end
+		if self._T.gridMoves == nil then return end
+		for userId, movement in pairs(self._T.gridMoves) do
+			local player = movement.Entity
+			if isvalid(player) == false or player.CurrentMap ~= self.Entity or player.MovementComponent == nil then
+				self._T.gridMoves[userId] = nil
+			else
+				local profile = movement.Profile
+				local step = _PlayerGridMovementLogic:Advance(movement, delta, profile.MoveCurve, profile.MoveSnapThreshold)
+				player.MovementComponent:SetWorldPosition(step.Position)
+				if step.Complete then
+					self._T.gridMoves[userId] = nil
+					log("[LobbyGridMove] completed user=" .. userId .. " snappedX=" .. tostring(step.Position.x))
+				end
+			end
+		end
 	end
 
 end

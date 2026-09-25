@@ -1,6 +1,18 @@
 @Component
 script BattleUnitComponent extends Component
 
+	@ExecSpace("ServerOnly")
+	method table RemoveNegativeStatusEffects()
+		-- Cleanses hostile seal only; positive buffs and guard retain their own lifetime.
+		if self.SealTurns <= 0 then
+			return { Success = false, Reason = "NO_NEGATIVE_STATUS_EFFECTS", AppliedAmount = 0 }
+		end
+		self.SealTurns = 0
+		log("[BattleStatus] cleansed unit=" .. self.UnitId)
+		return { Success = true, Reason = "CLEANSED", AppliedAmount = 1 }
+	end
+
+	@Sync property integer SealTurns = 0
 	@Sync property string UnitId = ""
 	@Sync property string Team = ""
 	@Sync property integer SpawnOrder = 0
@@ -9,12 +21,33 @@ script BattleUnitComponent extends Component
 	@Sync property number MaxHp = 100
 	@Sync property number CurrentHp = 100
 	@Sync property boolean IsDead = false
+	@Sync property boolean UtilityGuardActive = false
+	-- Battle-scoped self buffs granted by support skills (BuffEffectExecutorLogic). Turn counts tick on the
+	-- same enemy-round boundary as skill cooldowns and every value resets with InitializeBattleState.
+	-- The synced values are totals (amount = sum over skills, turns = longest remaining) for presentation and
+	-- damage rules; the per-skill entries behind them stay server-side.
+	@Sync property number NextAttackBonus = 0
+	@Sync property number AttackBuffAmount = 0
+	@Sync property integer AttackBuffTurns = 0
+	@Sync property number DefenseBuffAmount = 0
+	@Sync property integer DefenseBuffTurns = 0
+	@Sync property number MaxHpBuffAmount = 0
+	@Sync property integer MaxHpBuffTurns = 0
+	-- A guard buff ignores incoming damage outright; the amount is a flag, not a reduction.
+	@Sync property number GuardBuffAmount = 0
+	@Sync property integer GuardBuffTurns = 0
+	-- Different skills stack; recasting the same skill refreshes its own entry instead of adding a second one.
+	property table NextAttackBonusBySkill = {}
+	property table TimedBuffEntries = {}
 	@Sync property string EnemyDefinitionId = ""
+	@Sync property string EnemyDisplayName = ""
 	@Sync property number BasicAttackDamage = 3
 	@Sync property string EnemyPatternId = "prototype_basic"
 	@Sync property string EnemyMovementPolicy = "TRACK_PLAYER"
 	@Sync property string EnemyTraitIds = ""
 	@Sync property boolean IsBoss = false
+	@Sync property boolean IsAirborne = false
+	@Sync property integer PendingLandingCell = -1
 
 	method void OnBeginPlay()
 		-- Reports server registration and forwards initial values to optional presentation logic.
@@ -24,12 +57,14 @@ script BattleUnitComponent extends Component
 
 		if self:IsClient() then
 			self:RefreshPresentation()
+			self:RefreshFacingPresentation()
 		end
 	end
 
 	@ExecSpace("ServerOnly")
 	method table InitializeBattleState(string unitId, string team, integer cellIndex, string facing, number maxHp, integer spawnOrder)
 		-- Initializes the complete mutable unit state through its owning component.
+		self.EnemyDisplayName = ""
 		self.UnitId = unitId
 		self.Team = team
 		self.SpawnOrder = spawnOrder
@@ -38,17 +73,78 @@ script BattleUnitComponent extends Component
 		self.MaxHp = math.max(1, maxHp)
 		self.CurrentHp = self.MaxHp
 		self.IsDead = false
+		self.UtilityGuardActive = false
+		self:ClearBattleBuffs()
+		self.SealTurns = 0
 		self.IsBoss = false
+		self.IsAirborne = false
+		self.PendingLandingCell = -1
 		return { Success = true, Reason = "INITIALIZED", HpAfter = self.CurrentHp }
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ConfigureEnemyDefinition(string enemyDefinitionId, number basicAttackDamage, string enemyPatternId, string enemyMovementPolicy, string enemyTraitIds, boolean isBoss)
+	method table ApplySeal(integer turns)
+		-- Refreshes one hostile status without stacking duration across multiple Boogies.
+		if self.IsDead or turns < 1 then return { Success = false, Reason = "INVALID_STATUS_TARGET" } end
+		self.SealTurns = math.max(self.SealTurns, turns)
+		log("[BattleStatus] sealed unit=" .. self.UnitId .. " turns=" .. tostring(self.SealTurns))
+		return { Success = true, Hit = true, Reason = "SEALED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceNegativeStatusTurns()
+		-- Runs after the player's next consumed action, never immediately after the enemy applies seal.
+		self.SealTurns = math.max(0, self.SealTurns - 1)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearBattleBuffs()
+		-- Drops every self buff without touching HP; callers that own MaxHp reset it themselves.
+		self.NextAttackBonusBySkill = {}
+		self.TimedBuffEntries = {}
+		self.NextAttackBonus = 0
+		self.AttackBuffAmount = 0
+		self.AttackBuffTurns = 0
+		self.DefenseBuffAmount = 0
+		self.DefenseBuffTurns = 0
+		self.MaxHpBuffAmount = 0
+		self.MaxHpBuffTurns = 0
+		self.GuardBuffAmount = 0
+		self.GuardBuffTurns = 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RestoreCurrentHp(number currentHp)
+		-- Restores carried run HP after the generic battle-unit initializer sets MaxHp.
+		self.CurrentHp = math.max(0, math.min(self.MaxHp, currentHp))
+		self.IsDead = self.CurrentHp <= 0
+		log("[BattleUnit] hp restored unit=" .. self.UnitId .. " hp=" .. self.CurrentHp .. "/" .. self.MaxHp)
+		return { Success = true, Reason = "HP_RESTORED", HpAfter = self.CurrentHp, MaxHp = self.MaxHp }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SetAirborneState(boolean isAirborne, integer pendingLandingCell)
+		-- Keeps board occupancy and presentation driven by one synchronized unit state.
+		if self.IsDead == true then
+			return { Success = false, Reason = "UNIT_DEAD" }
+		end
+		if isAirborne == true and self.IsBoss == false then
+			return { Success = false, Reason = "AIRBORNE_REQUIRES_BOSS" }
+		end
+		self.IsAirborne = isAirborne
+		self.PendingLandingCell = isAirborne and pendingLandingCell or -1
+		log("[BattleUnit] airborne unit=" .. self.UnitId .. " state=" .. tostring(self.IsAirborne) .. " landingCell=" .. self.PendingLandingCell)
+		return { Success = true, Reason = self.IsAirborne and "AIRBORNE_ENTERED" or "AIRBORNE_EXITED", LandingCell = self.PendingLandingCell }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConfigureEnemyDefinition(string enemyDefinitionId, number basicAttackDamage, string enemyPatternId, string enemyMovementPolicy, string enemyTraitIds, boolean isBoss, string displayName)
 		-- Stores the validated enemy definition snapshot without exposing field writes to the session.
 		if self.Team ~= "Enemy" then
 			return { Success = false, Reason = "NOT_ENEMY_UNIT" }
 		end
 		self.EnemyDefinitionId = enemyDefinitionId
+		self.EnemyDisplayName = displayName or ""
 		self.BasicAttackDamage = math.max(0, basicAttackDamage)
 		self.EnemyPatternId = enemyPatternId
 		self.EnemyMovementPolicy = enemyMovementPolicy
@@ -103,9 +199,38 @@ script BattleUnitComponent extends Component
 			return result
 		end
 		result.HpAfter = math.max(0, result.HpBefore - amount)
+		if self.UtilityGuardActive then
+			result.Success = true
+			result.Reason = "UTILITY_GUARDED"
+			result.HpAfter = result.HpBefore
+			log("[UtilitySkill] guard blocked damage unit=" .. self.UnitId .. " amount=" .. tostring(amount))
+			return result
+		end
+		if self.GuardBuffAmount > 0 then
+			-- A skill-granted guard ignores the whole hit, exactly like the utility guard above.
+			result.Success = true
+			result.Reason = "GUARD_BUFFED"
+			result.HpAfter = result.HpBefore
+			log("[BattleBuff] guard blocked damage unit=" .. self.UnitId .. " amount=" .. tostring(amount) .. " turns=" .. tostring(self.GuardBuffTurns))
+			return result
+		end
+		if self.Team == "Player" then
+			local relics = self.Entity:GetComponent("script.PlayerRunRelicEffectComponent")
+			if relics ~= nil then
+				amount = relics:ResolveIncomingDamage(amount, result.HpBefore)
+				result.HpAfter = math.max(0, result.HpBefore - amount)
+			end
+		end
 		result.AppliedAmount = result.HpBefore - result.HpAfter
 		result.ReachedZero = result.HpAfter <= 0
 		self.CurrentHp = result.HpAfter
+		if self.Team == "Player" and self.Entity.PlayerComponent ~= nil then
+			local combatStats = self.Entity:GetComponent("script.PlayerRunCombatStatsComponent")
+			if combatStats ~= nil then
+				combatStats:RecordHit(result.AppliedAmount, result.HpBefore, result.HpAfter)
+			end
+		end
+		self:SyncRunHp("DAMAGE_APPLIED")
 		if self.IsBoss == true and result.HpAfter > 0 then
 			local phaseState = self.Entity:GetComponent("script.BossPhaseStateComponent")
 			if phaseState ~= nil then
@@ -139,9 +264,143 @@ script BattleUnitComponent extends Component
 			return result
 		end
 		self.CurrentHp = result.HpAfter
+		self:SyncRunHp("HEALING_APPLIED")
 		result.Success = true
 		result.Reason = "HEALING_APPLIED"
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyNextAttackBonus(string skillId, number amount)
+		-- Arms a one-shot damage bonus for this unit's next damaging skill. Bonuses from different skills add up;
+		-- recasting the same skill keeps its larger value instead of stacking.
+		if amount <= 0 then
+			return { Success = false, Reason = "INVALID_AMOUNT" }
+		end
+		if self.IsDead == true then
+			return { Success = false, Reason = "UNIT_DEAD" }
+		end
+		local previous = self.NextAttackBonusBySkill[skillId] or 0
+		self.NextAttackBonusBySkill[skillId] = math.max(previous, amount)
+		self.NextAttackBonus = self:SumTableValues(self.NextAttackBonusBySkill)
+		log("[BattleBuff] next attack bonus armed unit=" .. self.UnitId .. " skill=" .. skillId .. " amount=" .. tostring(self.NextAttackBonusBySkill[skillId]) .. " total=" .. tostring(self.NextAttackBonus) .. " refreshed=" .. tostring(previous > 0))
+		return { Success = true, Reason = previous > 0 and "NEXT_ATTACK_BONUS_REFRESHED" or "NEXT_ATTACK_BONUS_ARMED", Amount = self.NextAttackBonus }
+	end
+
+	@ExecSpace("ServerOnly")
+	method number ConsumeNextAttackBonus()
+		-- Spends every armed bonus once the skill it boosted has landed; returns the consumed total (0 when none was armed).
+		local amount = self.NextAttackBonus
+		self.NextAttackBonusBySkill = {}
+		self.NextAttackBonus = 0
+		if amount > 0 then
+			log("[BattleBuff] next attack bonus consumed unit=" .. self.UnitId .. " amount=" .. tostring(amount))
+		end
+		return amount
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyTimedBuff(string skillId, string stat, number amount, integer turns)
+		-- Adds or refreshes one skill's timed stat buff (ATTACK / DEFENSE / MAX_HP / GUARD). Entries from different
+		-- skills stack; the same skill keeps the larger amount and the longer duration.
+		if stat ~= "ATTACK" and stat ~= "DEFENSE" and stat ~= "MAX_HP" and stat ~= "GUARD" then
+			return { Success = false, Reason = "UNSUPPORTED_BUFF_STAT" }
+		end
+		if amount <= 0 or turns <= 0 then
+			return { Success = false, Reason = "INVALID_AMOUNT" }
+		end
+		if self.IsDead == true then
+			return { Success = false, Reason = "UNIT_DEAD" }
+		end
+		local key = skillId .. "|" .. stat
+		local entry = self.TimedBuffEntries[key]
+		local refreshed = entry ~= nil
+		if entry == nil then
+			entry = { SkillId = skillId, Stat = stat, Amount = 0, Turns = 0 }
+			self.TimedBuffEntries[key] = entry
+		end
+		entry.Amount = math.max(entry.Amount, amount)
+		entry.Turns = math.max(entry.Turns, turns)
+		self:RecomputeBuffTotals(stat .. "_BUFF_APPLIED")
+		log("[BattleBuff] " .. string.lower(stat) .. " buff applied unit=" .. self.UnitId .. " skill=" .. skillId .. " amount=" .. tostring(entry.Amount) .. " turns=" .. tostring(entry.Turns) .. " refreshed=" .. tostring(refreshed) .. " totals atk=" .. tostring(self.AttackBuffAmount) .. " def=" .. tostring(self.DefenseBuffAmount) .. " maxHp=" .. tostring(self.MaxHpBuffAmount) .. " hp=" .. tostring(self.CurrentHp) .. "/" .. tostring(self.MaxHp))
+		return { Success = true, Reason = refreshed and (stat .. "_BUFF_REFRESHED") or (stat .. "_BUFF_APPLIED"), Amount = entry.Amount, Turns = entry.Turns, HpAfter = self.CurrentHp, MaxHp = self.MaxHp }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table AdvanceBuffTurns(string reason)
+		-- Counts every timed buff down by one enemy round and removes the ones that ran out, on the same boundary as
+		-- skill cooldowns. A removed max-HP buff restores MaxHp and clips CurrentHp through RecomputeBuffTotals.
+		local result = { Success = true, Reason = "BUFFS_ADVANCED", AttackExpired = false, DefenseExpired = false, MaxHpExpired = false, MaxHpChanged = false }
+		local expiredKeys = {}
+		for key, entry in pairs(self.TimedBuffEntries) do
+			entry.Turns = entry.Turns - 1
+			if entry.Turns <= 0 then
+				table.insert(expiredKeys, key)
+			end
+		end
+		if #expiredKeys == 0 then
+			self:RecomputeBuffTotals(reason)
+			return result
+		end
+		for _, key in ipairs(expiredKeys) do
+			local entry = self.TimedBuffEntries[key]
+			self.TimedBuffEntries[key] = nil
+			if entry.Stat == "ATTACK" then
+				result.AttackExpired = true
+			elseif entry.Stat == "DEFENSE" then
+				result.DefenseExpired = true
+			elseif entry.Stat == "MAX_HP" then
+				result.MaxHpExpired = true
+			end
+			log("[BattleBuff] " .. string.lower(entry.Stat) .. " buff expired unit=" .. self.UnitId .. " skill=" .. entry.SkillId .. " amount=" .. tostring(entry.Amount) .. " reason=" .. (reason or ""))
+		end
+		local maxHpDelta = self:RecomputeBuffTotals("BUFF_EXPIRED")
+		result.MaxHpChanged = maxHpDelta ~= 0
+		log("[BattleBuff] totals after expiry unit=" .. self.UnitId .. " atk=" .. tostring(self.AttackBuffAmount) .. " def=" .. tostring(self.DefenseBuffAmount) .. " maxHp=" .. tostring(self.MaxHpBuffAmount) .. " hp=" .. tostring(self.CurrentHp) .. "/" .. tostring(self.MaxHp) .. " reason=" .. (reason or ""))
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method number RecomputeBuffTotals(string reason)
+		-- Rebuilds the synced totals from the per-skill entries and applies any max-HP change; returns that change.
+		local totals = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0 }
+		local longest = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0 }
+		for _, entry in pairs(self.TimedBuffEntries) do
+			totals[entry.Stat] = totals[entry.Stat] + entry.Amount
+			longest[entry.Stat] = math.max(longest[entry.Stat], entry.Turns)
+		end
+		self.AttackBuffAmount = totals.ATTACK
+		self.AttackBuffTurns = longest.ATTACK
+		self.DefenseBuffAmount = totals.DEFENSE
+		self.DefenseBuffTurns = longest.DEFENSE
+		self.GuardBuffAmount = totals.GUARD
+		self.GuardBuffTurns = longest.GUARD
+		self.MaxHpBuffTurns = longest.MAX_HP
+		local maxHpDelta = totals.MAX_HP - self.MaxHpBuffAmount
+		if maxHpDelta == 0 then
+			return 0
+		end
+		self.MaxHpBuffAmount = totals.MAX_HP
+		if maxHpDelta > 0 then
+			-- A new or larger buff raises the maximum and the current HP by the same amount.
+			self.MaxHp = self.MaxHp + maxHpDelta
+			self.CurrentHp = math.min(self.MaxHp, self.CurrentHp + maxHpDelta)
+		else
+			-- An expired buff only takes back the maximum; HP above the new maximum is clipped.
+			self.MaxHp = math.max(1, self.MaxHp + maxHpDelta)
+			self.CurrentHp = math.min(self.CurrentHp, self.MaxHp)
+		end
+		self:SyncRunHp("MAX_HP_" .. (reason or ""))
+		return maxHpDelta
+	end
+
+	method number SumTableValues(table values)
+		-- Sums the numeric values of a keyed table.
+		local total = 0
+		for _, value in pairs(values or {}) do
+			total = total + value
+		end
+		return total
 	end
 
 	@ExecSpace("ServerOnly")
@@ -152,7 +411,26 @@ script BattleUnitComponent extends Component
 		end
 		self.CurrentHp = math.max(0, self.CurrentHp)
 		self.IsDead = true
+		self:SyncRunHp("UNIT_MARKED_DEAD")
+		self.IsAirborne = false
+		self.PendingLandingCell = -1
 		return { Success = true, Reason = "MARKED_DEAD" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SyncRunHp(string reason)
+		-- Mirrors player HP into player-owned run state; enemy HP remains battle-scoped.
+		if self.Team ~= "Player" or self.Entity.PlayerComponent == nil then
+			return
+		end
+		local runState = self.Entity:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil then
+			log_warning("[RunHp] sync skipped reason=RUN_STATE_MISSING hpReason=" .. (reason or ""))
+			return
+		end
+		-- A timed max-HP buff is battle-only: the run keeps the unbuffed maximum, so HP above it never leaves the battle.
+		local baseMaxHp = math.max(1, self.MaxHp - self.MaxHpBuffAmount)
+		runState:SetRunHp(math.min(self.CurrentHp, baseMaxHp), baseMaxHp, reason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -182,9 +460,12 @@ script BattleUnitComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnSyncProperty(string name, any value)
-		-- Forwards only synchronized identity or HP changes; presentation owns all visual settings.
-		if name == "Team" or name == "UnitId" or name == "MaxHp" or name == "CurrentHp" or name == "IsDead" then
+		-- Forwards synchronized state changes; presentation owns all visual settings.
+		if name == "Team" or name == "UnitId" or name == "MaxHp" or name == "CurrentHp" or name == "IsDead" or name == "IsAirborne" then
 			self:RefreshPresentation()
+		end
+		if name == "Facing" then
+			self:RefreshFacingPresentation()
 		end
 	end
 
@@ -195,8 +476,17 @@ script BattleUnitComponent extends Component
 		if presentation == nil then
 			return
 		end
-		presentation:RefreshHpDisplay(self.UnitId, self.Team, self.CurrentHp, self.MaxHp)
 		presentation:RefreshDefeatedDisplay(self.UnitId, self.Team, self.IsDead)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshFacingPresentation()
+		-- Keeps sprite direction synchronized without replaying death presentation on every turn.
+		local presentation = self.Entity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			return
+		end
+		presentation:ApplySpriteFacing(self.UnitId, self.Facing)
 	end
 
 end

@@ -1,0 +1,417 @@
+@Logic
+script UnionStatDefinitionRepositoryLogic extends Logic
+
+    property string DefinitionDataSetName = "UnionStatDefinitions"
+    property string LevelDataSetName = "UnionStatLevelDefinitions"
+
+    @ExecSpace("ServerOnly")
+    method table GetStat(string statId)
+        -- Loads one 2026 Union Stat definition without reading player state.
+        local result = { Success = false, Reason = "UNION_STAT_NOT_FOUND", StatId = statId or "", MatchCount = 0 }
+        if statId == nil or statId == "" then
+            result.Reason = "INVALID_STAT_ID"
+            return result
+        end
+        local dataSet = _DataService:GetTable(self.DefinitionDataSetName)
+        if dataSet == nil then
+            result.Reason = "UNION_STAT_DATASET_MISSING"
+            return result
+        end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            if dataSet:GetCell(rowIndex, "StatId") == statId then
+                result.MatchCount = result.MatchCount + 1
+                if result.Success == false then
+                    result = self:ConvertStatRow(dataSet, rowIndex)
+                    result.MatchCount = 1
+                end
+            end
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllStats()
+        -- Returns fresh DTOs in deterministic SortOrder and StatId order.
+        local result = { Success = false, Reason = "UNION_STAT_DATASET_MISSING", Stats = {}, StatCount = 0 }
+        local dataSet = _DataService:GetTable(self.DefinitionDataSetName)
+        if dataSet == nil then
+            return result
+        end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            table.insert(result.Stats, self:ConvertStatRow(dataSet, rowIndex))
+        end
+        table.sort(result.Stats, function(left, right)
+            if left.SortOrder == right.SortOrder then
+                return left.StatId < right.StatId
+            end
+            return left.SortOrder < right.SortOrder
+        end)
+        result.Success = true
+        result.Reason = "OK"
+        result.StatCount = #result.Stats
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetStatsByCategory(string category)
+        -- Filters immutable Union Stat DTOs by the exact BASIC or EXPANDED category.
+        local result = { Success = false, Reason = "UNKNOWN_UNION_STAT_CATEGORY", Category = category or "", Stats = {}, StatCount = 0 }
+        if self:IsKnownCategory(category) == false then
+            return result
+        end
+        local allStats = self:GetAllStats()
+        if allStats.Success == false then
+            result.Reason = allStats.Reason
+            return result
+        end
+        for _, stat in ipairs(allStats.Stats) do
+            if stat.Category == category then
+                table.insert(result.Stats, stat)
+            end
+        end
+        result.Success = true
+        result.Reason = "OK"
+        result.StatCount = #result.Stats
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetLevel(string statId, integer level)
+        -- Loads one cumulative Union Stat level tuning row.
+        local result = { Success = false, Reason = "UNION_STAT_LEVEL_NOT_FOUND", StatId = statId or "", Level = level or 0, MatchCount = 0 }
+        if statId == nil or statId == "" then
+            result.Reason = "INVALID_STAT_ID"
+            return result
+        end
+        if level == nil or level <= 0 then
+            result.Reason = "INVALID_LEVEL"
+            return result
+        end
+        local stat = self:GetStat(statId)
+        if stat.Success == false then
+            result.Reason = stat.Reason
+            return result
+        end
+        if level > stat.MaxLevel then
+            result.Reason = "INVALID_LEVEL"
+            return result
+        end
+        local dataSet = _DataService:GetTable(self.LevelDataSetName)
+        if dataSet == nil then
+            result.Reason = "UNION_STAT_LEVEL_DATASET_MISSING"
+            return result
+        end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            local rowLevel = math.floor(tonumber(dataSet:GetCell(rowIndex, "Level")) or 0)
+            if dataSet:GetCell(rowIndex, "StatId") == statId and rowLevel == level then
+                result.MatchCount = result.MatchCount + 1
+                if result.Success == false then
+                    result = self:ConvertLevelRow(dataSet, rowIndex)
+                    result.MatchCount = 1
+                end
+            end
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetMaxLevel(string statId)
+        local stat = self:GetStat(statId)
+        if stat.Success == false then
+            return { Success = false, Reason = stat.Reason, StatId = statId or "", MaxLevel = 0 }
+        end
+        return { Success = true, Reason = "OK", StatId = stat.StatId, MaxLevel = stat.MaxLevel }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetRequiredUnionRank(string statId, integer level)
+        local levelDefinition = self:GetLevel(statId, level)
+        if levelDefinition.Success == false then
+            return { Success = false, Reason = levelDefinition.Reason, StatId = statId or "", Level = level or 0, RequiredUnionRank = "" }
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            StatId = levelDefinition.StatId,
+            Level = levelDefinition.Level,
+            RequiredUnionRank = levelDefinition.RequiredUnionRank
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table IsImplemented(string statId)
+        local stat = self:GetStat(statId)
+        if stat.Success == false then
+            return { Success = false, Reason = stat.Reason, StatId = statId or "", IsImplemented = false }
+        end
+        return { Success = true, Reason = "OK", StatId = stat.StatId, IsImplemented = stat.IsImplemented }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidateDefinitions()
+        -- Validates the complete 2026 Union Stat definition layer without applying effects.
+        local result = {
+            Success = false,
+            Reason = "CONTENT_VALIDATION_FAILED",
+            CheckedStatCount = 0,
+            CheckedLevelCount = 0,
+            BasicCount = 0,
+            ExpandedCount = 0,
+            ErrorCount = 0,
+            Errors = {},
+            ErrorSnapshot = ""
+        }
+        local definitions = _DataService:GetTable(self.DefinitionDataSetName)
+        local levels = _DataService:GetTable(self.LevelDataSetName)
+        if definitions == nil then
+            self:AddValidationError(result, self.DefinitionDataSetName, 0, "", 0, "DATASET_NOT_FOUND")
+        end
+        if levels == nil then
+            self:AddValidationError(result, self.LevelDataSetName, 0, "", 0, "DATASET_NOT_FOUND")
+        end
+        if definitions == nil or levels == nil then
+            return self:FinalizeValidation(result)
+        end
+
+        local definitionsById = {}
+        local definitionOrder = {}
+        local definitionCounts = {}
+        local seenDefinitionSortOrders = {}
+        for rowIndex = 1, definitions:GetRowCount() do
+            result.CheckedStatCount = result.CheckedStatCount + 1
+            local statId = definitions:GetCell(rowIndex, "StatId") or ""
+            definitionCounts[statId] = (definitionCounts[statId] or 0) + 1
+            if statId == "" then
+                self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "INVALID_STAT_ID")
+            elseif definitionCounts[statId] > 1 then
+                self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "DUPLICATE_STAT_ID")
+            else
+                local definition = self:ConvertStatRow(definitions, rowIndex)
+                definitionsById[statId] = definition
+                table.insert(definitionOrder, statId)
+                if definition.Category == "BASIC" then
+                    result.BasicCount = result.BasicCount + 1
+                elseif definition.Category == "EXPANDED" then
+                    result.ExpandedCount = result.ExpandedCount + 1
+                else
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "UNKNOWN_CATEGORY")
+                end
+                if definition.DisplayName == "" or definition.Description == "" then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "REQUIRED_FIELD_MISSING")
+                end
+                if self:IsPositiveIntegerCell(definitions:GetCell(rowIndex, "MaxLevel")) == false then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "INVALID_MAX_LEVEL")
+                end
+                if self:IsSupportedEffectType(definition.EffectType) == false then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "UNKNOWN_EFFECT_TYPE")
+                elseif definition.IsImplemented == true and self:IsImplementedEffectType(definition.EffectType) == false then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "IMPLEMENTED_EFFECT_TYPE_NOT_COMPATIBLE")
+                end
+                if self:IsBooleanCell(definitions:GetCell(rowIndex, "IsImplemented")) == false then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "INVALID_IS_IMPLEMENTED")
+                end
+                if self:IsValidRankId(definition.RequiredUnionRank) == false then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "INVALID_REQUIRED_UNION_RANK")
+                end
+                if self:IsPositiveIntegerCell(definitions:GetCell(rowIndex, "SortOrder")) == false then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "INVALID_SORT_ORDER")
+                elseif seenDefinitionSortOrders[definition.SortOrder] == true then
+                    self:AddValidationError(result, self.DefinitionDataSetName, rowIndex, statId, 0, "DUPLICATE_SORT_ORDER")
+                else
+                    seenDefinitionSortOrders[definition.SortOrder] = true
+                end
+            end
+        end
+
+        local seenLevelKeys = {}
+        local seenLevelSortOrders = {}
+        for rowIndex = 1, levels:GetRowCount() do
+            result.CheckedLevelCount = result.CheckedLevelCount + 1
+            local statId = levels:GetCell(rowIndex, "StatId") or ""
+            local levelCell = levels:GetCell(rowIndex, "Level")
+            local level = math.floor(tonumber(levelCell) or 0)
+            local definition = definitionsById[statId]
+            if self:IsPositiveIntegerCell(levelCell) == false then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "INVALID_LEVEL")
+            elseif definition == nil then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "UNKNOWN_STAT_ID")
+            elseif level > definition.MaxLevel then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "LEVEL_EXCEEDS_MAX_LEVEL")
+            else
+                local levelKey = statId .. "#" .. tostring(level)
+                if seenLevelKeys[levelKey] == true then
+                    self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "DUPLICATE_STAT_LEVEL")
+                else
+                    seenLevelKeys[levelKey] = true
+                end
+            end
+            if self:IsPositiveIntegerCell(levels:GetCell(rowIndex, "PointCost")) == false then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "INVALID_POINT_COST")
+            end
+            if self:IsPositiveIntegerCell(levels:GetCell(rowIndex, "CoinCost")) == false then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "INVALID_COIN_COST")
+            end
+            local effectValue = tonumber(levels:GetCell(rowIndex, "EffectValue"))
+            if effectValue == nil or effectValue < 0 then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "INVALID_EFFECT_VALUE")
+            end
+            local requiredRankId = levels:GetCell(rowIndex, "RequiredUnionRank") or ""
+            if self:IsValidRankId(requiredRankId) == false then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "INVALID_REQUIRED_UNION_RANK")
+            end
+            local sortOrderCell = levels:GetCell(rowIndex, "SortOrder")
+            local sortOrder = math.floor(tonumber(sortOrderCell) or 0)
+            if self:IsPositiveIntegerCell(sortOrderCell) == false then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "INVALID_SORT_ORDER")
+            elseif seenLevelSortOrders[sortOrder] == true then
+                self:AddValidationError(result, self.LevelDataSetName, rowIndex, statId, level, "DUPLICATE_SORT_ORDER")
+            else
+                seenLevelSortOrders[sortOrder] = true
+            end
+        end
+
+        table.sort(definitionOrder)
+        for _, statId in ipairs(definitionOrder) do
+            local definition = definitionsById[statId]
+            for level = 1, definition.MaxLevel do
+                local levelKey = statId .. "#" .. tostring(level)
+                if seenLevelKeys[levelKey] ~= true then
+                    self:AddValidationError(result, self.LevelDataSetName, 0, statId, level, level == 1 and "MISSING_LEVEL_1" or "MISSING_LEVEL_ROW_OR_GAP")
+                end
+            end
+        end
+        if result.CheckedStatCount ~= 10 then
+            self:AddValidationError(result, self.DefinitionDataSetName, 0, "", 0, "EXPECTED_TEN_STATS")
+        end
+        if result.BasicCount ~= 4 then
+            self:AddValidationError(result, self.DefinitionDataSetName, 0, "", 0, "EXPECTED_FOUR_BASIC_STATS")
+        end
+        if result.ExpandedCount ~= 6 then
+            self:AddValidationError(result, self.DefinitionDataSetName, 0, "", 0, "EXPECTED_SIX_EXPANDED_STATS")
+        end
+        return self:FinalizeValidation(result)
+    end
+
+    method table ConvertStatRow(any dataSet, integer rowIndex)
+        return {
+            Success = true,
+            Reason = "OK",
+            StatId = dataSet:GetCell(rowIndex, "StatId") or "",
+            Category = dataSet:GetCell(rowIndex, "Category") or "",
+            DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+            Description = dataSet:GetCell(rowIndex, "Description") or "",
+            EffectType = dataSet:GetCell(rowIndex, "EffectType") or "",
+            MaxLevel = math.floor(tonumber(dataSet:GetCell(rowIndex, "MaxLevel")) or 0),
+            RequiredUnionRank = dataSet:GetCell(rowIndex, "RequiredUnionRank") or "",
+            IsImplemented = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "IsImplemented")),
+            SortOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "SortOrder")) or 0),
+            RowIndex = rowIndex,
+            Source = "DATASET"
+        }
+    end
+
+    method table ConvertLevelRow(any dataSet, integer rowIndex)
+        return {
+            Success = true,
+            Reason = "OK",
+            StatId = dataSet:GetCell(rowIndex, "StatId") or "",
+            Level = math.floor(tonumber(dataSet:GetCell(rowIndex, "Level")) or 0),
+            PointCost = math.floor(tonumber(dataSet:GetCell(rowIndex, "PointCost")) or 0),
+            CoinCost = math.floor(tonumber(dataSet:GetCell(rowIndex, "CoinCost")) or 0),
+            EffectValue = tonumber(dataSet:GetCell(rowIndex, "EffectValue")) or 0,
+            RequiredUnionRank = dataSet:GetCell(rowIndex, "RequiredUnionRank") or "",
+            SortOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "SortOrder")) or 0),
+            RowIndex = rowIndex,
+            Source = "DATASET"
+        }
+    end
+
+    method boolean ParseBooleanCell(any cellValue)
+        if cellValue == true then
+            return true
+        end
+        local normalized = string.lower(tostring(cellValue or ""))
+        return normalized == "true" or normalized == "1" or normalized == "yes"
+    end
+
+    method boolean IsBooleanCell(any cellValue)
+        if cellValue == true or cellValue == false then
+            return true
+        end
+        local normalized = string.lower(tostring(cellValue or ""))
+        return normalized == "true" or normalized == "false" or normalized == "1" or normalized == "0" or normalized == "yes" or normalized == "no"
+    end
+
+    method boolean IsKnownCategory(string category)
+        return category == "BASIC" or category == "EXPANDED"
+    end
+
+    method boolean IsSupportedEffectType(string effectType)
+        return effectType == "MAX_HP"
+            or effectType == "MESO_GAIN_RATE"
+            or effectType == "ITEM_DROP_RATE"
+            or effectType == "UNION_POINT_GAIN_RATE"
+            or effectType == "STARTING_POTION"
+            or effectType == "INVENTORY_SLOT"
+            or effectType == "AUGMENT_REROLL"
+            or effectType == "STARTING_SKILL"
+            or effectType == "STARTING_RANDOM_RELIC"
+            or effectType == "ADDITIONAL_SKILL_UNLOCK"
+    end
+
+    method boolean IsImplementedEffectType(string effectType)
+        return effectType == "MAX_HP"
+            or effectType == "MESO_GAIN_RATE"
+            or effectType == "ITEM_DROP_RATE"
+            or effectType == "UNION_POINT_GAIN_RATE"
+            or effectType == "STARTING_POTION"
+            or effectType == "INVENTORY_SLOT"
+            or effectType == "AUGMENT_REROLL"
+            or effectType == "STARTING_SKILL"
+    end
+
+    method boolean IsValidRankId(string rankId)
+        if rankId == nil or rankId == "" then
+            return false
+        end
+        local rank = _UnionRankDefinitionRepositoryLogic:GetDefinition(rankId)
+        return rank.Success == true and (rank.MatchCount or 0) == 1
+    end
+
+    method boolean IsPositiveIntegerCell(any cellValue)
+        local numericValue = tonumber(cellValue)
+        return numericValue ~= nil and numericValue > 0 and numericValue == math.floor(numericValue)
+    end
+
+    method void AddValidationError(table result, string dataSetName, integer rowIndex, string statId, integer level, string detailReason)
+        table.insert(result.Errors, {
+            DataSetName = dataSetName,
+            RowIndex = rowIndex,
+            StatId = statId or "",
+            Level = level or 0,
+            DetailReason = detailReason or "UNKNOWN"
+        })
+    end
+
+    method string SerializeErrors(table errors)
+        local parts = {}
+        for _, item in ipairs(errors or {}) do
+            table.insert(parts, item.DataSetName .. "[" .. tostring(item.RowIndex) .. "]" .. item.StatId .. "#" .. tostring(item.Level) .. "=" .. item.DetailReason)
+        end
+        return table.concat(parts, "|")
+    end
+
+    method table FinalizeValidation(table result)
+        result.ErrorCount = #result.Errors
+        result.ErrorSnapshot = self:SerializeErrors(result.Errors)
+        if result.ErrorCount == 0 then
+            result.Success = true
+            result.Reason = "OK"
+            log("[UnionStatValidation] valid stats=" .. result.CheckedStatCount .. " basic=" .. result.BasicCount .. " expanded=" .. result.ExpandedCount .. " levels=" .. result.CheckedLevelCount)
+        else
+            log_error("[UnionStatValidation] rejected errors=" .. result.ErrorCount .. " details=" .. result.ErrorSnapshot)
+        end
+        return result
+    end
+
+end

@@ -1,20 +1,44 @@
 @Component
 script BattleUnitPresentationComponent extends Component
 
-	property string HpTextChildName = "BattleHpText"
-	property string HpTextFont = "Maple"
-	property number HpTextFontSize = 1.2
-	property Color HpTextColor = Color(1, 1, 1, 1)
-	property Vector2 HpTextOffset = Vector2(0, 0)
-	property Vector2 HpTextRectSize = Vector2(2.4, 0.5)
-	property string HpTextSortingLayer = "MapLayer0"
-	property integer HpTextOrderInLayer = 20
-	property Color HpTextOutlineColor = Color(0, 0, 0, 1)
-	property number HpTextOutlineWidth = 0.18
-
 	property Color HitFlashColor = Color(1, 0.35, 0.35, 1)
-	property number HitFlashDuration = 0.18
+	property Vector2 NormalHitSquashScale = Vector2(1.07, 0.93)
+	property Vector2 StrongHitSquashScale = Vector2(1.13, 0.87)
 	property string CombatMotionReturnState = "IDLE"
+	-- Maple monster sprite and animation resources face left in their unflipped state.
+	-- Override this only when a custom monster model is authored facing right.
+	property boolean SpriteFacesLeftByDefault = true
+
+	-- Optional per-character move-hop profile. When disabled, BattleSession team defaults are used.
+	@Sync property boolean UseCustomMoveHopProfile = false
+	@Sync property boolean CustomMoveHopEnabled = true
+	@Sync property number CustomMoveHopDuration = 0.13
+	@Sync property number CustomMoveHopHeight = 0.09
+	@Sync property number CustomMoveHopTakeoffDuration = 0.02
+	@Sync property number CustomMoveHopLandingDuration = 0.04
+	@Sync property Vector2 CustomMoveHopSquashScale = Vector2(1.03, 0.97)
+	@Sync property Vector2 CustomMoveHopLandingScale = Vector2(1.05, 0.95)
+	@Sync property number CustomMoveHopPeakProgress = 0.50
+	@Sync property string CustomMoveHopAnimationRuid = ""
+	@Sync property number CustomMoveHopAnimationPlayRate = 3
+	-- Data-driven enemy motion profile. Empty values preserve legacy model/skill fallbacks.
+	@Sync property string IdleMotionRuid = ""
+	@Sync property number IdleMotionPlayRate = 1
+	@Sync property string MovementMotionRuid = ""
+	@Sync property number MovementMotionPlayRate = 3
+	@Sync property string HitMotionRuid = ""
+	@Sync property number HitMotionPlayRate = 3
+	@Sync property number HitMotionDuration = 0.25
+	@Sync property string AttackMotionRuid = ""
+	@Sync property number AttackMotionPlayRate = 3
+	@Sync property number AttackMotionDuration = 0.35
+	@Sync property string DeathMotionRuid = ""
+	@Sync property number DeathMotionPlayRate = 3
+	@Sync property number DeathMotionDuration = 0.5
+	-- Per-resource ground alignment. Logical CellIndex/UnitY stay unchanged.
+	@Sync property number GroundVisualOffsetY = 0
+	-- Keeps the final death frame readable before the renderer is hidden or the next wave replaces it.
+	property number DeathMotionHoldDuration = 0.3
 
 	-- MapleStory skill clips are authored with their pivot already on the caster/target anchor
 	-- (measured: hit clips center at ~0, piercing's cast pivot sits at the forward edge), so the
@@ -23,87 +47,668 @@ script BattleUnitPresentationComponent extends Component
 	property string SkillEffectSortingLayer = "MapLayer0"
 	property integer SkillEffectOrderInLayer = 30
 
-	property string LastDisplayedHp = ""
 	property integer HitFlashTimerId = 0
+	property integer HitStopTimerId = 0
+	property integer HitReactionMidTimerId = 0
+	property integer HitReactionRestoreTimerId = 0
 	property integer MotionTimerId = 0
+	property boolean CombatMotionHandoffPending = false
+	property boolean CombatMotionReady = false
+	property boolean CombatMotionReleaseRequested = false
+	property string CombatMotionUnitId = ""
+	property string CombatMotionKey = ""
+	property integer SpriteMotionTimerId = 0
+	property integer DeathMotionTimerId = 0
+	property boolean DeathMotionActive = false
+	property boolean DeathMotionCompleted = false
 	property boolean HasOriginalSpriteColor = false
 	property Color OriginalSpriteColor = Color(1, 1, 1, 1)
+	property boolean HasOriginalImpactPlayRate = false
+	property number OriginalImpactPlayRate = 1
+	property boolean HasOriginalVisualScale = false
+	property Vector3 OriginalVisualScale = Vector3(1, 1, 1)
+	property boolean HasOriginalSpriteMotion = false
+	property string OriginalSpriteRuid = ""
+	property number OriginalSpritePlayRate = 1
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Presentation settings are local-only and never mutate logical battle state.
-		log("[BattlePresentation] ready entity=" .. self.Entity.Name .. " flashDuration=" .. self.HitFlashDuration)
+		log("[BattlePresentation] ready entity=" .. self.Entity.Name .. " tuningSource=BattleSessionComponent")
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then
+			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplySpriteFacing(string unitId, string facing)
+		-- Mirrors only sprite-based units. Player avatars continue to use LookDirectionX on the server.
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer == nil then
+			return
+		end
+		if facing ~= "Left" and facing ~= "Right" then
+			log_warning("[BattleFacing] sprite facing skipped unit=" .. unitId .. " reason=INVALID_FACING facing=" .. facing)
+			return
+		end
+
+		local shouldFlip = facing == "Right"
+		if self.SpriteFacesLeftByDefault == false then
+			shouldFlip = facing == "Left"
+		end
+		renderer.FlipX = shouldFlip
+		log("[BattleFacing] sprite applied unit=" .. unitId .. " facing=" .. facing .. " flipX=" .. tostring(shouldFlip))
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		self:CancelFullMotionPlayback("END_PLAY")
+		-- Restores every short-lived presentation override owned by this unit.
+		self:StopMoveHopVisual("END_PLAY")
 		if self.HitFlashTimerId > 0 then
 			_TimerService:ClearTimer(self.HitFlashTimerId)
 			self.HitFlashTimerId = 0
+		end
+		if self.HitStopTimerId > 0 then
+			_TimerService:ClearTimer(self.HitStopTimerId)
+			self.HitStopTimerId = 0
+		end
+		if self.HitReactionMidTimerId > 0 then
+			_TimerService:ClearTimer(self.HitReactionMidTimerId)
+			self.HitReactionMidTimerId = 0
+		end
+		if self.HitReactionRestoreTimerId > 0 then
+			_TimerService:ClearTimer(self.HitReactionRestoreTimerId)
+			self.HitReactionRestoreTimerId = 0
+		end
+		local impactRenderer = self:GetImpactSpriteRenderer()
+		if impactRenderer ~= nil then
+			if self.HasOriginalSpriteColor then
+				impactRenderer.Color = self.OriginalSpriteColor
+			end
+			if self.HasOriginalImpactPlayRate then
+				impactRenderer.PlayRate = self.OriginalImpactPlayRate
+			end
+		end
+		local visualEntity = self:GetImpactVisualEntity()
+		if self.HasOriginalVisualScale and isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+			visualEntity.TransformComponent.Scale = self.OriginalVisualScale
 		end
 		if self.MotionTimerId > 0 then
 			_TimerService:ClearTimer(self.MotionTimerId)
 			self.MotionTimerId = 0
 		end
+		self.CombatMotionHandoffPending = false
+		self.CombatMotionReady = false
+		self.CombatMotionReleaseRequested = false
+		self.CombatMotionUnitId = ""
+		self.CombatMotionKey = ""
+		if self.DeathMotionTimerId > 0 then
+			_TimerService:ClearTimer(self.DeathMotionTimerId)
+			self.DeathMotionTimerId = 0
+		end
+		self.DeathMotionActive = false
+		self:StopSpriteMotion(self.Entity.Name, "END_PLAY")
 	end
 
 	@ExecSpace("ClientOnly")
-	method void RefreshHpDisplay(string unitId, string team, number currentHp, number maxHp)
-		-- Only entities with the configured child opt in to a world-space HP label.
-		if team ~= "Enemy" then
+	method void OnMapLeave(Entity previousMap)
+		-- A transferred avatar must not retain event handlers, queued poses or death state from the old board.
+		self:CancelCombatMotionHandoff(self.Entity.Name, "MAP_LEAVE", false)
+		self:StopMoveHopVisual("MAP_LEAVE")
+		if self.DeathMotionTimerId > 0 then _TimerService:ClearTimer(self.DeathMotionTimerId) end
+		self.DeathMotionTimerId = 0
+		self.DeathMotionActive = false
+		self.DeathMotionCompleted = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnMapEnter(Entity enteredMap)
+		-- Lobby entry restores the avatar even while the previous battle's dead flag is still synchronized.
+		if isvalid(enteredMap) and enteredMap.Name == "lobby" then
+			self:RestoreAvatarDeathMotion("LOBBY_ENTER")
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreAvatarDeathMotion(string reason)
+		-- Clear only an outstanding death presentation; ordinary HP sync must not interrupt attacks.
+		local avatar = self.Entity.AvatarRendererComponent
+		if avatar == nil or self.Entity.PlayerComponent == nil then return end
+		local body = avatar:GetBodyEntity()
+		if isvalid(body) == false then return end
+		local selector = body.AvatarBodyActionSelectorComponent
+		local hasDeathPose = selector ~= nil and selector.ActionState == MapleAvatarBodyActionState.Dead
+		if hasDeathPose == false and self.DeathMotionActive == false and self.DeathMotionCompleted == false then return end
+		self:CancelCombatMotionHandoff(self.Entity.Name, reason, false)
+		if self.DeathMotionTimerId > 0 then _TimerService:ClearTimer(self.DeathMotionTimerId) end
+		self.DeathMotionTimerId = 0
+		self.DeathMotionActive = false
+		self.DeathMotionCompleted = false
+		local resetEvent = BodyActionStateChangeEvent()
+		resetEvent.ActionState = MapleAvatarBodyActionState.Stand
+		resetEvent.needResetAction = true
+		self.Entity:SendEvent(resetEvent)
+		log("[AvatarRevive] death motion restored reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method number GetLocalMotionSpeed()
+		-- Read the synchronized battle speed without making a client-to-server call.
+		local map = self.Entity.CurrentMap
+		local session = isvalid(map) and map:GetComponent("script.BattleSessionComponent") or nil
+		return session ~= nil and math.max(0.1, session.SkillSpeedMultiplier) or 1
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsFullMotionPending()
+		-- Handoff poses are already complete; only active playback, queued poses and death holds block actions.
+		return self._T.fullMotion ~= nil or (self._T.fullMotionQueue ~= nil and #self._T.fullMotionQueue > 0) or self.DeathMotionActive
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelFullMotionPlayback(string reason)
+		-- Invalidates callbacks before disconnecting so replacement/end events cannot complete a newer motion.
+		local motion = self._T.fullMotion
+		self._T.fullMotion = nil
+		self._T.fullMotionQueue = {}
+		if motion == nil then return end
+		if motion.TimerId > 0 then _TimerService:ClearTimer(motion.TimerId) end
+		if motion.FixedDurationTimerId ~= nil then _TimerService:ClearTimer(motion.FixedDurationTimerId) end
+		if motion.AttackPoseEndTimerId ~= nil and motion.AttackPoseEndTimerId > 0 then
+			_TimerService:ClearTimer(motion.AttackPoseEndTimerId)
+		end
+		if isvalid(motion.Target) then
+			for _, connection in ipairs(motion.Connections) do
+				motion.Target:DisconnectEvent(connection.Type, connection.Handler)
+			end
+		end
+		log("[BattleMotionPlayback] cancelled kind=" .. motion.Kind .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void WatchFullMotion(Entity target, string kind, any complete)
+		-- Most motions finish their full clip; avatar attacks may trim only the final pose's hold time.
+		local motion = { Target = target, Kind = kind, Complete = complete, Connections = {}, TimerId = 0, Started = false, SawLast = false, LastProgress = _UtilLogic.ElapsedSeconds }
+		self._T.fullMotion = motion
+		local finish = function(reason)
+			if self._T.fullMotion ~= motion then return end
+			if motion.FixedDurationTimerId ~= nil and reason ~= "HIT_DURATION_END" then return end
+			local queue = self._T.fullMotionQueue or {}
+			self:CancelFullMotionPlayback(reason)
+			self._T.fullMotionQueue = queue
+			if kind == "DEATH" and motion.LastFrame ~= nil and target.SpriteRendererComponent ~= nil then
+				target.SpriteRendererComponent.StartFrameIndex = math.max(0, motion.LastFrame)
+				target.SpriteRendererComponent.EndFrameIndex = math.max(0, motion.LastFrame)
+			end
+			complete()
+			log("[BattleMotionPlayback] completed kind=" .. kind .. " reason=" .. reason)
+			while #queue > 0 and self._T.fullMotion == nil and self.DeathMotionActive == false and self.DeathMotionCompleted == false do
+				local nextMotion = table.remove(queue, 1)
+				nextMotion()
+			end
+		end
+		motion.Finish = finish
+		local connect = function(eventType, eventCallback)
+			local connection = target:ConnectEvent(eventType, eventCallback)
+			table.insert(motion.Connections, { Type = eventType, Handler = connection })
+		end
+		connect(SpriteAnimPlayerStartEvent, function(event)
+			if self._T.fullMotion ~= motion then return end
+			motion.Started = true
+			motion.LastProgress = _UtilLogic.ElapsedSeconds
+		end)
+		connect(SpriteAnimPlayerChangeFrameEvent, function(event)
+			if self._T.fullMotion ~= motion then return end
+			motion.Started = true
+			motion.LastProgress = _UtilLogic.ElapsedSeconds
+			if motion.ReturnedToFirst and event.FrameIndex ~= 0 then finish("FULL_REVERSE_CYCLE") end
+		end)
+		connect(SpriteAnimPlayerEndFrameEvent, function(event)
+			if self._T.fullMotion ~= motion then return end
+			motion.Started = true
+			motion.SawLast = true
+			motion.LastFrame = event.TotalFrameCount - 1
+			motion.LastProgress = _UtilLogic.ElapsedSeconds
+			if motion.TrimAttackEndPose == true and event.ReversePlaying == false and motion.AttackPoseEndTimerId == nil then
+				-- Defer the reset outside frame dispatch and briefly show the final attack frame.
+				log("[BattleMotionPlayback] attack final frame kind=" .. kind .. " frame=" .. tostring(event.FrameIndex) .. " hold=0.1")
+				motion.AttackPoseEndTimerId = _TimerService:SetTimerOnce(function()
+					finish("ATTACK_END_POSE_RELEASE")
+				end, 0.1)
+			end
+		end)
+		connect(SpriteAnimPlayerStartFrameEvent, function(event)
+			if self._T.fullMotion ~= motion then return end
+			motion.Started = true
+			motion.LastProgress = _UtilLogic.ElapsedSeconds
+			if motion.SawLast and event.ReversePlaying then motion.ReturnedToFirst = true end
+			if motion.SawLast and event.ReversePlaying == false then
+				finish("FULL_CYCLE")
+			end
+		end)
+		connect(SpriteAnimPlayerEndEvent, function(event)
+			if motion.Started then finish("ANIMATION_END") end
+		end)
+		local checkProgress = nil
+		checkProgress = function()
+			if self._T.fullMotion ~= motion then return end
+			if _UtilLogic.ElapsedSeconds - motion.LastProgress >= 30 then
+				log_warning("[BattleMotionPlayback] no animation progress kind=" .. kind .. " fallback=RELEASE")
+				finish("NO_PROGRESS_TIMEOUT")
+				return
+			end
+			motion.TimerId = _TimerService:SetTimerOnce(checkProgress, 1)
+		end
+		motion.TimerId = _TimerService:SetTimerOnce(checkProgress, 1)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetHitMotionDuration()
+		-- Each hit owns 0.5 seconds of display time, independent of skill speed and clip length.
+		local motion = self._T.fullMotion
+		if motion == nil then return end
+		motion.FixedDurationTimerId = _TimerService:SetTimerOnce(function()
+			if self._T.fullMotion ~= motion then return end
+			motion.Finish("HIT_DURATION_END")
+		end, 0.5)
+		log("[BattleMotionPlayback] hit display started kind=" .. motion.Kind .. " duration=0.5")
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetImpactVisualEntity()
+		-- Avatar feedback targets the rendered body child; sprite enemies use their own visual entity.
+		if self.Entity.SpriteRendererComponent ~= nil then
+			return self.Entity
+		end
+		local avatarRenderer = self.Entity.AvatarRendererComponent
+		if avatarRenderer ~= nil then
+			local body = avatarRenderer:GetBodyEntity()
+			if isvalid(body) then
+				return body
+			end
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetMoveVisualEntity()
+		-- Avatar units use their visual child. Sprite units animate only their client replica;
+		-- authoritative CellIndex and the server Transform are never changed by PlayMoveHop.
+		local avatarRenderer = self.Entity.AvatarRendererComponent
+		if avatarRenderer ~= nil then
+			local avatarRoot = avatarRenderer:GetAvatarRootEntity()
+			if isvalid(avatarRoot) then
+				return avatarRoot
+			end
+		end
+		if self.Entity.SpriteRendererComponent ~= nil then
+			return self.Entity
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartMoveHopAnimation(table state, string animationRuid, number animationPlayRate)
+		-- Starts the existing avatar Fall action or the configured enemy jump clip without physics/state mutation.
+		local safePlayRate = math.max(0.1, animationPlayRate)
+		local avatarRenderer = self.Entity.AvatarRendererComponent
+		if avatarRenderer ~= nil then
+			if self.CombatMotionKey == "HIT" then
+				self:CancelCombatMotionHandoff(tostring(state.UnitId), "MOVE_STARTED", false)
+			end
+			local jumpEvent = BodyActionStateChangeEvent()
+			jumpEvent.ActionState = MapleAvatarBodyActionState.Fall
+			jumpEvent.needResetAction = true
+			jumpEvent.playRate = safePlayRate
+			self.Entity:SendEvent(jumpEvent)
+			state.AnimationKind = "AVATAR"
+			state.AnimationRuid = ""
+			log("[MoveHopAnimation] started unit=" .. tostring(state.UnitId)
+				.. " kind=AVATAR action=Fall rate=" .. tostring(safePlayRate))
 			return
 		end
 
-		local hpTextEntity = self.Entity:GetChildByName(self.HpTextChildName, false)
-		if isvalid(hpTextEntity) == false or hpTextEntity.TextRendererComponent == nil then
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer == nil or animationRuid == "" then
+			state.AnimationKind = "NONE"
+			log("[MoveHopAnimation] skipped unit=" .. tostring(state.UnitId) .. " reason=ANIMATION_UNAVAILABLE")
 			return
 		end
 
-		local displayText = "HP " .. math.floor(currentHp) .. " / " .. math.floor(maxHp)
-		if self.LastDisplayedHp == displayText then
+		state.AnimationKind = "SPRITE"
+		state.AnimationRuid = animationRuid
+		state.SpriteRenderer = renderer
+		state.BaseSpriteRuid = renderer.SpriteRUID
+		state.BaseSpritePlayRate = renderer.PlayRate
+		renderer.SpriteRUID = animationRuid
+		renderer.PlayRate = safePlayRate
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then
+			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+		end
+		log("[MoveHopAnimation] started unit=" .. tostring(state.UnitId)
+			.. " kind=SPRITE ruid=" .. animationRuid
+			.. " rate=" .. tostring(safePlayRate))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreMoveHopAnimation(table state, string reason)
+		-- Restores only the movement animation still owned by this hop instance.
+		if state == nil or state.AnimationKind == nil or state.AnimationKind == "NONE" then
 			return
 		end
 
-		local renderer = hpTextEntity.TextRendererComponent
-		renderer.Text = displayText
-		renderer.Font = self.HpTextFont
-		renderer.FontSize = self.HpTextFontSize
-		renderer.FontColor = self.HpTextColor
-		renderer.RectOffset = self.HpTextOffset
-		renderer.RectSize = self.HpTextRectSize
-		renderer.HorizontalAlignment = TextHorizontalAlignmentOption.Center
-		renderer.VerticalAlignment = TextVerticalAlignmentOption.Middle
-		renderer.SortingLayer = self.HpTextSortingLayer
-		renderer.OrderInLayer = self.HpTextOrderInLayer
-		renderer.OutlineColor = self.HpTextOutlineColor
-		renderer.OutlineWidth = self.HpTextOutlineWidth
+		if state.AnimationKind == "AVATAR" then
+			if isvalid(self.Entity) and self.Entity.AvatarRendererComponent ~= nil then
+				local standEvent = BodyActionStateChangeEvent()
+				standEvent.ActionState = MapleAvatarBodyActionState.Stand
+				standEvent.needResetAction = true
+				self.Entity:SendEvent(standEvent)
+				log("[MoveHopAnimation] restored unit=" .. tostring(state.UnitId)
+					.. " kind=AVATAR action=Stand reason=" .. tostring(reason))
+			end
+			return
+		end
 
-		self.LastDisplayedHp = displayText
-		log("[BattlePresentation] hp refreshed unit=" .. unitId .. " text=" .. displayText)
+		local renderer = state.SpriteRenderer
+		if isvalid(self.Entity) and renderer ~= nil and renderer.SpriteRUID == state.AnimationRuid then
+			renderer.SpriteRUID = state.BaseSpriteRuid
+			renderer.PlayRate = state.BaseSpritePlayRate
+			local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then
+				self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+			end
+			log("[MoveHopAnimation] restored unit=" .. tostring(state.UnitId)
+				.. " kind=SPRITE ruid=" .. tostring(state.BaseSpriteRuid)
+				.. " reason=" .. tostring(reason))
+		end
+	end
+
+	@ExecSpace("Client")
+	method void StopMoveHopVisual(string reason)
+		-- Cancels an overlapping cosmetic hop and restores the visual child's exact local transform.
+		local state = self._T.moveHopVisual
+		if state == nil then
+			return
+		end
+
+		self._T.moveHopVisual = nil
+		state.Cancelled = true
+		if state.Tweener ~= nil then
+			state.Tweener:Destroy()
+		end
+
+		local visualEntity = state.VisualEntity
+		if visualEntity ~= nil and isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+			if state.AnimatePosition then
+				if state.PreserveHorizontalPosition then
+					local currentPosition = visualEntity.TransformComponent.Position
+					visualEntity.TransformComponent.Position = Vector3(currentPosition.x, state.BasePosition.y, currentPosition.z)
+				else
+					visualEntity.TransformComponent.Position = state.BasePosition
+				end
+			end
+			visualEntity.TransformComponent.Scale = state.BaseScale
+			visualEntity.TransformComponent.Rotation = state.BaseRotation
+		end
+		self:RestoreMoveHopAnimation(state, reason)
+		log("[CharacterHopVisual] restored unit=" .. tostring(state.UnitId) .. " reason=" .. tostring(reason))
+	end
+
+	@ExecSpace("Client")
+	method void PlayMoveHop(string unitId, number duration, number height, number takeoffDuration, number landingDuration, number squashXScale, number squashYScale, number landingXScale, number landingYScale, number peakProgress, string animationRuid, number animationPlayRate, boolean animatePosition)
+		-- Shared cosmetic path for avatar and sprite units. It never mutates BattleUnit CellIndex.
+		if self._T.fullMotion ~= nil then
+			-- Charge displacement may happen during an attack; keep that pose while the server moves the entity.
+			return
+		end
+		self:StopMoveHopVisual("REPLACED")
+		-- Server-owned movement already resolved the profile and its full action duration.
+		if animatePosition == false then
+			if self.DeathMotionActive or self.DeathMotionCompleted then
+				return
+			end
+			self:StopSpriteMotion(unitId, "MOVE_STARTED")
+		end
+		if animatePosition and self.UseCustomMoveHopProfile then
+			if self.CustomMoveHopEnabled == false then
+				log("[CharacterHopVisual] skipped unit=" .. unitId .. " reason=CUSTOM_PROFILE_DISABLED")
+				return
+			end
+			duration = self.CustomMoveHopDuration
+			height = self.CustomMoveHopHeight
+			takeoffDuration = self.CustomMoveHopTakeoffDuration
+			landingDuration = self.CustomMoveHopLandingDuration
+			squashXScale = self.CustomMoveHopSquashScale.x
+			squashYScale = self.CustomMoveHopSquashScale.y
+			landingXScale = self.CustomMoveHopLandingScale.x
+			landingYScale = self.CustomMoveHopLandingScale.y
+			peakProgress = self.CustomMoveHopPeakProgress
+			if self.CustomMoveHopAnimationRuid ~= "" then
+				animationRuid = self.CustomMoveHopAnimationRuid
+				animationPlayRate = self.CustomMoveHopAnimationPlayRate
+			end
+		end
+		local visualEntity = self:GetMoveVisualEntity()
+		if visualEntity == nil or isvalid(visualEntity) == false or visualEntity.TransformComponent == nil then
+			log_warning("[CharacterHopVisual] skipped unit=" .. unitId .. " reason=VISUAL_ROOT_UNAVAILABLE")
+			return
+		end
+
+		local totalDuration = math.max(0.12, math.min(0.16, duration))
+		if animatePosition == false then
+			totalDuration = math.max(0.05, duration)
+		end
+		local hopHeight = math.max(0, height)
+		local hopPeakProgress = math.max(0.45, math.min(0.55, peakProgress))
+		local takeoff = math.max(0.02, math.min(0.04, takeoffDuration))
+		local landing = math.max(0.03, math.min(0.05, landingDuration))
+		local takeoffFraction = math.min(0.45, takeoff / totalDuration)
+		local landingFraction = math.min(0.45, landing / totalDuration)
+		local transform = visualEntity.TransformComponent
+		local basePosition = transform.Position
+		local baseScale = transform.Scale
+		local baseRotation = transform.Rotation
+		local preserveHorizontalPosition = visualEntity == self.Entity and self.Entity.SpriteRendererComponent ~= nil
+		local state = {
+			UnitId = unitId,
+			VisualEntity = visualEntity,
+			BasePosition = basePosition,
+			BaseScale = baseScale,
+			BaseRotation = baseRotation,
+			PreserveHorizontalPosition = preserveHorizontalPosition,
+			AnimatePosition = animatePosition,
+			Tweener = nil,
+			Cancelled = false
+		}
+		self._T.moveHopVisual = state
+		self:StartMoveHopAnimation(state, animationRuid, animationPlayRate)
+
+		local tweener = _TweenLogic:PlayTween(0, 1, totalDuration, EaseType.Linear, function(progress)
+			if state.Cancelled then
+				return
+			end
+			if visualEntity == nil or isvalid(visualEntity) == false or visualEntity.TransformComponent == nil then
+				state.Cancelled = true
+				return
+			end
+
+			local clampedProgress = math.max(0, math.min(1, progress))
+			-- Two half-sine segments keep the peak configurable while reacting on the first tween frame.
+			local yOffset = 0
+			if clampedProgress <= hopPeakProgress then
+				local riseProgress = clampedProgress / math.max(0.001, hopPeakProgress)
+				yOffset = math.sin(riseProgress * math.pi * 0.5) * hopHeight
+			else
+				local fallProgress = (clampedProgress - hopPeakProgress) / math.max(0.001, 1 - hopPeakProgress)
+				yOffset = math.cos(fallProgress * math.pi * 0.5) * hopHeight
+			end
+
+			local takeoffWeight = 0
+			local landingWeight = 0
+			if clampedProgress < takeoffFraction then
+				local takeoffProgress = clampedProgress / math.max(0.001, takeoffFraction)
+				takeoffWeight = math.sin(math.pi * takeoffProgress)
+			elseif clampedProgress > 1 - landingFraction then
+				local landingProgress = (clampedProgress - (1 - landingFraction)) / math.max(0.001, landingFraction)
+				landingWeight = math.sin(math.pi * landingProgress)
+			end
+
+			local scaleXMultiplier = 1 + ((squashXScale - 1) * takeoffWeight) + ((landingXScale - 1) * landingWeight)
+			local scaleYMultiplier = 1 + ((squashYScale - 1) * takeoffWeight) + ((landingYScale - 1) * landingWeight)
+			local scaleX = baseScale.x * scaleXMultiplier
+			local scaleY = baseScale.y * scaleYMultiplier
+			local currentPosition = visualEntity.TransformComponent.Position
+			local visualX = preserveHorizontalPosition and currentPosition.x or basePosition.x
+			local visualZ = preserveHorizontalPosition and currentPosition.z or basePosition.z
+			if animatePosition then
+				visualEntity.TransformComponent.Position = Vector3(visualX, basePosition.y + yOffset, visualZ)
+			end
+			visualEntity.TransformComponent.Scale = Vector3(scaleX, scaleY, baseScale.z)
+		end)
+		state.Tweener = tweener
+		tweener:SetOnEndCallback(function()
+			if state.Cancelled then
+				return
+			end
+			if visualEntity ~= nil and isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+				if animatePosition then
+					if preserveHorizontalPosition then
+						local currentPosition = visualEntity.TransformComponent.Position
+						visualEntity.TransformComponent.Position = Vector3(currentPosition.x, basePosition.y, currentPosition.z)
+					else
+						visualEntity.TransformComponent.Position = basePosition
+					end
+				end
+				visualEntity.TransformComponent.Scale = baseScale
+				visualEntity.TransformComponent.Rotation = baseRotation
+			end
+			self:RestoreMoveHopAnimation(state, "COMPLETED")
+			if self._T.moveHopVisual == state then
+				self._T.moveHopVisual = nil
+			end
+			log("[CharacterHopVisual] completed unit=" .. unitId .. " duration=" .. tostring(totalDuration) .. " height=" .. tostring(hopHeight))
+		end)
+
+		log("[CharacterHopVisual] started unit=" .. unitId
+			.. " duration=" .. tostring(totalDuration)
+			.. " height=" .. tostring(hopHeight)
+			.. " peak=" .. tostring(hopPeakProgress)
+			.. " takeoff=" .. tostring(takeoff)
+			.. " landing=" .. tostring(landing)
+			.. " target=" .. (preserveHorizontalPosition and "SPRITE_ROOT" or "VISUAL_CHILD"))
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetImpactSpriteRenderer()
+		local visualEntity = self:GetImpactVisualEntity()
+		if isvalid(visualEntity) and visualEntity.SpriteRendererComponent ~= nil then
+			return visualEntity.SpriteRendererComponent
+		end
+		return nil
 	end
 
 	@ExecSpace("ClientOnly")
 	method void RefreshDefeatedDisplay(string unitId, string team, boolean isDead)
-		-- Hides only the placed enemy sprite and HP label; player defeat remains visible behind the result UI.
+		-- Airborne bosses use the same visibility boundary while remaining alive in the turn order.
 		if team ~= "Enemy" then
+			local currentMap = self.Entity.CurrentMap
+			if self.Entity.PlayerComponent ~= nil and isvalid(currentMap) and currentMap.Name == "lobby" then
+				self:RestoreAvatarDeathMotion("LOBBY_SYNC")
+				return
+			end
+			if isDead and self.DeathMotionActive == false and self.DeathMotionCompleted == false and self.Entity.AvatarRendererComponent ~= nil then
+				self:CancelCombatMotionHandoff(unitId, "DEATH_STARTED", false)
+				local body = self.Entity.AvatarRendererComponent:GetBodyEntity()
+				if isvalid(body) then
+					self.DeathMotionActive = true
+					self:WatchFullMotion(body, "AVATAR_DEATH", function()
+						self.DeathMotionActive = false
+						self.DeathMotionCompleted = true
+					end)
+					local deathEvent = BodyActionStateChangeEvent()
+					deathEvent.ActionState = MapleAvatarBodyActionState.Dead
+					deathEvent.needResetAction = true
+					deathEvent.playRate = self:GetLocalMotionSpeed()
+					self.Entity:SendEvent(deathEvent)
+				end
+			elseif isDead == false then
+				self:RestoreAvatarDeathMotion("UNIT_ALIVE")
+				self.DeathMotionActive = false
+				self.DeathMotionCompleted = false
+			end
 			return
+		end
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		local isAirborne = unit ~= nil and unit.IsAirborne == true
+		local shouldEnable = isDead == false and isAirborne == false
+		if isDead then
+			self:StopMoveHopVisual("UNIT_DEFEATED")
+			self:PlayDeathMotion(unitId)
+		else
+			if self.DeathMotionTimerId > 0 then
+				_TimerService:ClearTimer(self.DeathMotionTimerId)
+				self.DeathMotionTimerId = 0
+			end
+			self.DeathMotionActive = false
+			self.DeathMotionCompleted = false
 		end
 
 		if self.Entity.SpriteRendererComponent ~= nil then
-			self.Entity.SpriteRendererComponent.Enable = isDead == false
+			if isDead == false or self.DeathMotionRuid == "" then
+				self.Entity.SpriteRendererComponent.Enable = shouldEnable
+			end
 		end
 
-		local hpTextEntity = self.Entity:GetChildByName(self.HpTextChildName, false)
-		if isvalid(hpTextEntity) and hpTextEntity.TextRendererComponent ~= nil then
-			hpTextEntity.TextRendererComponent.Enable = isDead == false
+		log("[BattlePresentation] visibility unit=" .. unitId .. " enabled=" .. tostring(shouldEnable) .. " dead=" .. tostring(isDead) .. " airborne=" .. tostring(isAirborne))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayDeathMotion(string unitId)
+		-- Death owns the renderer until its one-shot duration ends; repeated syncs cannot restart it.
+		if self.DeathMotionActive or self.DeathMotionCompleted then
+			return
 		end
-		log("[BattlePresentation] defeated display unit=" .. unitId .. " hidden=" .. tostring(isDead))
+		self:CancelFullMotionPlayback("DEATH_STARTED")
+		self:StopSpriteMotion(unitId, "DEATH_STARTED")
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer == nil or self.DeathMotionRuid == "" then
+			if renderer ~= nil then
+				renderer.Enable = false
+			end
+			self.DeathMotionCompleted = true
+			return
+		end
+		self.DeathMotionActive = true
+		self:WatchFullMotion(self.Entity, "DEATH", function()
+			self.DeathMotionTimerId = _TimerService:SetTimerOnce(function()
+				self.DeathMotionTimerId = 0
+				self.DeathMotionActive = false
+				self.DeathMotionCompleted = true
+				if isvalid(self.Entity) and self.Entity.SpriteRendererComponent ~= nil then
+					self.Entity.SpriteRendererComponent.Enable = false
+					self.Entity.SpriteRendererComponent.StartFrameIndex = 0
+					self.Entity.SpriteRendererComponent.EndFrameIndex = 2147483647
+				end
+				log("[EnemyDeathMotion] completed unit=" .. unitId)
+			end, math.max(0, self.DeathMotionHoldDuration) / self:GetLocalMotionSpeed())
+		end)
+		renderer.Enable = true
+		renderer.SpriteRUID = self.DeathMotionRuid
+		renderer.PlayRate = math.max(0.1, self.DeathMotionPlayRate) * self:GetLocalMotionSpeed()
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then
+			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+		end
+		log("[EnemyDeathMotion] started unit=" .. unitId .. " ruid=" .. self.DeathMotionRuid .. " completion=ANIMATION_END")
 	end
 
 	@ExecSpace("Client")
-	method void PlayHitFlash(string unitId)
+	method void PlayHitFlash(string unitId, number hitFlashDuration)
 		-- Restarts one configurable sprite tint flash without changing combat state.
-		local renderer = self.Entity.SpriteRendererComponent
+		local renderer = self:GetImpactSpriteRenderer()
 		if renderer == nil then
 			log_warning("[BattlePresentation] hit flash skipped unit=" .. unitId .. " reason=SPRITE_RENDERER_MISSING")
 			return
@@ -120,24 +725,118 @@ script BattleUnitPresentationComponent extends Component
 		end
 
 		renderer.Color = self.HitFlashColor
-		log("[BattlePresentation] hit flash started unit=" .. unitId .. " duration=" .. self.HitFlashDuration)
+		log("[BattlePresentation] hit flash started unit=" .. unitId .. " duration=" .. tostring(hitFlashDuration))
 
 		local restore = function()
-			if isvalid(self.Entity) and self.Entity.SpriteRendererComponent ~= nil then
-				self.Entity.SpriteRendererComponent.Color = self.OriginalSpriteColor
+			-- Tint expires independently of hit stop; playback may already have resumed.
+			if renderer ~= nil and isvalid(renderer.Entity) then
+				renderer.Color = self.OriginalSpriteColor
 			end
 			self.HitFlashTimerId = 0
 			self.HasOriginalSpriteColor = false
 			log("[BattlePresentation] hit flash restored unit=" .. unitId)
 		end
 
-		local duration = math.max(0.05, self.HitFlashDuration)
+		local duration = math.max(0.05, math.min(0.08, hitFlashDuration))
 		self.HitFlashTimerId = _TimerService:SetTimerOnce(restore, duration)
 	end
 
 	@ExecSpace("Client")
-	method void PlayCombatMotion(string unitId, string motionKey, string actionName, number playRate, number duration)
-		-- Plays either the equipped weapon attack or one arbitrary one-shot avatar action for this attack profile.
+	method void PlayHitStop(string unitId, boolean strongHit, number normalHitStopDuration, number strongHitStopDuration)
+		-- Freezes only the impacted presentation clip; global time and turn timers keep running.
+		local renderer = self:GetImpactSpriteRenderer()
+		if renderer == nil then
+			return
+		end
+		if self.HasOriginalImpactPlayRate == false then
+			self.OriginalImpactPlayRate = renderer.PlayRate
+			self.HasOriginalImpactPlayRate = true
+		end
+		if self.HitStopTimerId > 0 then
+			_TimerService:ClearTimer(self.HitStopTimerId)
+			self.HitStopTimerId = 0
+		end
+		local duration = math.max(0.03, math.min(0.05, normalHitStopDuration))
+		if strongHit then
+			duration = math.max(0.05, math.min(0.08, strongHitStopDuration))
+		end
+		renderer.PlayRate = 0
+		self.HitStopTimerId = _TimerService:SetTimerOnce(function()
+			if renderer ~= nil and isvalid(renderer.Entity) and renderer.PlayRate == 0 then
+				renderer.PlayRate = self.OriginalImpactPlayRate
+			end
+			self.HitStopTimerId = 0
+			self.HasOriginalImpactPlayRate = false
+			log("[BattlePresentation] hit stop restored unit=" .. unitId)
+		end, duration)
+		log("[BattlePresentation] hit stop started unit=" .. unitId .. " strong=" .. tostring(strongHit) .. " duration=" .. tostring(duration))
+	end
+
+	@ExecSpace("Client")
+	method void PlayHitReaction(string unitId, boolean strongHit, number hitReactionDuration)
+		-- Squash/stretch never changes Position or the logical BoardState cell.
+		local visualEntity = self:GetImpactVisualEntity()
+		if isvalid(visualEntity) == false or visualEntity.TransformComponent == nil then
+			return
+		end
+		if self.HasOriginalVisualScale == false then
+			self.OriginalVisualScale = visualEntity.TransformComponent.Scale
+			self.HasOriginalVisualScale = true
+		end
+		if self.HitReactionMidTimerId > 0 then
+			_TimerService:ClearTimer(self.HitReactionMidTimerId)
+			self.HitReactionMidTimerId = 0
+		end
+		if self.HitReactionRestoreTimerId > 0 then
+			_TimerService:ClearTimer(self.HitReactionRestoreTimerId)
+			self.HitReactionRestoreTimerId = 0
+		end
+		local duration = math.max(0.06, math.min(0.10, hitReactionDuration))
+		local squash = strongHit and self.StrongHitSquashScale or self.NormalHitSquashScale
+		local original = self.OriginalVisualScale
+		visualEntity.TransformComponent.Scale = Vector3(original.x * squash.x, original.y * squash.y, original.z)
+		self.HitReactionMidTimerId = _TimerService:SetTimerOnce(function()
+			if isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+				local stretchX = strongHit and 0.94 or 0.97
+				local stretchY = strongHit and 1.06 or 1.03
+				visualEntity.TransformComponent.Scale = Vector3(original.x * stretchX, original.y * stretchY, original.z)
+			end
+			self.HitReactionMidTimerId = 0
+		end, duration * 0.45)
+		self.HitReactionRestoreTimerId = _TimerService:SetTimerOnce(function()
+			if isvalid(visualEntity) and visualEntity.TransformComponent ~= nil then
+				visualEntity.TransformComponent.Scale = original
+			end
+			self.HitReactionRestoreTimerId = 0
+			self.HasOriginalVisualScale = false
+			log("[BattlePresentation] hit reaction restored unit=" .. unitId)
+		end, duration)
+		log("[BattlePresentation] hit reaction started unit=" .. unitId .. " strong=" .. tostring(strongHit) .. " duration=" .. tostring(duration))
+	end
+
+	@ExecSpace("Client")
+	method void PlayHitImpact(string unitId, boolean strongHit, number normalHitStopDuration, number strongHitStopDuration, number hitReactionDuration, number hitFlashDuration)
+		-- One accepted damage impact fans out to presentation-only feedback exactly once.
+		if self.DeathMotionActive == false and self.DeathMotionCompleted == false then
+			if self.Entity.AvatarRendererComponent ~= nil then
+				self:PlayCombatMotion(unitId, "HIT", "", self.HitMotionPlayRate * self:GetLocalMotionSpeed(), self.HitMotionDuration, false)
+			elseif self.HitMotionRuid ~= "" then
+				self:PlaySpriteMotion(unitId, self.HitMotionRuid, self.HitMotionPlayRate * self:GetLocalMotionSpeed(), self.HitMotionDuration, "", true)
+			end
+		end
+		self:PlayHitStop(unitId, strongHit, normalHitStopDuration, strongHitStopDuration)
+		self:PlayHitReaction(unitId, strongHit, hitReactionDuration)
+		self:PlayHitFlash(unitId, hitFlashDuration)
+	end
+
+	@ExecSpace("Client")
+	method void PlayCombatMotion(string unitId, string motionKey, string actionName, number playRate, number duration, boolean waitForServerHandoff)
+		-- Plays one avatar action and restores idle on completion, including queued player skills.
+		if self._T.fullMotion ~= nil then
+			self._T.fullMotionQueue = self._T.fullMotionQueue or {}
+			table.insert(self._T.fullMotionQueue, function() self:PlayCombatMotion(unitId, motionKey, actionName, playRate, duration, waitForServerHandoff) end)
+			return
+		end
 		local state = self.Entity.StateComponent
 		local avatarRenderer = self.Entity.AvatarRendererComponent
 		if state == nil or avatarRenderer == nil then
@@ -148,29 +847,53 @@ script BattleUnitPresentationComponent extends Component
 			log_warning("[BattleMotion] skipped unit=" .. unitId .. " reason=MOTION_KEY_EMPTY")
 			return
 		end
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if state.CurrentStateName == "DEAD" or (unit ~= nil and unit.IsDead) then
+			return
+		end
+		self:StopMoveHopVisual("COMBAT_MOTION_STARTED")
 
 		if self.MotionTimerId > 0 then
 			_TimerService:ClearTimer(self.MotionTimerId)
 			self.MotionTimerId = 0
 		end
+		-- Clear legacy handoff state before starting the next one-shot.
+		self.CombatMotionHandoffPending = false
+		self.CombatMotionReady = false
+		self.CombatMotionReleaseRequested = false
+		self.CombatMotionUnitId = ""
+		self.CombatMotionKey = ""
 
 		local safePlayRate = math.max(0.1, playRate)
 		local safeDuration = math.max(0.1, duration)
+
+		local body = avatarRenderer:GetBodyEntity()
+		if isvalid(body) == false then
+			log_warning("[BattleMotion] skipped unit=" .. unitId .. " reason=AVATAR_BODY_MISSING")
+			return
+		end
+		-- Keep the RPC argument for existing callers, but never hold a completed pose for server release.
+		self.CombatMotionHandoffPending = false
+		self.CombatMotionUnitId = unitId
+		self.CombatMotionKey = motionKey
+		self:WatchFullMotion(body, "AVATAR_" .. motionKey, function()
+			self:RestoreCombatMotionState(unitId, motionKey, "ANIMATION_END")
+		end)
+		-- Hits use a fixed display window; only attacks trim their trailing pose.
+		self._T.fullMotion.TrimAttackEndPose = motionKey ~= "HIT"
+		if motionKey == "HIT" then self:SetHitMotionDuration() end
 
 		local motionMode = "BUILTIN_BODY_ACTION"
 		if actionName == "" then
 			local attackEvent = BodyActionStateChangeEvent()
 			attackEvent.ActionState = MapleAvatarBodyActionState.Attack
+			if motionKey == "HIT" then
+				attackEvent.ActionState = MapleAvatarBodyActionState.Hit
+			end
 			attackEvent.needResetAction = true
 			attackEvent.playRate = safePlayRate
 			self.Entity:SendEvent(attackEvent)
 		else
-			local body = avatarRenderer:GetBodyEntity()
-			if isvalid(body) == false then
-				log_warning("[BattleMotion] skipped unit=" .. unitId .. " motion=" .. motionKey .. " reason=AVATAR_BODY_MISSING")
-				return
-			end
-
 			motionMode = "CUSTOM_ACTION"
 			local actionEvent = ActionStateChangedEvent()
 			actionEvent.CoreActionName = actionName
@@ -179,23 +902,152 @@ script BattleUnitPresentationComponent extends Component
 			actionEvent.PlayType = SpriteAnimClipPlayType.Onetime
 			body:SendEvent(actionEvent)
 		end
-		log("[BattleMotion] started unit=" .. unitId .. " motion=" .. motionKey .. " mode=" .. motionMode .. " action=" .. actionName .. " rate=" .. safePlayRate .. " duration=" .. safeDuration)
+		log("[BattleMotion] started unit=" .. unitId .. " motion=" .. motionKey .. " mode=" .. motionMode .. " action=" .. actionName .. " rate=" .. safePlayRate .. " duration=" .. safeDuration .. " serverHandoff=" .. tostring(waitForServerHandoff))
+	end
 
-		local restore = function()
-			if isvalid(self.Entity) then
-				if self.Entity.StateComponent ~= nil then
-					self.Entity.StateComponent:ChangeState(self.CombatMotionReturnState)
-				end
-				local resetEvent = BodyActionStateChangeEvent()
-				resetEvent.ActionState = MapleAvatarBodyActionState.Stand
-				resetEvent.needResetAction = true
-				self.Entity:SendEvent(resetEvent)
-				log("[BattleMotion] restored unit=" .. unitId .. " motion=" .. motionKey .. " state=" .. self.CombatMotionReturnState)
+	@ExecSpace("ClientOnly")
+	method void RestoreCombatMotionState(string unitId, string motionKey, string reason)
+		-- A delayed pose reset must never replace a death pose or revive the state machine.
+		local canRestore = isvalid(self.Entity)
+		if canRestore then
+			local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+			local state = self.Entity.StateComponent
+			canRestore = (unit == nil or unit.IsDead == false) and (state == nil or state.CurrentStateName ~= "DEAD")
+		end
+		if canRestore then
+			if self.Entity.StateComponent ~= nil then
+				self.Entity.StateComponent:ChangeState(self.CombatMotionReturnState)
 			end
+			local resetEvent = BodyActionStateChangeEvent()
+			resetEvent.ActionState = MapleAvatarBodyActionState.Stand
+			resetEvent.needResetAction = true
+			self.Entity:SendEvent(resetEvent)
+			log("[BattleMotion] restored unit=" .. unitId .. " motion=" .. motionKey .. " state=" .. self.CombatMotionReturnState .. " reason=" .. reason)
+		end
+		self.CombatMotionHandoffPending = false
+		self.CombatMotionReady = false
+		self.CombatMotionReleaseRequested = false
+		self.CombatMotionUnitId = ""
+		self.CombatMotionKey = ""
+	end
+
+	@ExecSpace("Client")
+	method void CompleteCombatMotionHandoff(string unitId, string reason)
+		if self.CombatMotionHandoffPending == false or self.CombatMotionUnitId ~= unitId then
+			return
+		end
+		self.CombatMotionReleaseRequested = true
+		log("[BattleMotionHandoff] release unit=" .. unitId .. " motion=" .. self.CombatMotionKey .. " ready=" .. tostring(self.CombatMotionReady) .. " reason=" .. reason)
+		if self.CombatMotionReady then
+			self:RestoreCombatMotionState(unitId, self.CombatMotionKey, reason)
+		end
+	end
+
+	@ExecSpace("Client")
+	method void CancelCombatMotionHandoff(string unitId, string reason, boolean restoreToStand)
+		self:CancelFullMotionPlayback(reason)
+		if self.MotionTimerId > 0 then
+			_TimerService:ClearTimer(self.MotionTimerId)
 			self.MotionTimerId = 0
 		end
+		local motionKey = self.CombatMotionKey
+		self.CombatMotionHandoffPending = false
+		self.CombatMotionReady = false
+		self.CombatMotionReleaseRequested = false
+		self.CombatMotionUnitId = ""
+		self.CombatMotionKey = ""
+		if restoreToStand then
+			self:RestoreCombatMotionState(unitId, motionKey, reason)
+		end
+		log("[BattleMotionHandoff] cancelled unit=" .. unitId .. " restore=" .. tostring(restoreToStand) .. " reason=" .. reason)
+	end
 
-		self.MotionTimerId = _TimerService:SetTimerOnce(restore, safeDuration)
+	@ExecSpace("ClientOnly")
+	method void StopSpriteMotion(string unitId, string reason)
+		-- Cancels one temporary sprite motion and restores the enemy's canonical idle clip.
+		if self.SpriteMotionTimerId > 0 then
+			_TimerService:ClearTimer(self.SpriteMotionTimerId)
+			self.SpriteMotionTimerId = 0
+		end
+		if self.HasOriginalSpriteMotion == false then
+			return
+		end
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer ~= nil then
+			if self.IdleMotionRuid ~= "" then
+				renderer.SpriteRUID = self.IdleMotionRuid
+				renderer.PlayRate = math.max(0.1, self.IdleMotionPlayRate)
+			else
+				renderer.SpriteRUID = self.OriginalSpriteRuid
+				renderer.PlayRate = self.OriginalSpritePlayRate
+			end
+			local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then
+				self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+			end
+		end
+		self.HasOriginalSpriteMotion = false
+		log("[BattleSpriteMotion] cancelled unit=" .. unitId .. " reason=" .. reason .. " restoredRate=" .. tostring(renderer ~= nil and renderer.PlayRate or 0))
+	end
+
+	@ExecSpace("Client")
+	method void ApplyPhaseIdleMotion(string idleRuid, number playRate)
+		-- Invalidates queued old-form animations and makes the phase change visible immediately.
+		if idleRuid == "" or self.Entity.SpriteRendererComponent == nil then return end
+		self:CancelFullMotionPlayback("BOSS_PHASE_CHANGED")
+		self.IdleMotionRuid = idleRuid
+		self.IdleMotionPlayRate = math.max(0.1, playRate)
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		local unitId = unit ~= nil and unit.UnitId or ""
+		self:StopSpriteMotion(unitId, "BOSS_PHASE_CHANGED")
+		self.Entity.SpriteRendererComponent.SpriteRUID = idleRuid
+		self.Entity.SpriteRendererComponent.PlayRate = self.IdleMotionPlayRate
+		if unit ~= nil then self:ApplySpriteFacing(unitId, unit.Facing) end
+		log("[BossPhaseMotion] visible unit=" .. unitId .. " idle=" .. idleRuid)
+	end
+
+	@ExecSpace("Client")
+	method void PlaySpriteMotion(string unitId, string motionRuid, number playRate, number duration, string facingOverride, boolean isHitMotion)
+		-- Sprite-based enemies opt into one-shot attack or movement-action motion through data.
+		-- Hits restore idle after 0.5 seconds; other motions finish their actual playback cycle.
+		local renderer = self.Entity.SpriteRendererComponent
+		if renderer == nil then
+			log_warning("[BattleSpriteMotion] skipped unit=" .. unitId .. " reason=SPRITE_RENDERER_MISSING")
+			return
+		end
+		if motionRuid == "" then
+			return
+		end
+		if self.DeathMotionActive or self.DeathMotionCompleted then
+			return
+		end
+		if self._T.fullMotion ~= nil then
+			self._T.fullMotionQueue = self._T.fullMotionQueue or {}
+			table.insert(self._T.fullMotionQueue, function() self:PlaySpriteMotion(unitId, motionRuid, playRate, duration, facingOverride, isHitMotion) end)
+			return
+		end
+		self:StopMoveHopVisual("SPRITE_MOTION_STARTED")
+		self:StopSpriteMotion(unitId, "REPLACED")
+		self.OriginalSpriteRuid = self.IdleMotionRuid ~= "" and self.IdleMotionRuid or renderer.SpriteRUID
+		self.OriginalSpritePlayRate = self.IdleMotionRuid ~= "" and math.max(0.1, self.IdleMotionPlayRate) or renderer.PlayRate
+		self.HasOriginalSpriteMotion = true
+
+		local safePlayRate = math.max(0.1, playRate)
+		local safeDuration = math.max(0.1, duration)
+		self:WatchFullMotion(self.Entity, "SPRITE", function()
+			self:StopSpriteMotion(unitId, "ANIMATION_END")
+		end)
+		if isHitMotion then self:SetHitMotionDuration() end
+		renderer.SpriteRUID = motionRuid
+		renderer.PlayRate = safePlayRate
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if facingOverride == "Left" or facingOverride == "Right" then
+			self:ApplySpriteFacing(unitId, facingOverride)
+		elseif unit ~= nil then
+			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
+		end
+		log("[BattleSpriteMotion] started unit=" .. unitId .. " ruid=" .. motionRuid .. " rate=" .. safePlayRate .. " duration=" .. safeDuration)
+
 	end
 
 	@ExecSpace("Client")
@@ -230,6 +1082,21 @@ script BattleUnitPresentationComponent extends Component
 			return
 		end
 		log("[BattleEffect] played unit=" .. unitId .. " phase=" .. phase .. " ruid=" .. effectRuid .. " scale=" .. safeScale .. " rate=" .. safePlayRate .. " flipX=" .. tostring(flipX) .. " serial=" .. serial)
+	end
+
+	@ExecSpace("Client")
+	method void PlaySkillSound(string unitId, string phase, string soundRuid, number volume)
+		-- Plays one authored skill sound for this unit's cast or impact frame. Deliberately 2D
+		-- (`PlaySound`, not a positional SoundComponent): the board is always fully on screen, so a
+		-- distance-attenuated cue would only make the far column quieter for no gameplay reason.
+		-- Purely presentational, so an unauthored RUID costs the cue and nothing else.
+		if soundRuid == "" then
+			return
+		end
+
+		local safeVolume = math.max(0, math.min(1, volume))
+		_SoundService:PlaySound(soundRuid, safeVolume)
+		log("[BattleSkillSound] played unit=" .. unitId .. " phase=" .. phase .. " ruid=" .. soundRuid .. " volume=" .. safeVolume)
 	end
 
 end

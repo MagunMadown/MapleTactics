@@ -1,0 +1,232 @@
+@Component
+script NewSkillStageChoiceComponent extends Component
+
+	property Vector3 TargetPosition = Vector3(0, 0.5, 0)
+	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
+	property string ClickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+	property number SoundVolume = 1
+
+	@ExecSpace("ServerOnly")
+	method table ResolveOffer(Entity playerEntity, integer choiceIndex)
+		-- Offers only unowned tier-1 job skills; higher tiers belong exclusively to the upgrade map.
+		if isvalid(playerEntity) == false then
+			return { Success = false, Reason = "INVALID_PLAYER" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil or runState.SelectedJobId == "" then
+			return { Success = false, Reason = "JOB_NOT_SELECTED" }
+		end
+		local catalog = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(runState.SelectedJobId)
+		if catalog.Success == false then
+			return catalog
+		end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" }
+		end
+		local candidateSkills = {}
+		for _, skillDefinition in ipairs(catalog.Skills) do
+			local ownsSkillFamily = inventory:HasOwnedSkillInFamily(skillDefinition.SkillId, catalog.Skills)
+			if skillDefinition.SkillTier == 1 and ownsSkillFamily == false then
+				table.insert(candidateSkills, skillDefinition)
+			end
+		end
+		local normalizedChoiceIndex = math.max(1, math.floor(choiceIndex or 1))
+		if normalizedChoiceIndex > #candidateSkills then
+			log("[NewSkillStage] offer slot unavailable job=" .. runState.SelectedJobId .. " slot=" .. normalizedChoiceIndex .. " candidates=" .. #candidateSkills .. " owned=" .. inventory.RunSkillSnapshot)
+			return { Success = false, Reason = "CHOICE_SLOT_UNAVAILABLE", JobId = runState.SelectedJobId, CandidateCount = #candidateSkills }
+		end
+		local rotation = math.abs(runState.RunSeed + runState.CompletedStageCount * 17)
+		local skillIndex = ((rotation + normalizedChoiceIndex - 1) % #candidateSkills) + 1
+		local definition = candidateSkills[skillIndex]
+		log("[NewSkillStage] offer filtered job=" .. runState.SelectedJobId .. " slot=" .. normalizedChoiceIndex .. " mode=NEW_FAMILY_AWARE catalog=" .. #catalog.Skills .. " unowned=" .. #candidateSkills .. " owned=" .. inventory.RunSkillSnapshot .. " selected=" .. definition.SkillId)
+		return {
+			Success = true,
+			Reason = "OK",
+			JobId = runState.SelectedJobId,
+			SkillId = definition.SkillId,
+			DisplayName = definition.DisplayName,
+			IconRuid = self:GetSkillIconRuid(definition),
+			Description = self:BuildSkillDescription(definition),
+			SkillTier = definition.SkillTier,
+			Context = self:BuildSelectionContext(playerEntity)
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method string BuildSkillDescription(any definition)
+		-- Builds a concise Korean tooltip from the authoritative skill definition fields.
+		local targetLabel = definition.TargetingType or ""
+		if targetLabel == "FRONT_CELL" then
+			targetLabel = "정면 칸"
+		elseif targetLabel == "FIRST_ENEMY_FORWARD" then
+			targetLabel = "전방의 첫 번째 적"
+		elseif targetLabel == "RANGE_OFFSETS" then
+			targetLabel = "지정 범위"
+		elseif targetLabel == "SELF" then
+			targetLabel = "자신"
+		elseif targetLabel == "" then
+			targetLabel = "정보 없음"
+		end
+		local damageValue = self:GetSkillDamageValue(definition)
+		local damageText = damageValue > 0 and tostring(damageValue) or "없음"
+		local description = "피해: " .. damageText
+			.. "\n범위: " .. tostring(definition.Range or 0)
+			.. "\n대상: " .. targetLabel
+			.. "\n재사용 대기: " .. tostring(definition.CooldownTurns or 0) .. "턴"
+		local buffText = _BuffEffectExecutorLogic:DescribeBuffEffects(definition.EffectSetId or "")
+		if buffText ~= "" then
+			description = description .. "\n효과: " .. buffText
+		end
+		if definition.CostType ~= nil and definition.CostType ~= "" and (definition.CostValue or 0) > 0 then
+			description = description .. "\n비용: " .. definition.CostType .. " " .. tostring(definition.CostValue)
+		end
+		return description
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetSkillDamageValue(any definition)
+		-- Sums every authored DAMAGE step so multi-step skills expose their total tooltip damage.
+		if definition == nil or definition.EffectSetId == nil or definition.EffectSetId == "" then
+			return 0
+		end
+		local effectResult = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId)
+		if effectResult.Success == false then
+			return 0
+		end
+		local totalDamage = 0
+		for _, effectStep in ipairs(effectResult.Steps) do
+			if effectStep.EffectType == "DAMAGE" then
+				totalDamage = totalDamage + (effectStep.Value or 0)
+			end
+		end
+		return totalDamage
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetSkillIconRuid(any definition)
+		-- Prefers the authored dataset icon and falls back to skill-specific effect art when it is empty.
+		local iconRuid = definition.IconRuid or ""
+		if iconRuid ~= "" then
+			return iconRuid
+		end
+		local sourceRuid = definition.CastEffectRuid or ""
+		if sourceRuid == "" then
+			sourceRuid = definition.HitEffectRuid or ""
+		end
+		if sourceRuid ~= "" then
+			return "thumbnail://" .. sourceRuid
+		end
+		return self.DefaultSkillIconRuid
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildSelectionContext(Entity playerEntity)
+		-- Binds requests to one run reward and the exact inventory shown to the player.
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		return { RunSequence = runState.RunSequence, RewardKey = "new_skill_stage:" .. runState.LastBattleRecordKey,
+			SkillRevision = inventory.SkillInventoryRevision, SlotIds = inventory.RunSkillBarSlotIds }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildReplacementState(Entity playerEntity, table offer, string reason)
+		-- Returns six slots in battle-bar order without granting or removing a skill.
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local order = inventory:GetOrInitializeRunSkillBarOrder()
+		local owned = {}
+		for index, id in ipairs(inventory:ParseRunSkillBarSlotPipe(order.SlotIds or "")) do
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(id)
+			local info = { SkillId = id, DisplayName = id, SkillTier = 1, IconRuid = self.DefaultSkillIconRuid, Description = "정보를 불러오지 못했습니다." }
+			if definition.Success then
+				info.DisplayName = definition.DisplayName
+				info.SkillTier = definition.SkillTier
+				info.IconRuid = self:GetSkillIconRuid(definition)
+				info.Description = self:BuildSkillDescription(definition)
+			end
+			owned[index] = info
+		end
+		local count = #inventory:GetDistinctOwnedSkillIds()
+		log("[NewSkillReward] replacement required count=" .. tostring(count) .. " skill=" .. offer.SkillId .. " slots=" .. inventory.RunSkillBarSlotIds)
+		return { Success = false, PendingReplacement = true, Reason = reason, SkillId = offer.SkillId,
+			Offer = offer, OwnedSkills = owned, CanReplace = order.Success and count == inventory.RunSkillBarSlotCount,
+			Context = self:BuildSelectionContext(playerEntity) }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ProcessSelection(Entity playerEntity, integer choiceIndex, string skillId, table context, string replacedSkillId, boolean skip, boolean resolving)
+		-- Validates the authoritative offer and replays a completed receipt before any ownership-dependent checks.
+		if isvalid(playerEntity) == false or isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap ~= self.Entity or playerEntity.CurrentMap.Name ~= "new_skill_stage" then
+			return { Success = false, Reason = "INVALID_REWARD_MAP" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if runState == nil or inventory == nil or runState.RunSequence <= 0 or inventory.ActiveRunSequence ~= runState.RunSequence or runState.LastBattleRecordKey == "" then
+			return { Success = false, Reason = "BATTLE_REWARD_CONTEXT_UNAVAILABLE" }
+		end
+		local rewardKey = "new_skill_stage:" .. runState.LastBattleRecordKey
+		if context == nil or context.RunSequence ~= runState.RunSequence or context.RewardKey ~= rewardKey then
+			return { Success = false, Reason = "STALE_REWARD_CONTEXT" }
+		end
+		local receipt = (inventory._T.NewSkillRewardReceipts or {})[rewardKey]
+		if receipt ~= nil then
+			-- RequestTeleport consumes this authorization; restore it only while still on this reward map.
+			runState.PendingNextStageMapName = receipt.NextStageMapName
+			log("[NewSkillReward] receipt replay key=" .. rewardKey .. " result=" .. receipt.Reason)
+			return receipt
+		end
+		if inventory:ContainsDelimitedKey(inventory.AppliedRewardKeys, rewardKey) then
+			return { Success = false, Reason = "REWARD_ALREADY_PROCESSED" }
+		end
+		local choiceCount = math.min(3, math.max(1, _StageTransitionManagerLogic.NewSkillChoiceCount))
+		if choiceIndex < 1 or choiceIndex > choiceCount then
+			return { Success = false, Reason = "CHOICE_SLOT_UNAVAILABLE" }
+		end
+		local offer = self:ResolveOffer(playerEntity, choiceIndex)
+		if offer.Success == false or offer.SkillId ~= skillId then
+			return { Success = false, Reason = offer.Success == false and offer.Reason or "OFFER_MISMATCH" }
+		end
+		local count = #inventory:GetDistinctOwnedSkillIds()
+		if resolving == false and count >= inventory.RunSkillBarSlotCount then
+			return self:BuildReplacementState(playerEntity, offer, "REPLACEMENT_REQUIRED")
+		end
+		if resolving and count < inventory.RunSkillBarSlotCount then
+			return { Success = false, Reason = "STALE_SKILL_INVENTORY" }
+		end
+		if context.SkillRevision ~= inventory.SkillInventoryRevision or context.SlotIds ~= inventory.RunSkillBarSlotIds then
+			if resolving then return self:BuildReplacementState(playerEntity, offer, "STALE_SKILL_INVENTORY") end
+			return { Success = false, Reason = "STALE_SKILL_INVENTORY" }
+		end
+		if resolving and skip == false and replacedSkillId == "" then return { Success = false, Reason = "REPLACEMENT_NOT_OWNED" } end
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then return validation end
+		local nextMap = _StageTransitionManagerLogic:GetNextStageMapNameForPlayer(playerEntity)
+		if nextMap == "" or isvalid(_EntityService:GetEntityByPath("/maps/" .. nextMap)) == false then
+			return { Success = false, Reason = "NEXT_STAGE_MAP_UNAVAILABLE" }
+		end
+		return inventory:CommitNewSkillReward(skillId, replacedSkillId, skip, rewardKey, context.SkillRevision, context.SlotIds, nextMap)
+	end
+
+	@ExecSpace("Server")
+	method void RequestSelectOffer(integer choiceIndex, string skillId, table context, integer revision)
+		-- Begins or retries a choice on behalf of the authenticated caller only.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:ProcessSelection(playerEntity, choiceIndex, skillId, context, "", false, false)
+		self:ReceiveSelectionResult(result, revision, senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestResolveReplacement(integer choiceIndex, string skillId, table context, string replacedSkillId, boolean skip, integer revision)
+		-- Confirms replacement or forfeiture through the same reward-key transaction.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:ProcessSelection(playerEntity, choiceIndex, skillId, context, replacedSkillId, skip, true)
+		self:ReceiveSelectionResult(result, revision, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveSelectionResult(table result, integer revision)
+		-- Lets the UI reject late responses before any teleport can be requested.
+		_NewSkillSelectionUILogic:ReceiveSelectionState(result, revision, self.TargetPosition)
+	end
+
+end

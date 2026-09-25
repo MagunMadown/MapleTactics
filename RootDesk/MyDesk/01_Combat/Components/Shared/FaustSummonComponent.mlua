@@ -1,0 +1,171 @@
+@Component
+script FaustSummonComponent extends Component
+
+	property Entity SummonedEnemy = nil
+	property integer NextSummonTurn = 0
+	property integer SummonSequence = 0
+	property table SummonedEnemies = {}
+	property string SummonPoolIds = "ellinia_faust_summon_pool"
+	property string LowHpSummonPoolIds = ""
+	property number LowHpRatio = 0.5
+	property boolean RequireEmptyBoard = false
+	property boolean PrioritizeSummon = false
+	property integer SummonCooldownTurns = 5
+	property string SummonMotionRuid = "681d4068577d4610945b63da43f48b9f"
+	@Sync property string SummonDisplayName = "좀비루팡 소환"
+	@Sync property string SummonIconRuid = "a878e3aa8b40480cba6f5167285a4ec4"
+
+	@ExecSpace("ServerOnly")
+	method boolean IsSummonAvailable(any session)
+		-- Preserve Faust's cooldown and living-summon restriction by default.
+		local boss = self.Entity:GetComponent("script.BattleUnitComponent")
+		if boss == nil or boss.IsDead or session.BattleResult ~= "" or session.StageTurnNumber < self.NextSummonTurn then
+			return false
+		end
+		if self.RequireEmptyBoard then
+			for _, enemy in ipairs(session.BoardState:CollectLivingEnemies()) do
+				if enemy ~= self.Entity then return false end
+			end
+		end
+		for _, enemy in ipairs(self.SummonedEnemies) do
+			if isvalid(enemy) then
+				local unit = enemy:GetComponent("script.BattleUnitComponent")
+				if unit ~= nil and unit.IsDead == false then return false end
+			end
+		end
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildSummonEntries(any session, integer targetCell)
+		-- Select distinct free cells and the HP-dependent roster before publishing a plan.
+		if self:IsSummonAvailable(session) == false then return {} end
+		local boss = self.Entity:GetComponent("script.BattleUnitComponent")
+		local pools = self.SummonPoolIds
+		if self.LowHpSummonPoolIds ~= "" and boss.CurrentHp <= boss.MaxHp * self.LowHpRatio then
+			pools = self.LowHpSummonPoolIds
+		end
+		local cells = {}
+		if session:IsValidCell(targetCell) and session:IsCellOccupied(targetCell, "") == false then
+			table.insert(cells, targetCell)
+		elseif self.RequireEmptyBoard == false then
+			return {}
+		end
+		if self.RequireEmptyBoard then
+			for offset = 0, session.CellCount - 1 do
+				local cell = targetCell == 0 and offset or session.CellCount - 1 - offset
+				if cell ~= targetCell and session:IsCellOccupied(cell, "") == false then table.insert(cells, cell) end
+			end
+		end
+		local entries = {}
+		for poolId in string.gmatch(pools, "([^|]+)") do
+			local index = #entries + 1
+			if cells[index] == nil then return {} end
+			table.insert(entries, { PoolId = poolId, Cell = cells[index] })
+		end
+		return entries
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean CanSummon(any session, integer targetCell)
+		-- Readiness probes do not replace an already published plan.
+		return #self:BuildSummonEntries(session, targetCell) > 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method string PrepareSummon(any session, integer targetCell)
+		-- Freeze roster and cells; crossing half HP never rewrites the current action.
+		self._T.preparedSummons = self:BuildSummonEntries(session, targetCell)
+		local cells = {}
+		for _, entry in ipairs(self._T.preparedSummons) do table.insert(cells, tostring(entry.Cell)) end
+		self._T.preparedCells = table.concat(cells, "|")
+		return self._T.preparedCells
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TrySummon(any session, integer targetCell)
+		-- Compatibility entry point for callers without a published action plan.
+		return self:TryPreparedSummon(session, self:PrepareSummon(session, targetCell))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryPreparedSummon(any session, string targetCells)
+		-- Recheck the frozen tile; a failed attempt consumes the action, never the cooldown.
+		local entries = self._T.preparedSummons or {}
+		if #entries == 0 or targetCells ~= self._T.preparedCells or self:IsSummonAvailable(session) == false then
+			return { Success = false, Reason = "SUMMON_BLOCKED_WAIT" }
+		end
+		local playerEntity = session:FindUnitEntity("player_01")
+		if isvalid(playerEntity) == false then
+			return { Success = false, Reason = "PLAYER_MISSING_WAIT" }
+		end
+		local player = playerEntity:GetComponent("script.BattleUnitComponent")
+		if player == nil or player.IsDead then
+			return { Success = false, Reason = "PLAYER_UNAVAILABLE_WAIT" }
+		end
+		local definitions = {}
+		for index, entry in ipairs(entries) do
+			if session:IsValidCell(entry.Cell) == false or session:IsCellOccupied(entry.Cell, "") then
+				log("[BossSummon] wait reason=CELL_BLOCKED cell=" .. entry.Cell)
+				return { Success = false, Reason = "SUMMON_BLOCKED_WAIT" }
+			end
+			local definition = _StageWaveRepositoryLogic:GetEnemySpawnDefinition(entry.PoolId, session.CurrentWave, index, session.RunSeed)
+			if definition.Success == false then return definition end
+			table.insert(definitions, definition)
+		end
+		local boss = self.Entity:GetComponent("script.BattleUnitComponent")
+		local spawned = {}
+		for index, entry in ipairs(entries) do
+			self.SummonSequence = self.SummonSequence + 1
+			local facing = player.CellIndex < entry.Cell and "Left" or "Right"
+			local summon = session:SpawnWaveEnemy("summon_" .. boss.UnitId .. "_" .. self.SummonSequence, entry.Cell, facing, boss.SpawnOrder + self.SummonSequence, definitions[index])
+			if isvalid(summon) == false then
+				self:RemoveEntities(session, spawned)
+				return { Success = false, Reason = "SUMMON_SPAWN_FAILED_WAIT" }
+			end
+			table.insert(spawned, summon)
+			local summonedUnit = summon:GetComponent("script.BattleUnitComponent")
+			if session.StageId == "region_04_stage_04" and boss.EnemyDefinitionId == "region_04_commander_skeleton"
+				and summonedUnit ~= nil and summonedUnit.EnemyDefinitionId == "region_04_skeleton_soldier" then
+				summonedUnit._T.SkeletonCommander = self.Entity
+			end
+		end
+		-- SpawnWaveEnemy registers an EMPTY plan. It joins planning next round with SPAWN_WAIT.
+		self.SummonedEnemies = spawned
+		self.SummonedEnemy = spawned[1]
+		self._T.preparedSummons = nil
+		self.NextSummonTurn = session.StageTurnNumber + self.SummonCooldownTurns
+		local presentation = self.Entity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			presentation:PlaySpriteMotion(boss.UnitId, self.SummonMotionRuid, 1, 0.6, boss.Facing, false)
+		end
+		log("[BossSummon] summoned owner=" .. boss.UnitId .. " count=" .. #spawned .. " cells=" .. targetCells .. " hp=" .. boss.CurrentHp .. " next=" .. self.NextSummonTurn)
+		return { Success = true, Reason = "SUMMON_COMPLETED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RemoveEntities(any session, table enemies)
+		-- Forced cleanup and failed spawn rollback deliberately bypass rewards.
+		for _, enemy in ipairs(enemies) do
+			if isvalid(enemy) then
+				local unit = enemy:GetComponent("script.BattleUnitComponent")
+				if unit ~= nil then
+					unit:MarkDead()
+					session.BoardState:UnregisterUnit(unit.UnitId)
+				end
+				_EntityService:Destroy(enemy)
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RemoveSummon(any session)
+		-- The owner's defeat clears all reinforcements and permits stage completion.
+		self:RemoveEntities(session, self.SummonedEnemies)
+		self.SummonedEnemies = {}
+		self.SummonedEnemy = nil
+		self._T.preparedSummons = nil
+		log("[BossSummon] removed reason=BOSS_DEFEATED")
+	end
+
+end
