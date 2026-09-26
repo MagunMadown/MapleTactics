@@ -1379,3 +1379,16 @@ Validator가 반환하는 코드가 아니다.
 - ContentValidator 차단 오류가 0개다.
 - 고정 Seed 대표 시나리오에서 의도한 행이 로드되었다는 positive log가 있다.
 - 새 원시 Type이 필요했다면 Router, Validator 허용 목록, 데이터 사전, 테스트를 함께 수정했다.
+
+## 24. DamageSkinDefinitions — 피해 숫자 표시
+
+`RootDesk/MyDesk/03_Data/DamageSkinDefinitions.csv` / `.userdataset`에 데미지스킨 표시 설정을 관리한다. Runtime name은 `DamageSkinDefinitions`, `serveronly=false`, SchemaVersion은 `1`이다.
+
+- 키: `SkinId` (중복 불가), 표시 이름: `DisplayName`.
+- 리소스: `ResourceRuid` (일반 sprite가 아닌 damage skin RUID).
+- 연출: `TweenType`, `OffsetX`, `OffsetY`, `Scale`, `PlayRate`, `Alpha`.
+- 필수 기본 행: `maple_default`(공격), `maple_taken`(플레이어 피격).
+- 책임: `DamageSkinDefinitionRepositoryLogic`의 독립 검증/조회 → `BattleUnitPresentationComponent`의 클라이언트 네이티브 재생. 전투 ContentValidator의 시작 차단 대상은 아니며, 설정 오류는 숫자 표시만 건너뛴다.
+- 연동: 일반 피해와 상태이상 피해의 실제 HP 감소량을 표시한다. 스킨 설정은 피해량·큐·턴·사망 판정을 변경하지 않는다.
+
+필드 허용값, 선택 API, 저장 범위, 테스트 절차는 [데미지스킨 제작 가이드](Guide/Damage-Skin-Authoring-Guide.md)를 따른다. 정적 검증과 Maker 빌드·기본 리소스 로드·양쪽 피격 호출을 확인했다. 실제 화면 위치 검증은 남아 있다.
