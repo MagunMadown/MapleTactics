@@ -592,6 +592,18 @@
     font-variant-numeric: tabular-nums; text-anchor: middle; pointer-events: none; }
   .graph-edge { stroke: var(--border); stroke-width: 2; fill: none; }
 
+  /* ---- skill upgrade chain ---- */
+  .bal-upgrade { border: 1px dashed var(--border); border-radius: 8px; padding: 6px 8px; margin: -2px 0 10px; font-size: var(--fs-xs); display: grid; gap: 4px; }
+  .bal-upgrade-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .bal-upgrade-k { color: var(--dim); min-width: 52px; }
+  .bal-upgrade-chip { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 999px; padding: 2px 9px;
+    font: inherit; cursor: pointer; }
+  .bal-upgrade-chip:hover { border-color: var(--accent); color: var(--accent); }
+  .bal-upgrade-d { color: var(--dim); font-family: var(--font-mono); font-size: var(--fs-2xs); }
+  .bal-upgrade-none { color: var(--dimmer); }
+  .bal-upgrade-issue { color: var(--warn); }
+  td.list-upgrade .bal-upgrade-chip { font-size: var(--fs-2xs); margin: 1px 2px; }
+
   /* ---- history / change summary / modal ---- */
   #btnChanges.has-changes { border-color: var(--warn); color: var(--warn); }
   .flash-note { position: fixed; left: 50%; bottom: 24px; transform: translate(-50%, 20px); opacity: 0; pointer-events: none;
@@ -3576,6 +3588,96 @@
     };
   }
 
+  // Skill upgrade chain (SkillDefinitionRepositoryLogic.GetNextSkillUpgrade):
+  // inside one job's skill table, the row whose BaseSkillId names the owned
+  // skill is its upgrade. Exactly one such row, with SkillTier = base + 1, or
+  // the game refuses the upgrade (AMBIGUOUS_UPGRADE_PATH /
+  // UPGRADE_TIER_MISMATCH / BASE_SKILL_NOT_IN_JOB_CATALOG).
+  const JOB_SKILL_TABLES = new Set(["WarriorSkillDefinitions", "MageSkillDefinitions", "ArcherSkillDefinitions", "ThiefSkillDefinitions", "PirateSkillDefinitions"]);
+  let skillUpgradeIndex = new Map();
+
+  function buildUpgradeIndex(concepts) {
+    const byId = new Map(concepts.map((c) => [c.skillId, c]));
+    const kids = new Map();
+    concepts.forEach((c) => {
+      if (!c.baseSkillId) return;
+      if (!kids.has(c.baseSkillId)) kids.set(c.baseSkillId, []);
+      kids.get(c.baseSkillId).push(c);
+    });
+    const info = new Map();
+    concepts.forEach((c) => {
+      const base = c.baseSkillId ? byId.get(c.baseSkillId) || null : null;
+      const all = kids.get(c.skillId) || [];
+      const ups = all.filter((u) => u.tableName === c.tableName);
+      const issues = [];
+      if (c.baseSkillId && !base) issues.push(`원본 '${c.baseSkillId}'이(가) 없습니다`);
+      if (base && base.tableName !== c.tableName) issues.push("원본이 다른 직업 표에 있어 강화로 연결되지 않습니다 (BASE_SKILL_NOT_IN_JOB_CATALOG)");
+      if (base && (Number(c.tier) || 0) !== (Number(base.tier) || 0) + 1) issues.push(`Tier ${c.tier || "?"}가 원본 Tier ${base.tier || "?"} + 1이 아닙니다 (UPGRADE_TIER_MISMATCH)`);
+      if (ups.length > 1) issues.push(`강화 후보가 ${ups.length}개 — 게임이 강화를 거절합니다 (AMBIGUOUS_UPGRADE_PATH)`);
+      let root = c;
+      for (let i = 0; i < 10 && root.baseSkillId && byId.get(root.baseSkillId); i++) root = byId.get(root.baseSkillId);
+      info.set(c.skillId, { base, ups, issues, root, jobTable: JOB_SKILL_TABLES.has(c.tableName) });
+    });
+    return info;
+  }
+
+  // Search also matches the whole upgrade family: "브랜디쉬" finds 브레이브 슬래시 too.
+  function skillMatchesQuery(c, q) {
+    if (!q) return true;
+    const hit = (x) => x && (x.displayName.toLowerCase().includes(q) || x.skillId.toLowerCase().includes(q));
+    if (hit(c) || (JOB_LABEL[c.job] || c.job || "").toLowerCase().includes(q)) return true;
+    const u = skillUpgradeIndex.get(c.skillId);
+    return !!u && (hit(u.root) || u.ups.some(hit) || hit(u.base));
+  }
+
+  function upgradeDelta(from, to) {
+    const parts = [];
+    const amt = (x) => (x.hasDamage ? x.totalDamage : x.hasHeal ? x.totalHeal : null);
+    const a = amt(from), b = amt(to);
+    if (a !== null && b !== null) parts.push(`${from.hasDamage ? "피해" : "회복"} ${a}→${b}`);
+    if (Number.isFinite(from.cooldown) && Number.isFinite(to.cooldown)) parts.push(`쿨 ${from.cooldown}→${to.cooldown}`);
+    if (from.range !== to.range && from.range && to.range) parts.push(`사거리 ${from.range}→${to.range}`);
+    return parts.join(" · ");
+  }
+
+  function focusSkill(target) {
+    state.balanceSearch = target.skillId;
+    state.balanceJob = "all";
+    renderBalanceView();
+  }
+
+  function buildUpgradeLine(c) {
+    const u = skillUpgradeIndex.get(c.skillId);
+    if (!u) return null;
+    const box = document.createElement("div");
+    box.className = "bal-upgrade";
+    const chip = (target, arrow) => {
+      const b = document.createElement("button");
+      b.className = "bal-upgrade-chip";
+      b.textContent = `${arrow === "from" ? "← " : ""}${target.displayName} T${target.tier || "?"}${arrow === "to" ? " →" : ""}`;
+      b.title = `${target.skillId} 카드 보기 (검색하면 강화 계열 전체가 함께 나옵니다)`;
+      b.addEventListener("click", () => focusSkill(target));
+      return b;
+    };
+    const row = (label, target, dir) => {
+      const line = document.createElement("div");
+      line.className = "bal-upgrade-row";
+      line.append(Object.assign(document.createElement("span"), { className: "bal-upgrade-k", textContent: label }), chip(target, dir));
+      const d = dir === "from" ? upgradeDelta(target, c) : upgradeDelta(c, target);
+      if (d) line.append(Object.assign(document.createElement("span"), { className: "bal-upgrade-d", textContent: d }));
+      box.appendChild(line);
+    };
+    if (u.base) row("강화 전", u.base, "from");
+    u.ups.forEach((up) => row("강화하면", up, "to"));
+    if (!u.base && !u.ups.length) {
+      if (!u.jobTable) return null;
+      box.appendChild(Object.assign(document.createElement("div"), { className: "bal-upgrade-none",
+        textContent: Number(c.tier) > 1 ? "강화 원본(BaseSkillId)이 비어 있습니다" : "강화 없음 — 업그레이드 스테이지에서 이 스킬은 강화 후보로 나오지 않습니다" }));
+    }
+    u.issues.forEach((t) => box.appendChild(Object.assign(document.createElement("div"), { className: "bal-upgrade-issue", textContent: "⚠ " + t })));
+    return box;
+  }
+
   function buildSkillConcepts() {
     const out = [];
     for (const tableName of SKILL_SCHEMA_TABLES) {
@@ -3639,6 +3741,7 @@
     }
 
     const concepts = buildSkillConcepts();
+    skillUpgradeIndex = buildUpgradeIndex(concepts);
     // Drop compare selections whose skill no longer exists (e.g. row deleted in Editor).
     const liveIds = new Set(concepts.map((c) => c.skillId));
     [...state.compareIds].forEach((id) => { if (!liveIds.has(id)) state.compareIds.delete(id); });
@@ -3766,6 +3869,10 @@
     { key: "name", label: "이름", get: (c) => c.displayName },
     { key: "job", label: "직업", get: (c) => JOB_LABEL[c.job] || (c.tableName === "EnemySkillDefinitions" ? "적 전용" : "공용") },
     { key: "tier", label: "Tier", get: (c) => parseFloat(c.tier) || 0, numeric: true },
+    { key: "upgrade", label: "강화", get: (c) => {
+      const u = skillUpgradeIndex.get(c.skillId);
+      return u ? (u.root.displayName + " " + (c.tier || "")) : "";
+    } },
     { key: "amount", label: "값", get: (c) => (c.hasDamage ? c.totalDamage : c.hasHeal ? c.totalHeal : 0), numeric: true },
     { key: "cooldown", label: "Cooldown", get: (c) => c.cooldown || 0, numeric: true },
     { key: "range", label: "Range", get: (c) => parseFloat(c.range) || 0, numeric: true },
@@ -3787,12 +3894,7 @@
     const q = state.balanceSearch.trim().toLowerCase();
     const filtered = concepts.filter((c) => {
       if (state.balanceJob !== "all" && skillJobFilterKey(c) !== state.balanceJob) return false;
-      if (!q) return true;
-      return (
-        c.displayName.toLowerCase().includes(q) ||
-        c.skillId.toLowerCase().includes(q) ||
-        (JOB_LABEL[c.job] || c.job || "").toLowerCase().includes(q)
-      );
+      return skillMatchesQuery(c, q);
     });
 
     const count = document.createElement("div");
@@ -3854,6 +3956,27 @@
     const tdTier = document.createElement("td");
     tdTier.textContent = c.tier || "—";
     tr.appendChild(tdTier);
+
+    const tdUp = document.createElement("td");
+    tdUp.className = "list-upgrade";
+    const u = skillUpgradeIndex.get(c.skillId);
+    if (u) {
+      const link = (target, text) => {
+        const b = document.createElement("button");
+        b.className = "bal-upgrade-chip";
+        b.textContent = text;
+        b.title = target.skillId;
+        b.addEventListener("click", () => focusSkill(target));
+        return b;
+      };
+      if (u.base) tdUp.appendChild(link(u.base, `← ${u.base.displayName}`));
+      u.ups.forEach((up) => tdUp.appendChild(link(up, `${up.displayName} →`)));
+      if (u.issues.length) {
+        tdUp.appendChild(Object.assign(document.createElement("span"), { className: "bal-upgrade-issue", textContent: " ⚠", title: u.issues.join("\n") }));
+      }
+      if (!u.base && !u.ups.length) tdUp.textContent = "—";
+    } else tdUp.textContent = "—";
+    tr.appendChild(tdUp);
 
     const tdAmount = document.createElement("td");
     const amountWidget = (c.hasDamage || c.hasHeal) ? buildEditableCell(c.effectTableName, c.primaryStepRowIndex, "Value") : null;
@@ -4095,12 +4218,7 @@
     const q = state.balanceSearch.trim().toLowerCase();
     const filtered = concepts.filter((c) => {
       if (state.balanceJob !== "all" && skillJobFilterKey(c) !== state.balanceJob) return false;
-      if (!q) return true;
-      return (
-        c.displayName.toLowerCase().includes(q) ||
-        c.skillId.toLowerCase().includes(q) ||
-        (JOB_LABEL[c.job] || c.job || "").toLowerCase().includes(q)
-      );
+      return skillMatchesQuery(c, q);
     });
 
     const count = document.createElement("div");
@@ -4277,6 +4395,8 @@
       badges.appendChild(tierBadge);
     }
     card.appendChild(badges);
+    const upgradeLine = buildUpgradeLine(c);
+    if (upgradeLine) card.appendChild(upgradeLine);
 
     // Progressive disclosure within the card itself: only the "is this skill
     // strong" signal (Effect + Cooldown + 턴당 기대치) shows by default.
@@ -4327,6 +4447,10 @@
     const moreStats = document.createElement("div");
     moreStats.className = "bal-more-details" + (cardExpanded ? " open" : "");
     if (!buildEditableStat(moreStats, "Range", c.tableName, c.rowIndex, "Range")) addStat(moreStats, "Range", c.range || "—");
+    if (JOB_SKILL_TABLES.has(c.tableName)) {
+      buildEditableStat(moreStats, "Tier", c.tableName, c.rowIndex, "SkillTier");
+      buildEditableStat(moreStats, "강화 원본 (BaseSkillId)", c.tableName, c.rowIndex, "BaseSkillId");
+    }
     addStat(moreStats, "Targets", c.targetCount === null ? "—" : String(c.targetCount));
     if (!buildEditableStat(moreStats, "ActionDuration", c.tableName, c.rowIndex, "ActionDuration")) {
       addStat(moreStats, "ActionDuration", c.actionDuration || "—");
@@ -6826,6 +6950,23 @@
       const q = cell("EnemyQueueTurns");
       if (q === "" || Number(q) < 1) {
         warn("EnemyQueueTurns", "0 이하는 런타임에서 1턴으로 보정됩니다 (적 스킬은 최소 1턴 장전 — Enemy-Mandatory-Queue-Guide). 의도대로라면 1로 적어 두세요.");
+      }
+    }
+
+    if (JOB_SKILL_TABLES.has(table) && header.includes("BaseSkillId")) {
+      const hi = (c) => header.indexOf(c);
+      const rowsNow = def.rows;
+      const baseId = cell("BaseSkillId"), myId = cell("SkillId");
+      if (baseId) {
+        const baseRow = rowsNow.find((r) => (r[hi("SkillId")] || "").trim() === baseId);
+        if (!baseRow) err("BaseSkillId", "BASE_SKILL_NOT_IN_JOB_CATALOG", `같은 직업 표에 '${baseId}'이(가) 없어 강화 경로가 끊깁니다.`);
+        else if ((Number(cell("SkillTier")) || 0) !== (Number(baseRow[hi("SkillTier")]) || 0) + 1) {
+          err("SkillTier", "UPGRADE_TIER_MISMATCH", `원본 '${baseId}'의 Tier(${baseRow[hi("SkillTier")] || "?"}) + 1이어야 합니다.`);
+        }
+      }
+      if (myId) {
+        const children = rowsNow.filter((r) => (r[hi("BaseSkillId")] || "").trim() === myId).length;
+        if (children > 1) err("SkillId", "AMBIGUOUS_UPGRADE_PATH", `이 스킬을 원본으로 하는 강화 스킬이 ${children}개입니다 — 게임은 강화 후보가 정확히 1개일 때만 강화합니다.`);
       }
     }
 
