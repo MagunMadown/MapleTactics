@@ -142,8 +142,9 @@ stop
 → stop
 ```
 
-Warning/Error가 없다는 사실만으로 완료가 아니다. 요청한 분기가 실행됐다는 positive log와 예상
-값이 필요하다.
+Warning/Error가 없다는 사실만으로 완료가 아니다. 검증 중에는 요청한 분기가 실행됐다는
+positive log와 예상값을 확인하고 작업 기록에 남긴다. 기능 완료 전에는 임시 반복 로그를
+삭제한다. [`Runtime-Logging-Guide.md`](./Runtime-Logging-Guide.md)를 따른다.
 
 ## 9. 인수인계 템플릿
 
