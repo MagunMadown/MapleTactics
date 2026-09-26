@@ -1,0 +1,125 @@
+@Logic
+script DamageSkinDefinitionRepositoryLogic extends Logic
+
+	property string DataSetName = "DamageSkinDefinitions"
+	property string DefaultOutgoingSkinId = "maple_default"
+	property string DefaultIncomingSkinId = "maple_taken"
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Warm the two default native skins before the first combat hit.
+		self:PreloadSkin(self.DefaultOutgoingSkinId)
+		self:PreloadSkin(self.DefaultIncomingSkinId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PreloadSkin(string skinId)
+		-- Native resource validation is async and cosmetic only; it must never block a turn.
+		local result = self:GetDefinition(skinId)
+		if result.Success == false then
+			log_warning("[DamageSkinData] preload skipped skin=" .. skinId .. " reason=" .. result.Reason)
+			return
+		end
+		if self._T.preloads == nil then self._T.preloads = {} end
+		local ruid = result.Definition.ResourceRuid
+		if self._T.preloads[ruid] then return end
+		self._T.preloads[ruid] = true
+		_DamageSkinService:PreloadAsync(ruid, function(success)
+			if success then
+				log("[DamageSkinData] preloaded skin=" .. skinId)
+			else
+				log_warning("[DamageSkinData] native resource failed skin=" .. skinId .. " ruid=" .. ruid)
+			end
+		end)
+	end
+
+	method table GetAllDefinitions()
+		-- Shared read-only catalog: cosmetic selection on server, native playback on client.
+		if self._T.catalog ~= nil then return self._T.catalog end
+		local result = { Success = false, Reason = "DAMAGE_SKIN_DATASET_MISSING", Definitions = {}, ById = {} }
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		if dataSet == nil then return result end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local entry = self:ConvertRow(dataSet, rowIndex)
+			local validation = self:ValidateDefinition(entry)
+			if validation.Success == false or result.ById[entry.SkinId] ~= nil then
+				result.Reason = validation.Success == false and validation.Reason or "DUPLICATE_DAMAGE_SKIN_ID"
+				log_error("[DamageSkinData] rejected row=" .. tostring(rowIndex) .. " reason=" .. result.Reason)
+				return result
+			end
+			result.ById[entry.SkinId] = entry
+			table.insert(result.Definitions, entry)
+		end
+		if result.ById[self.DefaultOutgoingSkinId] == nil or result.ById[self.DefaultIncomingSkinId] == nil then
+			result.Reason = "DAMAGE_SKIN_DEFAULT_MISSING"
+			return result
+		end
+		result.Success = true
+		result.Reason = "OK"
+		self._T.catalog = result
+		log("[DamageSkinData] loaded count=" .. tostring(#result.Definitions))
+		return result
+	end
+
+	method table ConvertRow(any dataSet, integer rowIndex)
+		-- CSV owns presentation only, never damage amounts, targeting or turn costs.
+		return {
+			SchemaVersion = tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")),
+			SkinId = dataSet:GetCell(rowIndex, "SkinId") or "",
+			DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+			ResourceRuid = dataSet:GetCell(rowIndex, "ResourceRuid") or "",
+			TweenType = dataSet:GetCell(rowIndex, "TweenType") or "",
+			OffsetX = tonumber(dataSet:GetCell(rowIndex, "OffsetX")),
+			OffsetY = tonumber(dataSet:GetCell(rowIndex, "OffsetY")),
+			Scale = tonumber(dataSet:GetCell(rowIndex, "Scale")),
+			PlayRate = tonumber(dataSet:GetCell(rowIndex, "PlayRate")),
+			Alpha = tonumber(dataSet:GetCell(rowIndex, "Alpha"))
+		}
+	end
+
+	method table ValidateDefinition(table entry)
+		-- Reject typos and non-finite/out-of-range numbers before passing them to the engine.
+		if entry.SchemaVersion ~= 1 then return { Success = false, Reason = "UNSUPPORTED_DAMAGE_SKIN_SCHEMA" } end
+		if entry.SkinId == "" or string.match(entry.SkinId, "^[a-z][a-z0-9_]*$") == nil or entry.DisplayName == "" then
+			return { Success = false, Reason = "INVALID_DAMAGE_SKIN_ID_OR_NAME" }
+		end
+		if string.len(entry.ResourceRuid) ~= 32 or string.match(entry.ResourceRuid, "^%x+$") == nil then
+			return { Success = false, Reason = "INVALID_DAMAGE_SKIN_RUID" }
+		end
+		local tweens = { Default = true, Volcano = true, Blade = true, DefaultMini = true, VolcanoMini = true, BladeMini = true }
+		if tweens[entry.TweenType] ~= true then return { Success = false, Reason = "INVALID_DAMAGE_SKIN_TWEEN" } end
+		local ranges = { OffsetX = { -10, 10 }, OffsetY = { -10, 10 }, Scale = { 0.1, 5 }, PlayRate = { 0.1, 5 }, Alpha = { 0.1, 1 } }
+		for field, bounds in pairs(ranges) do
+			local value = entry[field]
+			if value == nil or value ~= value or value < bounds[1] or value > bounds[2] then
+				return { Success = false, Reason = "INVALID_DAMAGE_SKIN_" .. string.upper(field) }
+			end
+		end
+		return { Success = true, Reason = "OK" }
+	end
+
+	method table GetDefinition(string skinId)
+		-- An unknown selection is rejected; the presentation caller chooses its explicit default.
+		local catalog = self:GetAllDefinitions()
+		if catalog.Success == false then return { Success = false, Reason = catalog.Reason } end
+		local definition = catalog.ById[skinId]
+		return { Success = definition ~= nil, Reason = definition ~= nil and "OK" or "DAMAGE_SKIN_NOT_FOUND", Definition = definition }
+	end
+
+	method table GetSkinOptions()
+		-- Return a detached UI list, not the repository's cached mutable definitions.
+		local catalog = self:GetAllDefinitions()
+		local result = { Success = catalog.Success, Reason = catalog.Reason, Skins = {} }
+		if catalog.Success == false then return result end
+		for _, definition in ipairs(catalog.Definitions) do
+			table.insert(result.Skins, { SkinId = definition.SkinId, DisplayName = definition.DisplayName })
+		end
+		return result
+	end
+
+	method void OnEndPlay()
+		-- Invalidate both client and server caches between Maker play sessions.
+		self._T.catalog = nil
+		self._T.preloads = nil
+	end
+end

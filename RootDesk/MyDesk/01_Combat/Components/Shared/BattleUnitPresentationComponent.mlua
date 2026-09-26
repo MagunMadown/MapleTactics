@@ -2,6 +2,10 @@
 script BattleUnitPresentationComponent extends Component
 
 	property Color HitFlashColor = Color(1, 0.35, 0.35, 1)
+	-- Stable catalog IDs; cosmetic selection belongs to the actor, not to an individual skill.
+	@Sync property string OutgoingDamageSkinId = "maple_default"
+	@Sync property string IncomingDamageSkinId = "maple_taken"
+	property Vector2 DamageNumberOffset = Vector2(0, 0)
 	property Vector2 NormalHitSquashScale = Vector2(1.07, 0.93)
 	property Vector2 StrongHitSquashScale = Vector2(1.13, 0.87)
 	property string CombatMotionReturnState = "IDLE"
@@ -78,6 +82,8 @@ script BattleUnitPresentationComponent extends Component
 	method void OnBeginPlay()
 		-- Presentation settings are local-only and never mutate logical battle state.
 		log("[BattlePresentation] ready entity=" .. self.Entity.Name .. " tuningSource=BattleSessionComponent")
+		_DamageSkinDefinitionRepositoryLogic:PreloadSkin(self.OutgoingDamageSkinId)
+		_DamageSkinDefinitionRepositoryLogic:PreloadSkin(self.IncomingDamageSkinId)
 		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
 		if unit ~= nil then
 			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
@@ -102,6 +108,45 @@ script BattleUnitPresentationComponent extends Component
 		end
 		renderer.FlipX = shouldFlip
 		log("[BattleFacing] sprite applied unit=" .. unitId .. " facing=" .. facing .. " flipX=" .. tostring(shouldFlip))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string propertyName, any value)
+		-- Warm newly equipped cosmetics without delaying damage or changing combat state.
+		if propertyName == "OutgoingDamageSkinId" or propertyName == "IncomingDamageSkinId" then
+			_DamageSkinDefinitionRepositoryLogic:PreloadSkin(tostring(value))
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SetDamageSkin(string skinId, boolean incoming)
+		-- Internal integration API; any future shop/equipment RPC must validate ownership first.
+		local result = _DamageSkinDefinitionRepositoryLogic:GetDefinition(skinId)
+		if result.Success == false then return { Success = false, Reason = result.Reason } end
+		if incoming then self.IncomingDamageSkinId = skinId else self.OutgoingDamageSkinId = skinId end
+		return { Success = true, Reason = "OK", SkinId = skinId }
+	end
+
+	@ExecSpace("Client")
+	method void PlayDamageNumber(string unitId, number appliedAmount, string skinId, boolean playerTarget)
+		-- One native pop per accepted HP mutation, including lethal hits; never derive hits from HP sync.
+		if not isvalid(self.Entity) or appliedAmount <= 0 or appliedAmount ~= appliedAmount then return end
+		local localPlayer = _UserService.LocalPlayer
+		if not isvalid(localPlayer) or localPlayer.CurrentMap ~= self.Entity.CurrentMap then return end
+		local repository = _DamageSkinDefinitionRepositoryLogic
+		local result = repository:GetDefinition(skinId)
+		if result.Success == false then
+			result = repository:GetDefinition(playerTarget and repository.DefaultIncomingSkinId or repository.DefaultOutgoingSkinId)
+		end
+		if result.Success == false then
+			log_warning("[DamageSkin] skipped unit=" .. unitId .. " reason=" .. result.Reason)
+			return
+		end
+		local definition = result.Definition
+		local offset = Vector2(definition.OffsetX + self.DamageNumberOffset.x, definition.OffsetY + self.DamageNumberOffset.y + self.GroundVisualOffsetY)
+		-- All optional native arguments are explicit. The existing combat pipeline is integer-valued.
+		_DamageSkinService:Play(self.Entity, definition.ResourceRuid, 0, { math.max(1, math.floor(appliedAmount + 0.5)) },
+			DamageSkinTweenType.CastFrom(definition.TweenType), false, offset, Vector2(definition.Scale, definition.Scale), definition.PlayRate, definition.Alpha, LitMode.Default)
 	end
 
 	@ExecSpace("ClientOnly")
