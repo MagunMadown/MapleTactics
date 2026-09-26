@@ -243,6 +243,10 @@
   .skill-motion-tag { display: inline-flex; align-items: center; gap: 3px; font-size: var(--fs-2xs); color: var(--dim);
     cursor: pointer; white-space: nowrap; }
   .skill-motion-tag input { margin: 0; }
+  .pattern-detail td.pattern-dmg { white-space: nowrap; }
+  .pattern-dmg-item { display: inline-flex; align-items: center; gap: 3px; margin-right: 4px; }
+  .pattern-dmg-tag { font-size: var(--fs-2xs); color: var(--dim); }
+  .pattern-dmg-shared { font-size: var(--fs-2xs); color: var(--warn); border: 1px solid var(--warn); border-radius: 999px; padding: 0 5px; }
   .pattern-detail td.step-desc { color: var(--text); white-space: normal; min-width: 150px; }
   .pattern-detail td .vocab-select { min-width: 0; max-width: 190px; font-size: var(--fs-2xs); }
   .pattern-detail td .numstep { min-width: 0; width: 88px; }
@@ -4168,8 +4172,21 @@
       target.appendChild(vEl);
     };
     if (c.hasDamage) {
-      const dmgLabel = c.damageHits > 1 ? `Damage (타격당 ×${c.damageHits} = ${c.totalDamage})` : "Damage";
-      if (!buildEditableStat(stats, dmgLabel, c.effectTableName, c.primaryStepRowIndex, "Value")) addStat(stats, "Damage", String(c.totalDamage));
+      const dmgSteps = c.steps.filter((s) => s.effectType === "DAMAGE");
+      if (dmgSteps.length === 1 && dmgSteps[0].paramA === "SOURCE_BASIC_ATTACK") {
+        addStat(stats, "Damage", "시전자 기본 공격력 (Value 미사용)");
+      } else if (dmgSteps.length === 1) {
+        const dmgLabel = c.damageHits > 1 ? `Damage (타격당 ×${c.damageHits} = ${c.totalDamage})` : "Damage";
+        if (!buildEditableStat(stats, dmgLabel, c.effectTableName, c.primaryStepRowIndex, "Value")) addStat(stats, "Damage", String(c.totalDamage));
+      } else {
+        // Several DAMAGE steps: one stepper per step (its own Value), then the total.
+        dmgSteps.forEach((s, i) => {
+          if (s.paramA === "SOURCE_BASIC_ATTACK") { addStat(stats, `Damage ${i + 1}`, "시전자 기본 공격력"); return; }
+          const tags = [s.hits > 1 ? `×${s.hits}` : "", s.condition ? "연계" : "", s.paramA === "SOURCE_BASIC_ATTACK" ? "기본 공격력" : ""].filter(Boolean).join(" · ");
+          buildEditableStat(stats, `Damage ${i + 1}${tags ? ` (${tags})` : ""}`, c.effectTableName, s.rowIndex, "Value");
+        });
+        addStat(stats, "Damage 합계", String(c.totalDamage));
+      }
       const notes = [];
       if (c.comboDamage) notes.push(`연계 시 +${c.comboDamage}`);
       if (c.usesBasicAttack) notes.push("+ 시전자 기본 공격력");
@@ -4995,14 +5012,14 @@
       const patternOpen = state.enemyPatternExpanded.has(c.enemyId);
       const toggleBtn = document.createElement("button");
       toggleBtn.className = "pattern-toggle";
-      toggleBtn.textContent = patternOpen ? "패턴 상세 접기 ▲" : `패턴 상세 보기 (${patternSteps.length}스텝) ▾`;
+      toggleBtn.textContent = patternOpen ? "패턴 상세 접기 ▲" : `패턴 상세 · 편집 (${patternSteps.length}스텝) ▾`;
       const detailWrap = document.createElement("div");
       detailWrap.className = "pattern-detail" + (patternOpen ? " open" : "");
-      detailWrap.appendChild(buildPatternDetailTable(patternSteps));
+      detailWrap.appendChild(buildPatternDetailTable(patternSteps, c));
       toggleBtn.addEventListener("click", () => {
         const open = detailWrap.classList.toggle("open");
         if (open) state.enemyPatternExpanded.add(c.enemyId); else state.enemyPatternExpanded.delete(c.enemyId);
-        toggleBtn.textContent = open ? "패턴 상세 접기 ▲" : `패턴 상세 보기 (${patternSteps.length}스텝) ▾`;
+        toggleBtn.textContent = open ? "패턴 상세 접기 ▲" : `패턴 상세 · 편집 (${patternSteps.length}스텝) ▾`;
       });
       card.appendChild(toggleBtn);
       card.appendChild(detailWrap);
@@ -5183,12 +5200,60 @@
     return `${s.conditionType === "ALWAYS" ? "" : c + " → "}${a}${s.actionType === "CAST_INTERRUPTIBLE" ? ` (${s.paramA || "?"}타 차단)` : ""}${Number(s.telegraphTurns) > 0 ? ` · 예고 ${s.telegraphTurns}턴` : ""}`;
   }
 
-  function buildPatternDetailTable(steps) {
+  // Damage of the enemy skill a pattern step fires (its DAMAGE steps' Value),
+  // edited in place. The skill row is shared: every enemy/step using the same
+  // SkillId changes with it — said in the tooltip and the count badge.
+  // SOURCE_BASIC_ATTACK steps ignore Value (DamageEffectExecutorLogic uses the
+  // caster's BasicAttackDamage), so there the cell edits this enemy's
+  // EnemyDefinitions.BasicAttackDamage instead — per enemy, not shared.
+  function buildPatternDamageCell(s, enemy) {
+    const td = document.createElement("td");
+    td.className = "pattern-dmg";
+    const sk = s.tileId ? enemySkillIndex.get(s.tileId) : null;
+    const dmg = sk ? sk.steps.filter((st) => st.effectType === "DAMAGE") : [];
+    if (!dmg.length) {
+      td.textContent = sk ? (sk.steps.map((st) => (VOCAB.skill.effects[st.effectType] || { label: st.effectType }).label).join(", ") || "—") : "—";
+      return td;
+    }
+    const users = (getCasterMotionUsage().get(sk.skillId) || { users: [] }).users.length;
+    let sharedEdit = false;
+    dmg.forEach((st) => {
+      const basic = st.paramA === "SOURCE_BASIC_ATTACK";
+      if (basic && !enemy) return;
+      if (!basic) sharedEdit = true;
+      const w = basic ? buildEditableCell("EnemyDefinitions", enemy.rowIndex, "BasicAttackDamage") : buildEditableCell(sk.effectTableName, st.rowIndex, "Value");
+      if (!w) return;
+      const wrap = document.createElement("span");
+      wrap.className = "pattern-dmg-item";
+      wrap.appendChild(w);
+      const tags = [st.hits > 1 ? `×${st.hits}` : "", st.condition ? "연계" : "", basic ? "기본 공격력" : ""].filter(Boolean).join(" ");
+      if (basic) wrap.title = `${enemy.displayName}의 BasicAttackDamage (이 스킬은 Value 대신 시전자 기본 공격력을 씀)`;
+      if (tags) {
+        const t = document.createElement("span");
+        t.className = "pattern-dmg-tag";
+        t.textContent = tags;
+        wrap.appendChild(t);
+      }
+      td.appendChild(wrap);
+    });
+    td.title = sharedEdit
+      ? `${sk.displayName} (${sk.skillId}) 피해 — SkillEffectSteps.Value` + (users > 1 ? `\n이 스킬을 쓰는 적 ${users}명 모두에 적용됩니다.` : "")
+      : `${sk.displayName}: 시전자 기본 공격력만큼 피해 — 이 적의 BasicAttackDamage를 고칩니다.`;
+    if (sharedEdit && users > 1) {
+      const b = document.createElement("span");
+      b.className = "pattern-dmg-shared";
+      b.textContent = `공유 ${users}`;
+      td.appendChild(b);
+    }
+    return td;
+  }
+
+  function buildPatternDetailTable(steps, enemy) {
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
     const showBC = steps.some((st) => st.paramB || st.paramC);
-    ["Step", "해석", "Action", "Condition", "ParamA", "Tile(Skill)", "Telegraph", ...(showBC ? ["ParamB", "ParamC"] : []), "성공→", "실패→"].forEach((h) => {
+    ["Step", "해석", "Action", "Condition", "ParamA", "Tile(Skill)", "피해", "Telegraph", ...(showBC ? ["ParamB", "ParamC"] : []), "성공→", "실패→"].forEach((h) => {
       const th = document.createElement("th");
       th.textContent = h;
       headRow.appendChild(th);
@@ -5236,6 +5301,7 @@
           tileTd.appendChild(cell);
         }
       }
+      tr.appendChild(buildPatternDamageCell(s, enemy));
       editCell("TelegraphTurns", s.telegraphTurns);
       if (showBC) { addCell(s.paramB); addCell(s.paramC); }
       addCell(s.nextOnSuccess);
