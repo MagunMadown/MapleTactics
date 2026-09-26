@@ -596,6 +596,7 @@
   .bal-upgrade { border: 1px dashed var(--border); border-radius: 8px; padding: 6px 8px; margin: -2px 0 10px; font-size: var(--fs-xs); display: grid; gap: 4px; }
   .bal-upgrade-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .bal-upgrade-k { color: var(--dim); min-width: 52px; }
+  .bal-upgrade-select { max-width: 230px; font-size: var(--fs-xs); }
   .bal-upgrade-chip { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 999px; padding: 2px 9px;
     font: inherit; cursor: pointer; }
   .bal-upgrade-chip:hover { border-color: var(--accent); color: var(--accent); }
@@ -3595,9 +3596,11 @@
   // UPGRADE_TIER_MISMATCH / BASE_SKILL_NOT_IN_JOB_CATALOG).
   const JOB_SKILL_TABLES = new Set(["WarriorSkillDefinitions", "MageSkillDefinitions", "ArcherSkillDefinitions", "ThiefSkillDefinitions", "PirateSkillDefinitions"]);
   let skillUpgradeIndex = new Map();
+  let skillConceptById = new Map();
 
   function buildUpgradeIndex(concepts) {
     const byId = new Map(concepts.map((c) => [c.skillId, c]));
+    skillConceptById = byId;
     const kids = new Map();
     concepts.forEach((c) => {
       if (!c.baseSkillId) return;
@@ -3646,33 +3649,141 @@
     renderBalanceView();
   }
 
+  // Chain edits keep the game's rule of one upgrade per skill: linking X as
+  // c's upgrade unlinks c's previous upgrade, and adopting a base unlinks that
+  // base's previous upgrade. A candidate from another tier gets its SkillTier
+  // set to base + 1 in the same step. Everything is one undo step.
+  function isAncestor(maybeAncestor, c) {
+    let cur = c;
+    for (let i = 0; i < 10 && cur && cur.baseSkillId; i++) {
+      if (cur.baseSkillId === maybeAncestor.skillId) return true;
+      cur = skillConceptById.get(cur.baseSkillId);
+    }
+    return false;
+  }
+
+  function linkUpgrade(base, child) {
+    const edits = [];
+    const notes = [];
+    const others = [...skillConceptById.values()].filter((x) => x.tableName === base.tableName && x.baseSkillId === base.skillId && x.skillId !== child.skillId);
+    others.forEach((x) => {
+      edits.push({ table: x.tableName, rowIndex: x.rowIndex, col: "BaseSkillId", value: "" });
+      notes.push(`${x.displayName}의 연결 해제`);
+    });
+    if (child.baseSkillId && child.baseSkillId !== base.skillId) {
+      const prev = skillConceptById.get(child.baseSkillId);
+      notes.push(`${prev ? prev.displayName : child.baseSkillId}은(는) 강화 없음이 됨`);
+    }
+    edits.push({ table: child.tableName, rowIndex: child.rowIndex, col: "BaseSkillId", value: base.skillId });
+    const tier = (Number(base.tier) || 0) + 1;
+    if ((Number(child.tier) || 0) !== tier) {
+      edits.push({ table: child.tableName, rowIndex: child.rowIndex, col: "SkillTier", value: String(tier) });
+      notes.push(`${child.displayName} Tier ${child.tier || "?"}→${tier}`);
+    }
+    applyCellEdits(edits);
+    flashNote(`${base.displayName} → ${child.displayName} 연결${notes.length ? " (" + notes.join(", ") + ")" : ""} — Ctrl+Z로 되돌리기`);
+  }
+
+  function unlinkUpgrades(base) {
+    const kids = [...skillConceptById.values()].filter((x) => x.tableName === base.tableName && x.baseSkillId === base.skillId);
+    if (!kids.length) return;
+    applyCellEdits(kids.map((x) => ({ table: x.tableName, rowIndex: x.rowIndex, col: "BaseSkillId", value: "" })));
+    flashNote(`${base.displayName}의 강화 연결 해제 (${kids.map((x) => x.displayName).join(", ")}) — Ctrl+Z로 되돌리기`);
+  }
+
+  function unlinkBase(c) {
+    applyCellEdits([{ table: c.tableName, rowIndex: c.rowIndex, col: "BaseSkillId", value: "" }]);
+    flashNote(`${c.displayName}의 강화 원본 연결 해제 — Ctrl+Z로 되돌리기`);
+  }
+
+  // <select> of same-job skills: the tier that fits first, the rest (tier is
+  // adjusted on pick) in a second group.
+  function buildChainSelect(c, dir, current) {
+    const sel = document.createElement("select");
+    sel.className = "vocab-select bal-upgrade-select";
+    sel.setAttribute("aria-label", dir === "up" ? `${c.displayName} 강화 스킬 선택` : `${c.displayName} 강화 원본 선택`);
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = dir === "up" ? "(강화 없음)" : "(원본 없음 — 1단계)";
+    sel.appendChild(none);
+    const myTier = Number(c.tier) || 0;
+    const wantTier = dir === "up" ? myTier + 1 : myTier - 1;
+    const pool = [...skillConceptById.values()].filter((x) => x.tableName === c.tableName && x.skillId !== c.skillId
+      && (dir === "up" ? !isAncestor(x, c) : !isAncestor(c, x)));
+    const fits = pool.filter((x) => (Number(x.tier) || 0) === wantTier);
+    const rest = pool.filter((x) => (Number(x.tier) || 0) !== wantTier);
+    const label = (x) => {
+      let t = `${x.displayName} (T${x.tier || "?"})`;
+      if (dir === "up" && x.baseSkillId && x.baseSkillId !== c.skillId) {
+        const b = skillConceptById.get(x.baseSkillId);
+        t += ` — 지금 ${b ? b.displayName : x.baseSkillId}의 강화`;
+      }
+      if (dir === "down") {
+        const taken = [...skillConceptById.values()].find((k) => k.tableName === x.tableName && k.baseSkillId === x.skillId && k.skillId !== c.skillId);
+        if (taken) t += ` — 지금 ${taken.displayName}로 강화됨`;
+      }
+      return t;
+    };
+    const group = (title, list) => {
+      if (!list.length) return;
+      const g = document.createElement("optgroup");
+      g.label = title;
+      list.sort((a, b) => a.displayName.localeCompare(b.displayName)).forEach((x) => {
+        const o = document.createElement("option");
+        o.value = x.skillId;
+        o.textContent = label(x);
+        g.appendChild(o);
+      });
+      sel.appendChild(g);
+    };
+    group(wantTier > 0 ? `Tier ${wantTier}` : "해당 Tier 없음", fits);
+    group(dir === "up" ? `다른 Tier (고르면 Tier를 ${myTier + 1}로 맞춤)` : "다른 Tier (고르면 이 스킬 Tier를 맞춤)", rest);
+    sel.value = current ? current.skillId : "";
+    sel.addEventListener("change", () => {
+      const picked = skillConceptById.get(sel.value);
+      if (dir === "up") { if (picked) linkUpgrade(c, picked); else unlinkUpgrades(c); }
+      else { if (picked) linkUpgrade(picked, c); else unlinkBase(c); }
+    });
+    return sel;
+  }
+
   function buildUpgradeLine(c) {
     const u = skillUpgradeIndex.get(c.skillId);
     if (!u) return null;
+    const editable = u.jobTable;
+    if (!editable && !u.base && !u.ups.length) return null;
     const box = document.createElement("div");
     box.className = "bal-upgrade";
-    const chip = (target, arrow) => {
+    const go = (target) => {
       const b = document.createElement("button");
       b.className = "bal-upgrade-chip";
-      b.textContent = `${arrow === "from" ? "← " : ""}${target.displayName} T${target.tier || "?"}${arrow === "to" ? " →" : ""}`;
-      b.title = `${target.skillId} 카드 보기 (검색하면 강화 계열 전체가 함께 나옵니다)`;
+      b.textContent = "보기";
+      b.title = `${target.displayName} (${target.skillId}) 카드로 이동 — 검색하면 강화 계열 전체가 함께 나옵니다`;
       b.addEventListener("click", () => focusSkill(target));
       return b;
     };
-    const row = (label, target, dir) => {
+    const row = (label, dir, target) => {
       const line = document.createElement("div");
       line.className = "bal-upgrade-row";
-      line.append(Object.assign(document.createElement("span"), { className: "bal-upgrade-k", textContent: label }), chip(target, dir));
-      const d = dir === "from" ? upgradeDelta(target, c) : upgradeDelta(c, target);
-      if (d) line.append(Object.assign(document.createElement("span"), { className: "bal-upgrade-d", textContent: d }));
+      line.appendChild(Object.assign(document.createElement("span"), { className: "bal-upgrade-k", textContent: label }));
+      if (editable) line.appendChild(buildChainSelect(c, dir, target));
+      else if (target) line.appendChild(Object.assign(document.createElement("span"), { textContent: `${target.displayName} T${target.tier || "?"}` }));
+      if (target) {
+        line.appendChild(go(target));
+        const d = dir === "down" ? upgradeDelta(target, c) : upgradeDelta(c, target);
+        if (d) line.appendChild(Object.assign(document.createElement("span"), { className: "bal-upgrade-d", textContent: d }));
+      }
       box.appendChild(line);
     };
-    if (u.base) row("강화 전", u.base, "from");
-    u.ups.forEach((up) => row("강화하면", up, "to"));
-    if (!u.base && !u.ups.length) {
-      if (!u.jobTable) return null;
+    if (u.base || (Number(c.tier) || 0) > 1) row("강화 전", "down", u.base);
+    if (u.ups.length > 1) u.ups.forEach((up) => row("강화하면", "up", up));
+    else row("강화하면", "up", u.ups[0] || null);
+    if (editable && !u.ups.length && (Number(c.tier) || 0) <= 1) {
       box.appendChild(Object.assign(document.createElement("div"), { className: "bal-upgrade-none",
-        textContent: Number(c.tier) > 1 ? "강화 원본(BaseSkillId)이 비어 있습니다" : "강화 없음 — 업그레이드 스테이지에서 이 스킬은 강화 후보로 나오지 않습니다" }));
+        textContent: "강화 없음 — 업그레이드 스테이지에서 이 스킬은 강화 후보로 나오지 않습니다" }));
+    }
+    if ((Number(c.tier) || 0) > 1 && !u.base && editable) {
+      box.appendChild(Object.assign(document.createElement("div"), { className: "bal-upgrade-issue", textContent: "⚠ Tier가 2 이상인데 강화 원본이 없습니다 — 업그레이드로는 얻을 수 없는 스킬입니다" }));
     }
     u.issues.forEach((t) => box.appendChild(Object.assign(document.createElement("div"), { className: "bal-upgrade-issue", textContent: "⚠ " + t })));
     return box;
@@ -4449,7 +4560,6 @@
     if (!buildEditableStat(moreStats, "Range", c.tableName, c.rowIndex, "Range")) addStat(moreStats, "Range", c.range || "—");
     if (JOB_SKILL_TABLES.has(c.tableName)) {
       buildEditableStat(moreStats, "Tier", c.tableName, c.rowIndex, "SkillTier");
-      buildEditableStat(moreStats, "강화 원본 (BaseSkillId)", c.tableName, c.rowIndex, "BaseSkillId");
     }
     addStat(moreStats, "Targets", c.targetCount === null ? "—" : String(c.targetCount));
     if (!buildEditableStat(moreStats, "ActionDuration", c.tableName, c.rowIndex, "ActionDuration")) {
@@ -6963,6 +7073,9 @@
         else if ((Number(cell("SkillTier")) || 0) !== (Number(baseRow[hi("SkillTier")]) || 0) + 1) {
           err("SkillTier", "UPGRADE_TIER_MISMATCH", `원본 '${baseId}'의 Tier(${baseRow[hi("SkillTier")] || "?"}) + 1이어야 합니다.`);
         }
+      }
+      if (!baseId && (Number(cell("SkillTier")) || 0) > 1) {
+        warn("BaseSkillId", "Tier 2 이상인데 강화 원본이 없습니다 — 업그레이드로도, 신규 스킬 선택(Tier 1 · 원본 없음만 후보)으로도 얻을 수 없는 스킬입니다.");
       }
       if (myId) {
         const children = rowsNow.filter((r) => (r[hi("BaseSkillId")] || "").trim() === myId).length;
