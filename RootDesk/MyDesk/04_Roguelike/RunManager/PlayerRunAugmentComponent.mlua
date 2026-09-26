@@ -3,9 +3,10 @@ script PlayerRunAugmentComponent extends Component
 
 	@TargetUserSync property integer ActiveRunSequence = 0
 	@TargetUserSync property string OwnedAugmentSnapshot = ""
+	@TargetUserSync property string SkillAugmentSnapshot = ""
 	@TargetUserSync property integer AvailableRerollCount = 0
 	@TargetUserSync property integer AugmentRevision = 0
-	property integer BaseRerollCount = 0
+	property integer BaseRerollCount = 2
 	property integer NextAcquiredOrder = 1
 	property string AppliedAugmentRewardKeys = ""
 
@@ -20,6 +21,9 @@ script PlayerRunAugmentComponent extends Component
 		-- Clears augment instances and initializes the available rerolls once for this run sequence.
 		self.ActiveRunSequence = math.max(0, runSequence)
 		self.OwnedAugmentSnapshot = ""
+		self.SkillAugmentSnapshot = ""
+		self._T.SkillUpgradeOffers = nil
+		self._T.RerollClearReceipts = {}
 		self.AvailableRerollCount = math.max(0, self.BaseRerollCount + math.max(0, math.floor(tonumber(rerollBonus) or 0)))
 		self.AugmentRevision = self.AugmentRevision + 1
 		self.NextAcquiredOrder = 1
@@ -38,6 +42,10 @@ script PlayerRunAugmentComponent extends Component
 		end
 		if self:ContainsDelimitedKey(self.AppliedAugmentRewardKeys, rewardKey) then
 			return { Success = true, Reason = "DUPLICATE_REWARD_IGNORED", AugmentId = augmentId, Revision = self.AugmentRevision }
+		end
+		local definition = _AugmentDefinitionRepositoryLogic:GetDefinition(augmentId)
+		if definition.Success and definition.ExclusiveGroup == "SKILL_AUGMENT" then
+			return { Success = false, Reason = "SKILL_BINDING_REQUIRED", AugmentId = augmentId }
 		end
 		local existing = self:FindOwnedAugment(augmentId)
 		if existing.Success == true then
@@ -116,7 +124,7 @@ script PlayerRunAugmentComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table GetSnapshot()
 		-- Returns the stable player-owned augment DTO for battle and external flow systems.
-		return { Success = true, Reason = "OK", RunSequence = self.ActiveRunSequence, OwnedAugmentSnapshot = self.OwnedAugmentSnapshot, OwnedCount = #self:GetOwnedEntries(), AvailableRerollCount = self.AvailableRerollCount, Revision = self.AugmentRevision }
+		return { Success = true, Reason = "OK", RunSequence = self.ActiveRunSequence, OwnedAugmentSnapshot = self.OwnedAugmentSnapshot, OwnedCount = #self:GetOwnedEntries(), SkillAugmentSnapshot = self.SkillAugmentSnapshot, AvailableRerollCount = self.AvailableRerollCount, Revision = self.AugmentRevision }
 	end
 
 	method boolean ContainsDelimitedKey(string snapshot, string key)
@@ -135,6 +143,50 @@ script PlayerRunAugmentComponent extends Component
 	method boolean IsSafeToken(string value)
 		-- Protects the internal augment snapshot delimiters from ambiguous identifiers.
 		return value ~= nil and value ~= "" and string.find(value, "|", 1, true) == nil and string.find(value, "~", 1, true) == nil
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method string GetSkillAugmentId(string skillId)
+		-- Reads one skill-bound augment separately from global/job passives.
+		for id, augmentId in string.gmatch(self.SkillAugmentSnapshot or "", "([^|~]+)~([^|~]+)") do
+			if id == skillId then return augmentId end
+		end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SetSkillAugment(string skillId, string augmentId, string rewardKey)
+		-- Replaces both sides of a trade-off atomically; caller validates the reward and eligibility.
+		if self.ActiveRunSequence <= 0 or not self:IsSafeToken(skillId) or not self:IsSafeToken(augmentId)
+			or not self:IsSafeToken(rewardKey) then return { Success = false, Reason = "INVALID_SKILL_AUGMENT" } end
+		if self:ContainsDelimitedKey(self.AppliedAugmentRewardKeys, rewardKey) then
+			return { Success = false, Reason = "UPGRADE_ALREADY_APPLIED" }
+		end
+		local kept = {}
+		for id, owned in string.gmatch(self.SkillAugmentSnapshot or "", "([^|~]+)~([^|~]+)") do
+			if id ~= skillId then table.insert(kept, id .. "~" .. owned) end
+		end
+		table.insert(kept, skillId .. "~" .. augmentId)
+		self.SkillAugmentSnapshot = table.concat(kept, "|")
+		self.AppliedAugmentRewardKeys = self:AppendDelimitedKey(self.AppliedAugmentRewardKeys, rewardKey)
+		self.AugmentRevision = self.AugmentRevision + 1
+		self._T.SkillUpgradeOffers = nil
+		log("[SkillAugment] applied skill=" .. skillId .. " augment=" .. augmentId .. " reward=" .. rewardKey)
+		return { Success = true, Reason = "APPLIED" }
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method void GrantClearReroll(string completionKey, boolean boss)
+		if self.ActiveRunSequence <= 0 or not self:IsSafeToken(completionKey) then return end
+		self._T.RerollClearReceipts = self._T.RerollClearReceipts or {}
+		if self._T.RerollClearReceipts[completionKey] then return end
+		-- Record misses too: repeated result callbacks must not reroll the 20% reward.
+		self._T.RerollClearReceipts[completionKey] = true
+		local awarded = boss or _UtilLogic:RandomIntegerRange(1, 100) <= 20
+		if awarded then self.AvailableRerollCount = self.AvailableRerollCount + 1 end
+		log("[AugmentReroll] clear=" .. completionKey .. " boss=" .. tostring(boss) .. " awarded=" .. tostring(awarded) .. " count=" .. self.AvailableRerollCount)
 	end
 
 end

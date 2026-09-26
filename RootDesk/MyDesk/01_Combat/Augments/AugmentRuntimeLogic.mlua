@@ -95,4 +95,139 @@ script AugmentRuntimeLogic
 		return result
 	end
 
+
+	@ExecSpace("ServerOnly")
+	method boolean CanBindSkillAugment(table definition, table steps, table augment)
+		-- Heal is the explicit repeatable charge exception; other augments require a terminal upgrade.
+		local effect = augment.Effects[1]
+		if effect == nil or not _AugmentContentValidatorLogic:IsSkillModifierValid(effect) then return false end
+		if definition.CostType == "HEAL_CHARGE" then return effect.ParamA == "HEAL_CHARGES" or effect.ParamA == "HEAL_UNLIMITED" end
+		if effect.ParamA == "HEAL_CHARGES" or effect.ParamA == "HEAL_UNLIMITED" then return false end
+		if definition.SkillTier <= 1 or (definition.BaseSkillId or "") == "" then return false end
+		local nextUpgrade = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(definition.RequiredJobTag, definition.SkillId)
+		if nextUpgrade.Reason ~= "NO_UPGRADE_PATH" then return false end
+		if effect.ParamA == "HIDDEN_COOLDOWN" then return definition.CooldownTurns > 1 end
+		local damage = nil
+		local damageCount = 0
+		local heal = nil
+		local control = false
+		local moving = false
+		for _, step in ipairs(steps) do
+			if step.EffectType == "DAMAGE" then damage = step; damageCount = damageCount + 1 end
+			if step.EffectType == "HEAL" then heal = step end
+			if step.EffectType == "STUN" or step.EffectType == "FREEZE" then control = true end
+			if step.EffectType == "MOVE_SELF" then moving = true end
+		end
+		local kind = effect.ParamA
+		local cooldown = tonumber(effect.ParamB)
+		if cooldown < 0 and (control or definition.CooldownTurns <= 1) then return false end
+		if damageCount ~= 1 or damage.ParameterA == "SOURCE_BASIC_ATTACK" then return false end
+		local hits = _DamageEffectExecutorLogic:GetHitCount(damage)
+		local single = damage.TargetSelector == "PRIMARY_TARGET" or definition.TargetingType == "FRONT_CELL" or definition.TargetingType == "FIRST_ENEMY_FORWARD"
+		if kind == "QUICK" then
+			return hits == 1 and damage.Value - effect.Amount >= 1
+		elseif kind == "POWER" or kind == "PRECISE" then
+			if hits ~= 1 or not single then return false end
+			return true
+		elseif kind == "VOLLEY" then
+			return hits >= 2 and (definition.WeaponType == "BOW" or definition.WeaponType == "CROSSBOW" or definition.WeaponType == "CLAW" or definition.WeaponType == "GUN")
+		elseif kind == "COMPACT" then
+			return hits >= 3 and hits - effect.Amount >= 2
+		elseif kind == "AREA" then
+			return hits == 1 and not single
+		elseif kind == "RANGE" then
+			if moving or definition.Range >= 6 or (definition.ProjectileRuid or "") == "" then return false end
+			if definition.TargetingType == "FIRST_ENEMY_FORWARD" or definition.TargetingType == "FIRST_ENEMY_PIERCE" then return true end
+			if definition.TargetingType ~= "RANGE_OFFSETS" then return false end
+			for offset in string.gmatch(definition.TargetOffsets or "", "([^|]+)") do
+				if (tonumber(offset) or 0) <= 0 then return false end
+			end
+			return (definition.TargetOffsets or "") ~= ""
+		end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetBoundSkillAugment(Entity player, string skillId)
+		-- Ignores stale run state and keeps enemy/global skill definitions immutable.
+		if not isvalid(player) then return "" end
+		local run = player:GetComponent("script.PlayerRunStateComponent")
+		local state = player:GetComponent("script.PlayerRunAugmentComponent")
+		if run == nil or state == nil or run.RunSequence <= 0 or state.ActiveRunSequence ~= run.RunSequence then return "" end
+		return state:GetSkillAugmentId(skillId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildSkillBundle(Entity player, table definition, table steps, string overrideAugmentId)
+		-- Copies authored data before applying exactly one skill-bound trade-off.
+		local result = { Definition = {}, EffectSteps = {}, AugmentId = "", AugmentName = "", Description = "" }
+		for key, value in pairs(definition) do result.Definition[key] = value end
+		for _, step in ipairs(steps) do
+			local copied = {}
+			for key, value in pairs(step) do copied[key] = value end
+			table.insert(result.EffectSteps, copied)
+		end
+		local augmentId = overrideAugmentId
+		if augmentId == "" then augmentId = self:GetBoundSkillAugment(player, definition.SkillId) end
+		if augmentId == "" or augmentId == "NONE" then return result end
+		local checked = _AugmentContentValidatorLogic:ValidateById(augmentId)
+		if not checked.Success or not self:CanBindSkillAugment(definition, steps, checked.Data) then return result end
+		local effect = checked.Data.Effects[1]
+		local kind = effect.ParamA
+		if kind == "HEAL_CHARGES" then
+			-- Preview metadata only. This reward never changes the combat skill or binds a modifier.
+			if overrideAugmentId ~= "" then
+				result.AugmentId = augmentId
+				result.AugmentName = checked.Data.Definition.NameKey
+				result.Description = checked.Data.Definition.DescriptionKey
+			end
+			return result
+		end
+		local amount = effect.Amount
+		local tuned = result.Definition
+		tuned.CooldownTurns = math.max(1, definition.CooldownTurns + tonumber(effect.ParamB))
+		if kind == "HEAL_UNLIMITED" then tuned.CostValue = 0 end
+		for _, step in ipairs(result.EffectSteps) do
+			if step.EffectType == "DAMAGE" then
+				if kind == "POWER" or kind == "AREA" then step.Value = step.Value + amount end
+				if kind == "QUICK" then step.Value = step.Value - amount end
+				if kind == "VOLLEY" or kind == "COMPACT" then
+					local delta = kind == "VOLLEY" and amount or -amount
+					step.ParameterB = tostring(_DamageEffectExecutorLogic:GetHitCount(step) + delta)
+					if (tuned.ProjectileRuid or "") ~= "" then tuned.ProjectileCount = tonumber(step.ParameterB) end
+				end
+			end
+		end
+		if kind == "RANGE" then
+			tuned.Range = math.min(6, tuned.Range + amount)
+			if tuned.TargetingType == "RANGE_OFFSETS" then
+				local offsets = {}
+				local last = 0
+				for token in string.gmatch(tuned.TargetOffsets, "([^|]+)") do
+					table.insert(offsets, token)
+					last = math.max(last, tonumber(token) or 0)
+				end
+				for index = 1, amount do table.insert(offsets, tostring(last + index)) end
+				tuned.TargetOffsets = table.concat(offsets, "|")
+			end
+		end
+		result.AugmentId = augmentId
+		result.AugmentName = checked.Data.Definition.NameKey
+		result.Description = checked.Data.Definition.DescriptionKey
+		tuned.AugmentCooldownFloor = 1
+		tuned.SkillAugmentId = augmentId
+		tuned.SkillAugmentName = result.AugmentName
+		tuned.SkillAugmentDescription = result.Description
+		tuned.PreciseRefund = kind == "PRECISE" and amount or 0
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEffectiveSkillBundle(Entity player, string skillId)
+		-- One validated read model serves execution, queue duration and skill HUD.
+		local checked = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if not checked.Success then return checked end
+		return { Success = true, Data = self:BuildSkillBundle(player, checked.Data.Definition, checked.Data.EffectSteps, "") }
+	end
+
 end
