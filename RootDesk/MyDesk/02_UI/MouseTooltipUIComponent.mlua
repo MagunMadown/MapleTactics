@@ -7,7 +7,7 @@ script MouseTooltipUIComponent extends Component
 	property number CursorGap = 24
 	property number EdgeMargin = 18
 	property number MinWidth = 160
-	property number MaxWidth = 480
+	property number MaxWidth = 560
 	property number MinHeight = 64
 	property number MaxHeight = 220
 	property number HorizontalPadding = 40
@@ -17,6 +17,9 @@ script MouseTooltipUIComponent extends Component
 	property string ActiveOwnerKey = ""
 	property boolean IsShowing = false
 	property Vector2 LastCursorPosition = Vector2(-100000, -100000)
+	property integer SkillHoverRequestId = 0
+	property string HoverSkillId = ""
+	property Entity HoverMap = nil
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
@@ -44,7 +47,10 @@ script MouseTooltipUIComponent extends Component
 			log_warning("[MouseTooltip] show rejected owner=" .. ownerKey .. " reason=BINDING_MISSING")
 			return
 		end
+		if ownerKey ~= "battle_skill" and self.HoverSkillId ~= "" then self:ForceHide() end
 		self.ActiveOwnerKey = ownerKey
+		self.TooltipText.HorizontalAlignment = TextHorizontalAlignmentOption.Left
+		self.TooltipText.VerticalAlignment = TextVerticalAlignmentOption.Top
 		self.TooltipText.Text = text
 		self:ResizeToText(text)
 		-- Hot Reload can preserve Visible=false from an older ForceHide implementation.
@@ -76,6 +82,10 @@ script MouseTooltipUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void ForceHide()
+		self.HoverSkillId = ""
+		self.HoverMap = nil
+		self.SkillHoverRequestId = self.SkillHoverRequestId + 1
+		self:ApplySkillRange(nil, {})
 		if isvalid(self.TooltipPanel) then self.TooltipPanel.Enable = false end
 		self.ActiveOwnerKey = ""
 		self.IsShowing = false
@@ -89,21 +99,78 @@ script MouseTooltipUIComponent extends Component
 		local maxLineUnits = 0
 		local lineCount = 0
 		local startIndex = 1
-		local textLength = string.len(text)
+		local measuredText, _ = string.gsub(text, "<[^>]+>", "")
+		local textLength = string.len(measuredText)
 		while startIndex <= textLength + 1 do
-			local newlineIndex, newlineEndIndex = string.find(text, "\n", startIndex, true)
+			local newlineIndex, newlineEndIndex = string.find(measuredText, "\n", startIndex, true)
 			local lineEnd = textLength
 			if newlineIndex ~= nil then lineEnd = newlineIndex - 1 end
-			local lineText = string.sub(text, startIndex, lineEnd)
+			local lineText = string.sub(measuredText, startIndex, lineEnd)
 			maxLineUnits = math.max(maxLineUnits, self:GetTextWidthUnits(lineText))
 			lineCount = lineCount + 1
 			if newlineIndex == nil then break end
 			startIndex = newlineEndIndex + 1
 		end
 		local panelWidth = math.max(self.MinWidth, math.min(self.MaxWidth, maxLineUnits * self.GlyphWidth + self.HorizontalPadding))
-		local panelHeight = math.max(self.MinHeight, math.min(self.MaxHeight, lineCount * self.LineHeight + self.VerticalPadding))
+		local preferred = self.TooltipText:GetPreferredHeight(text, math.max(1, panelWidth - self.HorizontalPadding))
+		local panelHeight = math.max(self.MinHeight, math.min(900, math.max(preferred, lineCount * self.LineHeight) + self.VerticalPadding))
 		self.TooltipPanel.UITransformComponent.RectSize = Vector2(panelWidth, panelHeight)
+		-- Center the inset text box so wrapped lines share one left edge and equal padding.
+		local textTransform = self.TooltipTextEntity.UITransformComponent
+		textTransform.AlignmentOption = AlignmentType.Center
+		textTransform.AnchorsMin = Vector2(0.5, 0.5)
+		textTransform.AnchorsMax = Vector2(0.5, 0.5)
+		textTransform.Pivot = Vector2(0.5, 0.5)
+		textTransform.anchoredPosition = Vector2.zero
 		self.TooltipTextEntity.UITransformComponent.RectSize = Vector2(math.max(1, panelWidth - self.HorizontalPadding), math.max(1, panelHeight - self.VerticalPadding))
+	end
+
+	@ExecSpace("ClientOnly")
+	method string ColorizeSkillText(string text)
+		local lines = {}
+		for line in string.gmatch(text or "", "[^\n]+") do
+			local cleanedText, replacementCount = string.gsub(line, "^%s*(.-)%s*$", "%1")
+			line = cleanedText
+			local color = "E0E8EE"
+			if #lines == 0 then color = "63E4D6"
+			elseif string.find(line, "연계", 1, true) == 1 then color = "FFC76B"
+			elseif string.find(line, "증강:", 1, true) == 1 then color = "C4A4FF"
+			elseif string.find(line, "회복:", 1, true) == 1 then color = "88E3AB" end
+			table.insert(lines, "<color=#" .. color .. ">" .. line .. "</color>")
+		end
+		return table.concat(lines, "\n")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestSkillHover(Entity map, string skillId, string signature)
+		if self.HoverMap == map and self.HoverSkillId == skillId and self._T.SkillHoverSignature == signature then return end
+		local session = map:GetComponent("script.BattleSessionComponent")
+		if session == nil then return end
+		self:ApplySkillRange(nil, {})
+		self.HoverMap = map
+		self.HoverSkillId = skillId
+		self._T.SkillHoverSignature = signature
+		self.SkillHoverRequestId = self.SkillHoverRequestId + 1
+		self.ActiveOwnerKey = "battle_skill"
+		self.IsShowing = false
+		if isvalid(self.TooltipPanel) then self.TooltipPanel.Enable = false end
+		session:RequestSkillHover(skillId, self.SkillHoverRequestId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReceiveSkillHover(Entity map, string skillId, integer requestId, string text, table cells)
+		if self.ActiveOwnerKey ~= "battle_skill" or self.HoverMap ~= map or self.HoverSkillId ~= skillId or self.SkillHoverRequestId ~= requestId then return end
+		self.TooltipText.IsRichText = true
+		self:Show("battle_skill", self:ColorizeSkillText(text))
+		self:ApplySkillRange(map, cells)
+		log("[SkillHover] shown skill=" .. skillId .. " cells=" .. tostring(#cells))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplySkillRange(Entity map, table cells)
+		local root = _EntityService:GetEntityByPath("/ui/BattlePlatformHUD")
+		local platforms = isvalid(root) and root:GetComponent("script.BattlePlatformUIComponent") or nil
+		if platforms ~= nil then platforms:SetSkillRange(map, cells) end
 	end
 
 	@ExecSpace("ClientOnly")

@@ -9,6 +9,7 @@ script EnemyIntentHudComponent extends Component
 	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
 	property string BasicAttackIconRuid = "ad4304f4d5654158aca63c8c142d5035"
 	property string RangedAttackIconRuid = "ee74ad8d798c489d957a32cf3c375490"
+	property string PoisonMistRuid = "5d133a20758e4ccc97b46354cd7911c1"
 	property boolean UseStaticSkillThumbnail = true
 	property number QueueOffsetX = 0
 	property number QueueOffsetY = 112
@@ -89,6 +90,7 @@ script EnemyIntentHudComponent extends Component
 		self._T.ActiveEnemyIds = {}
 		self._T.ActiveTelegraphKeys = {}
 		local cellOccupantCounts = {}
+		local attackCells = {}
 		for _, intent in ipairs(uiState.EnemyIntents or {}) do
 			local enemyEntity = self:ResolveEnemyEntity(currentMap, intent)
 			if isvalid(enemyEntity) then
@@ -106,13 +108,13 @@ script EnemyIntentHudComponent extends Component
 			if intent.IsAttackReady == true or intent.TelegraphKind == "BOSS_LANDING" or intent.TelegraphKind == "CHARGE_LINE" or intent.TelegraphKind == "SKILL_AREA" or intent.CastState == "CASTING" then
 				for cellToken in string.gmatch(intent.TargetCells or "", "([^|]+)") do
 					local cellIndex = math.floor(tonumber(cellToken) or -1)
-					if cellIndex >= 0 then
-						cellOccupantCounts[cellIndex] = (cellOccupantCounts[cellIndex] or 0) + 1
-						self:ShowTelegraph(session, intent, cellIndex, cellOccupantCounts[cellIndex])
+					if cellIndex >= 0 and session:IsValidCell(cellIndex) then
+						attackCells[cellIndex] = true
 					end
 				end
 			end
 		end
+		self:UpdateAttackPlatforms(currentMap, attackCells)
 		-- Persistent poison reuses floor markers without appearing as a fake monster in the queue.
 		for cellToken in string.gmatch(uiState.PoisonMistCells or "", "([^|]+)") do
 			local cellIndex = tonumber(cellToken)
@@ -124,6 +126,15 @@ script EnemyIntentHudComponent extends Component
 		self:HideInactiveEnemyViews()
 		self:HideInactiveTelegraphs()
 		self.LastPlanRevision = uiState.EnemyPlanRevision or self.LastPlanRevision
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateAttackPlatforms(Entity map, table cells)
+		-- Share authoritative telegraph cells with both world and UI platform renderers.
+		local root = _EntityService:GetEntityByPath("/ui/BattlePlatformHUD")
+		if not isvalid(root) then return end
+		local platforms = root:GetComponent("script.BattlePlatformUIComponent")
+		if platforms ~= nil then platforms:SetEnemyRange(map, cells) end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -344,6 +355,14 @@ script EnemyIntentHudComponent extends Component
 				return
 			end
 			view = self.TelegraphTemplate:Clone("Telegraph_" .. intent.UnitId .. "_" .. tostring(cellIndex))
+			if intent.UnitId == "poison_mist_area" and view.SpriteGUIRendererComponent ~= nil then
+				-- Set once: polling must not restart the looping cloud animation.
+				local sprite = view.SpriteGUIRendererComponent
+				sprite.ImageRUID = DataRef(self.PoisonMistRuid)
+				sprite.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+				sprite.Type = ImageType.Simple
+				sprite.Color = Color(1, 1, 1, 0.65)
+			end
 			self._T.TelegraphViews[key] = view
 		end
 		view.Enable = true
@@ -361,6 +380,15 @@ script EnemyIntentHudComponent extends Component
 		local screenPosition = _UILogic:WorldToScreenPosition(cellPosition)
 		local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
 		view.UITransformComponent.anchoredPosition = Vector2(uiPosition.x + (overlapIndex - 1) * 8, uiPosition.y - 42)
+		if intent.UnitId == "poison_mist_area" then
+			-- Fit the hazard to one board cell at the current camera zoom.
+			local nextScreen = _UILogic:WorldToScreenPosition(Vector2(cellPosition.x + session.CellSpacing, cellPosition.y))
+			local nextUI = _UILogic:ScreenToUIPosition(nextScreen)
+			local width = math.max(1, math.abs(nextUI.x - uiPosition.x))
+			local height = width * 0.75
+			view.UITransformComponent.RectSize = Vector2(width, height)
+			view.UITransformComponent.anchoredPosition = Vector2(uiPosition.x, uiPosition.y + height * 0.5)
+		end
 		local label = view:GetChildByName("Label")
 		if isvalid(label) and label.TextGUIRendererComponent ~= nil then
 			-- The floor color/shape is the telegraph. Text is intentionally hidden to keep the board readable.
@@ -422,6 +450,7 @@ script EnemyIntentHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void HideAllViews(string reason)
 		-- Disable both overlay trees and log each hide transition only once.
+		self:UpdateAttackPlatforms(nil, {})
 		if self._T.LastHideReason ~= reason then
 			log("[EnemyIntentHUD] hidden reason=" .. reason)
 			self._T.LastHideReason = reason
@@ -442,6 +471,8 @@ script EnemyIntentHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		-- Remove attack highlights together with their intent views.
+		self:UpdateAttackPlatforms(nil, {})
 		for _, record in pairs(self._T.EnemyViews or {}) do
 			if record ~= nil and isvalid(record.View) then
 				record.View:Destroy()
