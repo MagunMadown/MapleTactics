@@ -2144,6 +2144,12 @@ script BattleSessionComponent extends Component
 		self:RecordRunConsumedPlayerTurn()
 		local playerUnit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
 		if playerUnit ~= nil then playerUnit:AdvanceNegativeStatusTurns() end
+		if self.BoardState ~= nil then
+			for _, enemyEntity in ipairs(self.BoardState:CollectLivingEnemies()) do
+				local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
+				if enemy ~= nil and enemy.BurnTurns > 0 then enemy:AdvanceNegativeStatusTurns() end
+			end
+		end
 		self:AdvancePoisonMists()
 		if self.BattleResult ~= "" then return end
 		local handoffDelay = self.PlayerToEnemyBeatDuration
@@ -7014,6 +7020,13 @@ script BattleSessionComponent extends Component
 			amount = math.min(amount, targetUnit.AttackDamageCap)
 		end
 		-- BattleUnit retains the full UtilityGuardActive block, including zero damage.
+		if targetUnit.EnemyDefinitionId == "region_04_iron_hog" then
+			amount = math.max(0, amount - 1)
+			if amount == 0 then
+				return { Success = true, Reason = "IRON_ARMOR_BLOCKED", AppliedAmount = 0,
+					HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ExactLethal = false }
+			end
+		end
 		local damageResult = targetUnit:ApplyDamage(amount)
 		result.ExactLethal = damageResult.Success == true and damageResult.ReachedZero == true and amount == damageResult.HpBefore
 		if damageResult.Success == false then
@@ -7035,6 +7048,14 @@ script BattleSessionComponent extends Component
 		result.HpAfter = damageResult.HpAfter
 		result.AppliedAmount = damageResult.AppliedAmount
 		if damageResult.AppliedAmount > 0 then
+			if sourceUnit.EnemyDefinitionId == "region_04_fire_boar" and not isFixedDamage and not damageResult.ReachedZero then
+				-- A guarded/zero-damage hit cannot ignite; preserve stronger indefinite player burns.
+				if targetUnit.BurnDamage <= 0 or targetUnit.BurnTurns > 0 then
+					targetUnit.BurnTurns = 1
+				end
+				targetUnit.BurnDamage = math.max(1, targetUnit.BurnDamage)
+				targetUnit.BurnSourceUnitId = sourceUnitId
+			end
 			self:PresentDamageNumber(sourceEntity, targetEntity, damageResult.AppliedAmount)
 			self:PlayAcceptedEnemyImpact(sourceEntity, targetEntity, attackId)
 		end
@@ -7421,7 +7442,7 @@ script BattleSessionComponent extends Component
 		if not isvalid(commanderEntity) or commanderEntity.CurrentMap ~= self.Entity then return false end
 		local commander = commanderEntity:GetComponent("script.BattleUnitComponent")
 		if commander == nil or self:FindUnitEntity(commander.UnitId) ~= commanderEntity then return false end
-		if soldier.EnemyDefinitionId ~= "region_04_skeleton_soldier" or soldier.Team ~= "Enemy"
+		if (soldier.EnemyDefinitionId ~= "region_04_skeleton_soldier" and soldier.EnemyDefinitionId ~= "region_04_skeleton_officer") or soldier.Team ~= "Enemy"
 			or commander.EnemyDefinitionId ~= "region_04_commander_skeleton" or not commander.IsBoss or commander.Team ~= "Enemy" then
 			return false
 		end
@@ -7445,6 +7466,13 @@ script BattleSessionComponent extends Component
 		local commander = commanderEntity:GetComponent("script.BattleUnitComponent")
 		local soldierCell = soldier.CellIndex
 		local commanderCell = commander.CellIndex
+		-- Leave a commander-owned hazard at the departure cell before committing the swap.
+		local poisonCells = {}
+		for cell = commanderCell - 1, commanderCell + 1 do
+			if self:IsValidCell(cell) then table.insert(poisonCells, cell) end
+		end
+		self:ExecuteEnemySpecialEffect({ SourceUnitId = commander.UnitId, TargetCellIndices = poisonCells },
+			{ EffectType = "POISON_MIST", Value = 1, ParameterA = "2" })
 		-- Commit both cells before publishing movement so observers never see an occupied destination.
 		soldier:ApplyCellChange(commanderCell)
 		commander:ApplyCellChange(soldierCell)
@@ -7669,59 +7697,62 @@ script BattleSessionComponent extends Component
 			result.Reason = facingResult.Reason
 			return result
 		end
-		self:PlayEnemyMovementActionMotion(unitEntity, unitId, definition)
-
+		self:ApplyFacing(unitEntity, unit.Facing)
 		local traversed = {}
-		for _, nextCell in ipairs(committedCells) do
-			if nextCell ~= unit.CellIndex + direction then
-				result.StopReason = "COMMITTED_PATH_ENDED"
-				break
-			end
-			if self:IsValidCell(nextCell) == false then
-				result.StopReason = "OUT_OF_BOUNDS"
-				break
-			end
-
-			local occupantEntity = self.BoardState ~= nil and self.BoardState:FindAtCell(nextCell, unitId) or nil
-			if isvalid(occupantEntity) then
-				local occupantUnit = occupantEntity:GetComponent("script.BattleUnitComponent")
-				result.StopReason = "CELL_OCCUPIED"
-				if occupantUnit ~= nil and occupantUnit.IsDead == false and (occupantUnit.Team ~= unit.Team or unit.Team == "Enemy") then
-					self:BeginSkillEffectPresentation(unitId, definition)
-					local damage = self:ResolveSkillDamageImpact(unitId, skillId, occupantUnit.UnitId, nextCell, unit.BasicAttackDamage)
-					result.Success = damage.Success == true
-					result.Hit = damage.Hit == true
-					result.TargetUnitId = occupantUnit.UnitId
-					result.DamageAmount = damage.DamageAmount or 0
-					result.Reason = damage.Success == true and "CHARGE_HIT" or damage.Reason
-					result.ToCell = unit.CellIndex
-					result.TraversedCells = table.concat(traversed, "|")
-					log("[EnemyCharge] resolved unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " path=" .. result.TraversedCells .. " target=" .. result.TargetUnitId .. " damage=" .. result.DamageAmount .. " success=" .. tostring(result.Success))
-					return result
+		local targetCell = -1
+		for index, nextCell in ipairs(committedCells) do
+			if index > math.max(1, definition.Range) or nextCell ~= result.ToCell + direction then break end
+			local occupant = self.BoardState ~= nil and self.BoardState:FindAtCell(nextCell, unitId) or nil
+			if isvalid(occupant) then
+				local other = occupant:GetComponent("script.BattleUnitComponent")
+				if other ~= nil and not other.IsDead and (other.Team ~= unit.Team or unit.Team == "Enemy") then
+					result.TargetUnitId = other.UnitId
+					targetCell = nextCell
 				end
 				break
 			end
-
-			local move = self:TryMove(unitId, direction)
-			if move.Success == false then
-				if move.Reason == "OUT_OF_BOUNDS" or move.Reason == "CELL_OCCUPIED" then
-					result.StopReason = move.Reason
-					break
-				end
-				result.Reason = move.Reason
-				result.ToCell = unit.CellIndex
-				result.TraversedCells = table.concat(traversed, "|")
-				return result
-			end
-			table.insert(traversed, tostring(unit.CellIndex))
-			result.MovedCellCount = result.MovedCellCount + 1
-			result.ToCell = unit.CellIndex
+			result.ToCell = nextCell
+			table.insert(traversed, tostring(nextCell))
 		end
-
-		result.Success = true
-		result.Reason = result.StopReason == "CELL_OCCUPIED" and "CHARGE_BLOCKED" or "CHARGE_ENDPOINT_REACHED"
+		local changed = unit:ApplyCellChange(result.ToCell)
+		if changed.Success == false then result.Reason = changed.Reason; return result end
+		result.MovedCellCount = #traversed
 		result.TraversedCells = table.concat(traversed, "|")
-		log("[EnemyCharge] resolved unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " path=" .. result.TraversedCells .. " target=- damage=0 stop=" .. result.StopReason)
+		result.PresentationStarted = self:StartEnemyGridMovePresentation(unitEntity, result.FromCell, result.ToCell)
+		if result.PresentationStarted then
+			local movement = self._T.enemyGridMove
+			movement.IsCharge = true
+			movement.Height = 0
+			movement.Duration = math.max(0.22, tonumber(definition.ActionDuration) or 0.35)
+			if result.FromCell == result.ToCell and targetCell >= 0 then
+				movement.TargetPosition = Vector2(movement.StartPosition.x + direction * self.CellSpacing * 0.25, movement.StartPosition.y)
+			end
+			movement.Impact = function()
+				if result.TargetUnitId ~= "" and not unit.IsDead then
+					self:BeginSkillEffectPresentation(unitId, definition)
+					self:ResolveSkillDamageImpact(unitId, skillId, result.TargetUnitId, targetCell, unit.BasicAttackDamage)
+				end
+			end
+			local presentation = unitEntity:GetComponent("script.BattleUnitPresentationComponent")
+			if presentation ~= nil then
+				presentation:StopMoveHopVisual("CHARGE_STARTED")
+				presentation:PlaySpriteMotion(unitId, definition.CasterMotionRuid, 3, movement.Duration, unit.Facing, false)
+			end
+		else
+			result.Reason = "CHARGE_PRESENTATION_UNAVAILABLE"
+			unit:ApplyCellChange(result.FromCell)
+			return result
+		end
+		if result.FromCell ~= result.ToCell then
+			local moved = UnitMovedEvent()
+			moved.UnitId = unitId
+			moved.FromCell = result.FromCell
+			moved.ToCell = result.ToCell
+			self.Entity:SendEvent(moved)
+		end
+		result.Success = true
+		result.Reason = "CHARGE_STARTED"
+		log("[EnemyCharge] started unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " target=" .. result.TargetUnitId)
 		return result
 	end
 
@@ -8367,6 +8398,13 @@ script BattleSessionComponent extends Component
 				presentation:StopMoveHopVisual(reason)
 			end
 		end
+		if movement.IsCharge and isvalid(targetEntity) then
+			local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+			if presentation ~= nil then presentation:StopSpriteMotion(movement.UnitId, reason) end
+			if (reason == "VISUAL_COMPLETE" or reason == "FALLBACK_COMPLETE") and movement.Impact ~= nil and self.BattleResult == "" then
+				movement.Impact()
+			end
+		end
 		log("[EnemyMoveVisual] completed unit=" .. movement.UnitId .. " from=" .. tostring(movement.FromCell)
 			.. " to=" .. tostring(movement.ToCell) .. " reason=" .. reason .. " completeAction=" .. tostring(completeAction))
 		if completeAction and movement.CompleteAction ~= nil and self.BattleResult == ""
@@ -8626,7 +8664,11 @@ script BattleSessionComponent extends Component
 		local items = {}
 		local seen = {}
 		for entry in string.gmatch(snapshot, "([^|]+)") do
-			local itemId, amount = string.match(entry, "^([^~]+)~([^~]+)$")
+			local captures = { string.match(entry, "^([^~]+)~([^~]+)$") }
+
+			local itemId = captures[1]
+
+			local amount = captures[2]
 			local quantity = tonumber(amount) or 0
 			if itemId ~= nil and quantity > 0 and not seen[itemId] then
 				seen[itemId] = true
@@ -8841,6 +8883,7 @@ script BattleSessionComponent extends Component
 					applied = true
 				elseif kind == "BURN" then
 					unit.BurnDamage = math.max(unit.BurnDamage, step.Value)
+					unit.BurnTurns = 0
 					unit.BurnSourceUnitId = context.SourceUnitId
 					applied = true
 				elseif kind == "PUSH_ADJACENT" and math.abs(unit.CellIndex - source.CellIndex) == 1 then
@@ -8863,6 +8906,10 @@ script BattleSessionComponent extends Component
 		local entity = self:FindUnitEntity(targetUnitId)
 		local unit = isvalid(entity) and entity:GetComponent("script.BattleUnitComponent") or nil
 		if unit == nil or unit.IsDead then return { Success = false, Reason = "TARGET_DEAD" } end
+		if unit.EnemyDefinitionId == "region_04_iron_hog" then
+			amount = math.max(0, amount - 1)
+			if amount == 0 then return { Success = true, Reason = "IRON_ARMOR_BLOCKED", AppliedAmount = 0 } end
+		end
 		local result = unit:ApplyDamage(amount)
 		if result.Success and result.AppliedAmount > 0 then
 			self:PresentDamageNumber(self:FindUnitEntity(sourceUnitId), entity, result.AppliedAmount)
@@ -8939,7 +8986,8 @@ script BattleSessionComponent extends Component
 				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition("heal")
 				if definition.Success then icon = definition.IconRuid or "" end
 			elseif rewardType == "CURRENCY" and refId == "gold" then name = "메소" end
-			name = string.gsub(name, "[|~]", " ")
+			local cleanedText, replacementCount = string.gsub(name, "[|~]", " ")
+			name = cleanedText
 			entry = { Type = rewardType, Id = refId, Amount = 0, Name = name, Icon = icon }
 			self._T.RoundRewardEntries[key] = entry
 		end
