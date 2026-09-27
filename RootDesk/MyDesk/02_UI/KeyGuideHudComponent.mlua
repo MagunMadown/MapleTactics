@@ -11,7 +11,14 @@ script KeyGuideHudComponent extends Component
         -- Resolve the initial context while keeping the controller active outside hidden panels.
         self.CurrentContext = ""
         self.RefreshRemaining = 0.2
+        self._T.KeyCapSignature = ""
+        self._T.RowCaps = {}
+        self._T.AlternativeOrigins = {}
+        -- Authored pieces reused to build key caps: a key-cap container with a Glyph sprite, and a small label.
+        self._T.CapPrototype = _EntityService:GetEntityByPath("/ui/KeyGuideHUD/BattlePanel/Row1/Key/Icon1")
+        self._T.LabelPrototype = _EntityService:GetEntityByPath("/ui/KeyGuideHUD/BattlePanel/Row5/Key/Range")
         log("[KeyGuideHUD] begin")
+        self:RefreshKeyCaps()
         self:RefreshContext()
     end
 
@@ -21,16 +28,216 @@ script KeyGuideHudComponent extends Component
         self.RefreshRemaining = self.RefreshRemaining - delta
         if self.RefreshRemaining > 0 then return end
         self.RefreshRemaining = 0.2
+        self:RefreshKeyCaps()
         self:RefreshContext()
     end
 
     @ExecSpace("ClientOnly")
+    method table GetRowSpecs()
+        -- Which settings actions each guide row shows. Key 1 of every action comes first, then key 2.
+        -- Row 8 (right-click a queued item) is mouse-only and keeps its authored content.
+        return {
+            { Panel = "LobbyPanel", Row = "Row1", Actions = { "MOVE_LEFT", "MOVE_RIGHT" } },
+            { Panel = "LobbyPanel", Row = "Row2", Actions = { "TURN" } },
+            { Panel = "LobbyPanel", Row = "Row3", Actions = { "INTERACT" } },
+            { Panel = "BattlePanel", Row = "Row1", Actions = { "MOVE_LEFT", "MOVE_RIGHT" } },
+            { Panel = "BattlePanel", Row = "Row2", Actions = { "TURN" } },
+            { Panel = "BattlePanel", Row = "Row3", Actions = { "UTILITY" } },
+            { Panel = "BattlePanel", Row = "Row4", Actions = { "EXECUTE" } },
+            { Panel = "BattlePanel", Row = "Row5", Slots = true },
+            { Panel = "BattlePanel", Row = "Row6", Actions = { "CLEAR_QUEUE" } },
+            { Panel = "BattlePanel", Row = "Row7", Actions = { "USE_POTION" } }
+        }
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshKeyCaps()
+        -- Rebuilds the key caps only when a binding changed.
+        local parts = {}
+        for _, action in ipairs(_GameSettingsLogic:GetActions()) do
+            table.insert(parts, tostring(_GameSettingsLogic:GetBinding(action.Id, 1)) .. "," .. tostring(_GameSettingsLogic:GetBinding(action.Id, 2)))
+        end
+        local signature = table.concat(parts, ";")
+        if signature == self._T.KeyCapSignature then return end
+        if isvalid(self._T.CapPrototype) == false or isvalid(self._T.LabelPrototype) == false then return end
+        self._T.KeyCapSignature = signature
+        for _, spec in ipairs(self:GetRowSpecs()) do
+            self:LayoutRow(spec)
+        end
+        log("[KeyGuideHUD] key caps rebuilt")
+    end
+
+    @ExecSpace("ClientOnly")
+    method table GetRowItems(table spec)
+        -- Key codes to draw in order; "~" draws the authored range mark between the first and last slot keys.
+        local items = {}
+        if spec.Slots == true then
+            local codes = {}
+            local consecutive = true
+            for slot = 1, 6 do
+                codes[slot] = _GameSettingsLogic:GetBinding("SLOT_" .. tostring(slot), 1)
+                if codes[slot] == 0 or (slot > 1 and codes[slot] ~= codes[slot - 1] + 1) then consecutive = false end
+            end
+            if consecutive then return { codes[1], "~", codes[6] } end
+            for slot = 1, 6 do
+                if codes[slot] ~= 0 then table.insert(items, codes[slot]) end
+            end
+            return items
+        end
+        for slot = 1, 2 do
+            for _, actionId in ipairs(spec.Actions) do
+                local code = _GameSettingsLogic:GetBinding(actionId, slot)
+                if code ~= 0 then table.insert(items, code) end
+            end
+        end
+        return items
+    end
+
+    @ExecSpace("ClientOnly")
+    method void LayoutRow(table spec)
+        local panel = spec.Panel == "LobbyPanel" and self.LobbyPanel or self.BattlePanel
+        local row = isvalid(panel) and panel:GetChildByName(spec.Row) or nil
+        local key = isvalid(row) and row:GetChildByName("Key") or nil
+        if isvalid(key) == false then return end
+        local rowId = spec.Panel .. "/" .. spec.Row
+        for _, cap in ipairs(self._T.RowCaps[rowId] or {}) do
+            if isvalid(cap) then cap:Destroy() end
+        end
+        local caps = {}
+        self._T.RowCaps[rowId] = caps
+        -- The authored key images are replaced by caps built from the current bindings.
+        for _, child in ipairs(key.Children:ToTable()) do
+            child.Enable = false
+        end
+        local range = key:GetChildByName("Range")
+        local pieces = {}
+        local naturalWidth = 0
+        for _, item in ipairs(self:GetRowItems(spec)) do
+            local piece = nil
+            local gap = 6
+            if item == "~" then
+                if isvalid(range) then
+                    range.Enable = true
+                    piece = range
+                    gap = 4
+                end
+            else
+                piece = self:CreateCap(key, item, spec.Row .. "Cap" .. tostring(#caps + 1))
+                if isvalid(piece) then table.insert(caps, piece) end
+            end
+            if isvalid(piece) then
+                table.insert(pieces, { Entity = piece, Gap = gap })
+                naturalWidth = naturalWidth + piece.UITransformComponent.RectSize.x + gap
+            end
+        end
+        naturalWidth = math.max(0, naturalWidth - 6)
+        -- Shrink the whole row of caps when it would run into the description on the right.
+        local altExtent = self:PlaceAlternative(row, rowId, 0)
+        local description = row:GetChildByName("Description")
+        local available = row.UITransformComponent.RectSize.x - 10 - altExtent
+        if isvalid(description) then available = available - description.UITransformComponent.RectSize.x end
+        local scale = 1
+        if naturalWidth > 0 and naturalWidth > available then scale = math.max(0.6, available / naturalWidth) end
+        local x = 0
+        for _, piece in ipairs(pieces) do
+            local transform = piece.Entity.UITransformComponent
+            transform.UIScale = Vector3(scale, scale, 1)
+            transform.anchoredPosition = Vector2(x, 0)
+            x = x + (transform.RectSize.x + piece.Gap) * scale
+        end
+        local keyWidth = math.max(0, x - 6 * scale)
+        key.UITransformComponent.RectSize = Vector2(keyWidth, key.UITransformComponent.RectSize.y)
+        self:PlaceAlternative(row, rowId, keyWidth)
+    end
+
+    @ExecSpace("ClientOnly")
+    method number PlaceAlternative(Entity row, string rowId, number keyWidth)
+        -- Mouse hints (and their "필드" scope) follow the key caps; the authored arrow images are now caps of their own.
+        -- Returns the width the mouse hints take after the caps (0 when the row has none).
+        local alternative = row:GetChildByName("Alternative")
+        if isvalid(alternative) == false then return 0 end
+        local origin = self._T.AlternativeOrigins[rowId]
+        if origin == nil then
+            origin = { Y = alternative.UITransformComponent.anchoredPosition.y, Children = {}, HasArrow = false }
+            for _, child in ipairs(alternative.Children:ToTable()) do
+                origin.Children[child.Name] = child.UITransformComponent.anchoredPosition
+                if child.Name == "Left" or child.Name == "Right" or child.Name == "Up" or child.Name == "Down" then origin.HasArrow = true end
+            end
+            self._T.AlternativeOrigins[rowId] = origin
+        end
+        alternative.UITransformComponent.anchoredPosition = Vector2(keyWidth + 10, origin.Y)
+        local extent = 0
+        for _, child in ipairs(alternative.Children:ToTable()) do
+            local isArrow = child.Name == "Left" or child.Name == "Right" or child.Name == "Up" or child.Name == "Down"
+            child.Enable = isArrow == false
+            local position = origin.Children[child.Name]
+            if isArrow == false and position ~= nil then
+                local shift = origin.HasArrow and 46 or 0
+                child.UITransformComponent.anchoredPosition = Vector2(position.x - shift, position.y)
+                extent = math.max(extent, position.x - shift + child.UITransformComponent.RectSize.x + 10)
+            end
+        end
+        return extent
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity CreateCap(Entity parent, integer code, string name)
+        -- Uses the authored key image when one exists, otherwise draws a cream cap with a dark border and the key name.
+        local cap = self._T.CapPrototype:Clone(name)
+        if isvalid(cap) == false then return nil end
+        cap:AttachTo(parent)
+        cap.Enable = true
+        local glyph = cap:GetChildByName("Glyph")
+        if isvalid(glyph) == false then return cap end
+        glyph.Enable = true
+        local image = _GameSettingsLogic:GetKeyGlyph(code)
+        if image ~= nil then
+            glyph.SpriteGUIRendererComponent.ImageRUID = DataRef(image.Ruid)
+            glyph.UITransformComponent.RectSize = Vector2(image.Width, image.Height)
+            cap.UITransformComponent.RectSize = Vector2(image.Width, image.Height)
+            return cap
+        end
+        -- Border and fill first so the label, attached last, draws on top of both.
+        local border = glyph.SpriteGUIRendererComponent
+        border.ImageRUID = DataRef("2860136c06ab075439721c027de365af")
+        border.Type = ImageType.Sliced
+        border.PreserveSprite = PreserveSpriteType.None
+        border.Color = Color(0.12, 0.1, 0.09, 1)
+        glyph.UITransformComponent.anchoredPosition = Vector2(0, 0)
+        local fill = glyph:Clone("Fill")
+        fill:AttachTo(cap)
+        fill.SpriteGUIRendererComponent.Color = Color(0.97, 0.94, 0.86, 1)
+        local label = self._T.LabelPrototype:Clone("Label")
+        label:AttachTo(cap)
+        label.Enable = true
+        local text = label.TextGUIRendererComponent
+        text.Text = _GameSettingsLogic:GetKeyShortLabel(code)
+        text.FontSize = string.len(text.Text) <= 1 and 22 or 18
+        text.FontStyle = FontStyleType.Bold
+        text.FontColor = Color(0.08, 0.07, 0.06, 1)
+        text.HorizontalAlignment = TextHorizontalAlignmentOption.Center
+        local width = math.max(36, math.ceil(text:GetPreferredWidth(text.Text)) + 14)
+        local height = 36
+        cap.UITransformComponent.RectSize = Vector2(width, height)
+        glyph.UITransformComponent.RectSize = Vector2(width, height)
+        fill.UITransformComponent.RectSize = Vector2(width - 4, height - 4)
+        local transform = label.UITransformComponent
+        transform.AnchorsMin = Vector2(0.5, 0.5)
+        transform.AnchorsMax = Vector2(0.5, 0.5)
+        transform.Pivot = Vector2(0.5, 0.5)
+        transform.anchoredPosition = Vector2(0, 0)
+        transform.RectSize = Vector2(width, height)
+        return cap
+    end
+
+    @ExecSpace("ClientOnly")
     method void RefreshContext()
-        -- Show only the guide supported by the local player's current map on PC.
+        -- Show only the guide supported by the local player's current map on PC, unless the player turned it off.
         if not isvalid(self.LobbyPanel) or not isvalid(self.BattlePanel) then return end
         local context = "HIDDEN"
         local player = _UserService.LocalPlayer
-        if Environment:IsPCPlatform() and isvalid(player) and isvalid(player.CurrentMap) then
+        -- The player can switch the guide off in the settings window's game tab.
+        if _GameSettingsLogic.ShowKeyGuide and Environment:IsPCPlatform() and isvalid(player) and isvalid(player.CurrentMap) then
             local map = player.CurrentMap
             local battle = map:GetComponent("script.BattleSessionComponent")
             local lobby = map:GetComponent("script.LobbyGridMovementComponent")
