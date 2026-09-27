@@ -132,10 +132,10 @@ Maker 직접 실행은 MapId 기준 공통 테스트 진입기를 사용한다. 
 |---|---|---:|---|
 | `region_kerning_stage_01` | `kerning_city_battle` | 3 | 스티지 2 → 주니어 레이스 2 → 레이스 1 |
 | `region_kerning_stage_02` | `kerning_city_battle` | 3 | 주니어 레이스 2 → 레이스 2 → 셰이드 2 |
-| `region_kerning_stage_03` | `kerning_city_boss` | 4 | 주니어 네키 2 → 리게이터 2 → 크로코 2 → 늪진흙괴물 1 (`UnitY=0.12`) |
+| `region_kerning_stage_03` | `kerning_city_battle2` | 4 | 주니어 네키 2 → 리게이터 2 → 크로코 2 → 늪진흙괴물 1 (`UnitY=0.12`) |
 | `region_kerning_stage_04` | `kerning_city_boss` | 1 | 보스 다일 1, `StageType=BOSS`. 다일이 패턴 마지막에 늪진흙괴물 3마리 소환 |
 
-2-1·2-2는 `kerning_city_battle`에서 스티지~셰이드, 2-3·2-4는 늪지대 `kerning_city_boss`에서 주니어 네키~늪진흙괴물(+2-4 다일)을 사용한다.
+2-1·2-2는 `kerning_city_battle`에서 스티지~셰이드, 2-3은 보스맵을 복제한 늪지대 `kerning_city_battle2`(월드 발판 7개), 2-4는 `kerning_city_boss`(월드 발판 9개)에서 주니어 네키~늪진흙괴물(+2-4 다일)을 사용한다. 두 맵은 `BattlePlatforms` 레이어의 `BattleCell1~N` 링을 쓰며 x 위치는 Stage의 `CellStartX`/`CellSpacing`으로 런타임에 배치된다.
 일반 3단계는 Wave당 최대 2마리씩 `TURN_LIMIT`(3턴)으로 나누어 투입하고 `MaxConcurrent=2`로
 동시 등장을 제한한다. 마릿수를 정확히 맞춰야 하므로 가중치 혼합 Pool 대신 **적 1종만 담은
 전용 Pool**(`region_kerning_stirge_pool` / `_jr_wraith_pool` / `_wraith_pool` / `_ligator_pool` / `_shade_pool` / `_jr_necki_pool` / `_croco_pool` / `_swamp_mud_pool`)을 Wave별로 지정한다.
