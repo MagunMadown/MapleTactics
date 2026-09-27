@@ -306,6 +306,7 @@ script BattleSessionComponent extends Component
 	@EventSender("Service", "InputService")
 	handler HandleMoveKeyDown(KeyDownEvent event)
 		-- Converts one movement/turn/attack key press into a server-authoritative request.
+		if _RunRelicInventoryUILogic.IsOpen then return end
 		local player = _UserService.LocalPlayer
 		if isvalid(player) == false or player.CurrentMap ~= self.Entity then
 			return
@@ -401,7 +402,7 @@ script BattleSessionComponent extends Component
 	handler HandleUnitMovedEvent(UnitMovedEvent event)
 		-- Confirms that subscribers can observe a completed logical move, then ticks venom poison on the mover.
 		log("[BattleEvent] UnitMovedEvent received unit=" .. event.UnitId .. " from=" .. event.FromCell .. " to=" .. event.ToCell)
-		self:ApplyPoisonOnMove(event.UnitId)
+		if event.FromCell ~= event.ToCell then self:ApplyPoisonOnMove(event.UnitId) end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1861,6 +1862,8 @@ script BattleSessionComponent extends Component
 		self.UtilitySkillIconRuid = definition.IconRuid
 		self.UtilityMaxCooldown = definition.CooldownTurns
 		runtime:StartCooldown(definition.SkillId, definition.CooldownTurns)
+		local relicEffects = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relicEffects ~= nil then relicEffects:OnSkillCompleted(definition.SkillId) end
 		self.UtilityRemainingCooldown = runtime:GetRemainingCooldown(definition.SkillId)
 		self:PublishTurnStateSnapshot("UTILITY_EXECUTED")
 		local duration = math.max(0.1, definition.ActionDuration) / self:GetSkillSpeedMultiplier()
@@ -6032,6 +6035,16 @@ script BattleSessionComponent extends Component
 		end
 		contextResult.Data.PreviousSkillWasAttack = sourceUnit.PreviousSkillWasAttack
 		sourceUnit.PreviousSkillWasAttack = isAttack
+		local relics = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if isAttack and sourceUnit.Team == "Player" and relics ~= nil and self:HasSkillProjectile(definition) then
+			local extraStars = relics:GetExtraShurikenCount(definition)
+			contextResult.Data.ExtraShurikenCount = extraStars
+			if extraStars > 0 then
+				definition.ProjectileCount = math.max(1, definition.ProjectileCount or 1) + extraStars
+				definition.ProjectileInterval = math.max(0.06, definition.ProjectileInterval or 0)
+				log("[RunRelic] extra shuriken skill=" .. skillId .. " added=" .. extraStars)
+			end
+		end
 		if isAttack and sourceUnit.NextArrowCount > 0 then
 			contextResult.Data.ExtraArrowCount = sourceUnit.NextArrowCount
 			if not self:HasSkillProjectile(definition) then
@@ -6216,9 +6229,10 @@ script BattleSessionComponent extends Component
 			if distance > 0 and distance <= definition.Range then table.insert(cells, cell) end
 		end
 		table.sort(cells, function(a, b) return (a - sourceCell) * direction < (b - sourceCell) * direction end)
-		local authoredCount = _DamageEffectExecutorLogic:GetHitCount(effectStep)
+		local authoredCount = _DamageEffectExecutorLogic:GetHitCount(effectStep) + (context.ExtraShurikenCount or 0)
 		local shotCount = authoredCount + (context.ExtraArrowCount or 0)
 		context.ExtraArrowCount = 0
+		context.ExtraShurikenCount = 0
 		local speed = self:GetSkillProjectileSpeed(definition)
 		local interval = math.max(0, definition.ProjectileInterval or 0)
 		local launchDelay = self:GetProjectileLaunchDelay(definition)
@@ -6250,6 +6264,7 @@ script BattleSessionComponent extends Component
 				end
 			end
 			if aimCell == nil then
+				_SkillExecutionLogic:NotifyRelicSkillCompleted(context)
 				_SkillExecutionLogic:ConsumeNextAttackBonusOnHit(context, results)
 				return
 			end
@@ -6265,11 +6280,15 @@ script BattleSessionComponent extends Component
 				if not stillActive() then return end
 				if targetId ~= "" then
 					local damage = shotIndex > authoredCount and 1 or effectStep.Value
+					local previousContext = self._T.RelicDamageContext
+					self._T.RelicDamageContext = context
 					local hit = self:ResolveSkillDamageImpact(sourceId, context.SkillId, targetId, aimCell, damage)
+					self._T.RelicDamageContext = previousContext
 					table.insert(results, { EffectType = "DAMAGE", Hit = hit.Hit == true })
 					log("[SkillProjectile] star impact skill=" .. context.SkillId .. " shot=" .. shotIndex .. " target=" .. targetId .. " reason=" .. tostring(hit.Reason))
 				end
 				if shotIndex >= shotCount or self.BattleResult ~= "" then
+					_SkillExecutionLogic:NotifyRelicSkillCompleted(context)
 					_SkillExecutionLogic:ConsumeNextAttackBonusOnHit(context, results)
 				elseif stillActive() then
 					self.ImpactTimerId = _TimerService:SetTimerOnce(fireNext, math.max(0.001, interval))
@@ -6986,6 +7005,7 @@ script BattleSessionComponent extends Component
 			return result
 		end
 
+		local poisonBefore = targetUnit.PoisonDamage
 		local attackerEffects = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		local defenderEffects = targetEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		local attackerRun = sourceEntity:GetComponent("script.PlayerRunStateComponent")
@@ -6995,6 +7015,10 @@ script BattleSessionComponent extends Component
 		if isFixedDamage == false and sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
 			and attackerRun ~= nil and attackerEffects.ActiveRunSequence == attackerRun.RunSequence then
 			amount = amount + attackerEffects.AttackBonus
+			amount = amount + attackerEffects:GetDirectDamageBonus(sourceUnit, targetUnit)
+		end
+		if attackId == self.PushCollisionAttackId and sourceUnit.Team == "Player" and targetUnit.Team == "Enemy" and attackerEffects ~= nil then
+			amount = amount + attackerEffects:GetSpecialEffectValue("COLLISION_DAMAGE")
 		end
 		-- Self buffs live on the units, so both teams share one rule. The next-attack bonus is only read here;
 		-- SkillExecutionLogic spends it once the whole skill has landed so area skills boost every target.
@@ -7027,7 +7051,17 @@ script BattleSessionComponent extends Component
 					HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ExactLethal = false }
 			end
 		end
-		local damageResult = targetUnit:ApplyDamage(amount)
+		if not ignoresBuffs and defenderEffects ~= nil then
+			amount = math.max(0, amount - defenderEffects:GetFrontDamageReduction(sourceUnit, targetUnit))
+		end
+		local damageResult
+		if amount == 0 then
+			damageResult = { Success = true, Reason = "RELIC_FRONT_GUARDED", AppliedAmount = 0,
+				HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ReachedZero = false }
+			log("[RunRelic] front guard blocked source=" .. sourceUnitId .. " target=" .. targetUnitId)
+		else
+			damageResult = targetUnit:ApplyDamage(amount)
+		end
 		result.ExactLethal = damageResult.Success == true and damageResult.ReachedZero == true and amount == damageResult.HpBefore
 		if damageResult.Success == false then
 			result.Reason = damageResult.Reason
@@ -7072,9 +7106,27 @@ script BattleSessionComponent extends Component
 		if targetUnit.Team == "Player" then
 			self:RefreshPlayerHpSnapshot("DAMAGE_APPLIED")
 		end
-		-- An attacker under Venom poisons every enemy its attacks land on; fixed hits (collisions, poison) never do.
+		-- Consume only poison present before this hit. The skill context prevents repeated explosions.
+		local context = self._T.RelicDamageContext
+		if not isFixedDamage and damageResult.AppliedAmount > 0 and poisonBefore > 0 and attackerEffects ~= nil
+			and context ~= nil and context.SourceUnitId == sourceUnitId and context.SkillId == attackId
+			and attackerEffects:GetSpecialEffectValue("POISON_DETONATION") > 0
+			and string.find("|" .. (context.Definition.SkillTags or "") .. "|", "|fire|", 1, true) ~= nil then
+			context.RelicDetonatedTargets = context.RelicDetonatedTargets or {}
+			if not context.RelicDetonatedTargets[targetUnitId] then
+				context.RelicDetonatedTargets[targetUnitId] = true
+				targetUnit.PoisonDamage = 0
+				targetUnit.PoisonSourceUnitId = ""
+				targetUnit.PoisonMarkerRuid = ""
+				if not damageResult.ReachedZero then
+					self:ApplyStatusDamage(targetUnitId, poisonBefore * attackerEffects:GetSpecialEffectValue("POISON_DETONATION"), sourceUnitId, "RELIC_POISON_DETONATION")
+					result.HpAfter = targetUnit.CurrentHp
+				end
+			end
+		end
+		-- New venom is applied after detonation and remains for a later skill use.
 		if isFixedDamage == false and sourceUnit.VenomBuffAmount > 0 and targetUnit.Team == "Enemy"
-			and damageResult.ReachedZero ~= true then
+			and damageResult.ReachedZero ~= true and not targetUnit.IsDead and targetUnit.CurrentHp > 0 then
 			targetUnit:ApplyPoison(sourceUnitId, sourceUnit.VenomBuffAmount, sourceUnit.VenomMarkerRuid)
 		end
 		if damageResult.ReachedZero == true then

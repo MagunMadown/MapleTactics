@@ -1,0 +1,220 @@
+@Logic
+script RunRelicInventoryUILogic extends Logic
+
+	property boolean IsOpen = false
+	property boolean IsReady = false
+	property string LastSnapshot = ""
+	property string SelectedRelicId = ""
+	property table Items = {}
+	property table Totals = {}
+	property string HoveredRowId = ""
+	property table Bindings = {}
+	property table RowBindings = {}
+	property Entity Root = nil
+	property Entity Modal = nil
+	property Entity OpenButton = nil
+	property any Grid = nil
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Watch the owner snapshot so map transitions and shop changes need no battle session.
+		if not self:EnsureUI() then return end
+		if self.IsOpen then self:UpdateTooltipPosition() end
+		local player = _UserService.LocalPlayer
+		local run = isvalid(player) and player:GetComponent("script.PlayerRunStateComponent") or nil
+		local effects = isvalid(player) and player:GetComponent("script.PlayerRunRelicEffectComponent") or nil
+		local session = isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap:GetComponent("script.BattleSessionComponent") or nil
+		local available = run ~= nil and effects ~= nil and run.RunState == "Active" and effects.ActiveRunSequence == run.RunSequence
+			and (session == nil or not session.SkillTestMode)
+		self.OpenButton.Enable = available
+		if not available then self:SetOpen(false); self.LastSnapshot = ""; return end
+		if effects.InventoryDisplaySnapshot ~= self.LastSnapshot then
+			self.LastSnapshot = effects.InventoryDisplaySnapshot
+			self.Items = {}
+			self.Totals = {}
+			if self.LastSnapshot ~= "" then
+				local data = _HttpService:JSONDecode(self.LastSnapshot)
+				if data ~= nil and data.RunSequence == run.RunSequence then self.Items = data.Items or {}; self.Totals = data.Totals or {} end
+			end
+			self:RefreshList()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureUI()
+		-- Bind the authored native GridView once, keeping the global UI root active.
+		if self.IsReady then return true end
+		self.Root = _EntityService:GetEntityByPath("/ui/RunRelicInventoryUI")
+		if not isvalid(self.Root) then return false end
+		self.Modal = self.Root:GetChildByName("Modal")
+		self.OpenButton = self.Root:GetChildByName("Open")
+		local window = self.Modal:GetChildByName("Window")
+		self.Grid = window:GetChildByName("List").GridViewComponent
+		self.Grid.OnRefresh = function(index, row) self:RefreshRow(index, row) end
+		self.Grid.OnClear = function(index, row) self:ClearRow(row) end
+		self.Grid.ItemEntity = window:GetChildByName("Row")
+		self:BindButton(self.OpenButton, function() self:SetOpen(not self.IsOpen) end)
+		self:BindButton(window:GetChildByName("Close"), function() self:SetOpen(false) end)
+		self.Modal.Enable = false
+		self.IsReady = true
+		self:RefreshList()
+		log("[RelicInventory] ready")
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindButton(Entity entity, any callback)
+		-- Retain the connection handle for world-session cleanup.
+		table.insert(self.Bindings, { Entity = entity, Handle = entity:ConnectEvent(ButtonClickEvent, callback) })
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearRow(Entity row)
+		-- Recycled rows must release the previous selection callback.
+		local binding = self.RowBindings[row.Id]
+		if binding ~= nil then
+			row:DisconnectEvent(ButtonClickEvent, binding.Handle)
+			row:DisconnectEvent(UITouchEnterEvent, binding.Enter)
+			row:DisconnectEvent(UITouchExitEvent, binding.Leave)
+		end
+		if self.HoveredRowId == row.Id then self:HideTooltip() end
+		self.RowBindings[row.Id] = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshRow(integer index, Entity row)
+		-- GridView indexes are zero based; data and selection use stable relic IDs.
+		self:ClearRow(row)
+		local item = self.Items[index + 1]
+		if item == nil then return end
+		-- Reapply selection when GridView reuses a row; match the existing blue skill highlight.
+		row.SpriteGUIRendererComponent.OutlineColor = Color(0.45, 0.85, 1.0, 0.9)
+		row.SpriteGUIRendererComponent.Outline = item.RelicId == self.SelectedRelicId
+		row:GetChildByName("Icon").SpriteGUIRendererComponent.ImageRUID = DataRef(item.IconImageRUID)
+		local handle = row:ConnectEvent(ButtonClickEvent, function() self.SelectedRelicId = item.RelicId; self:RefreshDetail() end)
+		local enter = row:ConnectEvent(UITouchEnterEvent, function() self:ShowTooltip(row, item) end)
+		local leave = row:ConnectEvent(UITouchExitEvent, function() if self.HoveredRowId == row.Id then self:HideTooltip() end end)
+		self.RowBindings[row.Id] = { Entity = row, RelicId = item.RelicId, Handle = handle, Enter = enter, Leave = leave }
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetJobLabel(string jobId)
+		-- Display the same restriction used by server-side acquisition and effects.
+		local jobs = { warrior = "전사 전용", mage = "마법사 전용", archer = "궁수 전용", thief = "도적 전용", pirate = "해적 전용" }
+		return jobs[jobId] or "공용"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshList()
+		-- TotalCount is the whole inventory, independent of the compact HUD slot count.
+		self:HideTooltip()
+		local window = self.Modal:GetChildByName("Window")
+		window:GetChildByName("Empty").Enable = #self.Items == 0
+		window:GetChildByName("Count").TextGUIRendererComponent.Text = "보유 유물 " .. tostring(#self.Items) .. "개 · 소지 제한 없음 · I / Esc로 닫기"
+		self.Grid.TotalCount = #self.Items
+		self:RefreshDetail()
+		self.Grid:Refresh(false, true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshDetail()
+		-- Keep selection after updates, or select the first surviving relic after removal.
+		local selected = nil
+		for _, item in ipairs(self.Items) do if item.RelicId == self.SelectedRelicId then selected = item end end
+		if selected == nil then selected = self.Items[1] end
+		self.SelectedRelicId = selected ~= nil and selected.RelicId or ""
+		local detail = self.Modal:GetChildByName("Window"):GetChildByName("Detail")
+		detail:GetChildByName("Stats").TextGUIRendererComponent.Text = "공격력  +" .. tostring(self.Totals.Attack or 0)
+			.. "\n최대 체력  +" .. tostring(self.Totals.MaxHp or 0) .. "\n방어력  +" .. tostring(self.Totals.Defense or 0)
+		local text = detail:GetChildByName("Effects"):GetChildByName("Text")
+		local description = self.Totals.SpecialDescription or ""
+		if description == "" then description = "적용 중인 특수 효과가 없습니다." end
+		text.TextGUIRendererComponent.Text = description
+		text.UITransformComponent.RectSize = Vector2(430, math.max(290, text.TextGUIRendererComponent:GetPreferredHeight(description, 430) + 20))
+		-- Selection only repaints existing rows; rebuilding the grid here can move recycled cells.
+		for _, binding in pairs(self.RowBindings) do
+			if isvalid(binding.Entity) then
+				binding.Entity.SpriteGUIRendererComponent.Outline = binding.RelicId == self.SelectedRelicId
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowTooltip(Entity row, table item)
+		-- Hover uses the bound item without rebuilding or reordering the grid.
+		if not self.IsOpen then return end
+		self.HoveredRowId = row.Id
+		local tooltip = self.Modal:GetChildByName("Tooltip")
+		tooltip:GetChildByName("Name").TextGUIRendererComponent.Text = item.DisplayName
+		local description = self:GetJobLabel(item.RequiredJobId) .. "\n\n" .. item.EffectDescription
+		if item.RemainingUses >= 0 then description = description .. "\n남은 방어 횟수: " .. tostring(item.RemainingUses) end
+		if not item.Active then description = description .. "\n현재 직업에는 적용되지 않습니다." end
+		local body = tooltip:GetChildByName("Description")
+		body.TextGUIRendererComponent.Text = description
+		local height = math.max(150, body.TextGUIRendererComponent:GetPreferredHeight(description, 430) + 16)
+		body.UITransformComponent.RectSize = Vector2(430, height)
+		tooltip.UITransformComponent.RectSize = Vector2(470, height + 100)
+		tooltip.Enable = true
+		self:UpdateTooltipPosition()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateTooltipPosition()
+		-- Keep the hover card inside the screen and offset from the pointer.
+		local tooltip = self.Modal:GetChildByName("Tooltip")
+		if not tooltip.Enable then return end
+		local cursor = _UILogic:ScreenToUIPosition(_InputService:GetCursorPosition())
+		local height = tooltip.UITransformComponent.RectSize.y
+		local x = cursor.x + 24
+		if x + 470 > 948 then x = cursor.x - 494 end
+		tooltip.UITransformComponent.anchoredPosition = Vector2(math.max(-948, x), math.max(-528 + height, math.min(528, cursor.y - 16)))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideTooltip()
+		-- Remove stale hover content on close, inventory changes, and row recycling.
+		self.HoveredRowId = ""
+		if isvalid(self.Modal) then self.Modal:GetChildByName("Tooltip").Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetOpen(boolean open)
+		-- Modal input focus never pauses timers or running combat presentation.
+		if not self.IsReady then return end
+		if open and not self.OpenButton.Enable then return end
+		if not open then self:HideTooltip() end
+		self.IsOpen = open
+		-- Keep the HUD button behind the world map; raise only while the inventory is open.
+		self.Root.UIGroupComponent.GroupOrder = open and 24 or 12
+		self.Modal.Enable = open
+		if open then self:RefreshList() end
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleInventoryKey(KeyDownEvent event)
+		-- The skill-test map keeps its existing I-key panel.
+		if not self.IsReady or not self.OpenButton.Enable then return end
+		if event.key == KeyboardKey.I then self:SetOpen(not self.IsOpen)
+		elseif event.key == KeyboardKey.Escape then self:SetOpen(false) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Release persistent UI callbacks when the world session ends.
+		for _, binding in ipairs(self.Bindings) do
+			if isvalid(binding.Entity) then binding.Entity:DisconnectEvent(ButtonClickEvent, binding.Handle) end
+		end
+		if self.Grid ~= nil then self.Grid.OnRefresh = nil; self.Grid.OnClear = nil end
+		for _, binding in pairs(self.RowBindings) do
+			if isvalid(binding.Entity) then
+				binding.Entity:DisconnectEvent(ButtonClickEvent, binding.Handle)
+				binding.Entity:DisconnectEvent(UITouchEnterEvent, binding.Enter)
+				binding.Entity:DisconnectEvent(UITouchExitEvent, binding.Leave)
+			end
+		end
+		self.Bindings = {}
+		self.RowBindings = {}
+	end
+
+end
