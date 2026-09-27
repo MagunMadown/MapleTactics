@@ -10,6 +10,8 @@ script LobbyCodexLogic
 	property string DiscoveryFilterPanelPath = "/ui/CollectionUI/CollectionWindow/CollectionFrame/CollectionContent/DiscoveryFilterPanel"
 	property string MonsterRegionPanelPath = "/ui/CollectionUI/CollectionWindow/CollectionFrame/CollectionContent/MonsterRegionPanel"
 	property string SelectedMonsterRegion = ""
+	property table RegionButtons = {}
+	property table RegionHandles = {}
 	property string MonsterGalleryPanelPath = "/ui/CollectionUI/CollectionWindow/CollectionFrame/CollectionContent/MonsterGalleryPanel"
 	property integer MonsterPage = 1
 	property string CategoryNavigationPath = "/ui/CollectionUI/CollectionWindow/CollectionFrame/CollectionContent/CategoryNavigation"
@@ -86,6 +88,7 @@ script LobbyCodexLogic
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
 		-- Disconnects persistent button and cloned-slot events owned by this Logic.
+		self:ClearRegionButtons()
 		self:ClearEntrySlots()
 		for _, binding in pairs(self.EventHandles) do
 			if binding ~= nil and isvalid(binding.Entity) and binding.Handle ~= nil then
@@ -153,7 +156,32 @@ script LobbyCodexLogic
 	@ExecSpace("ClientOnly")
 	method void RefreshCodex()
 		-- Rebuilds the active category without changing tab or filter selection.
+		local selected = self.Entries[self.SelectedIndex]
+		local selectedId = selected ~= nil and selected.Id or ""
+		local page = self.MonsterPage
+		if self.ActiveCategory == "Monster" then self:RefreshMonsterNavigation() end
 		self:RefreshList()
+		self.MonsterPage = math.max(1, math.min(page, math.max(1, math.ceil(#self.Entries / 10))))
+		self.SelectedIndex = #self.Entries > 0 and (self.MonsterPage - 1) * 10 + 1 or 0
+		for i, entry in ipairs(self.Entries) do
+			if entry.Id == selectedId then self.SelectedIndex = i self.MonsterPage = math.ceil(i / 10) break end
+		end
+		self:RefreshDetailPanel()
+	end
+
+	@ExecSpace("Server")
+	method void RequestCatalogRefresh(string category)
+		-- Re-read authoritative content on opening/tab changes; bound work across all callers.
+		if isvalid(_UserService:GetUserEntityByUserId(senderUserId)) == false then return end
+		if category ~= "Monster" and category ~= "Skill" and category ~= "Item" then return end
+		self._T.NextCatalogRefresh = self._T.NextCatalogRefresh or {}
+		local now = _UtilLogic.ElapsedSeconds
+		if now < (self._T.NextCatalogRefresh[category] or 0) then return end
+		self._T.NextCatalogRefresh[category] = now + 2
+		if category == "Monster" then _MonsterCodexProvider:RefreshFromSource()
+		elseif category == "Skill" then _SkillCodexProvider:RefreshFromRepository()
+		else _ItemCodexProvider:RefreshFromSource() end
+		log("[LobbyCodex] source refreshed category=" .. category)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -172,6 +200,7 @@ script LobbyCodexLogic
 		self:RefreshFilters()
 		self:RefreshSkillJobTabs()
 		self:RefreshList()
+		self:RequestCatalogRefresh(category)
 		log("[LobbyCodex] tab changed category=" .. category)
 	end
 
@@ -228,7 +257,7 @@ script LobbyCodexLogic
 					or (self.ActiveFilter == "Normal" and entry.IsBoss ~= true)
 					or (self.ActiveFilter == "Boss" and entry.IsBoss == true))
 			end
-			local includeJob = self.ActiveCategory ~= "Skill" or entry.RequiredJobTag == self.SelectedSkillJob
+			local includeJob = self.ActiveCategory ~= "Skill" or entry.RequiredJobTag == self.SelectedSkillJob or entry.RequiredJobTag == ""
 			if includeDiscovery and includeJob then
 				table.insert(self.Entries, entry)
 			end
@@ -413,15 +442,22 @@ script LobbyCodexLogic
 	@ExecSpace("ClientOnly")
 	method void RefreshMonsterNavigation()
 		-- Lays out one expanded region beneath its continent and keeps selection visible.
+		self:EnsureRegionButtons()
 		local root = self.MonsterRegionPanelPath
 		self:SetPathText(self.MonsterGalleryPanelPath .. "/Continent", "빅토리아 아일랜드")
 		self:SetPathText(root .. "/Victoria/AllRegions", (self.MonsterContinentExpanded and "- " or "+ ") .. "빅토리아 아일랜드")
 		self:RefreshButtonState(root .. "/Victoria/AllRegions", self.SelectedMonsterRegion == "")
 		self:SetPathEnabled(root .. "/Victoria/Regions", self.MonsterContinentExpanded)
 		local label = "전체 지역"
-		local y = 112
-		for index, region in ipairs(_MonsterCodexProvider:GetVictoriaRegions()) do
-			local path = root .. "/Victoria/Regions/Region" .. tostring(index)
+		local regions = _MonsterCodexProvider:GetVictoriaRegions()
+		local known = self.SelectedMonsterRegion == ""
+		for _, region in ipairs(regions) do if region.Id == self.SelectedMonsterRegion then known = true end end
+		if not known then self.SelectedMonsterRegion = "" self.ExpandedMonsterRegion = "" self.ActiveFilter = "All" end
+		local height = #regions * 54 + (self.ExpandedMonsterRegion ~= "" and 88 or 0)
+		self:ApplyRectLayout(root .. "/Victoria/Regions/Content", 0, 0, 238, math.max(418, height))
+		local y = math.max(418, height) / 2 - 24
+		for index, region in ipairs(regions) do
+			local path = root .. "/Victoria/Regions/Content/Region" .. tostring(index)
 			local expanded = self.ExpandedMonsterRegion == region.Id
 			self:ApplyRectLayout(path, 6, y, 220, 48)
 			self:SetPathText(path, (expanded and "- " or "+ ") .. region.DisplayName)
@@ -443,17 +479,7 @@ script LobbyCodexLogic
 		-- Registers each navigation callback once in the existing cleanup collection.
 		local root = self.MonsterRegionPanelPath
 		if self:ConnectButton(root .. "/Victoria/AllRegions", function() self:ToggleMonsterContinent() end, "MonsterAllRegions") == false then return false end
-		for index, region in ipairs(_MonsterCodexProvider:GetVictoriaRegions()) do
-			local regionId = region.Id
-			if self:ConnectButton(root .. "/Victoria/Regions/Region" .. tostring(index), function() self:ToggleMonsterRegion(regionId) end, "MonsterRegion" .. tostring(index)) == false then return false end
-		end
-		for index, region in ipairs(_MonsterCodexProvider:GetVictoriaRegions()) do
-			local regionId = region.Id
-			for _, kind in ipairs({ "Normal", "Boss" }) do
-				local filter = kind
-				if self:ConnectButton(root .. "/Victoria/Regions/Region" .. tostring(index) .. "/" .. kind, function() self:SelectMonsterRegion(regionId) self:SetFilter(filter) end, "MonsterType" .. tostring(index) .. kind) == false then return false end
-			end
-		end
+		self:EnsureRegionButtons()
 		for index = 1, 5 do
 			local optionIndex = index
 			if self:ConnectButton(self.CategoryNavigationPath .. "/Option" .. tostring(index), function() self:SelectCategoryOption(optionIndex) end, "CategoryOption" .. tostring(index)) == false then return false end
@@ -465,6 +491,43 @@ script LobbyCodexLogic
 		if self:ConnectButton(self.MonsterGalleryPanelPath .. "/Pagination/Previous", function() self:ChangeMonsterPage(-1) end, "MonsterPreviousPage") == false then return false end
 		if self:ConnectButton(self.MonsterGalleryPanelPath .. "/Pagination/Next", function() self:ChangeMonsterPage(1) end, "MonsterNextPage") == false then return false end
 		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearRegionButtons()
+		-- Release generated navigation callbacks before replacing or destroying their entities.
+		for _, binding in ipairs(self.RegionHandles) do
+			if isvalid(binding.Entity) then binding.Entity:DisconnectEvent(ButtonClickEvent, binding.Handle) end
+		end
+		for _, entity in ipairs(self.RegionButtons) do if isvalid(entity) then entity:Destroy() end end
+		self.RegionHandles = {}
+		self.RegionButtons = {}
+		self._T.RegionSignature = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnsureRegionButtons()
+		-- Clone one authored template for every synchronized region, with scrollable overflow.
+		local regions = _MonsterCodexProvider:GetVictoriaRegions()
+		local signature = _HttpService:JSONEncode({ Regions = regions })
+		if signature == self._T.RegionSignature then return end
+		local template = _EntityService:GetEntityByPath(self.MonsterRegionPanelPath .. "/Victoria/Regions/Content/RegionTemplate")
+		if not isvalid(template) then return end
+		self:ClearRegionButtons()
+		self._T.RegionSignature = signature
+		for index, region in ipairs(regions) do
+			local regionId = region.Id
+			local button = template:Clone("Region" .. tostring(index))
+			button:SetEnable(true)
+			table.insert(self.RegionButtons, button)
+			table.insert(self.RegionHandles, { Entity = button, Handle = button:ConnectEvent(ButtonClickEvent, function() self:ToggleMonsterRegion(regionId) end) })
+			for _, kind in ipairs({ "Normal", "Boss" }) do
+				local filter = kind
+				local child = button:GetChildByName(kind)
+				table.insert(self.RegionHandles, { Entity = child, Handle = child:ConnectEvent(ButtonClickEvent, function() self:SelectMonsterRegion(regionId) self:SetFilter(filter) end) })
+			end
+		end
+		log("[LobbyCodex] region navigation count=" .. tostring(#regions))
 	end
 
 

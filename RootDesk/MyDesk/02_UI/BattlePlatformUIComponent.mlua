@@ -9,6 +9,30 @@ script BattlePlatformUIComponent extends Component
 	property number WorldHeight = 0.36
 
 	@ExecSpace("ClientOnly")
+	method void SetSkillRange(Entity map, table cells)
+		-- Player hover previews are independent from enemy attack warnings.
+		self._T.SkillRangeMap = map
+		self._T.SkillRangeCells = {}
+		for _, cell in ipairs(cells) do self._T.SkillRangeCells[cell] = true end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetEnemyRange(Entity map, table cells)
+		-- Use the same zero-based cells as the synchronized enemy intent HUD.
+		self._T.EnemyRangeMap = map
+		self._T.EnemyRangeCells = cells or {}
+	end
+
+	@ExecSpace("ClientOnly")
+	method Color GetPlatformColor(integer cell, Color base, table preview, boolean hasPreview, table danger)
+		-- Attack warnings stay red even under a player preview; other cells keep their base opacity.
+		if danger[cell] then return Color(1, 0.16, 0.20, 1) end
+		if preview[cell] then return Color(0.2, 1, 1, 1) end
+		if hasPreview then return Color(base.r, base.g, base.b, base.a * 0.35) end
+		return base
+	end
+
+	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Cache the single UI set; maps supply only their visual board origin and spacing.
 		self._T.Platforms = self.Entity:GetChildByName("Platforms")
@@ -26,7 +50,7 @@ script BattlePlatformUIComponent extends Component
 			return
 		end
 		log("[BattlePlatformUI] Animation loaded: " .. self.PlatformRUID .. "; frames=" .. tostring(clip.Frames.Count))
-		for index = 1, 7 do
+		for index = 1, 9 do
 			local cell = self._T.Platforms:GetChildByName("BattleCell" .. tostring(index))
 			if isvalid(cell) == false or cell.SpriteGUIRendererComponent == nil or cell.UITransformComponent == nil then
 				log_error("[BattlePlatformUI] Missing cell or renderer: " .. tostring(index))
@@ -38,13 +62,13 @@ script BattlePlatformUIComponent extends Component
 			self._T.Cells[index] = cell
 		end
 		self._T.ImageReady = true
-		log("[BattlePlatformUI] Shared seven-cell UI ready; world size=" .. tostring(self.WorldWidth) .. "x" .. tostring(self.WorldHeight))
+		log("[BattlePlatformUI] Shared variable-cell UI ready; world size=" .. tostring(self.WorldWidth) .. "x" .. tostring(self.WorldHeight))
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
 		-- Project world bounds each frame so camera movement, zoom and resolution preserve size.
-		if self._T.ImageReady ~= true or isvalid(self._T.Platforms) == false or self._T.Cells == nil or #self._T.Cells ~= 7 then
+		if self._T.ImageReady ~= true or isvalid(self._T.Platforms) == false or self._T.Cells == nil or #self._T.Cells ~= 9 then
 			return
 		end
 		local player = _UserService.LocalPlayer
@@ -59,8 +83,33 @@ script BattlePlatformUIComponent extends Component
 			self:HidePlatforms()
 			return
 		end
+		local session = map:GetComponent("script.BattleSessionComponent")
+		local cellCount = session ~= nil and math.max(1, math.min(9, session.CellCount)) or 7
+		local originX = session ~= nil and session.CellStartX or layout.PlatformOrigin.x
+		local spacing = session ~= nil and session.CellSpacing or layout.PlatformSpacing
 		local worldPlatforms = map:GetChildByName("BattlePlatforms")
+		local preview = self._T.SkillRangeMap == map and self._T.SkillRangeCells or {}
+		local hasPreview = next(preview) ~= nil
+		local danger = self._T.EnemyRangeMap == map and self._T.EnemyRangeCells or {}
+		if session == nil or session.BattleResult ~= "" then danger = {} end
 		if isvalid(worldPlatforms) then
+			for index = 1, 9 do
+				local cell = worldPlatforms:GetChildByName("BattleCell" .. tostring(index))
+				if isvalid(cell) then
+					cell.Enable = index <= cellCount
+					local renderer = cell.SpriteRendererComponent
+					if renderer ~= nil then
+						self._T.BaseRingColors = self._T.BaseRingColors or {}
+						if self._T.BaseRingColors[cell.Id] == nil then self._T.BaseRingColors[cell.Id] = renderer.Color end
+						local base = self._T.BaseRingColors[cell.Id]
+						renderer.Color = self:GetPlatformColor(index - 1, base, preview, hasPreview, danger)
+					end
+					if index <= cellCount then
+						local position = cell.TransformComponent.Position
+						cell.TransformComponent.Position = Vector3(originX + (index - 1) * spacing, position.y, position.z)
+					end
+				end
+			end
 			-- Keep actor visuals above ground rings, including newly spawned enemies.
 			if player.AvatarRendererComponent ~= nil then
 				player.AvatarRendererComponent.SortingLayer = "MapLayer2"
@@ -73,15 +122,15 @@ script BattlePlatformUIComponent extends Component
 			self._T.Platforms.Enable = false
 			if self._T.Map ~= map then
 				self._T.Map = map
-				log("[BattlePlatformUI] Using seven world platforms on BattlePlatforms layer")
+				log("[BattlePlatformUI] Using variable world platforms on BattlePlatforms layer")
 			end
 			return
 		end
-		local origin = layout.PlatformOrigin
+		local origin = Vector2(originX, layout.PlatformOrigin.y)
 		local occupied = {}
 		local units = map:GetChildComponentsByTypeName("script.BattleUnitComponent", true)
 		for _, unit in ipairs(units) do
-			if isvalid(unit.Entity) and unit.Entity.EnabledInHierarchy and unit.IsDead == false and unit.CellIndex >= 0 and unit.CellIndex < 7 then
+			if isvalid(unit.Entity) and unit.Entity.EnabledInHierarchy and unit.IsDead == false and unit.CellIndex >= 0 and unit.CellIndex < cellCount then
 				if unit.Team == "Player" then
 					occupied[unit.CellIndex] = self.PlayerPlatformRUID
 				elseif unit.Team == "Enemy" and occupied[unit.CellIndex] ~= self.PlayerPlatformRUID then
@@ -91,8 +140,10 @@ script BattlePlatformUIComponent extends Component
 		end
 		local halfWidth = self.WorldWidth * 0.5
 		local halfHeight = self.WorldHeight * 0.5
-		for index = 1, 7 do
-			local x = origin.x + (index - 1) * layout.PlatformSpacing
+		for index = 1, 9 do
+			self._T.Cells[index].Enable = index <= cellCount
+			if index > cellCount then continue end
+			local x = origin.x + (index - 1) * spacing
 			local lower = self:ToLocalUI(Vector2(x - halfWidth, origin.y - halfHeight))
 			local upper = self:ToLocalUI(Vector2(x + halfWidth, origin.y + halfHeight))
 			local cell = self._T.Cells[index]
@@ -102,12 +153,13 @@ script BattlePlatformUIComponent extends Component
 			end
 			cell.UITransformComponent.anchoredPosition = Vector2((lower.x + upper.x) * 0.5, (lower.y + upper.y) * 0.5)
 			cell.UITransformComponent.RectSize = Vector2(math.abs(upper.x - lower.x), math.abs(upper.y - lower.y))
-			cell.SpriteGUIRendererComponent.Color = layout.TileColor
+			local base = layout.TileColor
+			cell.SpriteGUIRendererComponent.Color = self:GetPlatformColor(index - 1, base, preview, hasPreview, danger)
 		end
 		self._T.Platforms.Enable = true
 		if self._T.Map ~= map then
 			self._T.Map = map
-			log("[BattlePlatformUI] Displaying seven platforms in " .. map.Name .. "; origin=" .. tostring(origin))
+			log("[BattlePlatformUI] Displaying variable platforms in " .. map.Name .. "; origin=" .. tostring(origin))
 		end
 	end
 
