@@ -825,7 +825,9 @@ Event는 이미 완료된 사실을 전달한다. Event 수신자가 같은 상�
 [ContentValidation]
 ```
 
-Positive log에는 최소한 ID와 결과를 포함한다.
+개발·검증 중 사용하는 Positive log에는 최소한 ID와 결과를 포함한다. 확인 결과를 작업
+기록에 남기고, 기능 완료 전에 반복 성공 로그를 제거한다. 운영에 필요한 드문 주요 사건만
+유지한다. 세부 기준은 [`Runtime-Logging-Guide.md`](./Runtime-Logging-Guide.md)를 따른다.
 
 ```text
 [SkillExecution] resolved skill=basic_slash source=player_01 success=true reason=OK

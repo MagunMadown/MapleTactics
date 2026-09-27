@@ -46,6 +46,7 @@
 | Turn·행동 큐 | [`Battle-Turn-Guide.md`](./Battle-Turn-Guide.md) |
 | Cooldown | [`Cooldown-Runtime-Guide.md`](./Cooldown-Runtime-Guide.md) |
 | 전투 코어 사용법 | [`Battle-Core-Quick-Guide.md`](./Battle-Core-Quick-Guide.md) |
+| 기능 검증 후 로그 정리 | [`Runtime-Logging-Guide.md`](./Runtime-Logging-Guide.md) |
 
 ## 2. 현재 병렬 개발 가능 범위
 
@@ -435,8 +436,9 @@ Maker Runtime 실패 경로:
 8. Play 종료 후 편집 모드 복귀
 9. 관련 Guide와 구현 계획 갱신
 
-성공 로그에는 최소한 Definition ID, 상태 전환, 결과를 포함한다. 실패 로그에는 Reason ID와
-입력 ID를 포함한다.
+검증 중 사용하는 성공 로그에는 Definition ID, 상태 전환, 결과를 포함한다. 실패 로그에는
+Reason ID와 입력 ID를 포함한다. 검증 증거를 작업 기록에 남긴 뒤 완성된 기능의 반복
+성공 로그를 정리한다. 유지 기준과 예외는 [`Runtime-Logging-Guide.md`](./Runtime-Logging-Guide.md)를 따른다.
 
 ## 11. 완료 조건
 
@@ -451,4 +453,5 @@ Maker Runtime 실패 경로:
 - UI가 서버 판정 상태를 직접 변경하지 않는다.
 - `.mlua/.codeblock` 페어와 관련 데이터가 전달 대상에 포함됐다.
 - Architecture 또는 기능별 Guide가 현재 구현과 일치한다.
+- 임시 디버그 로그를 정리하고 남긴 로그의 조치 가능성을 확인했다.
 - 다음 개발자가 수정해야 할 위치와 금지 영역을 문서만 보고 판단할 수 있다.

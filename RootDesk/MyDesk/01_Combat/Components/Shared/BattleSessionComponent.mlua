@@ -25,6 +25,7 @@ script BattleSessionComponent extends Component
 	@Sync property integer ResultKillCount = 0
 	@Sync property integer ResultElapsedSeconds = 0
 	@Sync property integer ResultGold = 0
+	@Sync property string ResultRewardSnapshot = ""
 	property number ResultStartTime = 0
 	property integer ResultStartGold = 0
 	property boolean ResultRecorded = false
@@ -991,6 +992,9 @@ script BattleSessionComponent extends Component
 		self.ResultKillCount = 0
 		self.ResultElapsedSeconds = 0
 		self.ResultGold = 0
+		self.ResultRewardSnapshot = ""
+		self._T.RoundRewardEntries = {}
+		self._T.RoundRewardReceipts = {}
 		self.ResultStartTime = _UtilLogic.ElapsedSeconds
 		_MonsterCollectionLogic:GetRecord(self.PlayerEntity)
 		local inventory = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent") or nil
@@ -4155,7 +4159,7 @@ script BattleSessionComponent extends Component
 
 		local capacity = self.TurnState.TileQueueCapacity
 
-		local skillValidation = _ContentValidatorLogic:ValidateSkillById(tileId)
+		local skillValidation = self:GetEffectiveSkillValidation("player_01", tileId)
 		if skillValidation.Success == false then
 			result.Reason = skillValidation.Reason
 			result.DetailReason = skillValidation.DetailReason or ""
@@ -4380,7 +4384,7 @@ script BattleSessionComponent extends Component
 	method number GetSkillActionDuration(string skillId)
 		-- Scaled by the same multiplier as the motion, so the queue slot frees when the swing ends
 		-- instead of holding the turn for the original 1x duration.
-		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		local validation = self:GetEffectiveSkillValidation("player_01", skillId)
 		if validation.Success == false then
 			return 0.1
 		end
@@ -4752,9 +4756,10 @@ script BattleSessionComponent extends Component
 			slotNames[slotIndex] = ""
 			slotCooldownTurns[slotIndex] = ""
 			if skillId ~= "" then
-				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
-				if definition.Success == true then
-					slotNames[slotIndex] = definition.DisplayName
+				local effective = self:GetEffectiveSkillValidation("player_01", skillId)
+				local definition = effective.Success and effective.Data.Definition or effective
+				if effective.Success == true then
+					slotNames[slotIndex] = definition.DisplayName .. ((definition.SkillAugmentName or "") ~= "" and " · " .. definition.SkillAugmentName or "")
 					slotCooldownTurns[slotIndex] = tostring(math.max(0, math.floor(definition.CooldownTurns or 0)))
 				else
 					log_error("[BattleSkillSlots] ordered skill definition unavailable skill=" .. skillId .. " reason=" .. (definition.Reason or "UNKNOWN"))
@@ -5257,6 +5262,7 @@ script BattleSessionComponent extends Component
 		local runSkillSnapshot = ""
 		local runInventoryRevision = 0
 		local runHealCharges = -1
+		local runHealUnlimited = false
 		local runSkillInventoryRevision = 0
 		local runConsumableCapacity = 0
 		local ownedAugmentSnapshot = ""
@@ -5275,6 +5281,7 @@ script BattleSessionComponent extends Component
 				runSkillSnapshot = runInventory.RunSkillSnapshot
 				runInventoryRevision = runInventory.InventoryRevision
 				runHealCharges = runInventory.HealCharges
+				runHealUnlimited = runInventory.HealUnlimited
 				runSkillInventoryRevision = runInventory.SkillInventoryRevision
 				runConsumableCapacity = runInventory.ConsumableCapacity
 			end
@@ -5493,6 +5500,7 @@ script BattleSessionComponent extends Component
 				ConsumableCapacity = runConsumableCapacity,
 				SkillRevision = runSkillInventoryRevision,
 				HealCharges = runHealCharges,
+				HealUnlimited = runHealUnlimited,
 				Revision = runInventoryRevision
 			},
 			Drops = {
@@ -6166,7 +6174,7 @@ script BattleSessionComponent extends Component
 	method table TryExecuteSkill(string sourceUnitId, string skillId)
 		-- Repeat the gate on the authoritative execution path, including already queued skills.
 		if sourceUnitId == "player_01" and self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
-		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		local validation = self:GetEffectiveSkillValidation(sourceUnitId, skillId)
 		if validation.Success == false then
 			return {
 				Success = false,
@@ -6216,7 +6224,7 @@ script BattleSessionComponent extends Component
 		end
 		local inventory = sourceEntity:GetComponent("script.PlayerRunInventoryComponent")
 		if definition.CostType == "HEAL_CHARGE" then
-			if inventory == nil or inventory:GetHealCharges() < definition.CostValue then
+			if inventory == nil or (not inventory.HealUnlimited and inventory:GetHealCharges() < definition.CostValue) then
 				return { Success = false, Reason = "HEAL_CHARGES_EMPTY" }
 			end
 			if sourceUnit.CurrentHp >= sourceUnit.MaxHp then return { Success = false, Reason = "HP_FULL" } end
@@ -7097,6 +7105,15 @@ script BattleSessionComponent extends Component
 		result.DamageAmount = damageResult.AppliedAmount
 		result.TargetHpBefore = damageResult.HpBefore
 		result.TargetHpAfter = damageResult.HpAfter
+		if damageResult.ExactLethal and sourceUnit.Team == "Player" and sourceEntity:GetComponent("script.PlayerRunAugmentComponent") ~= nil then
+			local effective = self:GetEffectiveSkillValidation(sourceUnitId, skillId)
+			local refund = effective.Success and (effective.Data.Definition.PreciseRefund or 0) or 0
+			local cooldown = self:GetSkillRuntimeState(sourceUnitId)
+			if refund > 0 and cooldown ~= nil then
+				cooldown:ReduceCooldown(skillId, math.min(refund, math.max(0, cooldown:GetRemainingCooldown(skillId) - 1)))
+				log("[SkillAugment] precise kill skill=" .. skillId .. " target=" .. targetUnitId)
+			end
+		end
 		if damageResult.AppliedAmount > 0 then
 			self:TryRegisterEnemyCastInterrupt(sourceUnitId, skillId, targetUnitId, result.DamageAmount)
 			self:PlayActiveHitEffect(targetUnitId)
@@ -7222,6 +7239,7 @@ script BattleSessionComponent extends Component
 		end
 		-- BattleUnit retains the full UtilityGuardActive block, including zero damage.
 		local damageResult = targetUnit:ApplyDamage(amount)
+		result.ExactLethal = damageResult.Success == true and damageResult.ReachedZero == true and amount == damageResult.HpBefore
 		if damageResult.Success == false then
 			result.Reason = damageResult.Reason
 			return result
@@ -7234,12 +7252,14 @@ script BattleSessionComponent extends Component
 			-- Training dummy: a lethal hit of any size refills HP instead of entering the death pipeline.
 			targetUnit:RestoreCurrentHp(targetUnit.MaxHp)
 			damageResult.ReachedZero = false
+			result.ExactLethal = false
 			log("[SkillTest] dummy refilled after lethal hit amount=" .. tostring(damageResult.AppliedAmount))
 		end
 		result.HpBefore = damageResult.HpBefore
 		result.HpAfter = damageResult.HpAfter
 		result.AppliedAmount = damageResult.AppliedAmount
 		if damageResult.AppliedAmount > 0 then
+			self:PresentDamageNumber(sourceEntity, targetEntity, damageResult.AppliedAmount)
 			self:PlayAcceptedEnemyImpact(sourceEntity, targetEntity, attackId)
 		end
 		local strongHit = amount >= math.max(0.01, self.StrongHitDamageThreshold)
@@ -7286,6 +7306,24 @@ script BattleSessionComponent extends Component
 		result.Reason = "OK"
 		log("[BattleDamage] applied source=" .. sourceUnitId .. " target=" .. targetUnitId .. " amount=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter)
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PresentDamageNumber(Entity sourceEntity, Entity targetEntity, number appliedAmount)
+		-- Resolve cosmetic selection on the server; this method never mutates HP or waits for rendering.
+		if not isvalid(targetEntity) or appliedAmount <= 0 then return end
+		local target = targetEntity:GetComponent("script.BattleUnitComponent")
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if target == nil or presentation == nil then return end
+		local playerTarget = target.Team == "Player"
+		local skinId = _DamageSkinDefinitionRepositoryLogic.DefaultOutgoingSkinId
+		if playerTarget then
+			skinId = presentation.IncomingDamageSkinId
+		elseif isvalid(sourceEntity) then
+			local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+			if sourcePresentation ~= nil then skinId = sourcePresentation.OutgoingDamageSkinId end
+		end
+		presentation:PlayDamageNumber(target.UnitId, appliedAmount, skinId, playerTarget)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -7483,9 +7521,21 @@ script BattleSessionComponent extends Component
 			end
 			runResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
 			if runResultRecorded == true then
+				if self.BattleResult == "Victory" then
+					local augments = self.PlayerEntity:GetComponent("script.PlayerRunAugmentComponent")
+					if augments ~= nil then
+						local before = augments.AvailableRerollCount
+						augments:GrantClearReroll(self.StageId .. ":" .. tostring(self.EntryRequestId), self._T.BossDefeated == true)
+						self:RecordRoundReward("REROLL", "augment_reroll", augments.AvailableRerollCount - before, "boss_or_round_reroll")
+					end
+				end
 				if self.BattleResult == "Victory" and self._T.BossDefeated == true then
 					local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
-					if inventory ~= nil then inventory:GrantBossHealCharge(self.StageId .. ":" .. tostring(self.EntryRequestId)) end
+					if inventory ~= nil then
+						local before = inventory.HealCharges
+						inventory:GrantBossHealCharge(self.StageId .. ":" .. tostring(self.EntryRequestId))
+						self:RecordRoundReward("HEAL_CHARGE", "heal", inventory.HealCharges - before, "boss_heal")
+					end
 				end
 				self:RefreshUnionRewardPresentation()
 			end
@@ -7494,8 +7544,7 @@ script BattleSessionComponent extends Component
 		log("[BattleResult] result=" .. self.BattleResult .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " runRecorded=" .. tostring(runResultRecorded))
 		self.ResultRecorded = runResultRecorded
 		self.ResultElapsedSeconds = math.max(0, math.floor(_UtilLogic.ElapsedSeconds - self.ResultStartTime))
-		local inventory = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent") or nil
-		self.ResultGold = inventory ~= nil and math.max(0, inventory:GetSnapshotAmount(inventory.RunCurrencySnapshot, "gold") - self.ResultStartGold) or 0
+		-- ResultGold records gross grants, including overflow conversion, independently of spending.
 		local expectedEntry = self.EntryRequestId
 		self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
 			self.ResultTransitionTimerId = 0
@@ -9008,7 +9057,12 @@ script BattleSessionComponent extends Component
 			return { Success = true, Hit = true, Reason = "NEXT_ARROW_ARMED" }
 		elseif kind == "REDUCE_OWN_COOLDOWN" then
 			local runtime = self:GetSkillRuntimeState(context.SourceUnitId)
-			if runtime ~= nil then runtime:ReduceCooldown(context.SkillId, step.Value) end
+			if runtime ~= nil then
+				local reduction = step.Value
+				local floor = context.Definition ~= nil and (context.Definition.AugmentCooldownFloor or 0) or 0
+				if floor > 0 then reduction = math.min(reduction, math.max(0, runtime:GetRemainingCooldown(context.SkillId) - floor)) end
+				runtime:ReduceCooldown(context.SkillId, reduction)
+			end
 			return { Success = true, Hit = true, Reason = "COMBO_COOLDOWN_REDUCED" }
 		end
 		local targets = _SkillTargetResolverLogic:SelectEffectTargets(context, step.TargetSelector)
@@ -9052,6 +9106,7 @@ script BattleSessionComponent extends Component
 		if unit == nil or unit.IsDead then return { Success = false, Reason = "TARGET_DEAD" } end
 		local result = unit:ApplyDamage(amount)
 		if result.Success and result.AppliedAmount > 0 then
+			self:PresentDamageNumber(self:FindUnitEntity(sourceUnitId), entity, result.AppliedAmount)
 			local presentation = entity:GetComponent("script.BattleUnitPresentationComponent")
 			if presentation ~= nil then presentation:PlayHitImpact(targetUnitId, false, self.NormalHitStopDuration, self.StrongHitStopDuration, self.HitReactionDuration, self.HitFlashDuration) end
 			if unit.Team == "Player" then self:RefreshPlayerHpSnapshot(status) end
@@ -9059,6 +9114,55 @@ script BattleSessionComponent extends Component
 		end
 		log("[BattleStatus] tick=" .. status .. " unit=" .. targetUnitId .. " damage=" .. tostring(result.AppliedAmount or 0))
 		return result
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method table GetEffectiveSkillValidation(string sourceUnitId, string skillId)
+		-- Validate authored content first, then overlay only this actor's run-bound augment.
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if not validation.Success then return validation end
+		local source = self:FindUnitEntity(sourceUnitId)
+		if not isvalid(source) or source:GetComponent("script.PlayerRunAugmentComponent") == nil then return validation end
+		return { Success = true, Data = _AugmentRuntimeLogic:BuildSkillBundle(source, validation.Data.Definition, validation.Data.EffectSteps, "") }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RecordRoundReward(string rewardType, string refId, integer amount, string receipt)
+		-- Capture accepted grants, never inventory differences: using an item cannot erase its pickup.
+		amount = math.max(0, math.floor(amount or 0))
+		if amount == 0 or self.StageId == "" or self._T.RoundRewardEntries == nil then return end
+		local key = rewardType .. "~" .. refId
+		local receiptKey = receipt .. ":" .. key
+		if self._T.RoundRewardReceipts[receiptKey] then return end
+		self._T.RoundRewardReceipts[receiptKey] = true
+		local entry = self._T.RoundRewardEntries[key]
+		if entry == nil then
+			local name, icon = refId, ""
+			if rewardType == "CONSUMABLE" then
+				local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(refId)
+				if definition.Success then name = definition.DisplayName; icon = definition.IconKey end
+			elseif rewardType == "REROLL" then name = "증강 리롤권"
+			elseif rewardType == "HEAL_CHARGE" then
+				name = "힐 사용 횟수"
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition("heal")
+				if definition.Success then icon = definition.IconRuid or "" end
+			elseif rewardType == "CURRENCY" and refId == "gold" then name = "메소" end
+			name = string.gsub(name, "[|~]", " ")
+			entry = { Type = rewardType, Id = refId, Amount = 0, Name = name, Icon = icon }
+			self._T.RoundRewardEntries[key] = entry
+		end
+		entry.Amount = entry.Amount + amount
+		if rewardType == "CURRENCY" and refId == "gold" then self.ResultGold = self.ResultGold + amount end
+		local keys, rows = {}, {}
+		for id, _ in pairs(self._T.RoundRewardEntries) do table.insert(keys, id) end
+		table.sort(keys)
+		for _, id in ipairs(keys) do
+			local item = self._T.RoundRewardEntries[id]
+			table.insert(rows, item.Type .. "~" .. item.Id .. "~" .. tostring(item.Amount) .. "~" .. item.Name .. "~" .. item.Icon)
+		end
+		self.ResultRewardSnapshot = table.concat(rows, "|")
+		log("[RoundReward] received=" .. key .. " amount=" .. amount .. " total=" .. entry.Amount)
 	end
 
 end

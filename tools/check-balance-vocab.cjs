@@ -81,6 +81,12 @@ function csvColumn(file, col) {
 }
 const skillTables = fs.readdirSync(DATA).filter((f) => /SkillDefinitions\.csv$/.test(f) && f !== "UtilitySkillDefinitions.csv");
 const fromData = {
+  augmentHidden: csvColumn("AugmentEffects.csv", "ParamC"),
+  augmentTrigger: csvColumn("AugmentEffects.csv", "TriggerType"),
+  augmentCondition: csvColumn("AugmentEffects.csv", "ConditionType"),
+  augmentEffect: csvColumn("AugmentEffects.csv", "EffectType"),
+  augmentTarget: csvColumn("AugmentEffects.csv", "TargetType"),
+  augmentModifier: csvColumn("AugmentEffects.csv", "ParamA"),
   effectType: csvColumn("SkillEffectSteps.csv", "EffectType"),
   utilityEffectType: csvColumn("UtilitySkillEffectSteps.csv", "EffectType"),
   effectCondition: csvColumn("SkillEffectSteps.csv", "ConditionId"),
@@ -93,6 +99,12 @@ const fromData = {
 
 const S = VOCAB.skill, P = VOCAB.enemyPattern;
 const catalog = {
+  augmentHidden: Object.keys(VOCAB.augment.hiddenMarker),
+  augmentTrigger: Object.keys(VOCAB.augment.triggerTypes),
+  augmentCondition: Object.keys(VOCAB.augment.conditionTypes),
+  augmentEffect: Object.keys(VOCAB.augment.effectTypes),
+  augmentTarget: Object.keys(VOCAB.augment.targetTypes),
+  augmentModifier: Object.keys(VOCAB.augment.modifiers),
   effectType: Object.keys(S.effects),
   utilityEffectType: Object.keys(S.utilityEffects),
   effectCondition: Object.keys(S.conditions),
@@ -106,6 +118,8 @@ const catalog = {
   cellSelector: Object.keys(P.conditions.CELL_FREE.paramA.options),
 };
 const TITLES = {
+  augmentHidden: "AugmentEffects.ParamC", augmentTrigger: "AugmentEffects.TriggerType", augmentCondition: "AugmentEffects.ConditionType",
+  augmentEffect: "AugmentEffects.EffectType", augmentTarget: "AugmentEffects.TargetType", augmentModifier: "AugmentEffects.ParamA",
   effectType: "SkillEffectSteps.EffectType", utilityEffectType: "UtilitySkillEffectSteps.EffectType",
   effectCondition: "SkillEffectSteps.ConditionId", costType: "*SkillDefinitions.CostType",
   targetingType: "*SkillDefinitions.TargetingType", targetSelector: "*EffectSteps.TargetSelector",
