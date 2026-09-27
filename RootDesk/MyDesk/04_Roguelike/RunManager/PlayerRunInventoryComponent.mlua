@@ -13,6 +13,7 @@ script PlayerRunInventoryComponent extends Component
 	@TargetUserSync property string OverflowCurrencyId = "gold"
 	@TargetUserSync property integer OverflowCurrencyPerItem = 1
 	@TargetUserSync property integer InventoryRevision = 0
+	@TargetUserSync property integer PendingSoldSkillChoices = 0
 	@TargetUserSync property integer SkillInventoryRevision = 0
 	@TargetUserSync property integer RunSkillBarRevision = 0
 
@@ -39,6 +40,7 @@ script PlayerRunInventoryComponent extends Component
 		self.HealUnlimited = false
 		self._T.BossHealChargeKeys = {}
 		self.RunSkillSnapshot = ""
+		self.PendingSoldSkillChoices = 0
 		self.RunSkillBarSlotIds = ""
 		self.RunItemSnapshot = ""
 		self.AppliedRewardKeys = ""
@@ -666,6 +668,7 @@ script PlayerRunInventoryComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table ApplyShopSale(string consumableId, string itemType, integer unitPrice, integer expectedRevision)
 		-- Atomically exchanges one owned item for server-validated gold; stale retries cannot sell twice.
+		if itemType == "SKILL" then return self:ApplySkillSale(consumableId, unitPrice, expectedRevision) end
 		if itemType ~= "CONSUMABLE" and itemType ~= "ITEM" then return { Success = false, Reason = "ITEM_NOT_SELLABLE" } end
 		if self.ActiveRunSequence <= 0 or unitPrice <= 0 or not self:IsSafeToken(consumableId) then
 			return { Success = false, Reason = "INVALID_SHOP_SALE" }
@@ -683,6 +686,27 @@ script PlayerRunInventoryComponent extends Component
 		self.InventoryRevision = self.InventoryRevision + 1
 		log("[RunShopSale] applied item=" .. consumableId .. " gold=" .. tostring(unitPrice) .. " remaining=" .. tostring(owned - 1))
 		return { Success = true, Reason = "SALE_APPLIED", Gold = unitPrice, RemainingAmount = owned - 1 }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplySkillSale(string skillId, integer price, integer expectedRevision)
+		if self.ActiveRunSequence <= 0 or price <= 0 or expectedRevision ~= self.InventoryRevision then return { Success = false, Reason = "INVENTORY_CHANGED" } end
+		local owned = self:GetSnapshotAmount(self.RunSkillSnapshot, skillId)
+		if owned <= 0 then return { Success = false, Reason = "SKILL_NOT_OWNED" } end
+		if #self:GetDistinctOwnedSkillIds() <= 1 then return { Success = false, Reason = "LAST_SKILL_REQUIRED" } end
+		local owner = self.Entity:GetComponent("script.PlayerRunAugmentComponent")
+		if owner == nil or owner.ActiveRunSequence ~= self.ActiveRunSequence then return { Success = false, Reason = "RUN_AUGMENT_UNAVAILABLE" } end
+		self.RunSkillSnapshot = self:SetSnapshotAmount(self.RunSkillSnapshot, skillId, 0)
+		self.RunCurrencySnapshot = self:AddSnapshotAmount(self.RunCurrencySnapshot, "gold", price)
+		self.PendingSoldSkillChoices = self.PendingSoldSkillChoices + 1
+		owner:RemoveSkillAugments(skillId)
+		self:RefreshHealChargeOwnership()
+		if self.HealCharges < 0 then self.HealUnlimited = false end
+		self:ReconcileRunSkillBarOrder("SKILL_SOLD")
+		self.InventoryRevision = self.InventoryRevision + 1
+		self.SkillInventoryRevision = self.SkillInventoryRevision + 1
+		log("[RunShopSkillSale] skill=" .. skillId .. " gold=" .. price .. " pending=" .. self.PendingSoldSkillChoices)
+		return { Success = true, Reason = "SALE_APPLIED", Gold = price, RemainingAmount = 0 }
 	end
 
 	@ExecSpace("ServerOnly")

@@ -7,6 +7,7 @@ script PlayerRunAugmentComponent extends Component
 	@TargetUserSync property integer AvailableRerollCount = 0
 	@TargetUserSync property integer AugmentRevision = 0
 	property integer BaseRerollCount = 2
+	property integer MaxSkillAugmentStages = 6
 	property integer NextAcquiredOrder = 1
 	property string AppliedAugmentRewardKeys = ""
 
@@ -157,23 +158,52 @@ script PlayerRunAugmentComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table SetSkillAugment(string skillId, string augmentId, string rewardKey)
-		-- Replaces both sides of a trade-off atomically; caller validates the reward and eligibility.
+		-- Appends one complete trade-off, preserving acquisition order and the six-stage cap.
 		if self.ActiveRunSequence <= 0 or not self:IsSafeToken(skillId) or not self:IsSafeToken(augmentId)
 			or not self:IsSafeToken(rewardKey) then return { Success = false, Reason = "INVALID_SKILL_AUGMENT" } end
 		if self:ContainsDelimitedKey(self.AppliedAugmentRewardKeys, rewardKey) then
 			return { Success = false, Reason = "UPGRADE_ALREADY_APPLIED" }
 		end
-		local kept = {}
-		for id, owned in string.gmatch(self.SkillAugmentSnapshot or "", "([^|~]+)~([^|~]+)") do
-			if id ~= skillId then table.insert(kept, id .. "~" .. owned) end
+		local inventory = self.Entity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.ActiveRunSequence ~= self.ActiveRunSequence or inventory:GetSnapshotAmount(inventory.RunSkillSnapshot, skillId) <= 0 then
+			return { Success = false, Reason = "SKILL_NOT_OWNED" }
 		end
-		table.insert(kept, skillId .. "~" .. augmentId)
-		self.SkillAugmentSnapshot = table.concat(kept, "|")
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if not definition.Success then return definition end
+		if definition.CostType ~= "HEAL_CHARGE" and #self:GetSkillAugmentIds(skillId) >= self.MaxSkillAugmentStages then
+			return { Success = false, Reason = "SKILL_AUGMENT_LIMIT" }
+		end
+		local current = _AugmentRuntimeLogic:GetEffectiveSkillBundle(self.Entity, skillId)
+		local checked = _AugmentContentValidatorLogic:ValidateById(augmentId)
+		if not current.Success or not checked.Success or not _AugmentRuntimeLogic:CanBindSkillAugment(current.Data.Definition, current.Data.EffectSteps, checked.Data) then
+			return { Success = false, Reason = "INVALID_SKILL_AUGMENT" }
+		end
+		self.SkillAugmentSnapshot = self:AppendDelimitedKey(self.SkillAugmentSnapshot, skillId .. "~" .. augmentId)
 		self.AppliedAugmentRewardKeys = self:AppendDelimitedKey(self.AppliedAugmentRewardKeys, rewardKey)
 		self.AugmentRevision = self.AugmentRevision + 1
 		self._T.SkillUpgradeOffers = nil
 		log("[SkillAugment] applied skill=" .. skillId .. " augment=" .. augmentId .. " reward=" .. rewardKey)
 		return { Success = true, Reason = "APPLIED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetSkillAugmentIds(string skillId)
+		local ids = {}
+		for id, augmentId in string.gmatch(self.SkillAugmentSnapshot or "", "([^|~]+)~([^|~]+)") do
+			if id == skillId then table.insert(ids, augmentId) end
+		end
+		return ids
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RemoveSkillAugments(string skillId)
+		local kept = {}
+		for id, augmentId in string.gmatch(self.SkillAugmentSnapshot or "", "([^|~]+)~([^|~]+)") do
+			if id ~= skillId then table.insert(kept, id .. "~" .. augmentId) end
+		end
+		self.SkillAugmentSnapshot = table.concat(kept, "|")
+		self.AugmentRevision = self.AugmentRevision + 1
+		self._T.SkillUpgradeOffers = nil
 	end
 
 

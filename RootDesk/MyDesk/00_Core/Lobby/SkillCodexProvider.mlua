@@ -20,20 +20,26 @@ script SkillCodexProvider extends Logic
 				local validation = _ContentValidatorLogic:ValidateSkillById(id)
 				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(id)
 				if validation.Success == true and definition.Success == true then
-					local description = self:BuildDescription(definition) .. " 사용 무기: " .. self:GetWeaponLabel(definition.WeaponType) .. "."
+					local description = self:BuildDescription(definition) .. "\n사용 무기: " .. self:GetWeaponLabel(definition.WeaponType)
 					local iconRuid = self:GetSkillIconRuid(definition)
 					local typeLabel = self:GetTypeLabel(definition)
 					local requiredJobTag = definition.RequiredJobTag or ""
 					local jobLabel = self:GetJobLabel(requiredJobTag)
 					local targetLabel = self:GetTargetLabel(definition.TargetingType)
-					table.insert(records, definition.SkillId .. "~" .. definition.DisplayName .. "~" .. iconRuid .. "~" .. description .. "~" .. typeLabel .. "~" .. jobLabel .. "~" .. targetLabel .. "~" .. requiredJobTag)
+					table.insert(records, {
+						Id = definition.SkillId, Category = "Skill", DisplayName = definition.DisplayName,
+						Icon = iconRuid, Description = description, TypeLabel = typeLabel,
+						MetaPrimaryLabel = "사용 직업", MetaPrimaryValue = jobLabel,
+						MetaSecondaryLabel = "대상 / 효과", MetaSecondaryValue = targetLabel,
+						RequiredJobTag = requiredJobTag, IsDiscovered = true
+					})
 				else
 					local reason = validation.Success == false and validation.Reason or definition.Reason
 					log_warning("[SkillCodexProvider] skipped id=" .. id .. " reason=" .. reason)
 				end
 			end
 		end
-		self.EntrySnapshot = table.concat(records, "|")
+		self.EntrySnapshot = _HttpService:JSONEncode({ Entries = records })
 		log("[SkillCodexProvider] refreshed source=PLAYER_SKILL_REPOSITORY count=" .. tostring(#records))
 	end
 
@@ -57,23 +63,63 @@ script SkillCodexProvider extends Logic
 	end
 
 	method string BuildDescription(table definition)
-		local targetLabel = definition.TargetingType
-		if definition.TargetingType == "FRONT_CELL" then
-			targetLabel = "정면 칸"
-		elseif definition.TargetingType == "FIRST_ENEMY_FORWARD" then
-			targetLabel = "바라보는 방향의 첫 번째 적"
-		elseif definition.TargetingType == "FIRST_ENEMY_PIERCE" then
-			targetLabel = "바라보는 방향의 첫 번째 적과 그 뒤 한 칸"
-		elseif definition.TargetingType == "RANGE_OFFSETS" then
-			targetLabel = "지정된 범위 칸"
-		end
-		local description = "대상: " .. targetLabel .. " (" .. definition.TargetingType .. "). 범위: " .. tostring(definition.Range) .. ". 재사용 대기: " .. tostring(definition.CooldownTurns) .. "턴."
-		local buffText = _BuffEffectExecutorLogic:DescribeBuffEffects(definition.EffectSetId or "")
-		if buffText ~= "" then description = description .. " 효과: " .. buffText .. "." end
-		if definition.RequiredJobTag ~= nil and definition.RequiredJobTag ~= "" then description = description .. " 직업 요구: " .. definition.RequiredJobTag .. "." end
-		if definition.FreePlay == true then description = description .. " FreePlay 사용 가능." end
-		return description
+		local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId or "")
+		return self:BuildReadableDescription(definition, effects.Success and effects.Steps or {})
 	end
+
+	@ExecSpace("ServerOnly")
+	method string BuildReadableDescription(table definition, table steps)
+		-- One player-facing description for rewards, the codex and live combat; values come from effects.
+		local lines = { "재사용 대기: " .. tostring(math.floor(definition.CooldownTurns or 0)) .. "턴", "범위: " .. self:DescribeRange(definition) }
+		for _, step in ipairs(steps) do
+			local kind = step.EffectType
+			local value = _BuffEffectExecutorLogic:FormatNumber(step.Value or 0)
+			local text = ""
+			if kind == "DAMAGE" then
+				local hits = _DamageEffectExecutorLogic:GetHitCount(step)
+				text = hits > 1 and ("기본 피해: " .. value .. " × " .. tostring(hits) .. "회 (타격마다 공격력 보너스 적용)") or ("기본 피해: " .. value)
+			elseif kind == "HEAL" then text = "회복: HP " .. value
+			elseif kind == "PUSH" then text = "밀치기: 대상 " .. value .. "칸"
+			elseif kind == "PULL" then text = "끌어오기: 대상 " .. value .. "칸"
+			elseif kind == "REDUCE_OWN_COOLDOWN" then text = "이 스킬의 재사용 대기 " .. value .. "턴 감소"
+			elseif kind == "PUSH_ADJACENT" then text = "앞뒤 인접한 적을 각각 " .. value .. "칸 밀어냄"
+			elseif kind == "NEXT_ARROW" then text = "연계 준비: 다음 공격에 화살 " .. value .. "발 추가"
+			elseif kind == "STUN" then text = value .. "% 확률로 " .. tostring(math.max(1, tonumber(step.ParameterA) or 1)) .. "턴 기절"
+			elseif kind == "MOVE_SELF" then
+				local mode = step.ParameterA or ""
+				if mode == "FORWARD_OFFSET" then text = value .. "칸 전진"
+				elseif mode == "BACKWARD_OFFSET" then text = value .. "칸 후퇴"
+				else text = _MoveSelfEffectExecutorLogic:DescribeMoveStep(step) end
+			else text = _BuffEffectExecutorLogic:DescribeEffectSteps({step}) end
+			if text ~= "" then
+				if step.ConditionId == "PREVIOUS_ATTACK" then text = "연계: 같은 실행 묶음에서 공격 스킬 바로 다음에 사용하면 " .. text end
+				if kind ~= "DAMAGE" and kind ~= "HEAL" and kind ~= "NEXT_ARROW" and step.ConditionId ~= "PREVIOUS_ATTACK" then text = "효과: " .. text end
+				table.insert(lines, text)
+			end
+		end
+		if definition.SkillId == "heal" then table.insert(lines, "횟수형: 보스 클리어 시 사용 횟수 +1") end
+		if definition.FreePlay then table.insert(lines, "즉시 사용: 턴을 소모하지 않음") end
+		if (definition.SkillAugmentName or "") ~= "" then table.insert(lines, "증강: " .. definition.SkillAugmentName) end
+		return table.concat(lines, "\n")
+	end
+
+	method string DescribeRange(table definition)
+		if definition.TargetingType == "SELF" then return "자신" end
+		if definition.TargetingType == "FRONT_CELL" then return "바라보는 방향의 바로 앞 1칸" end
+		local range = tostring(math.floor(definition.Range or 0))
+		if definition.TargetingType == "FIRST_ENEMY_FORWARD" then return "전방 " .. range .. "칸 안의 첫 번째 적" end
+		if definition.TargetingType == "FIRST_ENEMY_PIERCE" then return "전방 " .. range .. "칸 안의 첫 적과 그 뒤 1칸" end
+		local front, back = {}, {}
+		for token in string.gmatch(definition.TargetOffsets or "", "[^|]+") do
+			local offset = tonumber(token) or 0
+			if offset > 0 then table.insert(front, tostring(offset)) elseif offset < 0 then table.insert(back, tostring(-offset)) end
+		end
+		local labels = {}
+		if #front > 0 then table.insert(labels, "앞 " .. table.concat(front, "·") .. "칸") end
+		if #back > 0 then table.insert(labels, "뒤 " .. table.concat(back, "·") .. "칸") end
+		return #labels > 0 and table.concat(labels, " / ") or "자신의 위치"
+	end
+
 
 	@ExecSpace("ServerOnly")
 	method string GetWeaponLabel(string weaponType)
@@ -137,29 +183,17 @@ script SkillCodexProvider extends Logic
 
 	@ExecSpace("ClientOnly")
 	method table GetEntries()
-		-- Rehydrates Codex DTOs and preserves RequiredJobTag as the sole runtime job-classification field.
-		local entries = {}
-		for record in string.gmatch(self.EntrySnapshot or "", "([^|]+)") do
-			local fields = {}
-			for field in string.gmatch(record, "([^~]+)") do table.insert(fields, field) end
-			if #fields >= 8 then
-				table.insert(entries, {
-					Id = fields[1],
-					Category = "Skill",
-					DisplayName = fields[2],
-					Icon = fields[3],
-					Description = fields[4],
-					TypeLabel = fields[5],
-					MetaPrimaryLabel = "사용 직업",
-					MetaPrimaryValue = fields[6],
-					MetaSecondaryLabel = "대상 / 효과",
-					MetaSecondaryValue = fields[7],
-					RequiredJobTag = fields[8],
-					IsDiscovered = true
-				})
-			end
+		-- JSON preserves empty job tags, line breaks and delimiters in descriptions.
+		if self.EntrySnapshot == "" then return {} end
+		return _HttpService:JSONDecode(self.EntrySnapshot).Entries or {}
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- Repaints a catalog opened before the server snapshot arrived.
+		if name == "EntrySnapshot" and _LobbyCodexLogic:IsOpen() and _LobbyCodexLogic.ActiveCategory == "Skill" then
+			_LobbyCodexLogic:RefreshCodex()
 		end
-		return entries
 	end
 
 end
