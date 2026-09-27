@@ -128,24 +128,22 @@ Phase가 바뀌어도 현재 고정 행동의 PatternId는 옛 Pattern일 수 �
 
 | 구분 | 설정 |
 |---|---|
-| Stage | `region_kerning_stage_04`, `StageType=BOSS`, 2 Wave |
-| Enemy | `region_kerning_dyle`, HP 8, `IsBoss=true` |
+| Stage | `region_kerning_stage_04`, `StageType=BOSS`, 1 Wave (`CLEAR_ONLY`) |
+| Enemy | `region_kerning_dyle`, HP 32, `IsBoss=true` |
 | Model | `kerningdyle` |
 | Phase 1 | `OPENING`, `region_kerning_dyle_phase_01` |
 | Phase 2 | HP 50% 이하 `ENRAGED`, `region_kerning_dyle_phase_02` |
 | 기본 공격 | `region_kerning_dyle_bite`, 전방 1칸, 피해는 `BasicAttackDamage=3` |
 | 예고 광역 | `region_kerning_dyle_tail_sweep`, 1턴 예고 후 전방 1~2칸, 피해 3 |
 | 격노 광역 | `region_kerning_dyle_tail_sweep_enraged`, 1턴 예고 후 전방 1~2칸, 피해 4 |
-| 증원 | Phase 2 전환(HP 4 이하) 시 리게이터 2마리 소환. Wave 1이 `SpawnTriggerMode=BOSS_PHASE`, `TriggerPhaseIndex=2` |
+| 증원 소환 | 양 페이즈 패턴 마지막 단계 `SUMMON_ENEMIES`. 모델의 `FaustSummonComponent`가 `region_kerning_swamp_mud_pool` 3개로 늪진흙괴물 3마리를 소환(`RequireEmptyBoard=true`, `SummonCooldownTurns=5`). 소환수가 모두 쓰러져 보스만 남았을 때만 다시 소환하며, 보스 처치 시 소환수는 함께 제거된다 |
 | 처치 드롭 | 골드 6~7, 소형 회복 물약 1개 |
 
-Wave 2는 보스 전용 Pool이 아니라 일반 적 `region_kerning_ligator`(HP 4, `HEAVY`)를 사용한다.
-`HEAVY`는 밀치기를 거부하므로 보스전 후반에 플레이어의 `PUSH` 조합을 제한하는 역할을 한다.
+2026-09-27부터 Phase 2 전환 증원(리게이터 2마리, `BOSS_PHASE` Wave)은 제거하고 다일의 소환 스킬로 대체했다.
+소환은 스켈레톤 지휘관과 같은 `FaustSummonComponent` 경로를 쓰므로 Session에 보스별 조건문을 추가하지 않았다.
 
-증원 타이밍은 턴 수가 아니라 **Phase 전환에 직접 연동**된다. 규격은
-[Battle-Wave-Guide.md §5.1](./Battle-Wave-Guide.md)의 `BOSS_PHASE` 트리거를 따른다. 보스 전투에
-Phase 연동 증원을 넣을 때는 Pattern이 아니라 `StageEnemyWaves` 행에 선언하고,
-Session에 보스별 조건문을 추가하지 않는다.
+Phase 전환에 직접 연동되는 증원이 필요한 보스는 여전히
+[Battle-Wave-Guide.md §5.1](./Battle-Wave-Guide.md)의 `BOSS_PHASE` 트리거를 `StageEnemyWaves` 행에 선언해 사용한다.
 
 ## Region 06 슬리피우드 Stage 6-8 주니어 발록 예시
 
