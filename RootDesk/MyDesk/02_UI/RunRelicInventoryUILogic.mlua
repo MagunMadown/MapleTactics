@@ -1,0 +1,152 @@
+@Logic
+script RunRelicInventoryUILogic extends Logic
+
+	property boolean IsOpen = false
+	property boolean IsReady = false
+	property string LastSnapshot = ""
+	property string SelectedRelicId = ""
+	property table Items = {}
+	property table Bindings = {}
+	property table RowBindings = {}
+	property Entity Root = nil
+	property Entity Modal = nil
+	property Entity OpenButton = nil
+	property any Grid = nil
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Watch the owner snapshot so map transitions and shop changes need no battle session.
+		if not self:EnsureUI() then return end
+		local player = _UserService.LocalPlayer
+		local run = isvalid(player) and player:GetComponent("script.PlayerRunStateComponent") or nil
+		local effects = isvalid(player) and player:GetComponent("script.PlayerRunRelicEffectComponent") or nil
+		local session = isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap:GetComponent("script.BattleSessionComponent") or nil
+		local available = run ~= nil and effects ~= nil and run.RunState == "Active" and effects.ActiveRunSequence == run.RunSequence
+			and (session == nil or not session.SkillTestMode)
+		self.OpenButton.Enable = available
+		if not available then self:SetOpen(false); self.LastSnapshot = ""; return end
+		if effects.InventoryDisplaySnapshot ~= self.LastSnapshot then
+			self.LastSnapshot = effects.InventoryDisplaySnapshot
+			self.Items = {}
+			if self.LastSnapshot ~= "" then
+				local data = _HttpService:JSONDecode(self.LastSnapshot)
+				if data ~= nil and data.RunSequence == run.RunSequence then self.Items = data.Items or {} end
+			end
+			self:RefreshList()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureUI()
+		-- Bind the authored native GridView once, keeping the global UI root active.
+		if self.IsReady then return true end
+		self.Root = _EntityService:GetEntityByPath("/ui/RunRelicInventoryUI")
+		if not isvalid(self.Root) then return false end
+		self.Modal = self.Root:GetChildByName("Modal")
+		self.OpenButton = self.Root:GetChildByName("Open")
+		local window = self.Modal:GetChildByName("Window")
+		self.Grid = window:GetChildByName("List").GridViewComponent
+		self.Grid.OnRefresh = function(index, row) self:RefreshRow(index, row) end
+		self.Grid.OnClear = function(index, row) self:ClearRow(row) end
+		self.Grid.ItemEntity = window:GetChildByName("Row")
+		self:BindButton(self.OpenButton, function() self:SetOpen(not self.IsOpen) end)
+		self:BindButton(window:GetChildByName("Close"), function() self:SetOpen(false) end)
+		self.Modal.Enable = false
+		self.IsReady = true
+		self:RefreshList()
+		log("[RelicInventory] ready")
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindButton(Entity entity, any callback)
+		-- Retain the connection handle for world-session cleanup.
+		table.insert(self.Bindings, { Entity = entity, Handle = entity:ConnectEvent(ButtonClickEvent, callback) })
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearRow(Entity row)
+		-- Recycled rows must release the previous selection callback.
+		local handle = self.RowBindings[row.Id]
+		if handle ~= nil then row:DisconnectEvent(ButtonClickEvent, handle) end
+		self.RowBindings[row.Id] = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshRow(integer index, Entity row)
+		-- GridView indexes are zero based; data and selection use stable relic IDs.
+		self:ClearRow(row)
+		local item = self.Items[index + 1]
+		if item == nil then return end
+		row:GetChildByName("Name").TextGUIRendererComponent.Text = item.DisplayName
+		row:GetChildByName("Job").TextGUIRendererComponent.Text = self:GetJobLabel(item.RequiredJobId)
+		row:GetChildByName("Icon").SpriteGUIRendererComponent.ImageRUID = DataRef(item.IconImageRUID)
+		self.RowBindings[row.Id] = row:ConnectEvent(ButtonClickEvent, function() self.SelectedRelicId = item.RelicId; self:RefreshDetail() end)
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetJobLabel(string jobId)
+		-- Display the same restriction used by server-side acquisition and effects.
+		local jobs = { warrior = "전사 전용", mage = "마법사 전용", archer = "궁수 전용", thief = "도적 전용", pirate = "해적 전용" }
+		return jobs[jobId] or "공용"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshList()
+		-- TotalCount is the whole inventory, independent of the compact HUD slot count.
+		local window = self.Modal:GetChildByName("Window")
+		window:GetChildByName("Empty").Enable = #self.Items == 0
+		window:GetChildByName("Count").TextGUIRendererComponent.Text = "보유 유물 " .. tostring(#self.Items) .. "개 · 소지 제한 없음 · I / Esc로 닫기"
+		self.Grid.TotalCount = #self.Items
+		self.Grid:Refresh(false, true)
+		self:RefreshDetail()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshDetail()
+		-- Keep selection after updates, or select the first surviving relic after removal.
+		local selected = nil
+		for _, item in ipairs(self.Items) do if item.RelicId == self.SelectedRelicId then selected = item end end
+		if selected == nil then selected = self.Items[1] end
+		self.SelectedRelicId = selected ~= nil and selected.RelicId or ""
+		local detail = self.Modal:GetChildByName("Window"):GetChildByName("Detail")
+		detail:GetChildByName("Name").TextGUIRendererComponent.Text = selected ~= nil and selected.DisplayName or "유물을 선택하세요"
+		detail:GetChildByName("Job").TextGUIRendererComponent.Text = selected ~= nil and self:GetJobLabel(selected.RequiredJobId) or ""
+		detail:GetChildByName("Description").TextGUIRendererComponent.Text = selected ~= nil and selected.EffectDescription or "획득한 유물이 이곳에 표시됩니다."
+		local uses = ""
+		if selected ~= nil and selected.RemainingUses >= 0 then uses = "남은 방어 횟수: " .. tostring(selected.RemainingUses) end
+		if selected ~= nil and not selected.Active then uses = "현재 직업에는 적용되지 않습니다." end
+		detail:GetChildByName("Uses").TextGUIRendererComponent.Text = uses
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetOpen(boolean open)
+		-- Modal input focus never pauses timers or running combat presentation.
+		if not self.IsReady then return end
+		if open and not self.OpenButton.Enable then return end
+		self.IsOpen = open
+		self.Modal.Enable = open
+		if open then self:RefreshList() end
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleInventoryKey(KeyDownEvent event)
+		-- The skill-test map keeps its existing I-key panel.
+		if not self.IsReady or not self.OpenButton.Enable then return end
+		if event.key == KeyboardKey.I then self:SetOpen(not self.IsOpen)
+		elseif event.key == KeyboardKey.Escape then self:SetOpen(false) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Release persistent UI callbacks when the world session ends.
+		for _, binding in ipairs(self.Bindings) do
+			if isvalid(binding.Entity) then binding.Entity:DisconnectEvent(ButtonClickEvent, binding.Handle) end
+		end
+		if self.Grid ~= nil then self.Grid.OnRefresh = nil; self.Grid.OnClear = nil end
+		self.Bindings = {}
+		self.RowBindings = {}
+	end
+
+end
