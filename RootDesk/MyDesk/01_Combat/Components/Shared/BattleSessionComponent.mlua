@@ -6040,8 +6040,9 @@ script BattleSessionComponent extends Component
 			local extraStars = relics:GetExtraShurikenCount(definition)
 			contextResult.Data.ExtraShurikenCount = extraStars
 			if extraStars > 0 then
+				definition.ExtraShurikenVolley = true
 				definition.ProjectileCount = math.max(1, definition.ProjectileCount or 1) + extraStars
-				definition.ProjectileInterval = math.max(0.06, definition.ProjectileInterval or 0)
+				definition.ProjectileInterval = math.max(0.25, definition.ProjectileInterval or 0)
 				log("[RunRelic] extra shuriken skill=" .. skillId .. " added=" .. extraStars)
 			end
 		end
@@ -6065,6 +6066,10 @@ script BattleSessionComponent extends Component
 		-- Swap the avatar weapon before the motion starts so the swing shows the skill's own weapon.
 		self:ApplySkillWeapon(sourceUnitId, sourceEntity, definition)
 		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
+		if definition.ExtraShurikenVolley == true then
+			-- Let the equipped claw select its native throwing action instead of the shared sword swing.
+			motionProfile.ActionName = ""
+		end
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
 		if sourcePresentation ~= nil and isEnemyAttack == false then
 			if sourceEntity.PlayerControllerComponent ~= nil then
@@ -6206,7 +6211,8 @@ script BattleSessionComponent extends Component
 		-- Claw multi-hit projectiles share a finite shot budget instead of repeating it per enemy.
 		return self:HasSkillProjectile(definition) and definition.WeaponType == "CLAW"
 			and effectSteps ~= nil and #effectSteps == 1
-			and effectSteps[1].EffectType == "DAMAGE" and effectSteps[1].ParameterA == "MULTI_HIT"
+			and effectSteps[1].EffectType == "DAMAGE"
+			and (effectSteps[1].ParameterA == "MULTI_HIT" or definition.ExtraShurikenVolley == true)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -6223,13 +6229,19 @@ script BattleSessionComponent extends Component
 		local direction = facing == "Right" and 1 or -1
 		local resolved = _SkillTargetResolverLogic:Resolve(self, sourceId, definition)
 		if resolved.Success == false then return resolved end
+		context.PrimaryTargetUnitId = resolved.PrimaryTargetUnitId
+		context.TargetUnitIds = resolved.TargetUnitIds
+		context.TargetCellIndices = resolved.TargetCellIndices
+		context.TargetCellsByUnitId = resolved.TargetCellsByUnitId
 		local cells = {}
 		for _, cell in ipairs(resolved.TargetCellIndices) do
 			local distance = (cell - sourceCell) * direction
 			if distance > 0 and distance <= definition.Range then table.insert(cells, cell) end
 		end
 		table.sort(cells, function(a, b) return (a - sourceCell) * direction < (b - sourceCell) * direction end)
-		local authoredCount = _DamageEffectExecutorLogic:GetHitCount(effectStep) + (context.ExtraShurikenCount or 0)
+		local baseCount = _DamageEffectExecutorLogic:GetHitCount(effectStep)
+		local authoredCount = baseCount + (context.ExtraShurikenCount or 0)
+		local pierces = definition.TargetingType == "FIRST_ENEMY_PIERCE"
 		local shotCount = authoredCount + (context.ExtraArrowCount or 0)
 		context.ExtraArrowCount = 0
 		context.ExtraShurikenCount = 0
@@ -6268,11 +6280,20 @@ script BattleSessionComponent extends Component
 				_SkillExecutionLogic:ConsumeNextAttackBonusOnHit(context, results)
 				return
 			end
+			if pierces and #cells > 0 then aimCell = cells[#cells] end
 			self:PublishSkillTargetResolution(context.SkillId, definition.TargetingType, targetId, tostring(aimCell), targetId ~= "" and "TARGETS_RESOLVED" or "NO_TARGET")
 			local targetPosition = self:GetCellPosition(aimCell)
 			local endPosition = Vector2(targetPosition.x, targetPosition.y + height)
 			local flight = math.abs(endPosition.x - startPosition.x) / speed
 			self.ProjectileSpawnCount = self.ProjectileSpawnCount + 1
+			if shotIndex > baseCount and shotIndex <= authoredCount then
+				local presentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+				local motion = self:GetSkillMotionProfile(definition.MotionProfileId)
+				if presentation ~= nil then
+					presentation:PlayCombatMotion(sourceId, motion.MotionKey, "", motion.PlayRate, motion.Duration, false)
+				end
+				log("[RunRelic] extra shuriken throw skill=" .. context.SkillId .. " shot=" .. shotIndex)
+			end
 			self:SpawnSkillProjectile(context.SkillId, "SkillProjectile_" .. tostring(self.ProjectileSpawnCount), startPosition, endPosition, speed, definition.ProjectileRuid, definition.ProjectileScale or 1, direction > 0)
 			log("[SkillProjectile] star launched skill=" .. context.SkillId .. " shot=" .. shotIndex .. "/" .. shotCount .. " target=" .. targetId .. " cell=" .. aimCell .. " flight=" .. flight)
 			self.ImpactTimerId = _TimerService:SetTimerOnce(function()
@@ -6282,7 +6303,13 @@ script BattleSessionComponent extends Component
 					local damage = shotIndex > authoredCount and 1 or effectStep.Value
 					local previousContext = self._T.RelicDamageContext
 					self._T.RelicDamageContext = context
-					local hit = self:ResolveSkillDamageImpact(sourceId, context.SkillId, targetId, aimCell, damage)
+					local hit = nil
+					if pierces and shotIndex <= authoredCount then
+						-- Burst keeps its original piercing targets, but each thrown star lands separately.
+						hit = _DamageEffectExecutorLogic:Execute(context, effectStep)
+					else
+						hit = self:ResolveSkillDamageImpact(sourceId, context.SkillId, targetId, aimCell, damage)
+					end
 					self._T.RelicDamageContext = previousContext
 					table.insert(results, { EffectType = "DAMAGE", Hit = hit.Hit == true })
 					log("[SkillProjectile] star impact skill=" .. context.SkillId .. " shot=" .. shotIndex .. " target=" .. targetId .. " reason=" .. tostring(hit.Reason))
