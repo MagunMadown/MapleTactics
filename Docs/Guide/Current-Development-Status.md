@@ -51,7 +51,7 @@
 | 공통 전투 테스트 진입 | 전용 `battle_test_hub`의 Stage·직업·Seed 선택, MapId 기본 Stage 자동 선택, 공용 맵 Override, Prototype 전용 F8 | 사용 가능 |
 | Instance Map 정책 | 미확정 | 합의 필요 |
 | 보스 Phase | HP 임계 전환·Pattern 교체·UI DTO 최소 규격 완료 | 확장 가능 |
-| 증강 3택·4직업 | 미구현 | 후속 작업 |
+| 스킬 증강·업그레이드 3택·리롤 | 스킬 증강 14종(일반 9·히든 5), 스킬당 6단계 누적, 3택·슬롯 리롤 구현 (2026-09-28 기준, [`Skill-Augment-Reroll-Guide.md`](./Skill-Augment-Reroll-Guide.md)) | Maker 화면 검증 필요 |
 | 저장·재접속 | 미구현 | 후속 작업 |
 
 ## 3. 현재 실제 콘텐츠 수
