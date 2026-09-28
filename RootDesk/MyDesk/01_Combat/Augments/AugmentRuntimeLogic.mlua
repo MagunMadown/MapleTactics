@@ -98,27 +98,30 @@ script AugmentRuntimeLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method boolean CanBindSkillAugment(table definition, table steps, table augment)
-		-- Heal is the explicit repeatable charge exception; other augments require a terminal upgrade.
+		-- Skill tier upgrades and skill augments are independent.
 		local effect = augment.Effects[1]
 		if effect == nil or not _AugmentContentValidatorLogic:IsSkillModifierValid(effect) then return false end
 		if definition.CostType == "HEAL_CHARGE" then return effect.ParamA == "HEAL_CHARGES" or effect.ParamA == "HEAL_UNLIMITED" end
 		if effect.ParamA == "HEAL_CHARGES" or effect.ParamA == "HEAL_UNLIMITED" then return false end
-		if definition.SkillTier <= 1 or (definition.BaseSkillId or "") == "" then return false end
-		local nextUpgrade = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(definition.RequiredJobTag, definition.SkillId)
-		if nextUpgrade.Reason ~= "NO_UPGRADE_PATH" then return false end
 		if effect.ParamA == "HIDDEN_COOLDOWN" then return definition.CooldownTurns > 1 end
 		local damage = nil
 		local damageCount = 0
 		local heal = nil
 		local control = false
 		local moving = false
+		local buff = false
 		for _, step in ipairs(steps) do
 			if step.EffectType == "DAMAGE" then damage = step; damageCount = damageCount + 1 end
 			if step.EffectType == "HEAL" then heal = step end
+			if _BuffEffectExecutorLogic:IsBuffEffectType(step.EffectType) then buff = true end
 			if step.EffectType == "STUN" or step.EffectType == "FREEZE" then control = true end
 			if step.EffectType == "MOVE_SELF" then moving = true end
 		end
 		local kind = effect.ParamA
+		if kind == "BUFF_COOLDOWN" then return buff and damageCount == 0 and definition.CooldownTurns > 1 end
+		if buff and damageCount == 0 then
+			return kind == "ZERO_DAMAGE_FREE_LOAD" and definition.ZeroDamage ~= true and definition.FreePlay ~= true
+		end
 		local cooldown = tonumber(effect.ParamB)
 		if cooldown < 0 and definition.CooldownTurns <= 1 then return false end
 		if damageCount ~= 1 or damage.ParameterA == "SOURCE_BASIC_ATTACK" then return false end
@@ -198,7 +201,8 @@ script AugmentRuntimeLogic extends Logic
 		end
 		if augmentId == "" or augmentId == "NONE" then return result end
 		local checked = _AugmentContentValidatorLogic:ValidateById(augmentId)
-		if not checked.Success or not self:CanBindSkillAugment(definition, steps, checked.Data) then return result end
+		-- Eligibility is checked when granting/offering. Replaying owned modifiers must survive tier upgrades.
+		if not checked.Success then return result end
 		local effect = checked.Data.Effects[1]
 		local kind = effect.ParamA
 		if kind == "HEAL_CHARGES" then
@@ -222,7 +226,7 @@ script AugmentRuntimeLogic extends Logic
 			if step.EffectType == "DAMAGE" then
 				if kind == "ZERO_DAMAGE_FREE_LOAD" then step.Value = 0 end
 				if kind == "POWER" or kind == "AREA" then step.Value = step.Value + amount end
-				if kind == "QUICK" then step.Value = step.Value - amount end
+				if kind == "QUICK" then step.Value = math.max(1, step.Value - amount) end
 				if kind == "VOLLEY" or kind == "COMPACT" then
 					local delta = kind == "VOLLEY" and amount or -amount
 					step.ParameterB = tostring(_DamageEffectExecutorLogic:GetHitCount(step) + delta)
