@@ -112,6 +112,8 @@
         if(a==="FARTHEST_EMPTY_FORWARD"&&v===0&&b==="")return "";
         if(a==="BEHIND_FARTHEST_ENEMY_FORWARD"&&Number.isInteger(v)&&v>=1&&b==="REQUIRE_EMPTY")return "";
       }
+    } else if(s.EffectType==="THROW_BEHIND"){
+      if(d.TargetingType!=="SELF"&&s.TargetSelector==="PRIMARY_TARGET"&&Number.isInteger(v)&&v>=1&&b==="")return "";
     } else if(s.EffectType==="PUSH_DISTANCE"){
       if(d.TargetingType!=="SELF"&&["PRIMARY_TARGET","ALL_SKILL_TARGETS"].includes(s.TargetSelector)&&["","CARRY_CASTER"].includes(b)){
         if(a==="MAX"&&v===0)return "";

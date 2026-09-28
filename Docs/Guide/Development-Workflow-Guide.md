@@ -42,6 +42,7 @@
 | Skill·Effect Step | [`Skill-Authoring-Guide.md`](./Skill-Authoring-Guide.md) |
 | 직업별 유틸리티 스킬 | [`Utility-Skill-Authoring-Guide.md`](./Utility-Skill-Authoring-Guide.md) |
 | 직업 패시브·증강 | [`Job-Authoring-Guide.md`](./Job-Authoring-Guide.md), [`Augment-Authoring-Guide.md`](./Augment-Authoring-Guide.md) |
+| 스킬 증강·업그레이드 3택·리롤 | [`Skill-Augment-Reroll-Guide.md`](./Skill-Augment-Reroll-Guide.md) |
 | 새 EffectType | [`Effect-Executor-Guide.md`](./Effect-Executor-Guide.md) |
 | Turn·행동 큐 | [`Battle-Turn-Guide.md`](./Battle-Turn-Guide.md) |
 | Cooldown | [`Cooldown-Runtime-Guide.md`](./Cooldown-Runtime-Guide.md) |

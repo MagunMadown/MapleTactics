@@ -1057,6 +1057,13 @@ Stage Clear 조건은 `마지막 WaveIndex까지 생성 완료 AND 대기 중 Sp
 현재 `IMPLEMENTED` TargetType은 `SELF`다. 현재 구현된 전체 최소 조합은
 `TURN_START`, `ALWAYS`/`HP_RATIO_LE`, `HEAL`/`SELF`다.
 
+스킬 증강(`AugmentDefinitions.ExclusiveGroup=SKILL_AUGMENT`)은 별도 조합
+`SKILL_BUILD` / `ALWAYS` / `SKILL_MODIFIER` / `SKILL`(증강 1개당 효과 1행)을 쓴다. 종류는 `ParamA`
+(`POWER`, `QUICK`, `VOLLEY`, `COMPACT`, `AREA`, `RANGE`, `PRECISE`, `ZERO_DAMAGE_FREE_LOAD`, `HEAL_CHARGES`,
+`HEAL_UNLIMITED`, `HIDDEN_COOLDOWN`), 쿨타임 증감은 `ParamB`, 히든 여부는 `ParamC=HIDDEN`이다. 이 행은
+이벤트 Trigger로 실행되지 않고 스킬 정의를 읽을 때(`AugmentRuntimeLogic.BuildSkillBundle`) 적용된다.
+허용값·적용 조건·누적 규칙은 [스킬 증강·리롤 가이드](Guide/Skill-Augment-Reroll-Guide.md)를 따른다.
+
 `CHANCE_ROLL`(`ConditionValue`=0.0~1.0의 성공 확률, RunSeed 기반 결정적 롤)과
 `FRONT_CELL`, `RANGE_OFFSETS`, `FIRST_ENEMY_FORWARD`, `REAR_CELL`은 `PLANNED`다.
 이 값들은 §23(새 데이터 추가 완료 기준)의 "새 원시 Type" 규칙에 따라 Router/Resolver,
