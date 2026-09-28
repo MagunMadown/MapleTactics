@@ -204,7 +204,9 @@ Maker 직접 실행은 MapId 기준 공통 테스트 진입기를 사용한다. 
 | `region_06_tauromacis` | 16 / 6 | 근접, `HEAVY`. `attack1/info/hit` 클립을 적중 효과로 사용. 내려찍기 → `region_06_tauromacis_earthquake`(1턴 예고, 전방 1~2칸 피해 7, 쿨타임 3) → `region_06_tauromacis_roar`(자신 공격력 +1, 2회, 쿨타임 3) |
 
 모델은 `RootDesk/MyDesk/Models/Monsters/Region06*.model`이며 일반 적은 리소스가 커서 `Scale=0.75`,
-주니어 발록은 `Scale=1.2`를 사용한다.
+주니어 발록은 `Scale=1.2`를 사용한다. 신전 맵에는 `BattlePlatforms`가 없어 `BattlePlatformUIComponent`가
+전투 유닛을 `MapLayer2`로 올려 주지 않으므로, 신전 적 모델은 `SpriteRendererComponent.SortingLayer=MapLayer2`
+(`OrderInLayer=3`)로 직접 지정한다. `MapLayer0`이면 `MapLayer1`/`MapLayer2`의 바위·기둥에 가려진다.
 
 신전 적의 피격음·사망음과 스킬별 적중음은 `EnemyImpactPresentations.csv`에서 관리한다. 적 행
 (`SkillId=*`)의 `DamageSoundRuid`에 리소스 팩 `audio/Damage`, `DeathSoundRuid`에 `audio/Die`를 넣고,
