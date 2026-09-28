@@ -102,6 +102,18 @@ script NewSkillSelectionUILogic extends Logic
 		if isvalid(retry) and self.RetryBinding == nil then
 			self.RetryBinding = retry:ConnectEvent(ButtonClickEvent, function() self:RetrySelection() end)
 		end
+		self._T.RerollBindings = self._T.RerollBindings or {}
+		for i = 1, 3 do
+			local slot = i
+			local button = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Rerolls/Slot" .. i)
+			if isvalid(button) and self._T.RerollBindings[i] == nil then
+				local click = button:ConnectEvent(ButtonClickEvent, function() self:RequestSlotReroll(slot) end)
+				local hover = button:ConnectEvent(UITouchEnterEvent, function()
+					if button.ButtonComponent.Enable then _GameSettingsLogic:PlayUISound("159bf70a74634bfc8e91a29e527a4be5", 1) end
+				end)
+				self._T.RerollBindings[i] = { Entity = button, Click = click, Hover = hover }
+			end
+		end
 		return true
 	end
 
@@ -122,6 +134,7 @@ script NewSkillSelectionUILogic extends Logic
 		self.Loading = true
 		self.RequestTimeout = 10
 		self.RequestRevision = self.RequestRevision + 1
+		self:RefreshRerollButtons()
 		self:SetStatus("스킬을 불러오는 중입니다...", false)
 		self:RequestOffers(self.RequestRevision)
 	end
@@ -130,14 +143,20 @@ script NewSkillSelectionUILogic extends Logic
 	method void RequestOffers(integer revision)
 		-- Reuses the existing map provider's filtering, rotation, icon and description code.
 		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		self:SendOffers(playerEntity, revision, "", senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SendOffers(Entity playerEntity, integer revision, string rerollReason, string forUserId)
+		-- Sends a complete authoritative snapshot after both loads and rerolls.
 		if isvalid(playerEntity) == false or isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= self.RewardMapName then
-			self:ReceiveOffers({}, "INVALID_REWARD_MAP", revision, senderUserId)
+			self:ReceiveOffers({}, "INVALID_REWARD_MAP", revision, rerollReason, forUserId)
 			return
 		end
 		---@type NewSkillStageChoiceComponent
 		local provider = playerEntity.CurrentMap:GetComponent("script.NewSkillStageChoiceComponent")
 		if provider == nil then
-			self:ReceiveOffers({}, "PROVIDER_UNAVAILABLE", revision, senderUserId)
+			self:ReceiveOffers({}, "PROVIDER_UNAVAILABLE", revision, rerollReason, forUserId)
 			return
 		end
 		local offers = {}
@@ -160,12 +179,12 @@ script NewSkillSelectionUILogic extends Logic
 			table.insert(offers, offer)
 		end
 		if #offers > 0 then reason = "OK" end
-		self:ReceiveOffers(offers, reason, revision, senderUserId)
-		log("[NewSkillSelectionUI] offers sent user=" .. senderUserId .. " count=" .. tostring(#offers))
+		self:ReceiveOffers(offers, reason, revision, rerollReason, forUserId)
+		log("[NewSkillSelectionUI] offers sent user=" .. forUserId .. " count=" .. tostring(#offers))
 	end
 
 	@ExecSpace("Client")
-	method void ReceiveOffers(table offers, string reason, integer revision)
+	method void ReceiveOffers(table offers, string reason, integer revision, string rerollReason)
 		-- Displays server offers only for the current entry and centers one to three cards.
 		if revision ~= self.RequestRevision or self.ActiveMapName ~= self.RewardMapName or self.SelectionPending then return end
 		self.Loading = false
@@ -207,6 +226,11 @@ script NewSkillSelectionUILogic extends Logic
 			end
 		end
 		self:SetStatus("", false)
+		self:RefreshRerollButtons()
+		if rerollReason == "REROLLED" then self:SetStatus("다른 스킬로 변경했습니다 · 리롤 1회 사용", false)
+		elseif rerollReason == "NO_ALTERNATIVE" then self:SetStatus("다른 후보가 없습니다 · 리롤권 유지", false)
+		elseif rerollReason == "NO_REROLLS" then self:SetStatus("남은 리롤권이 없습니다", false)
+		elseif rerollReason ~= "" then self:SetStatus("후보 정보를 갱신했습니다. 다시 선택해 주세요.", false) end
 		log("[NewSkillSelectionUI] cards displayed count=" .. tostring(count) .. " first=" .. offers[1].SkillId)
 	end
 
@@ -225,6 +249,7 @@ script NewSkillSelectionUILogic extends Logic
 			return
 		end
 		self.SelectionPending = true
+		self:RefreshRerollButtons()
 		self.SelectedSkillId = offer.SkillId
 		self._T.Selection = { ChoiceIndex = slotIndex, SkillId = offer.SkillId, Context = offer.Context, Action = "SELECT", OldSkillId = "", Busy = false, Done = false }
 		for i = 1, 3 do
@@ -530,6 +555,49 @@ script NewSkillSelectionUILogic extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method void RefreshRerollButtons()
+		-- Aligns each reroll beneath its card and locks it during a pending transaction.
+		local count = math.min(3, #(self.Offers or {}))
+		local spacing = count == 3 and self.ThreeCardSpacing or self.TwoCardSpacing
+		for i, binding in pairs(self._T.RerollBindings or {}) do
+			local button = binding.Entity
+			local offer = self.Offers[i]
+			button.Enable = offer ~= nil and not self.SelectionPending
+			if offer ~= nil then
+				button.UITransformComponent.anchoredPosition = Vector2((i - (count + 1) / 2) * spacing, 0)
+				button.ButtonComponent.Enable = not self.Loading and not self.SelectionPending and (offer.Context.RerollCount or 0) > 0
+				self:SetText(self.GroupPath .. "/Screen/Rerolls/Slot" .. i, "리롤 (" .. tostring(offer.Context.RerollCount or 0) .. ")")
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestSlotReroll(integer slotIndex)
+		-- Sends the shown skill and reward revision, never a client-chosen replacement.
+		if self.ActiveMapName ~= self.RewardMapName or self.Loading or self.SelectionPending then return end
+		local offer = self.Offers[slotIndex]
+		if offer == nil or (offer.Context.RerollCount or 0) <= 0 then return end
+		self.Loading = true
+		self.RequestTimeout = 10
+		self.RequestRevision = self.RequestRevision + 1
+		self:RefreshRerollButtons()
+		self:SetStatus("다른 스킬을 뽑는 중입니다...", false)
+		_GameSettingsLogic:PlayUISound("972843e759204d3e9ad84e7d3fa94f83", 1)
+		self:RequestReroll(slotIndex, offer.SkillId, offer.Context, self.RequestRevision)
+	end
+
+	@ExecSpace("Server")
+	method void RequestReroll(integer slotIndex, string skillId, table context, integer revision)
+		-- Delegates validation and charging to the map-owned reward provider.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= self.RewardMapName then return end
+		local provider = player.CurrentMap:GetComponent("script.NewSkillStageChoiceComponent")
+		if provider == nil then return end
+		local result = provider:ProcessReroll(player, slotIndex, skillId, context)
+		self:SendOffers(player, revision, result.Reason, senderUserId)
+	end
+
+	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
 		-- Disconnects all retained UI events so play sessions never accumulate callbacks.
 		for i, card in pairs(self.Cards or {}) do
@@ -542,6 +610,13 @@ script NewSkillSelectionUILogic extends Logic
 		local retry = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Retry")
 		if isvalid(retry) and self.RetryBinding ~= nil then retry:DisconnectEvent(ButtonClickEvent, self.RetryBinding) end
 		self.RetryBinding = nil
+		for _, binding in pairs(self._T.RerollBindings or {}) do
+			if isvalid(binding.Entity) then
+				binding.Entity:DisconnectEvent(ButtonClickEvent, binding.Click)
+				binding.Entity:DisconnectEvent(UITouchEnterEvent, binding.Hover)
+			end
+		end
+		self._T.RerollBindings = {}
 		self.Bindings = {}
 		self.HoverBindings = {}
 		self.ExitBindings = {}

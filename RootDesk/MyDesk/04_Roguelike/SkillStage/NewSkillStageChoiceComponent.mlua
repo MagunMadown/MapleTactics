@@ -61,7 +61,7 @@ script NewSkillStageChoiceComponent extends Component
 				table.insert(previous[candidate.SkillId] and repeated or fresh, candidate)
 			end
 			for _, candidate in ipairs(repeated) do table.insert(fresh, candidate) end
-			cached = { RewardKey = rewardKey, PoolKey = poolKey, Skills = fresh, RunSequence = runState.RunSequence, JobId = runState.SelectedJobId }
+			cached = { RewardKey = rewardKey, PoolKey = poolKey, Skills = fresh, RunSequence = runState.RunSequence, JobId = runState.SelectedJobId, RerollRevision = 0 }
 			inventory._T.NewSkillOfferRoll = cached
 			log("[NewSkillStage] reward shuffled key=" .. rewardKey .. " candidates=" .. #candidateSkills)
 		end
@@ -127,8 +127,55 @@ script NewSkillStageChoiceComponent extends Component
 		-- Binds requests to one run reward and the exact inventory shown to the player.
 		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
 		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local owner = _RunManagerLogic:GetOrCreateRunAugmentState(playerEntity)
+		local roll = inventory._T.NewSkillOfferRoll
 		return { RunSequence = runState.RunSequence, RewardKey = "new_skill_stage:" .. runState.LastBattleRecordKey,
-			SkillRevision = inventory.SkillInventoryRevision, SlotIds = inventory.RunSkillBarSlotIds }
+			SkillRevision = inventory.SkillInventoryRevision, SlotIds = inventory.RunSkillBarSlotIds,
+			RerollRevision = roll ~= nil and (roll.RerollRevision or 0) or 0,
+			RerollCount = owner ~= nil and owner.AvailableRerollCount or 0 }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ProcessReroll(Entity playerEntity, integer choiceIndex, string expectedSkillId, table context)
+		-- Swaps one visible skill with an unseen eligible skill, atomically charging only a changed offer.
+		if not isvalid(playerEntity) or playerEntity.CurrentMap ~= self.Entity or self.Entity.Name ~= "new_skill_stage" then
+			return { Success = false, Reason = "INVALID_REWARD_MAP" }
+		end
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if run == nil or inventory == nil or run.LastBattleRecordKey == "" or context == nil then
+			return { Success = false, Reason = "BATTLE_REWARD_CONTEXT_UNAVAILABLE" }
+		end
+		local rewardKey = "new_skill_stage:" .. run.LastBattleRecordKey
+		if context.RunSequence ~= run.RunSequence or context.RewardKey ~= rewardKey
+			or inventory:ContainsDelimitedKey(inventory.AppliedRewardKeys, rewardKey) then
+			return { Success = false, Reason = "STALE_REWARD_CONTEXT" }
+		end
+		local choiceCount = math.min(3, math.max(1, _StageTransitionManagerLogic.NewSkillChoiceCount))
+		if choiceIndex ~= math.floor(choiceIndex) or choiceIndex < 1 or choiceIndex > choiceCount then
+			return { Success = false, Reason = "CHOICE_SLOT_UNAVAILABLE" }
+		end
+		local offer = self:ResolveOffer(playerEntity, choiceIndex)
+		if not offer.Success then return offer end
+		local roll = inventory._T.NewSkillOfferRoll
+		if offer.SkillId ~= expectedSkillId or context.RerollRevision ~= (roll.RerollRevision or 0)
+			or context.SkillRevision ~= inventory.SkillInventoryRevision or context.SlotIds ~= inventory.RunSkillBarSlotIds then
+			return { Success = false, Reason = "STALE_OFFER" }
+		end
+		local owner = _RunManagerLogic:GetOrCreateRunAugmentState(playerEntity)
+		if owner == nil or owner.ActiveRunSequence ~= run.RunSequence then return { Success = false, Reason = "RUN_AUGMENT_UNAVAILABLE" } end
+		if owner.AvailableRerollCount <= 0 then return { Success = false, Reason = "NO_REROLLS" } end
+		local alternatives = {}
+		for index = choiceCount + 1, #roll.Skills do
+			if _ContentValidatorLogic:ValidateSkillById(roll.Skills[index].SkillId).Success then table.insert(alternatives, index) end
+		end
+		if #alternatives == 0 then return { Success = false, Reason = "NO_ALTERNATIVE" } end
+		local otherIndex = alternatives[_UtilLogic:RandomIntegerRange(1, #alternatives)]
+		roll.Skills[choiceIndex], roll.Skills[otherIndex] = roll.Skills[otherIndex], roll.Skills[choiceIndex]
+		roll.RerollRevision = (roll.RerollRevision or 0) + 1
+		owner.AvailableRerollCount = owner.AvailableRerollCount - 1
+		log("[NewSkillReroll] slot=" .. choiceIndex .. " old=" .. expectedSkillId .. " new=" .. roll.Skills[choiceIndex].SkillId .. " remaining=" .. owner.AvailableRerollCount)
+		return { Success = true, Reason = "REROLLED" }
 	end
 
 	@ExecSpace("ServerOnly")
@@ -188,6 +235,7 @@ script NewSkillStageChoiceComponent extends Component
 		if offer.Success == false or offer.SkillId ~= skillId then
 			return { Success = false, Reason = offer.Success == false and offer.Reason or "OFFER_MISMATCH" }
 		end
+		if context.RerollRevision ~= offer.Context.RerollRevision then return { Success = false, Reason = "OFFER_MISMATCH" } end
 		local count = #inventory:GetDistinctOwnedSkillIds()
 		if resolving == false and count >= inventory.RunSkillBarSlotCount then
 			return self:BuildReplacementState(playerEntity, offer, "REPLACEMENT_REQUIRED")

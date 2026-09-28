@@ -3990,6 +3990,8 @@ script BattleSessionComponent extends Component
 			return result
 		end
 		result.ConsumesTurn = definition.FreePlay ~= true
+		local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relics ~= nil and relics:OnSkillLoaded(tileId, self.TurnNumber, not result.ConsumesTurn) then result.ConsumesTurn = false end
 		self:PublishTurnStateSnapshot("SKILL_QUEUED")
 		log("[BattleTileQueue] registered tile=" .. tileId .. " index=" .. result.QueueIndex .. " count=" .. result.QueueCount .. "/" .. capacity .. " turn=" .. self.TurnNumber .. " consumesTurn=" .. tostring(result.ConsumesTurn))
 		if result.ConsumesTurn == true and self.BattleResult == "" then
@@ -4038,9 +4040,13 @@ script BattleSessionComponent extends Component
 		log("[BattleTileQueue] tile started index=" .. self.ExecutingTileIndex .. "/" .. tileCount .. " tile=" .. tileId .. " action=" .. actionType)
 
 		local actionResult = nil
+		local isRelicRepeat = self._T.RelicRepeatIndex == self.TurnState.ExecutingTileIndex
+		self._T.ReplayingRelicSkill = isRelicRepeat
 		if actionType == "EXECUTE_SKILL" then
 			actionResult = self:TryExecuteSkill("player_01", tileId)
 		end
+		self._T.ReplayingRelicSkill = false
+		self._T.RelicRepeatIndex = nil
 
 		if actionResult == nil or actionResult.Success == false then
 			local reason = "EXECUTION_FAILED"
@@ -4052,6 +4058,8 @@ script BattleSessionComponent extends Component
 		end
 
 		local completedIndex = self.TurnState.ExecutingTileIndex
+		local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		local repeatSkill = not isRelicRepeat and relics ~= nil and relics:ConsumeReadyEffect("REPEAT_SKILL_INTERVAL", self.TurnNumber)
 		local expectedEntry = self.EntryRequestId
 		local executingQueue = self.TurnState.ExecutingTileIds
 		-- Impact time is only a lower bound: do not cut the cast short to start the next tile.
@@ -4063,6 +4071,12 @@ script BattleSessionComponent extends Component
 			log("[BattleTileQueue] tile completed index=" .. completedIndex .. "/" .. tileCount .. " tile=" .. tileId .. " reason=" .. actionResult.Reason)
 			if self.BattleResult ~= "" then
 				self:CompleteTileQueueExecution(true, "BATTLE_ENDED")
+				return
+			end
+			if repeatSkill and self._T.PendingClear == nil then
+				self._T.RelicRepeatIndex = completedIndex
+				log("[RunRelic] repeat cast skill=" .. tileId .. " index=" .. completedIndex)
+				self:ExecuteNextQueuedTile()
 				return
 			end
 			self.TurnState:AdvanceExecutingSkill()
@@ -4098,6 +4112,10 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void CompleteTileQueueExecution(boolean success, string reason)
 		-- Clears execution state once, then hands control to the enemy only after the full queue succeeds.
+		self._T.RelicRepeatIndex = nil
+		self._T.ReplayingRelicSkill = false
+		local relics = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent") or nil
+		if relics ~= nil then relics.LoadedCooldownReductions = {} end
 		self:ResetPlayerSkillChain(reason)
 		local executedCount = self.TurnState:GetTileIdCount(self.TurnState.ExecutingTileIds)
 		self.ActionTimerId = 0
@@ -4214,6 +4232,8 @@ script BattleSessionComponent extends Component
 			return result
 		end
 		self:PublishTurnStateSnapshot("SKILL_QUEUE_CLEARED")
+		local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relics ~= nil then relics.LoadedCooldownReductions = {} end
 		log("[BattleTileQueue] cleared count=" .. clearedCount .. " turn=" .. self.TurnNumber)
 		return result
 	end
@@ -4226,6 +4246,8 @@ script BattleSessionComponent extends Component
 			return result
 		end
 		self:PublishTurnStateSnapshot("SKILL_QUEUE_ITEM_REMOVED")
+		local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relics ~= nil then relics:CancelLoadedSkill(result.RemovedSkillId) end
 		log("[BattleTileQueue] removed index=" .. queueIndex .. " tile=" .. result.RemovedSkillId .. " remaining=" .. result.QueueCount .. " turn=" .. self.TurnNumber)
 		return result
 	end
@@ -5968,6 +5990,7 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table TryExecuteSkill(string sourceUnitId, string skillId)
 		-- Repeat the gate on the authoritative execution path, including already queued skills.
+		local relicRepeat = sourceUnitId == "player_01" and self._T.ReplayingRelicSkill == true
 		if sourceUnitId == "player_01" and self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		local validation = self:GetEffectiveSkillValidation(sourceUnitId, skillId)
 		if validation.Success == false then
@@ -6007,7 +6030,7 @@ script BattleSessionComponent extends Component
 				SkillId = skillId
 			}
 		end
-		local cooldownResult = runtimeState:CanUseSkill(skillId)
+		local cooldownResult = relicRepeat and { Success = true } or runtimeState:CanUseSkill(skillId)
 		if cooldownResult.Success == false then
 			return {
 				Success = false,
@@ -6028,7 +6051,7 @@ script BattleSessionComponent extends Component
 			self:ApplyStatusDamage(sourceUnitId, sourceUnit.BurnDamage, sourceUnit.BurnSourceUnitId, "BURN_CAST")
 			if sourceUnit.IsDead or self.BattleResult ~= "" then return { Success = true, Reason = "BURN_LETHAL", PresentationHandoffDuration = 0.01 } end
 		end
-		if definition.CostType == "HEAL_CHARGE" then inventory:SpendHealCharge(definition.CostValue) end
+		if definition.CostType == "HEAL_CHARGE" and not relicRepeat then inventory:SpendHealCharge(definition.CostValue) end
 		local isAttack = false
 		for _, step in ipairs(effectSteps) do
 			if step.EffectType == "DAMAGE" then isAttack = true end
@@ -6061,7 +6084,11 @@ script BattleSessionComponent extends Component
 			sourceUnit.NextArrowCount = 0
 			sourceUnit.NextArrowSkillId = ""
 		end
-		runtimeState:StartCooldown(skillId, definition.CooldownTurns)
+		if not relicRepeat then
+			local reduction = relics ~= nil and relics:ConsumeLoadedCooldownReduction(skillId) or 0
+			runtimeState:StartCooldown(skillId, math.max(0, definition.CooldownTurns - reduction))
+			if reduction > 0 then log("[RunRelic] loaded cooldown skill=" .. skillId .. " reduction=" .. reduction) end
+		end
 
 		-- Swap the avatar weapon before the motion starts so the swing shows the skill's own weapon.
 		self:ApplySkillWeapon(sourceUnitId, sourceEntity, definition)
@@ -6927,7 +6954,16 @@ script BattleSessionComponent extends Component
 		end
 
 		-- Skill damage uses the skill ID as the impact presentation key.
-		local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount, skillId)
+		local damageContext = self._T.RelicDamageContext
+		local zeroDamage = damageContext ~= nil and damageContext.SkillId == skillId
+			and damageContext.SourceUnitId == sourceUnitId and damageContext.Definition.ZeroDamage == true
+		local damageResult
+		if zeroDamage then
+			-- Zero damage is final: relics and attack buffs cannot turn the trade-off back into damage.
+			damageResult = { Success = true, AppliedAmount = 0, HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ExactLethal = false }
+		else
+			damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount, skillId)
+		end
 		if damageResult.Success == false then
 			result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
 			return result
@@ -7054,10 +7090,18 @@ script BattleSessionComponent extends Component
 			amount = amount + sourceUnit.NextAttackBonus
 			log("[BattleBuff] next attack bonus added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " bonus=" .. tostring(sourceUnit.NextAttackBonus) .. " amount=" .. tostring(amount))
 		end
-		-- Timed attack buffs stay active for their whole duration, so every hit in that window gets them.
-		if sourceUnit.AttackBuffAmount > 0 and not ignoresBuffs then
-			amount = amount + sourceUnit.AttackBuffAmount
-			log("[BattleBuff] attack buff added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " attack=" .. tostring(sourceUnit.AttackBuffAmount) .. " amount=" .. tostring(amount))
+		-- The executor shares one hit charge across area targets; each multi-hit index gets a new charge.
+		if not ignoresBuffs then
+			local hitScope = self._T.AttackBuffHit
+			local bonus = 0
+			if hitScope ~= nil and hitScope.SourceUnitId == sourceUnitId and hitScope.SkillId == attackId then
+				if hitScope.Amount == nil then hitScope.Amount = sourceUnit:ConsumeAttackBuffHit() end
+				bonus = hitScope.Amount
+			else
+				bonus = sourceUnit:ConsumeAttackBuffHit()
+			end
+			amount = amount + bonus
+			if bonus > 0 then log("[BattleBuff] attack buff added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " attack=" .. bonus .. " amount=" .. amount) end
 		end
 		if targetUnit.Team == "Player" and defenderEffects ~= nil and defenderEffects.IsInitialized
 			and defenderRun ~= nil and defenderEffects.ActiveRunSequence == defenderRun.RunSequence then
@@ -7369,6 +7413,8 @@ script BattleSessionComponent extends Component
 
 		local runResultRecorded = false
 		if isvalid(self.PlayerEntity) then
+			local playerUnit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+			if playerUnit ~= nil then playerUnit:ClearAttackBuffs() end
 			if self.BattleResult == "Victory" and self.DropRuntime ~= nil then
 				local dropRecordKey = self.StageId .. ":" .. tostring(self.EntryRequestId)
 				local collectResult = self.DropRuntime:AutoCollectAll(self.PlayerEntity, dropRecordKey)
@@ -7379,6 +7425,8 @@ script BattleSessionComponent extends Component
 				self.DropRuntime:DiscardPending("BATTLE_DEFEAT")
 			end
 			runResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
+			local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+			if relics ~= nil then relics:EndBattleEffects() end
 			if runResultRecorded == true then
 				if self.BattleResult == "Victory" then
 					local augments = self.PlayerEntity:GetComponent("script.PlayerRunAugmentComponent")

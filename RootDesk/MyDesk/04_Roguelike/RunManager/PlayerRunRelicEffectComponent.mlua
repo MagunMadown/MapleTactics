@@ -18,6 +18,9 @@ script PlayerRunRelicEffectComponent extends Component
 	property integer KillHealProgress = 0
 	property table DefeatedUnitIds = {}
 	property boolean FirstSkillUsed = false
+	property number BattleKillAttackBonus = 0
+	property table EffectReadyTurns = {}
+	property table LoadedCooldownReductions = {}
 	property table RemainingUses = {}
 	property table ExhaustedRelics = {}
 	@TargetUserSync property string InventoryDisplaySnapshot = ""
@@ -45,6 +48,9 @@ script PlayerRunRelicEffectComponent extends Component
 		self.KillHealProgress = 0
 		self.DefeatedUnitIds = {}
 		self.FirstSkillUsed = false
+		self.BattleKillAttackBonus = 0
+		self.EffectReadyTurns = {}
+		self.LoadedCooldownReductions = {}
 		self.RemainingUses = {}
 		self.ExhaustedRelics = {}
 		self.InventoryDisplaySnapshot = ""
@@ -196,6 +202,9 @@ script PlayerRunRelicEffectComponent extends Component
 		local recalculation = self:Recalculate()
 		if recalculation.Success == false then return end
 		self.ActiveBattleKey = key
+		self.BattleKillAttackBonus = 0
+		self.EffectReadyTurns = {}
+		self.LoadedCooldownReductions = {}
 		self.FirstSkillUsed = false
 		self.FirstHitGuardUsed = false
 		self.LethalSurvivalUsed = false
@@ -239,6 +248,12 @@ script PlayerRunRelicEffectComponent extends Component
 		-- Called only for an attributed, confirmed enemy death, before wave/victory settlement.
 		if not self:IsCurrentRun() or self.ActiveBattleKey == "" or self.DefeatedUnitIds[unitId] then return end
 		self.DefeatedUnitIds[unitId] = true
+		local gain = self:GetSpecialEffectValue("KILL_ATTACK_BATTLE")
+		if gain > 0 then
+			self.BattleKillAttackBonus = self.BattleKillAttackBonus + gain
+			self:PublishInventoryDisplay()
+			log("[RunRelic] kill attack bonus=" .. self.BattleKillAttackBonus .. " unit=" .. unitId)
+		end
 		self:ApplyRelicHealing("KILL_HEAL")
 		if self:GetSpecialEffectValue("THREE_KILL_HEAL") > 0 then
 			self.KillHealProgress = self.KillHealProgress + 1
@@ -315,7 +330,7 @@ script PlayerRunRelicEffectComponent extends Component
 		local offset = source.CellIndex - target.CellIndex
 		local distance = math.abs(offset)
 		local facing = target.Facing == "Right" and 1 or -1
-		local bonus = 0
+		local bonus = self:GetSpecialEffectValue("KILL_ATTACK_BATTLE") > 0 and self.BattleKillAttackBonus or 0
 		if offset * facing > 0 then bonus = bonus + self:GetSpecialEffectValue("FRONT_DAMAGE") end
 		if offset * facing < 0 then bonus = bonus + self:GetSpecialEffectValue("BACK_DAMAGE") end
 		if source.CurrentHp * 2 <= source.MaxHp then bonus = bonus + self:GetSpecialEffectValue("LOW_HP_DAMAGE") end
@@ -392,8 +407,60 @@ script PlayerRunRelicEffectComponent extends Component
 		end
 		self.InventoryDisplaySnapshot = _HttpService:JSONEncode({ RunSequence = self.ActiveRunSequence,
 			ItemSnapshot = inventory.RunItemSnapshot, Items = items,
-			Totals = { Attack = self.AttackBonus, MaxHp = self.MaxHpBonus, Defense = self.DefenseBonus,
+			Totals = { Attack = self.AttackBonus + (self:GetSpecialEffectValue("KILL_ATTACK_BATTLE") > 0 and self.BattleKillAttackBonus or 0), MaxHp = self.MaxHpBonus, Defense = self.DefenseBonus,
 				SpecialDescription = table.concat(descriptions, "\n\n") } })
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean ConsumeReadyEffect(string effectType, integer turnNumber)
+		-- Only accepted gameplay actions call this; the battle turn is the shared cooldown clock.
+		local cooldown = self:GetSpecialEffectValue(effectType)
+		if cooldown <= 0 or self.ActiveBattleKey == "" or turnNumber < (self.EffectReadyTurns[effectType] or 0) then return false end
+		self.EffectReadyTurns[effectType] = turnNumber + cooldown
+		log("[RunRelic] triggered effect=" .. effectType .. " turn=" .. turnNumber .. " ready=" .. self.EffectReadyTurns[effectType])
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean OnSkillLoaded(string skillId, integer turnNumber, boolean alreadyFree)
+		-- Natural free loading preserves the archer relic for the next paid load.
+		local freeLoad = false
+		if not alreadyFree then freeLoad = self:ConsumeReadyEffect("FREE_LOAD_INTERVAL", turnNumber) end
+		if self:ConsumeReadyEffect("LOAD_COOLDOWN_INTERVAL", turnNumber) then
+			self.LoadedCooldownReductions[skillId] = 3
+		end
+		return freeLoad
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer ConsumeLoadedCooldownReduction(string skillId)
+		-- Reserved by a successful load and spent once when that loaded skill is actually cast.
+		local amount = self.LoadedCooldownReductions[skillId] or 0
+		self.LoadedCooldownReductions[skillId] = nil
+		if self:GetSpecialEffectValue("LOAD_COOLDOWN_INTERVAL") <= 0 then return 0 end
+		return amount
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CancelLoadedSkill(string skillId)
+		-- Removing a loaded card drops its benefit without refunding the relic's internal cooldown.
+		self.LoadedCooldownReductions[skillId] = nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method void EndBattleEffects()
+		-- Battle-only bonuses and pending load effects never survive a result or map transfer.
+		self.BattleKillAttackBonus = 0
+		self.EffectReadyTurns = {}
+		self.LoadedCooldownReductions = {}
+		self.ActiveBattleKey = ""
+		self:PublishInventoryDisplay()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnMapLeave(Entity nextMap)
+		-- The player component owns cleanup across maps, unlike a global Logic singleton.
+		self:EndBattleEffects()
 	end
 
 	@ExecSpace("ServerOnly")
