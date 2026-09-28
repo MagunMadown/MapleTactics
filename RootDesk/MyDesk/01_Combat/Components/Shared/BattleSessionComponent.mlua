@@ -7096,7 +7096,8 @@ script BattleSessionComponent extends Component
 		end
 		if damageResult.AppliedAmount > 0 then
 			self:TryRegisterEnemyCastInterrupt(sourceUnitId, skillId, targetUnitId, result.DamageAmount)
-			self:PlayActiveHitEffect(targetUnitId)
+			local batch = self._T.damageNumberBatch
+			if batch == nil or batch.HitCount <= 1 then self:PlayActiveHitEffect(targetUnitId) end
 		end
 
 		local attackEvent = BasicAttackResolvedEvent()
@@ -7273,6 +7274,9 @@ script BattleSessionComponent extends Component
 		result.HpBefore = damageResult.HpBefore
 		result.HpAfter = damageResult.HpAfter
 		result.AppliedAmount = damageResult.AppliedAmount
+		local batch = self._T.damageNumberBatch
+		if batch ~= nil and (batch.SourceUnitId ~= sourceUnitId or batch.TargetUnitId ~= targetUnitId) then batch = nil end
+		local playImpact = damageResult.AppliedAmount > 0
 		if damageResult.AppliedAmount > 0 then
 			if sourceUnit.EnemyDefinitionId == "region_04_fire_boar" and not isFixedDamage and not damageResult.ReachedZero then
 				-- A guarded/zero-damage hit cannot ignite; preserve stronger indefinite player burns.
@@ -7282,19 +7286,25 @@ script BattleSessionComponent extends Component
 				targetUnit.BurnDamage = math.max(1, targetUnit.BurnDamage)
 				targetUnit.BurnSourceUnitId = sourceUnitId
 			end
-			self:PresentDamageNumber(sourceEntity, targetEntity, damageResult.AppliedAmount)
-			self:PlayAcceptedEnemyImpact(sourceEntity, targetEntity, attackId)
+			if batch ~= nil then
+				table.insert(batch.Damages, damageResult.AppliedAmount)
+				batch.HitCount = batch.HitCount + 1
+				playImpact = batch.HitCount == 1
+			else
+				self:PresentDamageNumber(sourceEntity, targetEntity, damageResult.AppliedAmount)
+			end
+			if playImpact then self:PlayAcceptedEnemyImpact(sourceEntity, targetEntity, attackId) end
 		end
 		local strongHit = amount >= math.max(0.01, self.StrongHitDamageThreshold)
 		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if sourcePresentation ~= nil then
+		if sourcePresentation ~= nil and playImpact then
 			sourcePresentation:PlayHitStop(sourceUnitId, strongHit, self.NormalHitStopDuration, self.StrongHitStopDuration)
 		end
 		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if targetPresentation ~= nil and damageResult.AppliedAmount > 0 then
-			targetPresentation:PlayHitImpact(targetUnitId, strongHit, self.NormalHitStopDuration, self.StrongHitStopDuration, self.HitReactionDuration, self.HitFlashDuration)
+		if targetPresentation ~= nil and playImpact then
+			targetPresentation:PlayHitImpact(targetUnitId, strongHit, self.NormalHitStopDuration, self.StrongHitStopDuration, self.HitReactionDuration, self.HitFlashDuration, batch ~= nil)
 		end
-		self:PlayImpactCameraShake(strongHit)
+		if playImpact then self:PlayImpactCameraShake(strongHit) end
 		if targetUnit.Team == "Player" then
 			self:RefreshPlayerHpSnapshot("DAMAGE_APPLIED")
 		end
@@ -7311,6 +7321,7 @@ script BattleSessionComponent extends Component
 				targetUnit.PoisonSourceUnitId = ""
 				targetUnit.PoisonMarkerRuid = ""
 				if not damageResult.ReachedZero then
+					if batch ~= nil then self:FlushDamageNumberBatch(batch) end
 					self:ApplyStatusDamage(targetUnitId, poisonBefore * attackerEffects:GetSpecialEffectValue("POISON_DETONATION"), sourceUnitId, "RELIC_POISON_DETONATION")
 					result.HpAfter = targetUnit.CurrentHp
 				end
@@ -7322,6 +7333,7 @@ script BattleSessionComponent extends Component
 			targetUnit:ApplyPoison(sourceUnitId, sourceUnit.VenomBuffAmount, sourceUnit.VenomMarkerRuid)
 		end
 		if damageResult.ReachedZero == true then
+			if batch ~= nil then self:FlushDamageNumberBatch(batch) end
 			self:HandleUnitDiedFromSource(targetUnitId, "DAMAGE", sourceUnitId)
 		end
 
@@ -7333,8 +7345,24 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void PresentDamageNumber(Entity sourceEntity, Entity targetEntity, number appliedAmount)
-		-- Resolve cosmetic selection on the server; this method never mutates HP or waits for rendering.
-		if not isvalid(targetEntity) or appliedAmount <= 0 then return end
+		-- Single hits use the same native damage-skin path as a multi-hit batch.
+		if appliedAmount <= 0 then return end
+		self:PresentDamageNumbers(sourceEntity, targetEntity, { appliedAmount }, 0)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FlushDamageNumberBatch(table batch)
+		-- Dispatch each accepted multi-hit segment before its target can be removed on death.
+		if batch == nil or batch.Damages == nil or #batch.Damages == 0 then return end
+		local amounts = batch.Damages
+		batch.Damages = {}
+		self:PresentDamageNumbers(self:FindUnitEntity(batch.SourceUnitId), self:FindUnitEntity(batch.TargetUnitId), amounts, 0.08)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PresentDamageNumbers(Entity sourceEntity, Entity targetEntity, table appliedAmounts, number delayPerAttack)
+		-- Resolve cosmetic selection once; the native service spaces values inside one damage list.
+		if not isvalid(targetEntity) or appliedAmounts == nil or #appliedAmounts == 0 then return end
 		local target = targetEntity:GetComponent("script.BattleUnitComponent")
 		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
 		if target == nil or presentation == nil then return end
@@ -7346,7 +7374,7 @@ script BattleSessionComponent extends Component
 			local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
 			if sourcePresentation ~= nil then skinId = sourcePresentation.OutgoingDamageSkinId end
 		end
-		presentation:PlayDamageNumber(target.UnitId, appliedAmount, skinId, playerTarget)
+		presentation:PlayDamageNumbers(target.UnitId, appliedAmounts, skinId, playerTarget, delayPerAttack)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -9187,7 +9215,7 @@ script BattleSessionComponent extends Component
 		if result.Success and result.AppliedAmount > 0 then
 			self:PresentDamageNumber(self:FindUnitEntity(sourceUnitId), entity, result.AppliedAmount)
 			local presentation = entity:GetComponent("script.BattleUnitPresentationComponent")
-			if presentation ~= nil then presentation:PlayHitImpact(targetUnitId, false, self.NormalHitStopDuration, self.StrongHitStopDuration, self.HitReactionDuration, self.HitFlashDuration) end
+			if presentation ~= nil then presentation:PlayHitImpact(targetUnitId, false, self.NormalHitStopDuration, self.StrongHitStopDuration, self.HitReactionDuration, self.HitFlashDuration, false) end
 			if unit.Team == "Player" then self:RefreshPlayerHpSnapshot(status) end
 			if result.ReachedZero then self:HandleUnitDiedFromSource(targetUnitId, status, sourceUnitId) end
 		end
