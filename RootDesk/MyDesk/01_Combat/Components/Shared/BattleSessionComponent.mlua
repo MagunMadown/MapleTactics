@@ -1491,6 +1491,21 @@ script BattleSessionComponent extends Component
 							end
 						end
 					end
+					-- An interrupted cast keeps its queued icon/status until the action resolves,
+					-- but its attack cells are no longer a valid warning for any client.
+					if plan.CastState == "INTERRUPTED" and plan.CastingSkillId == tileId then
+						targetCellSnapshot = ""
+						telegraphKind = ""
+						landingCell = -1
+					end
+					local displayActionType = actionType
+					if plan.PlanState == "PREPARED" and (actionType == "MOVE_TOWARD" or actionType == "MOVE_AWAY" or actionType == "MOVE_FIXED_FACING")
+						and (direction == -1 or direction == 1) then
+						local facingDirection = unit.Facing == "Right" and 1 or -1
+						if facingDirection ~= direction then
+							displayActionType = "TURN_TO_PLAYER"
+						end
+					end
 					table.insert(entries, table.concat({
 						unit.UnitId,
 						tostring(unit.SpawnOrder),
@@ -1498,7 +1513,7 @@ script BattleSessionComponent extends Component
 						tostring(plan.CurrentActionIndex),
 						tostring(plan.PlannedActionCount),
 						plan.TraitIds ~= "" and plan.TraitIds or "-",
-						actionType ~= "" and actionType or "-",
+						displayActionType ~= "" and displayActionType or "-",
 						tileId ~= "" and tileId or "-",
 						tostring(direction),
 						tostring(telegraphTurns),
@@ -2838,7 +2853,17 @@ script BattleSessionComponent extends Component
 		end
 		local isTrackingCommand = executingPlan.PlanState == "TRACKING"
 			and (intent.ActionType == "TURN_TO_PLAYER" or intent.ActionType == "MOVE_TOWARD" or intent.ActionType == "WAIT")
-		if isTrackingCommand == false then
+		local isMovement = intent.ActionType == "MOVE_TOWARD" or intent.ActionType == "MOVE_AWAY"
+			or intent.ActionType == "MOVE_FIXED_FACING"
+		local preMoveTurn = false
+		if isMovement and executingPlan.PlanState == "PREPARED" and (intent.Direction == -1 or intent.Direction == 1) then
+			local movingUnit = executingEnemy:GetComponent("script.BattleUnitComponent")
+			if movingUnit ~= nil then
+				local facingDirection = movingUnit.Facing == "Right" and 1 or -1
+				preMoveTurn = facingDirection ~= intent.Direction
+			end
+		end
+		if isTrackingCommand == false and preMoveTurn == false then
 			local planBegin = executingPlan:TryBeginCurrentAction()
 			if planBegin.Success == false then
 				log_error("[BattleEnemyIntent] plan execute rejected reason=" .. planBegin.Reason .. " enemy=" .. intent.EnemyId)
@@ -2849,7 +2874,7 @@ script BattleSessionComponent extends Component
 		self:PublishEnemyIntentSnapshot("EXECUTING")
 		self:PublishEnemyPlanSnapshot("ACTION_EXECUTING")
 		local actionDirection = intent.Direction
-		self.TurnState:UpdateEnemyAction("ENEMY_" .. intent.ActionType, actionDirection)
+		self.TurnState:UpdateEnemyAction(preMoveTurn and "ENEMY_TURN_TO_PLAYER" or "ENEMY_" .. intent.ActionType, actionDirection)
 		self:PublishTurnStateSnapshot("ENEMY_ACTION")
 		log("[BattleEnemyIntent] execute enemy=" .. intent.EnemyId .. " pattern=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " action=" .. intent.ActionType .. " tile=" .. intent.TileId .. " telegraphRemaining=" .. intent.TelegraphTurnsRemaining .. " preparedTurn=" .. intent.PreparedTurn .. " currentTurn=" .. self.TurnNumber)
 
@@ -2865,6 +2890,8 @@ script BattleSessionComponent extends Component
 		local actionResult = nil
 		if burnKilled then
 			actionResult = { Success = true, Reason = "BURN_LETHAL" }
+		elseif preMoveTurn then
+			actionResult = self:TryFaceDirection(intent.EnemyId, actionDirection)
 		elseif intent.ActionType == "MOVE_TOWARD" then
 			actionResult = self:TryMoveInternal(intent.EnemyId, actionDirection, true)
 		elseif intent.ActionType == "MOVE_AWAY" then
@@ -2904,7 +2931,7 @@ script BattleSessionComponent extends Component
 			self.TurnState:UpdateEnemyAction("ENEMY_WAIT", 0)
 			self:PublishTurnStateSnapshot("SUMMON_BLOCKED_WAIT")
 		end
-		if intent.ActionType == "MOVE_TOWARD" or intent.ActionType == "MOVE_AWAY" or intent.ActionType == "MOVE_FIXED_FACING" then
+		if isMovement and not preMoveTurn then
 			actionResult = self:ConvertBlockedEnemyMoveToWait(intent.EnemyId, intent.ActionType, actionDirection, actionResult)
 		end
 
@@ -2914,7 +2941,7 @@ script BattleSessionComponent extends Component
 			reason = actionResult.Reason
 		end
 
-		local duration = self:GetEnemyActionDuration(intent.ActionType, intent.TileId)
+		local duration = self:GetEnemyActionDuration(preMoveTurn and "TURN_TO_PLAYER" or intent.ActionType, intent.TileId)
 		if intent.ActionType == "EXECUTE_TILE" and actionResult ~= nil then
 			-- The actual impact delay already includes the final projectile; playback completion supplies the visual boundary.
 			duration = actionResult.PresentationHandoffDuration or 0.01
@@ -2926,7 +2953,7 @@ script BattleSessionComponent extends Component
 			end
 			completed = true
 			self.ActionTimerId = 0
-			if isTrackingCommand then
+			if isTrackingCommand or preMoveTurn then
 				self:CompleteQueuedAttackTrackingCommand(intent.EnemyId, intent.ActionType, success, reason)
 				return
 			end
@@ -3080,7 +3107,9 @@ script BattleSessionComponent extends Component
 			return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING", CanExecute = false }
 		end
 		local result = plan:ConsumeInterruptibleCast(skillId)
-		if result.Reason ~= "CAST_NOT_REQUIRED" then
+		-- The interrupted plan is still ATTACK_READY here. Publishing after clearing its
+		-- cast flag would briefly resurrect the cancelled area before action completion.
+		if result.Reason ~= "CAST_NOT_REQUIRED" and result.Reason ~= "CAST_INTERRUPTED" then
 			self:PublishEnemyPlanSnapshot(result.Reason)
 		end
 		return result
@@ -7441,7 +7470,7 @@ script BattleSessionComponent extends Component
 				return
 			end
 		end
-		if unit.Team == "Enemy" and self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0 then
+		if unit.Team == "Enemy" and not unit.IsBoss and self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0 then
 			-- Keep the frozen queue alive so healing/buffs resolve before wave or victory settlement.
 			self:ClearForcedSpawnSchedule("QUEUE_CLEAR_PENDING")
 			self._T.PendingClear = { UnitId = unitId, Cause = cause, Entry = self.EntryRequestId }

@@ -20,6 +20,8 @@ script EnemyIntentHudComponent extends Component
 	property number QueueSlotSpacing = 84
 	property number SkillIconOffsetX = 0
 	property number SkillIconOffsetY = 0
+	property number MoveArrowOffsetY = -16
+	property number MoveArrowFontSize = 18
 	property number SkillIconSize = 56
 	property number ReadyLabelWidth = 180
 	property number ReadyLabelHeight = 32
@@ -28,6 +30,7 @@ script EnemyIntentHudComponent extends Component
 	method void OnBeginPlay()
 		self._T.EnemyViews = {}
 		self._T.TelegraphViews = {}
+		self._T.AirborneBossRuid = {}
 		self._T.ActiveEnemyIds = {}
 		self._T.ActiveTelegraphKeys = {}
 		if self.EnemyIntentTemplate ~= nil then
@@ -104,8 +107,12 @@ script EnemyIntentHudComponent extends Component
 					end
 					self:ApplyEnemyIntent(view, intent, headOffsetUiY)
 				end
+				local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+				if intent.TelegraphKind == "BOSS_LANDING" and enemyUnit ~= nil and enemyUnit.IsAirborne == true then
+					self:ShowAirborneBossPreview(session, intent, enemyEntity)
+				end
 			end
-			if intent.IsAttackReady == true or intent.TelegraphKind == "BOSS_LANDING" or intent.TelegraphKind == "CHARGE_LINE" or intent.TelegraphKind == "SKILL_AREA" or intent.CastState == "CASTING" then
+			if intent.CastState ~= "INTERRUPTED" and (intent.IsAttackReady == true or intent.TelegraphKind == "BOSS_LANDING" or intent.TelegraphKind == "CHARGE_LINE" or intent.TelegraphKind == "SKILL_AREA" or intent.CastState == "CASTING") then
 				for cellToken in string.gmatch(intent.TargetCells or "", "([^|]+)") do
 					local cellIndex = math.floor(tonumber(cellToken) or -1)
 					if cellIndex >= 0 and session:IsValidCell(cellIndex) then
@@ -269,6 +276,11 @@ script EnemyIntentHudComponent extends Component
 			local marker = self:GetMovementMarker(intent)
 			moveArrow.Enable = marker ~= ""
 			moveArrow.TextGUIRendererComponent.Text = marker
+			moveArrow.TextGUIRendererComponent.FontSize = self.MoveArrowFontSize
+			if moveArrow.UITransformComponent ~= nil then
+				moveArrow.UITransformComponent.anchoredPosition = Vector2(0, self.MoveArrowOffsetY)
+				moveArrow.UITransformComponent.RectSize = Vector2(30, 24)
+			end
 		end
 	end
 
@@ -324,11 +336,14 @@ script EnemyIntentHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method string GetMovementMarker(table intent)
-		if intent.State ~= "TRACKING" then
-			return ""
-		end
+		-- Authored retreat and turn actions are PREPARED, not TRACKING.
 		local commandType = intent.NextCommandType or ""
 		local direction = intent.NextCommandDirection or 0
+		if commandType ~= "MOVE_TOWARD" and commandType ~= "MOVE_AWAY"
+			and commandType ~= "MOVE_FIXED_FACING" and commandType ~= "TURN_TO_PLAYER" then
+			commandType = intent.CommandType or ""
+			direction = intent.Direction or 0
+		end
 		if commandType == "MOVE_TOWARD" or commandType == "MOVE_AWAY" or commandType == "MOVE_FIXED_FACING" then
 			if direction < 0 then
 				return "◀"
@@ -395,6 +410,43 @@ script EnemyIntentHudComponent extends Component
 			label.TextGUIRendererComponent.Text = ""
 			label.TextGUIRendererComponent.Enable = false
 		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowAirborneBossPreview(any session, table intent, Entity enemyEntity)
+		-- Loop the boss's authored idle motion above the locked landing cell while its world body is untargetable.
+		local landingCell = intent.LandingCell or -1
+		local presentation = enemyEntity:GetComponent("script.BattleUnitPresentationComponent")
+		local idleRuid = presentation ~= nil and presentation.IdleMotionRuid or ""
+		if landingCell < 0 or session:IsValidCell(landingCell) == false or idleRuid == "" then
+			return
+		end
+		local key = "airborne:" .. intent.UnitId
+		local view = self._T.TelegraphViews[key]
+		if isvalid(view) == false then
+			if isvalid(self.TelegraphTemplate) == false then return end
+			view = self.TelegraphTemplate:Clone("AirborneBoss_" .. intent.UnitId)
+			self._T.TelegraphViews[key] = view
+		end
+		if view.SpriteGUIRendererComponent == nil or view.UITransformComponent == nil then return end
+		view.Enable = true
+		self._T.ActiveTelegraphKeys[key] = true
+		local sprite = view.SpriteGUIRendererComponent
+		if self._T.AirborneBossRuid[key] ~= idleRuid then
+			sprite.ImageRUID = DataRef(idleRuid)
+			self._T.AirborneBossRuid[key] = idleRuid
+			log("[EnemyIntentHUD] airborne idle preview enemy=" .. intent.UnitId .. " cell=" .. landingCell .. " ruid=" .. idleRuid)
+		end
+		sprite.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+		sprite.PlayRate = math.max(0.1, presentation.IdleMotionPlayRate or 1)
+		sprite.Type = ImageType.Simple
+		sprite.Color = Color(1, 1, 1, 1)
+		view.UITransformComponent.RectSize = Vector2(128, 128)
+		local position = session:GetCellPosition(landingCell)
+		local screenPosition = _UILogic:WorldToScreenPosition(Vector2(position.x, position.y + 1.45))
+		view.UITransformComponent.anchoredPosition = _UILogic:ScreenToUIPosition(screenPosition)
+		local label = view:GetChildByName("Label")
+		if isvalid(label) then label.Enable = false end
 	end
 
 	@ExecSpace("ClientOnly")
