@@ -4,7 +4,8 @@ script BattleUnitComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table RemoveNegativeStatusEffects()
 		-- Cleanses hostile statuses; positive buffs and guard retain their own lifetime.
-		if self.SealTurns <= 0 and self.StopActionTurns <= 0 and self.PoisonDamage <= 0 and self.BurnDamage <= 0 then
+		if self.SealTurns <= 0 and self.StopActionTurns <= 0 and self.PoisonDamage <= 0 and self.BurnDamage <= 0
+			and self.FrostbiteTurns <= 0 and self.ConfuseTurns <= 0 then
 			return { Success = false, Reason = "NO_NEGATIVE_STATUS_EFFECTS", AppliedAmount = 0 }
 		end
 		self.SealTurns = 0
@@ -16,14 +17,18 @@ script BattleUnitComponent extends Component
 		self.BurnDamage = 0
 		self.BurnTurns = 0
 		self.BurnSourceUnitId = ""
+		self.FrostbiteTurns = 0
+		self.ConfuseTurns = 0
 		log("[BattleStatus] cleansed unit=" .. self.UnitId)
 		return { Success = true, Reason = "CLEANSED", AppliedAmount = 1 }
 	end
 
 	@Sync property integer StopActionTurns = 0
 	@Sync property string StopMarkerRuid = ""
-	property number BurnDamage = 0
-	property integer BurnTurns = 0
+	@Sync property number BurnDamage = 0
+	@Sync property integer BurnTurns = 0
+	@Sync property integer FrostbiteTurns = 0
+	@Sync property integer ConfuseTurns = 0
 	property string BurnSourceUnitId = ""
 	property integer NextArrowCount = 0
 	property string NextArrowSkillId = ""
@@ -114,6 +119,8 @@ script BattleUnitComponent extends Component
 		self.UtilityGuardActive = false
 		self:ClearBattleBuffs()
 		self.SealTurns = 0
+		self.FrostbiteTurns = 0
+		self.ConfuseTurns = 0
 		self.PoisonDamage = 0
 		self.PoisonSourceUnitId = ""
 		self.PoisonMarkerRuid = ""
@@ -130,6 +137,30 @@ script BattleUnitComponent extends Component
 		self.SealTurns = math.max(self.SealTurns, turns)
 		log("[BattleStatus] sealed unit=" .. self.UnitId .. " turns=" .. tostring(self.SealTurns))
 		return { Success = true, Hit = true, Reason = "SEALED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyHostileStatus(string kind, integer turns, number damage, string sourceUnitId)
+		-- Enemy-applied player statuses; frostbite and confusion never overlap, burn refreshes to the stronger one.
+		if self.IsDead or turns < 1 then return { Success = false, Hit = false, Reason = "INVALID_STATUS_TARGET" } end
+		if kind == "IGNITE" then
+			if damage <= 0 then return { Success = false, Hit = false, Reason = "INVALID_STATUS_DAMAGE" } end
+			-- An indefinite burn (BurnTurns 0 with damage) is already stronger than any timed one.
+			if self.BurnDamage <= 0 or self.BurnTurns > 0 then self.BurnTurns = math.max(self.BurnTurns, turns) end
+			self.BurnDamage = math.max(self.BurnDamage, damage)
+			self.BurnSourceUnitId = sourceUnitId
+			log("[BattleStatus] ignited unit=" .. self.UnitId .. " damage=" .. tostring(self.BurnDamage) .. " turns=" .. tostring(self.BurnTurns))
+			return { Success = true, Hit = true, Reason = "IGNITED" }
+		end
+		if kind ~= "FROSTBITE" and kind ~= "CONFUSE" then return { Success = false, Hit = false, Reason = "UNKNOWN_HOSTILE_EFFECT" } end
+		if self.FrostbiteTurns > 0 or self.ConfuseTurns > 0 then
+			log("[BattleStatus] control resisted unit=" .. self.UnitId .. " kind=" .. kind)
+			return { Success = true, Hit = false, Reason = "CONTROL_RESISTED" }
+		end
+		-- Frostbite lasts player actions; confusion is a count of upcoming skill casts to reverse.
+		if kind == "FROSTBITE" then self.FrostbiteTurns = turns else self.ConfuseTurns = turns end
+		log("[BattleStatus] " .. (kind == "FROSTBITE" and "frostbitten" or "confused") .. " unit=" .. self.UnitId .. " turns=" .. tostring(turns))
+		return { Success = true, Hit = true, Reason = kind == "FROSTBITE" and "FROSTBITTEN" or "CONFUSED" }
 	end
 
 	@ExecSpace("ServerOnly")
@@ -150,6 +181,8 @@ script BattleUnitComponent extends Component
 	method void AdvanceNegativeStatusTurns()
 		-- Runs after the player's next consumed action, never immediately after the enemy applies seal.
 		self.SealTurns = math.max(0, self.SealTurns - 1)
+		self.FrostbiteTurns = math.max(0, self.FrostbiteTurns - 1)
+		-- ConfuseTurns counts pending skill reversals; queueing consumes actions, so only casts spend it.
 		if self.BurnTurns > 0 then
 			self.BurnTurns = self.BurnTurns - 1
 			if self.BurnTurns == 0 then self.BurnDamage = 0; self.BurnSourceUnitId = "" end
@@ -169,6 +202,8 @@ script BattleUnitComponent extends Component
 		self.BurnDamage = 0
 		self.BurnTurns = 0
 		self.BurnSourceUnitId = ""
+		self.FrostbiteTurns = 0
+		self.ConfuseTurns = 0
 		self.NextArrowCount = 0
 		self.NextArrowSkillId = ""
 		self.PreviousSkillWasAttack = false
