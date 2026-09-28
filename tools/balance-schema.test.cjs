@@ -4,8 +4,8 @@ const S=require("./balance-schema.js");
 const dataDir=path.join(__dirname,"../RootDesk/MyDesk/03_Data");
 const all=Object.fromEntries(fs.readdirSync(dataDir).filter(n=>n.endsWith(".csv")).map(n=>[n.slice(0,-4),S.parseCSV(fs.readFileSync(path.join(dataDir,n),"utf8"))]));
 const copy=()=>structuredClone(all);
-test("all 46 current CSVs pass explicit schema; original bytes round-trip",()=>{
-  assert.equal(Object.keys(all).length,46);assert.deepEqual(S.validate(all),[]);
+test("all 47 current CSVs pass explicit schema; original bytes round-trip",()=>{
+  assert.equal(Object.keys(all).length,47);assert.deepEqual(S.validate(all),[]);
   for(const t of Object.values(all))assert.equal(S.serializeCSV(t),t.raw);
 });
 test("six legacy union tables read-only, six current tables editable",()=>{
@@ -82,4 +82,10 @@ test("browser scripts parse and module exports without Node",()=>{
 test("required enemy skill cannot be blank even though WAIT permits blank",()=>{
   const t=copy();t.EnemyPatternSteps.rows[0].TileId="";
   assert.ok(S.validate(t).some(e=>e.code==="PATTERN_TILE_ID_MISSING"));
+});
+test("THROW_BEHIND utility effect follows ContentValidator.ValidateUtilityEffect",()=>{
+  const t=copy();const step=t.UtilitySkillEffectSteps.rows.find(r=>r.EffectType==="THROW_BEHIND");
+  assert.ok(step);assert.deepEqual(S.validate(t),[]);
+  step.Value="0";
+  assert.ok(S.validate(t).some(e=>e.code==="INVALID_UTILITY_EFFECT_PARAMETERS"));
 });

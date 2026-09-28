@@ -2,6 +2,10 @@
 
 ## 현재 지원 범위
 
+> 강화가 끝난 스킬에 붙는 **스킬 증강**(`ExclusiveGroup=SKILL_AUGMENT`, `SKILL_BUILD`·`SKILL_MODIFIER`)과
+> 업그레이드 스테이지 3택·리롤은 [`Skill-Augment-Reroll-Guide.md`](./Skill-Augment-Reroll-Guide.md)를 따른다.
+> 이 문서는 직업 시작 패시브와 전역 증강만 다룬다.
+
 직업 시작 패시브와 향후 상점·보상 증강은 같은 `AugmentDefinitions`와 `AugmentEffects` 규격을
 사용한다. 현재 런타임에서 지원하는 최소 조합은 다음과 같다.
 
