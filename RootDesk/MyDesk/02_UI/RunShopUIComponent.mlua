@@ -25,6 +25,12 @@ script RunShopUIComponent extends Component
 	property string LastSellClickedId = ""
 	property number LastBuyClickTime = -1
 	property string LastBuyClickedId = ""
+	property boolean BuybackMode = false
+	property boolean BuybackPending = false
+	property integer BuybackPage = 1
+	property integer BuybackPageCount = 1
+	property string BuybackMessage = ""
+	property table BuybackHandlers = {}
 	property integer SelectedOfferIndex = 0
 	property integer PurchaseRequestId = 200000
 	property string LastRevisionKey = ""
@@ -69,6 +75,14 @@ script RunShopUIComponent extends Component
 			end
 		end
 		self:BindTooltipRows()
+		for name, action in pairs({BuyTab = function() self:SelectBuyMode(false) end,
+			BuybackTab = function() self:SelectBuyMode(true) end,
+			BuybackPrevious = function() self:ChangeBuybackPage(-1) end,
+			BuybackNext = function() self:ChangeBuybackPage(1) end,
+			BuybackButton = function() self:OnBuyClicked() end}) do
+			local button = self:GetEntity("ShopPopup/" .. name)
+			if isvalid(button) then self.BuybackHandlers[name] = button:ConnectEvent(ButtonClickEvent, action) end
+		end
 		self:SetPopupVisible(false)
 		log("[RunShopUI] controller ready")
 	end
@@ -132,7 +146,8 @@ script RunShopUIComponent extends Component
 			state.SkillSnapshot or "", state.ConsumableSnapshot or "",
 			state.LastPurchase.OfferId or "", tostring(state.LastPurchase.Success),
 			state.LastPurchase.Reason or "", tostring(state.Commands.CanPurchase),
-			state.SellCatalogSnapshot or "", tostring(self.SalePending), self.SaleMessage
+			state.SellCatalogSnapshot or "", tostring(self.SalePending), self.SaleMessage,
+			state.BuybackSnapshot or "", tostring(self.BuybackPending), self.BuybackMessage
 		}, "\n")
 		if refreshKey == self.LastRevisionKey then return end
 		if state.ShopState == "OPEN" then self.WaitingForOpen = false end
@@ -152,8 +167,20 @@ script RunShopUIComponent extends Component
 			self.SellFilter = "ALL"
 			self.SalePending = false
 			self.SaleMessage = ""
+			self.BuybackMode = false
+			self.BuybackPage = 1
+			self.BuybackPending = false
+			self.BuybackMessage = ""
 		end
 		self.Offers = self:ParseOffers(state.OfferSnapshot)
+		if self.BuybackMode then
+			local all = self:ParseOffers(state.BuybackSnapshot)
+			self.BuybackPageCount = math.max(1, math.ceil(#all / 17))
+			self.BuybackPage = math.min(self.BuybackPage, self.BuybackPageCount)
+			self.Offers = {}
+			for i = (self.BuybackPage - 1) * 17 + 1, math.min(self.BuybackPage * 17, #all) do table.insert(self.Offers, all[i]) end
+		end
+		self:RefreshBuybackControls(state)
 		self:SetText("ShopPopup/Title", "상점")
 		self:SetText("ShopPopup/GoldPanel/Fill/GoldText", tostring(self:GetSnapshotAmount(state.CurrencySnapshot, "gold")))
 		for rowIndex = 1, 17 do
@@ -180,7 +207,9 @@ script RunShopUIComponent extends Component
 		end
 		self:RefreshSelectedOffer(state)
 		self:RefreshSellOffers(state)
-		if state.LastPurchase.Reason ~= "" and state.LastPurchase.Reason ~= "SHOP_OPENED" then
+		if self.BuybackMode then
+			self:SetStatus(self.BuybackMessage ~= "" and self.BuybackMessage or (#self.Offers == 0 and "재구매할 유물이나 포션이 없습니다." or "판매했던 가격으로 1개씩 재구매합니다."))
+		elseif state.LastPurchase.Reason ~= "" and state.LastPurchase.Reason ~= "SHOP_OPENED" then
 			local reason = state.LastPurchase.Reason
 			if reason == "PURCHASE_APPLIED" or reason == "DUPLICATE_PURCHASE_IGNORED" or reason == "DUPLICATE_PURCHASE_REQUEST_IGNORED" then
 				self:SetStatus("구매가 완료되었습니다.")
@@ -283,6 +312,17 @@ script RunShopUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnBuyClicked()
+		if self.BuybackMode then
+			if self.BuybackPending then return end
+			local offer = self.Offers[self.SelectedOfferIndex]
+			local state = _RunShopLogic:GetLocalShopUiState()
+			if offer == nil or not state.Success or state.ShopState ~= "OPEN" then return end
+			self.BuybackPending = true
+			self.BuybackMessage = "재구매 중입니다."
+			self.LastRevisionKey = ""
+			_RunShopLogic:RequestBuybackItem(offer.OfferId, state.RunSequence, state.VisitSequence, state.InventoryRevision)
+			return
+		end
 		local offer = self.Offers[self.SelectedOfferIndex]
 		log("[RunShopUI] buy clicked selected=" .. tostring(self.SelectedOfferIndex))
 		if offer == nil then
@@ -520,6 +560,7 @@ script RunShopUIComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void SetStatus(string message)
 		self:SetText("ShopPopup/StatusText", message or "")
+		self:SetText("ShopPopup/TitleBar/Subtitle", message or "")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -597,8 +638,8 @@ script RunShopUIComponent extends Component
 		self:SetText(root .. "Name", offer.DisplayName)
 		self:SetText(root .. "Category", isSkill and "보유 스킬" or (isConsumable and "소비 아이템" or "이번 런에 적용되는 유물"))
 		self:SetText(root .. "Description", selling and offer.Description or offer.EffectDescription)
-		self:SetText(root .. "EffectHint", isSkill and "스킬은 최소 1개 남겨야 합니다." or (isConsumable and "사용하면 보유 수량이 감소합니다." or "판매하면 유물 효과가 사라집니다."))
-		self:SetText(root .. "Price", (selling and "판매 가격: " or "구매 가격: ") .. tostring(offer.Price) .. " 골드")
+		self:SetText(root .. "EffectHint", (not selling and self.BuybackMode) and "판매 당시 가격으로 되살 수 있습니다." or (isSkill and "스킬은 최소 1개 남겨야 합니다." or (isConsumable and "사용하면 보유 수량이 감소합니다." or "판매하면 유물 효과가 사라집니다.")))
+		self:SetText(root .. "Price", (selling and "판매 가격: " or (self.BuybackMode and "재구매 가격: " or "구매 가격: ")) .. tostring(offer.Price) .. " 골드")
 		local remaining = selling and offer.Count or (self:ContainsId(state.PurchasedOfferIds, offer.OfferId) and 0 or 1)
 		self:SetText(root .. "Quantity", (selling and "보유 수량: " or "남은 수량: ") .. tostring(remaining))
 		local icon = self:GetEntity(root .. "Icon")
@@ -636,6 +677,10 @@ script RunShopUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		for name, subscription in pairs(self.BuybackHandlers) do
+			local button = self:GetEntity("ShopPopup/" .. name)
+			if isvalid(button) then button:DisconnectEvent(ButtonClickEvent, subscription) end
+		end
 		-- Release all purchase and sale event subscriptions.
 		for _, binding in ipairs(self.TooltipHandlers) do
 			if isvalid(binding.Entity) then binding.Entity:DisconnectEvent(binding.Event, binding.Subscription) end
@@ -662,6 +707,74 @@ script RunShopUIComponent extends Component
 			if isvalid(row) and self.RowHandlers[rowIndex] ~= nil then row:DisconnectEvent(ButtonClickEvent, self.RowHandlers[rowIndex]) end
 			if isvalid(row) and self.HoverHandlers[rowIndex] ~= nil then row:DisconnectEvent(UITouchEnterEvent, self.HoverHandlers[rowIndex]) end
 		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectBuyMode(boolean buyback)
+		self:HideItemTooltip()
+		self.BuybackMode = buyback
+		self.BuybackPage = 1
+		self.SelectedOfferIndex = 0
+		self.LastBuyClickedId = ""
+		self.BuybackMessage = ""
+		self.LastRevisionKey = ""
+		local scroll = self:GetEntity("ShopPopup/ListFrame/ListScroll")
+		if isvalid(scroll) then scroll.ScrollLayoutGroupComponent:ResetScrollPosition(UITransformAxis.Vertical) end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success then self:RefreshFromState(state) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ChangeBuybackPage(integer direction)
+		self.BuybackPage = math.max(1, math.min(self.BuybackPageCount, self.BuybackPage + direction))
+		self.SelectedOfferIndex = 0
+		self.LastBuyClickedId = ""
+		self.LastRevisionKey = ""
+		local scroll = self:GetEntity("ShopPopup/ListFrame/ListScroll")
+		if isvalid(scroll) then scroll.ScrollLayoutGroupComponent:ResetScrollPosition(UITransformAxis.Vertical) end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success then self:RefreshFromState(state) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshBuybackControls(table state)
+		for _, name in ipairs({"BuybackPrevious", "BuybackNext", "BuybackPage", "BuybackButton"}) do
+			local entity = self:GetEntity("ShopPopup/" .. name)
+			if isvalid(entity) then entity.Enable = self.BuybackMode end
+		end
+		local scroll = self:GetEntity("ShopPopup/ListFrame/ListScroll")
+		if isvalid(scroll) then
+			scroll.UITransformComponent.RectSize = Vector2(472, self.BuybackMode and 566 or 626)
+			scroll.UITransformComponent.anchoredPosition = Vector2(0, self.BuybackMode and 30 or 0)
+		end
+		local empty = self:GetEntity("ShopPopup/ListFrame/Empty")
+		if isvalid(empty) then empty.Enable = #self.Offers == 0 end
+		self:SetText("ShopPopup/ListFrame/Empty", self.BuybackMode and "재구매할 아이템이 없습니다." or "판매 중인 상품이 없습니다.")
+		self:SetText("ShopPopup/BuybackPage", tostring(self.BuybackPage) .. " / " .. tostring(self.BuybackPageCount))
+		self:SetText("ShopPopup/BuybackButton", self.BuybackPending and "재구매 중" or "선택 아이템 재구매")
+		local button = self:GetEntity("ShopPopup/BuybackButton")
+		if isvalid(button) then button.ButtonComponent.Enable = #self.Offers > 0 and state.ShopState == "OPEN" and not self.BuybackPending end
+		local previous = self:GetEntity("ShopPopup/BuybackPrevious")
+		local nextButton = self:GetEntity("ShopPopup/BuybackNext")
+		if isvalid(previous) then previous.ButtonComponent.Enable = self.BuybackPage > 1 end
+		if isvalid(nextButton) then nextButton.ButtonComponent.Enable = self.BuybackPage < self.BuybackPageCount end
+		for _, name in ipairs({"BuyTab", "BuybackTab"}) do
+			local tab = self:GetEntity("ShopPopup/" .. name)
+			local active = (name == "BuybackTab") == self.BuybackMode
+			if isvalid(tab) then tab.SpriteGUIRendererComponent.Color = active and Color(0.16, 0.70, 0.79, 1) or Color(0.43, 0.48, 0.54, 1) end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleBuybackResult(boolean success, string reason)
+		self.BuybackPending = false
+		local messages = { INSUFFICIENT_CURRENCY = "골드가 부족합니다.", CONSUMABLE_CAPACITY_FULL = "포션 보유 한도에 도달했습니다.",
+			RELIC_ALREADY_OWNED = "이미 보유한 유물입니다.", RELIC_NOT_ELIGIBLE = "이미 보유했거나 획득할 수 없는 유물입니다.",
+			INVENTORY_CHANGED = "보유 상태가 변경되었습니다. 다시 선택해 주세요.", BUYBACK_NOT_AVAILABLE = "이미 재구매한 아이템입니다." }
+		self.BuybackMessage = success and "판매했던 가격으로 재구매했습니다." or (messages[reason] or "상점을 다시 열어 주세요.")
+		self.LastBuyClickedId = ""
+		self.LastRevisionKey = ""
+		log("[RunShopBuybackUI] success=" .. tostring(success) .. " reason=" .. reason)
 	end
 
 end

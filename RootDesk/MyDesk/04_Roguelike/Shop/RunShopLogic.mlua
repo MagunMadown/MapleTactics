@@ -180,6 +180,7 @@ script RunShopLogic extends Logic
 			end
 		end
 		local result = inventory:ApplyShopSale(itemId, itemType, price, expectedRevision)
+		if result.Success then shopState:RecordBuyback(itemId, itemType, result.Gold) end
 		if result.Success and effects ~= nil then effects:Recalculate() end
 		return result
 	end
@@ -396,6 +397,7 @@ script RunShopLogic extends Logic
 			RunSequence = shopState.ActiveRunSequence,
 			InventoryRevision = inventory.InventoryRevision,
 			SellCatalogSnapshot = shopState.SellCatalogSnapshot,
+			BuybackSnapshot = shopState.BuybackSnapshot,
 			OfferSnapshot = shopState.OfferSnapshot,
 			PurchasedOfferIds = shopState.PurchasedOfferIds,
 			CurrencySnapshot = inventory.RunCurrencySnapshot,
@@ -430,6 +432,48 @@ script RunShopLogic extends Logic
 		local effects = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		if effects == nil then effects = playerEntity:AddComponent("PlayerRunRelicEffectComponent") end
 		return effects
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuybackItem(Entity player, string receiptId, integer runSequence, integer visitSequence, integer expectedRevision)
+		local run = _RunManagerLogic:GetOrCreateRunState(player)
+		local shop = self:GetOrCreateShopState(player)
+		local inventory = _RunManagerLogic:GetOrCreateRunInventory(player)
+		if run == nil or shop == nil or inventory == nil then return { Success = false, Reason = "SHOP_NOT_OPEN" } end
+		if shop.ShopState ~= "OPEN" or runSequence ~= run.RunSequence or runSequence ~= shop.ActiveRunSequence
+			or runSequence ~= inventory.ActiveRunSequence or visitSequence ~= shop.VisitSequence
+			or run.RunFlowState ~= "AWAITING_SHOP" or run.SelectedContentType ~= "SHOP"
+			or run.ContentTransitionState ~= "READY" or shop.ActiveShopId ~= run.SelectedContentId
+			or shop.ActiveNodeId ~= run.SelectedNodeId or shop.VisitKey ~= run.LastContentSelectionKey then
+			return { Success = false, Reason = "SHOP_NOT_OPEN" }
+		end
+		if inventory.InventoryRevision ~= expectedRevision then return { Success = false, Reason = "INVENTORY_CHANGED" } end
+		for index, entry in ipairs(shop.BuybackEntries) do
+			if entry.ShopEntryId == receiptId then
+				local result = _RunManagerLogic:ApplyRunShopPurchase(player, entry, receiptId)
+				if result.Success then
+					table.remove(shop.BuybackEntries, index)
+					shop:PublishBuybacks()
+					log("[RunShopBuyback] restored item=" .. entry.RewardRefId .. " price=" .. entry.PriceAmount .. " receipt=" .. receiptId)
+				end
+				return result
+			end
+		end
+		return { Success = false, Reason = "BUYBACK_NOT_AVAILABLE" }
+	end
+
+	@ExecSpace("Server")
+	method void RequestBuybackItem(string receiptId, integer runSequence, integer visitSequence, integer expectedRevision)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:BuybackItem(player, receiptId, runSequence, visitSequence, expectedRevision)
+		self:NotifyBuybackResult(result.Success, result.Reason, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyBuybackResult(boolean success, string reason)
+		local root = _EntityService:GetEntityByPath("/ui/RunShopUI")
+		local controller = isvalid(root) and root:GetComponent("script.RunShopUIComponent") or nil
+		if controller ~= nil then controller:HandleBuybackResult(success, reason) end
 	end
 
 end
