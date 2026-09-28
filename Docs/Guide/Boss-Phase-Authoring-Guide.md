@@ -148,19 +148,19 @@ Phase 전환에 직접 연동되는 증원이 필요한 보스는 여전히
 ## Region 06 슬리피우드 Stage 6-8 주니어 발록 예시
 
 `region_06_stage_08`은 슬리피우드 후반전(신전)의 보스 스테이지다. 물리 맵은 `sleepywood_temple_boss`이며
-리소스 팩의 공격 3종을 모두 스킬로 사용한다. 증원은 없다.
+리소스 팩의 공격 3종을 모두 스킬로 사용한다. Phase 2에서 와일드카고 증원(`region_06_jr_balrog_adds`, 3턴 간격, 살아 있는 일반 적 최대 2)이 있다.
 
 | 구분 | 설정 |
 |---|---|
 | Stage | `region_06_stage_08`, `StageType=BOSS`, 1 Wave (`CLEAR_ONLY`), Pool `region_06_stage_08_boss_pool` |
-| Enemy | `region_06_jr_balrog`, HP 36, `BasicAttackDamage=5`, `IsBoss=true` |
+| Enemy | `region_06_jr_balrog`, HP 44, `BasicAttackDamage=6`, `IsBoss=true` |
 | Model | `region06jrbalrog` (`Scale=1.2`, 화염구 `ProjectileHeight=1.2`) |
-| 할퀴기 (`attack1`) | `region_06_jr_balrog_claw`, 전방 1칸, 피해는 `BasicAttackDamage=5` |
-| 화염구 (`attack2`) | `region_06_jr_balrog_fireball`, 전방 3칸 안 첫 적에게 `info/ball` 투사체, 피해 4, 쿨타임 2 |
-| 불꽃 휩쓸기 (`attack3`) | `region_06_jr_balrog_flame_sweep`, 1턴 예고 후 전방 1~3칸, 피해 6 |
-| 격노 휩쓸기 | `region_06_jr_balrog_flame_sweep_enraged`, 1턴 예고 후 전방 1~3칸, 피해 7 |
+| 할퀴기 (`attack1`) | `region_06_jr_balrog_claw`, 전방 1칸, 피해는 `BasicAttackDamage=6` |
+| 화염구 (`attack2`) | `region_06_jr_balrog_fireball`, 전방 3칸 안 첫 적에게 `info/ball` 투사체, 피해 5, 쿨타임 2 |
+| 불꽃 휩쓸기 (`attack3`) | `region_06_jr_balrog_flame_sweep`, 1턴 예고 후 전방 1~3칸, 피해 7 |
+| 격노 휩쓸기 | `region_06_jr_balrog_flame_sweep_enraged`, 1턴 예고 후 전방 1~3칸, 피해 8 |
 | Phase 1 | `OPENING`: 할퀴기 → 화염구 → 대기 → 휩쓸기 예고 → 실행 → 대기 |
-| Phase 2 | HP 50% 이하 `ENRAGED`: 격노 휩쓸기 예고 → 실행 → 화염구 → 할퀴기 → 대기 |
+| Phase 2 | HP 50% 이하 `ENRAGED`: 격노 휩쓸기 예고 → 실행 → 화염구 → 할퀴기 → 할퀴기, 3턴마다 와일드카고 증원 |
 | 처치 드롭 | 골드 8~10, 하얀 포션 1개 |
 
 화염구는 적 스킬 최초의 투사체 사용 사례다. 투사체 연출은 플레이어 스킬과 같은

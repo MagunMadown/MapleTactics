@@ -177,10 +177,13 @@ Maker 직접 실행은 MapId 기준 공통 테스트 진입기를 사용한다. 
 
 | Stage | 물리 맵 | Wave 수 | 기본 구성 |
 |---|---|---:|---|
-| `region_06_stage_05` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 와일드카고 2 → 타우로스피어 1 |
-| `region_06_stage_06` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 타우로스피어 2 → 타우로마시스 1 |
-| `region_06_stage_07` | `sleepywood_temple_battle` | 3 | 타우로스피어 2 → 타우로마시스 2 → 타우로마시스 1 |
-| `region_06_stage_08` | `sleepywood_temple_boss` | 1 | 보스 주니어 발록 1, `StageType=BOSS`, 2 Phase, 증원 없음 |
+| `region_06_stage_05` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 와일드카고 2 → 타우로스피어 2 |
+| `region_06_stage_06` | `sleepywood_temple_battle` | 3 | 와일드카고 2 → 타우로스피어 2 → 타우로마시스 2 |
+| `region_06_stage_07` | `sleepywood_temple_battle` | 4 | 타우로스피어 2 → 타우로마시스 2 → 와일드카고 1 → 타우로마시스 2 |
+| `region_06_stage_08` | `sleepywood_temple_boss` | 1 | 보스 주니어 발록 1, `StageType=BOSS`, 2 Phase, Phase 2 와일드카고 증원 |
+
+2026-09-28 난이도 상향: 신전(6-5~6-8)을 페리온·노틸러스보다 약 1.2배 어렵게 조정했다. 마릿수 5/5/5 → 6/6/7,
+신전 적 HP 약 1.2배, 타우로스피어·타우로마시스·주니어 발록 기본 공격력 +1, 신전 적 전원 패턴 추가.
 
 커닝시티와 같은 Wave 규칙(`TURN_LIMIT` 3턴, `MaxConcurrent=2`, 적 1종 전용 Pool)을 사용한다.
 
@@ -196,9 +199,9 @@ Maker 직접 실행은 MapId 기준 공통 테스트 진입기를 사용한다. 
 
 | 적 | HP / 공격 | 역할 |
 |---|---|---|
-| `region_06_wild_kargo` | 8 / 4 | 근접, `QUICK`. attack 클립이 없어 `jump` 클립을 들이받기 모션으로 사용 |
-| `region_06_taurospear` | 9 / 4 | `attack1` 창 찌르기(`FIRST_ENEMY_FORWARD` 2칸, 쿨타임 2) → `attack2` 1턴 예고 휩쓸기(`RANGE_OFFSETS 1\|2`, 피해 5)를 번갈아 사용 |
-| `region_06_tauromacis` | 13 / 5 | 근접, `HEAVY`. `attack1/info/hit` 클립을 적중 효과로 사용 |
+| `region_06_wild_kargo` | 10 / 4 | 근접, `QUICK`. attack 클립이 없어 `jump` 클립을 들이받기 모션으로 사용. 방향 전환 → `region_06_wild_kargo_charge`(1턴 예고 돌진, 최대 3칸, 기본 공격력 피해) → 들이받기를 순환 |
+| `region_06_taurospear` | 11 / 5 | `attack1` 창 찌르기(`FIRST_ENEMY_FORWARD` 2칸, 쿨타임 2) → `attack2` 1턴 예고 휩쓸기(`RANGE_OFFSETS 1\|2`, 피해 6) → 한 칸 후퇴(`MOVE_AWAY`) |
+| `region_06_tauromacis` | 16 / 6 | 근접, `HEAVY`. `attack1/info/hit` 클립을 적중 효과로 사용. 내려찍기 → `region_06_tauromacis_earthquake`(1턴 예고, 전방 1~2칸 피해 7, 쿨타임 3) → `region_06_tauromacis_roar`(자신 공격력 +1, 2회, 쿨타임 3) |
 
 모델은 `RootDesk/MyDesk/Models/Monsters/Region06*.model`이며 일반 적은 리소스가 커서 `Scale=0.75`,
 주니어 발록은 `Scale=1.2`를 사용한다.
