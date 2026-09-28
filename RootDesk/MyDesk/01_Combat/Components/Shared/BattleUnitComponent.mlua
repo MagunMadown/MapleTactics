@@ -58,6 +58,12 @@ script BattleUnitComponent extends Component
 	@Sync property number VenomBuffAmount = 0
 	@Sync property integer VenomBuffTurns = 0
 	property string VenomMarkerRuid = ""
+	-- Combo: while active, the Nth attack skill in one executing queue deals N × ComboBuffAmount extra damage.
+	-- The chain count and the bonus of the skill being cast are server-only and reset with the queue.
+	@Sync property number ComboBuffAmount = 0
+	@Sync property integer ComboBuffTurns = 0
+	property integer ComboChainCount = 0
+	property number ComboAttackBonus = 0
 	-- Legacy field name: persistent poison stacks (0..5), dealing one damage per stack on each actual move.
 	property number PoisonDamage = 0
 	property string PoisonSourceUnitId = ""
@@ -178,6 +184,10 @@ script BattleUnitComponent extends Component
 		self.VenomBuffAmount = 0
 		self.VenomBuffTurns = 0
 		self.VenomMarkerRuid = ""
+		self.ComboBuffAmount = 0
+		self.ComboBuffTurns = 0
+		self.ComboChainCount = 0
+		self.ComboAttackBonus = 0
 	end
 
 	@ExecSpace("ServerOnly")
@@ -370,7 +380,7 @@ script BattleUnitComponent extends Component
 	method table ApplyTimedBuff(string skillId, string stat, number amount, integer turns)
 		-- ATTACK uses hit charges; other stats use turns. The existing Turns entry field stores either budget.
 		-- Different skills stack; recasting one skill refreshes the larger amount and remaining budget.
-		if stat ~= "ATTACK" and stat ~= "DEFENSE" and stat ~= "MAX_HP" and stat ~= "GUARD" and stat ~= "VENOM" and stat ~= "DAMAGE_CAP" then
+		if stat ~= "ATTACK" and stat ~= "DEFENSE" and stat ~= "MAX_HP" and stat ~= "GUARD" and stat ~= "VENOM" and stat ~= "DAMAGE_CAP" and stat ~= "COMBO" then
 			return { Success = false, Reason = "UNSUPPORTED_BUFF_STAT" }
 		end
 		if amount <= 0 or turns <= 0 then
@@ -401,8 +411,9 @@ script BattleUnitComponent extends Component
 		local result = { Success = true, Reason = "BUFFS_ADVANCED", AttackExpired = false, DefenseExpired = false, MaxHpExpired = false, MaxHpChanged = false }
 		local expiredKeys = {}
 		for key, entry in pairs(self.TimedBuffEntries) do
-			-- ATTACK stores remaining hit charges; preparation and enemy turns never spend them.
-			if entry.Stat ~= "ATTACK" then entry.Turns = entry.Turns - 1 end
+			-- ATTACK stores remaining hit charges and COMBO remaining attacking queues (AdvanceComboQueueTurns);
+			-- preparation and enemy turns never spend either.
+			if entry.Stat ~= "ATTACK" and entry.Stat ~= "COMBO" then entry.Turns = entry.Turns - 1 end
 			if entry.Turns <= 0 then
 				table.insert(expiredKeys, key)
 			end
@@ -448,6 +459,29 @@ script BattleUnitComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method void AdvanceComboQueueTurns(string reason)
+		-- A combo lasts a number of attacking skill queues, not enemy rounds: registering each queued skill already
+		-- passes an enemy round, so a round-based combo would run out before the next queue could use it.
+		-- The caller only advances it after a queue in which an attack skill used the combo.
+		local expired = {}
+		local changed = false
+		for key, entry in pairs(self.TimedBuffEntries) do
+			if entry.Stat == "COMBO" then
+				entry.Turns = entry.Turns - 1
+				changed = true
+				if entry.Turns <= 0 then table.insert(expired, key) end
+			end
+		end
+		if changed == false then return end
+		for _, key in ipairs(expired) do
+			log("[BattleBuff] combo buff expired unit=" .. self.UnitId .. " skill=" .. self.TimedBuffEntries[key].SkillId .. " reason=" .. (reason or ""))
+			self.TimedBuffEntries[key] = nil
+		end
+		self:RecomputeBuffTotals("COMBO_QUEUE_ADVANCED")
+		log("[BattleBuff] combo queue advanced unit=" .. self.UnitId .. " amount=" .. tostring(self.ComboBuffAmount) .. " queues=" .. tostring(self.ComboBuffTurns) .. " reason=" .. (reason or ""))
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ClearAttackBuffs()
 		-- Attack charges belong to this battle; discard them on completion or map departure.
 		local keys = {}
@@ -469,8 +503,8 @@ script BattleUnitComponent extends Component
 	@ExecSpace("ServerOnly")
 	method number RecomputeBuffTotals(string reason)
 		-- Rebuilds the synced totals from the per-skill entries and applies any max-HP change; returns that change.
-		local totals = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0, VENOM = 0, DAMAGE_CAP = 0 }
-		local longest = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0, VENOM = 0, DAMAGE_CAP = 0 }
+		local totals = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0, VENOM = 0, DAMAGE_CAP = 0, COMBO = 0 }
+		local longest = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0, VENOM = 0, DAMAGE_CAP = 0, COMBO = 0 }
 		for _, entry in pairs(self.TimedBuffEntries) do
 			totals[entry.Stat] = totals[entry.Stat] + entry.Amount
 			longest[entry.Stat] = math.max(longest[entry.Stat], entry.Turns)
@@ -486,6 +520,8 @@ script BattleUnitComponent extends Component
 		-- Venom does not stack across skills in practice (one skill grants it); the total is the poison per move.
 		self.VenomBuffAmount = totals.VENOM
 		self.VenomBuffTurns = longest.VENOM
+		self.ComboBuffAmount = totals.COMBO
+		self.ComboBuffTurns = longest.COMBO
 		self.MaxHpBuffTurns = longest.MAX_HP
 		self:RefreshActiveBuffSnapshot()
 		local maxHpDelta = totals.MAX_HP - self.MaxHpBuffAmount

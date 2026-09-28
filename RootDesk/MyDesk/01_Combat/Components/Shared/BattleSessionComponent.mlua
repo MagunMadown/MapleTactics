@@ -4106,7 +4106,23 @@ script BattleSessionComponent extends Component
 		local unit = playerEntity:GetComponent("script.BattleUnitComponent")
 		if unit == nil then return end
 		unit.PreviousSkillWasAttack = false
+		-- The combo chain also counts within one executing queue only.
+		unit.ComboChainCount = 0
+		unit.ComboAttackBonus = 0
 		log("[BattleSkillChain] reset reason=" .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceComboChain(any sourceUnit, string skillId, boolean isAttack)
+		-- While a combo buff is active, each attack skill in the executing queue raises the chain by one and
+		-- deals chain × ComboBuffAmount extra damage. Non-attack skills neither count nor break the chain.
+		if isAttack == false or sourceUnit.ComboBuffAmount <= 0 then
+			sourceUnit.ComboAttackBonus = 0
+			return
+		end
+		sourceUnit.ComboChainCount = sourceUnit.ComboChainCount + 1
+		sourceUnit.ComboAttackBonus = sourceUnit.ComboChainCount * sourceUnit.ComboBuffAmount
+		log("[BattleBuff] combo chain unit=" .. sourceUnit.UnitId .. " skill=" .. skillId .. " chain=" .. sourceUnit.ComboChainCount .. " bonus=" .. tostring(sourceUnit.ComboAttackBonus))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4116,7 +4132,11 @@ script BattleSessionComponent extends Component
 		self._T.ReplayingRelicSkill = false
 		local relics = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent") or nil
 		if relics ~= nil then relics.LoadedCooldownReductions = {} end
+		-- Like attack charges, a combo is only spent by a queue that actually attacked while it was active.
+		local playerUnit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
+		local comboAttacked = playerUnit ~= nil and playerUnit.ComboChainCount > 0
 		self:ResetPlayerSkillChain(reason)
+		if comboAttacked then playerUnit:AdvanceComboQueueTurns(reason) end
 		local executedCount = self.TurnState:GetTileIdCount(self.TurnState.ExecutingTileIds)
 		self.ActionTimerId = 0
 		self:CompletePlayerCombatPresentationHandoff(reason)
@@ -5965,6 +5985,52 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ResolveTurnImpactOnTarget(string sourceUnitId, string targetUnitId)
+		-- Reverses a hit target's facing in place. Unlike TryTurn it runs on the caster's turn, so the target's
+		-- own phase is not checked; the target then needs its own turn action to face the caster again.
+		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, TargetUnitId = targetUnitId, PreviousFacing = "", CurrentFacing = "" }
+		local sourceEntity = self:FindUnitEntity(sourceUnitId)
+		local targetEntity = self:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false or isvalid(targetEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
+			result.Reason = "TARGET_SAME_TEAM"
+			return result
+		end
+
+		result.PreviousFacing = targetUnit.Facing
+		local facingResult = targetUnit:ApplyFacingState(targetUnit.Facing == "Right" and "Left" or "Right")
+		if facingResult.Success == false then
+			result.Reason = facingResult.Reason
+			return result
+		end
+		result.CurrentFacing = facingResult.CurrentFacing
+		self:ApplyFacing(targetEntity, targetUnit.Facing)
+		local turnedEvent = UnitTurnedEvent()
+		turnedEvent.UnitId = targetUnit.UnitId
+		turnedEvent.PreviousFacing = result.PreviousFacing
+		turnedEvent.CurrentFacing = result.CurrentFacing
+		self.Entity:SendEvent(turnedEvent)
+		result.Success = true
+		result.Hit = true
+		result.Reason = "TURNED"
+		log("[BattleTurnTarget] resolved source=" .. sourceUnitId .. " target=" .. targetUnitId .. " from=" .. result.PreviousFacing .. " to=" .. result.CurrentFacing .. " cell=" .. targetUnit.CellIndex)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ApplyPushCollisionDamage(string sourceUnitId, any pushedUnit, integer blockedCell)
 		-- A pushed monster slamming into another monster hurts both by a fixed amount, separate from the
 		-- skill's own damage. Walls, the player and HEAVY monsters that refuse to move do not count.
@@ -6058,6 +6124,7 @@ script BattleSessionComponent extends Component
 		end
 		contextResult.Data.PreviousSkillWasAttack = sourceUnit.PreviousSkillWasAttack
 		sourceUnit.PreviousSkillWasAttack = isAttack
+		self:AdvanceComboChain(sourceUnit, skillId, isAttack)
 		local relics = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		if isAttack and sourceUnit.Team == "Player" and relics ~= nil and self:HasSkillProjectile(definition) then
 			local extraStars = relics:GetExtraShurikenCount(definition)
@@ -7089,6 +7156,11 @@ script BattleSessionComponent extends Component
 		if sourceUnit.NextAttackBonus > 0 and not ignoresBuffs then
 			amount = amount + sourceUnit.NextAttackBonus
 			log("[BattleBuff] next attack bonus added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " bonus=" .. tostring(sourceUnit.NextAttackBonus) .. " amount=" .. tostring(amount))
+		end
+		-- Set per cast by AdvanceComboChain and cleared with the queue, so it only scales the current skill's hits.
+		if sourceUnit.ComboAttackBonus > 0 and not ignoresBuffs then
+			amount = amount + sourceUnit.ComboAttackBonus
+			log("[BattleBuff] combo bonus added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " bonus=" .. tostring(sourceUnit.ComboAttackBonus) .. " amount=" .. tostring(amount))
 		end
 		-- The executor shares one hit charge across area targets; each multi-hit index gets a new charge.
 		if not ignoresBuffs then

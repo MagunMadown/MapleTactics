@@ -265,8 +265,9 @@ SchemaVersion,EffectSetId,StepIndex,EffectType,TargetSelector,Value,ParameterA,P
 1,wind_talisman_effects,2,PUSH,PRIMARY_TARGET,1,,,
 ```
 
-현재 지원 `EffectType`은 `DAMAGE`, `PUSH`, `PULL`, `HEAL`, 자기 버프 6종
-`NEXT_ATTACK_BONUS`, `ATTACK_BUFF`, `MAX_HP_BUFF`, `DEFENSE_BUFF`, `GUARD_BUFF`, `VENOM_BUFF`, 그리고 이동 `MOVE_SELF`·`TURN_SELF`다.
+현재 지원 `EffectType`은 `DAMAGE`, `PUSH`, `PULL`, `TURN_TARGET`(맞은 적 방향 반전), `HEAL`, 자기 버프 7종
+`NEXT_ATTACK_BONUS`, `ATTACK_BUFF`, `MAX_HP_BUFF`, `DEFENSE_BUFF`, `GUARD_BUFF`, `VENOM_BUFF`, `COMBO_BUFF`, 그리고 이동 `MOVE_SELF`·`TURN_SELF`다.
+`COMBO_BUFF`의 `ParameterA`만은 적 라운드가 아니라 공격 스킬을 쓴 예약 실행 횟수다.
 버프와 이동 모두 `SELF_UNIT` 전용이고, 지속형 버프는 `ParameterA`에 턴 수를, `MOVE_SELF`는 `Value`에 전진 칸
 수와 `ParameterA=FORWARD_OFFSET`을 적는다. 다른 스킬의 같은 능력치는 합산되고 같은 스킬은 갱신된다. 규칙은
 [`Effect-Executor-Guide.md`](./Effect-Executor-Guide.md) "버프 EffectType 규칙"과 "`MOVE_SELF` 규칙"이 소유한다.

@@ -104,7 +104,9 @@ method table Execute(table context, table effectStep)
 | `GUARD_BUFF` | `BuffEffectExecutorLogic` | 시전자가 받는 피해를 전부 무효, `ParameterA`턴 |
 | `MOVE_SELF` | `MoveSelfEffectExecutorLogic` | 시전자를 바라보는 방향으로 이동. 착지 칸은 `ParameterA` 모드가 정한다 |
 | `TURN_SELF` | `MoveSelfEffectExecutorLogic` | 시전자 방향 전환(`TryTurn`). `SELF_UNIT` 전용, `Value`는 쓰지 않는다(`0`). 도적 `tornado_spin` 마지막 스텝 |
-| `PULL` | `PushEffectExecutorLogic` | `PRIMARY_TARGET`을 시전자 앞 `Value`칸으로 끌어온다. 그 칸이 차 있으면 오는 길의 가장 가까운 빈 칸, 이미 가까우면·HEAVY면 제자리. 도적 `chain_hell` |
+| `PULL` | `PushEffectExecutorLogic` | `PRIMARY_TARGET` 또는 `ALL_SKILL_TARGETS`를 시전자 쪽으로 `Value`칸 거리까지 끌어온다(뒤쪽 대상은 뒤에서 당긴다). 그 칸이 차 있으면 오는 길의 가장 가까운 빈 칸, 이미 가까우면·HEAVY면 제자리. 앞 스텝에서 죽은 대상은 건너뛴다. 도적 `chain_hell`, 전사 `page_order` |
+| `TURN_TARGET` | `PushEffectExecutorLogic` | 맞은 대상(`PRIMARY_TARGET`/`ALL_SKILL_TARGETS`)의 바라보는 방향을 반대로 뒤집는다(`ResolveTurnImpactOnTarget`). 적은 다시 돌아서는 행동을 써야 공격할 수 있다. `Value`는 쓰지 않는다(`0`). 전사 `page_order` |
+| `COMBO_BUFF` | `BuffEffectExecutorLogic` | 지속되는 동안 한 예약 실행 안에서 N번째 공격 스킬(DAMAGE 스텝이 있는 스킬)이 피해 +`Value`×N. 비공격 스킬은 세지도 끊지도 않는다. `ParameterA`는 적 라운드가 아니라 **공격한 예약 실행 횟수** — `ATTACK_BUFF`처럼 공격할 때만 소모되어, 콤보가 적용된 공격 스킬이 있었던 큐가 끝날 때만 1 감소한다(예약 한 칸마다 적 라운드가 지나가므로 라운드 기준이면 다음 큐 전에 만료된다). 전사 `combo_attack` |
 | `VENOM_BUFF` | `BuffEffectExecutorLogic` | `ParameterA`턴 동안 시전자가 피해를 준 적을 중독시킨다. 중독된 적은 칸을 옮길 때마다 `Value` 고정 피해(죽을 때까지). `ParameterB`는 중독된 적 머리 위 루프 이펙트 RUID. 도적 `venom` |
 
 ### `MOVE_SELF` 규칙
