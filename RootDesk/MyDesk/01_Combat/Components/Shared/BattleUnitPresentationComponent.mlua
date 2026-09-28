@@ -157,6 +157,7 @@ script BattleUnitPresentationComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		self:ClearStatusMarkers()
 		self:CancelFullMotionPlayback("END_PLAY")
 		-- Restores every short-lived presentation override owned by this unit.
 		self:StopMoveHopVisual("END_PLAY")
@@ -208,6 +209,7 @@ script BattleUnitPresentationComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnMapLeave(Entity previousMap)
+		self:ClearStatusMarkers()
 		-- A transferred avatar must not retain event handlers, queued poses or death state from the old board.
 		self:CancelCombatMotionHandoff(self.Entity.Name, "MAP_LEAVE", false)
 		self:StopMoveHopVisual("MAP_LEAVE")
@@ -1174,34 +1176,57 @@ script BattleUnitPresentationComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void ClearStatusMarkers()
+		for _, serial in ipairs(self._T.statusMarkerSerials or {}) do _EffectService:RemoveEffect(serial) end
+		self._T.statusMarkerSerials = {}
+		self._T.statusMarkerRuid = nil
+		self._T.confusionMarkerActive = false
+		self._T.confusionMarkerVersion = (self._T.confusionMarkerVersion or 0) + 1
+	end
+
+	@ExecSpace("Client")
+	method void ShowConfusionMarker()
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead then return end
+		self._T.confusionMarkerActive = true
+		self._T.confusionMarkerVersion = (self._T.confusionMarkerVersion or 0) + 1
+		local version = self._T.confusionMarkerVersion
+		unit:RefreshStatusMarker()
+		_TimerService:SetTimerOnce(function()
+			if not isvalid(self.Entity) or self._T.confusionMarkerVersion ~= version then return end
+			self._T.confusionMarkerActive = false
+			unit:RefreshStatusMarker()
+		end, 1.2)
+	end
+
+	@ExecSpace("ClientOnly")
 	method void RefreshStatusMarker(string unitId, string markerRuid, boolean active)
-		-- Keeps exactly one looping marker above the unit while a hostile status (venom poison) is on it.
-		local wanted = ""
-		if active == true then
-			wanted = markerRuid or ""
+		-- Render concurrent statuses in a centered row instead of hiding poison/burn behind a stun.
+		if not active then self:ClearStatusMarkers(); return end
+		local wanted = markerRuid or ""
+		if self._T.confusionMarkerActive then
+			wanted = wanted .. (wanted ~= "" and "|" or "") .. "086dfcf2a666440e92e2d15ed35a9275"
 		end
-		if self._T.statusMarkerRuid == wanted then
-			return
-		end
-		if self._T.statusMarkerSerial ~= nil then
-			_EffectService:RemoveEffect(self._T.statusMarkerSerial)
-			self._T.statusMarkerSerial = nil
-		end
+		if self._T.statusMarkerRuid == wanted then return end
+		for _, serial in ipairs(self._T.statusMarkerSerials or {}) do _EffectService:RemoveEffect(serial) end
+		self._T.statusMarkerSerials = {}
 		self._T.statusMarkerRuid = wanted
-		if wanted == "" then
-			return
-		end
+		local markers = {}
+		for ruid in string.gmatch(wanted, "([^|]+)") do table.insert(markers, ruid) end
 		local options = {}
 		options["SortingLayer"] = self.SkillEffectSortingLayer
 		options["OrderInLayer"] = self.SkillEffectOrderInLayer
 		local scale = math.max(0.05, self.StatusMarkerScale)
-		local serial = _EffectService:PlayEffectAttached(wanted, self.Entity, Vector3(0, self.StatusMarkerOffsetY, 0), 0, Vector3(scale, scale, 1), true, options)
-		if serial == 0 then
-			log_warning("[BattleStatusMarker] failed unit=" .. unitId .. " ruid=" .. wanted)
-			return
+		for index, ruid in ipairs(markers) do
+			local x = (index - (#markers + 1) / 2) * 0.45
+			local serial = _EffectService:PlayEffectAttached(ruid, self.Entity, Vector3(x, self.StatusMarkerOffsetY, 0), 0, Vector3(scale, scale, 1), true, options)
+			if serial ~= 0 then
+				table.insert(self._T.statusMarkerSerials, serial)
+			else
+				log_warning("[BattleStatusMarker] failed unit=" .. unitId .. " ruid=" .. ruid)
+			end
 		end
-		self._T.statusMarkerSerial = serial
-		log("[BattleStatusMarker] shown unit=" .. unitId .. " ruid=" .. wanted .. " serial=" .. serial)
+		log("[BattleStatusMarker] updated unit=" .. unitId .. " markers=" .. wanted)
 	end
 
 	@ExecSpace("Client")
