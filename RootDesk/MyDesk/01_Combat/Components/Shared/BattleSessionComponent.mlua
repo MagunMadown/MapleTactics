@@ -4236,7 +4236,7 @@ script BattleSessionComponent extends Component
 		-- A volley finishes on its last shot, so the slot has to cover the whole stream, not one arrow.
 		local volleySpan = math.max(0, definition.ProjectileInterval or 0) / speed * (math.max(1, definition.ProjectileCount or 1) - 1)
 		local minimumDuration = launchDelay + volleySpan + worstFlight
-		if self:IsSequentialStarVolley(definition, validation.Data.EffectSteps) then
+		if self:IsSequentialProjectileVolley(definition, validation.Data.EffectSteps) then
 			local count = _DamageEffectExecutorLogic:GetHitCount(validation.Data.EffectSteps[1])
 			minimumDuration = launchDelay + count * worstFlight + math.max(0, count - 1) * math.max(0.001, definition.ProjectileInterval or 0) + 0.02
 		end
@@ -6200,8 +6200,8 @@ script BattleSessionComponent extends Component
 		end
 
 		self:ClearSkillImpactTimers()
-		if self:IsSequentialStarVolley(definition, effectSteps) then
-			return self:LaunchSequentialStarVolley(context, effectSteps[1])
+		if self:IsSequentialProjectileVolley(definition, effectSteps) then
+			return self:LaunchSequentialProjectileVolley(context, effectSteps[1])
 		end
 		-- A projectile skill splits the impact in two: the shot leaves at its launch delay, and the
 		-- effects resolve only once it has crossed the board to the target cell.
@@ -6301,16 +6301,17 @@ script BattleSessionComponent extends Component
 		return math.max(0.1, (definition.ProjectileSpeed or 0) * 0.5)
 	end
 
-	method boolean IsSequentialStarVolley(table definition, table effectSteps)
-		-- Claw multi-hit projectiles share a finite shot budget instead of repeating it per enemy.
-		return self:HasSkillProjectile(definition) and definition.WeaponType == "CLAW"
+	method boolean IsSequentialProjectileVolley(table definition, table effectSteps)
+		-- Single-target volleys resolve each projectile on arrival, regardless of weapon type.
+		return self:HasSkillProjectile(definition)
 			and effectSteps ~= nil and #effectSteps == 1
 			and effectSteps[1].EffectType == "DAMAGE"
+			and (definition.WeaponType == "CLAW" or definition.TargetingType == "FIRST_ENEMY_FORWARD")
 			and (effectSteps[1].ParameterA == "MULTI_HIT" or definition.ExtraShurikenVolley == true)
 	end
 
 	@ExecSpace("ServerOnly")
-	method table LaunchSequentialStarVolley(table context, table effectStep)
+	method table LaunchSequentialProjectileVolley(table context, table effectStep)
 		-- Resolve each star on arrival, then aim the next at the nearest survivor in the original range.
 		local definition = context.Definition
 		local sourceId = context.SourceUnitId
@@ -6389,12 +6390,14 @@ script BattleSessionComponent extends Component
 				log("[RunRelic] extra shuriken throw skill=" .. context.SkillId .. " shot=" .. shotIndex)
 			end
 			self:SpawnSkillProjectile(context.SkillId, "SkillProjectile_" .. tostring(self.ProjectileSpawnCount), startPosition, endPosition, speed, definition.ProjectileRuid, definition.ProjectileScale or 1, direction > 0)
-			log("[SkillProjectile] star launched skill=" .. context.SkillId .. " shot=" .. shotIndex .. "/" .. shotCount .. " target=" .. targetId .. " cell=" .. aimCell .. " flight=" .. flight)
+			log("[SkillProjectile] volley launched skill=" .. context.SkillId .. " shot=" .. shotIndex .. "/" .. shotCount .. " target=" .. targetId .. " cell=" .. aimCell .. " flight=" .. flight)
 			self.ImpactTimerId = _TimerService:SetTimerOnce(function()
 				if self._T.projectileCastSequence == castSequence then self.ImpactTimerId = 0 end
 				if not stillActive() then return end
 				if targetId ~= "" then
-					local damage = shotIndex > authoredCount and 1 or effectStep.Value
+					local damage = shotIndex > 1 and 1 or effectStep.Value
+					local previousHit = self._T.AttackBuffHit
+					self._T.AttackBuffHit = { SourceUnitId = sourceId, SkillId = context.SkillId, FixedFollowup = shotIndex > 1 }
 					local previousContext = self._T.RelicDamageContext
 					self._T.RelicDamageContext = context
 					local hit = nil
@@ -6405,8 +6408,9 @@ script BattleSessionComponent extends Component
 						hit = self:ResolveSkillDamageImpact(sourceId, context.SkillId, targetId, aimCell, damage)
 					end
 					self._T.RelicDamageContext = previousContext
+					self._T.AttackBuffHit = previousHit
 					table.insert(results, { EffectType = "DAMAGE", Hit = hit.Hit == true })
-					log("[SkillProjectile] star impact skill=" .. context.SkillId .. " shot=" .. shotIndex .. " target=" .. targetId .. " reason=" .. tostring(hit.Reason))
+					log("[SkillProjectile] volley impact skill=" .. context.SkillId .. " shot=" .. shotIndex .. " target=" .. targetId .. " reason=" .. tostring(hit.Reason))
 				end
 				if shotIndex >= shotCount or self.BattleResult ~= "" then
 					_SkillExecutionLogic:NotifyRelicSkillCompleted(context)
@@ -7142,7 +7146,11 @@ script BattleSessionComponent extends Component
 		local defenderRun = targetEntity:GetComponent("script.PlayerRunStateComponent")
 		-- Push collisions and poison ticks are fixed hits, so the caster's attack bonuses never scale them.
 		local isFixedDamage = attackId == self.PushCollisionAttackId or attackId == self.VenomPoisonAttackId
-		if isFixedDamage == false and sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
+		local attackHit = self._T.AttackBuffHit
+		local fixedFollowup = attackHit ~= nil and attackHit.SourceUnitId == sourceUnitId
+			and attackHit.SkillId == attackId and attackHit.FixedFollowup == true
+		if fixedFollowup then amount = 1 end
+		if not fixedFollowup and isFixedDamage == false and sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
 			and attackerRun ~= nil and attackerEffects.ActiveRunSequence == attackerRun.RunSequence then
 			amount = amount + attackerEffects.AttackBonus
 			amount = amount + attackerEffects:GetDirectDamageBonus(sourceUnit, targetUnit)
@@ -7153,7 +7161,7 @@ script BattleSessionComponent extends Component
 		-- Self buffs live on the units, so both teams share one rule. The next-attack bonus is only read here;
 		-- SkillExecutionLogic spends it once the whole skill has landed so area skills boost every target.
 		local ignoresBuffs = attackId == "commander_poison_mist" or isFixedDamage
-		if sourceUnit.NextAttackBonus > 0 and not ignoresBuffs then
+		if sourceUnit.NextAttackBonus > 0 and not ignoresBuffs and not fixedFollowup then
 			amount = amount + sourceUnit.NextAttackBonus
 			log("[BattleBuff] next attack bonus added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " bonus=" .. tostring(sourceUnit.NextAttackBonus) .. " amount=" .. tostring(amount))
 		end
@@ -7172,8 +7180,9 @@ script BattleSessionComponent extends Component
 			else
 				bonus = sourceUnit:ConsumeAttackBuffHit()
 			end
-			amount = amount + bonus
-			if bonus > 0 then log("[BattleBuff] attack buff added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " attack=" .. bonus .. " amount=" .. amount) end
+			-- Follow-up hits still spend a hit charge, but never scale their base damage of one.
+			if not fixedFollowup then amount = amount + bonus end
+			if bonus > 0 then log("[BattleBuff] attack buff consumed source=" .. sourceUnitId .. " target=" .. targetUnitId .. " attack=" .. bonus .. " amount=" .. amount) end
 		end
 		if targetUnit.Team == "Player" and defenderEffects ~= nil and defenderEffects.IsInitialized
 			and defenderRun ~= nil and defenderEffects.ActiveRunSequence == defenderRun.RunSequence then
@@ -7509,6 +7518,12 @@ script BattleSessionComponent extends Component
 					end
 				end
 				if self.BattleResult == "Victory" and self._T.BossDefeated == true then
+					if relics ~= nil then
+						local reward = relics:GrantBossClassRelic(self.StageId .. ":" .. tostring(self.EntryRequestId))
+						if reward.Success and reward.RelicId ~= nil then
+							self:RecordRoundReward("ITEM", reward.RelicId, 1, "boss_class_relic")
+						end
+					end
 					local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
 					if inventory ~= nil then
 						local before = inventory.HealCharges
@@ -9179,6 +9194,10 @@ script BattleSessionComponent extends Component
 			if rewardType == "CONSUMABLE" then
 				local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(refId)
 				if definition.Success then name = definition.DisplayName; icon = definition.IconKey end
+			elseif rewardType == "ITEM" then
+				local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+				local definition = relics ~= nil and relics.Definitions[refId] or nil
+				if definition ~= nil then name = definition.DisplayName; icon = definition.IconImageRUID or "" end
 			elseif rewardType == "REROLL" then name = "증강 리롤권"
 			elseif rewardType == "HEAL_CHARGE" then
 				name = "힐 사용 횟수"
