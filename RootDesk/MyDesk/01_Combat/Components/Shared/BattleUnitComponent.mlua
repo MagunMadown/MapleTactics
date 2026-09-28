@@ -46,6 +46,7 @@ script BattleUnitComponent extends Component
 	@Sync property number NextAttackBonus = 0
 	@Sync property number AttackBuffAmount = 0
 	@Sync property integer AttackBuffTurns = 0
+	@Sync property integer AttackBuffHits = 0
 	@Sync property number DefenseBuffAmount = 0
 	@Sync property integer DefenseBuffTurns = 0
 	@Sync property number MaxHpBuffAmount = 0
@@ -167,6 +168,7 @@ script BattleUnitComponent extends Component
 		self.NextAttackBonus = 0
 		self.AttackBuffAmount = 0
 		self.AttackBuffTurns = 0
+		self.AttackBuffHits = 0
 		self.DefenseBuffAmount = 0
 		self.DefenseBuffTurns = 0
 		self.MaxHpBuffAmount = 0
@@ -366,8 +368,8 @@ script BattleUnitComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table ApplyTimedBuff(string skillId, string stat, number amount, integer turns)
-		-- Adds or refreshes one skill's timed stat buff (ATTACK / DEFENSE / MAX_HP / GUARD). Entries from different
-		-- skills stack; the same skill keeps the larger amount and the longer duration.
+		-- ATTACK uses hit charges; other stats use turns. The existing Turns entry field stores either budget.
+		-- Different skills stack; recasting one skill refreshes the larger amount and remaining budget.
 		if stat ~= "ATTACK" and stat ~= "DEFENSE" and stat ~= "MAX_HP" and stat ~= "GUARD" and stat ~= "VENOM" and stat ~= "DAMAGE_CAP" then
 			return { Success = false, Reason = "UNSUPPORTED_BUFF_STAT" }
 		end
@@ -394,12 +396,13 @@ script BattleUnitComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table AdvanceBuffTurns(string reason)
-		-- Counts every timed buff down by one enemy round and removes the ones that ran out, on the same boundary as
+		-- Counts non-attack buffs down by one enemy round and removes the ones that ran out, on the same boundary as
 		-- skill cooldowns. A removed max-HP buff restores MaxHp and clips CurrentHp through RecomputeBuffTotals.
 		local result = { Success = true, Reason = "BUFFS_ADVANCED", AttackExpired = false, DefenseExpired = false, MaxHpExpired = false, MaxHpChanged = false }
 		local expiredKeys = {}
 		for key, entry in pairs(self.TimedBuffEntries) do
-			entry.Turns = entry.Turns - 1
+			-- ATTACK stores remaining hit charges; preparation and enemy turns never spend them.
+			if entry.Stat ~= "ATTACK" then entry.Turns = entry.Turns - 1 end
 			if entry.Turns <= 0 then
 				table.insert(expiredKeys, key)
 			end
@@ -427,6 +430,43 @@ script BattleUnitComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method number ConsumeAttackBuffHit()
+		-- Returns this hit's bonus before spending one charge from each active attack buff.
+		local amount = self.AttackBuffAmount
+		if amount <= 0 then return 0 end
+		local expired = {}
+		for key, entry in pairs(self.TimedBuffEntries) do
+			if entry.Stat == "ATTACK" then
+				entry.Turns = entry.Turns - 1
+				if entry.Turns <= 0 then table.insert(expired, key) end
+			end
+		end
+		for _, key in ipairs(expired) do self.TimedBuffEntries[key] = nil end
+		self:RecomputeBuffTotals("ATTACK_HIT_CONSUMED")
+		log("[BattleBuff] attack hit consumed unit=" .. self.UnitId .. " bonus=" .. amount .. " remaining=" .. self.AttackBuffHits)
+		return amount
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearAttackBuffs()
+		-- Attack charges belong to this battle; discard them on completion or map departure.
+		local keys = {}
+		for key, entry in pairs(self.TimedBuffEntries) do
+			if entry.Stat == "ATTACK" then table.insert(keys, key) end
+		end
+		if #keys == 0 then return end
+		for _, key in ipairs(keys) do self.TimedBuffEntries[key] = nil end
+		self:RecomputeBuffTotals("BATTLE_ATTACK_BUFFS_CLEARED")
+		log("[BattleBuff] attack charges cleared unit=" .. self.UnitId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnMapLeave(Entity nextMap)
+		-- Prevents unused attack charges from surviving an interrupted battle transfer.
+		self:ClearAttackBuffs()
+	end
+
+	@ExecSpace("ServerOnly")
 	method number RecomputeBuffTotals(string reason)
 		-- Rebuilds the synced totals from the per-skill entries and applies any max-HP change; returns that change.
 		local totals = { ATTACK = 0, DEFENSE = 0, MAX_HP = 0, GUARD = 0, VENOM = 0, DAMAGE_CAP = 0 }
@@ -437,7 +477,8 @@ script BattleUnitComponent extends Component
 		end
 		self.AttackDamageCap = totals.DAMAGE_CAP
 		self.AttackBuffAmount = totals.ATTACK
-		self.AttackBuffTurns = longest.ATTACK
+		self.AttackBuffTurns = 0
+		self.AttackBuffHits = longest.ATTACK
 		self.DefenseBuffAmount = totals.DEFENSE
 		self.DefenseBuffTurns = longest.DEFENSE
 		self.GuardBuffAmount = totals.GUARD
@@ -473,11 +514,12 @@ script BattleUnitComponent extends Component
 		for _, entry in pairs(self.TimedBuffEntries) do
 			local record = bySkill[entry.SkillId]
 			if record == nil then
-				record = { SkillId = entry.SkillId, Turns = 0, Sequence = entry.Sequence or 0 }
+				record = { SkillId = entry.SkillId, Turns = 0, Hits = 0, Sequence = entry.Sequence or 0 }
 				bySkill[entry.SkillId] = record
 				table.insert(skills, record)
 			end
-			record.Turns = math.max(record.Turns, entry.Turns)
+			if entry.Stat == "ATTACK" then record.Hits = math.max(record.Hits, entry.Turns)
+			else record.Turns = math.max(record.Turns, entry.Turns) end
 			record.Sequence = math.min(record.Sequence, entry.Sequence or 0)
 		end
 		table.sort(skills, function(a, b) return a.Sequence < b.Sequence end)
@@ -486,8 +528,8 @@ script BattleUnitComponent extends Component
 			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(record.SkillId)
 			local isBuffSkill = definition.Success == true
 				and string.find("|" .. (definition.SkillTags or "") .. "|", "|buff|", 1, true) ~= nil
-			if record.Turns > 0 and isBuffSkill then
-				table.insert(parts, record.SkillId .. "~" .. tostring(record.Turns) .. "~" .. (definition.IconRuid or ""))
+			if (record.Turns > 0 or record.Hits > 0) and isBuffSkill then
+				table.insert(parts, record.SkillId .. "~" .. tostring(record.Turns) .. "~" .. (definition.IconRuid or "") .. "~" .. tostring(record.Hits))
 			end
 		end
 		local snapshot = table.concat(parts, "|")
