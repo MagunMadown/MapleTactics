@@ -70,6 +70,7 @@ script BattleUnitComponent extends Component
 	@Sync property string PoisonMarkerRuid = ""
 	-- Different skills stack; recasting the same skill refreshes its own entry instead of adding a second one.
 	property table NextAttackBonusBySkill = {}
+	property table NextAttackBonusSequence = {}
 	property table TimedBuffEntries = {}
 	property integer TimedBuffApplySequence = 0
 	-- Per-skill view of the timed buffs for the buff HUD: "skillId~turns~iconRuid|..." in first-applied order, where
@@ -159,6 +160,7 @@ script BattleUnitComponent extends Component
 	method void ClearBattleBuffs()
 		-- Drops every self buff without touching HP; callers that own MaxHp reset it themselves.
 		self.NextAttackBonusBySkill = {}
+		self.NextAttackBonusSequence = {}
 		self.TimedBuffEntries = {}
 		self.TimedBuffApplySequence = 0
 		self.ActiveBuffSnapshot = ""
@@ -360,6 +362,12 @@ script BattleUnitComponent extends Component
 		local previous = self.NextAttackBonusBySkill[skillId] or 0
 		self.NextAttackBonusBySkill[skillId] = math.max(previous, amount)
 		self.NextAttackBonus = self:SumTableValues(self.NextAttackBonusBySkill)
+		if previous <= 0 then
+			-- Shares the timed-buff order so the HUD lists every buff in the order it was cast.
+			self.TimedBuffApplySequence = self.TimedBuffApplySequence + 1
+			self.NextAttackBonusSequence[skillId] = self.TimedBuffApplySequence
+		end
+		self:RefreshActiveBuffSnapshot()
 		log("[BattleBuff] next attack bonus armed unit=" .. self.UnitId .. " skill=" .. skillId .. " amount=" .. tostring(self.NextAttackBonusBySkill[skillId]) .. " total=" .. tostring(self.NextAttackBonus) .. " refreshed=" .. tostring(previous > 0))
 		return { Success = true, Reason = previous > 0 and "NEXT_ATTACK_BONUS_REFRESHED" or "NEXT_ATTACK_BONUS_ARMED", Amount = self.NextAttackBonus }
 	end
@@ -369,9 +377,11 @@ script BattleUnitComponent extends Component
 		-- Spends every armed bonus once the skill it boosted has landed; returns the consumed total (0 when none was armed).
 		local amount = self.NextAttackBonus
 		self.NextAttackBonusBySkill = {}
+		self.NextAttackBonusSequence = {}
 		self.NextAttackBonus = 0
 		if amount > 0 then
 			log("[BattleBuff] next attack bonus consumed unit=" .. self.UnitId .. " amount=" .. tostring(amount))
+			self:RefreshActiveBuffSnapshot()
 		end
 		return amount
 	end
@@ -554,9 +564,22 @@ script BattleUnitComponent extends Component
 				bySkill[entry.SkillId] = record
 				table.insert(skills, record)
 			end
-			if entry.Stat == "ATTACK" then record.Hits = math.max(record.Hits, entry.Turns)
+			-- ATTACK (hit charges) and COMBO (attacking queues) are counts, shown as "회" rather than "턴".
+			if entry.Stat == "ATTACK" or entry.Stat == "COMBO" then record.Hits = math.max(record.Hits, entry.Turns)
 			else record.Turns = math.max(record.Turns, entry.Turns) end
 			record.Sequence = math.min(record.Sequence, entry.Sequence or 0)
+		end
+		-- A next-attack bonus lasts for the next damaging skill, so it shows as one remaining use.
+		for skillId, amount in pairs(self.NextAttackBonusBySkill) do
+			if amount > 0 then
+				local record = bySkill[skillId]
+				if record == nil then
+					record = { SkillId = skillId, Turns = 0, Hits = 0, Sequence = self.NextAttackBonusSequence[skillId] or 0 }
+					bySkill[skillId] = record
+					table.insert(skills, record)
+				end
+				record.Hits = math.max(record.Hits, 1)
+			end
 		end
 		table.sort(skills, function(a, b) return a.Sequence < b.Sequence end)
 		local parts = {}
