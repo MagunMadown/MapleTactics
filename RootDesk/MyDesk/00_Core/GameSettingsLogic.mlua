@@ -1,0 +1,428 @@
+@Logic
+script GameSettingsLogic extends Logic
+
+	-- Per-user client settings: four volume sliders and two rebindable keys per action. The client owns the live
+	-- values; the server only persists the JSON blob in the user's DataStorage.
+	property string StorageKey = "GameSettingsV1"
+	property number SaveDelay = 1.0
+	property number LoadRetryInterval = 5
+	property integer MaxPayloadLength = 4096
+	property table Volumes = {}
+	property table Bindings = {}
+	property boolean ShowKeyGuide = true
+	property boolean IsLoaded = false
+	property boolean IsWindowOpen = false
+	property boolean IsCapturingKey = false
+	property integer Revision = 0
+	property integer SaveTimerId = 0
+	property number LoadRetryRemaining = 0
+
+	method table GetVolumeCatalog()
+		-- Slider order in the sound tab. UI sounds follow only the master volume.
+		return {
+			{ Id = "Master", Label = "전체 볼륨" },
+			{ Id = "Bgm", Label = "배경 음악" },
+			{ Id = "Skill", Label = "스킬 효과음" },
+			{ Id = "Monster", Label = "몬스터 효과음" }
+		}
+	end
+
+	method table GetActionCatalog()
+		-- Rebindable actions in display order; Default holds { key 1, key 2 } as KeyboardKey codes (0 = none).
+		-- Mouse inputs (left: execute, right: utility, wheel: turn) and Esc stay fixed and are not listed here.
+		return {
+			{ Id = "MOVE_LEFT", Label = "왼쪽 이동", Default = { 97, 276 } },
+			{ Id = "MOVE_RIGHT", Label = "오른쪽 이동", Default = { 100, 275 } },
+			{ Id = "TURN", Label = "방향 전환", Default = { 119, 273 } },
+			{ Id = "UTILITY", Label = "유틸 스킬", Default = { 115, 274 } },
+			{ Id = "EXECUTE", Label = "예약 스킬 실행", Default = { 32, 0 } },
+			{ Id = "SLOT_1", Label = "슬롯 1 스킬 예약", Default = { 49, 257 } },
+			{ Id = "SLOT_2", Label = "슬롯 2 스킬 예약", Default = { 50, 258 } },
+			{ Id = "SLOT_3", Label = "슬롯 3 스킬 예약", Default = { 51, 259 } },
+			{ Id = "SLOT_4", Label = "슬롯 4 스킬 예약", Default = { 52, 260 } },
+			{ Id = "SLOT_5", Label = "슬롯 5 스킬 예약", Default = { 53, 261 } },
+			{ Id = "SLOT_6", Label = "슬롯 6 스킬 예약", Default = { 54, 262 } },
+			{ Id = "CLEAR_QUEUE", Label = "예약 전체 취소", Default = { 8, 0 } },
+			{ Id = "INTERACT", Label = "상호작용 (로비)", Default = { 101, 0 } }
+		}
+	end
+
+	method table GetKeyCatalog()
+		-- Every key a player may bind, with its label. Esc (menu), Delete (unbind while capturing), F8 (debug) and
+		-- mouse buttons are reserved and deliberately absent.
+		local keys = {
+			{ 8, "Backspace" }, { 9, "Tab" }, { 13, "Enter" }, { 32, "Space" },
+			{ 39, "'" }, { 44, "," }, { 45, "-" }, { 46, "." }, { 47, "/" },
+			{ 59, ";" }, { 61, "=" }, { 91, "[" }, { 92, "\\" }, { 93, "]" }, { 96, "`" },
+			{ 273, "↑" }, { 274, "↓" }, { 275, "→" }, { 276, "←" },
+			{ 277, "Insert" }, { 278, "Home" }, { 279, "End" }, { 280, "Page Up" }, { 281, "Page Down" },
+			{ 303, "오른쪽 Shift" }, { 304, "왼쪽 Shift" }, { 305, "오른쪽 Ctrl" }, { 306, "왼쪽 Ctrl" },
+			{ 307, "오른쪽 Alt" }, { 308, "왼쪽 Alt" },
+			{ 266, "숫자패드 ." }, { 267, "숫자패드 /" }, { 268, "숫자패드 *" }, { 269, "숫자패드 -" },
+			{ 270, "숫자패드 +" }, { 271, "숫자패드 Enter" }
+		}
+		for code = 48, 57 do table.insert(keys, { code, tostring(code - 48) }) end
+		for code = 97, 122 do table.insert(keys, { code, string.upper(string.char(code)) }) end
+		for code = 256, 265 do table.insert(keys, { code, "숫자패드 " .. tostring(code - 256) }) end
+		for code = 282, 293 do
+			if code ~= 289 then table.insert(keys, { code, "F" .. tostring(code - 281) }) end
+		end
+		local catalog = {}
+		for _, entry in ipairs(keys) do
+			table.insert(catalog, { Code = entry[1], Label = entry[2] })
+		end
+		return catalog
+	end
+
+	method void EnsureCatalogCache()
+		-- Builds the lookups once per context; KeyboardKey values are cached so input checks never re-cast.
+		if self._T.KeyLabels ~= nil then return end
+		self._T.KeyLabels = {}
+		self._T.KeyEnums = {}
+		for _, entry in ipairs(self:GetKeyCatalog()) do
+			self._T.KeyLabels[entry.Code] = entry.Label
+			self._T.KeyEnums[entry.Code] = KeyboardKey.CastFrom(entry.Code)
+		end
+		self._T.Actions = self:GetActionCatalog()
+		self._T.ActionById = {}
+		for _, action in ipairs(self._T.Actions) do
+			self._T.ActionById[action.Id] = action
+		end
+	end
+
+	method void ApplyDefaultVolumes()
+		self.Volumes = { Master = 100, Bgm = 100, Skill = 100, Monster = 100 }
+	end
+
+	method void ApplyDefaultBindings()
+		self:EnsureCatalogCache()
+		local bindings = {}
+		for _, action in ipairs(self._T.Actions) do
+			bindings[action.Id] = { action.Default[1], action.Default[2] }
+		end
+		self.Bindings = bindings
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self:ApplyDefaultVolumes()
+		self:ApplyDefaultBindings()
+		self.LoadRetryRemaining = 0
+		log("[GameSettings] ready defaults applied")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Asks the server for the saved settings once the local player exists, retrying until an answer arrives.
+		if self.IsLoaded then return end
+		self.LoadRetryRemaining = self.LoadRetryRemaining - delta
+		if self.LoadRetryRemaining > 0 then return end
+		if isvalid(_UserService.LocalPlayer) == false then return end
+		self.LoadRetryRemaining = self.LoadRetryInterval
+		self:RequestSettings()
+	end
+
+	-- ---------- input ----------
+
+	method boolean IsActionKey(string actionId, any key)
+		-- True when the pressed key is either binding of the action. Unknown actions never match.
+		local binding = self.Bindings[actionId]
+		if binding == nil then return false end
+		self:EnsureCatalogCache()
+		for slot = 1, 2 do
+			local code = binding[slot] or 0
+			if code ~= 0 and self._T.KeyEnums[code] == key then return true end
+		end
+		return false
+	end
+
+	method integer GetMoveDirection(any key)
+		if self:IsActionKey("MOVE_LEFT", key) then return -1 end
+		if self:IsActionKey("MOVE_RIGHT", key) then return 1 end
+		return 0
+	end
+
+	method boolean IsInputBlocked()
+		-- Gameplay keys pause while the settings window is open or waiting for a new key.
+		return self.IsWindowOpen or self.IsCapturingKey
+	end
+
+	method integer FindKeyCode(any key)
+		-- Maps a pressed KeyboardKey back to its catalog code; 0 for reserved or unsupported keys.
+		self:EnsureCatalogCache()
+		for code, value in pairs(self._T.KeyEnums) do
+			if value == key then return code end
+		end
+		return 0
+	end
+
+	method string GetKeyLabel(integer code)
+		if code == nil or code == 0 then return "-" end
+		self:EnsureCatalogCache()
+		return self._T.KeyLabels[code] or "?"
+	end
+
+	method string GetKeyShortLabel(integer code)
+		-- Compact label for key caps and small badges; long catalog names are abbreviated.
+		if code == nil or code == 0 then return "" end
+		if code >= 256 and code <= 265 then return "N" .. tostring(code - 256) end
+		local short = {
+			[13] = "Enter", [277] = "Ins", [280] = "PgUp", [281] = "PgDn",
+			[303] = "RShift", [304] = "LShift", [305] = "RCtrl", [306] = "LCtrl", [307] = "RAlt", [308] = "LAlt",
+			[266] = "N.", [267] = "N/", [268] = "N*", [269] = "N-", [270] = "N+", [271] = "NEnter"
+		}
+		return short[code] or self:GetKeyLabel(code)
+	end
+
+	method string GetActionKeyShortLabel(string actionId)
+		-- The key shown on single-key hints (lobby prompt, skill slot badge): key 1, or key 2 when key 1 is unbound.
+		local code = self:GetBinding(actionId, 1)
+		if code == 0 then code = self:GetBinding(actionId, 2) end
+		return self:GetKeyShortLabel(code)
+	end
+
+	method table GetKeyGlyph(integer code)
+		-- Key cap images authored for the key guide; keys without one are drawn as a text cap by the caller.
+		local glyphs = {
+			[97] = { "ff62239879f64554b2f621225f5d5aa1", 36, 36 },   -- A
+			[100] = { "eea981ca0b9a4d00a08f5280d18e1fcf", 36, 36 },  -- D
+			[101] = { "c28ce20aa271440583ca1034ede021ab", 36, 36 },  -- E
+			[104] = { "aef27d73561148779c992d4a2595b3bc", 36, 36 },  -- H
+			[115] = { "f142e3f20a2546d399dbf82f152f0c2a", 36, 36 },  -- S
+			[119] = { "f2f0ce1ac1b84bccb75e68b479dfab5a", 36, 36 },  -- W
+			[49] = { "54897ed728f14af39eb839e52d18c8bf", 36, 36 },   -- 1
+			[54] = { "5955f0f0641442b7b88c2baed070eaee", 36, 36 },   -- 6
+			[32] = { "cdda1dec79154d549ff98f0f8a973383", 72, 40 },   -- Space
+			[8] = { "b356449df20c4ee8aa013f3c99321827", 48, 36 },    -- Backspace
+			[273] = { "a1eabebc74be40e6ac0cad05d823e5f7", 36, 36 },  -- Up
+			[274] = { "73bf4bcae4684f77b32c9bbff0b0bbb3", 36, 36 },  -- Down
+			[275] = { "c23d102e8d704f8f8b5ad3923c721ac1", 36, 36 },  -- Right
+			[276] = { "b0feb0c094f44e5abc6df5bdadc8a28f", 36, 36 }   -- Left
+		}
+		local glyph = glyphs[code]
+		if glyph == nil then return nil end
+		return { Ruid = glyph[1], Width = glyph[2], Height = glyph[3] }
+	end
+
+	method table GetActions()
+		self:EnsureCatalogCache()
+		return self._T.Actions
+	end
+
+	method integer GetBinding(string actionId, integer slot)
+		local binding = self.Bindings[actionId]
+		if binding == nil then return 0 end
+		return binding[slot] or 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method string SetBinding(string actionId, integer slot, integer code)
+		-- Assigns one key slot. A key already used elsewhere is moved here; returns that action's label ("" if none).
+		self:EnsureCatalogCache()
+		local binding = self.Bindings[actionId]
+		if binding == nil or (slot ~= 1 and slot ~= 2) then return "" end
+		local displaced = ""
+		if code ~= 0 then
+			for otherId, other in pairs(self.Bindings) do
+				for otherSlot = 1, 2 do
+					if other[otherSlot] == code and (otherId ~= actionId or otherSlot ~= slot) then
+						other[otherSlot] = 0
+						if otherId ~= actionId then displaced = self._T.ActionById[otherId].Label end
+					end
+				end
+			end
+		end
+		binding[slot] = code
+		log("[GameSettings] binding action=" .. actionId .. " slot=" .. tostring(slot) .. " key=" .. self:GetKeyLabel(code) .. " displaced=" .. displaced)
+		self:MarkChanged()
+		return displaced
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetBindings()
+		self:ApplyDefaultBindings()
+		log("[GameSettings] bindings reset")
+		self:MarkChanged()
+	end
+
+	-- ---------- game ----------
+
+	@ExecSpace("ClientOnly")
+	method void SetShowKeyGuide(boolean visible)
+		if self.ShowKeyGuide == visible then return end
+		self.ShowKeyGuide = visible
+		log("[GameSettings] key guide visible=" .. tostring(visible))
+		self:MarkChanged()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetGameOptions()
+		self.ShowKeyGuide = true
+		log("[GameSettings] game options reset")
+		self:MarkChanged()
+	end
+
+	-- ---------- sound ----------
+
+	method integer GetVolume(string id)
+		return self.Volumes[id] or 100
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetVolume(string id, number value)
+		local clamped = math.max(0, math.min(100, math.floor(value + 0.5)))
+		if self.Volumes[id] == nil or self.Volumes[id] == clamped then return end
+		self.Volumes[id] = clamped
+		self:MarkChanged()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetVolumes()
+		self:ApplyDefaultVolumes()
+		log("[GameSettings] volumes reset")
+		self:MarkChanged()
+	end
+
+	method number GetVolumeScale(string category)
+		-- Master x category, both 0~100. Categories: Bgm, Skill, Monster; anything else (UI) uses master only.
+		local scale = self:GetVolume("Master") / 100
+		if category == "Bgm" or category == "Skill" or category == "Monster" then
+			scale = scale * self:GetVolume(category) / 100
+		end
+		return scale
+	end
+
+	method string GetBattleSoundCategory(string phase, string team)
+		-- Monster sounds are the enemy impact/death cues and anything an enemy casts; the rest are player skills.
+		if phase == "MONSTER_DAMAGE" or phase == "MONSTER_DEATH" or phase == "ENEMY_HIT" then return "Monster" end
+		if phase == "CAST" and team == "Enemy" then return "Monster" end
+		return "Skill"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayUISound(string ruid, number volume)
+		-- Every interface sound goes through here so the master volume applies to it.
+		local scaled = math.max(0, math.min(1, volume * self:GetVolumeScale("UI")))
+		if scaled <= 0 then return end
+		_SoundService:PlaySound(ruid, scaled)
+	end
+
+	-- ---------- persistence ----------
+
+	method string Encode()
+		return _HttpService:JSONEncode({ Version = 1, Game = { ShowKeyGuide = self.ShowKeyGuide }, Volumes = self.Volumes, Bindings = self.Bindings })
+	end
+
+	method table Decode(string raw)
+		-- Returns { ShowKeyGuide, Volumes, Bindings } with defaults for anything missing or invalid; nil for unreadable data.
+		if raw == nil or raw == "" then return nil end
+		local ok, decoded = pcall(function() return _HttpService:JSONDecode(raw) end)
+		if ok == false or type(decoded) ~= "table" or decoded.Version ~= 1 then return nil end
+		self:EnsureCatalogCache()
+		-- Saves written before the game tab existed have no Game block and keep the guide visible.
+		local showKeyGuide = true
+		if type(decoded.Game) == "table" and decoded.Game.ShowKeyGuide == false then showKeyGuide = false end
+		local volumes = { Master = 100, Bgm = 100, Skill = 100, Monster = 100 }
+		if type(decoded.Volumes) == "table" then
+			for id, _ in pairs(volumes) do
+				local value = tonumber(decoded.Volumes[id])
+				if value ~= nil then volumes[id] = math.max(0, math.min(100, math.floor(value))) end
+			end
+		end
+		local bindings = {}
+		local used = {}
+		for _, action in ipairs(self._T.Actions) do
+			local saved = type(decoded.Bindings) == "table" and decoded.Bindings[action.Id] or nil
+			local pair = { action.Default[1], action.Default[2] }
+			if type(saved) == "table" then
+				for slot = 1, 2 do
+					local code = math.floor(tonumber(saved[slot]) or 0)
+					if code ~= 0 and self._T.KeyLabels[code] == nil then code = 0 end
+					pair[slot] = code
+				end
+			end
+			for slot = 1, 2 do
+				-- A key may drive only one action; a duplicate in the saved data keeps the first occurrence.
+				if pair[slot] ~= 0 then
+					if used[pair[slot]] then pair[slot] = 0 else used[pair[slot]] = true end
+				end
+			end
+			bindings[action.Id] = pair
+		end
+		return { ShowKeyGuide = showKeyGuide, Volumes = volumes, Bindings = bindings }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void MarkChanged()
+		-- Bumps the revision the UI and BGM watch, and debounces one save for a burst of slider or key edits.
+		self.Revision = self.Revision + 1
+		self._T.ChangedBeforeLoad = self.IsLoaded == false
+		if self.SaveTimerId ~= 0 then _TimerService:ClearTimer(self.SaveTimerId) end
+		self.SaveTimerId = _TimerService:SetTimerOnce(function()
+			self.SaveTimerId = 0
+			self:SaveSettings(self:Encode())
+		end, self.SaveDelay)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveSettings(string raw, boolean success)
+		-- Applies the saved settings unless the player already edited them while the load was in flight.
+		self.IsLoaded = true
+		if self._T.ChangedBeforeLoad == true then
+			log("[GameSettings] load ignored reason=EDITED_BEFORE_LOAD")
+			return
+		end
+		local decoded = self:Decode(raw)
+		if decoded == nil then
+			log("[GameSettings] load applied defaults success=" .. tostring(success) .. " hasData=" .. tostring(raw ~= ""))
+			return
+		end
+		self.ShowKeyGuide = decoded.ShowKeyGuide
+		self.Volumes = decoded.Volumes
+		self.Bindings = decoded.Bindings
+		self.Revision = self.Revision + 1
+		log("[GameSettings] load applied keyGuide=" .. tostring(self.ShowKeyGuide) .. " master=" .. tostring(self.Volumes.Master) .. " bgm=" .. tostring(self.Volumes.Bgm) .. " skill=" .. tostring(self.Volumes.Skill) .. " monster=" .. tostring(self.Volumes.Monster))
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetStorageUserKey(Entity player)
+		-- Same key choice as the other per-user saves: the profile code, falling back to the user id.
+		local key = player.PlayerComponent.ProfileCode
+		if key == nil or key == "" then key = player.PlayerComponent.UserId end
+		return key
+	end
+
+	@ExecSpace("Server")
+	method void RequestSettings()
+		-- Resolves the caller on the server; a missing entry (1000002) is a first-time player with defaults.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if isvalid(player) == false or player.PlayerComponent == nil then return end
+		local storage = _DataStorageService:GetUserDataStorage(self:GetStorageUserKey(player))
+		local code, raw = storage:GetAndWait(self.StorageKey)
+		if code ~= 0 and code ~= 1000002 then
+			log_warning("[GameSettings] load failed code=" .. tostring(code))
+			return
+		end
+		self:ReceiveSettings(code == 0 and (raw or "") or "", true, senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void SaveSettings(string raw)
+		-- Last write wins; the payload is re-validated so a client can only store a well-formed settings blob.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if isvalid(player) == false or player.PlayerComponent == nil then return end
+		if raw == nil or string.len(raw) > self.MaxPayloadLength or self:Decode(raw) == nil then
+			log_warning("[GameSettings] save rejected length=" .. tostring(raw and string.len(raw) or 0))
+			return
+		end
+		local storage = _DataStorageService:GetUserDataStorage(self:GetStorageUserKey(player))
+		storage:SetAsync(self.StorageKey, raw, function(code)
+			if code ~= 0 then
+				log_warning("[GameSettings] save failed code=" .. tostring(code))
+			else
+				log("[GameSettings] saved bytes=" .. tostring(string.len(raw)))
+			end
+		end)
+	end
+
+end

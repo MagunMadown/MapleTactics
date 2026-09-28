@@ -15,7 +15,12 @@ script PlayerRunRelicEffectComponent extends Component
 	property boolean FirstHitGuardUsed = false
 	property boolean LethalSurvivalUsed = false
 	property boolean FirstKillUsed = false
+	property integer KillHealProgress = 0
 	property table DefeatedUnitIds = {}
+	property boolean FirstSkillUsed = false
+	property table RemainingUses = {}
+	property table ExhaustedRelics = {}
+	@TargetUserSync property string InventoryDisplaySnapshot = ""
 
 	@ExecSpace("ServerOnly")
 	method table CaptureForRun(integer runSequence)
@@ -37,7 +42,12 @@ script PlayerRunRelicEffectComponent extends Component
 		self.FirstHitGuardUsed = false
 		self.LethalSurvivalUsed = false
 		self.FirstKillUsed = false
+		self.KillHealProgress = 0
 		self.DefeatedUnitIds = {}
+		self.FirstSkillUsed = false
+		self.RemainingUses = {}
+		self.ExhaustedRelics = {}
+		self.InventoryDisplaySnapshot = ""
 		if runSequence <= 0 then return { Success = true, Reason = "RELIC_RESET" } end
 		local catalog = _RelicDefinitionRepositoryLogic:GetAllDefinitions()
 		if catalog.Success == false then return catalog end
@@ -60,7 +70,7 @@ script PlayerRunRelicEffectComponent extends Component
 		end
 		local candidates = {}
 		for id, _ in pairs(self.Definitions) do
-			if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) == 0 then table.insert(candidates, id) end
+			if self:CanAcquireRelic(id) then table.insert(candidates, id) end
 		end
 		table.sort(candidates)
 		local pending = {}
@@ -119,13 +129,16 @@ script PlayerRunRelicEffectComponent extends Component
 		local attack, hp, defense = 0, 0, 0
 		local specialEffects = {}
 		for id, definition in pairs(self.Definitions) do
-			if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) > 0 then
+			if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) > 0 and self:IsJobAllowed(id) and not self.ExhaustedRelics[id] then
 				attack = attack + definition.AttackBonus
 				hp = hp + definition.MaxHpBonus
 				defense = defense + definition.DefenseBonus
 				local effectType = definition.SpecialEffectType or ""
 				if effectType ~= "" then
 					specialEffects[effectType] = (specialEffects[effectType] or 0) + definition.SpecialEffectValue
+					if effectType == "FINITE_GUARD" and self.RemainingUses[id] == nil then
+						self.RemainingUses[id] = definition.SpecialEffectValue
+					end
 				end
 			end
 		end
@@ -148,6 +161,7 @@ script PlayerRunRelicEffectComponent extends Component
 			end
 			log("[RunRelic] hp delta=" .. delta .. " hp=" .. runState.RunCurrentHp .. "/" .. runState.RunMaxHp)
 		end
+		self:PublishInventoryDisplay()
 		return { Success = true, Reason = "RELIC_EFFECTS_APPLIED", AttackBonus = attack, MaxHpBonus = hp, DefenseBonus = defense }
 	end
 
@@ -164,7 +178,13 @@ script PlayerRunRelicEffectComponent extends Component
 	method number GetSpecialEffectValue(string effectType)
 		-- Reads the unique-owned-relic aggregate captured for the current run.
 		if not self:IsCurrentRun() then return 0 end
-		return self.SpecialEffects[effectType] or 0
+		local inventory = self.Entity:GetComponent("script.PlayerRunInventoryComponent")
+		local value = 0
+		for id, definition in pairs(self.Definitions) do
+			if definition.SpecialEffectType == effectType and self:IsJobAllowed(id) and not self.ExhaustedRelics[id]
+				and inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) > 0 then value = value + definition.SpecialEffectValue end
+		end
+		return value
 	end
 
 	@ExecSpace("ServerOnly")
@@ -176,6 +196,7 @@ script PlayerRunRelicEffectComponent extends Component
 		local recalculation = self:Recalculate()
 		if recalculation.Success == false then return end
 		self.ActiveBattleKey = key
+		self.FirstSkillUsed = false
 		self.FirstHitGuardUsed = false
 		self.LethalSurvivalUsed = false
 		self.FirstKillUsed = false
@@ -187,12 +208,13 @@ script PlayerRunRelicEffectComponent extends Component
 	@ExecSpace("ServerOnly")
 	method number ResolveIncomingDamage(number amount, number currentHp)
 		-- Runs after other guards and stat reductions, before the unit commits HP or death.
-		if amount <= 0 or currentHp <= 0 or self.ActiveBattleKey == "" then return amount end
+		if not self:IsCurrentRun() or amount <= 0 or currentHp <= 0 or self.ActiveBattleKey == "" then return amount end
 		if not self.FirstHitGuardUsed and self:GetSpecialEffectValue("FIRST_HIT_GUARD") > 0 then
 			self.FirstHitGuardUsed = true
 			log("[RunRelic] triggered effect=FIRST_HIT_GUARD key=" .. self.ActiveBattleKey .. " blocked=" .. amount)
 			return 0
 		end
+		if self:ConsumeGuardUse() then return 0 end
 		if amount >= currentHp and not self.LethalSurvivalUsed and self:GetSpecialEffectValue("LETHAL_SURVIVAL") > 0 then
 			self.LethalSurvivalUsed = true
 			log("[RunRelic] triggered effect=LETHAL_SURVIVAL key=" .. self.ActiveBattleKey .. " hp=1")
@@ -218,14 +240,160 @@ script PlayerRunRelicEffectComponent extends Component
 		if not self:IsCurrentRun() or self.ActiveBattleKey == "" or self.DefeatedUnitIds[unitId] then return end
 		self.DefeatedUnitIds[unitId] = true
 		self:ApplyRelicHealing("KILL_HEAL")
+		if self:GetSpecialEffectValue("THREE_KILL_HEAL") > 0 then
+			self.KillHealProgress = self.KillHealProgress + 1
+			if self.KillHealProgress >= 3 then
+				self.KillHealProgress = 0
+				self:ApplyRelicHealing("THREE_KILL_HEAL")
+			end
+		end
 		if self.FirstKillUsed then return end
 		self.FirstKillUsed = true
+		local percent = self:GetSpecialEffectValue("FIRST_KILL_HEAL_PERCENT")
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if percent > 0 and unit ~= nil then
+			unit:ApplyHealing(math.max(1, math.floor(unit.MaxHp * percent / 100)))
+		end
 		local reduction = self:GetSpecialEffectValue("FIRST_KILL_COOLDOWN")
 		local runtime = self.Entity:GetComponent("script.SkillRuntimeStateComponent")
 		if reduction > 0 and runtime ~= nil then
 			runtime:AdvanceCooldowns(reduction, "RELIC_FIRST_KILL")
 			log("[RunRelic] triggered effect=FIRST_KILL_COOLDOWN key=" .. self.ActiveBattleKey .. " reduction=" .. reduction)
 		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsJobAllowed(string relicId)
+		-- Uses the current run job, including when checking cached catalog definitions.
+		local definition = self.Definitions[relicId]
+		local run = self.Entity:GetComponent("script.PlayerRunStateComponent")
+		return definition ~= nil and run ~= nil and ((definition.RequiredJobId or "") == "" or definition.RequiredJobId == run.SelectedJobId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean CanAcquireRelic(string relicId)
+		-- All acquisition paths share ownership, job and permanent exhaustion checks.
+		if not self:IsCurrentRun() or not self:IsJobAllowed(relicId) or self.ExhaustedRelics[relicId] then return false end
+		if self.Definitions[relicId].IsOpen ~= true then return false end
+		local inventory = self.Entity:GetComponent("script.PlayerRunInventoryComponent")
+		return inventory:GetSnapshotAmount(inventory.RunItemSnapshot, relicId) == 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean ConsumeGuardUse()
+		-- Charges survive battles and sales; exhaustion is permanent until CaptureForRun resets it.
+		if self:GetSpecialEffectValue("FINITE_GUARD") <= 0 then return false end
+		local inventory = self.Entity:GetComponent("script.PlayerRunInventoryComponent")
+		local ids = {}
+		for id, definition in pairs(self.Definitions) do
+			if definition.SpecialEffectType == "FINITE_GUARD" and self:IsJobAllowed(id) and not self.ExhaustedRelics[id]
+				and inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) > 0 then table.insert(ids, id) end
+		end
+		table.sort(ids)
+		for _, id in ipairs(ids) do
+			local remaining = self.RemainingUses[id]
+			if remaining == nil then remaining = self.Definitions[id].SpecialEffectValue end
+			if remaining > 0 then
+				self.RemainingUses[id] = remaining - 1
+				if remaining == 1 then
+					self.ExhaustedRelics[id] = true
+					inventory.RunItemSnapshot = inventory:SetSnapshotAmount(inventory.RunItemSnapshot, id, 0)
+				end
+				inventory.InventoryRevision = inventory.InventoryRevision + 1
+				self:Recalculate()
+				log("[RunRelic] finite guard id=" .. id .. " remaining=" .. tostring(remaining - 1))
+				return true
+			end
+		end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetDirectDamageBonus(any source, any target)
+		-- Every direct hit evaluates its own impact-time position, HP and hostile statuses.
+		if not self:IsCurrentRun() or source == nil or target == nil or source.Team ~= "Player" or target.Team ~= "Enemy" then return 0 end
+		local offset = source.CellIndex - target.CellIndex
+		local distance = math.abs(offset)
+		local facing = target.Facing == "Right" and 1 or -1
+		local bonus = 0
+		if offset * facing > 0 then bonus = bonus + self:GetSpecialEffectValue("FRONT_DAMAGE") end
+		if offset * facing < 0 then bonus = bonus + self:GetSpecialEffectValue("BACK_DAMAGE") end
+		if source.CurrentHp * 2 <= source.MaxHp then bonus = bonus + self:GetSpecialEffectValue("LOW_HP_DAMAGE") end
+		if source.CurrentHp >= source.MaxHp then bonus = bonus + self:GetSpecialEffectValue("FULL_HP_DAMAGE") end
+		if target.CurrentHp >= target.MaxHp then bonus = bonus + self:GetSpecialEffectValue("FULL_TARGET_DAMAGE") end
+		if target.PoisonDamage > 0 then bonus = bonus + self:GetSpecialEffectValue("POISONED_DAMAGE") end
+		if target.BurnDamage > 0 then bonus = bonus + self:GetSpecialEffectValue("BURNING_DAMAGE") end
+		if distance >= 3 then bonus = bonus + self:GetSpecialEffectValue("DISTANT_DAMAGE") end
+		if distance == 1 then bonus = bonus + self:GetSpecialEffectValue("ADJACENT_DAMAGE") end
+		return bonus
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetFrontDamageReduction(any source, any target)
+		-- Direction belongs to the defender and is evaluated at impact, not at cast time.
+		if source == nil or target == nil or source.Team ~= "Enemy" or target.Team ~= "Player" then return 0 end
+		local facing = target.Facing == "Right" and 1 or -1
+		if (source.CellIndex - target.CellIndex) * facing <= 0 then return 0 end
+		return self:GetSpecialEffectValue("FRONT_DAMAGE_REDUCTION")
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetExtraShurikenCount(table definition)
+		-- Explicit tags distinguish thrown stars from other claw-weapon skills such as Wind Talisman.
+		if definition == nil or string.find("|" .. (definition.SkillTags or "") .. "|", "|shuriken|", 1, true) == nil then return 0 end
+		return self:GetSpecialEffectValue("EXTRA_SHURIKEN")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnSkillCompleted(string skillId)
+		-- Called only after successful skill resolution; basic attacks do not enter this hook.
+		if not self:IsCurrentRun() or self.ActiveBattleKey == "" or self.FirstSkillUsed then return end
+		self.FirstSkillUsed = true
+		local amount = self:GetSpecialEffectValue("FIRST_SKILL_COOLDOWN")
+		local runtime = self.Entity:GetComponent("script.SkillRuntimeStateComponent")
+		if amount > 0 and runtime ~= nil then
+			runtime:ReduceCooldown(skillId, amount)
+			log("[RunRelic] first skill cooldown skill=" .. skillId .. " amount=" .. tostring(amount))
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishInventoryDisplay()
+		-- Owner-synced presentation is independent of the current map's battle session.
+		if not self:IsCurrentRun() then self.InventoryDisplaySnapshot = ""; return end
+		local inventory = self.Entity:GetComponent("script.PlayerRunInventoryComponent")
+		local ids, items = {}, {}
+		for id, definition in pairs(self.Definitions) do
+			if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) > 0 then table.insert(ids, id) end
+		end
+		table.sort(ids)
+		for _, id in ipairs(ids) do
+			local definition = self.Definitions[id]
+			table.insert(items, { RelicId = id, DisplayName = definition.DisplayName, IconImageRUID = definition.IconImageRUID,
+				EffectDescription = definition.EffectDescription, RequiredJobId = definition.RequiredJobId or "",
+				RemainingUses = self.RemainingUses[id] or -1, Active = self:IsJobAllowed(id) and not self.ExhaustedRelics[id] })
+		end
+		if #items == 0 then self.InventoryDisplaySnapshot = ""; return end
+		local effectTypes, descriptions = {}, {}
+		for effectType, value in pairs(self.SpecialEffects) do
+			if value > 0 then table.insert(effectTypes, effectType) end
+		end
+		table.sort(effectTypes)
+		for _, effectType in ipairs(effectTypes) do
+			local description = _RelicDefinitionRepositoryLogic:DescribeSpecialEffect(effectType, self.SpecialEffects[effectType])
+			if effectType == "FINITE_GUARD" then
+				local remaining = 0
+				for _, item in ipairs(items) do
+					if item.Active and item.RemainingUses >= 0 then remaining = remaining + item.RemainingUses end
+				end
+				description = "피해 무효화 남은 횟수: " .. tostring(remaining)
+			end
+			table.insert(descriptions, description)
+		end
+		self.InventoryDisplaySnapshot = _HttpService:JSONEncode({ RunSequence = self.ActiveRunSequence,
+			ItemSnapshot = inventory.RunItemSnapshot, Items = items,
+			Totals = { Attack = self.AttackBonus, MaxHp = self.MaxHpBonus, Defense = self.DefenseBonus,
+				SpecialDescription = table.concat(descriptions, "\n\n") } })
 	end
 
 	@ExecSpace("ServerOnly")

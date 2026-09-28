@@ -34,7 +34,7 @@
   const columns = {
     EnemyPatternSteps:{TileId:{label:"적 스킬 ID (TileId)",note:"타일이 아님. EnemySkillDefinitions.SkillId 참조.",ref:["EnemySkillDefinitions","SkillId"],optional:true}},
     UnionBoardCellDefinitions:{RegionId:{label:"보드 영역 (RegionId)",note:"GROWTH / COMBAT / CORE / EXPLORATION / TACTICS. RegionDefinitions와 관계없음.",ref:null}},
-    RelicDefinitions:{EffectDescription:{label:"미사용 설명 (EffectDescription)",note:"런타임은 AttackBonus / MaxHpBonus / DefenseBonus로 설명을 생성함.",readonly:true}},
+    RelicDefinitions:{IsOpen:{label:"유물 개방 (IsOpen)",note:"true: 획득 가능 / false: 상점·시작 추첨·지급 차단. 변경은 새 런부터 적용."},RequiredJobId:{ref:["JobDefinitions","JobId"],optional:true},EffectDescription:{label:"미사용 설명 (EffectDescription)",note:"런타임은 능력치와 특수 효과로 설명을 생성함.",readonly:true}},
     TopHudThemeDefinitions:{
       RegionId:{ref:["RegionDefinitions","RegionId"],allow:["default"]},
       BackdropColor:{label:"화면 미반영 (BackdropColor)",note:"테마 검증에서는 읽지만 배경 렌더링에는 적용하지 않음.",readonly:true},
@@ -128,6 +128,7 @@
       for(const h of m.key) if(!t.headers.includes(h))add(name,1,h,"REQUIRED_KEY_COLUMN");
       t.rows.forEach((r,i)=>{
         const row=i+2;
+        if(name==="RelicDefinitions" && !["true","false"].includes(r.IsOpen))add(name,row,"IsOpen","INVALID_RELIC_OPEN_FLAG");
         if(name==="EnemyPatternSteps"&&["EXECUTE_TILE","TELEGRAPH_TILE","CHARGE_FORWARD","CAST_INTERRUPTIBLE","BOSS_JUMP_TELEGRAPH","BOSS_LAND_OPPOSITE"].includes(r.ActionType)&&!r.TileId)add(name,row,"TileId","PATTERN_TILE_ID_MISSING");
         if(m.key.length){
           // Level is numeric in runtime; "01" and "1" must collide.

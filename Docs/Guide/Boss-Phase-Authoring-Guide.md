@@ -57,7 +57,7 @@ StageDefinitions(StageType=BOSS)
 ### 휴면 보스 예시: 6-4 포장마차
 
 - 1페이즈: `WAIT` 한 행이 자기 자신으로 돌아간다. 휴면 `stand`를 대기·이동·피격에 지정해 맞을 때 활성 모습으로 튀지 않게 한다.
-- 2페이즈: HP 50% 이하에서 공격 Pattern으로 교체하고, 모션 네 칸은 비워 활성 기본 모션으로 복원한다.
+- 2페이즈: `HpRatioLE=0.999`로 설정해 HP 38의 첫 유효 피해(1 이상) 직후 공격 Pattern으로 교체하고, 모션 네 칸은 비워 활성 기본 모션으로 복원한다. 피해 0·빗나감에는 전환하지 않는다.
 - 입장 잡몹은 StageEnemyWaves/EnemySpawnPools에서 함께 생성한다. 이후 페이즈별 보충은 아래 선택 설정으로 분리한다.
 
 ### 페이즈별 잡몹 보충
@@ -66,7 +66,7 @@ StageDefinitions(StageType=BOSS)
 - `ReinforcementIntervalTurns`: 보충 간격(양의 정수). 페이즈 진입 후 이만큼의 턴이 지난 뒤 첫 보충을 시도한다.
 - `ReinforcementMaxAlive`: 최초 등장 잡몹을 포함한 살아 있는 일반 적 상한(1~4).
 - 매 라운드 종료 경계에서만 시도하며 성공 시 다음 보충 턴을 갱신한다. 상한/빈 칸 부족 시 다음 턴에 재시도한다. 전투 종료·보스 사망·보충 없는 페이즈로 전환 시 중단한다.
-- 포장마차 DORMANT는 `region_06_food_cart_adds / 3 / 2`, DINNER_RUSH는 비활성화다. 기존 잡몹은 페이즈 전환 시 남고, 신규 잡몹도 공통 SpawnWaveEnemy와 SPAWN_WAIT 경로를 사용한다.
+- 포장마차 DORMANT는 `region_06_food_cart_adds / 2 / 2`, DINNER_RUSH는 비활성화다. 기존 잡몹은 페이즈 전환 시 남고, 신규 잡몹도 공통 SpawnWaveEnemy와 SPAWN_WAIT 경로를 사용한다.
 
 ## 중단 가능한 캐스팅
 
@@ -83,6 +83,7 @@ StageDefinitions(StageType=BOSS)
 - `EXECUTE_TILE.NextStepOnFailure`: 중단됐을 때 이동할 경직·대기 행
 - 같은 큐 타일 실행 안의 여러 `DAMAGE` Effect 행은 중단 횟수 1회로 센다.
 - 피해가 0이거나 적중하지 않은 이동·회전·밀치기만으로는 캐스팅이 끊기지 않는다.
+- `CAST_INTERRUPTED`가 되면 해당 스킬의 바닥 범위 예고를 즉시 숨긴다. 큐 아이콘과 `중단!` 표시는 행동이 정리될 때까지 남기되, 중단 상태를 소비하는 중간 스냅샷에서 범위가 다시 나타나서는 안 된다. 이 규칙은 모든 `CAST_INTERRUPTIBLE` 패턴에 공통 적용된다.
 - 2 Phase처럼 `ParamA=2`로 올리면 한 플레이어 큐 안에서 서로 다른 두 스킬 실행을 맞혀야 끊을 수 있다.
 
 Validator는 캐스팅 Skill 참조, `ParamA >= 1`, 다음 성공 Step의 `EXECUTE_TILE` 및 동일 Skill 연결을 검사한다.
@@ -128,24 +129,22 @@ Phase가 바뀌어도 현재 고정 행동의 PatternId는 옛 Pattern일 수 �
 
 | 구분 | 설정 |
 |---|---|
-| Stage | `region_kerning_stage_04`, `StageType=BOSS`, 2 Wave |
-| Enemy | `region_kerning_dyle`, HP 8, `IsBoss=true` |
+| Stage | `region_kerning_stage_04`, `StageType=BOSS`, 1 Wave (`CLEAR_ONLY`) |
+| Enemy | `region_kerning_dyle`, HP 32, `IsBoss=true` |
 | Model | `kerningdyle` |
 | Phase 1 | `OPENING`, `region_kerning_dyle_phase_01` |
 | Phase 2 | HP 50% 이하 `ENRAGED`, `region_kerning_dyle_phase_02` |
 | 기본 공격 | `region_kerning_dyle_bite`, 전방 1칸, 피해는 `BasicAttackDamage=3` |
 | 예고 광역 | `region_kerning_dyle_tail_sweep`, 1턴 예고 후 전방 1~2칸, 피해 3 |
 | 격노 광역 | `region_kerning_dyle_tail_sweep_enraged`, 1턴 예고 후 전방 1~2칸, 피해 4 |
-| 증원 | Phase 2 전환(HP 4 이하) 시 리게이터 2마리 소환. Wave 1이 `SpawnTriggerMode=BOSS_PHASE`, `TriggerPhaseIndex=2` |
+| 증원 소환 | 양 페이즈 패턴 마지막 단계 `SUMMON_ENEMIES`. 모델의 `FaustSummonComponent`가 `region_kerning_swamp_mud_pool` 3개로 늪진흙괴물 3마리를 소환(`RequireEmptyBoard=true`, `SummonCooldownTurns=5`). 소환수가 모두 쓰러져 보스만 남았을 때만 다시 소환하며, 보스 처치 시 소환수는 함께 제거된다 |
 | 처치 드롭 | 골드 6~7, 소형 회복 물약 1개 |
 
-Wave 2는 보스 전용 Pool이 아니라 일반 적 `region_kerning_ligator`(HP 4, `HEAVY`)를 사용한다.
-`HEAVY`는 밀치기를 거부하므로 보스전 후반에 플레이어의 `PUSH` 조합을 제한하는 역할을 한다.
+2026-09-27부터 Phase 2 전환 증원(리게이터 2마리, `BOSS_PHASE` Wave)은 제거하고 다일의 소환 스킬로 대체했다.
+소환은 스켈레톤 지휘관과 같은 `FaustSummonComponent` 경로를 쓰므로 Session에 보스별 조건문을 추가하지 않았다.
 
-증원 타이밍은 턴 수가 아니라 **Phase 전환에 직접 연동**된다. 규격은
-[Battle-Wave-Guide.md §5.1](./Battle-Wave-Guide.md)의 `BOSS_PHASE` 트리거를 따른다. 보스 전투에
-Phase 연동 증원을 넣을 때는 Pattern이 아니라 `StageEnemyWaves` 행에 선언하고,
-Session에 보스별 조건문을 추가하지 않는다.
+Phase 전환에 직접 연동되는 증원이 필요한 보스는 여전히
+[Battle-Wave-Guide.md §5.1](./Battle-Wave-Guide.md)의 `BOSS_PHASE` 트리거를 `StageEnemyWaves` 행에 선언해 사용한다.
 
 ## Region 06 슬리피우드 Stage 6-8 주니어 발록 예시
 

@@ -14,6 +14,7 @@ script BattleUnitComponent extends Component
 		self.PoisonSourceUnitId = ""
 		self.PoisonMarkerRuid = ""
 		self.BurnDamage = 0
+		self.BurnTurns = 0
 		self.BurnSourceUnitId = ""
 		log("[BattleStatus] cleansed unit=" .. self.UnitId)
 		return { Success = true, Reason = "CLEANSED", AppliedAmount = 1 }
@@ -22,6 +23,7 @@ script BattleUnitComponent extends Component
 	@Sync property integer StopActionTurns = 0
 	@Sync property string StopMarkerRuid = ""
 	property number BurnDamage = 0
+	property integer BurnTurns = 0
 	property string BurnSourceUnitId = ""
 	property integer NextArrowCount = 0
 	property string NextArrowSkillId = ""
@@ -55,13 +57,17 @@ script BattleUnitComponent extends Component
 	@Sync property number VenomBuffAmount = 0
 	@Sync property integer VenomBuffTurns = 0
 	property string VenomMarkerRuid = ""
-	-- Hostile poison applied by an enemy's venom. It lasts until the unit dies and costs PoisonDamage per move.
+	-- Legacy field name: persistent poison stacks (0..5), dealing one damage per stack on each actual move.
 	property number PoisonDamage = 0
 	property string PoisonSourceUnitId = ""
 	@Sync property string PoisonMarkerRuid = ""
 	-- Different skills stack; recasting the same skill refreshes its own entry instead of adding a second one.
 	property table NextAttackBonusBySkill = {}
 	property table TimedBuffEntries = {}
+	property integer TimedBuffApplySequence = 0
+	-- Per-skill view of the timed buffs for the buff HUD: "skillId~turns~iconRuid|..." in first-applied order, where
+	-- turns is the longest remaining duration among that skill's stats. Only skills tagged "buff" are listed.
+	@Sync property string ActiveBuffSnapshot = ""
 	@Sync property string EnemyDefinitionId = ""
 	@Sync property string EnemyDisplayName = ""
 	@Sync property number BasicAttackDamage = 3
@@ -120,10 +126,10 @@ script BattleUnitComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table ApplyPoison(string sourceUnitId, number damagePerMove, string markerRuid)
-		-- Poisons this unit until it dies; a stronger venom replaces a weaker one, re-poisoning only refreshes.
+		-- Adds persistent poison stacks, capped at five; the latest applier owns movement damage.
 		if self.IsDead or damagePerMove <= 0 then return { Success = false, Reason = "INVALID_STATUS_TARGET" } end
 		local refreshed = self.PoisonDamage > 0
-		self.PoisonDamage = math.max(self.PoisonDamage, damagePerMove)
+		self.PoisonDamage = math.min(5, self.PoisonDamage + math.floor(damagePerMove))
 		self.PoisonSourceUnitId = sourceUnitId
 		self.PoisonMarkerRuid = markerRuid or ""
 		if refreshed == false then
@@ -136,6 +142,10 @@ script BattleUnitComponent extends Component
 	method void AdvanceNegativeStatusTurns()
 		-- Runs after the player's next consumed action, never immediately after the enemy applies seal.
 		self.SealTurns = math.max(0, self.SealTurns - 1)
+		if self.BurnTurns > 0 then
+			self.BurnTurns = self.BurnTurns - 1
+			if self.BurnTurns == 0 then self.BurnDamage = 0; self.BurnSourceUnitId = "" end
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -143,9 +153,12 @@ script BattleUnitComponent extends Component
 		-- Drops every self buff without touching HP; callers that own MaxHp reset it themselves.
 		self.NextAttackBonusBySkill = {}
 		self.TimedBuffEntries = {}
+		self.TimedBuffApplySequence = 0
+		self.ActiveBuffSnapshot = ""
 		self.StopActionTurns = 0
 		self.StopMarkerRuid = ""
 		self.BurnDamage = 0
+		self.BurnTurns = 0
 		self.BurnSourceUnitId = ""
 		self.NextArrowCount = 0
 		self.NextArrowSkillId = ""
@@ -368,7 +381,8 @@ script BattleUnitComponent extends Component
 		local entry = self.TimedBuffEntries[key]
 		local refreshed = entry ~= nil
 		if entry == nil then
-			entry = { SkillId = skillId, Stat = stat, Amount = 0, Turns = 0 }
+			self.TimedBuffApplySequence = self.TimedBuffApplySequence + 1
+			entry = { SkillId = skillId, Stat = stat, Amount = 0, Turns = 0, Sequence = self.TimedBuffApplySequence }
 			self.TimedBuffEntries[key] = entry
 		end
 		entry.Amount = math.max(entry.Amount, amount)
@@ -432,6 +446,7 @@ script BattleUnitComponent extends Component
 		self.VenomBuffAmount = totals.VENOM
 		self.VenomBuffTurns = longest.VENOM
 		self.MaxHpBuffTurns = longest.MAX_HP
+		self:RefreshActiveBuffSnapshot()
 		local maxHpDelta = totals.MAX_HP - self.MaxHpBuffAmount
 		if maxHpDelta == 0 then
 			return 0
@@ -448,6 +463,38 @@ script BattleUnitComponent extends Component
 		end
 		self:SyncRunHp("MAX_HP_" .. (reason or ""))
 		return maxHpDelta
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshActiveBuffSnapshot()
+		-- Folds the per-stat entries into one record per skill so a multi-stat buff shows as a single HUD icon.
+		local bySkill = {}
+		local skills = {}
+		for _, entry in pairs(self.TimedBuffEntries) do
+			local record = bySkill[entry.SkillId]
+			if record == nil then
+				record = { SkillId = entry.SkillId, Turns = 0, Sequence = entry.Sequence or 0 }
+				bySkill[entry.SkillId] = record
+				table.insert(skills, record)
+			end
+			record.Turns = math.max(record.Turns, entry.Turns)
+			record.Sequence = math.min(record.Sequence, entry.Sequence or 0)
+		end
+		table.sort(skills, function(a, b) return a.Sequence < b.Sequence end)
+		local parts = {}
+		for _, record in ipairs(skills) do
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(record.SkillId)
+			local isBuffSkill = definition.Success == true
+				and string.find("|" .. (definition.SkillTags or "") .. "|", "|buff|", 1, true) ~= nil
+			if record.Turns > 0 and isBuffSkill then
+				table.insert(parts, record.SkillId .. "~" .. tostring(record.Turns) .. "~" .. (definition.IconRuid or ""))
+			end
+		end
+		local snapshot = table.concat(parts, "|")
+		if snapshot ~= self.ActiveBuffSnapshot then
+			self.ActiveBuffSnapshot = snapshot
+			log("[BattleBuff] active buff snapshot unit=" .. self.UnitId .. " buffs=" .. snapshot)
+		end
 	end
 
 	method number SumTableValues(table values)
@@ -467,6 +514,9 @@ script BattleUnitComponent extends Component
 		end
 		self.CurrentHp = math.max(0, self.CurrentHp)
 		self.IsDead = true
+		self.PoisonDamage = 0
+		self.PoisonSourceUnitId = ""
+		self.PoisonMarkerRuid = ""
 		self:SyncRunHp("UNIT_MARKED_DEAD")
 		self.IsAirborne = false
 		self.PendingLandingCell = -1

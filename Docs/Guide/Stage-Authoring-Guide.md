@@ -130,15 +130,42 @@ Maker 직접 실행은 MapId 기준 공통 테스트 진입기를 사용한다. 
 
 | Stage | 물리 맵 | Wave 수 | 기본 구성 |
 |---|---|---:|---|
-| `region_kerning_stage_01` | `kerning_city_battle` | 3 | 스티지 5 (2+2+1) |
-| `region_kerning_stage_02` | `kerning_city_battle` | 3 | 스티지 2 → 주니어 레이스 2 → 레이스 1 |
-| `region_kerning_stage_03` | `kerning_city_battle` | 3 | 주니어 레이스 2 → 레이스 2 → 레이스 1 |
-| `region_kerning_stage_04` | `kerning_city_boss` | 2 | 보스 다일 1, `StageType=BOSS`, Phase 2 전환 시 리게이터 2 증원 |
+| `region_kerning_stage_01` | `kerning_city_battle` | 3 | 스티지 2 → 주니어 레이스 2 → 레이스 1 |
+| `region_kerning_stage_02` | `kerning_city_battle` | 3 | 주니어 레이스 2 → 레이스 2 → 셰이드 2 |
+| `region_kerning_stage_03` | `kerning_city_battle2` | 4 | 주니어 네키 2 → 리게이터 2 → 크로코 2 → 늪진흙괴물 1 (`UnitY=0.12`) |
+| `region_kerning_stage_04` | `kerning_city_boss` | 1 | 보스 다일 1, `StageType=BOSS`. 다일이 패턴 마지막에 늪진흙괴물 3마리 소환 |
 
+2-1·2-2는 `kerning_city_battle`에서 스티지~셰이드, 2-3은 보스맵을 복제한 늪지대 `kerning_city_battle2`(월드 발판 7개), 2-4는 `kerning_city_boss`(월드 발판 9개)에서 주니어 네키~늪진흙괴물(+2-4 다일)을 사용한다. 두 맵은 `BattlePlatforms` 레이어의 `BattleCell1~N` 링을 쓰며 x 위치는 Stage의 `CellStartX`/`CellSpacing`으로 런타임에 배치된다.
 일반 3단계는 Wave당 최대 2마리씩 `TURN_LIMIT`(3턴)으로 나누어 투입하고 `MaxConcurrent=2`로
 동시 등장을 제한한다. 마릿수를 정확히 맞춰야 하므로 가중치 혼합 Pool 대신 **적 1종만 담은
-전용 Pool**(`region_kerning_stirge_pool` / `_jr_wraith_pool` / `_wraith_pool`)을 Wave별로 지정한다.
+전용 Pool**(`region_kerning_stirge_pool` / `_jr_wraith_pool` / `_wraith_pool` / `_ligator_pool` / `_shade_pool` / `_jr_necki_pool` / `_croco_pool` / `_swamp_mud_pool`)을 Wave별로 지정한다.
 가중치 Pool은 어떤 적이 몇 마리 나올지 보장하지 못한다.
+
+2026-09-27 난이도 상향(엘리니아 수준): 다일 HP 32. 일반 적은 난이도 순서(스티지 < 주니어 레이스 < 레이스 < 셰이드 < 주니어 네키 < 리게이터 < 크로코 < 늪진흙괴물)에 맞춰 HP 4~8, 기본 공격력 1~4로 배정한다. 기본 공격이 아닌 스킬 피해는 4를 넘을 수 있다.
+
+| 적 | HP | 공격력 |
+|---|---:|---:|
+| 스티지 | 4 | 1 |
+| 주니어 레이스 | 4 | 1 |
+| 레이스 | 5 | 2 |
+| 셰이드 | 5 | 2 |
+| 주니어 네키 | 6 | 3 |
+| 리게이터 | 6 | 3 |
+| 크로코 | 7 | 4 |
+| 늪진흙괴물 | 8 | 4 |
+
+일반 적 패턴은 다음처럼 순환한다. 보스 다일은 기존 패턴 끝에 늪진흙괴물 3마리 소환 단계가 추가됐다([Boss-Phase-Authoring-Guide.md](Boss-Phase-Authoring-Guide.md)).
+
+| 적 | 패턴 순환 | 추가 스킬 |
+|---|---|---|
+| 스티지 | 방향 전환 → 급강하 → 할퀴기 2회 | `region_kerning_stirge_dive`: 1턴 예고 돌진(최대 5칸), 기본 공격력 피해 |
+| 주니어 레이스 | 원혼의 손아귀 → 손톱 2회 | `region_kerning_jr_wraith_grasp`: 전방 3칸 첫 대상, 피해 1 + 바로 앞으로 당기기, 쿨다운 2 |
+| 레이스 | 원혼탄 → 원혼 파동 → 원혼탄 → 저주 | `region_kerning_wraith_soul_wave`: 1턴 예고, 전방 1~3칸 피해 2 / `region_kerning_wraith_curse`: 1턴 예고, 전방 1~2칸 봉인 1턴, 쿨다운 4 |
+| 주니어 네키 | 독침 뱉기 → 물기 2회 | `region_kerning_jr_necki_spit`: 전방 2칸 첫 대상 피해 3, 쿨다운 2 |
+| 크로코 (`HEAVY`) | 물기 2회 → 꼬리 휩쓸기 | `region_kerning_croco_tail_sweep`: 1턴 예고, 앞뒤 1칸 피해 5 |
+| 셰이드 | 원한의 손길 → 영혼 흡수 → 방향 전환 → 그림자 급습 | `region_kerning_shade_soul_drain`: 전방 2칸 피해 2 + 자신 HP 2 회복, 쿨다운 3 / `region_kerning_shade_dash`: 1턴 예고 돌진 |
+| 늪진흙괴물 | 진흙 덩어리 던지기 → 후려치기 → 진흙 늪 → 후려치기 | `region_kerning_swamp_mud_throw`: 전방 3칸 첫 대상 피해 3, 쿨다운 2 / `region_kerning_swamp_mud_bog`: 전방 1~2칸에 2턴 동안 진흙 늪(지휘관 독안개와 같은 `POISON_MIST`), 턴 종료 시 그 칸에 있으면 피해 1, 쿨다운 4 |
+| 리게이터 | 물기 → 꼬리치기 → 크게 물기 | `region_kerning_ligator_tail_whip`: 피해 3 + 밀치기 / `region_kerning_ligator_chomp`: 1턴 예고, 전방 1칸 피해 5 |
 
 커닝시티 적은 모두 전용 `EnemyDefinitions`와 `RootDesk/MyDesk/Models/Monsters/Kerning*.model`을
 사용하며 헤네시스 적을 재사용하지 않는다. 보스 규칙은

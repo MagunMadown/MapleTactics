@@ -76,20 +76,25 @@ script UpgradeSkillStageLogic extends Logic
 		local normal = {}
 		local augmented = {}
 		local hiddenOffers = {}
+		local newSkills = {}
+		local canReplaceSold = inventory.PendingSoldSkillChoices > 0 and #inventory:GetDistinctOwnedSkillIds() < inventory.RunSkillBarSlotCount
 		for _, definition in ipairs(catalog.Skills) do
+			if canReplaceSold and definition.SkillTier == 1 and (definition.BaseSkillId or "") == "" and not inventory:HasOwnedSkillInFamily(definition.SkillId, catalog.Skills) then
+				local checked = _ContentValidatorLogic:ValidateSkillById(definition.SkillId)
+				if checked.Success then table.insert(newSkills, { Token = definition.SkillId .. "~NEW", Before = definition, After = definition, AugmentId = "", NewSkill = true }) end
+			end
 			local ownership = inventory:CanUseSkill(definition.SkillId)
 			if ownership.Success or ownership.Reason == "HEAL_CHARGES_EMPTY" then
 				local path = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(run.SelectedJobId, definition.SkillId)
 				if path.Success and definition.CostType ~= "HEAL_CHARGE" then
 					table.insert(normal, { Token = definition.SkillId, Before = definition, After = path.UpgradeDefinition, AugmentId = "" })
 				elseif path.Reason == "NO_UPGRADE_PATH" or definition.CostType == "HEAL_CHARGE" then
-					local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId)
-					if effects.Success then
+					local effects = _AugmentRuntimeLogic:GetEffectiveSkillBundle(playerEntity, definition.SkillId)
+					if effects.Success and (definition.CostType == "HEAL_CHARGE" or #owner:GetSkillAugmentIds(definition.SkillId) < owner.MaxSkillAugmentStages) then
 						local hidden = {}
 						for _, augment in ipairs(augments.Augments) do
 							local recharge = augment.Effects[1].ParamA == "HEAL_CHARGES"
-							if (recharge or owner:GetSkillAugmentId(definition.SkillId) ~= augment.Definition.AugmentId)
-								and _AugmentRuntimeLogic:CanBindSkillAugment(definition, effects.Steps, augment)
+							if _AugmentRuntimeLogic:CanBindSkillAugment(effects.Data.Definition, effects.Data.EffectSteps, augment)
 								and (definition.CostType ~= "HEAL_CHARGE" or not inventory.HealUnlimited)
 								and (not recharge or inventory:GetHealCharges() < 4) then
 								table.insert(augment.Effects[1].ParamC == "HIDDEN" and hidden or augmented, { Token = definition.SkillId .. "~" .. augment.Definition.AugmentId, Before = definition, After = definition, AugmentId = augment.Definition.AugmentId })
@@ -104,6 +109,17 @@ script UpgradeSkillStageLogic extends Logic
 			end
 		end
 		local allOffers = {}
+		-- A sold slot receives a dedicated basic-skill selection, never an upgraded skill.
+		if #newSkills > 0 then
+			self:ShuffleOffers(newSkills)
+			local offers = {}
+			for index, offer in ipairs(newSkills) do if index <= 3 then table.insert(offers, offer) end end
+			local state = { Success = true, Reason = "OK", Offers = offers, AllOffers = newSkills, RerollRevision = 0, RewardKey = rewardKey }
+			local formatted = self:FormatUpgradeOffers(playerEntity, state)
+			if not formatted.Success then return formatted end
+			owner._T.SkillUpgradeOffers = { Key = cacheKey, State = state }
+			return state
+		end
 		for _, list in ipairs({ normal, augmented, hiddenOffers }) do for _, offer in ipairs(list) do table.insert(allOffers, offer) end end
 		self:ShuffleOffers(normal)
 		self:ShuffleOffers(augmented)
@@ -129,33 +145,8 @@ script UpgradeSkillStageLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method string BuildSkillStatText(any definition)
-		-- Formats the authored combat fields used by the Before and After comparison panels.
-		local targetLabel = definition.TargetingType or ""
-		if targetLabel == "FRONT_CELL" then
-			targetLabel = "정면 칸"
-		elseif targetLabel == "FIRST_ENEMY_FORWARD" then
-			targetLabel = "전방의 첫 번째 적"
-		elseif targetLabel == "FIRST_ENEMY_PIERCE" then
-			targetLabel = "전방의 첫 번째 적과 그 뒤 한 칸"
-		elseif targetLabel == "RANGE_OFFSETS" then
-			targetLabel = "지정 범위"
-		elseif targetLabel == "SELF" then
-			targetLabel = "자신"
-		elseif targetLabel == "" then
-			targetLabel = "정보 없음"
-		end
-		local damageValue = self:GetSkillDamageValue(definition)
-		local damageText = damageValue > 0 and tostring(damageValue) or "없음"
-		local statText = "스킬명: " .. tostring(definition.DisplayName or definition.SkillId)
-			.. "\n피해: " .. damageText
-			.. "\n범위: " .. tostring(definition.Range or 0)
-			.. "\n대상: " .. targetLabel
-			.. "\n재사용 대기: " .. tostring(definition.CooldownTurns or 0) .. "턴"
-		local buffText = _BuffEffectExecutorLogic:DescribeBuffEffects(definition.EffectSetId or "")
-		if buffText ~= "" then
-			statText = statText .. "\n효과: " .. buffText
-		end
-		return statText
+		return _SkillCodexProvider:BuildDescription(definition)
+
 	end
 
 	@ExecSpace("ServerOnly")
@@ -207,7 +198,14 @@ script UpgradeSkillStageLogic extends Logic
 		if nextMap == "" then self:ReceiveApplyResult(false, "NEXT_STAGE_MAP_UNAVAILABLE", skillId, "", 0, "", senderUserId) return end
 		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
 		local applied = nil
-		if selected.AugmentId ~= "" then
+		if selected.NewSkill then
+			if inventory.PendingSoldSkillChoices <= 0 or #inventory:GetDistinctOwnedSkillIds() >= inventory.RunSkillBarSlotCount then
+				applied = { Success = false, Reason = "NO_SOLD_SKILL_SLOT" }
+			else
+				applied = inventory:GrantSkill(selected.After.SkillId, 1, state.RewardKey)
+				if applied.Success and applied.GrantedAmount == 1 then inventory.PendingSoldSkillChoices = inventory.PendingSoldSkillChoices - 1 end
+			end
+		elseif selected.AugmentId ~= "" then
 			local owner = player:GetComponent("script.PlayerRunAugmentComponent")
 			if selected.Before.CostType == "HEAL_CHARGE" and selected.AugmentId == "skill_heal" then
 				applied = inventory:GrantHealChargeReward(2, state.RewardKey)
@@ -291,25 +289,12 @@ script UpgradeSkillStageLogic extends Logic
 	method string BuildEffectiveStatText(table bundle)
 		-- Shows the same adjusted damage, hit count, range and cooldown used by combat.
 		local definition = bundle.Definition
-		local lines = { "스킬명: " .. definition.DisplayName }
+		local lines = { _SkillCodexProvider:BuildReadableDescription(definition, bundle.EffectSteps) }
 		if bundle.UnlimitedHeal then table.insert(lines, "사용 횟수: 무제한") end
-		if bundle.HealCharges ~= nil then table.insert(lines, "사용 횟수: " .. tostring(bundle.HealCharges) .. " / 5회") end
-		for _, step in ipairs(bundle.EffectSteps) do
-			if step.EffectType == "DAMAGE" then
-				local hits = _DamageEffectExecutorLogic:GetHitCount(step)
-				table.insert(lines, "피해: " .. tostring(step.Value) .. " × " .. tostring(hits) .. "타")
-			elseif step.EffectType == "HEAL" then
-				table.insert(lines, "회복: " .. tostring(step.Value))
-			end
-		end
-		table.insert(lines, "범위: " .. tostring(definition.Range) .. "칸")
-		table.insert(lines, "재사용 대기: " .. tostring(definition.CooldownTurns) .. "턴")
+		if bundle.HealCharges ~= nil and not bundle.UnlimitedHeal then table.insert(lines, "사용 횟수: " .. tostring(bundle.HealCharges)) end
 		if bundle.AugmentId ~= "" then
-			table.insert(lines, "증강: " .. bundle.AugmentName)
 			table.insert(lines, "장단점: " .. bundle.Description)
 		end
-		local effects = _BuffEffectExecutorLogic:DescribeEffectSteps(bundle.EffectSteps)
-		if effects ~= "" then table.insert(lines, "효과: " .. effects) end
 		return table.concat(lines, "\n")
 	end
 
@@ -334,7 +319,7 @@ script UpgradeSkillStageLogic extends Logic
 				after = afterResult.Data
 			end
 			if before == nil or after == nil then return { Success = false, Reason = "INVALID_SKILL_CONTENT" } end
-			if offer.Before.CostType == "HEAL_CHARGE" then
+			if offer.Before.CostType == "HEAL_CHARGE" and not offer.NewSkill then
 				before.HealCharges = inventory:GetHealCharges()
 				if offer.AugmentId == "hidden_heal" then after.UnlimitedHeal = true else after.HealCharges = math.min(5, before.HealCharges + 2) end
 			end
@@ -348,6 +333,18 @@ script UpgradeSkillStageLogic extends Logic
 				afterName, self:GetSkillIconRuid(offer.After), offer.AugmentId ~= "" and "AUGMENT" or tostring(offer.After.SkillTier),
 				self:BuildEffectiveStatText(after)
 			}
+			if offer.NewSkill then
+				values[4] = "NEW"
+				values[5] = "상태: 판매한 스킬의 빈 자리\n선택: 새 기본 스킬"
+				values[9] = "NEW"
+			else
+				local owner = playerEntity:GetComponent("script.PlayerRunAugmentComponent")
+				local stage = #owner:GetSkillAugmentIds(offer.Before.SkillId)
+				if offer.Before.CostType ~= "HEAL_CHARGE" then
+					values[5] = values[5] .. "\n증강 단계: " .. stage .. "/6"
+					values[10] = values[10] .. "\n증강 단계: " .. (stage + (offer.AugmentId ~= "" and 1 or 0)) .. "/6"
+				end
+			end
 			for index, field in ipairs(fields) do table.insert(columns[field], values[index]) end
 		end
 		for _, field in ipairs(fields) do state[field] = table.concat(columns[field], "|") end

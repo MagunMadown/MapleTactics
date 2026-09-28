@@ -45,8 +45,11 @@ script FaustSummonComponent extends Component
 		if self.LowHpSummonPoolIds ~= "" and boss.CurrentHp <= boss.MaxHp * self.LowHpRatio then
 			pools = self.LowHpSummonPoolIds
 		end
+		if boss.EnemyDefinitionId == "region_04_commander_skeleton" then
+			return self:BuildCommanderSummonEntries(session, boss, pools)
+		end
 		local cells = {}
-		if session:IsValidCell(targetCell) and session:IsCellOccupied(targetCell, "") == false then
+		if session.WaveRuntime:IsSpawnCellFree(session, targetCell) then
 			table.insert(cells, targetCell)
 		elseif self.RequireEmptyBoard == false then
 			return {}
@@ -54,7 +57,7 @@ script FaustSummonComponent extends Component
 		if self.RequireEmptyBoard then
 			for offset = 0, session.CellCount - 1 do
 				local cell = targetCell == 0 and offset or session.CellCount - 1 - offset
-				if cell ~= targetCell and session:IsCellOccupied(cell, "") == false then table.insert(cells, cell) end
+				if cell ~= targetCell and session.WaveRuntime:IsSpawnCellFree(session, cell) then table.insert(cells, cell) end
 			end
 		end
 		local entries = {}
@@ -63,7 +66,53 @@ script FaustSummonComponent extends Component
 			if cells[index] == nil then return {} end
 			table.insert(entries, { PoolId = poolId, Cell = cells[index] })
 		end
+		if session.WaveRuntime:GetAvailableSlots(session) < #entries then return {} end
 		return entries
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildCommanderSummonEntries(any session, any boss, string pools)
+		-- Reserve the player's rear first, then an intact pair beside/in front of the commander.
+		local playerEntity = session:FindUnitEntity("player_01")
+		if not isvalid(playerEntity) then return {} end
+		local player = playerEntity:GetComponent("script.BattleUnitComponent")
+		if player == nil or player.IsDead then return {} end
+		local rearDirection = player.Facing == "Right" and -1 or 1
+		local forward = boss.Facing == "Right" and 1 or -1
+		local pairs = {
+			{ boss.CellIndex - 1, boss.CellIndex + 1 },
+			{ boss.CellIndex + forward, boss.CellIndex + forward * 2 }
+		}
+		local roster = {}
+		for poolId in string.gmatch(pools, "([^|]+)") do table.insert(roster, poolId) end
+		if (#roster ~= 2 and #roster ~= 3) or session.WaveRuntime:GetAvailableSlots(session) < #roster then return {} end
+		for distance = 1, session.CellCount - 1 do
+			local rear = player.CellIndex + rearDirection * distance
+			if session:IsValidCell(rear) and session.WaveRuntime:IsSpawnCellFree(session, rear) then
+				if #roster == 2 then
+					for _, offset in ipairs({ forward, -forward, forward * 2 }) do
+						local cell = boss.CellIndex + offset
+						if cell ~= rear and session:IsValidCell(cell) and session.WaveRuntime:IsSpawnCellFree(session, cell) then
+							return { { PoolId = roster[1], Cell = rear }, { PoolId = roster[2], Cell = cell } }
+						end
+					end
+				else
+					for _, pair in ipairs(pairs) do
+						if pair[1] ~= rear and pair[2] ~= rear
+							and session:IsValidCell(pair[1]) and session:IsValidCell(pair[2])
+							and session.WaveRuntime:IsSpawnCellFree(session, pair[1])
+							and session.WaveRuntime:IsSpawnCellFree(session, pair[2]) then
+							return {
+								{ PoolId = roster[1], Cell = rear },
+								{ PoolId = roster[2], Cell = pair[1] },
+								{ PoolId = roster[3], Cell = pair[2] }
+							}
+						end
+					end
+				end
+			end
+		end
+		return {}
 	end
 
 	@ExecSpace("ServerOnly")
@@ -103,14 +152,19 @@ script FaustSummonComponent extends Component
 		if player == nil or player.IsDead then
 			return { Success = false, Reason = "PLAYER_UNAVAILABLE_WAIT" }
 		end
+		if session.WaveRuntime:GetAvailableSlots(session) < #entries then return { Success = false, Reason = "SUMMON_CAPACITY_WAIT" } end
 		local definitions = {}
 		for index, entry in ipairs(entries) do
-			if session:IsValidCell(entry.Cell) == false or session:IsCellOccupied(entry.Cell, "") then
+			if session.WaveRuntime:IsSpawnCellFree(session, entry.Cell) == false then
 				log("[BossSummon] wait reason=CELL_BLOCKED cell=" .. entry.Cell)
 				return { Success = false, Reason = "SUMMON_BLOCKED_WAIT" }
 			end
 			local definition = _StageWaveRepositoryLogic:GetEnemySpawnDefinition(entry.PoolId, session.CurrentWave, index, session.RunSeed)
 			if definition.Success == false then return definition end
+			local owner = self.Entity:GetComponent("script.BattleUnitComponent")
+			-- Only commander summons are fragile; the ordinary mummy-dog definition stays intact.
+			if owner ~= nil and owner.EnemyDefinitionId == "region_04_commander_skeleton"
+				and definition.EnemyDefinitionId == "region_04_mummydog" then definition.MaxHp = 1 end
 			table.insert(definitions, definition)
 		end
 		local boss = self.Entity:GetComponent("script.BattleUnitComponent")
@@ -126,7 +180,8 @@ script FaustSummonComponent extends Component
 			table.insert(spawned, summon)
 			local summonedUnit = summon:GetComponent("script.BattleUnitComponent")
 			if session.StageId == "region_04_stage_04" and boss.EnemyDefinitionId == "region_04_commander_skeleton"
-				and summonedUnit ~= nil and summonedUnit.EnemyDefinitionId == "region_04_skeleton_soldier" then
+				and summonedUnit ~= nil and (summonedUnit.EnemyDefinitionId == "region_04_skeleton_soldier"
+					or summonedUnit.EnemyDefinitionId == "region_04_skeleton_officer") then
 				summonedUnit._T.SkeletonCommander = self.Entity
 			end
 		end
