@@ -199,8 +199,8 @@ Maker 직접 실행은 MapId 기준 공통 테스트 진입기를 사용한다. 
 
 | 적 | HP / 공격 | 역할 |
 |---|---|---|
-| `region_06_wild_kargo` | 10 / 4 | 근접, `QUICK`. attack 클립이 없어 `jump` 클립을 들이받기 모션으로 사용. 방향 전환 → `region_06_wild_kargo_charge`(1턴 예고 돌진, 최대 3칸, 기본 공격력 피해) → 들이받기를 순환 |
-| `region_06_taurospear` | 11 / 5 | `attack1` 창 찌르기(`FIRST_ENEMY_FORWARD` 2칸, 쿨타임 2) → `attack2` 1턴 예고 휩쓸기(`RANGE_OFFSETS 1\|2`, 피해 6) → 한 칸 후퇴(`MOVE_AWAY`) |
+| `region_06_wild_kargo` | 10 / 4 | 근접, `QUICK`. attack 클립이 없어 `jump` 클립을 들이받기 모션으로 사용. 들이받기 → `region_06_wild_kargo_breath`(전방 1~2칸 `RANGE_OFFSETS 1|2`, 고정 피해 2, 쿨타임 3) → 방향 전환 → `region_06_wild_kargo_charge`(1턴 예고 돌진, 최대 2칸, 피해 1)를 순환 |
+| `region_06_taurospear` | 11 / 5 | `attack1` 창 찌르기(`FIRST_ENEMY_FORWARD` 사거리 1, 쿨타임 2) → `attack2` 1턴 예고 휩쓸기(`RANGE_OFFSETS 1\|2`, 피해 6) → 한 칸 후퇴 → 창 던지기(`region_06_taurospear_throw`, `FIRST_ENEMY_FORWARD` 2칸 첫 적, 쿨타임 2) → 한 칸 후퇴 |
 | `region_06_tauromacis` | 16 / 6 | 근접, `HEAVY`. `attack1/info/hit` 클립을 적중 효과로 사용. 내려찍기 → `region_06_tauromacis_earthquake`(1턴 예고, 전방 1~2칸 피해 7, 쿨타임 3) → `region_06_tauromacis_roar`(자신 공격력 +1, 2회, 쿨타임 3) |
 
 모델은 `RootDesk/MyDesk/Models/Monsters/Region06*.model`이며 일반 적은 리소스가 커서 `Scale=0.75`,
