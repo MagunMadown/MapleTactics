@@ -1,0 +1,336 @@
+@Logic
+script MoveSelfEffectExecutorLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table Execute(table context, table effectStep)
+		-- Moves the caster along its facing, normally as the step after a skill's damage. A destination that is
+		-- off the board or occupied is an authored-normal outcome: the skill keeps its damage and stays put.
+		local result = {
+			Success = false,
+			Reason = "INVALID_EFFECT_CONTEXT",
+			EffectType = "MOVE_SELF",
+			StepIndex = effectStep.StepIndex or 0,
+			Value = effectStep.Value or 0,
+			Hit = false,
+			TargetUnitId = "",
+			TargetUnitIds = {},
+			Results = {}
+		}
+		local battleSession = context.BattleSession
+		if battleSession == nil then
+			result.Reason = "SESSION_MISSING"
+			return result
+		end
+		if effectStep.EffectType == "TURN_SELF" then
+			-- Reverses the caster in place, normally as the last step of a skill that dashes past its targets.
+			result.EffectType = "TURN_SELF"
+			if context.LastSelfMoveSucceeded == false then
+				result.Success = true
+				result.Reason = "TURN_SKIPPED_NO_MOVE"
+				log("[BattleSkillMove] turn skipped skill=" .. tostring(context.SkillId) .. " reason=NO_MOVE")
+				return result
+			end
+			local turnResult = battleSession:TryTurn(context.SourceUnitId)
+			table.insert(result.Results, turnResult)
+			result.Success = turnResult.Success
+			result.Hit = turnResult.Success
+			result.Reason = turnResult.Success and "TURNED" or turnResult.Reason
+			return result
+		end
+
+		context.LastSelfMoveSucceeded = false
+		local targetUnitIds = _SkillTargetResolverLogic:SelectEffectTargets(context, effectStep.TargetSelector)
+		if #targetUnitIds == 0 then
+			result.Success = true
+			result.Reason = "MISS_EMPTY"
+			return result
+		end
+
+		local offset = self:ResolveForwardOffset(context, effectStep)
+		if offset.Success == false then
+			-- No cell to land on (e.g. the skill hit nobody). The damage steps still stand.
+			result.Success = true
+			result.Reason = offset.Reason
+			return result
+		end
+
+		-- Only the caster moves itself; the selector is restricted to SELF_UNIT by the validator.
+		local moveResult = battleSession:ResolveSkillMoveImpact(
+			context.SourceUnitId,
+			context.SkillId,
+			offset.ForwardOffset,
+			effectStep.ParameterB ~= "ALLOW_OCCUPIED"
+		)
+		table.insert(result.Results, moveResult)
+		if moveResult.Success == false then
+			result.Reason = moveResult.Reason
+			return result
+		end
+
+		result.Success = true
+		result.Hit = moveResult.Moved == true
+		context.LastSelfMoveSucceeded = result.Hit
+		result.Reason = moveResult.Reason
+		if result.Hit == true then
+			result.TargetUnitId = context.SourceUnitId
+			table.insert(result.TargetUnitIds, context.SourceUnitId)
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveForwardOffset(table context, table effectStep)
+		-- Turns the authored mode into "how many cells ahead of the caster to land", counted along its facing.
+		-- A negative result means the caster steps backwards without turning around.
+		local result = { Success = false, Reason = "UNSUPPORTED_MOVE_MODE", ForwardOffset = 0 }
+		local mode = effectStep.ParameterA or ""
+		local value = self:ParseMoveValue(effectStep)
+		if mode == "DASH_FORWARD" then
+			return self:ResolveForwardDash(context, value, self:HasParameterBToken(effectStep, "PASS_UNITS"))
+		end
+		if mode == "FORWARD_OFFSET" then
+			result.Success = true
+			result.Reason = "OK"
+			result.ForwardOffset = value
+			return result
+		end
+		if mode == "BACKWARD_OFFSET" then
+			result.Success = true
+			result.Reason = "OK"
+			result.ForwardOffset = -value
+			return result
+		end
+		if mode == "BACKWARD_OVER_ENEMY" then
+			return self:ResolveBackwardOverEnemy(context, value)
+		end
+		if mode == "BEFORE_FIRST_ENEMY" then
+			return self:ResolveBeforeFirstEnemy(context, value)
+		end
+		if mode ~= "BEHIND_FARTHEST_TARGET" then
+			return result
+		end
+
+		-- Land behind the farthest enemy this skill actually hit, so the caster ends up past the whole group.
+		local sourceEntity = context.BattleSession:FindUnitEntity(context.SourceUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		local direction = sourceUnit.Facing == "Right" and 1 or -1
+		local farthestDistance = 0
+		for _, targetUnitId in ipairs(context.TargetUnitIds or {}) do
+			local targetCell = (context.TargetCellsByUnitId or {})[targetUnitId]
+			if targetCell ~= nil then
+				local distance = (targetCell - sourceUnit.CellIndex) * direction
+				if distance > farthestDistance then
+					farthestDistance = distance
+				end
+			end
+		end
+		if farthestDistance <= 0 then
+			if self:HasParameterBToken(effectStep, "FALLBACK_FARTHEST_EMPTY") then
+				-- No enemy to land behind: dash to the farthest empty cell the skill could ever reach instead.
+				return self:ResolveFarthestEmptyForward(context, sourceUnit, direction, value)
+			end
+			-- The skill hit nothing ahead, so there is no enemy to land behind.
+			result.Reason = "MOVE_NO_TARGET"
+			return result
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		result.ForwardOffset = farthestDistance + value
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveBackwardOverEnemy(table context, integer value)
+		-- Steps back `value` cells; when a living enemy stands there, lands one cell further behind it instead.
+		-- Only one enemy is hopped: a blocked or off-board landing cell is left to the move impact, which stays put.
+		local result = { Success = false, Reason = "SOURCE_NOT_FOUND", ForwardOffset = 0 }
+		local battleSession = context.BattleSession
+		local sourceEntity = battleSession:FindUnitEntity(context.SourceUnitId)
+		if isvalid(sourceEntity) == false then
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		local direction = sourceUnit.Facing == "Right" and 1 or -1
+		local offset = -value
+		local occupant = battleSession.BoardState:FindAtCell(sourceUnit.CellIndex + direction * offset, sourceUnit.UnitId)
+		if isvalid(occupant) then
+			local occupantUnit = occupant:GetComponent("script.BattleUnitComponent")
+			if occupantUnit ~= nil and occupantUnit.IsDead == false and occupantUnit.Team ~= sourceUnit.Team then
+				offset = offset - 1
+			end
+		end
+		result.Success = true
+		result.Reason = "OK"
+		result.ForwardOffset = offset
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveBeforeFirstEnemy(table context, integer value)
+		-- Dashes up to `value` cells so the caster ends right in front of the first enemy ahead (looked for within
+		-- value + 1 cells). No enemy in reach, or one already adjacent, means no move.
+		local result = { Success = false, Reason = "SOURCE_NOT_FOUND", ForwardOffset = 0 }
+		local battleSession = context.BattleSession
+		local sourceEntity = battleSession:FindUnitEntity(context.SourceUnitId)
+		if isvalid(sourceEntity) == false then
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		local direction = sourceUnit.Facing == "Right" and 1 or -1
+		for distance = 1, value + 1 do
+			local cell = sourceUnit.CellIndex + direction * distance
+			if battleSession:IsValidCell(cell) == false then
+				break
+			end
+			local entity = battleSession.BoardState:FindAtCell(cell, sourceUnit.UnitId)
+			if isvalid(entity) then
+				local unit = entity:GetComponent("script.BattleUnitComponent")
+				if unit ~= nil and unit.IsDead == false and unit.Team ~= sourceUnit.Team then
+					if distance == 1 then
+						result.Reason = "MOVE_ALREADY_ADJACENT"
+						return result
+					end
+					result.Success = true
+					result.Reason = "OK"
+					result.ForwardOffset = distance - 1
+					return result
+				end
+				-- Something else blocks the lane before any enemy, so there is nothing to dash to.
+				result.Reason = "MOVE_LANE_BLOCKED"
+				return result
+			end
+		end
+		result.Reason = "MOVE_NO_TARGET"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveFarthestEmptyForward(table context, any sourceUnit, integer direction, integer value)
+		-- The reach is the skill's Range plus the behind distance, i.e. the farthest cell the normal landing could be.
+		local result = { Success = false, Reason = "MOVE_NO_EMPTY_CELL", ForwardOffset = 0 }
+		local definition = context.Definition or {}
+		local reach = math.max(1, math.floor(tonumber(definition.Range) or 0) + value)
+		for offset = reach, 1, -1 do
+			local cell = sourceUnit.CellIndex + direction * offset
+			if context.BattleSession:IsValidCell(cell) and context.BattleSession:IsCellOccupied(cell, sourceUnit.UnitId) == false then
+				result.Success = true
+				result.Reason = "OK"
+				result.ForwardOffset = offset
+				return result
+			end
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveForwardDash(table context, integer distance, boolean passUnits)
+		-- Stops before occupied cells or the board edge; an empty lane still permits the dash.
+		-- With PASS_UNITS the caster jumps over units in the lane and lands on the farthest empty cell in reach;
+		-- when the last cell of the lane is taken it lands on the empty cell right behind it instead.
+		local session = context.BattleSession
+		local entity = session:FindUnitEntity(context.SourceUnitId)
+		local unit = isvalid(entity) and entity:GetComponent("script.BattleUnitComponent") or nil
+		if unit == nil then return { Success = false, Reason = "SOURCE_NOT_FOUND" } end
+		local direction = unit.Facing == "Right" and 1 or -1
+		local offset = 0
+		for step = 1, distance do
+			local cell = unit.CellIndex + direction * step
+			if not session:IsValidCell(cell) then break end
+			if session:IsCellOccupied(cell, unit.UnitId) then
+				if passUnits ~= true then break end
+			else
+				offset = step
+			end
+		end
+		if passUnits == true and offset < distance then
+			local behind = unit.CellIndex + direction * (distance + 1)
+			if session:IsValidCell(behind) and not session:IsCellOccupied(behind, unit.UnitId) then
+				offset = distance + 1
+			end
+		end
+		return { Success = offset > 0, Reason = offset > 0 and "OK" or "DASH_BLOCKED", ForwardOffset = offset }
+	end
+
+	method boolean HasParameterBToken(table effectStep, string token)
+		-- ParameterB is a `|`-separated modifier list shared by the move modes.
+		for part in string.gmatch(effectStep.ParameterB or "", "([^|]+)") do
+			if part == token then
+				return true
+			end
+		end
+		return false
+	end
+
+	method boolean IsMoveEffectType(string effectType)
+		-- Single source of truth for which EffectTypes this executor owns; the Router and Validator both ask here.
+		return effectType == "MOVE_SELF" or effectType == "TURN_SELF"
+	end
+
+	method integer ParseMoveValue(table effectStep)
+		-- Always a positive cell count; the mode decides which way it is applied.
+		return math.floor(tonumber(effectStep.Value) or 0)
+	end
+
+	method integer ParseForwardOffset(table effectStep)
+		-- Kept for the validator's range check; the runtime offset comes from ResolveForwardOffset.
+		return self:ParseMoveValue(effectStep)
+	end
+
+	method boolean IsSupportedMoveMode(string parameterA)
+		-- Four modes so far; the utility catalog's scan modes stay unimplemented.
+		return parameterA == "FORWARD_OFFSET"
+			or parameterA == "DASH_FORWARD"
+			or parameterA == "BACKWARD_OFFSET"
+			or parameterA == "BACKWARD_OVER_ENEMY"
+			or parameterA == "BEFORE_FIRST_ENEMY"
+			or parameterA == "BEHIND_FARTHEST_TARGET"
+	end
+
+	method string DescribeMoveStep(table effectStep)
+		-- Player-facing summary appended to skill tooltips next to the buff lines.
+		if effectStep.EffectType == "TURN_SELF" then
+			return "시전 후 방향 전환"
+		end
+		local mode = effectStep.ParameterA or ""
+		if mode == "DASH_FORWARD" then
+			if self:HasParameterBToken(effectStep, "PASS_UNITS") then
+				return "전방 " .. tostring(self:ParseMoveValue(effectStep)) .. "칸을 돌진 (유닛은 뛰어넘고, 끝 칸에 유닛이 있으면 그 뒤로 착지)"
+			end
+			return "전방 최대 " .. tostring(self:ParseMoveValue(effectStep)) .. "칸 돌진 후 공격 (적 앞에서 정지)"
+		end
+		if mode == "FORWARD_OFFSET" then
+			return "시전 후 " .. tostring(self:ParseMoveValue(effectStep)) .. "칸 전진"
+		end
+		if mode == "BACKWARD_OFFSET" then
+			return "시전 후 " .. tostring(self:ParseMoveValue(effectStep)) .. "칸 후퇴"
+		end
+		if mode == "BEHIND_FARTHEST_TARGET" then
+			return "가장 먼 적의 뒤로 이동"
+		end
+		if mode == "BEFORE_FIRST_ENEMY" then
+			return "최대 " .. tostring(self:ParseMoveValue(effectStep)) .. "칸 돌진해 앞의 적과 맞붙음"
+		end
+		if mode == "BACKWARD_OVER_ENEMY" then
+			return "시전 후 " .. tostring(self:ParseMoveValue(effectStep)) .. "칸 후퇴 (적이 있으면 그 뒤로)"
+		end
+		return ""
+	end
+
+end

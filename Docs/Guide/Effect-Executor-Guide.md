@@ -96,6 +96,72 @@ method table Execute(table context, table effectStep)
 |---|---|---|
 | `DAMAGE` | `DamageEffectExecutorLogic` | 전방 대상 피해 |
 | `PUSH` | `PushEffectExecutorLogic` | 전방 대상 Cell 이동 |
+| `HEAL` | `HealEffectExecutorLogic` | 같은 팀 대상 회복 |
+| `NEXT_ATTACK_BONUS` | `BuffEffectExecutorLogic` | 시전자의 다음 피해 스킬 1회 피해 +`Value` |
+| `ATTACK_BUFF` | `BuffEffectExecutorLogic` | 시전자가 주는 모든 피해 +`Value`, `ParameterA`턴 |
+| `MAX_HP_BUFF` | `BuffEffectExecutorLogic` | 시전자 최대 HP·현재 HP +`Value`, `ParameterA`턴 |
+| `DEFENSE_BUFF` | `BuffEffectExecutorLogic` | 시전자가 받는 피해 -`Value`(최소 1), `ParameterA`턴 |
+| `GUARD_BUFF` | `BuffEffectExecutorLogic` | 시전자가 받는 피해를 전부 무효, `ParameterA`턴 |
+| `MOVE_SELF` | `MoveSelfEffectExecutorLogic` | 시전자를 바라보는 방향으로 이동. 착지 칸은 `ParameterA` 모드가 정한다 |
+| `TURN_SELF` | `MoveSelfEffectExecutorLogic` | 시전자 방향 전환(`TryTurn`). `SELF_UNIT` 전용, `Value`는 쓰지 않는다(`0`). 도적 `tornado_spin` 마지막 스텝 |
+| `PULL` | `PushEffectExecutorLogic` | `PRIMARY_TARGET` 또는 `ALL_SKILL_TARGETS`를 시전자 쪽으로 `Value`칸 거리까지 끌어온다(뒤쪽 대상은 뒤에서 당긴다). 그 칸이 차 있으면 오는 길의 가장 가까운 빈 칸, 이미 가까우면·HEAVY면 제자리. 앞 스텝에서 죽은 대상은 건너뛴다. 도적 `chain_hell`, 전사 `page_order` |
+| `TURN_TARGET` | `PushEffectExecutorLogic` | 맞은 대상(`PRIMARY_TARGET`/`ALL_SKILL_TARGETS`)의 바라보는 방향을 반대로 뒤집는다(`ResolveTurnImpactOnTarget`). 적은 다시 돌아서는 행동을 써야 공격할 수 있다. `Value`는 쓰지 않는다(`0`). 전사 `page_order` |
+| `COMBO_BUFF` | `BuffEffectExecutorLogic` | 지속되는 동안 한 예약 실행 안에서 N번째 공격 스킬(DAMAGE 스텝이 있는 스킬)이 피해 +`Value`×N. 비공격 스킬은 세지도 끊지도 않는다. `ParameterA`는 적 라운드가 아니라 **공격한 예약 실행 횟수** — `ATTACK_BUFF`처럼 공격할 때만 소모되어, 콤보가 적용된 공격 스킬이 있었던 큐가 끝날 때만 1 감소한다(예약 한 칸마다 적 라운드가 지나가므로 라운드 기준이면 다음 큐 전에 만료된다). 전사 `combo_attack` |
+| `VENOM_BUFF` | `BuffEffectExecutorLogic` | `ParameterA`턴 동안 시전자가 피해를 준 적을 중독시킨다. 중독된 적은 칸을 옮길 때마다 `Value` 고정 피해(죽을 때까지). `ParameterB`는 중독된 적 머리 위 루프 이펙트 RUID. 도적 `venom` |
+
+### `MOVE_SELF` 규칙
+
+피해 스텝 뒤에 붙여 "공격하고 전진"을 만든다. 상태가 아니라 보드 이동이라 버프와 다른 Executor가 소유한다.
+
+- `TargetSelector`는 `SELF_UNIT`만(`MOVE_REQUIRES_SELF_UNIT`), `Value`는 1 이상(`INVALID_MOVE_OFFSET`),
+  `ParameterA`는 아래 표의 네 모드 중 하나(`UNSUPPORTED_MOVE_MODE`).
+
+| `ParameterA` | 착지 칸 | `Value`의 뜻 |
+|---|---|---|
+| `FORWARD_OFFSET` | 시전자 기준 앞으로 `Value`칸 | 전진 칸 수 |
+| `BACKWARD_OFFSET` | 시전자 기준 뒤로 `Value`칸(방향 전환 없음) | 후퇴 칸 수 |
+| `BACKWARD_OVER_ENEMY` | 뒤로 `Value`칸. 그 칸에 살아 있는 적이 있으면 한 칸 더 뒤(적 하나만 넘는다) | 후퇴 칸 수 |
+| `BEHIND_FARTHEST_TARGET` | 그 스킬이 맞힌 적 중 가장 먼 적의 `Value`칸 뒤 | 적 뒤로 몇 칸인지(`1`이면 바로 뒤) |
+| `BEFORE_FIRST_ENEMY` | 앞으로 `Value + 1`칸 안의 첫 적 바로 앞 칸(최대 `Value`칸 전진). 이미 붙어 있거나 적이 없으면 이동 안 함 | 최대 전진 칸 수. 해적 `screw_punch`는 `2` |
+
+- `BEHIND_FARTHEST_TARGET`은 스킬이 실제로 맞힌 대상 스냅샷(`TargetCellsByUnitId`)에서 가장 먼 칸을 고르므로,
+  맞힌 적이 하나도 없으면 `MOVE_NO_TARGET`으로 이동하지 않는다. 앞쪽 대상만 계산에 넣는다.
+- `BACKWARD_OVER_ENEMY`는 적을 하나만 넘는다. 넘은 뒤의 칸도 막혀 있거나 보드 밖이면 아래 규칙대로 이동하지 않는다
+  (궁수 `retreat_shot`).
+- `ParameterB=ALLOW_OCCUPIED`이면 점유 칸도 허용한다. 비우면 빈 칸일 때만 이동한다.
+- `ParameterB=FALLBACK_FARTHEST_EMPTY`(`BEHIND_FARTHEST_TARGET` 전용)이면 맞힌 적이 없을 때 이동을 생략하지 않고,
+  `Range + Value`칸 이내에서 가장 먼 빈 칸으로 간다(도적 `muspelheim`: 사거리 2 + 1 = 3칸).
+- `MOVE_SELF`가 실제로 이동했고 뒤에 스텝이 남아 있으면 대상 스냅샷을 **새 위치에서 다시 잡는다**. 그래서
+  `MOVE_SELF` → `DAMAGE` 순서로 "돌진 후 타격"을 만들 수 있다(도적 `flying_assaulter`). 이동이 막히면 원래 스냅샷을 쓴다.
+- 이동은 `BattleSessionComponent.ResolveSkillMoveImpact` → `RelocateUnitForMechanic`을 통과하므로 칸 검증·점유
+  검사·드롭 회수·`UnitMovedEvent`가 그대로 적용된다. 플레이어는 그 위에 기존 이동 연출을 얹는다.
+- 보드 밖(`MOVE_OUT_OF_BOUNDS`)이거나 칸이 차 있으면(`MOVE_CELL_OCCUPIED`) `Success=true`로 끝난다. 즉 스킬의
+  피해는 그대로 남고 이동만 생략된다.
+
+### 버프 EffectType 규칙
+
+네 버프는 한 Executor(`BuffEffectExecutorLogic`)가 소유한다. Router와 Validator는
+`IsBuffEffectType` / `IsTimedBuffEffectType`으로 같은 목록을 공유하고, 지속형 EffectType→능력치 매핑은
+`GetBuffStat`(`ATTACK_BUFF`→`ATTACK`, `DEFENSE_BUFF`→`DEFENSE`, `MAX_HP_BUFF`→`MAX_HP`) 한 곳에 있다.
+
+- `TargetSelector`는 `SELF_UNIT`만 허용한다(`BUFF_REQUIRES_SELF_UNIT`). `Value`는 0 초과(`INVALID_BUFF_VALUE`).
+- 지속형(`ATTACK_BUFF`, `MAX_HP_BUFF`, `DEFENSE_BUFF`)은 `ParameterA`에 1 이상 정수 턴 수가 필요하다(`INVALID_BUFF_DURATION`).
+- 턴은 쿨다운과 같은 경계(`AdvancePlayerSkillCooldowns`, 적 라운드 종료 후 다음 플레이어 턴 직전)에서 1 줄어든다.
+  실행 후 N번의 적 라운드 동안 유지된다. `1`턴이면 같은 큐의 뒤 스킬과 바로 다음 적 라운드까지 적용된다.
+- **중첩 규칙: 스킬이 다르면 합산, 같은 스킬은 갱신.** `BattleUnitComponent`가 `스킬|능력치`별 항목
+  (`TimedBuffEntries`, `NextAttackBonusBySkill`, 서버 전용)을 보관하고, 동기화 값
+  (`AttackBuffAmount`, `DefenseBuffAmount`, `MaxHpBuffAmount`, `NextAttackBonus`)은 합계, `*Turns`는 가장 긴
+  잔여 턴이다. 같은 스킬을 다시 쓰면 그 항목만 큰 수치·긴 지속으로 갱신된다.
+  예: 블레스(공격 +1) + 메디테이션(공격 +2) = 공격 +3, 블레스(방어 +1) + 매직 가드(방어 +1) = 방어 +2.
+- 한 스킬에 버프 Step이 여러 개면(블레스) 대상 이펙트는 첫 Step에서만 재생한다
+  (`context.BuffHitPresentedUnitIds` → `ResolveSkillBuffImpact(..., presentHit)`).
+- `ATTACK_BUFF`는 `ApplyDamage`에서 지속시간 동안 모든 피해에 더해진다(다음 공격 보너스와 별개로 합산).
+- `NEXT_ATTACK_BONUS`는 `ApplyDamage`에서 더해지고, 피해 스킬의 모든 Step이 끝난 뒤
+  하나 이상 적중했을 때 `SkillExecutionLogic.ConsumeNextAttackBonusOnHit`가 소비한다. 그래서 범위기는 모든 대상에 적용된다.
+- `DEFENSE_BUFF`는 유물 방어력 뒤에 `max(1, amount - DefenseBuffAmount)`로 적용된다. Utility Guard 무효화가 우선한다.
+- `MAX_HP_BUFF`는 전투 전용이다. `SyncRunHp`는 버프를 뺀 최대 HP와 그 이하로 절삭한 현재 HP만 런 상태에 기록하므로
+  전투가 버프 도중 끝나도 런 HP가 부풀지 않는다. 만료 시 최대 HP를 원복하고 초과 현재 HP를 절삭한다.
+- 툴팁·도감 문구는 `BuffEffectExecutorLogic.DescribeBuffEffects` 한 곳에서 만든다.
 
 ## 복합 스킬 예제
 

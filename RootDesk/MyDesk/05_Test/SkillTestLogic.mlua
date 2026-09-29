@@ -1,0 +1,499 @@
+@Logic
+script SkillTestLogic extends Logic
+
+	@Sync property string SkillCatalogSnapshot = ""
+	@Sync property integer CatalogRevision = 0
+	@Sync property string LastHitText = ""
+	@Sync property integer HitRevision = 0
+	property number TotalDummyDamage = 0
+	property integer DummyHitCount = 0
+	property string SkillTestMapId = "skill_test"
+	property string CatalogJobIds = "warrior,mage,archer,thief,pirate"
+	property number OverrideWatchInterval = 1
+	property number OverrideWatchElapsed = 0
+	-- Client-local: the test panel sets this while a stat input has focus so battle keys stay idle.
+	property boolean KeyboardCaptured = false
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Overrides never survive a world restart, and the catalog is built once from the job datasets.
+		_SkillDefinitionRepositoryLogic:ClearAllTestOverrides("WORLD_BEGIN")
+		self:RefreshCatalog()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		-- Stat edits are world-global in the repository, so drop them as soon as nobody is on the test map.
+		self.OverrideWatchElapsed = self.OverrideWatchElapsed + delta
+		if self.OverrideWatchElapsed < self.OverrideWatchInterval then
+			return
+		end
+		self.OverrideWatchElapsed = 0
+		if _SkillDefinitionRepositoryLogic.TestOverrideCount <= 0 then
+			return
+		end
+		if self:CountUsersOnTestMap() == 0 then
+			_SkillDefinitionRepositoryLogic:ClearAllTestOverrides("TEST_MAP_EMPTY")
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer CountUsersOnTestMap()
+		local mapEntity = _EntityService:GetEntityByPath("/maps/" .. self.SkillTestMapId)
+		if isvalid(mapEntity) == false or mapEntity.MapComponent == nil then
+			return 0
+		end
+		local users = _UserService:GetUsersByMapComponent(mapEntity.MapComponent)
+		if users == nil then
+			return 0
+		end
+		return #users
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshCatalog()
+		-- Serializes every player skill as skillId~name~icon~job~tier; skill datasets are server-only.
+		local records = {}
+		for jobId in string.gmatch(self.CatalogJobIds, "([^,]+)") do
+			local catalog = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(jobId)
+			if catalog.Success == true then
+				for _, definition in ipairs(catalog.Skills) do
+					table.insert(records, table.concat({
+						self:SafeField(definition.SkillId),
+						self:SafeField(definition.DisplayName),
+						self:SafeField(definition.IconRuid),
+						jobId,
+						tostring(definition.SkillTier or 1)
+					}, "~"))
+				end
+			end
+		end
+		self.SkillCatalogSnapshot = table.concat(records, "|")
+		self.CatalogRevision = self.CatalogRevision + 1
+		log("[SkillTest] catalog refreshed skills=" .. tostring(#records) .. " revision=" .. tostring(self.CatalogRevision))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RecordDummyHit(string attackId, number amount)
+		-- Publishes the true hit size; the dummy's HP pips cannot show anything above its max HP.
+		local name = attackId or ""
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(name)
+		if definition.Success == true then
+			name = definition.DisplayName
+		end
+		self.TotalDummyDamage = self.TotalDummyDamage + amount
+		self.DummyHitCount = self.DummyHitCount + 1
+		self.LastHitText = "마지막 타격: " .. self:FormatValue(amount) .. "  (" .. name .. ")    누적: " .. self:FormatValue(self.TotalDummyDamage) .. " / " .. tostring(self.DummyHitCount) .. "타"
+		self.HitRevision = self.HitRevision + 1
+		log("[SkillTest] dummy hit attack=" .. (attackId or "") .. " amount=" .. self:FormatValue(amount) .. " total=" .. self:FormatValue(self.TotalDummyDamage))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResetDummyHitStats()
+		self.TotalDummyDamage = 0
+		self.DummyHitCount = 0
+		self.LastHitText = "누적 피해를 초기화했습니다."
+		self.HitRevision = self.HitRevision + 1
+	end
+
+	method string SafeField(string value)
+		local text = value or ""
+		local cleaned, _ = string.gsub(text, "[|~]", " ")
+		return cleaned
+	end
+
+	method table GetDefinitionFieldSpecs()
+		-- Editable definition columns and their value kinds. Order is the panel's display order.
+		return {
+			{ Field = "TargetingType", Kind = "string" },
+			{ Field = "Range", Kind = "integer" },
+			{ Field = "TargetOffsets", Kind = "string" },
+			{ Field = "CooldownTurns", Kind = "integer" },
+			{ Field = "ActionDuration", Kind = "number" },
+			{ Field = "EffectScale", Kind = "number" },
+			{ Field = "FreePlay", Kind = "boolean" },
+			{ Field = "ProjectileSpeed", Kind = "number" },
+			{ Field = "ProjectileScale", Kind = "number" },
+			{ Field = "ProjectileCount", Kind = "integer" },
+			{ Field = "ProjectileInterval", Kind = "number" },
+			{ Field = "ProjectileLaunchDelay", Kind = "number" },
+			{ Field = "ProjectileHeight", Kind = "number" }
+		}
+	end
+
+	method string GetFieldKind(string field)
+		for _, spec in ipairs(self:GetDefinitionFieldSpecs()) do
+			if spec.Field == field then
+				return spec.Kind
+			end
+		end
+		return ""
+	end
+
+	method table ParseFieldValue(string kind, string text)
+		-- Converts panel text into the typed value ConvertSkillRow would have produced.
+		local trimmed = string.match(text or "", "^%s*(.-)%s*$") or ""
+		if kind == "string" then
+			return { Success = true, Value = trimmed }
+		end
+		if kind == "boolean" then
+			local lowered = string.lower(trimmed)
+			if lowered == "true" or lowered == "1" or lowered == "yes" then
+				return { Success = true, Value = true }
+			end
+			if lowered == "false" or lowered == "0" or lowered == "no" then
+				return { Success = true, Value = false }
+			end
+			return { Success = false, Reason = "BOOLEAN_EXPECTED" }
+		end
+		local number = tonumber(trimmed)
+		if number == nil then
+			return { Success = false, Reason = "NUMBER_EXPECTED" }
+		end
+		if kind == "integer" then
+			if number ~= math.floor(number) then
+				return { Success = false, Reason = "INTEGER_EXPECTED" }
+			end
+			return { Success = true, Value = math.floor(number) }
+		end
+		return { Success = true, Value = number }
+	end
+
+	method string FormatValue(any value)
+		if value == nil then
+			return ""
+		end
+		if type(value) == "number" then
+			if value == math.floor(value) then
+				return string.format("%d", math.floor(value))
+			end
+			local trimmed, _ = string.gsub(string.format("%.3f", value), "0+$", "")
+			local compact, _ = string.gsub(trimmed, "%.$", "")
+			return compact
+		end
+		return tostring(value)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveTestSession(string userId)
+		-- Every request must come from a player standing on the skill test map with an active test session.
+		local playerEntity = _UserService:GetUserEntityByUserId(userId)
+		if isvalid(playerEntity) == false or isvalid(playerEntity.CurrentMap) == false then
+			return { Success = false, Reason = "INVALID_PLAYER" }
+		end
+		if playerEntity.CurrentMap.Name ~= self.SkillTestMapId then
+			return { Success = false, Reason = "NOT_ON_SKILL_TEST_MAP" }
+		end
+		local session = playerEntity.CurrentMap:GetComponent("script.BattleSessionComponent")
+		if session == nil or session.SkillTestMode ~= true then
+			return { Success = false, Reason = "SKILL_TEST_SESSION_MISSING" }
+		end
+		if session.PlayerEntity ~= playerEntity then
+			return { Success = false, Reason = "SKILL_TEST_SESSION_NOT_READY" }
+		end
+		return { Success = true, Reason = "OK", Session = session, Player = playerEntity }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildSkillDetail(string skillId)
+		-- Flat string table of the effective (overridden) values the panel edits.
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			return {}
+		end
+		local detail = {
+			SkillId = skillId,
+			DisplayName = definition.DisplayName or skillId,
+			IconRuid = definition.IconRuid or "",
+			JobId = definition.RequiredJobTag or "",
+			Tier = tostring(definition.SkillTier or 1),
+			HasProjectile = (definition.ProjectileRuid or "") ~= "" and "true" or "false"
+		}
+		local overridden = {}
+		for _, spec in ipairs(self:GetDefinitionFieldSpecs()) do
+			detail["F_" .. spec.Field] = self:FormatValue(definition[spec.Field])
+			if _SkillDefinitionRepositoryLogic:GetTestDefinitionOverride(skillId, spec.Field) ~= nil then
+				table.insert(overridden, spec.Field)
+			end
+		end
+		local stepRecords = {}
+		local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId)
+		for _, step in ipairs(effects.Steps or {}) do
+			table.insert(stepRecords, table.concat({
+				tostring(step.StepIndex),
+				self:SafeField(step.EffectType),
+				self:SafeField(step.TargetSelector),
+				self:FormatValue(step.Value),
+				self:SafeField(step.ParameterA)
+			}, "~"))
+			for _, field in ipairs({ "Value", "ParameterA" }) do
+				if _SkillDefinitionRepositoryLogic:GetTestEffectOverride(definition.EffectSetId, step.StepIndex, field) ~= nil then
+					table.insert(overridden, "S" .. tostring(step.StepIndex) .. "." .. field)
+				end
+			end
+		end
+		detail.Steps = table.concat(stepRecords, "|")
+		detail.Overridden = table.concat(overridden, "|")
+		return detail
+	end
+
+	@ExecSpace("Server")
+	method void RequestSkillDetail(string skillId)
+		local access = self:ResolveTestSession(senderUserId)
+		if access.Success == false then
+			self:ReceiveSkillTestResult("DETAIL", false, access.Reason, {}, senderUserId)
+			return
+		end
+		self:ReceiveSkillTestResult("DETAIL", true, "OK", self:BuildSkillDetail(skillId), senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestSetDefinitionStat(string skillId, string field, string valueText)
+		local access = self:ResolveTestSession(senderUserId)
+		if access.Success == false then
+			self:ReceiveSkillTestResult("SET_STAT", false, access.Reason, {}, senderUserId)
+			return
+		end
+		local result = self:TrySetDefinitionStat(skillId, field, valueText)
+		if result.Success == true then
+			access.Session:RefreshSkillTestPresentation("SKILL_TEST_STAT")
+		end
+		self:ReceiveSkillTestResult("SET_STAT", result.Success, result.Reason, self:BuildSkillDetail(skillId), senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TrySetDefinitionStat(string skillId, string field, string valueText)
+		local kind = self:GetFieldKind(field)
+		if kind == "" then
+			return { Success = false, Reason = "FIELD_NOT_EDITABLE" }
+		end
+		local parsed = self:ParseFieldValue(kind, valueText)
+		if parsed.Success == false then
+			return { Success = false, Reason = field .. ":" .. parsed.Reason }
+		end
+		local value = parsed.Value
+		if field == "TargetingType" then
+			value = string.upper(value)
+		end
+		local previous = _SkillDefinitionRepositoryLogic:GetTestDefinitionOverride(skillId, field)
+		local previousOffsets = _SkillDefinitionRepositoryLogic:GetTestDefinitionOverride(skillId, "TargetOffsets")
+		if field == "TargetingType" and value == "RANGE_OFFSETS" then
+			-- RANGE_OFFSETS needs explicit cells; seed 1..Range so the switch works without a second edit.
+			local current = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+			local range = math.max(1, current.Range or 1)
+			if current.Success == true and _ContentValidatorLogic:AreValidTargetOffsets(current.TargetOffsets, range) == false then
+				local cells = {}
+				for offset = 1, range do
+					table.insert(cells, tostring(offset))
+				end
+				_SkillDefinitionRepositoryLogic:SetTestDefinitionOverride(skillId, "TargetOffsets", table.concat(cells, "|"))
+				log("[SkillTest] target offsets seeded skill=" .. skillId .. " offsets=" .. table.concat(cells, "|"))
+			end
+		end
+		_SkillDefinitionRepositoryLogic:SetTestDefinitionOverride(skillId, field, value)
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then
+			-- Keep the previous effective state; an invalid row would make the skill unusable mid-test.
+			_SkillDefinitionRepositoryLogic:SetTestDefinitionOverride(skillId, field, previous)
+			_SkillDefinitionRepositoryLogic:SetTestDefinitionOverride(skillId, "TargetOffsets", previousOffsets)
+			local reason = validation.DetailReason or validation.Reason
+			log_warning("[SkillTest] stat rejected skill=" .. skillId .. " field=" .. field .. " value=" .. tostring(valueText) .. " reason=" .. reason)
+			return { Success = false, Reason = reason }
+		end
+		log("[SkillTest] stat applied skill=" .. skillId .. " field=" .. field .. " value=" .. self:FormatValue(value))
+		return { Success = true, Reason = "OK" }
+	end
+
+	@ExecSpace("Server")
+	method void RequestSetEffectStat(string skillId, integer stepIndex, string field, string valueText)
+		local access = self:ResolveTestSession(senderUserId)
+		if access.Success == false then
+			self:ReceiveSkillTestResult("SET_STAT", false, access.Reason, {}, senderUserId)
+			return
+		end
+		local result = self:TrySetEffectStat(skillId, stepIndex, field, valueText)
+		if result.Success == true then
+			access.Session:RefreshSkillTestPresentation("SKILL_TEST_EFFECT")
+		end
+		self:ReceiveSkillTestResult("SET_STAT", result.Success, result.Reason, self:BuildSkillDetail(skillId), senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TrySetEffectStat(string skillId, integer stepIndex, string field, string valueText)
+		if field ~= "Value" and field ~= "ParameterA" then
+			return { Success = false, Reason = "FIELD_NOT_EDITABLE" }
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			return { Success = false, Reason = definition.Reason }
+		end
+		local kind = field == "Value" and "number" or "string"
+		local parsed = self:ParseFieldValue(kind, valueText)
+		if parsed.Success == false then
+			return { Success = false, Reason = field .. ":" .. parsed.Reason }
+		end
+		local previous = _SkillDefinitionRepositoryLogic:GetTestEffectOverride(definition.EffectSetId, stepIndex, field)
+		_SkillDefinitionRepositoryLogic:SetTestEffectOverride(definition.EffectSetId, stepIndex, field, parsed.Value)
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then
+			_SkillDefinitionRepositoryLogic:SetTestEffectOverride(definition.EffectSetId, stepIndex, field, previous)
+			local reason = validation.DetailReason or validation.Reason
+			log_warning("[SkillTest] effect stat rejected skill=" .. skillId .. " step=" .. tostring(stepIndex) .. " field=" .. field .. " reason=" .. reason)
+			return { Success = false, Reason = reason }
+		end
+		log("[SkillTest] effect stat applied skill=" .. skillId .. " step=" .. tostring(stepIndex) .. " field=" .. field .. " value=" .. self:FormatValue(parsed.Value))
+		return { Success = true, Reason = "OK" }
+	end
+
+	@ExecSpace("Server")
+	method void RequestResetSkillStats(string skillId)
+		local access = self:ResolveTestSession(senderUserId)
+		if access.Success == false then
+			self:ReceiveSkillTestResult("RESET_STATS", false, access.Reason, {}, senderUserId)
+			return
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		_SkillDefinitionRepositoryLogic:ClearTestOverridesForSkill(skillId, definition.EffectSetId or "")
+		access.Session:RefreshSkillTestPresentation("SKILL_TEST_RESET_STATS")
+		self:ReceiveSkillTestResult("RESET_STATS", true, "OK", self:BuildSkillDetail(skillId), senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestExportOverrides()
+		-- Writes every active edit as [SkillTestExport] log lines so they can be copied into the CSVs.
+		local access = self:ResolveTestSession(senderUserId)
+		if access.Success == false then
+			self:ReceiveSkillTestResult("EXPORT", false, access.Reason, {}, senderUserId)
+			return
+		end
+		local count = self:ExportOverrides()
+		self:ReceiveSkillTestResult("EXPORT", true, tostring(count), {}, senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer ExportOverrides()
+		local repository = _SkillDefinitionRepositoryLogic
+		local lines = {}
+		for skillId, overrides in pairs(repository.TestDefinitionOverrides) do
+			repository.TestOverridesSuspended = true
+			local original = repository:GetSkillDefinition(skillId)
+			repository.TestOverridesSuspended = false
+			local csvName = self:FindSkillDataSetName(skillId) .. ".csv"
+			for field, value in pairs(overrides) do
+				local fromText = original.Success == true and self:FormatValue(original[field]) or "?"
+				local toText = self:FormatValue(value)
+				if fromText ~= toText then
+					table.insert(lines, "csv=" .. csvName .. " skill=" .. skillId .. " field=" .. field .. " from=" .. fromText .. " to=" .. toText)
+				end
+			end
+		end
+		for effectSetId, setOverrides in pairs(repository.TestEffectOverrides) do
+			repository.TestOverridesSuspended = true
+			local original = repository:GetEffectSteps(effectSetId)
+			repository.TestOverridesSuspended = false
+			for stepIndex, stepOverrides in pairs(setOverrides) do
+				local originalStep = nil
+				for _, step in ipairs(original.Steps or {}) do
+					if step.StepIndex == stepIndex then
+						originalStep = step
+					end
+				end
+				for field, value in pairs(stepOverrides) do
+					local fromText = originalStep ~= nil and self:FormatValue(originalStep[field]) or "?"
+					local toText = self:FormatValue(value)
+					if fromText ~= toText then
+						table.insert(lines, "csv=" .. repository.EffectStepDataSetName .. ".csv effectSet=" .. effectSetId .. " step=" .. tostring(stepIndex) .. " field=" .. field .. " from=" .. fromText .. " to=" .. toText)
+					end
+				end
+			end
+		end
+		table.sort(lines)
+		log("[SkillTestExport] begin count=" .. tostring(#lines))
+		for _, line in ipairs(lines) do
+			log("[SkillTestExport] " .. line)
+		end
+		log("[SkillTestExport] end count=" .. tostring(#lines))
+		return #lines
+	end
+
+	@ExecSpace("ServerOnly")
+	method string FindSkillDataSetName(string skillId)
+		for _, dataSetName in ipairs(_SkillDefinitionRepositoryLogic:GetSkillDataSetNames()) do
+			local dataSet = _DataService:GetTable(dataSetName)
+			if dataSet ~= nil then
+				for rowIndex = 1, dataSet:GetRowCount() do
+					if dataSet:GetCell(rowIndex, "SkillId") == skillId then
+						return dataSetName
+					end
+				end
+			end
+		end
+		return "UNKNOWN"
+	end
+
+	@ExecSpace("Server")
+	method void RequestAssignSlot(integer slotIndex, string skillId)
+		local access = self:ResolveTestSession(senderUserId)
+		if access.Success == false then
+			self:ReceiveSkillTestResult("ASSIGN", false, access.Reason, {}, senderUserId)
+			return
+		end
+		local result = access.Session:TrySkillTestAssignSlot(slotIndex, skillId)
+		self:ReceiveSkillTestResult("ASSIGN", result.Success, result.Reason, { SkillId = skillId, SlotIndex = tostring(slotIndex) }, senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestResetCooldowns()
+		local access = self:ResolveTestSession(senderUserId)
+		if access.Success == false then
+			self:ReceiveSkillTestResult("RESET_COOLDOWN", false, access.Reason, {}, senderUserId)
+			return
+		end
+		local result = access.Session:ResetSkillTestCooldowns()
+		self:ReceiveSkillTestResult("RESET_COOLDOWN", result.Success, result.Reason, {}, senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestRestoreDummy()
+		local access = self:ResolveTestSession(senderUserId)
+		if access.Success == false then
+			self:ReceiveSkillTestResult("RESTORE_DUMMY", false, access.Reason, {}, senderUserId)
+			return
+		end
+		local result = access.Session:RestoreSkillTestDummy()
+		self:ResetDummyHitStats()
+		self:ReceiveSkillTestResult("RESTORE_DUMMY", result.Success, result.Reason, {}, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveSkillTestResult(string action, boolean success, string reason, table detail)
+		-- Server answers are routed to the panel controller on the requesting client only.
+		local controller = _EntityService:GetEntityByPath("/ui/SkillTestUI/Controller")
+		local component = isvalid(controller) and controller:GetComponent("script.SkillTestUIComponent") or nil
+		if component ~= nil then
+			component:HandleServerResult(action, success, reason, detail)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetCatalog()
+		local result = {}
+		for record in string.gmatch(self.SkillCatalogSnapshot or "", "[^|]+") do
+			local fields = {}
+			for part in string.gmatch(record .. "~", "([^~]*)~") do
+				table.insert(fields, part)
+			end
+			if #fields >= 5 and fields[1] ~= "" then
+				table.insert(result, {
+					SkillId = fields[1],
+					DisplayName = fields[2],
+					IconRuid = fields[3],
+					JobId = fields[4],
+					Tier = tonumber(fields[5]) or 1
+				})
+			end
+		end
+		return result
+	end
+
+end

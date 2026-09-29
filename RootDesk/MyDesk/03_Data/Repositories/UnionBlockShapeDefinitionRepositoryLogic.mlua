@@ -1,0 +1,255 @@
+@Logic
+script UnionBlockShapeDefinitionRepositoryLogic extends Logic
+
+    property string ShapeDataSetName = "UnionBlockShapeDefinitions"
+
+    @ExecSpace("ServerOnly")
+    method table GetShape(string shapeId)
+        -- Returns one immutable logical shape definition. Shapes never contain gameplay effects.
+        local result = { Success = false, Reason = "UNION_BLOCK_SHAPE_NOT_FOUND", ShapeId = shapeId or "" }
+        if self:IsSafeToken(shapeId) == false then
+            result.Reason = "INVALID_SHAPE_ID"
+            return result
+        end
+        local dataSet = _DataService:GetTable(self.ShapeDataSetName)
+        if dataSet == nil then
+            result.Reason = "UNION_BLOCK_SHAPE_DATASET_MISSING"
+            return result
+        end
+        local matchCount = 0
+        for rowIndex = 1, dataSet:GetRowCount() do
+            if dataSet:GetCell(rowIndex, "ShapeId") == shapeId then
+                matchCount = matchCount + 1
+                if result.Success == false then result = self:ConvertShapeRow(dataSet, rowIndex) end
+            end
+        end
+        result.MatchCount = matchCount
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllShapes()
+        local result = { Success = false, Reason = "UNION_BLOCK_SHAPE_DATASET_MISSING", Shapes = {}, ShapeCount = 0 }
+        local dataSet = _DataService:GetTable(self.ShapeDataSetName)
+        if dataSet == nil then return result end
+        for rowIndex = 1, dataSet:GetRowCount() do
+            table.insert(result.Shapes, self:ConvertShapeRow(dataSet, rowIndex))
+        end
+        table.sort(result.Shapes, function(left, right)
+            if left.SortOrder == right.SortOrder then return left.ShapeId < right.ShapeId end
+            return left.SortOrder < right.SortOrder
+        end)
+        result.Success = true
+        result.Reason = "OK"
+        result.ShapeCount = #result.Shapes
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetRotatedCells(string shapeId, integer rotation)
+        -- Rotates local integer offsets counter-clockwise in quarter turns, then normalizes the minimum X/Y to zero.
+        local shape = self:GetShape(shapeId)
+        if shape.Success == false or (shape.MatchCount or 0) ~= 1 then return shape end
+        local normalizedRotation = self:NormalizeRotation(rotation)
+        if normalizedRotation < 0 then
+            return { Success = false, Reason = "INVALID_SHAPE_ROTATION", ShapeId = shapeId, Rotation = rotation or -1 }
+        end
+        if shape.RotationAllowed == false and normalizedRotation ~= 0 then
+            return { Success = false, Reason = "SHAPE_ROTATION_NOT_ALLOWED", ShapeId = shapeId, Rotation = normalizedRotation }
+        end
+        local parsed = self:ParseCells(shape.Cells)
+        if parsed.Success == false then
+            parsed.ShapeId = shapeId
+            return parsed
+        end
+        local rotated = {}
+        local minX = nil
+        local minY = nil
+        for _, cell in ipairs(parsed.Cells) do
+            local x = cell.X
+            local y = cell.Y
+            local rotatedX = x
+            local rotatedY = y
+            if normalizedRotation == 1 then
+                rotatedX = -y
+                rotatedY = x
+            elseif normalizedRotation == 2 then
+                rotatedX = -x
+                rotatedY = -y
+            elseif normalizedRotation == 3 then
+                rotatedX = y
+                rotatedY = -x
+            end
+            table.insert(rotated, { X = rotatedX, Y = rotatedY })
+            if minX == nil or rotatedX < minX then minX = rotatedX end
+            if minY == nil or rotatedY < minY then minY = rotatedY end
+        end
+        for _, cell in ipairs(rotated) do
+            cell.X = cell.X - minX
+            cell.Y = cell.Y - minY
+        end
+        table.sort(rotated, function(left, right)
+            if left.Y == right.Y then return left.X < right.X end
+            return left.Y < right.Y
+        end)
+        return {
+            Success = true,
+            Reason = "OK",
+            ShapeId = shapeId,
+            Rotation = normalizedRotation,
+            RotationDegrees = normalizedRotation * 90,
+            Cells = rotated,
+            CellCount = #rotated
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidateShapes()
+        local result = { Success = false, Reason = "CONTENT_VALIDATION_FAILED", CheckedShapeCount = 0, ErrorCount = 0, Errors = {}, ErrorSnapshot = "" }
+        local dataSet = _DataService:GetTable(self.ShapeDataSetName)
+        if dataSet == nil then
+            self:AddValidationError(result, 0, "", "DATASET_NOT_FOUND")
+            return self:FinalizeValidation(result)
+        end
+        local seenShapeIds = {}
+        local seenSortOrders = {}
+        for rowIndex = 1, dataSet:GetRowCount() do
+            result.CheckedShapeCount = result.CheckedShapeCount + 1
+            local shapeId = dataSet:GetCell(rowIndex, "ShapeId") or ""
+            local displayName = dataSet:GetCell(rowIndex, "DisplayName") or ""
+            local cellsText = dataSet:GetCell(rowIndex, "Cells") or ""
+            local sortOrderCell = dataSet:GetCell(rowIndex, "SortOrder")
+            local sortOrder = math.floor(tonumber(sortOrderCell) or 0)
+            if self:IsSafeToken(shapeId) == false then
+                self:AddValidationError(result, rowIndex, shapeId, "INVALID_SHAPE_ID")
+            elseif seenShapeIds[shapeId] == true then
+                self:AddValidationError(result, rowIndex, shapeId, "DUPLICATE_SHAPE_ID")
+            else
+                seenShapeIds[shapeId] = true
+            end
+            if displayName == "" then self:AddValidationError(result, rowIndex, shapeId, "DISPLAY_NAME_MISSING") end
+            if cellsText == "" then
+                self:AddValidationError(result, rowIndex, shapeId, "EMPTY_CELLS")
+            else
+                local parsed = self:ParseCells(cellsText)
+                if parsed.Success == false then self:AddValidationError(result, rowIndex, shapeId, parsed.Reason) end
+            end
+            if self:IsStrictBooleanCell(dataSet:GetCell(rowIndex, "RotationAllowed")) == false then
+                self:AddValidationError(result, rowIndex, shapeId, "INVALID_ROTATION_ALLOWED")
+            end
+            if self:IsStrictBooleanCell(dataSet:GetCell(rowIndex, "FlipAllowed")) == false then
+                self:AddValidationError(result, rowIndex, shapeId, "INVALID_FLIP_ALLOWED")
+            end
+            if self:IsPositiveIntegerCell(sortOrderCell) == false then
+                self:AddValidationError(result, rowIndex, shapeId, "INVALID_SORT_ORDER")
+            elseif seenSortOrders[sortOrder] == true then
+                self:AddValidationError(result, rowIndex, shapeId, "DUPLICATE_SORT_ORDER")
+            else
+                seenSortOrders[sortOrder] = true
+            end
+        end
+        if result.CheckedShapeCount == 0 then self:AddValidationError(result, 0, "", "NO_SHAPE_ROWS") end
+        return self:FinalizeValidation(result)
+    end
+
+    method table ConvertShapeRow(any dataSet, integer rowIndex)
+        return {
+            Success = true,
+            Reason = "OK",
+            ShapeId = dataSet:GetCell(rowIndex, "ShapeId") or "",
+            DisplayName = dataSet:GetCell(rowIndex, "DisplayName") or "",
+            Cells = dataSet:GetCell(rowIndex, "Cells") or "",
+            RotationAllowed = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "RotationAllowed")),
+            FlipAllowed = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "FlipAllowed")),
+            SortOrder = math.floor(tonumber(dataSet:GetCell(rowIndex, "SortOrder")) or 0),
+            RowIndex = rowIndex,
+            Source = "DATASET"
+        }
+    end
+
+    method table ParseCells(string cellsText)
+        local result = { Success = false, Reason = "EMPTY_CELLS", Cells = {}, CellCount = 0 }
+        if cellsText == nil or cellsText == "" then return result end
+        if string.sub(cellsText, 1, 1) == "|" or string.sub(cellsText, -1) == "|" or string.match(cellsText, "%|%|") ~= nil then
+            result.Reason = "MALFORMED_CELL_COORDINATE"
+            return result
+        end
+        local seen = {}
+        for token in string.gmatch(cellsText, "([^|]+)") do
+            local separatorStart, separatorEnd = string.find(token, ":", 1, true)
+            local secondSeparatorStart, secondSeparatorEnd = nil, nil
+            if separatorStart ~= nil then secondSeparatorStart, secondSeparatorEnd = string.find(token, ":", separatorEnd + 1, true) end
+            if separatorStart == nil or separatorStart <= 1 or separatorEnd >= string.len(token) or secondSeparatorStart ~= nil then
+                result.Reason = "MALFORMED_CELL_COORDINATE"
+                return result
+            end
+            local x = tonumber(string.sub(token, 1, separatorStart - 1))
+            local y = tonumber(string.sub(token, separatorEnd + 1))
+            if x == nil or y == nil or x ~= math.floor(x) or y ~= math.floor(y) then
+                result.Reason = "MALFORMED_CELL_COORDINATE"
+                return result
+            end
+            local key = tostring(x) .. ":" .. tostring(y)
+            if seen[key] == true then
+                result.Reason = "DUPLICATE_LOCAL_CELL"
+                return result
+            end
+            seen[key] = true
+            table.insert(result.Cells, { X = math.floor(x), Y = math.floor(y) })
+        end
+        if #result.Cells == 0 then return result end
+        result.Success = true
+        result.Reason = "OK"
+        result.CellCount = #result.Cells
+        return result
+    end
+
+    method integer NormalizeRotation(integer rotation)
+        local numeric = tonumber(rotation)
+        if numeric == nil or numeric ~= math.floor(numeric) then return -1 end
+        local normalized = math.floor(numeric) % 4
+        if normalized < 0 then normalized = normalized + 4 end
+        return normalized
+    end
+
+    method boolean ParseBooleanCell(any cellValue)
+        local normalized = string.lower(tostring(cellValue or ""))
+        return normalized == "true" or normalized == "1"
+    end
+
+    method boolean IsStrictBooleanCell(any cellValue)
+        local normalized = string.lower(tostring(cellValue or ""))
+        return normalized == "true" or normalized == "false" or normalized == "1" or normalized == "0"
+    end
+
+    method boolean IsPositiveIntegerCell(any cellValue)
+        local numeric = tonumber(cellValue)
+        return numeric ~= nil and numeric > 0 and numeric == math.floor(numeric)
+    end
+
+    method boolean IsSafeToken(string value)
+        return value ~= nil and value ~= "" and string.match(value, "^[%w_]+$") ~= nil
+    end
+
+    method void AddValidationError(table result, integer rowIndex, string shapeId, string detailReason)
+        table.insert(result.Errors, { DataSetName = self.ShapeDataSetName, RowIndex = rowIndex, ShapeId = shapeId or "", DetailReason = detailReason or "UNKNOWN" })
+    end
+
+    method table FinalizeValidation(table result)
+        local parts = {}
+        for _, item in ipairs(result.Errors) do
+            table.insert(parts, item.DataSetName .. "[" .. tostring(item.RowIndex) .. "]" .. item.ShapeId .. "=" .. item.DetailReason)
+        end
+        result.ErrorCount = #result.Errors
+        result.ErrorSnapshot = table.concat(parts, "|")
+        if result.ErrorCount == 0 then
+            result.Success = true
+            result.Reason = "OK"
+            log("[UnionBlockShapeValidation] valid shapes=" .. result.CheckedShapeCount)
+        else
+            log_error("[UnionBlockShapeValidation] rejected errors=" .. result.ErrorCount .. " details=" .. result.ErrorSnapshot)
+        end
+        return result
+    end
+
+end

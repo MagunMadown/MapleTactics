@@ -1,0 +1,306 @@
+@Component
+script SettingsUIComponent extends Component
+
+	-- View for GameSettingsLogic: tabs, game options, volume sliders and key capture. All values live in the Logic.
+	property string RootPath = "/ui/SettingsUI"
+	property string ActiveTab = "Graphics"
+	property integer RenderedRevision = -1
+	property table EventLinks = {}
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		local root = self.RootPath
+		self._T.Screen = _EntityService:GetEntityByPath(root .. "/Screen")
+		self._T.Window = root .. "/Screen/Window"
+		self._T.Status = self:Find("/Status")
+		self._T.Capture = nil
+		if isvalid(self._T.Screen) == false then
+			log_warning("[SettingsUI] screen missing path=" .. root .. "/Screen")
+			return
+		end
+		_GameUIPolishLogic:HideWindowImmediately(self._T.Screen)
+		self:Connect(_EntityService:GetEntityByPath(root .. "/OpenButton"), function() self:SetOpen(true) end)
+		self:Connect(self:Find("/CloseButton"), function() self:SetOpen(false) end)
+		self:Connect(self:Find("/FooterCloseButton"), function() self:SetOpen(false) end)
+		self:Connect(self:Find("/TabGame"), function() self:SelectTab("Game") end)
+		self:Connect(self:Find("/TabGraphics"), function() self:SelectTab("Graphics") end)
+		self:Connect(self:Find("/TabSound"), function() self:SelectTab("Sound") end)
+		self:Connect(self:Find("/TabControls"), function() self:SelectTab("Controls") end)
+		self:Connect(self:Find("/ResetButton"), function() self:ResetActiveTab() end)
+		self:Connect(self:Find("/GamePage/KeyGuideToggle"), function() _GameSettingsLogic:SetShowKeyGuide(_GameSettingsLogic.ShowKeyGuide == false) end)
+		self:BindSliders()
+		self:BindKeyButtons()
+		-- Window mode and resolution have no MSW API, so the dropdowns are shown but never open.
+		for _, name in ipairs({ "ScreenModeRowDropdown", "ResolutionRowDropdown" }) do
+			local dropdown = self:Find("/GraphicsPage/" .. name)
+			if isvalid(dropdown) then dropdown.ButtonComponent.Enable = false end
+		end
+		self:SelectTab("Graphics")
+		log("[SettingsUI] ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity Find(string relativePath)
+		return _EntityService:GetEntityByPath(self._T.Window .. relativePath)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Connect(Entity button, any callback)
+		-- Buttons play the shared click sound; every handler is kept for OnEndPlay cleanup.
+		if isvalid(button) == false then return end
+		local eventHandler = button:ConnectEvent(ButtonClickEvent, function()
+			_GameUIPolishLogic:PlayClick()
+			callback()
+		end)
+		table.insert(self.EventLinks, { Entity = button, EventType = ButtonClickEvent, Handler = eventHandler })
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Listen(Entity entity, any eventType, any callback)
+		if isvalid(entity) == false then return end
+		local eventHandler = entity:ConnectEvent(eventType, callback)
+		table.insert(self.EventLinks, { Entity = entity, EventType = eventType, Handler = eventHandler })
+	end
+
+	-- ---------- open / close ----------
+
+	@ExecSpace("ClientOnly")
+	method void SetOpen(boolean open)
+		if _GameSettingsLogic.IsWindowOpen == open then return end
+		self:CancelCapture()
+		_GameSettingsLogic.IsWindowOpen = open
+		if open then _GameUIPolishLogic:BringUIGroupToFront(_EntityService:GetEntityByPath(self.RootPath)) end
+		_GameUIPolishLogic:SetWindowVisible(self._T.Screen, open)
+		if open then
+			self.RenderedRevision = -1
+			self:Render()
+		end
+		log("[SettingsUI] open=" .. tostring(open) .. " tab=" .. self.ActiveTab)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		if _GameSettingsLogic.IsWindowOpen and self.RenderedRevision ~= _GameSettingsLogic.Revision then
+			self:Render()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleSettingsKeyDown(KeyDownEvent event)
+		if self._T.Capture ~= nil then
+			self:CaptureKey(event.key)
+			return
+		end
+		-- Esc only closes the window here; GameMenuLogic owns opening the menu from Esc.
+		if event.key == KeyboardKey.Escape and _GameSettingsLogic.IsWindowOpen then
+			self:SetOpen(false)
+		end
+	end
+
+	-- ---------- tabs ----------
+
+	@ExecSpace("ClientOnly")
+	method void SelectTab(string tab)
+		self:CancelCapture()
+		self.ActiveTab = tab
+		for _, name in ipairs({ "Graphics", "Sound", "Game", "Controls" }) do
+			local selected = name == tab
+			local page = self:Find("/" .. name .. "Page")
+			if isvalid(page) then page.Enable = selected end
+			local button = self:Find("/Tab" .. name)
+			if isvalid(button) then
+				button.SpriteGUIRendererComponent.Color = selected and Color(0.95, 0.72, 0.28, 1) or Color(0.12, 0.15, 0.22, 1)
+				button.TextGUIRendererComponent.FontColor = selected and Color(0.08, 0.09, 0.14, 1) or Color(0.95, 0.96, 0.98, 1)
+			end
+		end
+		local reset = self:Find("/ResetButton")
+		if isvalid(reset) then reset.Enable = tab ~= "Graphics" end
+		self:SetStatus(self:GetDefaultHint())
+		self.RenderedRevision = -1
+		self:Render()
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetDefaultHint()
+		if self.ActiveTab == "Controls" then return "칸을 클릭하고 새 키 입력 · Esc 취소 · Delete 해제" end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetStatus(string text)
+		if isvalid(self._T.Status) then self._T.Status.TextGUIRendererComponent.Text = text end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetActiveTab()
+		self:CancelCapture()
+		if self.ActiveTab == "Game" then
+			_GameSettingsLogic:ResetGameOptions()
+			self:SetStatus("게임 설정을 초기화했습니다")
+		elseif self.ActiveTab == "Sound" then
+			_GameSettingsLogic:ResetVolumes()
+			self:SetStatus("사운드 설정을 초기화했습니다")
+		elseif self.ActiveTab == "Controls" then
+			_GameSettingsLogic:ResetBindings()
+			self:SetStatus("조작키를 초기화했습니다")
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Render()
+		self.RenderedRevision = _GameSettingsLogic.Revision
+		if self.ActiveTab == "Game" then self:RenderGameOptions() end
+		if self.ActiveTab == "Sound" then self:RenderSliders() end
+		if self.ActiveTab == "Controls" then self:RenderKeyButtons() end
+	end
+
+	-- ---------- game options ----------
+
+	@ExecSpace("ClientOnly")
+	method void RenderGameOptions()
+		local toggle = self:Find("/GamePage/KeyGuideToggle")
+		if isvalid(toggle) == false then return end
+		local on = _GameSettingsLogic.ShowKeyGuide
+		toggle.TextGUIRendererComponent.Text = on and "켜짐" or "꺼짐"
+		toggle.SpriteGUIRendererComponent.Color = on and Color(0.95, 0.72, 0.28, 1) or Color(0.12, 0.15, 0.22, 1)
+		toggle.TextGUIRendererComponent.FontColor = on and Color(0.08, 0.09, 0.14, 1) or Color(0.62, 0.67, 0.76, 1)
+	end
+
+	-- ---------- sound sliders ----------
+
+	@ExecSpace("ClientOnly")
+	method void BindSliders()
+		for _, volume in ipairs(_GameSettingsLogic:GetVolumeCatalog()) do
+			local id = volume.Id
+			local slider = self:Find("/SoundPage/" .. id .. "Slider")
+			self:Listen(slider, UITouchDownEvent, function(event) self:DragSlider(id, event.TouchPoint) end)
+			self:Listen(slider, UITouchDragEvent, function(event) self:DragSlider(id, event.TouchPoint) end)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DragSlider(string id, Vector2 touchPoint)
+		-- The track's local x runs from -width/2 to +width/2 around its centre pivot.
+		local track = self:Find("/SoundPage/" .. id .. "Slider/Track")
+		if isvalid(track) == false then return end
+		local transform = track.UITransformComponent
+		local localPoint = _UILogic:ScreenToLocalUIPosition(touchPoint, transform)
+		local width = transform.RectSize.x
+		local ratio = math.max(0, math.min(1, (localPoint.x + width * transform.Pivot.x) / width))
+		_GameSettingsLogic:SetVolume(id, ratio * 100)
+		self:RenderSliders()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderSliders()
+		for _, volume in ipairs(_GameSettingsLogic:GetVolumeCatalog()) do
+			local value = _GameSettingsLogic:GetVolume(volume.Id)
+			local base = "/SoundPage/" .. volume.Id
+			local track = self:Find(base .. "Slider/Track")
+			local fill = self:Find(base .. "Slider/Fill")
+			local handle = self:Find(base .. "Slider/Handle")
+			local label = self:Find(base .. "Value")
+			if isvalid(track) and isvalid(fill) and isvalid(handle) then
+				local width = track.UITransformComponent.RectSize.x
+				local height = fill.UITransformComponent.RectSize.y
+				fill.UITransformComponent.RectSize = Vector2(width * value / 100, height)
+				fill.UITransformComponent.anchoredPosition = Vector2(0, 0)
+				handle.UITransformComponent.anchoredPosition = Vector2(width * (value / 100 - 0.5), 0)
+			end
+			if isvalid(label) then label.TextGUIRendererComponent.Text = tostring(value) end
+		end
+	end
+
+	-- ---------- key bindings ----------
+
+	@ExecSpace("ClientOnly")
+	method void BindKeyButtons()
+		for _, action in ipairs(_GameSettingsLogic:GetActions()) do
+			local actionId = action.Id
+			local row = "/ControlsPage/Row_" .. actionId
+			local label = self:Find(row .. "/Label")
+			if isvalid(label) then label.TextGUIRendererComponent.Text = action.Label end
+			for slot = 1, 2 do
+				local capturedSlot = slot
+				self:Connect(self:Find(row .. "/Key" .. tostring(slot)), function() self:BeginCapture(actionId, capturedSlot) end)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BeginCapture(string actionId, integer slot)
+		self._T.Capture = { ActionId = actionId, Slot = slot }
+		_GameSettingsLogic.IsCapturingKey = true
+		self:SetStatus("새 키를 누르세요 · Esc 취소 · Delete 해제")
+		self:RenderKeyButtons()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelCapture()
+		if self._T.Capture == nil then return end
+		self._T.Capture = nil
+		_GameSettingsLogic.IsCapturingKey = false
+		self:SetStatus(self:GetDefaultHint())
+		self:RenderKeyButtons()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CaptureKey(any key)
+		-- Esc or a mouse click cancels, Delete clears the slot, any catalog key is assigned.
+		local capture = self._T.Capture
+		if key == KeyboardKey.Escape or key == KeyboardKey.Mouse0 or key == KeyboardKey.Mouse1 or key == KeyboardKey.Mouse2 then
+			self:CancelCapture()
+			return
+		end
+		if key == KeyboardKey.Delete then
+			_GameSettingsLogic:SetBinding(capture.ActionId, capture.Slot, 0)
+			self:FinishCapture("키를 해제했습니다")
+			return
+		end
+		local code = _GameSettingsLogic:FindKeyCode(key)
+		if code == 0 then
+			self:SetStatus("이 키는 사용할 수 없습니다. 다른 키를 누르세요")
+			return
+		end
+		local displaced = _GameSettingsLogic:SetBinding(capture.ActionId, capture.Slot, code)
+		local message = _GameSettingsLogic:GetKeyLabel(code) .. " 키를 지정했습니다"
+		if displaced ~= "" then message = message .. "  ·  '" .. displaced .. "'에서 해제됨" end
+		self:FinishCapture(message)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void FinishCapture(string message)
+		self._T.Capture = nil
+		_GameSettingsLogic.IsCapturingKey = false
+		self:SetStatus(message)
+		self:RenderKeyButtons()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderKeyButtons()
+		local capture = self._T.Capture
+		for _, action in ipairs(_GameSettingsLogic:GetActions()) do
+			for slot = 1, 2 do
+				local button = self:Find("/ControlsPage/Row_" .. action.Id .. "/Key" .. tostring(slot))
+				if isvalid(button) then
+					local waiting = capture ~= nil and capture.ActionId == action.Id and capture.Slot == slot
+					button.TextGUIRendererComponent.Text = waiting and "키 입력..." or _GameSettingsLogic:GetKeyLabel(_GameSettingsLogic:GetBinding(action.Id, slot))
+					button.SpriteGUIRendererComponent.Color = waiting and Color(0.95, 0.72, 0.28, 1) or Color(0.12, 0.15, 0.22, 1)
+					button.TextGUIRendererComponent.FontColor = waiting and Color(0.08, 0.09, 0.14, 1) or Color(0.95, 0.96, 0.98, 1)
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		for _, link in ipairs(self.EventLinks) do
+			if isvalid(link.Entity) then link.Entity:DisconnectEvent(link.EventType, link.Handler) end
+		end
+		self.EventLinks = {}
+		_GameSettingsLogic.IsWindowOpen = false
+		_GameSettingsLogic.IsCapturingKey = false
+	end
+
+end

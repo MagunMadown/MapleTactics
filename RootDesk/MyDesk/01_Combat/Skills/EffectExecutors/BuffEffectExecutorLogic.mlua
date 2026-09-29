@@ -1,0 +1,197 @@
+@Logic
+script BuffEffectExecutorLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table Execute(table context, table effectStep)
+		-- Grants one self-support buff (next-attack bonus or a timed stat buff) on the units chosen by the row's selector.
+		local result = {
+			Success = false,
+			Reason = "INVALID_EFFECT_CONTEXT",
+			EffectType = effectStep.EffectType or "",
+			StepIndex = effectStep.StepIndex or 0,
+			Value = effectStep.Value or 0,
+			Hit = false,
+			TargetUnitId = "",
+			TargetUnitIds = {},
+			Results = {}
+		}
+		local battleSession = context.BattleSession
+		if battleSession == nil then
+			result.Reason = "SESSION_MISSING"
+			return result
+		end
+		if self:IsBuffEffectType(result.EffectType) == false then
+			result.Reason = "UNSUPPORTED_BUFF_TYPE"
+			return result
+		end
+
+		local turns = self:ParseDurationTurns(effectStep)
+		local targetUnitIds = _SkillTargetResolverLogic:SelectEffectTargets(context, effectStep.TargetSelector)
+		if #targetUnitIds == 0 then
+			result.Success = true
+			result.Reason = "MISS_EMPTY"
+			return result
+		end
+
+		-- A skill with several buff steps (e.g. attack + defense) must show its self effect once, not once per step.
+		if context.BuffHitPresentedUnitIds == nil then
+			context.BuffHitPresentedUnitIds = {}
+		end
+		for _, targetUnitId in ipairs(targetUnitIds) do
+			local presentHit = context.BuffHitPresentedUnitIds[targetUnitId] ~= true
+			context.BuffHitPresentedUnitIds[targetUnitId] = true
+			local buffResult = battleSession:ResolveSkillBuffImpact(
+				context.SourceUnitId,
+				context.SkillId,
+				targetUnitId,
+				result.EffectType,
+				effectStep.Value,
+				turns,
+				presentHit
+			)
+			table.insert(result.Results, buffResult)
+			if buffResult.Success == false then
+				result.Reason = buffResult.Reason
+				return result
+			end
+			if result.EffectType == "VENOM_BUFF" then
+				-- ParameterB names the looping clip drawn over every enemy this venom poisons.
+				self:SetVenomMarker(battleSession, targetUnitId, effectStep.ParameterB or "")
+			end
+			result.Hit = true
+			table.insert(result.TargetUnitIds, targetUnitId)
+			if result.TargetUnitId == "" then
+				result.TargetUnitId = targetUnitId
+			end
+		end
+
+		result.Success = true
+		result.Reason = "BUFF_APPLIED"
+		return result
+	end
+
+	method boolean IsBuffEffectType(string effectType)
+		-- Single source of truth for which EffectTypes this executor owns; the Router and Validator both ask here.
+		return effectType == "NEXT_ATTACK_BONUS" or self:IsTimedBuffEffectType(effectType)
+	end
+
+	method boolean IsTimedBuffEffectType(string effectType)
+		-- Stat buffs require ParameterA: hit charges for ATTACK, enemy rounds for the other stats.
+		return self:GetBuffStat(effectType) ~= ""
+	end
+
+	method string GetBuffStat(string effectType)
+		-- Maps a timed buff EffectType to the stat key BattleUnitComponent stores it under.
+		if effectType == "ATTACK_BUFF" then
+			return "ATTACK"
+		elseif effectType == "DEFENSE_BUFF" then
+			return "DEFENSE"
+		elseif effectType == "MAX_HP_BUFF" then
+			return "MAX_HP"
+		elseif effectType == "GUARD_BUFF" then
+			return "GUARD"
+		elseif effectType == "DAMAGE_CAP_BUFF" then
+			return "DAMAGE_CAP"
+		elseif effectType == "VENOM_BUFF" then
+			return "VENOM"
+		elseif effectType == "COMBO_BUFF" then
+			return "COMBO"
+		end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SetVenomMarker(any battleSession, string unitId, string markerRuid)
+		-- Remembers which marker this unit's venom paints on the enemies it poisons.
+		local entity = battleSession:FindUnitEntity(unitId)
+		if isvalid(entity) == false then
+			return
+		end
+		local unit = entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then
+			unit.VenomMarkerRuid = markerRuid
+		end
+	end
+
+	method integer ParseDurationTurns(table effectStep)
+		-- ParameterA holds whole hit charges (ATTACK) or enemy rounds; next-attack bonus has none.
+		local turns = tonumber(effectStep.ParameterA)
+		if turns == nil then
+			return 0
+		end
+		return math.floor(turns)
+	end
+
+	@ExecSpace("ServerOnly")
+	method string DescribeBuffEffects(string effectSetId)
+		-- Player-facing buff summary shared by the Codex and skill reward tooltips so the wording lives in one place.
+		if effectSetId == nil or effectSetId == "" then
+			return ""
+		end
+		local effectResult = _SkillDefinitionRepositoryLogic:GetEffectSteps(effectSetId)
+		if effectResult.Success == false then
+			return ""
+		end
+		return self:DescribeEffectSteps(effectResult.Steps)
+	end
+
+	@ExecSpace("ServerOnly")
+	method string DescribeEffectSteps(table steps)
+		-- Accepts effective copies so augmented hit counts match combat.
+		local parts = {}
+		for _, effectStep in ipairs(steps) do
+			local valueText = self:FormatNumber(effectStep.Value or 0)
+			local turnText = " (" .. tostring(self:ParseDurationTurns(effectStep)) .. "턴)"
+			if effectStep.EffectType == "NEXT_ATTACK_BONUS" then
+				table.insert(parts, "다음 공격 피해 +" .. valueText)
+			elseif effectStep.EffectType == "ATTACK_BUFF" then
+				table.insert(parts, "다음 " .. tostring(self:ParseDurationTurns(effectStep)) .. "회 타격 공격력 +" .. valueText .. " (다단 공격은 타격마다 1회 소모)")
+			elseif effectStep.EffectType == "MAX_HP_BUFF" then
+				table.insert(parts, "최대 HP +" .. valueText .. turnText)
+			elseif effectStep.EffectType == "DEFENSE_BUFF" then
+				table.insert(parts, "방어력 +" .. valueText .. turnText)
+			elseif effectStep.EffectType == "GUARD_BUFF" then
+				table.insert(parts, "받는 피해 무효" .. turnText)
+			elseif effectStep.EffectType == "DAMAGE_CAP_BUFF" then
+				table.insert(parts, "받는 공격 피해 최대 " .. valueText .. turnText)
+			elseif effectStep.EffectType == "FREEZE" then
+				table.insert(parts, "빙결 " .. valueText .. "% (" .. effectStep.ParameterA .. "턴)")
+			elseif effectStep.EffectType == "STUN" then
+				local conditionText = (effectStep.ConditionId or "") == "PREVIOUS_ATTACK" and "공격 스킬 연계 시 " or ""
+				table.insert(parts, conditionText .. "기절 " .. valueText .. "%" .. turnText)
+			elseif effectStep.EffectType == "POISON" then
+				table.insert(parts, "중독 +" .. valueText .. "스택 (최대 5, 이동마다 스택 수만큼 피해)")
+			elseif effectStep.EffectType == "BURN" then
+				table.insert(parts, "화상: 스킬 사용할 때 피해 " .. valueText)
+			elseif effectStep.EffectType == "NEXT_ARROW" then
+				table.insert(parts, "다음 공격에 화살 " .. valueText .. "발 추가")
+			elseif effectStep.EffectType == "REDUCE_OWN_COOLDOWN" then
+				table.insert(parts, "공격 스킬 연계 시 쿨타임 -" .. valueText)
+			elseif effectStep.EffectType == "PUSH_ADJACENT" then
+				table.insert(parts, "공격 스킬 연계 시 앞뒤 인접 적 " .. valueText .. "칸 밀기")
+			elseif effectStep.EffectType == "DAMAGE" and effectStep.ParameterA == "MULTI_HIT" then
+				table.insert(parts, "총 " .. effectStep.ParameterB .. "타: 첫 타 피해 " .. valueText .. " + 공격력, 이후 타격 피해 1 (공격 버프는 타격마다 1회 소모)")
+			elseif effectStep.EffectType == "VENOM_BUFF" then
+				table.insert(parts, "공격한 적 중독 +" .. valueText .. "스택 (최대 5, 이동마다 스택 수만큼 피해), 공격 " .. tostring(self:ParseDurationTurns(effectStep)) .. "회 (다단 타격마다 1회 소모)")
+			elseif effectStep.EffectType == "COMBO_BUFF" then
+				table.insert(parts, "콤보: 예약 실행 중 N번째 공격 스킬 피해 +" .. valueText .. "×N (공격한 예약 실행 " .. tostring(self:ParseDurationTurns(effectStep)) .. "회)")
+			elseif effectStep.EffectType == "TURN_TARGET" then
+				table.insert(parts, "맞은 적 방향 반전")
+			elseif _MoveSelfEffectExecutorLogic:IsMoveEffectType(effectStep.EffectType) then
+				-- Movement is not a buff, but tooltips need one combined line of non-damage effects.
+				local moveText = _MoveSelfEffectExecutorLogic:DescribeMoveStep(effectStep)
+				if moveText ~= "" then table.insert(parts, moveText) end
+			end
+		end
+		return table.concat(parts, ", ")
+	end
+
+	method string FormatNumber(number value)
+		-- Prints authored whole numbers without a trailing ".0".
+		if value == math.floor(value) then
+			return tostring(math.floor(value))
+		end
+		return tostring(value)
+	end
+
+end

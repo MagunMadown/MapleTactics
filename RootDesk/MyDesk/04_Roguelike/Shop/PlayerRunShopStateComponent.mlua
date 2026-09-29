@@ -4,6 +4,8 @@ script PlayerRunShopStateComponent extends Component
 	@TargetUserSync property integer ActiveRunSequence = 0
 	@TargetUserSync property string ShopState = "IDLE"
 	@TargetUserSync property string ActiveShopId = ""
+	@TargetUserSync property string ActiveNodeId = ""
+	@TargetUserSync property string ShopDisplayName = ""
 	@TargetUserSync property integer VisitSequence = 0
 	@TargetUserSync property string VisitKey = ""
 	@TargetUserSync property string OfferSnapshot = ""
@@ -13,24 +15,70 @@ script PlayerRunShopStateComponent extends Component
 	@TargetUserSync property string LastPurchaseReason = ""
 	@TargetUserSync property string LastCloseReason = ""
 	@TargetUserSync property integer ShopRevision = 0
+	property table OfferedEntry = {}
+	property table OfferedEntries = {}
+	@TargetUserSync property string SellCatalogSnapshot = ""
+	property table SellCatalog = {}
+	property table SellItemTypes = {}
 	property string AppliedPurchaseRequestKeys = ""
+	@TargetUserSync property string BuybackSnapshot = ""
+	property table BuybackEntries = {}
+	property integer BuybackSequence = 0
 
 	@ExecSpace("ServerOnly")
-	method table Open(integer runSequence, string shopId, string visitKey, string offerSnapshot)
-		if runSequence <= 0 or shopId == "" or visitKey == "" or offerSnapshot == "" then
+	method table ResetForRun(integer runSequence)
+		-- Clear the last displayed offer and all run purchase receipts.
+		self.ActiveRunSequence = math.max(0, runSequence)
+		self.ShopState = "IDLE"
+		self.ActiveShopId = ""
+		self.ActiveNodeId = ""
+		self.ShopDisplayName = ""
+		self.VisitSequence = 0
+		self.VisitKey = ""
+		self.OfferedEntry = {}
+		self.OfferedEntries = {}
+		self.SellCatalog = {}
+		self.SellItemTypes = {}
+		self.SellCatalogSnapshot = ""
+		self.OfferSnapshot = ""
+		self.PurchasedOfferIds = ""
+		self.LastPurchaseOfferId = ""
+		self.LastPurchaseSuccess = false
+		self.LastPurchaseReason = ""
+		self.LastCloseReason = ""
+		self.AppliedPurchaseRequestKeys = ""
+		self.BuybackSnapshot = ""
+		self.BuybackEntries = {}
+		self.BuybackSequence = 0
+		self.ShopRevision = self.ShopRevision + 1
+		log("[RunShopState] reset sequence=" .. self.ActiveRunSequence .. " revision=" .. self.ShopRevision)
+		return self:GetSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table Open(integer runSequence, string shopId, string nodeId, string displayName, string visitKey, string offerSnapshot)
+		-- An empty offer is a valid visit that still permits departure.
+		if runSequence <= 0 or shopId == "" or nodeId == "" or displayName == "" or visitKey == "" then
 			return { Success = false, Reason = "INVALID_SHOP_OPEN_CONTEXT" }
 		end
-		if self.ShopState == "OPEN" and self.ActiveRunSequence == runSequence and self.ActiveShopId == shopId and self.VisitKey == visitKey then
+		if self.ActiveRunSequence ~= runSequence then
+			self:ResetForRun(runSequence)
+		end
+		if self.ShopState == "OPEN" and self.ActiveShopId == shopId and self.ActiveNodeId == nodeId and self.VisitKey == visitKey then
 			local snapshot = self:GetSnapshot()
 			snapshot.Reason = "SHOP_ALREADY_OPEN"
 			return snapshot
 		end
 		self.ActiveRunSequence = runSequence
 		self.ActiveShopId = shopId
+		-- Buyback inventory belongs to this visit; keep receipt IDs unique across the run.
+		self.BuybackEntries = {}
+		self.BuybackSnapshot = ""
+		self.ActiveNodeId = nodeId
+		self.ShopDisplayName = displayName
 		self.VisitSequence = self.VisitSequence + 1
 		self.VisitKey = visitKey
 		self.OfferSnapshot = offerSnapshot
-		self.PurchasedOfferIds = ""
 		self.LastPurchaseOfferId = ""
 		self.LastPurchaseSuccess = false
 		self.LastPurchaseReason = "SHOP_OPENED"
@@ -38,7 +86,7 @@ script PlayerRunShopStateComponent extends Component
 		self.AppliedPurchaseRequestKeys = ""
 		self.ShopState = "OPEN"
 		self.ShopRevision = self.ShopRevision + 1
-		log("[RunShopState] opened shop=" .. shopId .. " visit=" .. self.VisitSequence .. " offers=" .. offerSnapshot .. " revision=" .. self.ShopRevision)
+		log("[RunShopState] opened shop=" .. shopId .. " node=" .. nodeId .. " visit=" .. self.VisitSequence .. " offers=" .. offerSnapshot .. " revision=" .. self.ShopRevision)
 		return self:GetSnapshot()
 	end
 
@@ -54,6 +102,8 @@ script PlayerRunShopStateComponent extends Component
 			return { Success = false, Reason = "SHOP_CLOSE_CONTEXT_MISMATCH" }
 		end
 		self.ShopState = "CLOSED"
+		self.BuybackEntries = {}
+		self.BuybackSnapshot = ""
 		self.LastCloseReason = reason or "SHOP_COMPLETED"
 		self.ShopRevision = self.ShopRevision + 1
 		log("[RunShopState] closed shop=" .. self.ActiveShopId .. " visit=" .. self.VisitSequence .. " reason=" .. self.LastCloseReason .. " revision=" .. self.ShopRevision)
@@ -106,8 +156,11 @@ script PlayerRunShopStateComponent extends Component
 			RunSequence = self.ActiveRunSequence,
 			ShopState = self.ShopState,
 			ShopId = self.ActiveShopId,
+			NodeId = self.ActiveNodeId,
+			ShopDisplayName = self.ShopDisplayName,
 			VisitSequence = self.VisitSequence,
 			OfferSnapshot = self.OfferSnapshot,
+			BuybackSnapshot = self.BuybackSnapshot,
 			PurchasedOfferIds = self.PurchasedOfferIds,
 			LastPurchaseOfferId = self.LastPurchaseOfferId,
 			LastPurchaseSuccess = self.LastPurchaseSuccess,
@@ -115,6 +168,36 @@ script PlayerRunShopStateComponent extends Component
 			LastCloseReason = self.LastCloseReason,
 			Revision = self.ShopRevision
 		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RecordBuyback(string itemId, string itemType, integer price)
+		-- Freeze the actual sale price and display metadata for the current shop visit.
+		if self.ShopState ~= "OPEN" then return end
+		if itemType ~= "ITEM" and itemType ~= "CONSUMABLE" then return end
+		for raw in string.gmatch(self.SellCatalogSnapshot, "([^|]+)") do
+			local fields = {}
+			for field in string.gmatch(raw .. "~", "([^~]*)~") do table.insert(fields, field) end
+			if fields[1] == itemId and fields[6] == itemType then
+				self.BuybackSequence = self.BuybackSequence + 1
+				local id = "buyback:" .. self.ActiveRunSequence .. ":" .. self.BuybackSequence
+				local entry = { Success = true, ShopEntryId = id, RewardType = itemType, RewardRefId = itemId,
+					RewardAmount = 1, PriceCurrencyId = "gold", PriceAmount = price }
+				entry.Row = table.concat({id, fields[2], itemType, itemId, "1", "gold", tostring(price),
+					tostring(self.BuybackSequence), fields[3], itemType == "ITEM" and "유물" or "물약", "0", "0", "0", fields[5]}, "~")
+				table.insert(self.BuybackEntries, 1, entry)
+				self:PublishBuybacks()
+				return
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishBuybacks()
+		local rows = {}
+		for _, entry in ipairs(self.BuybackEntries) do table.insert(rows, entry.Row) end
+		self.BuybackSnapshot = table.concat(rows, "|")
+		self.ShopRevision = self.ShopRevision + 1
 	end
 
 end

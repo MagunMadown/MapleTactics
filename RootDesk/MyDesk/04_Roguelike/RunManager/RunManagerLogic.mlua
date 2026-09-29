@@ -1,8 +1,11 @@
 @Logic
-script RunManagerLogic
+script RunManagerLogic extends Logic
 
 	property integer DefaultRunSeed = 1000
-	property string DefaultJobId = "prototype_warrior"
+	property string DefaultJobId = "warrior"
+	property string LobbyPrototypeStageId = "henesys_stage_01"
+	property string MesoCurrencyId = "gold"
+	property string StartingPotionId = "orange_potion"
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
@@ -33,6 +36,10 @@ script RunManagerLogic
 		if runState.SelectedJobId ~= "" and runState.SelectedJobId ~= resolvedJobId then
 			return { Success = false, Reason = "JOB_CHANGE_NOT_ALLOWED", JobId = resolvedJobId }
 		end
+		local unionSnapshot = self:GetRunUnionEffectSnapshot(playerEntity)
+		if unionSnapshot.Success == false then
+			return unionSnapshot
+		end
 		local jobSnapshot = nil
 		if runState.SelectedJobId == resolvedJobId and runState.JobBaseMaxHp > 0 then
 			jobSnapshot = runState:GetJobSnapshot()
@@ -41,7 +48,7 @@ script RunManagerLogic
 			if validation.Success == false then
 				return validation
 			end
-			jobSnapshot = runState:ApplyJobBundle(validation.Data)
+			jobSnapshot = runState:ApplyJobBundle(validation.Data, unionSnapshot.StartingSkillBonus, unionSnapshot.MaxHPBonus)
 		end
 		if jobSnapshot.Success == false then
 			return jobSnapshot
@@ -62,17 +69,12 @@ script RunManagerLogic
 		if augmentState == nil or augmentState.ActiveRunSequence ~= runState.RunSequence then
 			return { Success = false, Reason = "RUN_AUGMENT_SEQUENCE_MISMATCH", JobId = resolvedJobId }
 		end
-		if runState.SelectedJobPassiveSetId ~= "" then
-			local passiveResult = self:GrantRunAugment(
-				playerEntity,
-				runState.SelectedJobPassiveSetId,
-				"JOB",
-				"job:" .. tostring(runState.RunSequence) .. ":" .. runState.SelectedJobPassiveSetId
-			)
-			if passiveResult.Success == false then
-				return passiveResult
-			end
-		end
+		-- Job utilities replace automatic job augments, including already-started run snapshots.
+		runState.SelectedJobPassiveSetId = ""
+		runState.SelectedJobMechanicId = "NONE"
+		augmentState:RemoveJobPassives()
+		jobSnapshot.PassiveSetId = ""
+		jobSnapshot.MechanicId = "NONE"
 		jobSnapshot.OwnedAugmentSnapshot = augmentState.OwnedAugmentSnapshot
 		jobSnapshot.AugmentRevision = augmentState.AugmentRevision
 		return jobSnapshot
@@ -86,6 +88,105 @@ script RunManagerLogic
 			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
 		end
 		return runState:GetJobSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetLobbyBattleEntryContext(Entity playerEntity)
+		-- Aggregates existing owners only; this facade does not own lobby, job, or run state.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { IsReady = false, Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		local jobState = playerEntity:GetComponent("script.TemporaryClassSelectionStateComponent")
+		if jobState == nil or jobState.SelectedJobId == "" then
+			return { IsReady = false, Success = false, Reason = "JOB_NOT_SELECTED" }
+		end
+
+		local stageId = self:ResolveLobbyBattleStageId(runState)
+		local stageDefinition = _StageDefinitionRepositoryLogic:GetStageDefinition(stageId)
+		if stageDefinition.Success == false then
+			return { IsReady = false, Success = false, Reason = stageDefinition.Reason, StageId = stageId }
+		end
+		local jobDefinition = _JobDefinitionRepositoryLogic:GetJobDefinition(jobState.SelectedJobId)
+		if jobDefinition.Success == false or jobDefinition.Enabled ~= true then
+			return { IsReady = false, Success = false, Reason = jobDefinition.Reason, StageId = stageId, JobId = jobState.SelectedJobId }
+		end
+
+		local entryMode = self:ResolveLobbyBattleEntryMode(runState)
+		if runState.RunState == "Completed" then
+			log("[RunManager] completed run restart ready sequence=" .. tostring(runState.RunSequence) .. " stage=" .. stageId .. " mode=" .. entryMode)
+		end
+		return {
+			IsReady = true,
+			Success = true,
+			Reason = "OK",
+			StageId = stageId,
+			JobId = jobState.SelectedJobId,
+			RunSeed = runState.RunSeed,
+			EntryMode = entryMode,
+			CharacterId = "",
+			LoadoutId = "",
+			CharacterIdRequired = false,
+			LoadoutIdRequired = false
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method string ResolveLobbyBattleStageId(any runState)
+		-- A selected battle/boss node is authoritative; otherwise use the real StageDefinitions prototype row.
+		if runState ~= nil
+			and runState.RunState == "Active"
+			and (runState.SelectedContentType == "BATTLE" or runState.SelectedContentType == "BOSS")
+			and runState.SelectedContentId ~= "" then
+			return runState.SelectedContentId
+		end
+		return self.LobbyPrototypeStageId
+	end
+
+	method string ResolveLobbyBattleEntryMode(any runState)
+		-- Only an active run is resumable in the existing lifecycle; Idle, Failed, and Completed start new.
+		if runState ~= nil and runState.RunSequence > 0 and runState.RunState == "Active" then
+			return "CONTINUE_RUN"
+		end
+		return "NEW_RUN"
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalLobbyBattleEntryContext()
+		-- UI-facing read DTO built from synced player-owned state; no random/default IDs are generated here.
+		local playerEntity = _UserService.LocalPlayer
+		if playerEntity == nil then
+			return { IsReady = false, Success = false, Reason = "LOCAL_PLAYER_UNAVAILABLE" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local jobState = playerEntity:GetComponent("script.TemporaryClassSelectionStateComponent")
+		if jobState == nil or jobState.SelectedJobId == "" then
+			return { IsReady = false, Success = false, Reason = "JOB_NOT_SELECTED" }
+		end
+		local stageId = self.LobbyPrototypeStageId
+		if runState ~= nil
+			and runState.RunState == "Active"
+			and (runState.SelectedContentType == "BATTLE" or runState.SelectedContentType == "BOSS")
+			and runState.SelectedContentId ~= "" then
+			stageId = runState.SelectedContentId
+		end
+		local runSeed = self.DefaultRunSeed
+		if runState ~= nil then
+			runSeed = runState.RunSeed
+		end
+		return {
+			IsReady = stageId ~= "",
+			Success = stageId ~= "",
+			Reason = stageId ~= "" and "OK" or "STAGE_NOT_RESOLVED",
+			StageId = stageId,
+			JobId = jobState.SelectedJobId,
+			RunSeed = runSeed,
+			EntryMode = self:ResolveLobbyBattleEntryMode(runState),
+			CharacterId = "",
+			LoadoutId = "",
+			CharacterIdRequired = false,
+			LoadoutIdRequired = false
+		}
 	end
 
 	@ExecSpace("ServerOnly")
@@ -142,6 +243,100 @@ script RunManagerLogic
 	end
 
 	@ExecSpace("ServerOnly")
+	method any GetOrCreateRunUnionEffectState(Entity playerEntity)
+		-- Returns the player-owned immutable-per-run Union effect snapshot component.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			log_error("[RunManager] Union effect state unavailable reason=INVALID_PLAYER")
+			return nil
+		end
+		local unionState = playerEntity:GetComponent("script.PlayerRunUnionEffectComponent")
+		if unionState == nil then
+			unionState = playerEntity:AddComponent("PlayerRunUnionEffectComponent")
+		end
+		if unionState == nil then
+			log_error("[RunManager] Union effect state unavailable reason=COMPONENT_ATTACH_FAILED player=" .. playerEntity.Name)
+		end
+		return unionState
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunUnionEffectSnapshot(Entity playerEntity)
+		-- Exposes only the captured run snapshot and never re-resolves the permanent profile mid-run.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		local unionState = self:GetOrCreateRunUnionEffectState(playerEntity)
+		if runState == nil or unionState == nil then
+			return { Success = false, Reason = "RUN_UNION_STATE_UNAVAILABLE" }
+		end
+		local snapshot = unionState:GetSnapshot()
+		if snapshot.Success == false or snapshot.RunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_UNION_SEQUENCE_MISMATCH", RunSequence = runState.RunSequence, UnionRunSequence = snapshot.RunSequence or 0 }
+		end
+		return snapshot
+	end
+
+	@ExecSpace("ServerOnly")
+	method table InitializeNewRunOwnedState(Entity playerEntity, any runState, table resolvedEffectSnapshot)
+		-- Captures Union once, then initializes the existing inventory and augment owners for the same sequence.
+		local unionState = self:GetOrCreateRunUnionEffectState(playerEntity)
+		if unionState == nil then
+			return { Success = false, Reason = "RUN_UNION_STATE_UNAVAILABLE" }
+		end
+		local captured = unionState:CaptureForRun(runState.RunSequence, resolvedEffectSnapshot)
+		if captured.Success == false then
+			return captured
+		end
+		local rewardRun = _UnionRewardServiceLogic:BeginRun(playerEntity, runState.RunSequence)
+		if rewardRun.Success == false then
+			return {
+				Success = false,
+				Reason = "UNION_REWARD_RUN_INITIALIZATION_FAILED",
+				CauseReason = rewardRun.Reason or "UNKNOWN",
+				DetailReason = rewardRun.DetailReason or "",
+				ErrorCode = rewardRun.ErrorCode or 0
+			}
+		end
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if inventory == nil then
+			return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" }
+		end
+		inventory:ResetForRun(runState.RunSequence, captured.InventorySlotBonus)
+		if captured.StartingPotionBonus > 0 then
+			local potionGrant = inventory:GrantRunReward(
+				"CONSUMABLE",
+				self.StartingPotionId,
+				captured.StartingPotionBonus,
+				"union:start:" .. tostring(runState.RunSequence) .. ":" .. self.StartingPotionId
+			)
+			if potionGrant.Success == false then
+				return { Success = false, Reason = "UNION_STARTING_POTION_GRANT_FAILED", DetailReason = potionGrant.Reason }
+			end
+		end
+		local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
+		if augmentState == nil then
+			return { Success = false, Reason = "RUN_AUGMENT_UNAVAILABLE" }
+		end
+		augmentState:ResetForRun(runState.RunSequence, captured.AugmentRerollBonus)
+		local shopReset = _RunShopLogic:ResetPlayerShopState(playerEntity, runState.RunSequence)
+		if shopReset.Success == false then
+			return { Success = false, Reason = "RUN_SHOP_STATE_INITIALIZATION_FAILED", DetailReason = shopReset.Reason }
+		end
+		local relics = self:GetRunStartingRelicReward(playerEntity, captured.StartingRandomRelicBonus)
+		if relics.Success == false then return relics end
+		local supply = _UnionShopServiceLogic:GrantDepartureSupply(playerEntity, inventory, unionState.RewardRunId)
+		if supply.Success == false then return supply end
+		return { Success = true, Reason = "RUN_OWNED_STATE_INITIALIZED", UnionSnapshot = captured }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunStartingRelicReward(Entity playerEntity, integer amount)
+		-- Grants the captured Union bonus through the same relic owner used by shops and battle.
+		if amount <= 0 then return { Success = true, Reason = "NO_STARTING_RELIC_BONUS" } end
+		local effects = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if effects == nil then return { Success = false, Reason = "RUN_RELIC_STATE_UNAVAILABLE" } end
+		return effects:GrantStartingRelics(amount)
+	end
+
+	@ExecSpace("ServerOnly")
 	method any EnsureRunState(Entity playerEntity, integer fallbackSeed)
 		-- Reuses an active run or initializes progression and inventory as one boundary.
 		local runState = self:GetOrCreateRunState(playerEntity)
@@ -154,26 +349,45 @@ script RunManagerLogic
 			if seed < 0 then
 				seed = self.DefaultRunSeed
 			end
+			local resolvedEffects = _UnionEffectResolverLogic:GetEffectSnapshot(playerEntity)
+			if resolvedEffects.Success == false then
+				log_error("[UnionEffect] run start blocked reason=" .. (resolvedEffects.Reason or "UNKNOWN"))
+				return nil
+			end
 			runState:BeginNewRun(seed)
-			local inventory = self:GetOrCreateRunInventory(playerEntity)
-			if inventory == nil then
+			local initialized = self:InitializeNewRunOwnedState(playerEntity, runState, resolvedEffects.EffectSnapshot)
+			if initialized.Success == false then
+				log_error("[UnionEffect] run-owned initialization failed reason=" .. initialized.Reason)
 				return nil
 			end
-			inventory:ResetForRun(runState.RunSequence)
-			local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
-			if augmentState == nil then
-				return nil
-			end
-			augmentState:ResetForRun(runState.RunSequence)
 			log("[RunManager] initialized player=" .. playerEntity.Name .. " sequence=" .. runState.RunSequence .. " seed=" .. runState.RunSeed)
 		else
 			self:GetOrCreateRunInventory(playerEntity)
+			local unionState = self:GetOrCreateRunUnionEffectState(playerEntity)
+			if unionState == nil then
+				return nil
+			end
+			if unionState.IsInitialized == false or unionState.ActiveRunSequence ~= runState.RunSequence then
+				local fallbackCapture = unionState:CaptureForRun(runState.RunSequence, {})
+				if fallbackCapture.Success == false then
+					return nil
+				end
+				log_warning("[UnionEffect] active run had no stable snapshot; zero bonuses captured sequence=" .. runState.RunSequence)
+			end
+			if unionState.RewardRunId <= 0 then
+				local rewardRun = _UnionRewardServiceLogic:BeginRun(playerEntity, runState.RunSequence)
+				if rewardRun.Success == false then
+					log_error("[UnionReward] active run reward initialization failed reason=" .. rewardRun.Reason)
+					return nil
+				end
+				log_warning("[UnionReward] active run received a migrated reward run id=" .. tostring(rewardRun.RewardRunId or 0))
+			end
 			local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
 			if augmentState == nil then
 				return nil
 			end
 			if augmentState.ActiveRunSequence ~= runState.RunSequence then
-				augmentState:ResetForRun(runState.RunSequence)
+				augmentState:ResetForRun(runState.RunSequence, unionState.AugmentRerollBonus)
 				log("[RunManager] migrated augment state sequence=" .. runState.RunSequence)
 			end
 			log("[RunManager] reused player=" .. playerEntity.Name .. " sequence=" .. runState.RunSequence .. " seed=" .. runState.RunSeed .. " state=" .. runState.RunState)
@@ -189,23 +403,74 @@ script RunManagerLogic
 			return nil
 		end
 
+		local resolvedEffects = _UnionEffectResolverLogic:GetEffectSnapshot(playerEntity)
+		if resolvedEffects.Success == false then
+			log_error("[UnionEffect] run start blocked reason=" .. (resolvedEffects.Reason or "UNKNOWN"))
+			return nil
+		end
 		runState:BeginNewRun(runSeed)
-		local inventory = self:GetOrCreateRunInventory(playerEntity)
-		if inventory == nil then
+		local initialized = self:InitializeNewRunOwnedState(playerEntity, runState, resolvedEffects.EffectSnapshot)
+		if initialized.Success == false then
+			log_error("[UnionEffect] run-owned initialization failed reason=" .. initialized.Reason .. " cause=" .. (initialized.CauseReason or "UNKNOWN") .. " detail=" .. (initialized.DetailReason or "") .. " errorCode=" .. tostring(initialized.ErrorCode or 0))
 			return nil
 		end
-		inventory:ResetForRun(runState.RunSequence)
-		local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
-		if augmentState == nil then
-			return nil
-		end
-		augmentState:ResetForRun(runState.RunSequence)
 		log("[RunManager] new run player=" .. playerEntity.Name .. " sequence=" .. runState.RunSequence .. " seed=" .. runState.RunSeed)
 		return runState
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ResetFailedRun(Entity playerEntity, string reason)
+		-- Clears every player-owned run payload only after the authoritative defeat result has been recorded.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		if runState.RunState ~= "Failed" or runState.LastBattleResult ~= "Defeat" then
+			return { Success = false, Reason = "RUN_NOT_FAILED" }
+		end
+		local inventory = self:GetOrCreateRunInventory(playerEntity)
+		if inventory == nil then
+			return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" }
+		end
+		local augmentState = self:GetOrCreateRunAugmentState(playerEntity)
+		if augmentState == nil then
+			return { Success = false, Reason = "RUN_AUGMENT_UNAVAILABLE" }
+		end
+		local unionState = self:GetOrCreateRunUnionEffectState(playerEntity)
+		if unionState == nil then
+			return { Success = false, Reason = "RUN_UNION_STATE_UNAVAILABLE" }
+		end
+
+		local resetResult = runState:ResetAfterDefeat(reason)
+		if resetResult.Success == false then
+			return resetResult
+		end
+		inventory:ResetForRun(0, 0)
+		augmentState:ResetForRun(0, 0)
+		unionState:ClearRunSnapshot("DEFEAT_RESET")
+		local shopReset = _RunShopLogic:ResetPlayerShopState(playerEntity, 0)
+		if shopReset.Success == false then
+			return { Success = false, Reason = "RUN_SHOP_STATE_RESET_FAILED", DetailReason = shopReset.Reason }
+		end
+		log("[RunManager] failed run reset player=" .. playerEntity.Name .. " sequence=" .. resetResult.RunSequence .. " reason=" .. resetResult.Reason)
+		return resetResult
+	end
+
+	@ExecSpace("ServerOnly")
+	method table AbandonRun(Entity playerEntity, string reason)
+		-- A voluntary exit is recorded as a failed run so the failed-run reset owns every cleanup.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		runState.RunState = "Failed"
+		runState.LastBattleResult = "Defeat"
+		return self:ResetFailedRun(playerEntity, reason)
+	end
+
+	@ExecSpace("ServerOnly")
 	method boolean RecordBattleResult(Entity playerEntity, string stageId, integer stageNumber, string battleResult, integer entryRequestId)
+		-- Commits stage and relic rewards before progressing the run; each reward owns its retry receipt.
 		local runState = self:GetOrCreateRunState(playerEntity)
 		if runState == nil then
 			return false
@@ -231,11 +496,65 @@ script RunManagerLogic
 				log_error("[RunManager] stage reward failed stage=" .. stageId .. " reason=" .. rewardResult.Reason .. " detail=" .. (rewardResult.DetailReason or ""))
 				return false
 			end
+			local relics = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+			if relics ~= nil then
+				local relicResult = relics:ApplyVictory(battleRecordKey)
+				if relicResult.Success == false then
+					log_error("[RunManager] relic victory failed key=" .. battleRecordKey .. " reason=" .. relicResult.Reason)
+					return false
+				end
+			end
+		end
+		local unionRewardResult = _UnionRewardServiceLogic:ProcessBattleResult(
+			playerEntity,
+			stageId,
+			flowResult.StageType or self:ResolveStageType(stageId),
+			battleResult,
+			battleRecordKey,
+			flowResult
+		)
+		if unionRewardResult.Success == false then
+			log_error("[RunManager] Union reward failed stage=" .. stageId .. " reason=" .. unionRewardResult.Reason)
+			return false
+		end
+		if battleResult == "Victory" then
+			-- Uses the node normalized by ResolveBattleOutcome before applying the next flow state.
+			if runState.CurrentNodeGraphId ~= flowResult.NodeGraphId or runState.CurrentNodeId ~= flowResult.CompletedNodeId then
+				log_warning("[RunManager] Union Job milestone context normalized stage=" .. stageId .. " previousGraph=" .. runState.CurrentNodeGraphId .. " previousNode=" .. runState.CurrentNodeId .. " resolvedGraph=" .. (flowResult.NodeGraphId or "") .. " resolvedNode=" .. (flowResult.CompletedNodeId or ""))
+			end
+			local jobProgressionResult = _UnionJobProgressionServiceLogic:TryApplyJobUnionMilestone(playerEntity, {
+				BattleResult = battleResult,
+				StageId = stageId,
+				NodeGraphId = flowResult.NodeGraphId,
+				NodeId = flowResult.CompletedNodeId
+			})
+			if jobProgressionResult.Success == false then
+				log_error("[RunManager] Union Job milestone failed stage=" .. stageId .. " reason=" .. (jobProgressionResult.Reason or "UNKNOWN"))
+				return false
+			end
+			if jobProgressionResult.WasImproved == true then
+				log("[RunManager] Union Job milestone committed job=" .. jobProgressionResult.AuthoritativeJobId .. " milestone=" .. jobProgressionResult.MilestoneId .. " progress=" .. tostring(jobProgressionResult.NewProgress))
+			end
 		end
 		if runState:RecordBattleResult(stageNumber, battleResult, battleRecordKey) == false then
 			return false
 		end
-		return runState:ApplyBattleFlowResult(flowResult)
+		if runState:ApplyBattleFlowResult(flowResult) == false then
+			return false
+		end
+		if unionRewardResult.RunEnded == true and battleResult == "Victory" then
+			runState:MarkRunCompleted("UNION_REWARD_RUN_CLEAR")
+		end
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method string ResolveStageType(string stageId)
+		local definition = _StageDefinitionRepositoryLogic:GetStageDefinition(stageId)
+		if definition.Success == false then
+			return ""
+		end
+		return definition.StageType or ""
 	end
 
 	@ExecSpace("ServerOnly")
@@ -264,7 +583,8 @@ script RunManagerLogic
 			else
 				result.AppliedCount = result.AppliedCount + 1
 			end
-			local snapshotEntry = entry.StageRewardEntryId .. "~" .. entry.RewardType .. "~" .. entry.RewardRefId .. "~" .. tostring(entry.Amount)
+			local grantedAmount = grant.FinalAmount or entry.Amount
+			local snapshotEntry = entry.StageRewardEntryId .. "~" .. entry.RewardType .. "~" .. entry.RewardRefId .. "~" .. tostring(grantedAmount)
 			result.RewardSnapshot = result.RewardSnapshot == "" and snapshotEntry or result.RewardSnapshot .. "|" .. snapshotEntry
 		end
 		log("[StageReward] resolved stage=" .. stageId .. " battleKey=" .. battleRecordKey .. " applied=" .. result.AppliedCount .. " duplicate=" .. result.DuplicateCount .. " rewards=" .. result.RewardSnapshot)
@@ -346,6 +666,10 @@ script RunManagerLogic
 		if flowResult.Success == false then
 			return flowResult
 		end
+		if flowResult.FlowState == "RUN_COMPLETED" then
+			local reward = _UnionRewardServiceLogic:ProcessTerminalContentCompletion(playerEntity, runState.RunSequence, runState.LastCompletedStageId)
+			if reward.Success == false then return reward end
+		end
 		return runState:ApplyContentCompletion(flowResult, completionKey)
 	end
 
@@ -366,6 +690,12 @@ script RunManagerLogic
 				local expectedContentId = nodeDefinition.NodeId
 				if nodeDefinition.NodeType == "BATTLE" or nodeDefinition.NodeType == "BOSS" then
 					expectedContentId = nodeDefinition.StageId
+				elseif nodeDefinition.NodeType == "SHOP" then
+					local binding = _ShopNodeBindingRepositoryLogic:GetBinding(nodeDefinition.NodeGraphId, nodeDefinition.NodeId)
+					if binding.Success == false then
+						return { Success = false, Reason = binding.DetailReason or binding.Reason, NodeId = nodeId }
+					end
+					expectedContentId = binding.ShopId
 				end
 				if nodeDefinition.NodeType ~= contentTypes[index] or expectedContentId ~= contentIds[index] then
 					return { Success = false, Reason = "RUN_FLOW_OPTION_DEFINITION_MISMATCH", NodeId = nodeId }
@@ -397,9 +727,86 @@ script RunManagerLogic
 		local result = self:SelectNextContent(playerEntity, nodeId, requestId)
 		if result.Success == false then
 			log_warning("[RunContentFlow] selection rejected user=" .. senderUserId .. " node=" .. nodeId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			self:NotifyContentSelectionResult(false, result.Reason, nodeId, senderUserId)
 			return
 		end
 		log("[RunContentFlow] selection accepted user=" .. senderUserId .. " node=" .. nodeId .. " request=" .. requestId .. " action=" .. (result.RouteAction or "") .. " reason=" .. result.Reason)
+		if result.Reason ~= "DUPLICATE_SELECTION_IGNORED" and (result.SelectedContentType == "SHOP" or result.ContentType == "SHOP") then
+			local transfer = _RunContentMapTransitionAdapterLogic:ConsumeSelectedShop(playerEntity)
+			if transfer.Success == false then
+				log_warning("[RunContentFlow] shop transfer rejected user=" .. senderUserId .. " node=" .. nodeId .. " reason=" .. transfer.Reason)
+			end
+		elseif result.SelectedContentType == "BATTLE" or result.ContentType == "BATTLE"
+			or result.SelectedContentType == "BOSS" or result.ContentType == "BOSS" then
+			local transfer = _RunContentMapTransitionAdapterLogic:ConsumeSelectedBattle(playerEntity)
+			if transfer.Success == false then
+				log_warning("[RunContentFlow] battle transfer rejected user=" .. senderUserId .. " node=" .. nodeId .. " reason=" .. transfer.Reason)
+				self:NotifyContentSelectionResult(false, transfer.Reason, nodeId, senderUserId)
+			end
+		end
+	end
+
+	@ExecSpace("Client")
+	method void NotifyContentSelectionResult(boolean success, string reason, string nodeId)
+		-- Restores the matching world-map choice after a rejected selection.
+		if success then return end
+		if string.find(nodeId or "", "shop_", 1, true) == 1 then
+			local uiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+			local minimap = isvalid(uiRoot) and uiRoot:GetComponent("script.MinimapUI") or nil
+			if minimap ~= nil then
+				local clearedStageId = nodeId == "shop_ellinia_nautilus" and "ellinia_stage_04" or "henesys_stage_04"
+				if nodeId == "shop_kerning_perion" then clearedStageId = "region_kerning_stage_04" end
+				if nodeId == "shop_perion_sleepywood" then clearedStageId = "region_04_stage_04" end
+				if nodeId == "shop_nautilus_sleepywood" then clearedStageId = "region_05_stage_04" end
+				minimap:OpenWorldMapMode("SHOP_CHOICE", "SELECTION_REJECTED:" .. reason, clearedStageId)
+			end
+			log_warning("[WorldMapShop] selection rejected node=" .. nodeId .. " reason=" .. reason)
+			return
+		end
+		local regionPaths = { kerning_stage01_battle = "KerningCityBranchBtn", perion_stage01_battle = "PerionCityBranchBtn", ellinia_stage01_battle = "ElliniaBranchBtn", nautilus_stage01_battle = "NautilusCityBranchBtn", sleepywood_stage01_battle = "SleepywoodCityBranchBtn" }
+		if regionPaths[nodeId] ~= nil then
+			local elliniaNode = _EntityService:GetEntityByPath("/ui/PopupGroup/MapTeleportPopup/" .. regionPaths[nodeId])
+			local regionButton = isvalid(elliniaNode) and elliniaNode:GetComponent("script.WorldMapFutureRegionButtonComponent") or nil
+			if regionButton ~= nil then regionButton:HandleEntryResult(false, reason) end
+			log_warning("[WorldMapRegion] battle selection rejected node=" .. nodeId .. " reason=" .. reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SelectWorldMapBranch(Entity playerEntity, string branchId)
+		-- Commits exactly one post-Henesys route so upper and lower shop choices are mutually exclusive.
+		local runState = self:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		if runState.CompletedStageCount < 1 then
+			return { Success = false, Reason = "HENESYS_NOT_CLEARED" }
+		end
+		if branchId ~= "UPPER" and branchId ~= "LOWER" then
+			return { Success = false, Reason = "INVALID_WORLD_MAP_BRANCH" }
+		end
+		if runState.SelectedWorldMapBranch == branchId then
+			return { Success = true, Reason = "DUPLICATE_BRANCH_SELECTION", BranchId = branchId }
+		end
+		if runState.SelectedWorldMapBranch ~= "" then
+			return { Success = false, Reason = "WORLD_MAP_BRANCH_ALREADY_SELECTED", BranchId = runState.SelectedWorldMapBranch }
+		end
+		runState.SelectedWorldMapBranch = branchId
+		runState.RunFlowRevision = runState.RunFlowRevision + 1
+		log("[WorldMap] branch selected player=" .. playerEntity.Name .. " branch=" .. branchId .. " completed=" .. runState.CompletedStageCount)
+		return { Success = true, Reason = "WORLD_MAP_BRANCH_SELECTED", BranchId = branchId }
+	end
+
+	@ExecSpace("Server")
+	method void RequestSelectWorldMapBranch(string branchId)
+		-- Accepts the owning client's upper/lower shop choice through an authenticated RPC boundary.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:SelectWorldMapBranch(playerEntity, branchId)
+		if result.Success == false then
+			log_warning("[WorldMap] branch request rejected user=" .. senderUserId .. " branch=" .. branchId .. " reason=" .. result.Reason)
+			return
+		end
+		log("[WorldMap] branch request accepted user=" .. senderUserId .. " branch=" .. branchId .. " reason=" .. result.Reason)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -424,6 +831,7 @@ script RunManagerLogic
 			AvailableNodeIds = runState.AvailableNodeIds,
 			AvailableContentTypes = runState.AvailableContentTypes,
 			AvailableContentIds = runState.AvailableContentIds,
+			SelectedWorldMapBranch = runState.SelectedWorldMapBranch,
 			Transition = {
 				State = runState.ContentTransitionState,
 				SelectedNodeId = runState.SelectedNodeId,
@@ -460,7 +868,35 @@ script RunManagerLogic
 		if inventory.ActiveRunSequence ~= runState.RunSequence then
 			return { Success = false, Reason = "RUN_INVENTORY_SEQUENCE_MISMATCH" }
 		end
-		return inventory:GrantRunReward(rewardType, rewardRefId, amount, rewardKey)
+		local finalAmount = amount
+		local mesoGainRate = 0
+		local mesoUnionState = nil
+		if rewardType == "CURRENCY" and rewardRefId == self.MesoCurrencyId then
+			local unionState = self:GetOrCreateRunUnionEffectState(playerEntity)
+			if unionState == nil or unionState.IsInitialized == false or unionState.ActiveRunSequence ~= runState.RunSequence then
+				return { Success = false, Reason = "RUN_UNION_SEQUENCE_MISMATCH" }
+			end
+			mesoGainRate = unionState.MesoGainRate
+			mesoUnionState = unionState
+			finalAmount = unionState:CalculateMesoReward(amount)
+		end
+		local grant = inventory:GrantRunReward(rewardType, rewardRefId, finalAmount, rewardKey)
+		if mesoUnionState ~= nil and grant.Success and grant.Reason ~= "DUPLICATE_REWARD_IGNORED" then
+			mesoUnionState:CommitMesoReward(amount, finalAmount)
+		end
+		grant.BaseAmount = amount
+		grant.FinalAmount = finalAmount
+		grant.UnionMesoGainRate = mesoGainRate
+		if grant.Success and grant.Reason ~= "DUPLICATE_REWARD_IGNORED" and isvalid(playerEntity.CurrentMap) then
+			local session = playerEntity.CurrentMap:GetComponent("script.BattleSessionComponent")
+			if session ~= nil and session.PlayerEntity == playerEntity then
+				session:RecordRoundReward(rewardType, grant.RewardRefId or rewardRefId, grant.AcceptedAmount or 0, rewardKey)
+				if (grant.OverflowAmount or 0) > 0 and inventory.OverflowCurrencyPerItem > 0 and inventory.OverflowCurrencyId ~= "" then
+					session:RecordRoundReward("CURRENCY", inventory.OverflowCurrencyId, grant.OverflowAmount * inventory.OverflowCurrencyPerItem, rewardKey .. ":overflow")
+				end
+			end
+		end
+		return grant
 	end
 
 	@ExecSpace("ServerOnly")
@@ -477,7 +913,20 @@ script RunManagerLogic
 		if inventory.ActiveRunSequence ~= runState.RunSequence then
 			return { Success = false, Reason = "RUN_INVENTORY_SEQUENCE_MISMATCH" }
 		end
-		return inventory:ApplyShopPurchase(
+		local effects = _RunShopLogic:GetOrCreateRelicEffects(playerEntity)
+		if effects == nil or not effects.IsInitialized or effects.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" }
+		end
+		if shopEntry.RewardType == "ITEM" and effects.Definitions[shopEntry.RewardRefId] == nil then
+			return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" }
+		end
+		if shopEntry.RewardType ~= "ITEM" and shopEntry.RewardType ~= "CONSUMABLE" then
+			return { Success = false, Reason = "UNSUPPORTED_PURCHASE_REWARD_TYPE" }
+		end
+		if shopEntry.RewardType == "ITEM" and inventory:GetSnapshotAmount(inventory.RunItemSnapshot, shopEntry.RewardRefId) > 0 then
+			return { Success = false, Reason = "RELIC_ALREADY_OWNED" }
+		end
+		local purchase = inventory:ApplyShopPurchase(
 			shopEntry.PriceCurrencyId,
 			shopEntry.PriceAmount,
 			shopEntry.RewardType,
@@ -485,6 +934,8 @@ script RunManagerLogic
 			shopEntry.RewardAmount,
 			purchaseKey
 		)
+		if purchase.Success and shopEntry.RewardType == "ITEM" then effects:Recalculate() end
+		return purchase
 	end
 
 	@ExecSpace("ServerOnly")
@@ -495,6 +946,25 @@ script RunManagerLogic
 			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
 		end
 		return inventory:GetSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CalculateUnionPointReward(Entity playerEntity, integer baseUnionPoints)
+		-- Returns the captured-run Union Coin result without granting or persisting it.
+		local unionSnapshot = self:GetRunUnionEffectSnapshot(playerEntity)
+		if unionSnapshot.Success == false then
+			return unionSnapshot
+		end
+		local unionState = self:GetOrCreateRunUnionEffectState(playerEntity)
+		local finalUnionPoints = unionState:CalculateUnionPointReward(baseUnionPoints)
+		return {
+			Success = baseUnionPoints ~= nil and baseUnionPoints > 0,
+			Reason = baseUnionPoints ~= nil and baseUnionPoints > 0 and "OK" or "INVALID_UNION_POINT_AMOUNT",
+			BaseUnionPoints = baseUnionPoints or 0,
+			UnionPointGainRate = unionSnapshot.UnionPointGainRate,
+			FinalUnionPoints = finalUnionPoints,
+			WasGranted = false
+		}
 	end
 
 	@ExecSpace("ServerOnly")
@@ -585,6 +1055,20 @@ script RunManagerLogic
 			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
 		end
 		return inventory:Consume(consumableId, 1, useKey)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalRunStatsSnapshot()
+		-- Exposes synchronized run statistics in battle, rest, shop, and the completed-run lobby.
+		local playerEntity = _UserService.LocalPlayer
+		if isvalid(playerEntity) then
+			local combatStats = playerEntity:GetComponent("script.PlayerRunCombatStatsComponent")
+			if combatStats ~= nil then
+				return combatStats:GetSnapshot()
+			end
+		end
+		return { Success = false, RunSequence = 0, RunStartTime = 0, ElapsedSeconds = 0,
+			FinalElapsedSeconds = 0, IsRunning = false, ConsumedTurns = 0, HitsTaken = 0, Revision = 0 }
 	end
 
 end

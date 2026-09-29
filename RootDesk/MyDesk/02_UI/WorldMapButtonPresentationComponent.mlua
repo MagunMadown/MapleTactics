@@ -1,0 +1,175 @@
+@Component
+script WorldMapButtonPresentationComponent extends Component
+
+	property string TooltipOwnerKey = ""
+	property string DefaultTooltipText = ""
+	property string InitialState = "LOCKED"
+	property string HoverSoundRUID = "159bf70a74634bfc8e91a29e527a4be5"
+	property number SoundVolume = 1
+	property number AvailableAlpha = 1
+	property number CompletedAlpha = 0.7
+	property number LockedAlpha = 0.45
+	property string CurrentState = "LOCKED"
+	property string CurrentTooltipText = ""
+	property CanvasGroupComponent PresentationCanvas = nil
+	property ButtonComponent PresentationButton = nil
+	property any TooltipUI = nil
+	property any HoverEnterHandler = nil
+	property any HoverExitHandler = nil
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Initializes reusable hover and visual state when the owning UI group is active.
+		self:EnsureReady("BEGIN_PLAY")
+		self:ApplyState(self.InitialState, self.DefaultTooltipText)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureReady(string reason)
+		-- Resolves local components once and idempotently connects hover handlers.
+		if self.PresentationCanvas == nil then
+			self.PresentationCanvas = self.Entity.CanvasGroupComponent
+		end
+		if self.PresentationButton == nil then
+			self.PresentationButton = self.Entity.ButtonComponent
+		end
+		if self.PresentationCanvas == nil then
+			log_warning("[WorldMapPresentation] canvas missing node=" .. self.Entity.Name .. " reason=" .. (reason or "UNSPECIFIED"))
+			return false
+		end
+		if self.HoverEnterHandler == nil then
+			self.HoverEnterHandler = self.Entity:ConnectEvent(UITouchEnterEvent, self.OnHoverEnter)
+		end
+		if self.HoverExitHandler == nil then
+			self.HoverExitHandler = self.Entity:ConnectEvent(UITouchExitEvent, self.OnHoverExit)
+		end
+		return self.HoverEnterHandler ~= nil and self.HoverExitHandler ~= nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean RebindHoverHandlers(string reason)
+		-- Refresh/Hot Reload may preserve the UI entity while invalidating its old event handles.
+		if self.HoverEnterHandler ~= nil then
+			self.Entity:DisconnectEvent(UITouchEnterEvent, self.HoverEnterHandler)
+		end
+		if self.HoverExitHandler ~= nil then
+			self.Entity:DisconnectEvent(UITouchExitEvent, self.HoverExitHandler)
+		end
+		self.HoverEnterHandler = nil
+		self.HoverExitHandler = nil
+		self.PresentationCanvas = nil
+		self.PresentationButton = nil
+		self.TooltipUI = nil
+		local connected = self:EnsureReady(reason or "REBIND")
+		log("[WorldMapPresentation] hover rebound node=" .. self.Entity.Name .. " connected=" .. tostring(connected) .. " reason=" .. (reason or "REBIND"))
+		return connected
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyState(string stateKey, string tooltipText)
+		-- Applies one presentation state without disabling hover input.
+		if self:EnsureReady("APPLY_STATE") == false then
+			return
+		end
+		local resolvedState = stateKey or "LOCKED"
+		if resolvedState ~= "AVAILABLE" and resolvedState ~= "COMPLETED" and resolvedState ~= "LOCKED" then
+			resolvedState = "LOCKED"
+		end
+		self.CurrentState = resolvedState
+		if tooltipText ~= nil and tooltipText ~= "" then
+			self.CurrentTooltipText = tooltipText
+		elseif self.CurrentTooltipText == "" then
+			self.CurrentTooltipText = self.DefaultTooltipText
+		end
+		local alpha = self.LockedAlpha
+		if resolvedState == "AVAILABLE" then
+			alpha = self.AvailableAlpha
+		elseif resolvedState == "COMPLETED" then
+			alpha = self.CompletedAlpha
+		end
+		self.PresentationCanvas.GroupAlpha = alpha
+		self.PresentationCanvas.Interactable = true
+		self.PresentationCanvas.BlocksRaycasts = true
+		if self.PresentationButton ~= nil then
+			self.PresentationButton.Enable = true
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CanActivate()
+		-- Returns whether the owning action component may accept a click.
+		return self.CurrentState == "AVAILABLE"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowTooltip()
+		-- Shows the current state text through the shared mouse tooltip.
+		if self.CurrentTooltipText == nil or self.CurrentTooltipText == "" then
+			return
+		end
+		local tooltip = self:GetTooltipUI()
+		if tooltip == nil then
+			return
+		end
+		tooltip:Show(self:GetOwnerKey(), self.CurrentTooltipText)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnHoverEnter()
+		-- Delegates hover entry to the reusable tooltip presentation.
+		if self.HoverSoundRUID ~= nil and self.HoverSoundRUID ~= "" then
+			_GameSettingsLogic:PlayUISound(self.HoverSoundRUID, self.SoundVolume)
+		end
+		self:ShowTooltip()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnHoverExit()
+		-- Hides only the tooltip owned by this world-map button.
+		local tooltip = self:GetTooltipUI()
+		if tooltip ~= nil then
+			tooltip:Hide(self:GetOwnerKey())
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetOwnerKey()
+		-- Returns a configured stable key or derives one from the UI entity name.
+		if self.TooltipOwnerKey ~= nil and self.TooltipOwnerKey ~= "" then
+			return self.TooltipOwnerKey
+		end
+		return "world_map:" .. self.Entity.Name
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetTooltipUI()
+		-- Caches the shared tooltip component and resolves it again only after invalidation.
+		if self.TooltipUI ~= nil and isvalid(self.TooltipUI.Entity) then
+			local currentTooltip = self.TooltipUI.Entity:GetComponent("script.MouseTooltipUIComponent")
+			if currentTooltip == self.TooltipUI then return self.TooltipUI end
+		end
+		self.TooltipUI = nil
+		local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
+		if isvalid(root) then
+			self.TooltipUI = root:GetComponent("script.MouseTooltipUIComponent")
+		end
+		return self.TooltipUI
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Releases reusable hover subscriptions when the UI entity is destroyed.
+		local tooltip = self:GetTooltipUI()
+		if tooltip ~= nil then tooltip:Hide(self:GetOwnerKey()) end
+		if self.HoverEnterHandler ~= nil then
+			self.Entity:DisconnectEvent(UITouchEnterEvent, self.HoverEnterHandler)
+		end
+		if self.HoverExitHandler ~= nil then
+			self.Entity:DisconnectEvent(UITouchExitEvent, self.HoverExitHandler)
+		end
+		self.HoverEnterHandler = nil
+		self.HoverExitHandler = nil
+		self.TooltipUI = nil
+	end
+
+end

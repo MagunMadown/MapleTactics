@@ -1,0 +1,108 @@
+@Component
+script MapTransitionUIComponent extends Component
+	property Entity CoverEntity = "2478abec-1041-41eb-86f7-57bc839ad1a4"
+	property CanvasGroupComponent CoverCanvas = "2478abec-1041-41eb-86f7-57bc839ad1a4"
+	property boolean IsTransferActive = false
+	property string SourceMapName = ""
+	property number TransferElapsed = 0
+	property number ReadyElapsed = 0
+	property number FadeElapsed = 0
+	property number ReadyHoldSeconds = 0.8
+	property number FadeSeconds = 0.18
+	property number TransferTimeoutSeconds = 8
+	property boolean HasWarnedTimeout = false
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Keeps the cover hidden until the common navigation boundary requests a transfer.
+		if self.CoverEntity ~= nil then
+			self.CoverEntity.Enable = false
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BeginTransfer(string source)
+		-- Covers the source map before its destination starts rendering.
+		local player = _UserService.LocalPlayer
+		self.SourceMapName = ""
+		if isvalid(player) and isvalid(player.CurrentMap) then
+			self.SourceMapName = player.CurrentMap.Name
+		end
+		self.IsTransferActive = true
+		self.TransferElapsed = 0
+		self.ReadyElapsed = 0
+		self.FadeElapsed = 0
+		self.HasWarnedTimeout = false
+		if self.CoverCanvas ~= nil then
+			self.CoverCanvas.GroupAlpha = 1
+		end
+		if self.CoverEntity ~= nil then
+			self.CoverEntity.Enable = true
+		end
+		log("[MapTransitionUI] covered source=" .. (source or "UNSPECIFIED") .. " map=" .. self.SourceMapName)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Reveals the destination after its HUD has accepted the new map and the view has settled.
+		if self.IsTransferActive == false then return end
+		self.TransferElapsed = self.TransferElapsed + delta
+		local player = _UserService.LocalPlayer
+		local currentMapName = ""
+		if isvalid(player) and isvalid(player.CurrentMap) then
+			currentMapName = player.CurrentMap.Name
+		end
+		local destinationChanged = currentMapName ~= "" and currentMapName ~= self.SourceMapName
+		local hudReady = true
+		local hudRoot = _EntityService:GetEntityByPath("/ui/BattleQueueHUD")
+		if isvalid(hudRoot) then
+			local controller = hudRoot:GetChildByName("Controller", false)
+			if isvalid(controller) then
+				local hud = controller:GetComponent("script.BattleQueueHudComponent")
+				if hud ~= nil and hud.IsMapTransferPending then
+					hudReady = false
+				end
+			end
+		end
+		if destinationChanged then
+			local battleSession = player.CurrentMap:GetComponent("script.BattleSessionComponent")
+			if battleSession ~= nil and battleSession.BattlePhase == "Setup" then
+				hudReady = false
+			end
+		end
+		local visualReady = true
+		if destinationChanged then
+			local map = player.CurrentMap
+			local layout = map:GetComponent("script.BattleTileColor")
+			if layout ~= nil and layout.Enable then
+				local platformRoot = _EntityService:GetEntityByPath("/ui/BattlePlatformHUD")
+				local platforms = isvalid(platformRoot) and platformRoot:GetComponent("script.BattlePlatformUIComponent") or nil
+				visualReady = platforms ~= nil and platforms:IsMapVisualReady(map)
+			end
+		end
+		if destinationChanged and hudReady and visualReady then
+			self.ReadyElapsed = self.ReadyElapsed + delta
+		else
+			self.ReadyElapsed = 0
+		end
+		if self.ReadyElapsed < self.ReadyHoldSeconds then
+			if self.TransferElapsed >= self.TransferTimeoutSeconds and not self.HasWarnedTimeout then
+				self.HasWarnedTimeout = true
+				log_warning("[MapTransitionUI] waiting for destination visuals map=" .. currentMapName .. " source=" .. self.SourceMapName)
+			end
+			return
+		end
+		self.FadeElapsed = self.FadeElapsed + delta
+		local fadeDuration = math.max(0.01, self.FadeSeconds)
+		local alpha = math.max(0, 1 - self.FadeElapsed / fadeDuration)
+		if self.CoverCanvas ~= nil then
+			self.CoverCanvas.GroupAlpha = alpha
+		end
+		if alpha > 0 then return end
+		self.IsTransferActive = false
+		if self.CoverEntity ~= nil then
+			self.CoverEntity.Enable = false
+		end
+		log("[MapTransitionUI] revealed map=" .. currentMapName)
+	end
+end

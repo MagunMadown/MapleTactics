@@ -22,7 +22,7 @@ script EnemyIntentResolverLogic extends Logic
 			return intent
 		end
 		local cellDelta = playerCell - enemyCell
-		if cellDelta == 0 then
+		if cellDelta == 0 and context.EnemyIsAirborne ~= true then
 			intent.Reason = "SAME_CELL"
 			return intent
 		end
@@ -49,8 +49,10 @@ script EnemyIntentResolverLogic extends Logic
 				intent.StepIndex = currentStepIndex
 				return intent
 			end
-			if self:IsConditionSatisfied(context, step, distance) == true
-				and self:IsActionApplicable(step.ActionType, enemyCell, playerCell, playerDirection, facingDirection) == true then
+			local skillReady = step.TileId == nil or step.TileId == ""
+				or context.SkillReadyById == nil or context.SkillReadyById[step.TileId] ~= false
+			if skillReady and self:IsConditionSatisfied(context, step, distance) == true
+				and self:IsActionApplicable(context, step.ActionType, step.ConditionType, enemyCell, playerCell, playerDirection, facingDirection) == true then
 				return self:CreateIntentFromStep(context, step, playerDirection, facingDirection, #steps)
 			end
 			visited[currentStepIndex] = true
@@ -73,11 +75,172 @@ script EnemyIntentResolverLogic extends Logic
 		return intent
 	end
 
+	@ExecSpace("ServerOnly")
+	method boolean IsAllyInAttackLine(table context, table skillDefinition, table targetCells, integer enemyCell, integer playerCell)
+		-- Enemies never start an attack that would land on a living ally first; committed attacks may still hit one.
+		local allyCells = context.AllyCells
+		if allyCells == nil or context.EnemyIsBoss == true then return false end
+		if skillDefinition.TargetingType == "FIRST_ENEMY_FORWARD" or skillDefinition.TargetingType == "FIRST_ENEMY_PIERCE" then
+			local step = playerCell > enemyCell and 1 or -1
+			for cell = enemyCell + step, playerCell - step, step do
+				if allyCells[cell] == true then return true end
+			end
+			return false
+		end
+		for _, cell in ipairs(targetCells) do
+			if allyCells[cell] == true then return true end
+		end
+		return false
+	end
+
+	method table BlockForAlly(table result)
+		-- Holds the loaded attack and waits instead of firing through an ally.
+		result.Reason = "ALLY_IN_LINE"
+		result.Readiness = "BLOCKED"
+		result.NextCommandType = "WAIT"
+		result.TargetCellSnapshot = ""
+		return result
+	end
+
+	method table ResolveQueuedAttackReadiness(table context, table skillDefinition)
+		-- Reuses the existing tactical direction resolver while SkillTargetResolver remains the only owner of range offsets.
+		local result = {
+			Success = false,
+			Reason = "INVALID_QUEUED_ATTACK_CONTEXT",
+			Readiness = "BLOCKED",
+			NextCommandType = "WAIT",
+			Direction = 0,
+			TargetCellSnapshot = ""
+		}
+		if context == nil or skillDefinition == nil then
+			return result
+		end
+		local enemyCell = math.floor(tonumber(context.EnemyCellIndex) or -1)
+		local playerCell = math.floor(tonumber(context.PlayerCellIndex) or -1)
+		if enemyCell < 0 or playerCell < 0 or enemyCell == playerCell then
+			result.Reason = "INVALID_RELATIVE_CELLS"
+			return result
+		end
+
+		local directions = self:ResolveRelativeDirections(enemyCell, context.EnemyFacing, playerCell)
+		local offsets = _SkillTargetResolverLogic:BuildOffsets(skillDefinition.TargetingType, skillDefinition.Range, skillDefinition.TargetOffsets)
+		if offsets.Success == false then
+			result.Reason = offsets.Reason
+			return result
+		end
+		local targetCells = {}
+		for _, offset in ipairs(offsets.Values) do
+			table.insert(targetCells, enemyCell + directions.FacingDirection * offset)
+		end
+		result.TargetCellSnapshot = self:SerializeIntegers(targetCells)
+		result.Direction = directions.PlayerDirection
+		result.Success = true
+		if skillDefinition.TargetingType == "BOARD_PARITY" then
+			-- A board-wide parity strike covers the player from anywhere, so it never turns or approaches first.
+			result.Reason = "READY"
+			result.Readiness = "READY"
+			result.NextCommandType = "EXECUTE_TILE"
+			return result
+		end
+
+		-- Offsets are relative to the facing, so a negative RANGE_OFFSETS entry already covers the player
+		-- behind the enemy; turning first would waste a turn and move the pattern off the player.
+		local signedOffset = (playerCell - enemyCell) * directions.FacingDirection
+		for _, offset in ipairs(offsets.Values) do
+			if offset == signedOffset then
+				if self:IsAllyInAttackLine(context, skillDefinition, targetCells, enemyCell, playerCell) then
+					return self:BlockForAlly(result)
+				end
+				result.Reason = "READY"
+				result.Readiness = "READY"
+				result.NextCommandType = "EXECUTE_TILE"
+				return result
+			end
+		end
+
+		if directions.FacingDirection ~= directions.PlayerDirection then
+			result.Reason = "NEEDS_TURN"
+			result.Readiness = "NEEDS_TURN"
+			result.NextCommandType = "TURN_TO_PLAYER"
+			result.TargetCellSnapshot = ""
+			return result
+		end
+
+		local distance = math.abs(playerCell - enemyCell)
+		local playerInTargetOffsets = skillDefinition.TargetingType == "SELF"
+		for _, offset in ipairs(offsets.Values) do
+			if offset == distance then
+				playerInTargetOffsets = true
+				break
+			end
+		end
+		if playerInTargetOffsets then
+			if self:IsAllyInAttackLine(context, skillDefinition, targetCells, enemyCell, playerCell) then
+				return self:BlockForAlly(result)
+			end
+			result.Reason = "READY"
+			result.Readiness = "READY"
+			result.NextCommandType = "EXECUTE_TILE"
+			return result
+		end
+
+		if context.TowardPlayerCellFree == true then
+			result.Reason = "NEEDS_MOVE"
+			result.Readiness = "NEEDS_MOVE"
+			result.NextCommandType = "MOVE_TOWARD"
+			result.TargetCellSnapshot = ""
+			return result
+		end
+
+		result.Reason = "BLOCKED"
+		result.Readiness = "BLOCKED"
+		result.NextCommandType = "WAIT"
+		result.TargetCellSnapshot = ""
+		return result
+	end
+
+	method table ResolveTrackingCommand(table context, string commandType)
+		-- Retarget only a non-damaging tracking command. Never promote it to an unannounced attack.
+		local result = { ActionType = commandType, Direction = 0, Reason = "TRACKING_COMMAND_PRESERVED" }
+		if commandType ~= "TURN_TO_PLAYER" and commandType ~= "MOVE_TOWARD" then
+			return result
+		end
+		if context == nil or context.EnemyCellIndex == nil or context.PlayerCellIndex == nil
+			or context.EnemyCellIndex == context.PlayerCellIndex then
+			result.ActionType = "WAIT"
+			result.Reason = "TRACKING_TARGET_UNAVAILABLE"
+			return result
+		end
+		local relative = self:ResolveRelativeDirections(context.EnemyCellIndex, context.EnemyFacing, context.PlayerCellIndex)
+		if relative.PlayerDirection ~= relative.FacingDirection then
+			result.ActionType = "TURN_TO_PLAYER"
+			result.Direction = relative.PlayerDirection
+			result.Reason = "TRACKING_NEEDS_TURN"
+		elseif commandType == "TURN_TO_PLAYER" then
+			result.ActionType = "WAIT"
+			result.Reason = "TRACKING_ALREADY_FACING"
+		else
+			result.Direction = relative.PlayerDirection
+			result.Reason = "TRACKING_MOVE_TOWARD"
+		end
+		return result
+	end
+
+	method table ResolveRelativeDirections(integer enemyCell, string enemyFacing, integer playerCell)
+		local playerDirection = playerCell >= enemyCell and 1 or -1
+		local facingDirection = enemyFacing == "Right" and 1 or -1
+		return { PlayerDirection = playerDirection, FacingDirection = facingDirection }
+	end
+
 	method boolean IsConditionSatisfied(table context, table step, integer distance)
 		if step.ConditionType == "ALWAYS" then
 			return true
+		elseif step.ConditionType == "SUMMON_READY" then
+			return context.SummonReady == true
 		elseif step.ConditionType == "DISTANCE_EQ" then
 			return distance == math.floor(tonumber(step.ParamA) or -1)
+		elseif step.ConditionType == "DISTANCE_LE" then
+			return distance <= math.floor(tonumber(step.ParamA) or -1)
 		elseif step.ConditionType == "HP_RATIO_LE" then
 			local maxHp = tonumber(context.EnemyMaxHp) or 0
 			if maxHp <= 0 then
@@ -95,12 +258,17 @@ script EnemyIntentResolverLogic extends Logic
 		return false
 	end
 
-	method boolean IsActionApplicable(string actionType, integer enemyCell, integer playerCell, integer playerDirection, integer facingDirection)
+	method boolean IsActionApplicable(table context, string actionType, string conditionType, integer enemyCell, integer playerCell, integer playerDirection, integer facingDirection)
 		-- Action applicability prevents no-op TURN rows and attacks through the enemy's back side.
 		if actionType == "TURN_TO_PLAYER" then
 			return facingDirection ~= playerDirection
 		elseif actionType == "EXECUTE_TILE" then
-			return playerCell == enemyCell + facingDirection
+			-- ALWAYS opts into the range-aware queued cycle; legacy distance-gated patterns keep their old facing branch.
+			return conditionType == "ALWAYS" or facingDirection == playerDirection
+		elseif actionType == "BOSS_JUMP_TELEGRAPH" then
+			return context.EnemyIsBoss == true and context.EnemyIsAirborne ~= true
+		elseif actionType == "BOSS_LAND_OPPOSITE" then
+			return context.EnemyIsBoss == true and context.EnemyIsAirborne == true
 		end
 		return true
 	end
@@ -111,11 +279,11 @@ script EnemyIntentResolverLogic extends Logic
 			direction = playerDirection
 		elseif step.ActionType == "MOVE_AWAY" then
 			direction = -playerDirection
-		elseif step.ActionType == "MOVE_FIXED_FACING" then
+		elseif step.ActionType == "MOVE_FIXED_FACING" or step.ActionType == "CHARGE_FORWARD" then
 			direction = facingDirection
 		end
 		local telegraphTurnsRemaining = 0
-		if step.ActionType == "TELEGRAPH_TILE" then
+		if step.ActionType == "TELEGRAPH_TILE" or step.ActionType == "CHARGE_FORWARD" then
 			telegraphTurnsRemaining = math.floor(tonumber(context.TelegraphTurnsRemaining) or 0)
 			if telegraphTurnsRemaining <= 0 then
 				telegraphTurnsRemaining = math.max(1, math.floor(tonumber(step.TelegraphTurns) or 0))
@@ -144,6 +312,14 @@ script EnemyIntentResolverLogic extends Logic
 			PatternStepCount = 0,
 			TelegraphTurnsRemaining = 0
 		}
+	end
+
+	method string SerializeIntegers(table values)
+		local parts = {}
+		for _, value in ipairs(values or {}) do
+			table.insert(parts, tostring(math.floor(value)))
+		end
+		return table.concat(parts, "|")
 	end
 
 end

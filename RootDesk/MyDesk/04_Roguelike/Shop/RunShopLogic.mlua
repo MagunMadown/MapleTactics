@@ -1,5 +1,5 @@
 @Logic
-script RunShopLogic
+script RunShopLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method any GetOrCreateShopState(Entity playerEntity)
@@ -14,7 +14,22 @@ script RunShopLogic
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ResetPlayerShopState(Entity playerEntity, integer runSequence)
+		-- Reset the visit and capture immutable relic definitions at the new-run boundary.
+		local shopState = self:GetOrCreateShopState(playerEntity)
+		if shopState == nil then
+			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
+		end
+		local relics = self:GetOrCreateRelicEffects(playerEntity)
+		if relics == nil then return { Success = false, Reason = "RUN_RELIC_STATE_UNAVAILABLE" } end
+		local captured = relics:CaptureForRun(runSequence)
+		if captured.Success == false then return captured end
+		return shopState:ResetForRun(runSequence)
+	end
+
+	@ExecSpace("ServerOnly")
 	method table OpenShop(Entity playerEntity, string shopId)
+		-- Keep an existing visit or draw up to three distinct unowned relics with shared rarity weights.
 		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
 		local shopState = self:GetOrCreateShopState(playerEntity)
 		if runState == nil or shopState == nil then
@@ -24,33 +39,215 @@ script RunShopLogic
 			or runState.SelectedContentType ~= "SHOP" or runState.SelectedContentId ~= shopId then
 			return { Success = false, Reason = "SHOP_TRANSITION_NOT_READY" }
 		end
-		local validation = _ContentValidatorLogic:ValidateShopById(shopId)
-		if validation.Success == false then
-			return validation
+		if shopState.ActiveRunSequence == runState.RunSequence and shopState.VisitKey == runState.LastContentSelectionKey
+			and shopState.ActiveShopId == shopId and shopState.ActiveNodeId == runState.SelectedNodeId then
+			return shopState:GetSnapshot()
 		end
-		local bundle = validation.Data
-		local offerParts = {}
+		local relics = self:GetOrCreateRelicEffects(playerEntity)
+		local inventory = _RunManagerLogic:GetOrCreateRunInventory(playerEntity)
+		if relics == nil or not relics.IsInitialized or relics.ActiveRunSequence ~= runState.RunSequence
+			or inventory == nil or inventory.ActiveRunSequence ~= runState.RunSequence then
+			return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" }
+		end
+		local bundle = relics.ShopBundle
+		if bundle.Definition.ShopId ~= shopId then return { Success = false, Reason = "INVALID_SHOP_ID" } end
+		local nextVisit = shopState.ActiveRunSequence == runState.RunSequence and shopState.VisitSequence + 1 or 1
+		local potions = self:BuildPotionOffers(shopId, runState.RunSequence, nextVisit)
+		if not potions.Success then return potions end
+		local candidates = {}
 		for _, entry in ipairs(bundle.Entries) do
-			table.insert(offerParts, entry.ShopEntryId .. "~" .. entry.DisplayName .. "~" .. entry.RewardType .. "~" .. entry.RewardRefId .. "~" .. tostring(entry.RewardAmount) .. "~" .. entry.PriceCurrencyId .. "~" .. tostring(entry.PriceAmount) .. "~" .. tostring(entry.DisplayOrder))
+			if relics:CanAcquireRelic(entry.RewardRefId) and not shopState:IsOfferPurchased(entry.ShopEntryId) then
+				table.insert(candidates, entry)
+			end
 		end
-		return shopState:Open(runState.RunSequence, shopId, runState.LastContentSelectionKey, table.concat(offerParts, "|"))
+		table.sort(candidates, function(left, right) return left.ShopEntryId < right.ShopEntryId end)
+		local relicIds = {}
+		for _, entry in ipairs(candidates) do table.insert(relicIds, entry.RewardRefId) end
+		local snapshot = ""
+		local offeredEntries = {}
+		local firstOffered = nil
+		for slot = 1, math.min(3, #candidates) do
+			local index = relics:SelectRelicIndex(relicIds)
+			if index <= 0 then return { Success = false, Reason = "INVALID_RELIC_OFFER_POOL" } end
+			local offered = candidates[index]
+			if firstOffered == nil then firstOffered = offered end
+			offeredEntries[offered.ShopEntryId] = offered
+			local definition = relics.Definitions[offered.RewardRefId]
+			local row = table.concat({ offered.ShopEntryId, definition.DisplayName, offered.RewardType, offered.RewardRefId,
+				tostring(offered.RewardAmount), offered.PriceCurrencyId, tostring(offered.PriceAmount), tostring(offered.DisplayOrder),
+				offered.IconImageRUID, offered.ItemCategory, tostring(definition.AttackBonus), tostring(definition.MaxHpBonus),
+				tostring(definition.DefenseBonus), definition.EffectDescription }, "~")
+			snapshot = snapshot == "" and row or snapshot .. "|" .. row
+			table.remove(candidates, index)
+			table.remove(relicIds, index)
+		end
+		for _, entry in ipairs(potions.Entries) do
+			offeredEntries[entry.ShopEntryId] = entry
+			local row = table.concat({ entry.ShopEntryId, entry.DisplayName, entry.RewardType, entry.RewardRefId,
+				"1", entry.PriceCurrencyId, tostring(entry.PriceAmount), tostring(entry.DisplayOrder), entry.IconImageRUID,
+				"물약", "0", "0", "0", entry.EffectDescription }, "~")
+			snapshot = snapshot == "" and row or snapshot .. "|" .. row
+		end
+		local opened = shopState:Open(runState.RunSequence, shopId, runState.SelectedNodeId, bundle.Definition.DisplayName, runState.LastContentSelectionKey, snapshot)
+		if opened.Success then
+			if playerEntity.PlayerControllerComponent ~= nil then
+				playerEntity.PlayerControllerComponent.LookDirectionX = 1
+			end
+			shopState.OfferedEntry = firstOffered or {}
+			shopState.OfferedEntries = offeredEntries
+			self:CaptureSellCatalog(shopState, relics)
+			self:CaptureSkillSellCatalog(playerEntity, shopState)
+		end
+		return opened
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildPotionOffers(string shopId, integer runSequence, integer visitSequence)
+		-- Freeze three potion offers per visit; visit-specific IDs prevent replay and reopen restocking.
+		local entries = {}
+		for index, id in ipairs({ "red_potion", "orange_potion", "white_potion" }) do
+			local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(id)
+			if not definition.Success then return definition end
+			local price = _ConsumableDefinitionRepositoryLogic.ShopBasePrices[id] or 0
+			if price <= 0 then return { Success = false, Reason = "INVALID_POTION_PRICE" } end
+			local displayName, replacementCount = string.gsub(definition.DisplayName, "[~|]", " ")
+			local description, replacementCount = string.gsub(definition.Description, "[~|]", " ")
+			table.insert(entries, { Success = true, ShopId = shopId, ShopEntryId = "potion:" .. runSequence .. ":" .. visitSequence .. ":" .. id,
+				DisplayName = displayName, RewardType = "CONSUMABLE", RewardRefId = id, RewardAmount = 1,
+				PriceCurrencyId = "gold", PriceAmount = price, DisplayOrder = 100 + index,
+				IconImageRUID = definition.IconKey, EffectDescription = description })
+		end
+		return { Success = true, Entries = entries }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CaptureSellCatalog(any shopState, any relics)
+		-- Freeze validated names, art, and 70-percent prices for this visit; clients never submit a price.
+		local ids = { "red_potion", "orange_potion", "white_potion", "time_sand", "all_cure_potion" }
+		local rows = {}
+		shopState.SellCatalog = {}
+		shopState.SellItemTypes = {}
+		if relics ~= nil and relics.IsInitialized and relics.ActiveRunSequence == shopState.ActiveRunSequence then
+			local entries = {}
+			for _, entry in ipairs(relics.ShopBundle.Entries or {}) do table.insert(entries, entry) end
+			table.sort(entries, function(a, b) return a.DisplayOrder < b.DisplayOrder end)
+			for _, entry in ipairs(entries) do
+				local definition = relics.Definitions[entry.RewardRefId]
+				if definition ~= nil and entry.RewardType == "ITEM" and entry.PriceCurrencyId == "gold" then
+					local price = math.max(1, math.floor(entry.PriceAmount * 70 / 100 / math.max(1, entry.RewardAmount)))
+					shopState.SellCatalog[entry.RewardRefId] = price
+					shopState.SellItemTypes[entry.RewardRefId] = "ITEM"
+					local displayName, _ = string.gsub(definition.DisplayName, "[~|]", " ")
+					local description, _ = string.gsub(definition.EffectDescription, "[~|]", " ")
+					table.insert(rows, table.concat({entry.RewardRefId, displayName, entry.IconImageRUID, tostring(price), description, "ITEM"}, "~"))
+				end
+			end
+		end
+		for _, itemId in ipairs(ids) do
+			local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(itemId)
+			local basePrice = _ConsumableDefinitionRepositoryLogic.ShopBasePrices[itemId] or 0
+			local price = math.floor(basePrice * 70 / 100)
+			if definition.Success and price > 0 then
+				shopState.SellCatalog[itemId] = price
+				shopState.SellItemTypes[itemId] = "CONSUMABLE"
+				local displayName, _ = string.gsub(definition.DisplayName, "[~|]", " ")
+				local description, _ = string.gsub(definition.Description, "[~|]", " ")
+				table.insert(rows, table.concat({ itemId, displayName, definition.IconKey, tostring(price), description, "CONSUMABLE" }, "~"))
+			end
+		end
+		shopState.SellCatalogSnapshot = table.concat(rows, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SellItem(Entity playerEntity, string itemId, integer runSequence, integer visitSequence, integer expectedRevision)
+		-- Restrict a sale to the owning player's current ready shop visit and inventory revision.
+		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
+		local shopState = self:GetOrCreateShopState(playerEntity)
+		local inventory = _RunManagerLogic:GetOrCreateRunInventory(playerEntity)
+		if runState == nil or shopState == nil or inventory == nil then return { Success = false, Reason = "SHOP_NOT_OPEN" } end
+		if shopState.ShopState ~= "OPEN" or runSequence ~= runState.RunSequence or runSequence ~= shopState.ActiveRunSequence
+			or runSequence ~= inventory.ActiveRunSequence or visitSequence ~= shopState.VisitSequence
+			or runState.RunFlowState ~= "AWAITING_SHOP" or runState.SelectedContentType ~= "SHOP"
+			or runState.ContentTransitionState ~= "READY" or shopState.ActiveShopId ~= runState.SelectedContentId
+			or shopState.ActiveNodeId ~= runState.SelectedNodeId or shopState.VisitKey ~= runState.LastContentSelectionKey then
+			return { Success = false, Reason = "SHOP_NOT_OPEN" }
+		end
+		local price = shopState.SellCatalog[itemId]
+		if price == nil or price <= 0 then return { Success = false, Reason = "ITEM_NOT_SELLABLE" } end
+		local itemType = shopState.SellItemTypes[itemId]
+		local effects = nil
+		if itemType == "ITEM" then
+			effects = self:GetOrCreateRelicEffects(playerEntity)
+			if effects == nil or not effects.IsInitialized or effects.ActiveRunSequence ~= runSequence or effects.Definitions[itemId] == nil then
+				return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" }
+			end
+		end
+		local result = inventory:ApplyShopSale(itemId, itemType, price, expectedRevision)
+		if result.Success then shopState:RecordBuyback(itemId, itemType, result.Gold) end
+		if result.Success and effects ~= nil then effects:Recalculate() end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CaptureSkillSellCatalog(Entity player, any shopState)
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		local owner = _RunManagerLogic:GetOrCreateRunAugmentState(player)
+		if inventory == nil or owner == nil then return end
+		for _, id in ipairs(inventory:GetDistinctOwnedSkillIds()) do
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(id)
+			if definition.Success then
+				local price = (definition.SkillTier > 1 or #owner:GetSkillAugmentIds(id) > 0) and 40 or 20
+				shopState.SellCatalog[id] = price
+				shopState.SellItemTypes[id] = "SKILL"
+				local name, replacementCount = string.gsub(definition.DisplayName, "[~|]", " ")
+				local description = "판매 시 스킬과 증강 제거 / 이후 증강 선택에서 새 기본 스킬 선택 가능"
+				local row = table.concat({ id, name, _UpgradeSkillStageLogic:GetSkillIconRuid(definition), tostring(price), description, "SKILL" }, "~")
+				shopState.SellCatalogSnapshot = shopState.SellCatalogSnapshot == "" and row or shopState.SellCatalogSnapshot .. "|" .. row
+			end
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestSellItem(string itemId, integer runSequence, integer visitSequence, integer expectedRevision)
+		-- Resolve identity from the RPC sender rather than a client-supplied player.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:SellItem(playerEntity, itemId, runSequence, visitSequence, expectedRevision)
+		self:NotifySaleResult(result.Success, result.Reason, expectedRevision + 1, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void NotifySaleResult(boolean success, string reason, integer committedRevision)
+		-- Deliver transaction feedback without placing an RPC on the client-only UI entity.
+		local root = _EntityService:GetEntityByPath("/ui/RunShopUI")
+		local controller = isvalid(root) and root:GetComponent("script.RunShopUIComponent") or nil
+		if controller ~= nil then controller:HandleSaleResult(success, reason, committedRevision) end
 	end
 
 	@ExecSpace("ServerOnly")
 	method table PurchaseOffer(Entity playerEntity, string shopEntryId, integer requestId)
+		-- Accept only the displayed offer and make successful retries idempotent.
 		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
 		local shopState = self:GetOrCreateShopState(playerEntity)
 		if runState == nil or shopState == nil then
 			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
 		end
 		if requestId == nil or requestId <= 0 then
+			shopState:PublishPurchaseResult(shopEntryId, false, "INVALID_SHOP_PURCHASE_REQUEST")
 			return { Success = false, Reason = "INVALID_SHOP_PURCHASE_REQUEST" }
 		end
 		if shopState.ShopState ~= "OPEN" or shopState.ActiveRunSequence ~= runState.RunSequence
-			or shopState.ActiveShopId ~= runState.SelectedContentId or runState.RunFlowState ~= "AWAITING_SHOP" then
+			or shopState.ActiveShopId ~= runState.SelectedContentId or runState.RunFlowState ~= "AWAITING_SHOP"
+			or shopState.ActiveNodeId ~= runState.SelectedNodeId or shopState.VisitKey ~= runState.LastContentSelectionKey
+			or runState.ContentTransitionState ~= "READY" then
+			shopState:PublishPurchaseResult(shopEntryId, false, "SHOP_NOT_OPEN")
 			return { Success = false, Reason = "SHOP_NOT_OPEN" }
 		end
-		local requestKey = tostring(runState.RunSequence) .. ":" .. tostring(requestId)
+		local entry = shopState.OfferedEntries[shopEntryId]
+		if entry == nil then
+			shopState:PublishPurchaseResult(shopEntryId, false, "SHOP_OFFER_MISMATCH")
+			return { Success = false, Reason = "SHOP_OFFER_MISMATCH" }
+		end
+		local requestKey = tostring(runState.RunSequence) .. ":" .. tostring(shopState.VisitSequence) .. ":" .. tostring(requestId)
 		if shopState:IsPurchaseRequestApplied(requestKey) then
 			return { Success = true, Reason = "DUPLICATE_PURCHASE_REQUEST_IGNORED", ShopEntryId = shopEntryId, Revision = shopState.ShopRevision }
 		end
@@ -59,12 +256,11 @@ script RunShopLogic
 			shopState:PublishPurchaseResult(shopEntryId, true, "DUPLICATE_PURCHASE_IGNORED")
 			return { Success = true, Reason = "DUPLICATE_PURCHASE_IGNORED", ShopEntryId = shopEntryId, Revision = shopState.ShopRevision }
 		end
-		local entry = _ShopDefinitionRepositoryLogic:GetEntry(shopState.ActiveShopId, shopEntryId)
 		if entry.Success == false then
 			shopState:PublishPurchaseResult(shopEntryId, false, entry.Reason)
 			return entry
 		end
-		local purchaseKey = "shop:" .. tostring(runState.RunSequence) .. ":" .. tostring(shopState.VisitSequence) .. ":" .. shopEntryId
+		local purchaseKey = "shop:" .. tostring(runState.RunSequence) .. ":" .. shopEntryId
 		local purchase = _RunManagerLogic:ApplyRunShopPurchase(playerEntity, entry, purchaseKey)
 		if purchase.Success == false then
 			shopState:PublishPurchaseResult(shopEntryId, false, purchase.Reason)
@@ -113,6 +309,9 @@ script RunShopLogic
 		closed.RunState = flowResult.RunState
 		closed.NextNodeIds = flowResult.AvailableNodeIds
 		closed.CompletionKey = completionKey
+		if closed.RunState == "Completed" then
+			_StageTransitionManagerLogic:HandleCompletedRunTransition(playerEntity)
+		end
 		return closed
 	end
 
@@ -123,6 +322,20 @@ script RunShopLogic
 		if result.Success == false then
 			log_warning("[RunShop] open rejected user=" .. senderUserId .. " shop=" .. shopId .. " reason=" .. result.Reason)
 		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestOpenSelectedShop()
+		-- The client supplies no ShopId; the server opens only the route selected for this run.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
+		local shopId = runState == nil and "" or runState.SelectedContentId
+		local result = self:OpenShop(playerEntity, shopId)
+		if result.Success == false then
+			log_warning("[RunShop] selected open rejected user=" .. senderUserId .. " reason=" .. result.Reason)
+			return
+		end
+		log("[RunShop] selected open accepted user=" .. senderUserId .. " shop=" .. shopId)
 	end
 
 	@ExecSpace("Server")
@@ -140,16 +353,51 @@ script RunShopLogic
 	method void RequestCloseShop(integer requestId)
 		-- Lets the owning client finish or skip the active shop through the same completion path.
 		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
-		local result = self:CloseShop(playerEntity, requestId)
+		local visit = self:GetOrCreateShopState(playerEntity)
+		local run = _RunManagerLogic:GetOrCreateRunState(playerEntity)
+		local bossShop = visit ~= nil and run ~= nil and visit.ActiveRunSequence == run.RunSequence
+			and visit.ActiveNodeId == "shop_sleepywood_balrog"
+		if bossShop and (isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= "shop") then
+			self:NotifyCloseShopResult(false, "SHOP_MAP_REQUIRED", senderUserId)
+			return
+		end
+		local result = nil
+		if bossShop and visit.ShopState == "CLOSED" then
+			result = { Success = true, Reason = "RETRY_BOSS_DEPARTURE" }
+		else
+			result = self:CloseShop(playerEntity, requestId)
+		end
+		if result.Success and bossShop then
+			if run.AvailableNodeIds == "sleepywood_stage08_boss" then
+				result = _RunManagerLogic:SelectNextContent(playerEntity, "sleepywood_stage08_boss", 9000000 + run.RunFlowRevision)
+			end
+			if result.Success then
+				if run.SelectedNodeId ~= "sleepywood_stage08_boss" then
+					result = { Success = false, Reason = "BOSS_ROUTE_NOT_READY" }
+				else
+					result = _RunContentMapTransitionAdapterLogic:ConsumeSelectedBattle(playerEntity)
+				end
+			end
+			if result.Success then self:NotifyCloseShopResult(true, "BOSS_DEPARTED", senderUserId) end
+		end
 		if result.Success == false then
 			log_warning("[RunShop] close rejected user=" .. senderUserId .. " request=" .. requestId .. " reason=" .. result.Reason)
+			self:NotifyCloseShopResult(false, result.Reason, senderUserId)
 			return
 		end
 		log("[RunShop] close accepted user=" .. senderUserId .. " request=" .. requestId .. " state=" .. (result.RunFlowState or "") .. " reason=" .. result.Reason)
 	end
 
+	@ExecSpace("Client")
+	method void NotifyCloseShopResult(boolean success, string reason)
+		local exitEntity = _EntityService:GetEntityByPath("/ui/ShopDepartureUI/Controller")
+		local exitButton = isvalid(exitEntity) and exitEntity:GetComponent("script.ShopExitButtonComponent") or nil
+		if exitButton ~= nil then exitButton:HandleCloseResult(success, reason) end
+	end
+
 	@ExecSpace("ClientOnly")
 	method table GetLocalShopUiState()
+		-- Expose owner-synced display data without reading the server-only catalog.
 		local playerEntity = _UserService.LocalPlayer
 		if playerEntity == nil then
 			return { Success = false, Reason = "LOCAL_PLAYER_UNAVAILABLE" }
@@ -160,18 +408,30 @@ script RunShopLogic
 		if shopState == nil or inventory == nil or runState == nil then
 			return { Success = false, Reason = "RUN_SHOP_STATE_UNAVAILABLE" }
 		end
+		local hasAvailableOffer = false
+		for row in string.gmatch(shopState.OfferSnapshot, "([^|]+)") do
+			local offerId = string.match(row, "^([^~]+)~")
+			if offerId ~= nil and string.find("|" .. shopState.PurchasedOfferIds .. "|", "|" .. offerId .. "|", 1, true) == nil then hasAvailableOffer = true end
+		end
 		return {
 			Success = true,
 			Reason = shopState.ShopState == "CLOSED" and shopState.LastCloseReason or shopState.LastPurchaseReason,
 			RevisionKey = tostring(shopState.ShopRevision) .. ":" .. tostring(inventory.InventoryRevision) .. ":" .. tostring(inventory.SkillInventoryRevision) .. ":" .. tostring(runState.RunFlowRevision) .. ":" .. tostring(runState.ContentTransitionRevision),
 			ShopState = shopState.ShopState,
 			ShopId = shopState.ActiveShopId,
+			NodeId = shopState.ActiveNodeId,
+			ShopDisplayName = shopState.ShopDisplayName,
 			VisitSequence = shopState.VisitSequence,
+			RunSequence = shopState.ActiveRunSequence,
+			InventoryRevision = inventory.InventoryRevision,
+			SellCatalogSnapshot = shopState.SellCatalogSnapshot,
+			BuybackSnapshot = shopState.BuybackSnapshot,
 			OfferSnapshot = shopState.OfferSnapshot,
 			PurchasedOfferIds = shopState.PurchasedOfferIds,
 			CurrencySnapshot = inventory.RunCurrencySnapshot,
 			ConsumableSnapshot = inventory.RunConsumableSnapshot,
 			SkillSnapshot = inventory.RunSkillSnapshot,
+			ItemSnapshot = inventory.RunItemSnapshot,
 			LastPurchase = {
 				OfferId = shopState.LastPurchaseOfferId,
 				Success = shopState.LastPurchaseSuccess,
@@ -185,11 +445,63 @@ script RunShopLogic
 				LastCompletedContentId = runState.LastCompletedContentId
 			},
 			Commands = {
-				CanPurchase = shopState.ShopState == "OPEN",
+				CanOpenUi = runState.RunFlowState == "AWAITING_SHOP" and runState.SelectedContentType == "SHOP",
+				CanPurchase = shopState.ShopState == "OPEN" and hasAvailableOffer,
 				CanClose = shopState.ShopState == "OPEN",
 				CanSkip = shopState.ShopState == "OPEN"
 			}
 		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateRelicEffects(Entity playerEntity)
+		-- Attach run-owned effects using the existing runtime component pattern.
+		if not isvalid(playerEntity) or playerEntity.PlayerComponent == nil then return nil end
+		local effects = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if effects == nil then effects = playerEntity:AddComponent("PlayerRunRelicEffectComponent") end
+		return effects
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuybackItem(Entity player, string receiptId, integer runSequence, integer visitSequence, integer expectedRevision)
+		local run = _RunManagerLogic:GetOrCreateRunState(player)
+		local shop = self:GetOrCreateShopState(player)
+		local inventory = _RunManagerLogic:GetOrCreateRunInventory(player)
+		if run == nil or shop == nil or inventory == nil then return { Success = false, Reason = "SHOP_NOT_OPEN" } end
+		if shop.ShopState ~= "OPEN" or runSequence ~= run.RunSequence or runSequence ~= shop.ActiveRunSequence
+			or runSequence ~= inventory.ActiveRunSequence or visitSequence ~= shop.VisitSequence
+			or run.RunFlowState ~= "AWAITING_SHOP" or run.SelectedContentType ~= "SHOP"
+			or run.ContentTransitionState ~= "READY" or shop.ActiveShopId ~= run.SelectedContentId
+			or shop.ActiveNodeId ~= run.SelectedNodeId or shop.VisitKey ~= run.LastContentSelectionKey then
+			return { Success = false, Reason = "SHOP_NOT_OPEN" }
+		end
+		if inventory.InventoryRevision ~= expectedRevision then return { Success = false, Reason = "INVENTORY_CHANGED" } end
+		for index, entry in ipairs(shop.BuybackEntries) do
+			if entry.ShopEntryId == receiptId then
+				local result = _RunManagerLogic:ApplyRunShopPurchase(player, entry, receiptId)
+				if result.Success then
+					table.remove(shop.BuybackEntries, index)
+					shop:PublishBuybacks()
+					log("[RunShopBuyback] restored item=" .. entry.RewardRefId .. " price=" .. entry.PriceAmount .. " receipt=" .. receiptId)
+				end
+				return result
+			end
+		end
+		return { Success = false, Reason = "BUYBACK_NOT_AVAILABLE" }
+	end
+
+	@ExecSpace("Server")
+	method void RequestBuybackItem(string receiptId, integer runSequence, integer visitSequence, integer expectedRevision)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:BuybackItem(player, receiptId, runSequence, visitSequence, expectedRevision)
+		self:NotifyBuybackResult(result.Success, result.Reason, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyBuybackResult(boolean success, string reason)
+		local root = _EntityService:GetEntityByPath("/ui/RunShopUI")
+		local controller = isvalid(root) and root:GetComponent("script.RunShopUIComponent") or nil
+		if controller ~= nil then controller:HandleBuybackResult(success, reason) end
 	end
 
 end

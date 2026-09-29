@@ -6,17 +6,32 @@ script EnemyActionPlanComponent extends Component
 	@Sync property integer PlannedTurn = 0
 	@Sync property integer CurrentActionIndex = 0
 	@Sync property integer PlannedActionCount = 0
+	@Sync property integer QueueTurnsRequired = 0
+	@Sync property integer QueueTurnsElapsed = 0
+	@Sync property string ReadinessReason = ""
+	@Sync property string NextCommandType = ""
+	@Sync property integer NextCommandDirection = 0
+	@Sync property string TargetCellSnapshot = ""
 	@Sync property string PlannedActionSnapshot = ""
 	@Sync property string TraitIds = ""
 	@Sync property string PlanReason = ""
 	@Sync property integer PlanRevision = 0
+	@Sync property integer DeferredUntilTurn = 0
+	@Sync property string CastState = "NONE"
+	@Sync property string CastingSkillId = ""
+	@Sync property integer InterruptHitsRequired = 0
+	@Sync property integer InterruptHitsReceived = 0
+	@Sync property string LastInterruptHitKey = ""
 
 	property table PlannedActions = nil
+	property table PendingQueueActions = nil
+	property boolean QueueSkillsIndividually = false
 	property boolean AggregateSuccess = true
+	property boolean SpawnWaitPending = true
 
 	@ExecSpace("ServerOnly")
-	method table ReplacePlan(string ownerUnitId, table actions, integer plannedTurn, string traitIds, string reason)
-		-- One enemy owns one immutable round plan. The session coordinates plans but never owns their queues.
+	method table ReplacePlan(string ownerUnitId, table actions, integer plannedTurn, string traitIds, string reason, integer queueTurnsRequired)
+		-- Each enemy owns its plan; individually queued attacks remain pending until their insertion turn.
 		if ownerUnitId == nil or ownerUnitId == "" then
 			return { Success = false, Reason = "INVALID_OWNER_UNIT_ID" }
 		end
@@ -45,29 +60,69 @@ script EnemyActionPlanComponent extends Component
 			})
 		end
 
+		self.QueueTurnsRequired = math.max(0, math.floor(tonumber(queueTurnsRequired) or 0))
+		-- The boss jump's takeoff is its warning turn; landing spends the next turn.
+		-- Neither half inserts a separate queue turn.
+		local firstActionType = self.PlannedActions[1].ActionType
+		local isBossJumpAction = firstActionType == "BOSS_JUMP_TELEGRAPH" or firstActionType == "BOSS_LAND_OPPOSITE"
+		if isBossJumpAction then
+			self.QueueTurnsRequired = 0
+		elseif self.PlannedActions[1].TileId ~= "" then
+			self.QueueTurnsRequired = math.max(1, self.QueueTurnsRequired)
+		end
+		self.QueueTurnsElapsed = 0
+		self.PendingQueueActions = nil
+		self.QueueSkillsIndividually = self.PlannedActions[1].ActionType == "EXECUTE_TILE" and _EnemyTraitRouterLogic:HasTrait(traitIds, "DOUBLE_STRIKE")
+		if self.QueueSkillsIndividually then
+			self.QueueTurnsRequired = 2
+		end
+		-- QUICK skips one insertion turn, but never removes a dedicated telegraph/cast warning.
+		if self.PlannedActions[1].ActionType == "EXECUTE_TILE" and _EnemyTraitRouterLogic:HasTrait(traitIds, "QUICK") then
+			self.QueueTurnsRequired = math.max(0, self.QueueTurnsRequired - 1)
+			log("[EnemyActionPlan] quick insertion enemy=" .. ownerUnitId .. " turns=" .. self.QueueTurnsRequired)
+		end
 		self.PlanState = "PREPARED"
+		if self.PlannedActions[1].TileId ~= "" and self.QueueTurnsRequired > 0 then
+			self.PlanState = "INSERTING"
+		elseif self.PlannedActions[1].ActionType == "EXECUTE_TILE" then
+			self.PlanState = "TRACKING"
+		end
 		self.OwnerUnitId = ownerUnitId
 		self.PlannedTurn = math.max(0, plannedTurn)
 		self.CurrentActionIndex = 1
 		self.PlannedActionCount = #self.PlannedActions
 		self.TraitIds = traitIds or ""
 		self.PlanReason = reason or "PLANNED"
+		self.DeferredUntilTurn = 0
+		self.ReadinessReason = self.PlanState == "INSERTING" and "ATTACK_TILE_INSERTING" or ""
+		self.NextCommandType = self.PlanState == "INSERTING" and "QUEUE_TILE" or ""
+		self.NextCommandDirection = 0
+		self.TargetCellSnapshot = ""
 		self.AggregateSuccess = true
+		if self.QueueSkillsIndividually then
+			self.PendingQueueActions = self.PlannedActions
+			self.PlannedActions = {}
+			self.PlannedActionCount = 0
+		end
 		self.PlanRevision = self.PlanRevision + 1
 		self:PublishSnapshot()
-		log("[EnemyActionPlan] prepared enemy=" .. self.OwnerUnitId .. " turn=" .. self.PlannedTurn .. " actions=" .. self.PlannedActionCount .. " traits=" .. self.TraitIds .. " revision=" .. self.PlanRevision)
-		return { Success = true, Reason = "PLAN_PREPARED", ActionCount = self.PlannedActionCount, Revision = self.PlanRevision }
+		log("[EnemyActionPlan] prepared enemy=" .. self.OwnerUnitId .. " turn=" .. self.PlannedTurn .. " state=" .. self.PlanState .. " queue=" .. self.QueueTurnsElapsed .. "/" .. self.QueueTurnsRequired .. " actions=" .. self.PlannedActionCount .. " traits=" .. self.TraitIds .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = self.PlanState == "INSERTING" and "PLAN_INSERTING" or self.PlanState == "TRACKING" and "PLAN_TRACKING" or "PLAN_PREPARED", State = self.PlanState, ActionCount = self.PlannedActionCount, Revision = self.PlanRevision }
 	end
 
 	@ExecSpace("ServerOnly")
 	method table GetCurrentAction()
-		if self.PlanState ~= "PREPARED" and self.PlanState ~= "EXECUTING" then
+		-- During insertion the pending skill describes the command, but is not yet an owned queue item.
+		if self.PlanState ~= "INSERTING" and self.PlanState ~= "TRACKING" and self.PlanState ~= "ATTACK_READY" and self.PlanState ~= "PREPARED" and self.PlanState ~= "EXECUTING" then
 			return { Success = false, Reason = "PLAN_NOT_PREPARED" }
 		end
 		if self.PlannedActions == nil then
 			return { Success = false, Reason = "PLAN_RUNTIME_MISSING" }
 		end
 		local action = self.PlannedActions[self.CurrentActionIndex]
+		if self.PlanState == "INSERTING" and self.QueueSkillsIndividually and self.PendingQueueActions ~= nil then
+			action = self.PendingQueueActions[1]
+		end
 		if action == nil then
 			return { Success = false, Reason = "PLANNED_ACTION_MISSING" }
 		end
@@ -92,23 +147,139 @@ script EnemyActionPlanComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table AdvanceQueueTurn()
+		-- Insertion consumes a turn; individually queued skills become owned one at a time.
+		if self.PlanState ~= "INSERTING" then
+			return { Success = false, Reason = "PLAN_NOT_INSERTING", Ready = self.PlanState == "TRACKING" or self.PlanState == "ATTACK_READY" }
+		end
+		if self.QueueSkillsIndividually then
+			local pending = self.PendingQueueActions ~= nil and self.PendingQueueActions[1] or nil
+			if pending == nil or pending.ActionType ~= "EXECUTE_TILE" then
+				return { Success = false, Reason = "PENDING_QUEUE_ATTACK_MISSING", Ready = false }
+			end
+			table.insert(self.PlannedActions, table.remove(self.PendingQueueActions, 1))
+			self.PlannedActionCount = #self.PlannedActions
+		end
+		self.QueueTurnsElapsed = math.min(self.QueueTurnsRequired, self.QueueTurnsElapsed + 1)
+		local isReady = self.QueueTurnsElapsed >= self.QueueTurnsRequired
+		if isReady then
+			if self.QueueSkillsIndividually then
+				-- Recovery movement follows the entire cast and keeps its existing deferred-turn behavior.
+				for _, pending in ipairs(self.PendingQueueActions) do
+					table.insert(self.PlannedActions, pending)
+				end
+				self.PendingQueueActions = nil
+				self.PlannedActionCount = #self.PlannedActions
+			end
+			-- Directional telegraphs need the same turn/approach stage as attacks before warning cells commit.
+			local firstActionType = self.PlannedActions[1].ActionType
+			self.PlanState = (firstActionType == "EXECUTE_TILE" or firstActionType == "TELEGRAPH_TILE") and "TRACKING" or "PREPARED"
+			self.PlanReason = "ATTACK_TILE_QUEUED"
+			self.ReadinessReason = "READINESS_PENDING"
+			self.NextCommandType = ""
+			self.NextCommandDirection = 0
+			if self.PlannedActions[1].ActionType == "CHARGE_FORWARD" then
+				-- The insertion consumes this turn; charge the frozen warned line on the next turn.
+				-- Charges do not use melee tracking, which would replace their action or target cells.
+				self.PlanState = "ATTACK_READY"
+				self.PlanReason = "CHARGE_QUEUED"
+				self.ReadinessReason = "CHARGE_READY"
+				self.NextCommandType = "CHARGE_FORWARD"
+				self.NextCommandDirection = self.PlannedActions[1].Direction
+			end
+		else
+			self.PlanReason = "ATTACK_TILE_QUEUEING"
+			self.ReadinessReason = "ATTACK_TILE_INSERTING"
+			self.NextCommandType = "QUEUE_TILE"
+		end
+		self.PlanRevision = self.PlanRevision + 1
+		self:PublishSnapshot()
+		log("[EnemyActionPlan] queue advanced enemy=" .. self.OwnerUnitId .. " state=" .. self.PlanState .. " queue=" .. self.QueueTurnsElapsed .. "/" .. self.QueueTurnsRequired .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = self.PlanReason, Ready = isReady, QueueTurnsElapsed = self.QueueTurnsElapsed, QueueTurnsRequired = self.QueueTurnsRequired, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SetTrackingState(string readinessReason, string nextCommandType, integer nextCommandDirection, string targetCellSnapshot)
+		if self.PlanState ~= "TRACKING" then
+			return { Success = false, Reason = "PLAN_NOT_TRACKING" }
+		end
+		self.ReadinessReason = readinessReason or "TRACKING"
+		self.NextCommandType = nextCommandType or "WAIT"
+		self.NextCommandDirection = math.floor(tonumber(nextCommandDirection) or 0)
+		self.TargetCellSnapshot = targetCellSnapshot or ""
+		self.PlanReason = self.ReadinessReason
+		self.PlanRevision = self.PlanRevision + 1
+		self:PublishSnapshot()
+		log("[EnemyActionPlan] tracking enemy=" .. self.OwnerUnitId .. " readiness=" .. self.ReadinessReason .. " next=" .. self.NextCommandType .. " cells=" .. self.TargetCellSnapshot .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = self.ReadinessReason, State = self.PlanState, NextCommandType = self.NextCommandType, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table MarkAttackReady(string readinessReason, string targetCellSnapshot)
+		-- Commit the original action; a ready telegraph must remain a telegraph, not become an attack.
+		if self.PlanState ~= "TRACKING" then
+			return { Success = false, Reason = "PLAN_NOT_TRACKING" }
+		end
+		self.PlanState = "ATTACK_READY"
+		self.ReadinessReason = readinessReason or "READY"
+		self.NextCommandType = self.PlannedActions[self.CurrentActionIndex].ActionType
+		self.NextCommandDirection = 0
+		self.TargetCellSnapshot = targetCellSnapshot or ""
+		self.PlanReason = "ATTACK_READY"
+		self.PlanRevision = self.PlanRevision + 1
+		self:PublishSnapshot()
+		log("[EnemyActionPlan] attack ready enemy=" .. self.OwnerUnitId .. " tile=" .. (self.PlannedActions ~= nil and self.PlannedActions[1] ~= nil and self.PlannedActions[1].TileId or "") .. " cells=" .. self.TargetCellSnapshot .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = "ATTACK_READY", State = self.PlanState, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
 	method table TryBeginCurrentAction()
-		if self.PlanState ~= "PREPARED" then
+		-- QUICK may legitimately finish insertion at zero turns; keep ordinary skills gated.
+		if self.PlanState ~= "PREPARED" and self.PlanState ~= "ATTACK_READY" then
 			return { Success = false, Reason = "PLAN_NOT_PREPARED" }
 		end
 		local current = self:GetCurrentAction()
 		if current.Success == false then
 			return current
 		end
+		local instantQuickAttack = current.ActionType == "EXECUTE_TILE"
+			and self.QueueTurnsRequired == 0 and _EnemyTraitRouterLogic:HasTrait(self.TraitIds, "QUICK")
+		local bossJumpAction = current.ActionType == "BOSS_JUMP_TELEGRAPH" or current.ActionType == "BOSS_LAND_OPPOSITE"
+		if current.TileId ~= "" and not bossJumpAction and ((self.QueueTurnsRequired < 1 and not instantQuickAttack) or self.QueueTurnsElapsed < self.QueueTurnsRequired) then
+			return { Success = false, Reason = "SKILL_NOT_QUEUED" }
+		end
 		self.PlanState = "EXECUTING"
+		self.DeferredUntilTurn = 0
 		self.PlanRevision = self.PlanRevision + 1
 		return current
 	end
 
 	@ExecSpace("ServerOnly")
+	method table DeferCurrentActionUntilTurn(integer turnNumber, string reason)
+		-- Keeps the next action visible in the enemy-owned plan while preventing same-round execution.
+		if self.PlanState ~= "PREPARED" then
+			return { Success = false, Reason = "PLAN_NOT_PREPARED" }
+		end
+		local minimumTurn = self.PlannedTurn + 1
+		self.DeferredUntilTurn = math.max(minimumTurn, math.floor(tonumber(turnNumber) or minimumTurn))
+		self.PlanReason = reason or "ACTION_DEFERRED"
+		self.ReadinessReason = "WAITING_NEXT_ENEMY_TURN"
+		self.PlanRevision = self.PlanRevision + 1
+		self:PublishSnapshot()
+		log("[EnemyActionPlan] deferred enemy=" .. self.OwnerUnitId .. " action=" .. self.CurrentActionIndex .. "/" .. self.PlannedActionCount .. " untilTurn=" .. self.DeferredUntilTurn .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = self.PlanReason, DeferredUntilTurn = self.DeferredUntilTurn, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
 	method table CompleteCurrentAction(boolean success, string reason)
+		-- Consumes the one-time spawn wait only after its enemy turn actually completes.
 		if self.PlanState ~= "EXECUTING" then
 			return { Success = false, Reason = "PLAN_NOT_EXECUTING" }
+		end
+		local currentAction = self.PlannedActions[self.CurrentActionIndex]
+		if success == true and currentAction.ActionType == "WAIT" and currentAction.Reason == "SPAWN_WAIT" then
+			self.SpawnWaitPending = false
+			log("[EnemySpawnWait] completed enemy=" .. self.OwnerUnitId .. " turn=" .. self.PlannedTurn)
 		end
 		self.AggregateSuccess = self.AggregateSuccess and success
 		if self.CurrentActionIndex < self.PlannedActionCount then
@@ -127,7 +298,119 @@ script EnemyActionPlanComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table BeginInterruptibleCast(string skillId, integer requiredHits)
+		-- Starts a cast that survives the telegraph plan reset and can be interrupted by later player skills.
+		if skillId == nil or skillId == "" then
+			return { Success = false, Reason = "INVALID_CAST_SKILL_ID" }
+		end
+		self.CastState = "CASTING"
+		self.CastingSkillId = skillId
+		self.InterruptHitsRequired = math.max(1, math.floor(tonumber(requiredHits) or 1))
+		self.InterruptHitsReceived = 0
+		self.LastInterruptHitKey = ""
+		self.PlanRevision = self.PlanRevision + 1
+		log("[EnemyCast] started enemy=" .. self.OwnerUnitId .. " skill=" .. self.CastingSkillId .. " hits=0/" .. self.InterruptHitsRequired .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = "CAST_STARTED", CastState = self.CastState, RequiredHits = self.InterruptHitsRequired, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RegisterInterruptHit(string skillId, string hitKey)
+		-- Counts one successful player skill execution once, even when it owns multiple DAMAGE effect rows.
+		if self.CastState ~= "CASTING" then
+			return { Success = false, Reason = "CAST_NOT_ACTIVE", Interrupted = false }
+		end
+		if skillId == nil or skillId == "" or hitKey == nil or hitKey == "" then
+			return { Success = false, Reason = "INVALID_INTERRUPT_HIT", Interrupted = false }
+		end
+		if self.LastInterruptHitKey == hitKey then
+			return { Success = true, Reason = "INTERRUPT_HIT_DUPLICATE", Interrupted = false, HitsReceived = self.InterruptHitsReceived, RequiredHits = self.InterruptHitsRequired }
+		end
+		self.LastInterruptHitKey = hitKey
+		self.InterruptHitsReceived = math.min(self.InterruptHitsRequired, self.InterruptHitsReceived + 1)
+		if self.InterruptHitsReceived >= self.InterruptHitsRequired then
+			self.CastState = "INTERRUPTED"
+		end
+		self.PlanRevision = self.PlanRevision + 1
+		log("[EnemyCast] hit enemy=" .. self.OwnerUnitId .. " sourceSkill=" .. skillId .. " hits=" .. self.InterruptHitsReceived .. "/" .. self.InterruptHitsRequired .. " state=" .. self.CastState .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = self.CastState == "INTERRUPTED" and "CAST_INTERRUPTED" or "INTERRUPT_HIT_COUNTED", Interrupted = self.CastState == "INTERRUPTED", HitsReceived = self.InterruptHitsReceived, RequiredHits = self.InterruptHitsRequired, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConsumeInterruptibleCast(string skillId)
+		-- Lets the matching cast execute or reports its interruption, then clears the persistent cast state.
+		if self.CastState == "NONE" or self.CastingSkillId ~= skillId then
+			return { Success = true, Reason = "CAST_NOT_REQUIRED", CanExecute = true }
+		end
+		local wasInterrupted = self.CastState == "INTERRUPTED"
+		local hitsReceived = self.InterruptHitsReceived
+		local requiredHits = self.InterruptHitsRequired
+		self:ClearInterruptibleCast(wasInterrupted and "INTERRUPTED_CONSUMED" or "CAST_EXECUTED")
+		return { Success = true, Reason = wasInterrupted and "CAST_INTERRUPTED" or "CAST_COMPLETED", CanExecute = wasInterrupted == false, HitsReceived = hitsReceived, RequiredHits = requiredHits }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearInterruptibleCast(string reason)
+		-- Clears cast-only state without changing the currently prepared pattern action.
+		if self.CastState ~= "NONE" then
+			log("[EnemyCast] cleared enemy=" .. self.OwnerUnitId .. " skill=" .. self.CastingSkillId .. " state=" .. self.CastState .. " reason=" .. reason)
+		end
+		self.CastState = "NONE"
+		self.CastingSkillId = ""
+		self.InterruptHitsRequired = 0
+		self.InterruptHitsReceived = 0
+		self.LastInterruptHitKey = ""
+		self.PlanRevision = self.PlanRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method string CollectPendingAttackSkillIds()
+		-- Attack-shaped actions this enemy has queued but not executed yet, plus an active interruptible cast.
+		local skillIds = {}
+		local seen = {}
+		local sources = { self.PlannedActions, self.PendingQueueActions }
+		for _, actions in ipairs(sources) do
+			if actions ~= nil then
+				for actionIndex, action in ipairs(actions) do
+					local isPending = actions == self.PendingQueueActions or actionIndex >= self.CurrentActionIndex
+					local isAttack = action.ActionType == "EXECUTE_TILE" or action.ActionType == "CHARGE_FORWARD"
+						or action.ActionType == "TELEGRAPH_TILE" or action.ActionType == "CAST_INTERRUPTIBLE"
+						or action.ActionType == "BOSS_JUMP_TELEGRAPH" or action.ActionType == "BOSS_LAND_OPPOSITE"
+					if isPending and isAttack then
+						local skillId = action.TileId ~= "" and action.TileId or action.ActionType
+						if seen[skillId] ~= true then
+							seen[skillId] = true
+							table.insert(skillIds, skillId)
+						end
+					end
+				end
+			end
+		end
+		if self.CastState == "CASTING" and self.CastingSkillId ~= "" and seen[self.CastingSkillId] ~= true then
+			table.insert(skillIds, self.CastingSkillId)
+		end
+		return table.concat(skillIds, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CancelQueuedSkills(string reason)
+		-- Drops every queued attack and any active cast so the enemy must plan again from its pattern.
+		if self.PlanState == "EXECUTING" then
+			return { Success = false, Reason = "PLAN_EXECUTING", CancelledSkillIds = "" }
+		end
+		local cancelledSkillIds = self:CollectPendingAttackSkillIds()
+		if cancelledSkillIds == "" then
+			return { Success = false, Reason = "NO_QUEUED_SKILL", CancelledSkillIds = "" }
+		end
+		self:ClearInterruptibleCast(reason or "QUEUE_CANCELLED")
+		self:ResetPlan(reason or "QUEUE_CANCELLED")
+		self:PublishSnapshot()
+		log("[EnemyActionPlan] queue cancelled enemy=" .. self.OwnerUnitId .. " skills=" .. cancelledSkillIds .. " reason=" .. (reason or "") .. " revision=" .. self.PlanRevision)
+		return { Success = true, Reason = "QUEUE_CANCELLED", CancelledSkillIds = cancelledSkillIds, Revision = self.PlanRevision }
+	end
+
+	@ExecSpace("ServerOnly")
 	method void ResetPlan(string reason)
+		-- Discards both registered skills and pending insertions at the existing plan boundaries.
 		if self.PlanState ~= "EMPTY" then
 			log("[EnemyActionPlan] reset enemy=" .. self.OwnerUnitId .. " state=" .. self.PlanState .. " reason=" .. reason)
 		end
@@ -135,9 +418,18 @@ script EnemyActionPlanComponent extends Component
 		self.PlannedTurn = 0
 		self.CurrentActionIndex = 0
 		self.PlannedActionCount = 0
+		self.QueueTurnsRequired = 0
+		self.QueueTurnsElapsed = 0
+		self.ReadinessReason = ""
+		self.NextCommandType = ""
+		self.NextCommandDirection = 0
+		self.TargetCellSnapshot = ""
 		self.PlannedActionSnapshot = ""
 		self.PlanReason = reason or "RESET"
+		self.DeferredUntilTurn = 0
 		self.PlannedActions = nil
+		self.PendingQueueActions = nil
+		self.QueueSkillsIndividually = false
 		self.AggregateSuccess = true
 		self.PlanRevision = self.PlanRevision + 1
 	end
@@ -150,28 +442,42 @@ script EnemyActionPlanComponent extends Component
 			PlannedTurn = self.PlannedTurn,
 			CurrentActionIndex = self.CurrentActionIndex,
 			ActionCount = self.PlannedActionCount,
+			QueueTurnsRequired = self.QueueTurnsRequired,
+			QueueTurnsElapsed = self.QueueTurnsElapsed,
+			ReadinessReason = self.ReadinessReason,
+			NextCommandType = self.NextCommandType,
+			NextCommandDirection = self.NextCommandDirection,
+			TargetCellSnapshot = self.TargetCellSnapshot,
 			ActionSnapshot = self.PlannedActionSnapshot,
 			TraitIds = self.TraitIds,
 			Reason = self.PlanReason,
+			DeferredUntilTurn = self.DeferredUntilTurn,
 			Revision = self.PlanRevision,
-			AggregateSuccess = self.AggregateSuccess
+			AggregateSuccess = self.AggregateSuccess,
+			CastState = self.CastState,
+			CastingSkillId = self.CastingSkillId,
+			InterruptHitsRequired = self.InterruptHitsRequired,
+			InterruptHitsReceived = self.InterruptHitsReceived
 		}
 	end
 
 	@ExecSpace("ServerOnly")
 	method void PublishSnapshot()
+		-- Publish only registered, unconsumed entries for the incremental queue; retain legacy snapshots.
 		local entries = {}
 		if self.PlannedActions ~= nil then
 			for index, action in ipairs(self.PlannedActions) do
-				table.insert(entries, table.concat({
-					tostring(index),
-					action.ActionType,
-					action.TileId ~= "" and action.TileId or "-",
-					tostring(action.Direction),
-					tostring(action.TelegraphTurnsRemaining),
-					action.PatternId,
-					tostring(action.StepIndex)
-				}, "~"))
+				if not self.QueueSkillsIndividually or (index >= self.CurrentActionIndex and self.PlanState ~= "COMPLETED") then
+					table.insert(entries, table.concat({
+						tostring(index),
+						action.ActionType,
+						action.TileId ~= "" and action.TileId or "-",
+						tostring(action.Direction),
+						tostring(action.TelegraphTurnsRemaining),
+						action.PatternId,
+						tostring(action.StepIndex)
+					}, "~"))
+				end
 			end
 		end
 		self.PlannedActionSnapshot = table.concat(entries, ">")

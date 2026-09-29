@@ -14,13 +14,33 @@ script BattleWaveComponent extends Component
 	@Sync property integer MaxConcurrentEnemies = 1
 	@Sync property number CurrentClearSpawnDelay = 0
 	@Sync property integer PendingWaveNumber = 0
+	@Sync property integer CurrentWaveTriggerPhaseIndex = 0
 
+	@Sync property integer PendingSpawnCount = 0
+	@Sync property string SpawnProfile = "NORMAL"
+	@Sync property integer NextSpawnInTurns = 0
+	property table PendingSpawnDefinitions = {}
+	property integer PendingSpawnCursor = 1
+	property integer PendingBatchWave = 0
+	property string PendingSidePolicy = "BALANCED"
+	property integer LastSpawnStageTurn = -1
+	property integer LastBoundaryTurn = -1
+	property integer LoneEnemySinceTurn = -1
 	property integer WaveTimerId = 0
 	property integer ForceSpawnTimerId = 0
+	@Sync property integer SpawnVariantIndex = 0
+	property integer SpawnVariantSeed = 0
 
 	@ExecSpace("ServerOnly")
 	method void ResetWaveState(integer totalWaves, string reason)
+		-- Reset battle-owned variant state along with pending spawns and timers.
+		self.SpawnVariantIndex = 0
+		self.SpawnVariantSeed = 0
 		self:ClearAllTimers(reason)
+		self:CancelPendingSpawns(reason)
+		self.LastBoundaryTurn = -1
+		self.LastSpawnStageTurn = -1
+		self.LoneEnemySinceTurn = -1
 		self.CurrentWave = 0
 		self.TotalWaves = math.max(1, totalWaves)
 		self.WaveState = "Setup"
@@ -34,6 +54,7 @@ script BattleWaveComponent extends Component
 		self.MaxConcurrentEnemies = 1
 		self.CurrentClearSpawnDelay = 0
 		self.PendingWaveNumber = 0
+		self.CurrentWaveTriggerPhaseIndex = 0
 		log("[BattleWaveState] reset reason=" .. reason .. " total=" .. self.TotalWaves)
 	end
 
@@ -47,6 +68,20 @@ script BattleWaveComponent extends Component
 	method void SetWaveState(string state, string reason)
 		self.WaveState = state
 		log("[BattleWaveState] state=" .. state .. " wave=" .. self.CurrentWave .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ForceFinalWaveForPrototypeTest(string reason)
+		-- Test-only state transition owned by the wave component so Session snapshots cannot restore an earlier wave.
+		self:ClearAllTimers(reason)
+		self:CancelPendingSpawns(reason)
+		self.CurrentWave = self.TotalWaves
+		self.WaveState = "Active"
+		self.ForceSpawnPending = false
+		self.ForceSpawnPendingReason = ""
+		self.PendingWaveNumber = 0
+		log("[BattleWaveState] prototype final wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " reason=" .. reason)
+		return { Success = true, Reason = "PROTOTYPE_FINAL_WAVE", CurrentWave = self.CurrentWave }
 	end
 
 	@ExecSpace("ServerOnly")
@@ -74,8 +109,46 @@ script BattleWaveComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method void SetWaveTriggerPhaseIndex(integer phaseIndex, string reason)
+		-- Records which boss phase must be reached before the next wave is released.
+		-- Only meaningful while CurrentWaveSpawnMode is BOSS_PHASE; 0 disables the rule.
+		self.CurrentWaveTriggerPhaseIndex = math.max(0, phaseIndex)
+		if self.CurrentWaveTriggerPhaseIndex > 0 then
+			log("[BattleWaveState] phase trigger armed wave=" .. self.CurrentWave .. " phase=" .. self.CurrentWaveTriggerPhaseIndex .. " reason=" .. reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyBossPhaseTrigger(integer phaseIndex, string reason)
+		-- Queues the next wave when the boss reaches the configured phase. The spawn itself
+		-- still happens on the Session's turn boundary, so a phase flip mid-action never
+		-- injects enemies while another unit is resolving.
+		local result = { Success = true, Reason = "PHASE_TRIGGER_IGNORED", Pended = false }
+		if self.CurrentWaveSpawnMode ~= "BOSS_PHASE" then
+			return result
+		end
+		if self.CurrentWaveTriggerPhaseIndex <= 0 or phaseIndex < self.CurrentWaveTriggerPhaseIndex then
+			result.Reason = "PHASE_THRESHOLD_NOT_REACHED"
+			return result
+		end
+		if self.CurrentWave >= self.TotalWaves then
+			result.Reason = "NO_NEXT_WAVE"
+			return result
+		end
+		if self.ForceSpawnPending == true then
+			result.Reason = "SPAWN_ALREADY_PENDING"
+			return result
+		end
+		self:MarkSpawnPending(self.CurrentWave + 1, "BOSS_PHASE")
+		result.Reason = "BOSS_PHASE"
+		result.Pended = true
+		log("[BattleWaveState] phase trigger fired wave=" .. self.CurrentWave .. " phase=" .. phaseIndex .. " threshold=" .. self.CurrentWaveTriggerPhaseIndex .. " reason=" .. reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method void MarkWaveActive(string reason)
-		self.WaveState = "Active"
+		self.WaveState = self.PendingSpawnCount > 0 and "SpawnPending" or "Active"
 		log("[BattleWaveState] active wave=" .. self.CurrentWave .. " reason=" .. reason)
 	end
 
@@ -133,29 +206,6 @@ script BattleWaveComponent extends Component
 		end
 	end
 
-	@ExecSpace("ServerOnly")
-	method table EvaluateForcedSpawnAtTurnBoundary(integer stageTurn, boolean battleEnded)
-		local result = { Success = true, Reason = "NO_PENDING_WAVE", ShouldSpawn = false, WaveNumber = 0, PendingReason = "" }
-		if battleEnded == true or self.CurrentWave >= self.TotalWaves then
-			return result
-		end
-
-		if self.CurrentWaveSpawnMode == "TURN_LIMIT" or self.CurrentWaveSpawnMode == "TURN_OR_TIME" then
-			local elapsedTurns = stageTurn - self.WaveSpawnStageTurn
-			if self.ForceAfterTurns > 0 and elapsedTurns >= self.ForceAfterTurns then
-				self:MarkSpawnPending(self.CurrentWave + 1, "TURN_LIMIT")
-			end
-		end
-		if self.ForceSpawnPending == false then
-			return result
-		end
-
-		result.Reason = "PENDING_WAVE"
-		result.ShouldSpawn = true
-		result.WaveNumber = self.PendingWaveNumber
-		result.PendingReason = self.ForceSpawnPendingReason
-		return result
-	end
 
 	@ExecSpace("ServerOnly")
 	method void ScheduleWaveTransition(integer clearedWave, integer nextWave, number delaySeconds)
@@ -192,6 +242,312 @@ script BattleWaveComponent extends Component
 			self.ForceSpawnTimerId = 0
 			log("[BattleWaveState] force timer cleared reason=" .. reason)
 		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method Entity SpawnEnemy(any session, string side, integer startCell, string facing, integer spawnOrder, table spawnDefinition)
+		-- Spawns one enemy with a wave-unique name and UnitId, then registers its logical state.
+		if session.BattleResult ~= "" or self:GetAvailableSlots(session) < 1 or self:IsSpawnCellFree(session, startCell) == false then
+			log("[BattleSpawn] deferred side=" .. side .. " reason=CAPACITY_OR_CELL_UNAVAILABLE")
+			return nil
+		end
+
+		local unitId = "enemy_w" .. session.CurrentWave .. "_" .. side
+		local entityName = "BattleEnemy_W" .. session.CurrentWave .. "_" .. side
+		local position = session:GetCellPosition(startCell)
+		local enemy = _SpawnService:SpawnByModelId(
+			spawnDefinition.EnemyModelId,
+			entityName,
+			Vector3(position.x, position.y, 0),
+			session.Entity
+		)
+		if isvalid(enemy) == false then
+			log_error("[BattleWave] SpawnByModelId failed model=" .. spawnDefinition.EnemyModelId .. " unit=" .. unitId)
+			return nil
+		end
+
+		local resolvedFacing = facing
+		if spawnDefinition.InitialFacingPolicy == "FIXED_LEFT" then
+			resolvedFacing = "Left"
+		elseif spawnDefinition.InitialFacingPolicy == "FIXED_RIGHT" then
+			resolvedFacing = "Right"
+		end
+		local unitInitialization = session:InitializeUnitState(enemy, unitId, "Enemy", startCell, resolvedFacing, spawnDefinition.MaxHp, spawnOrder)
+		if unitInitialization.Success == false then
+			log_error("[BattleWave] enemy initialization failed unit=" .. unitId .. " reason=" .. unitInitialization.Reason)
+			_EntityService:Destroy(enemy)
+			return nil
+		end
+		local enemyUnit = enemy:GetComponent("script.BattleUnitComponent")
+		if enemyUnit ~= nil then
+			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, spawnDefinition.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.TraitIds or "", spawnDefinition.IsBoss == true, spawnDefinition.DisplayName or "")
+			if enemyConfiguration.Success == false then
+				log_error("[EnemyData] apply failed unit=" .. unitId .. " reason=" .. enemyConfiguration.Reason)
+				_EntityService:Destroy(enemy)
+				return nil
+			end
+			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " traits=" .. enemyUnit.EnemyTraitIds .. " boss=" .. tostring(enemyUnit.IsBoss) .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
+		end
+		if spawnDefinition.EnemyDefinitionId == "ellinia_faust" then
+			enemy:AddComponent("FaustSummonComponent")
+		end
+		local phaseState = enemy:GetComponent("script.BossPhaseStateComponent")
+		if phaseState ~= nil then
+			phaseState:ApplyPresentationOverrides(spawnDefinition)
+		else
+			session:ConfigureEnemyMovementPresentation(enemy, spawnDefinition)
+		end
+		-- Re-apply the logical cell after the resource-specific ground offset is configured.
+		session:PlaceEntity(enemy, position)
+		log("[EnemyGround] placed unit=" .. unitId .. " map=" .. session.Entity.Name
+			.. " boardY=" .. tostring(session.UnitY) .. " placedY=" .. tostring(enemy.TransformComponent.Position.y))
+		local registration = session:RegisterConfiguredUnit(enemy)
+		if registration.Success == false then
+			log_error("[BattleWave] enemy registration failed unit=" .. unitId .. " reason=" .. registration.Reason)
+			_EntityService:Destroy(enemy)
+			return nil
+		end
+		return enemy
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method void CancelPendingSpawns(string reason)
+		-- Discard battle-owned requests on reset, defeat or boss victory.
+		self.PendingSpawnDefinitions = {}
+		self.PendingSpawnCount = 0
+		self.PendingSpawnCursor = 1
+		self.PendingBatchWave = 0
+		self.NextSpawnInTurns = 0
+		self:ClearForcedSpawnSchedule(reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsSpawnCellFree(any session, integer cell)
+		-- Airborne actors still reserve their logical cells for spawn safety.
+		if session.BoardState == nil or session:IsValidCell(cell) == false then return false end
+		for _, entity in ipairs(session.BoardState:CollectRegisteredUnits()) do
+			local unit = entity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil and unit.IsDead == false and unit.CellIndex == cell then return false end
+		end
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer GetAvailableSlots(any session)
+		-- Every source, including boss skills, shares this cap and occupancy test.
+		if session.BoardState == nil or session.BattleResult ~= "" then return 0 end
+		local empty = 0
+		for cell = 0, session.CellCount - 1 do
+			if self:IsSpawnCellFree(session, cell) then empty = empty + 1 end
+		end
+		return math.max(0, math.min(empty, self.MaxConcurrentEnemies - #session.BoardState:CollectLivingEnemies()))
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer SelectSpawnCell(any session, string policy, integer ordinal)
+		-- Apply seeded variants only to ordinary balanced waves; explicit policies stay authoritative.
+		local playerEntity = session:FindUnitEntity("player_01")
+		local player = isvalid(playerEntity) and playerEntity:GetComponent("script.BattleUnitComponent") or nil
+		local playerCell = player ~= nil and player.CellIndex or session.PlayerStartCell
+		local selected = -1
+		local bestDistance = -1
+		if policy == "BALANCED" and session.StageType ~= "BOSS" and not session.SkillTestMode and self.SpawnVariantIndex > 0 then
+			return self:SelectVariantSpawnCell(session, playerCell, ordinal)
+		end
+		for offset = 0, session.CellCount - 1 do
+			local cell = ordinal % 2 == 0 and session.CellCount - 1 - offset or offset
+			if policy == "LEFT" then cell = offset end
+			if policy == "RIGHT" then cell = session.CellCount - 1 - offset end
+			if self:IsSpawnCellFree(session, cell) then
+				local distance = math.abs(cell - playerCell)
+				if policy ~= "FARTHEST" then
+					if session.StageType == "BOSS" or session.SkillTestMode or distance > 1 then return cell end
+				elseif distance > bestDistance then
+					selected = cell
+					bestDistance = distance
+				end
+			end
+		end
+		return selected
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer SelectVariantSpawnCell(any session, integer playerCell, integer ordinal)
+		-- A/B alternate opposite edges across waves; C deterministically distributes safe empty cells.
+		local fromRight = (self.CurrentWave + ordinal) % 2 ~= 0
+		if self.SpawnVariantIndex == 2 then fromRight = not fromRight end
+		local selected = -1
+		local bestScore = -1
+		for offset = 0, session.CellCount - 1 do
+			local cell = fromRight and session.CellCount - 1 - offset or offset
+			if math.abs(cell - playerCell) > 1 and self:IsSpawnCellFree(session, cell) then
+				if self.SpawnVariantIndex ~= 3 then return cell end
+				local key = tostring(self.CurrentWave) .. ":" .. tostring(ordinal) .. ":" .. tostring(cell)
+				local score = _StageWaveRepositoryLogic:GetSpawnHash(key, self.SpawnVariantSeed)
+				score = (score * 48271) % 2147483647
+				score = (score * 48271) % 2147483647
+				if score > bestScore then
+					selected = cell
+					bestScore = score
+				end
+			end
+		end
+		return selected
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SpawnWave(any session, integer waveNumber)
+		-- Freeze one finite batch and retain unsent members until a later safe boundary.
+		if session.BattleResult ~= "" or waveNumber < 1 or waveNumber > self.TotalWaves then return end
+		if self.PendingSpawnCount > 0 then
+			if waveNumber == self.PendingBatchWave then self:DrainPendingWave(session) end
+			return
+		end
+		if waveNumber ~= self.CurrentWave + 1 then return end
+		local useVariant = session.StageType ~= "BOSS" and not session.SkillTestMode
+		if waveNumber == 1 then
+			self.SpawnVariantIndex = 0
+			self.SpawnVariantSeed = 0
+			if useVariant then
+				self.SpawnVariantIndex = _StageWaveRepositoryLogic:GetSpawnVariantIndex(session.StageId, session.RunSeed)
+				self.SpawnVariantSeed = _StageWaveRepositoryLogic:GetSpawnVariantSeed(session.StageId, session.RunSeed)
+			end
+			log("[BattleSpawnVariant] stage=" .. session.StageId .. " runSeed=" .. session.RunSeed .. " variant=" .. self.SpawnVariantIndex .. " spawnSeed=" .. self.SpawnVariantSeed)
+		end
+		local definition = _StageWaveRepositoryLogic:GetWaveDefinition(session.WaveTableId, waveNumber, session.RunSeed)
+		if definition.Success == false then
+			self:SetWaveState("DataError", "WAVE_DEFINITION_ERROR")
+			session:PublishWaveStateSnapshot("WAVE_DEFINITION_ERROR")
+			return
+		end
+		local count = session.SkillTestMode and 1 or definition.SpawnCount
+		local roster = {}
+		for index = 1, count do
+			local enemy = nil
+			if useVariant then
+				enemy = _StageWaveRepositoryLogic:GetVariantEnemySpawnDefinition(definition.EnemyPoolId, waveNumber, index, self.SpawnVariantSeed)
+			else
+				enemy = _StageWaveRepositoryLogic:GetEnemySpawnDefinition(definition.EnemyPoolId, waveNumber, index, session.RunSeed)
+			end
+			if enemy.Success == false then
+				self:SetWaveState("DataError", "ENEMY_DEFINITION_ERROR")
+				session:PublishWaveStateSnapshot("ENEMY_DEFINITION_ERROR")
+				return
+			end
+			if session.SkillTestMode then enemy.MaxHp = math.max(1, session.SkillTestDummyMaxHp) end
+			table.insert(roster, enemy)
+		end
+		self:BeginWave(waveNumber, definition.SpawnTriggerMode, definition.ForceAfterTurns, definition.ForceAfterSeconds, count, definition.MaxConcurrent, definition.ClearSpawnDelaySeconds, math.max(1, session.StageTurnNumber))
+		self:SetWaveTriggerPhaseIndex(definition.TriggerPhaseIndex or 0, "WAVE_BEGIN")
+		self.SpawnProfile = session.StageType == "BOSS" and "BOSS" or (definition.SpawnTriggerMode == "LONE_ENEMY" and "NORMAL" or "PRESSURE")
+		self.PendingSpawnDefinitions = roster
+		self.PendingSpawnCursor = 1
+		self.PendingSpawnCount = count
+		self.PendingBatchWave = waveNumber
+		self.PendingSidePolicy = definition.SpawnSidePolicy
+		self.LoneEnemySinceTurn = -1
+		self:ClearWaveTransitionTimer("WAVE_BEGIN")
+		local first = roster[1]
+		session.EnemyModelId = first.EnemyModelId
+		session.CurrentEnemyDefinitionId = first.EnemyDefinitionId
+		session.CurrentEnemyMaxHp = first.MaxHp
+		session.CurrentEnemyBasicAttackDamage = first.BasicAttackDamage
+		session.CurrentEnemyPatternId = first.PatternId
+		session.CurrentEnemyMovementPolicy = first.MovementPolicy
+		if waveNumber == 1 then
+			session.TurnState:ResetTurnState(session.TileQueueCapacity, "FIRST_WAVE_SPAWN")
+			session:ClearPreparedEnemyIntent("FIRST_WAVE_SPAWN")
+		end
+		session:PublishWaveStateSnapshot("WAVE_BEGIN")
+		self:DrainPendingWave(session)
+		if waveNumber == 1 then session:TryStartBattle() end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DrainPendingWave(any session)
+		-- Only successful creations advance the cursor; no skipped enemies or rerolls.
+		if session.BattleResult ~= "" or self.PendingSpawnCount <= 0 then return end
+		session:CleanupDefeatedEnemies("BEFORE_REINFORCEMENT")
+		local budget = self:GetAvailableSlots(session)
+		if #session.BoardState:CollectLivingEnemies() > 0 and session.StageType ~= "BOSS" then budget = math.min(1, budget) end
+		local spawned = 0
+		while budget > 0 and self.PendingSpawnCount > 0 do
+			local index = self.PendingSpawnCursor
+			local cell = self:SelectSpawnCell(session, self.PendingSidePolicy, index)
+			if session.SkillTestMode then cell = session.SkillTestDummyCell end
+			if cell < 0 then break end
+			local playerEntity = session:FindUnitEntity("player_01")
+			local player = isvalid(playerEntity) and playerEntity:GetComponent("script.BattleUnitComponent") or nil
+			local playerCell = player ~= nil and player.CellIndex or session.PlayerStartCell
+			local enemy = self:SpawnEnemy(session, "wave_" .. tostring(index), cell, playerCell < cell and "Left" or "Right", self.CurrentWave * 100 + index, self.PendingSpawnDefinitions[index])
+			if isvalid(enemy) == false then
+				self:SetWaveState("SpawnFailed", "SPAWN_RETRY_REQUIRED")
+				break
+			end
+			if isvalid(session.EnemyEntity) == false then session.EnemyEntity = enemy end
+			log("[BattleSpawnVariant] spawned stage=" .. session.StageId .. " variant=" .. self.SpawnVariantIndex .. " wave=" .. self.CurrentWave .. " slot=" .. index .. " cell=" .. cell .. " enemy=" .. self.PendingSpawnDefinitions[index].EnemyDefinitionId)
+			self.PendingSpawnCursor = index + 1
+			self.PendingSpawnCount = self.PendingSpawnCount - 1
+			budget = budget - 1
+			spawned = spawned + 1
+		end
+		if spawned > 0 then
+			self.LastSpawnStageTurn = math.max(1, session.StageTurnNumber)
+			self.LoneEnemySinceTurn = #session.BoardState:CollectLivingEnemies() == 1 and math.max(1, session.StageTurnNumber) or -1
+		end
+		if self.PendingSpawnCount == 0 then
+			self.PendingSpawnDefinitions = {}
+			self.PendingBatchWave = 0
+			self.WaveSpawnStageTurn = math.max(1, session.StageTurnNumber)
+			self:ClearForcedSpawnSchedule("BATCH_COMPLETED")
+			self:MarkWaveActive("BATCH_COMPLETED")
+			session:ScheduleForcedSpawnTimer()
+		elseif self.WaveState ~= "SpawnFailed" then
+			self:MarkSpawnPending(self.CurrentWave, "CAPACITY_WAIT")
+		end
+		session:PublishWaveStateSnapshot("BATCH_DRAINED")
+		log("[BattleSpawn] wave=" .. self.CurrentWave .. " spawned=" .. spawned .. " pending=" .. self.PendingSpawnCount .. " cap=" .. self.MaxConcurrentEnemies .. " cells=" .. session.CellCount)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ProcessTurnBoundary(any session)
+		-- Deduplicate turn processing and preserve all surviving actors' prepared plans.
+		if session.SkillTestMode or session.BattleResult ~= "" or self.LastBoundaryTurn == session.StageTurnNumber then return end
+		self.LastBoundaryTurn = session.StageTurnNumber
+		if self.PendingSpawnCount > 0 then
+			if session.StageTurnNumber - self.LastSpawnStageTurn >= math.max(1, self.ForceAfterTurns) or #session.BoardState:CollectLivingEnemies() == 0 then self:DrainPendingWave(session) end
+		elseif self.CurrentWave < self.TotalWaves then
+			local living = #session.BoardState:CollectLivingEnemies()
+			local due = self.ForceSpawnPending
+			if session.StageType ~= "BOSS" then
+				if living <= 1 then
+					if self.LoneEnemySinceTurn < 0 then self.LoneEnemySinceTurn = session.StageTurnNumber end
+				else self.LoneEnemySinceTurn = -1 end
+				local elapsed = session.StageTurnNumber - self.WaveSpawnStageTurn
+				local interval = math.max(1, self.ForceAfterTurns)
+				if self.CurrentWaveSpawnMode == "LONE_ENEMY" then
+					due = living == 0 or (self.LoneEnemySinceTurn >= 0 and session.StageTurnNumber - self.LoneEnemySinceTurn >= interval)
+					self.NextSpawnInTurns = self.LoneEnemySinceTurn >= 0 and math.max(0, interval - (session.StageTurnNumber - self.LoneEnemySinceTurn)) or interval
+				elseif self.CurrentWaveSpawnMode == "TURN_LIMIT" or self.CurrentWaveSpawnMode == "TURN_OR_TIME" then
+					due = due or living == 0 or elapsed >= interval
+					self.NextSpawnInTurns = math.max(0, interval - elapsed)
+				end
+			end
+			if due then self:SpawnWave(session, self.CurrentWave + 1) end
+		else self.NextSpawnInTurns = 0 end
+		for _, enemy in ipairs(session.BoardState:CollectLivingEnemies()) do
+			local phase = enemy:GetComponent("script.BossPhaseStateComponent")
+			if phase ~= nil then phase:TrySpawnPhaseReinforcement(session) end
+		end
+		session:PublishWaveStateSnapshot("SPAWN_TURN_BOUNDARY")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- A wave controller is scoped to its battle map, including every deferred spawn.
+		self:ClearAllTimers("END_PLAY")
+		self:CancelPendingSpawns("END_PLAY")
 	end
 
 end

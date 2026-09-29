@@ -1,0 +1,172 @@
+@Logic
+script MonsterCodexProvider extends Logic
+
+	@Sync property string EntrySnapshot = ""
+	property string DataSetName = "EnemyDefinitions"
+	property string DefaultIconRuid = "a95cfed2c8fe4d2cb64cbb62db051f92"
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Loads the server-only enemy table and publishes the public codex fields.
+		self:RefreshFromSource()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshFromSource()
+		-- Keeps table order and uses JSON so names containing delimiters remain intact.
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		local records = {}
+		local membership = self:BuildRegionMembership()
+		if dataSet == nil then
+			self.EntrySnapshot = ""
+			log_warning("[MonsterCodexProvider] dataset missing name=" .. self.DataSetName)
+			return
+		end
+		for rowIndex = 1, dataSet:GetRowCount() do
+			local id = dataSet:GetCell(rowIndex, "EnemyDefinitionId") or ""
+			if id ~= "" and membership[id] ~= nil then
+				local displayName = dataSet:GetCell(rowIndex, "DisplayName") or ""
+				if displayName == "" then displayName = id end
+				local bossValue = string.lower(dataSet:GetCell(rowIndex, "IsBoss") or "")
+				local isBoss = bossValue == "true" or bossValue == "1" or bossValue == "yes"
+				local typeLabel = isBoss and "보스 몬스터" or "일반 몬스터"
+				local maxHp = math.max(1, tonumber(dataSet:GetCell(rowIndex, "MaxHp")) or 1)
+				local attack = math.max(0, tonumber(dataSet:GetCell(rowIndex, "BasicAttackDamage")) or 0)
+				local icon = self:GetIconRuid(dataSet:GetCell(rowIndex, "IdleMotionRuid") or "", dataSet:GetCell(rowIndex, "MoveMotionRuid") or "")
+				table.insert(records, {
+					Id = id,
+					Category = "Monster",
+					ContinentId = "victoria",
+					RegionIds = membership[id],
+					IsBoss = isBoss,
+					DisplayName = displayName,
+					Icon = icon,
+					Description = displayName .. "은(는) 모험 중 만날 수 있는 " .. typeLabel .. "입니다.",
+					TypeLabel = typeLabel,
+					MetaPrimaryLabel = "기본 체력",
+					MetaPrimaryValue = tostring(maxHp),
+					MetaSecondaryLabel = "기본 공격력",
+					MetaSecondaryValue = tostring(attack),
+					-- Private discovery is joined on the receiving client.
+					IsDiscovered = false
+				})
+			end
+		end
+		self.EntrySnapshot = _HttpService:JSONEncode({ Entries = records, Regions = self:ReadRegions() })
+		log("[MonsterCodexProvider] refreshed source=" .. self.DataSetName .. " count=" .. tostring(#records))
+	end
+
+	method table GetVictoriaRegions()
+		-- Navigation and entries travel in one snapshot, including newly enabled regions.
+		if self.EntrySnapshot == "" then return {} end
+		return _HttpService:JSONDecode(self.EntrySnapshot).Regions or {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ReadRegions()
+		-- RegionDefinitions owns membership, ordering and labels; no region whitelist.
+		local dataSet = _DataService:GetTable("RegionDefinitions")
+		local regions = {}
+		if dataSet == nil then return regions end
+		for i = 1, dataSet:GetRowCount() do
+			local id = dataSet:GetCell(i, "RegionId") or ""
+			local flag = string.lower(dataSet:GetCell(i, "Enabled") or "")
+			if id ~= "" and (flag == "true" or flag == "1" or flag == "yes") then
+				local label = dataSet:GetCell(i, "DisplayName") or ""
+				-- Compatibility with the first region's original placeholder name.
+				if id == "henesys" and label == "Region 1" then label = "헤네시스" end
+				if label == "" then label = id end
+				table.insert(regions, { Id = id, DisplayName = label, Order = tonumber(dataSet:GetCell(i, "RegionOrder")) or i })
+			end
+		end
+		table.sort(regions, function(a, b) if a.Order == b.Order then return a.Id < b.Id end return a.Order < b.Order end)
+		return regions
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildRegionMembership()
+		-- Joins enabled regions to stage waves and eligible spawn rows; never guesses from IDs.
+		local regions = _DataService:GetTable("RegionDefinitions")
+		local stages = _DataService:GetTable("StageDefinitions")
+		local waves = _DataService:GetTable("StageEnemyWaves")
+		local pools = _DataService:GetTable("EnemySpawnPools")
+		if regions == nil or stages == nil or waves == nil or pools == nil then
+			log_warning("[MonsterCodexProvider] region source missing")
+			return {}
+		end
+		local enabled = {}
+		for i = 1, regions:GetRowCount() do
+			local flag = string.lower(regions:GetCell(i, "Enabled") or "")
+			local id = regions:GetCell(i, "RegionId") or ""
+			if id ~= "" and (flag == "true" or flag == "1" or flag == "yes") then enabled[id] = true end
+		end
+		local wavesByTable = {}
+		for i = 1, waves:GetRowCount() do
+			local key = waves:GetCell(i, "WaveTableId") or ""
+			if wavesByTable[key] == nil then wavesByTable[key] = {} end
+			table.insert(wavesByTable[key], {
+				PoolId = waves:GetCell(i, "EnemyPoolId") or "",
+				Index = tonumber(waves:GetCell(i, "WaveIndex")) or 0
+			})
+		end
+		local enemiesByPool = {}
+		for i = 1, pools:GetRowCount() do
+			local key = pools:GetCell(i, "PoolId") or ""
+			if enemiesByPool[key] == nil then enemiesByPool[key] = {} end
+			table.insert(enemiesByPool[key], {
+				Id = pools:GetCell(i, "EnemyDefinitionId") or "",
+				ModelId = pools:GetCell(i, "EnemyModelId") or "",
+				Weight = math.floor(tonumber(pools:GetCell(i, "Weight")) or 0),
+				Min = math.floor(tonumber(pools:GetCell(i, "MinWaveIndex")) or 1),
+				Max = math.floor(tonumber(pools:GetCell(i, "MaxWaveIndex")) or math.huge)
+			})
+		end
+		local membership = {}
+		for i = 1, stages:GetRowCount() do
+			local regionId = stages:GetCell(i, "RegionId") or ""
+			local waveTable = stages:GetCell(i, "WaveTableId") or ""
+			if enabled[regionId] then
+				for _, wave in ipairs(wavesByTable[waveTable] or {}) do
+					for _, enemy in ipairs(enemiesByPool[wave.PoolId] or {}) do
+						if enemy.Id ~= "" and enemy.ModelId ~= "" and enemy.Weight > 0 and wave.Index >= enemy.Min and wave.Index <= enemy.Max then
+							if membership[enemy.Id] == nil then membership[enemy.Id] = {} end
+							membership[enemy.Id][regionId] = true
+						end
+					end
+				end
+			end
+		end
+		return membership
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetEntries()
+		-- Reads only the synchronized public snapshot; EnemyDefinitions stays server-only.
+		if self.EntrySnapshot == "" then return {} end
+		local snapshot = _HttpService:JSONDecode(self.EntrySnapshot)
+		local entries = snapshot.Entries or {}
+		for _, entry in ipairs(entries) do
+			local state = _MonsterCollectionLogic.LocalEntries[entry.Id] or 0
+			entry.IsDiscovered = state > 0
+			entry.IsNew = state == 1
+		end
+		return entries
+	end
+
+	method string GetIconRuid(string idleRuid, string moveRuid)
+		-- Prefers an idle thumbnail, then movement, then the existing fallback image.
+		local sourceRuid = idleRuid
+		if sourceRuid == "" then sourceRuid = moveRuid end
+		if sourceRuid == "" then return self.DefaultIconRuid end
+		return "thumbnail://" .. sourceRuid
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string name, any value)
+		-- Handles opening the codex before the initial snapshot reaches this client.
+		if name == "EntrySnapshot" and _LobbyCodexLogic:IsOpen() and _LobbyCodexLogic.ActiveCategory == "Monster" then
+			_LobbyCodexLogic:RefreshCodex()
+		end
+	end
+
+end

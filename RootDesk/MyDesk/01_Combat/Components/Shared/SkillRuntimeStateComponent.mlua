@@ -4,6 +4,7 @@ script SkillRuntimeStateComponent extends Component
 	@Sync property string CooldownSnapshot = ""
 	@Sync property integer CooldownRevision = 0
 	property any RemainingCooldowns = nil
+	property table FreshPlayerCooldowns = {}
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
@@ -15,6 +16,7 @@ script SkillRuntimeStateComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void ResetSkillRuntimeState(string reason)
 		self.RemainingCooldowns = {}
+		self.FreshPlayerCooldowns = {}
 		self:RefreshCooldownSnapshot(reason)
 		log("[SkillRuntimeState] reset entity=" .. self.Entity.Name .. " reason=" .. reason)
 	end
@@ -57,7 +59,29 @@ script SkillRuntimeStateComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method void StartPlayerCooldown(string skillId, integer cooldownTurns)
+		-- The casting action does not count toward its own cooldown; enemy starts use StartCooldown.
+		self:StartCooldown(skillId, cooldownTurns)
+		if cooldownTurns > 0 then self.FreshPlayerCooldowns[skillId] = true end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvancePlayerCooldowns(string reason)
+		-- Clear protection once per consumed player action, including an entire execution queue.
+		local excluded = self.FreshPlayerCooldowns
+		self.FreshPlayerCooldowns = {}
+		self:AdvanceCooldownsExcept(1, reason, excluded)
+	end
+
+	@ExecSpace("ServerOnly")
 	method void AdvanceCooldowns(integer elapsedTurns, string reason)
+		-- Explicit cooldown reductions and enemy actions do not consume player action protection.
+		self:AdvanceCooldownsExcept(elapsedTurns, reason, {})
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceCooldownsExcept(integer elapsedTurns, string reason, table excluded)
+		-- Apply a clock tick without reducing skills started during that same player action.
 		self:EnsureCooldownTable()
 		local normalizedTurns = math.max(0, math.floor(elapsedTurns))
 		if normalizedTurns <= 0 then
@@ -66,6 +90,7 @@ script SkillRuntimeStateComponent extends Component
 
 		local changed = false
 		for skillId, remainingTurns in pairs(self.RemainingCooldowns) do
+			if excluded[skillId] ~= true then
 			local nextTurns = math.max(0, math.floor(tonumber(remainingTurns) or 0) - normalizedTurns)
 			if nextTurns <= 0 then
 				self.RemainingCooldowns[skillId] = nil
@@ -73,6 +98,7 @@ script SkillRuntimeStateComponent extends Component
 				self.RemainingCooldowns[skillId] = nextTurns
 			end
 			changed = true
+			end
 		end
 		if changed == false then
 			return
@@ -80,6 +106,20 @@ script SkillRuntimeStateComponent extends Component
 
 		self:RefreshCooldownSnapshot(reason)
 		log("[SkillRuntimeState] cooldown advanced entity=" .. self.Entity.Name .. " elapsed=" .. normalizedTurns .. " reason=" .. reason .. " snapshot=" .. self.CooldownSnapshot)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ReduceCooldown(string skillId, integer amount)
+		-- Mutates the existing turn-based cooldown and publishes the same HUD snapshot.
+		local before = self:GetRemainingCooldown(skillId)
+		if amount <= 0 or before <= 0 then
+			return { Success = false, Reason = "SKILL_NOT_ON_COOLDOWN", AppliedAmount = 0 }
+		end
+		local after = math.max(0, before - amount)
+		self.RemainingCooldowns[skillId] = after > 0 and after or nil
+		self:RefreshCooldownSnapshot("TIME_SAND")
+		log("[BattleConsumable] cooldown skill=" .. skillId .. " before=" .. before .. " after=" .. after)
+		return { Success = true, Reason = "COOLDOWN_REDUCED", AppliedAmount = before - after, CooldownBefore = before, CooldownAfter = after }
 	end
 
 	@ExecSpace("ServerOnly")

@@ -1,0 +1,833 @@
+@Logic
+script NewSkillSelectionUILogic extends Logic
+
+	property string GroupPath = "/ui/NewSkillSelectionUI"
+	property string ReplacementGroupPath = "/ui/SkillReplacementUI"
+
+
+	property string RewardMapName = "new_skill_stage"
+	property number TwoCardSpacing = 420
+	property number ThreeCardSpacing = 500
+	property string ActiveMapName = ""
+	property integer RequestRevision = 0
+	property boolean SelectionPending = false
+	property string SelectedSkillId = ""
+	property boolean Loading = false
+	property number RequestTimeout = 0
+	property any Offers = nil
+	property any Bindings = nil
+	property any Cards = nil
+	property any RetryBinding = nil
+	property any HoverBindings = nil
+	property any ExitBindings = nil
+	property integer HoveredSlot = 0
+	property number ConfirmationRemaining = 0
+	property string ConfirmationMap = ""
+	property Vector3 ConfirmationPosition = Vector3(0, 0, 0)
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Initializes the persistent UI adapter; map components retain reward ownership.
+		self.ActiveMapName = ""
+		self.RequestRevision = 0
+		self.Offers = {}
+		self.Cards = {}
+		self.Bindings = {}
+		self.HoverBindings = {}
+		self.ExitBindings = {}
+		self.SelectionPending = false
+		self.Loading = false
+		self:Hide()
+		log("[NewSkillSelectionUI] adapter ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Opens on reward-map entry and clears pending responses on every departure.
+		local playerEntity = _UserService.LocalPlayer
+		local mapName = ""
+		if isvalid(playerEntity) and isvalid(playerEntity.CurrentMap) then mapName = playerEntity.CurrentMap.Name end
+		if mapName ~= self.ActiveMapName then
+			self.ActiveMapName = mapName
+			self.RequestRevision = self.RequestRevision + 1
+			self.SelectionPending = false
+			self.SelectedSkillId = ""
+			self.Loading = false
+			self.Offers = {}
+			self:Hide()
+			if mapName == self.RewardMapName then self:LoadOffers() end
+		end
+		self:AnimateCards(delta)
+		local selection = self._T.Selection
+		if selection ~= nil and selection.Busy then
+			selection.Timeout = selection.Timeout - delta
+			if selection.Timeout <= 0 then
+				selection.Busy = false
+				selection.TimedOut = true
+				self:SetSelectionError(selection.Done and "이동이 지연되고 있습니다. 다시 시도해 주세요." or "응답이 지연되고 있습니다. 다시 시도해 주세요.")
+			end
+		end
+		if mapName == self.RewardMapName and self.Loading then
+			self.RequestTimeout = self.RequestTimeout - delta
+			if self.RequestTimeout <= 0 then
+				self.Loading = false
+				self.RequestRevision = self.RequestRevision + 1
+				self:SetStatus("스킬을 불러오지 못했습니다. 다시 시도해 주세요.", true)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean BindCards()
+		-- Resolves the existing three card entities and connects each button only once.
+		for i = 1, 3 do
+			local card = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Cards/Choice" .. tostring(i))
+			if isvalid(card) == false or card.ButtonComponent == nil then return false end
+			if self.Bindings[i] == nil then
+				local slotIndex = i
+				self.Cards[i] = card
+				self.Bindings[i] = card:ConnectEvent(ButtonClickEvent, function() self:SelectChoice(slotIndex) end)
+				self.HoverBindings[i] = card:ConnectEvent(UITouchEnterEvent, function()
+					if self.SelectionPending == false and self.Offers[slotIndex] ~= nil then
+						self:SetCardHighlight(slotIndex, true)
+						_GameSettingsLogic:PlayUISound("159bf70a74634bfc8e91a29e527a4be5", 1)
+					end
+				end)
+				self.ExitBindings[i] = card:ConnectEvent(UITouchExitEvent, function()
+					if self.SelectionPending == false then self:SetCardHighlight(slotIndex, false) end
+				end)
+			end
+		end
+		local retry = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Retry")
+		if isvalid(retry) and self.RetryBinding == nil then
+			self.RetryBinding = retry:ConnectEvent(ButtonClickEvent, function() self:RetrySelection() end)
+		end
+		self._T.RerollBindings = self._T.RerollBindings or {}
+		for i = 1, 3 do
+			local slot = i
+			local button = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Rerolls/Slot" .. i)
+			if isvalid(button) and self._T.RerollBindings[i] == nil then
+				local click = button:ConnectEvent(ButtonClickEvent, function() self:RequestSlotReroll(slot) end)
+				local hover = button:ConnectEvent(UITouchEnterEvent, function()
+					if button.ButtonComponent.Enable then _GameSettingsLogic:PlayUISound("159bf70a74634bfc8e91a29e527a4be5", 1) end
+				end)
+				self._T.RerollBindings[i] = { Entity = button, Click = click, Hover = hover }
+			end
+		end
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void LoadOffers()
+		-- Requests actual map offers and keeps authored sample cards hidden while loading.
+		if self.ActiveMapName ~= self.RewardMapName or self.SelectionPending or self.Loading then return end
+		local group = _EntityService:GetEntityByPath(self.GroupPath)
+		if isvalid(group) == false or self:BindCards() == false then return end
+		self.Offers = {}
+		self:ClearPreviewFits()
+		self:ResetCardVisuals()
+		for i = 1, 3 do
+			self.Cards[i].Enable = false
+			self:SetCardHighlight(i, false)
+		end
+		group.Enable = true
+		self.Loading = true
+		self.RequestTimeout = 10
+		self.RequestRevision = self.RequestRevision + 1
+		self:RefreshRerollButtons()
+		self:SetStatus("스킬을 불러오는 중입니다...", false)
+		self:RequestOffers(self.RequestRevision)
+	end
+
+	@ExecSpace("Server")
+	method void RequestOffers(integer revision)
+		-- Reuses the existing map provider's filtering, rotation, icon and description code.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		self:SendOffers(playerEntity, revision, "", senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SendOffers(Entity playerEntity, integer revision, string rerollReason, string forUserId)
+		-- Sends a complete authoritative snapshot after both loads and rerolls.
+		if isvalid(playerEntity) == false or isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= self.RewardMapName then
+			self:ReceiveOffers({}, "INVALID_REWARD_MAP", revision, rerollReason, forUserId)
+			return
+		end
+		---@type NewSkillStageChoiceComponent
+		local provider = playerEntity.CurrentMap:GetComponent("script.NewSkillStageChoiceComponent")
+		if provider == nil then
+			self:ReceiveOffers({}, "PROVIDER_UNAVAILABLE", revision, rerollReason, forUserId)
+			return
+		end
+		local offers = {}
+		local count = math.min(3, math.max(1, _StageTransitionManagerLogic.NewSkillChoiceCount))
+		local reason = "OK"
+		for i = 1, count do
+			local offer = provider:ResolveOffer(playerEntity, i)
+			if offer.Success == false then
+				reason = offer.Reason
+				break
+			end
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(offer.SkillId)
+			if definition.Success then
+				offer.Summary = ""
+				local coloredDescription, _ = string.gsub(offer.Description, "(연계[^\n]+)", "<color=#FFC76B>%1</color>")
+				offer.Stats = coloredDescription
+				offer.PreviewRuid = definition.CastEffectRuid or ""
+				if offer.PreviewRuid == "" then offer.PreviewRuid = definition.HitEffectRuid or "" end
+			end
+			table.insert(offers, offer)
+		end
+		if #offers > 0 then reason = "OK" end
+		self:ReceiveOffers(offers, reason, revision, rerollReason, forUserId)
+		log("[NewSkillSelectionUI] offers sent user=" .. forUserId .. " count=" .. tostring(#offers))
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveOffers(table offers, string reason, integer revision, string rerollReason)
+		-- Displays server offers only for the current entry and centers one to three cards.
+		if revision ~= self.RequestRevision or self.ActiveMapName ~= self.RewardMapName or self.SelectionPending then return end
+		self.Loading = false
+		self.Offers = offers
+		local count = math.min(3, #offers)
+		local spacing = count == 3 and self.ThreeCardSpacing or self.TwoCardSpacing
+		if reason ~= "OK" or count == 0 then
+			self:SetStatus("선택할 스킬을 불러오지 못했습니다. 다시 시도해 주세요.", true)
+			log_warning("[NewSkillSelectionUI] offers unavailable reason=" .. reason)
+			return
+		end
+		for i = 1, 3 do
+			local card = self.Cards[i]
+			if isvalid(card) then
+				card.Enable = i <= count
+				if i <= count then
+					local offer = offers[i]
+					local path = self.GroupPath .. "/Screen/Cards/Choice" .. tostring(i) .. "/Surface"
+					card.UITransformComponent.anchoredPosition = Vector2((i - (count + 1) / 2) * spacing, 0)
+					card.ButtonComponent.Enable = true
+					self:SetText(path .. "/Header/SkillName", offer.DisplayName)
+					self:SetText(path .. "/Description/SkillDescription", offer.Stats or offer.Description)
+					self:SetText(path .. "/Description/Summary", offer.Summary or "")
+					self:SetText(path .. "/SelectHint", "선택")
+					local icon = _EntityService:GetEntityByPath(path .. "/Artwork/SkillIcon")
+					if isvalid(icon) and icon.SpriteGUIRendererComponent ~= nil then
+						icon.SpriteGUIRendererComponent.ImageRUID = DataRef(offer.IconRuid)
+						local preview = _EntityService:GetEntityByPath(path .. "/Artwork/SkillPreview")
+						local hasPreview = offer.PreviewRuid ~= nil and offer.PreviewRuid ~= ""
+						if isvalid(preview) then
+							self:ReleasePreviewFit(preview)
+							preview.Enable = hasPreview
+							if hasPreview then self:SetPreviewThumbnail(preview, offer.PreviewRuid) end
+						end
+						icon.UITransformComponent.RectSize = hasPreview and Vector2(48,48) or Vector2(160,160)
+						icon.UITransformComponent.anchoredPosition = hasPreview and Vector2(-140,100) or Vector2(0,0)
+					end
+				end
+			end
+		end
+		self:SetStatus("", false)
+		self:RefreshRerollButtons()
+		if rerollReason == "REROLLED" then self:SetStatus("다른 스킬로 변경했습니다 · 리롤 1회 사용", false)
+		elseif rerollReason == "NO_ALTERNATIVE" then self:SetStatus("다른 후보가 없습니다 · 리롤권 유지", false)
+		elseif rerollReason == "NO_REROLLS" then self:SetStatus("남은 리롤권이 없습니다", false)
+		elseif rerollReason ~= "" then self:SetStatus("후보 정보를 갱신했습니다. 다시 선택해 주세요.", false) end
+		log("[NewSkillSelectionUI] cards displayed count=" .. tostring(count) .. " first=" .. offers[1].SkillId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectChoice(integer slotIndex)
+		-- Sends a card selection through the map's existing validation, grant and teleport RPC.
+		if self.ActiveMapName ~= self.RewardMapName or self.SelectionPending or self.Loading then return end
+		local offer = self.Offers[slotIndex]
+		if offer == nil then return end
+		local playerEntity = _UserService.LocalPlayer
+		if isvalid(playerEntity) == false or isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= self.RewardMapName then return end
+		---@type NewSkillStageChoiceComponent
+		local provider = playerEntity.CurrentMap:GetComponent("script.NewSkillStageChoiceComponent")
+		if provider == nil then
+			self:SetStatus("선택을 처리하지 못했습니다. 다시 불러와 주세요.", true)
+			return
+		end
+		self.SelectionPending = true
+		self:RefreshRerollButtons()
+		self.SelectedSkillId = offer.SkillId
+		self._T.Selection = { ChoiceIndex = slotIndex, SkillId = offer.SkillId, Context = offer.Context, Action = "SELECT", OldSkillId = "", Busy = false, Done = false }
+		for i = 1, 3 do
+			self.Cards[i].ButtonComponent.Enable = false
+			self:SetCardHighlight(i, i == slotIndex)
+			self:SetText(self.GroupPath .. "/Screen/Cards/Choice" .. tostring(i) .. "/Surface/SelectHint", i == slotIndex and "선택 중..." or "")
+		end
+		self:SetStatus("스킬을 획득하고 다음 스테이지로 이동합니다...", false)
+		_GameSettingsLogic:PlayUISound(provider.ClickSoundRUID, provider.SoundVolume)
+		self:SendSelectionRequest()
+		log("[NewSkillSelectionUI] selection sent slot=" .. tostring(slotIndex) .. " skill=" .. offer.SkillId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReceiveSelectionState(table result, integer revision, Vector3 position)
+		-- Rejects old entry/request responses before showing a popup or scheduling a transfer.
+		local selection = self._T.Selection
+		local playerEntity = _UserService.LocalPlayer
+		if selection == nil or revision ~= self.RequestRevision or self.ActiveMapName ~= self.RewardMapName then return end
+		if not isvalid(playerEntity) or not isvalid(playerEntity.CurrentMap) or playerEntity.CurrentMap.Name ~= self.RewardMapName then return end
+		if selection.Busy == false and selection.TimedOut ~= true then return end
+		selection.Busy = false
+		selection.TimedOut = false
+		if result.PendingReplacement then
+			selection.Context = result.Context
+			selection.Replacement = result
+			selection.SelectedSlot = 0
+			selection.OldSkillId = ""
+			selection.Action = "SELECT"
+			self:OpenReplacement()
+		elseif result.Success then
+			if result.RunSequence ~= selection.Context.RunSequence or result.RewardKey ~= selection.Context.RewardKey then return end
+			selection.Done = true
+			self.SelectedSkillId = result.SkillId
+			self:CloseReplacement()
+			local message = result.Reason == "SKIPPED" and "새 스킬을 포기했습니다." or "스킬 획득 완료"
+			self:SetStatus(message .. " 다음 스테이지로 이동합니다...", false)
+			self:ShowConfirmation(result.SkillId, result.NextStageMapName, position)
+			-- Keep a retry path if the existing teleport request never moves the player.
+			selection.Busy = true
+			selection.Timeout = 10
+		else
+			local reason = result.Reason or "UNKNOWN"
+			if reason == "OFFER_MISMATCH" or reason == "STALE_REWARD_CONTEXT" or reason == "CHOICE_SLOT_UNAVAILABLE" or reason == "STALE_SKILL_INVENTORY" then
+				self:CloseReplacement()
+				self._T.Selection = nil
+				self.SelectionPending = false
+				self.SelectedSkillId = ""
+				self:ResetCardVisuals()
+			end
+			local message = "처리하지 못했습니다. 다시 시도해 주세요."
+			if reason == "NEXT_STAGE_MAP_UNAVAILABLE" then message = "다음 스테이지를 확인하지 못했습니다. 다시 시도해 주세요."
+			elseif reason == "STALE_SKILL_INVENTORY" or reason == "OFFER_MISMATCH" then message = "보유 스킬 또는 후보가 변경되었습니다. 다시 불러와 주세요."
+			elseif reason == "REPLACEMENT_NOT_OWNED" then message = "교체할 스킬을 다시 선택해 주세요." end
+			self:SetSelectionError(message)
+		end
+		log("[NewSkillSelectionUI] selection result reason=" .. (result.Reason or "UNKNOWN") .. " revision=" .. tostring(revision))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SendSelectionRequest()
+		-- Retries the same intent after a timeout; the server receipt decides the final outcome.
+		local selection = self._T.Selection
+		local playerEntity = _UserService.LocalPlayer
+		if selection == nil or selection.Busy or not isvalid(playerEntity) or not isvalid(playerEntity.CurrentMap) or playerEntity.CurrentMap.Name ~= self.RewardMapName then return end
+		local provider = playerEntity.CurrentMap:GetComponent("script.NewSkillStageChoiceComponent")
+		if provider == nil then self:SetSelectionError("스킬 선택을 처리할 수 없습니다. 다시 시도해 주세요.") return end
+		selection.Busy = true
+		selection.TimedOut = false
+		selection.Timeout = 10
+		self.RequestRevision = self.RequestRevision + 1
+		self:SetStatus("선택을 처리하는 중입니다...", false)
+		self:UpdateReplacementButtons()
+		self:SetText(self.ReplacementGroupPath .. "/Window/Status", "선택을 처리하는 중입니다...")
+		if selection.Action == "SELECT" or selection.Done then
+			provider:RequestSelectOffer(selection.ChoiceIndex, selection.SkillId, selection.Context, self.RequestRevision)
+		else
+			provider:RequestResolveReplacement(selection.ChoiceIndex, selection.SkillId, selection.Context, selection.OldSkillId, selection.Action == "SKIP", self.RequestRevision)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RetrySelection()
+		-- Reloads rejected offers or resends the outstanding transaction without granting twice.
+		if self._T.Selection == nil then self:LoadOffers() else self:SendSelectionRequest() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetSelectionError(string message)
+		-- Keeps errors and retries on the currently visible screen.
+		local group = _EntityService:GetEntityByPath(self.ReplacementGroupPath)
+		if isvalid(group) and group.Enable then
+			self:SetText(self.ReplacementGroupPath .. "/Window/Status", message)
+			self:UpdateReplacementButtons()
+			local retry = _EntityService:GetEntityByPath(self.ReplacementGroupPath .. "/Window/Retry")
+			if isvalid(retry) then retry.Enable = true end
+		else
+			self:SetStatus(message, true)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OpenReplacement()
+		-- Shows the six-slot comparison modal in the authoritative battle-bar order.
+		self:CloseReplacement()
+		local selection = self._T.Selection
+		local state = selection.Replacement
+		local group = _EntityService:GetEntityByPath(self.ReplacementGroupPath)
+		if not isvalid(group) then self:SetSelectionError("교체 화면을 불러오지 못했습니다. 다시 시도해 주세요.") return end
+		group.Enable = true
+		self._T.ReplacementBindings = {}
+		-- Disabled buttons still leave background graphics in the raycast path.
+		local selectionGroup = _EntityService:GetEntityByPath(self.GroupPath)
+		if isvalid(selectionGroup) and selectionGroup.CanvasGroupComponent ~= nil then
+			local canvas = selectionGroup.CanvasGroupComponent
+			self._T.SelectionInputState = { BlocksRaycasts = canvas.BlocksRaycasts, Interactable = canvas.Interactable }
+			canvas.BlocksRaycasts = false
+			canvas.Interactable = false
+		end
+		local root = self.ReplacementGroupPath .. "/Window"
+		self:RenderReplacementDetail("Before", nil)
+		self:RenderReplacementDetail("After", state.Offer)
+		for index = 1, 6 do
+			local slot = index
+			local path = root .. "/Slots/Slot" .. tostring(index)
+			local info = state.OwnedSkills[index]
+			self:SetText(path .. "/Name", info ~= nil and info.DisplayName or "정보 없음")
+			self:SetText(path .. "/Tier", info ~= nil and (tostring(info.SkillTier) .. "단계") or "")
+			local icon = _EntityService:GetEntityByPath(path .. "/Icon")
+			if isvalid(icon) then
+				icon.Enable = info ~= nil and info.SkillId ~= ""
+				if icon.Enable then icon.SpriteGUIRendererComponent.ImageRUID = DataRef(info.IconRuid) end
+			end
+			self:BindReplacementButton(path, function() self:SelectReplacementSlot(slot) end)
+		end
+		self:BindReplacementButton(root .. "/Confirm", function() self:ConfirmReplacement(false) end)
+		self:BindReplacementButton(root .. "/Skip", function() self:ConfirmReplacement(true) end)
+		self:BindReplacementButton(root .. "/Retry", function() self:RetrySelection() end)
+		local message = "교체할 기존 스킬을 선택해 주세요."
+		if state.CanReplace == false then message = "보유 스킬 수 또는 슬롯 상태를 확인할 수 없어 교체가 제한됩니다. 새 스킬을 포기하고 진행할 수 있습니다."
+		elseif state.Reason == "STALE_SKILL_INVENTORY" then message = "보유 스킬이 변경되었습니다. 교체할 스킬을 다시 선택해 주세요." end
+		self:SetText(root .. "/Status", message)
+		self:UpdateReplacementButtons()
+		log("[SkillReplacementUI] opened skill=" .. selection.SkillId .. " slots=" .. selection.Context.SlotIds)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindReplacementButton(string path, any callback)
+		-- Retains click/hover subscriptions for cleanup on close and map departure.
+		local entity = _EntityService:GetEntityByPath(path)
+		if not isvalid(entity) then return end
+		local click = entity:ConnectEvent(ButtonClickEvent, function()
+			log("[SkillReplacementUI] click path=" .. path)
+			callback()
+		end)
+		local hover = entity:ConnectEvent(UITouchEnterEvent, function()
+			if entity.ButtonComponent.Enable then _GameSettingsLogic:PlayUISound("159bf70a74634bfc8e91a29e527a4be5", 1) end
+		end)
+		table.insert(self._T.ReplacementBindings, { Entity = entity, Click = click, Hover = hover })
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectReplacementSlot(integer slotIndex)
+		-- Changes only the local comparison selection, never inventory ownership.
+		local selection = self._T.Selection
+		if selection == nil or selection.Busy or selection.TimedOut or selection.Done or selection.Replacement.CanReplace == false then return end
+		local info = selection.Replacement.OwnedSkills[slotIndex]
+		if info == nil then return end
+		selection.SelectedSlot = slotIndex
+		selection.OldSkillId = info.SkillId
+		self:RenderReplacementDetail("Before", info)
+		self:UpdateReplacementButtons()
+		_GameSettingsLogic:PlayUISound("972843e759204d3e9ad84e7d3fa94f83", 1)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderReplacementDetail(string side, any info)
+		-- Renders the same authoritative descriptions used by the existing reward cards.
+		local path = self.ReplacementGroupPath .. "/Window/" .. side
+		self:SetText(path .. "/Name", info ~= nil and info.DisplayName or "교체할 스킬을 선택하세요")
+		self:SetText(path .. "/Tier", info ~= nil and (tostring(info.SkillTier) .. "단계") or "")
+		self:SetText(path .. "/Description", info ~= nil and info.Description or "아래 보유 스킬 중 하나를 선택하면\n신규 스킬과 비교할 수 있습니다.")
+		local icon = _EntityService:GetEntityByPath(path .. "/Icon")
+		if isvalid(icon) then
+			icon.Enable = info ~= nil
+			if info ~= nil then icon.SpriteGUIRendererComponent.ImageRUID = DataRef(info.IconRuid) end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateReplacementButtons()
+		-- Disables changing intent while a result is unknown and highlights exactly one slot.
+		local selection = self._T.Selection
+		if selection == nil then return end
+		local ready = not selection.Busy and not selection.TimedOut and not selection.Done
+		local canReplace = ready and selection.Replacement ~= nil and selection.Replacement.CanReplace
+		local root = self.ReplacementGroupPath .. "/Window"
+		for index = 1, 6 do
+			local slot = _EntityService:GetEntityByPath(root .. "/Slots/Slot" .. tostring(index))
+			if isvalid(slot) then
+				slot.ButtonComponent.Enable = canReplace == true
+				slot.SpriteGUIRendererComponent.Color = selection.SelectedSlot == index and Color(0.20, 0.43, 0.46, 1) or Color(0.09, 0.106, 0.173, 1)
+			end
+		end
+		local confirm = _EntityService:GetEntityByPath(root .. "/Confirm")
+		local skip = _EntityService:GetEntityByPath(root .. "/Skip")
+		local retry = _EntityService:GetEntityByPath(root .. "/Retry")
+		if isvalid(confirm) then confirm.ButtonComponent.Enable = canReplace == true and (selection.SelectedSlot or 0) > 0 end
+		if isvalid(skip) then skip.ButtonComponent.Enable = ready end
+		if isvalid(retry) then retry.Enable = selection.TimedOut == true end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConfirmReplacement(boolean skip)
+		-- Sends the explicit replacement or forfeiture choice; there is no background-click dismissal.
+		local selection = self._T.Selection
+		if selection == nil or selection.Busy or selection.TimedOut or selection.Done then return end
+		if not skip and (selection.Replacement.CanReplace == false or (selection.SelectedSlot or 0) == 0) then return end
+		selection.Action = skip and "SKIP" or "REPLACE"
+		if skip then selection.OldSkillId = "" end
+		_GameSettingsLogic:PlayUISound("972843e759204d3e9ad84e7d3fa94f83", 1)
+		self:SendSelectionRequest()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseReplacement()
+		-- Disconnects the modal independently of the selected reward transaction.
+		local inputState = self._T.SelectionInputState
+		local selectionGroup = _EntityService:GetEntityByPath(self.GroupPath)
+		if inputState ~= nil and isvalid(selectionGroup) and selectionGroup.CanvasGroupComponent ~= nil then
+			selectionGroup.CanvasGroupComponent.BlocksRaycasts = inputState.BlocksRaycasts
+			selectionGroup.CanvasGroupComponent.Interactable = inputState.Interactable
+		end
+		self._T.SelectionInputState = nil
+		for _, binding in ipairs(self._T.ReplacementBindings or {}) do
+			if isvalid(binding.Entity) then
+				binding.Entity:DisconnectEvent(ButtonClickEvent, binding.Click)
+				binding.Entity:DisconnectEvent(UITouchEnterEvent, binding.Hover)
+			end
+		end
+		self._T.ReplacementBindings = {}
+		local group = _EntityService:GetEntityByPath(self.ReplacementGroupPath)
+		if isvalid(group) then group.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetCardHighlight(integer slotIndex, boolean highlighted)
+		-- Highlights the active card and plays only its authored skill effect.
+		if highlighted and self.HoveredSlot ~= 0 and self.HoveredSlot ~= slotIndex then
+			self:SetPreviewPlaying(self.HoveredSlot, false)
+		end
+		self:SetPreviewPlaying(slotIndex, highlighted)
+		if highlighted then self.HoveredSlot = slotIndex
+		elseif self.HoveredSlot == slotIndex then self.HoveredSlot = 0 end
+		local frame = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Cards/Choice" .. tostring(slotIndex) .. "/HoverFrame")
+		if isvalid(frame) then frame.Enable = highlighted end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetPreviewPlaying(integer slotIndex, boolean playing)
+		-- Switches the existing effect between a static thumbnail and native looping animation.
+		local offer = self.Offers ~= nil and self.Offers[slotIndex] or nil
+		if offer == nil or offer.PreviewRuid == nil or offer.PreviewRuid == "" then return end
+		local preview = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Cards/Choice" .. tostring(slotIndex) .. "/Surface/Artwork/SkillPreview")
+		if isvalid(preview) == false or preview.SpriteGUIRendererComponent == nil then return end
+		local renderer = preview.SpriteGUIRendererComponent
+		local ruid = playing and offer.PreviewRuid or ("thumbnail://" .. offer.PreviewRuid)
+		if renderer.ImageRUID.DataId == ruid and preview.Enable then return end
+		if playing then
+			self:PlayFittedPreview(preview, offer.PreviewRuid)
+			self:SetText(self.GroupPath .. "/Screen/Cards/Choice" .. tostring(slotIndex) .. "/Surface/SelectHint", "선택")
+		else
+			self:SetPreviewThumbnail(preview, offer.PreviewRuid)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetText(string path, string value)
+		-- Updates a known card label without assuming the UI has already been loaded.
+		local target = _EntityService:GetEntityByPath(path)
+		if isvalid(target) and target.TextGUIRendererComponent ~= nil then target.TextGUIRendererComponent.Text = value end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetStatus(string value, boolean allowRetry)
+		-- Shows loading or failure feedback with a retry button only when needed.
+		self:SetText(self.GroupPath .. "/Screen/Hint", value)
+		local retry = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Retry")
+		if isvalid(retry) then retry.Enable = allowRetry end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Hide()
+		-- Hides the selection overlay without changing inventory or reward state.
+		self:CloseReplacement()
+		self._T.Selection = nil
+		self.ConfirmationRemaining = 0
+		self.ConfirmationMap = ""
+		self:ResetCardVisuals()
+		self:ClearPreviewFits()
+		local group = _EntityService:GetEntityByPath(self.GroupPath)
+		if isvalid(group) then group.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshRerollButtons()
+		-- Aligns each reroll beneath its card and locks it during a pending transaction.
+		local count = math.min(3, #(self.Offers or {}))
+		local spacing = count == 3 and self.ThreeCardSpacing or self.TwoCardSpacing
+		for i, binding in pairs(self._T.RerollBindings or {}) do
+			local button = binding.Entity
+			local offer = self.Offers[i]
+			button.Enable = offer ~= nil and not self.SelectionPending
+			if offer ~= nil then
+				button.UITransformComponent.anchoredPosition = Vector2((i - (count + 1) / 2) * spacing, 0)
+				button.ButtonComponent.Enable = not self.Loading and not self.SelectionPending and (offer.Context.RerollCount or 0) > 0
+				self:SetText(self.GroupPath .. "/Screen/Rerolls/Slot" .. i, "리롤 (" .. tostring(offer.Context.RerollCount or 0) .. ")")
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestSlotReroll(integer slotIndex)
+		-- Sends the shown skill and reward revision, never a client-chosen replacement.
+		if self.ActiveMapName ~= self.RewardMapName or self.Loading or self.SelectionPending then return end
+		local offer = self.Offers[slotIndex]
+		if offer == nil or (offer.Context.RerollCount or 0) <= 0 then return end
+		self.Loading = true
+		self.RequestTimeout = 10
+		self.RequestRevision = self.RequestRevision + 1
+		self:RefreshRerollButtons()
+		self:SetStatus("다른 스킬을 뽑는 중입니다...", false)
+		_GameSettingsLogic:PlayUISound("972843e759204d3e9ad84e7d3fa94f83", 1)
+		self:RequestReroll(slotIndex, offer.SkillId, offer.Context, self.RequestRevision)
+	end
+
+	@ExecSpace("Server")
+	method void RequestReroll(integer slotIndex, string skillId, table context, integer revision)
+		-- Delegates validation and charging to the map-owned reward provider.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= self.RewardMapName then return end
+		local provider = player.CurrentMap:GetComponent("script.NewSkillStageChoiceComponent")
+		if provider == nil then return end
+		local result = provider:ProcessReroll(player, slotIndex, skillId, context)
+		self:SendOffers(player, revision, result.Reason, senderUserId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Disconnects all retained UI events so play sessions never accumulate callbacks.
+		for i, card in pairs(self.Cards or {}) do
+			if isvalid(card) then
+				if self.Bindings[i] ~= nil then card:DisconnectEvent(ButtonClickEvent, self.Bindings[i]) end
+				if self.HoverBindings[i] ~= nil then card:DisconnectEvent(UITouchEnterEvent, self.HoverBindings[i]) end
+				if self.ExitBindings[i] ~= nil then card:DisconnectEvent(UITouchExitEvent, self.ExitBindings[i]) end
+			end
+		end
+		local retry = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Retry")
+		if isvalid(retry) and self.RetryBinding ~= nil then retry:DisconnectEvent(ButtonClickEvent, self.RetryBinding) end
+		self.RetryBinding = nil
+		for _, binding in pairs(self._T.RerollBindings or {}) do
+			if isvalid(binding.Entity) then
+				binding.Entity:DisconnectEvent(ButtonClickEvent, binding.Click)
+				binding.Entity:DisconnectEvent(UITouchEnterEvent, binding.Hover)
+			end
+		end
+		self._T.RerollBindings = {}
+		self.Bindings = {}
+		self.HoverBindings = {}
+		self.ExitBindings = {}
+		self.Cards = {}
+		self.Offers = {}
+		self.Loading = false
+		self.SelectionPending = false
+		self:Hide()
+	end
+	@ExecSpace("ClientOnly")
+	method void ResetCardVisuals()
+		-- Restores transform and opacity after retries, map changes and play shutdown.
+		self.HoveredSlot = 0
+		for i, card in pairs(self.Cards or {}) do
+			if isvalid(card) then
+				local pos = card.UITransformComponent.anchoredPosition
+				card.UITransformComponent.anchoredPosition = Vector2(pos.x, 0)
+				card.UITransformComponent.UIScale = Vector3(1,1,1)
+				if card.CanvasGroupComponent ~= nil then card.CanvasGroupComponent.GroupAlpha = 1 end
+				self:SetCardHighlight(i, false)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void AnimateCards(number delta)
+		-- Smoothly lifts hovered cards and separates the confirmed choice without added particles.
+		if self.ActiveMapName ~= self.RewardMapName then return end
+		local blend = 1 - math.exp(-16 * delta)
+		for i, card in pairs(self.Cards or {}) do
+			if isvalid(card) and card.Enable then
+				local offer = self.Offers[i]
+				local selected = self.SelectionPending and offer ~= nil and offer.SkillId == self.SelectedSkillId
+				local active = selected or (self.SelectionPending == false and self.HoveredSlot == i)
+				local y = active and (selected and 18 or 10) or 0
+				local scale = active and (selected and 1.035 or 1.015) or 1
+				local alpha = self.SelectionPending and not selected and 0.42 or 1
+				local transform = card.UITransformComponent
+				local pos = transform.anchoredPosition
+				transform.anchoredPosition = Vector2(pos.x, pos.y + (y-pos.y)*blend)
+				local currentScale = transform.UIScale.x + (scale-transform.UIScale.x)*blend
+				transform.UIScale = Vector3(currentScale,currentScale,1)
+				local canvas = card.CanvasGroupComponent
+				if canvas ~= nil then canvas.GroupAlpha = canvas.GroupAlpha + (alpha-canvas.GroupAlpha)*blend end
+			end
+		end
+		if self.ConfirmationRemaining > 0 then
+			self.ConfirmationRemaining = self.ConfirmationRemaining - delta
+			if self.ConfirmationRemaining <= 0 then
+				local destination = self.ConfirmationMap
+				self.ConfirmationMap = ""
+				_MapTeleportManager:RequestTeleport(destination, self.ConfirmationPosition, "NEW_SKILL_STAGE_COMPLETE")
+				log("[NewSkillSelectionUI] confirmation finished map=" .. destination)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ShowConfirmation(string skillId, string destination, Vector3 position)
+		-- Briefly presents the server-confirmed reward before using the existing teleport request.
+		if self.ActiveMapName ~= self.RewardMapName or self.SelectionPending == false or self.SelectedSkillId ~= skillId or destination == "" then return false end
+		self.ConfirmationMap = destination
+		self.ConfirmationPosition = position
+		self.ConfirmationRemaining = 0.45
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReleasePreviewFit(Entity preview)
+		-- Cancels a pending load and removes the previous frame callback.
+		local fits = self._T.PreviewFits
+		if fits == nil or not isvalid(preview) then return end
+		local state = fits[preview.Id]
+		if state == nil then return end
+		fits[preview.Id] = nil
+		if state.eventHandler ~= nil then
+			preview:DisconnectEvent(SpriteGUIAnimPlayerChangeFrameEvent, state.eventHandler)
+		end
+		preview.UITransformComponent.RectSize = state.box
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearPreviewFits()
+		-- Releases frame callbacks and invalidates loads on close or play shutdown.
+		for _, state in pairs(self._T.PreviewFits or {}) do
+			if isvalid(state.entity) then
+				if state.eventHandler ~= nil then
+					state.entity:DisconnectEvent(SpriteGUIAnimPlayerChangeFrameEvent, state.eventHandler)
+				end
+				state.entity.UITransformComponent.RectSize = state.box
+			end
+		end
+		self._T.PreviewFits = {}
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetPreviewThumbnail(Entity preview, string ruid)
+		-- Restores the full preview box when leaving animation playback.
+		self:ReleasePreviewFit(preview)
+		local renderer = preview.SpriteGUIRendererComponent
+		renderer.Type = ImageType.Simple
+		-- Skill effects use world-space pivots; ignore them inside the centered preview rect.
+		renderer.PreserveSprite = PreserveSpriteType.None
+		renderer.LocalPosition = Vector2(0, 0)
+		renderer.LocalScale = Vector2(1, 1)
+		renderer.Color = Color(1, 1, 1, 1)
+		-- Show frame zero of the source clip while preview playback is inactive.
+		renderer.StartFrameIndex = 0
+		renderer.EndFrameIndex = 0
+		renderer.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+		renderer.PlayRate = 1
+		renderer.ImageRUID = DataRef(ruid)
+		preview.Enable = true
+		self._T.PreviewFits = self._T.PreviewFits or {}
+		local state = { entity = preview, box = preview.UITransformComponent.RectSize }
+		self._T.PreviewFits[preview.Id] = state
+		_ResourceService:PreloadAsync({ruid}, function()
+			if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
+			local ok, kind = pcall(function() return _ResourceService:GetTypeAndWait(ruid) end)
+			if not ok or kind ~= ResourceType.AnimationClip then return end
+			local loaded, clip = pcall(function() return _ResourceService:LoadAnimationClipAndWait(ruid) end)
+			if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
+			if not loaded or clip == nil or not clip.IsLoadComplete then return end
+			for _, frame in ipairs(clip.Frames:ToTable()) do
+				if frame.FrameIndex == 0 and frame.FrameSprite ~= nil then
+					local sprite = frame.FrameSprite
+					if sprite.Width > 0 and sprite.Height > 0 then
+						local scale = math.min(state.box.x / sprite.Width, state.box.y / sprite.Height)
+						preview.UITransformComponent.RectSize = Vector2(sprite.Width * scale, sprite.Height * scale)
+					end
+					break
+				end
+			end
+		end)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayFittedPreview(Entity preview, string ruid)
+		-- Fits all animation frames at one scale; world pivots cannot push UI art into the mask.
+		self:ReleasePreviewFit(preview)
+		self._T.PreviewFits = self._T.PreviewFits or {}
+		self._T.PreviewSizes = self._T.PreviewSizes or {}
+		local state = { entity = preview, box = preview.UITransformComponent.RectSize }
+		self._T.PreviewFits[preview.Id] = state
+		preview.Enable = false
+		_ResourceService:PreloadAsync({ruid}, function()
+			if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
+			local sizes = self._T.PreviewSizes[ruid]
+			if sizes == nil then
+				-- Sprite previews are valid UI resources, but cannot be loaded as AnimationClip.
+				local typeOk, resourceType = pcall(function() return _ResourceService:GetTypeAndWait(ruid) end)
+				if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
+				if not typeOk or resourceType ~= ResourceType.AnimationClip then
+					self:SetPreviewThumbnail(preview, ruid)
+					return
+				end
+				local ok, clip = pcall(function() return _ResourceService:LoadAnimationClipAndWait(ruid) end)
+				if ok and clip ~= nil and clip.IsLoadComplete then
+					sizes = { width = 0, height = 0, frames = {} }
+					for _, frame in ipairs(clip.Frames:ToTable()) do
+						local sprite = frame.FrameSprite
+						if sprite ~= nil and sprite.IsLoadComplete and sprite.Width > 0 and sprite.Height > 0 then
+							sizes.frames[frame.FrameIndex] = Vector2(sprite.Width, sprite.Height)
+							sizes.width = math.max(sizes.width, sprite.Width)
+							sizes.height = math.max(sizes.height, sprite.Height)
+						else
+							sizes = nil
+							break
+						end
+					end
+					if sizes ~= nil and sizes.width > 0 and sizes.height > 0 then
+						self._T.PreviewSizes[ruid] = sizes
+					else
+						sizes = nil
+					end
+				end
+			end
+			-- Resource waits can resume after a different skill, hover exit or map change.
+			if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
+			if sizes == nil or sizes.frames[0] == nil then
+				log_warning("[SkillPreviewFit] metadata unavailable; thumbnail fallback ruid=" .. ruid)
+				self:SetPreviewThumbnail(preview, ruid)
+				return
+			end
+			local scale = math.min(state.box.x / sizes.width, state.box.y / sizes.height)
+			local applyFrame = function(frameIndex)
+				if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
+				local size = sizes.frames[frameIndex]
+				if size ~= nil then
+					preview.UITransformComponent.RectSize = Vector2(size.x * scale, size.y * scale)
+				end
+			end
+			local renderer = preview.SpriteGUIRendererComponent
+			renderer.Type = ImageType.Simple
+			-- None ignores sprite pivots; each frame's rect already preserves its native aspect.
+			renderer.PreserveSprite = PreserveSpriteType.None
+			renderer.LocalPosition = Vector2(0, 0)
+			renderer.LocalScale = Vector2(1, 1)
+			renderer.Color = Color(1, 1, 1, 1)
+			renderer.StartFrameIndex = 0
+			renderer.EndFrameIndex = 2147483647
+			renderer.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+			renderer.PlayRate = 1
+			state.eventHandler = preview:ConnectEvent(SpriteGUIAnimPlayerChangeFrameEvent, function(event)
+				applyFrame(event.FrameIndex)
+		end)
+		applyFrame(0)
+		renderer.ImageRUID = DataRef(ruid)
+		preview.Enable = true
+		log("[SkillPreviewFit] ruid=" .. ruid .. " bounds=" .. tostring(sizes.width) .. "x" .. tostring(sizes.height) .. " scale=" .. tostring(scale))
+		end)
+	end
+
+end

@@ -31,18 +31,57 @@ script PlayerRunStateComponent extends Component
 	@Sync property string LastContentCompletionKey = ""
 	@Sync property string LastCompletedContentType = ""
 	@Sync property string LastCompletedContentId = ""
+	@Sync property string SelectedWorldMapBranch = ""
 	@Sync property string SelectedJobId = ""
 	@Sync property string SelectedJobMechanicId = "NONE"
 	@Sync property string SelectedJobPassiveSetId = ""
 	@Sync property string StartingSkillIds = ""
+	property integer StartingSkillSlotCount = 2
+	@Sync property integer EffectiveStartingSkillSlotCount = 2
+	@Sync property integer StartingSkillUnionBonus = 0
 	@Sync property integer JobBaseMaxHp = 0
+	@Sync property number MaxHpUnionBonus = 0
+	@Sync property number RunMaxHp = 0
+	@Sync property number RunCurrentHp = 0
+	@Sync property boolean RunHpInitialized = false
+	@Sync property integer RunHpRevision = 0
 	@Sync property integer JobBaseQueueCapacity = 0
 	@Sync property integer JobRevision = 0
+	@Sync property string PendingNextStageMapName = ""
+	-- Server-owned test marker that survives reward-map and battle-map transitions within one run.
+	property boolean PrototypeTestMode = false
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
 		-- The player owns this state so separate users never share one roguelike run.
 		log("[PlayerRunState] attached player=" .. self.Entity.Name .. " sequence=" .. self.RunSequence .. " seed=" .. self.RunSeed .. " state=" .. self.RunState)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSyncProperty(string propertyName, any value)
+		-- Publishes only world-map presentation changes; authoritative state remains server-owned.
+		if propertyName ~= "CompletedStageCount" and propertyName ~= "SelectedWorldMapBranch" and propertyName ~= "RunState" then
+			return
+		end
+		local event = WorldMapProgressChangedEvent()
+		event.CompletedStageCount = self.CompletedStageCount
+		event.SelectedWorldMapBranch = self.SelectedWorldMapBranch or ""
+		event.Reason = "SYNC:" .. propertyName
+		self.Entity:SendEvent(event)
+		log("[WorldMapProgress] event published clears=" .. tostring(event.CompletedStageCount) .. " branch=" .. event.SelectedWorldMapBranch .. " reason=" .. event.Reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetWorldMapProgressSnapshot()
+		-- A completed run keeps its results, but the lobby offers a fresh Henesys entry.
+		local map = self.Entity.CurrentMap
+		if self.RunState == "Completed" and isvalid(map) and map.Name == "lobby" then
+			return { CompletedStageCount = 0, SelectedWorldMapBranch = "" }
+		end
+		return {
+			CompletedStageCount = self.CompletedStageCount,
+			SelectedWorldMapBranch = self.SelectedWorldMapBranch or ""
+		}
 	end
 
 	@ExecSpace("ServerOnly")
@@ -51,6 +90,13 @@ script PlayerRunStateComponent extends Component
 		self.RunSeed = math.max(0, math.floor(math.abs(runSeed)))
 		self.RunSequence = self.RunSequence + 1
 		self.RunState = "Active"
+		local combatStats = self.Entity:GetComponent("script.PlayerRunCombatStatsComponent")
+		if combatStats == nil then
+			combatStats = self.Entity:AddComponent("PlayerRunCombatStatsComponent")
+		end
+		if combatStats ~= nil then
+			combatStats:BeginRun(self.RunSequence)
+		end
 		self.CurrentStageNumber = 1
 		self.CompletedStageCount = 0
 		self.LastBattleResult = ""
@@ -66,38 +112,112 @@ script PlayerRunStateComponent extends Component
 		self.LastContentCompletionKey = ""
 		self.LastCompletedContentType = ""
 		self.LastCompletedContentId = ""
+		self.SelectedWorldMapBranch = ""
 		self:ResetContentTransition("NEW_RUN")
 		self.SelectedJobId = ""
 		self.SelectedJobMechanicId = "NONE"
 		self.SelectedJobPassiveSetId = ""
 		self.StartingSkillIds = ""
+		self.EffectiveStartingSkillSlotCount = self.StartingSkillSlotCount
+		self.StartingSkillUnionBonus = 0
 		self.JobBaseMaxHp = 0
+		self.MaxHpUnionBonus = 0
+		self.RunMaxHp = 0
+		self.RunCurrentHp = 0
+		self.RunHpInitialized = false
+		self.RunHpRevision = self.RunHpRevision + 1
 		self.JobBaseQueueCapacity = 0
 		self.JobRevision = self.JobRevision + 1
+		self.PendingNextStageMapName = ""
+		self.PrototypeTestMode = false
 		log("[PlayerRunState] begun sequence=" .. self.RunSequence .. " seed=" .. self.RunSeed .. " stage=" .. self.CurrentStageNumber)
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ApplyJobBundle(table bundle)
+	method table ResetAfterDefeat(string reason)
+		-- Returns a failed run to its lobby-ready baseline while preserving the monotonic run sequence.
+		if self.RunState ~= "Failed" or self.LastBattleResult ~= "Defeat" then
+			return { Success = false, Reason = "RUN_NOT_FAILED", RunSequence = self.RunSequence }
+		end
+		local resetReason = reason
+		if resetReason == nil or resetReason == "" then
+			resetReason = "DEFEAT_RETURN_TO_LOBBY"
+		end
+		local previousRunSequence = self.RunSequence
+		self.RunSeed = 1000
+		self.RunState = "Idle"
+		local combatStats = self.Entity:GetComponent("script.PlayerRunCombatStatsComponent")
+		if combatStats ~= nil then
+			combatStats:ClearRun()
+		end
+		self.CurrentStageNumber = 1
+		self.CompletedStageCount = 0
+		self.LastBattleResult = ""
+		self.RunFlowState = "IDLE"
+		self.CurrentNodeGraphId = ""
+		self.CurrentNodeId = ""
+		self.LastCompletedStageId = ""
+		self.AvailableNodeIds = ""
+		self.AvailableContentTypes = ""
+		self.AvailableContentIds = ""
+		self.LastBattleRecordKey = ""
+		self.LastContentCompletionKey = ""
+		self.LastCompletedContentType = ""
+		self.LastCompletedContentId = ""
+		self.SelectedWorldMapBranch = ""
+		self:ResetContentTransition(resetReason)
+		self.SelectedJobId = ""
+		self.SelectedJobMechanicId = "NONE"
+		self.SelectedJobPassiveSetId = ""
+		self.StartingSkillIds = ""
+		self.EffectiveStartingSkillSlotCount = self.StartingSkillSlotCount
+		self.StartingSkillUnionBonus = 0
+		self.JobBaseMaxHp = 0
+		self.MaxHpUnionBonus = 0
+		self.RunMaxHp = 0
+		self.RunCurrentHp = 0
+		self.RunHpInitialized = false
+		self.RunHpRevision = self.RunHpRevision + 1
+		self.JobBaseQueueCapacity = 0
+		self.JobRevision = self.JobRevision + 1
+		self.PendingNextStageMapName = ""
+		self.PrototypeTestMode = false
+		self.RunFlowRevision = self.RunFlowRevision + 1
+		log("[PlayerRunState] defeat reset sequence=" .. previousRunSequence .. " state=" .. self.RunState .. " reason=" .. resetReason)
+		return { Success = true, Reason = resetReason, RunSequence = previousRunSequence }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyJobBundle(table bundle, integer startingSkillBonus, number maxHpBonus)
 		-- Stores only the validated run snapshot so later stages do not depend on mutable dataset rows.
 		if bundle == nil or bundle.Success ~= true or bundle.Definition == nil then
 			return { Success = false, Reason = "INVALID_JOB_BUNDLE" }
 		end
 		local definition = bundle.Definition
+		self.StartingSkillUnionBonus = math.max(0, math.floor(tonumber(startingSkillBonus) or 0))
+		self.EffectiveStartingSkillSlotCount = self.StartingSkillSlotCount + self.StartingSkillUnionBonus
+		self.MaxHpUnionBonus = math.max(0, tonumber(maxHpBonus) or 0)
 		local skillIds = {}
 		for _, entry in ipairs(bundle.StartingSkills or {}) do
 			for copyIndex = 1, math.max(1, entry.Count or 1) do
+				if #skillIds >= self.EffectiveStartingSkillSlotCount then
+					break
+				end
 				table.insert(skillIds, entry.SkillId)
+			end
+			if #skillIds >= self.EffectiveStartingSkillSlotCount then
+				break
 			end
 		end
 		self.SelectedJobId = definition.JobId
-		self.SelectedJobMechanicId = definition.JobMechanicId
-		self.SelectedJobPassiveSetId = definition.JobPassiveSetId or ""
+		self.SelectedJobMechanicId = "NONE"
+		self.SelectedJobPassiveSetId = ""
 		self.StartingSkillIds = table.concat(skillIds, "|")
 		self.JobBaseMaxHp = definition.BaseMaxHp
+		self:EnsureRunHpInitialized(self.JobBaseMaxHp + self.MaxHpUnionBonus, "JOB_APPLIED")
 		self.JobBaseQueueCapacity = definition.BaseQueueCapacity
 		self.JobRevision = self.JobRevision + 1
-		log("[PlayerRunState] job applied job=" .. self.SelectedJobId .. " mechanic=" .. self.SelectedJobMechanicId .. " passive=" .. self.SelectedJobPassiveSetId .. " hp=" .. self.JobBaseMaxHp .. " queue=" .. self.JobBaseQueueCapacity .. " skills=" .. self.StartingSkillIds .. " revision=" .. self.JobRevision)
+		log("[PlayerRunState] job applied job=" .. self.SelectedJobId .. " mechanic=" .. self.SelectedJobMechanicId .. " passive=" .. self.SelectedJobPassiveSetId .. " hp=" .. self.JobBaseMaxHp .. "+" .. self.MaxHpUnionBonus .. " queue=" .. self.JobBaseQueueCapacity .. " skillSlots=" .. self.EffectiveStartingSkillSlotCount .. " skills=" .. self.StartingSkillIds .. " revision=" .. self.JobRevision)
 		return self:GetJobSnapshot()
 	end
 
@@ -111,9 +231,60 @@ script PlayerRunStateComponent extends Component
 			MechanicId = self.SelectedJobMechanicId,
 			PassiveSetId = self.SelectedJobPassiveSetId,
 			StartingSkillIds = self.StartingSkillIds,
+			StartingSkillSlotCount = self.EffectiveStartingSkillSlotCount,
+			StartingSkillUnionBonus = self.StartingSkillUnionBonus,
 			BaseMaxHp = self.JobBaseMaxHp,
+			MaxHpUnionBonus = self.MaxHpUnionBonus,
+			CurrentHp = self.RunCurrentHp,
+			MaxHp = self.RunMaxHp,
+			HpInitialized = self.RunHpInitialized,
+			HpRevision = self.RunHpRevision,
 			BaseQueueCapacity = self.JobBaseQueueCapacity,
 			Revision = self.JobRevision
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table EnsureRunHpInitialized(number fallbackMaxHp, string reason)
+		-- Initializes HP exactly once per run and otherwise preserves the carried value.
+		local resolvedMaxHp = math.max(1, fallbackMaxHp)
+		if self.RunHpInitialized == false then
+			self.RunMaxHp = resolvedMaxHp
+			self.RunCurrentHp = resolvedMaxHp
+			self.RunHpInitialized = true
+			self.RunHpRevision = self.RunHpRevision + 1
+			log("[RunHp] initialized current=" .. self.RunCurrentHp .. " max=" .. self.RunMaxHp .. " reason=" .. (reason or ""))
+		end
+		return self:GetRunHpSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SetRunHp(number currentHp, number maxHp, string reason)
+		-- Commits the authoritative battle HP without granting implicit healing.
+		local resolvedMaxHp = math.max(1, maxHp)
+		local resolvedCurrentHp = math.max(0, math.min(resolvedMaxHp, currentHp))
+		local changed = self.RunHpInitialized == false
+			or self.RunMaxHp ~= resolvedMaxHp
+			or self.RunCurrentHp ~= resolvedCurrentHp
+		self.RunMaxHp = resolvedMaxHp
+		self.RunCurrentHp = resolvedCurrentHp
+		self.RunHpInitialized = true
+		if changed == true then
+			self.RunHpRevision = self.RunHpRevision + 1
+			log("[RunHp] committed current=" .. self.RunCurrentHp .. " max=" .. self.RunMaxHp .. " reason=" .. (reason or "") .. " revision=" .. self.RunHpRevision)
+		end
+		return self:GetRunHpSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunHpSnapshot()
+		-- Returns the run-owned HP boundary used by battle sessions across map changes.
+		return {
+			Success = self.RunHpInitialized,
+			Reason = self.RunHpInitialized and "OK" or "RUN_HP_NOT_INITIALIZED",
+			CurrentHp = self.RunCurrentHp,
+			MaxHp = self.RunMaxHp,
+			Revision = self.RunHpRevision
 		}
 	end
 
@@ -140,6 +311,7 @@ script PlayerRunStateComponent extends Component
 			self.RunState = "Active"
 		else
 			self.RunState = "Failed"
+			self:FinishRunCombatStats()
 		end
 		log("[PlayerRunState] result recorded sequence=" .. self.RunSequence .. " seed=" .. self.RunSeed .. " result=" .. battleResult .. " stage=" .. stageNumber .. " nextStage=" .. self.CurrentStageNumber .. " completed=" .. self.CompletedStageCount .. " state=" .. self.RunState)
 		return true
@@ -167,11 +339,28 @@ script PlayerRunStateComponent extends Component
 		self.RunFlowRevision = self.RunFlowRevision + 1
 		if self.RunFlowState == "RUN_COMPLETED" then
 			self.RunState = "Completed"
+			self:FinishRunCombatStats()
 		elseif self.RunFlowState == "RUN_FAILED" then
 			self.RunState = "Failed"
+			self:FinishRunCombatStats()
 		end
 		log("[PlayerRunState] flow applied state=" .. self.RunFlowState .. " graph=" .. self.CurrentNodeGraphId .. " node=" .. self.CurrentNodeId .. " nextNodes=" .. self.AvailableNodeIds .. " nextTypes=" .. self.AvailableContentTypes .. " revision=" .. self.RunFlowRevision)
 		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkRunCompleted(string reason)
+		-- Finalizes the real run boundary after the terminal boss reward has been committed.
+		self.RunState = "Completed"
+		self.PrototypeTestMode = false
+		self:FinishRunCombatStats()
+		self.RunFlowState = "RUN_COMPLETED"
+		self.AvailableNodeIds = ""
+		self.AvailableContentTypes = ""
+		self.AvailableContentIds = ""
+		self:ResetContentTransition(reason or "RUN_COMPLETED")
+		self.RunFlowRevision = self.RunFlowRevision + 1
+		log("[PlayerRunState] run completed sequence=" .. self.RunSequence .. " reason=" .. (reason or ""))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -228,6 +417,7 @@ script PlayerRunStateComponent extends Component
 			self.ContentTransitionRevision = self.ContentTransitionRevision + 1
 		elseif self.RunFlowState == "RUN_COMPLETED" then
 			self.RunState = "Completed"
+			self:FinishRunCombatStats()
 		end
 		self.RunFlowRevision = self.RunFlowRevision + 1
 		log("[RunContentFlow] completed type=" .. completedContentType .. " content=" .. completedContentId .. " state=" .. self.RunFlowState .. " nextNodes=" .. self.AvailableNodeIds .. " key=" .. completionKey .. " revision=" .. self.RunFlowRevision)
@@ -282,8 +472,21 @@ script PlayerRunStateComponent extends Component
 			LastContentSelectionKey = self.LastContentSelectionKey,
 			LastContentCompletionKey = self.LastContentCompletionKey,
 			LastCompletedContentType = self.LastCompletedContentType,
-			LastCompletedContentId = self.LastCompletedContentId
+			LastCompletedContentId = self.LastCompletedContentId,
+			SelectedWorldMapBranch = self.SelectedWorldMapBranch,
+			CurrentHp = self.RunCurrentHp,
+			MaxHp = self.RunMaxHp,
+			HpRevision = self.RunHpRevision
 		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishRunCombatStats()
+		-- Observes the existing terminal run state without altering progression or reward rules.
+		local combatStats = self.Entity:GetComponent("script.PlayerRunCombatStatsComponent")
+		if combatStats ~= nil then
+			combatStats:FinishRun()
+		end
 	end
 
 end

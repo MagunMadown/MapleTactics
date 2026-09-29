@@ -1,13 +1,49 @@
 @Logic
-script StageWaveRepositoryLogic
+script StageWaveRepositoryLogic extends Logic
 
 	property string WaveDataSetName = "StageEnemyWaves"
 	property string PoolDataSetName = "EnemySpawnPools"
 	property string EnemyDefinitionDataSetName = "EnemyDefinitions"
 
 	@ExecSpace("ServerOnly")
-	method integer GetTotalWaveCount(string stageId)
-		-- Returns the largest validated WaveIndex for one stage.
+	method integer GetSpawnVariantIndex(string stageId, integer runSeed)
+		-- Rotate three authored placement variants by stage while preserving explicit seed replay.
+		local stageHash = self:GetSpawnHash(stageId, 0)
+		return ((math.floor(math.abs(runSeed)) + stageHash) % 3) + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer GetSpawnHash(string key, integer seed)
+		-- Bounded integer arithmetic stays exact in both Lua integers and engine number values.
+		local value = math.floor(math.abs(seed)) % 2147483647
+		for index = 1, #key do
+			value = (value * 131 + string.byte(key, index)) % 2147483647
+		end
+		return value
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer GetSpawnVariantSeed(string stageId, integer runSeed)
+		-- Each stage has exactly three reproducible spawn plans, independent of other random draws.
+		local variantSeeds = { 104729, 130363, 155921 }
+		local variant = self:GetSpawnVariantIndex(stageId, runSeed)
+		return self:GetSpawnHash(stageId, variantSeeds[variant])
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetVariantEnemySpawnDefinition(string poolId, integer waveIndex, integer spawnIndex, integer variantSeed)
+		-- Salt each slot separately; keep the existing pool weights and wave eligibility checks.
+		local key = poolId .. ":" .. tostring(waveIndex) .. ":" .. tostring(spawnIndex)
+		local seed = self:GetSpawnHash(key, variantSeed)
+		-- Mix away the short consecutive-slot cycle before the weighted pool lookup.
+		seed = (seed * 48271) % 2147483647
+		seed = (seed * 48271) % 2147483647
+		return self:GetEnemySpawnDefinition(poolId, waveIndex, spawnIndex, seed)
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer GetTotalWaveCount(string waveTableId)
+		-- Returns the largest validated WaveIndex for one explicit wave table.
 		local dataSet = _DataService:GetTable(self.WaveDataSetName)
 		if dataSet == nil then
 			log_error("[StageWaveData] dataset missing name=" .. self.WaveDataSetName)
@@ -16,22 +52,22 @@ script StageWaveRepositoryLogic
 
 		local totalWaves = 0
 		for rowIndex = 1, dataSet:GetRowCount() do
-			if dataSet:GetCell(rowIndex, "StageId") == stageId then
+			if dataSet:GetCell(rowIndex, "WaveTableId") == waveTableId then
 				local waveIndex = math.floor(tonumber(dataSet:GetCell(rowIndex, "WaveIndex")) or 0)
 				totalWaves = math.max(totalWaves, waveIndex)
 			end
 		end
-		log("[StageWaveData] stage loaded stage=" .. stageId .. " totalWaves=" .. totalWaves)
+		log("[StageWaveData] table loaded waveTable=" .. waveTableId .. " totalWaves=" .. totalWaves)
 		return totalWaves
 	end
 
 	@ExecSpace("ServerOnly")
-	method table GetWaveDefinition(string stageId, integer waveIndex, integer runSeed)
+	method table GetWaveDefinition(string waveTableId, integer waveIndex, integer runSeed)
 		-- Validates and converts one UserDataSet row into a runtime wave definition.
 		local result = {
 			Success = false,
 			Reason = "ROW_NOT_FOUND",
-			StageId = stageId,
+			WaveTableId = waveTableId,
 			WaveIndex = waveIndex
 		}
 		local dataSet = _DataService:GetTable(self.WaveDataSetName)
@@ -41,13 +77,13 @@ script StageWaveRepositoryLogic
 		end
 
 		for rowIndex = 1, dataSet:GetRowCount() do
-			local rowStageId = dataSet:GetCell(rowIndex, "StageId")
+			local rowWaveTableId = dataSet:GetCell(rowIndex, "WaveTableId")
 			local rowWaveIndex = math.floor(tonumber(dataSet:GetCell(rowIndex, "WaveIndex")) or 0)
-			if rowStageId == stageId and rowWaveIndex == waveIndex then
+			if rowWaveTableId == waveTableId and rowWaveIndex == waveIndex then
 				local triggerMode = dataSet:GetCell(rowIndex, "SpawnTriggerMode") or ""
 				if self:IsValidSpawnTriggerMode(triggerMode) == false then
 					result.Reason = "INVALID_TRIGGER_MODE"
-					log_error("[StageWaveData] invalid mode stage=" .. stageId .. " wave=" .. waveIndex .. " value=" .. triggerMode)
+					log_error("[StageWaveData] invalid mode waveTable=" .. waveTableId .. " wave=" .. waveIndex .. " value=" .. triggerMode)
 					return result
 				end
 
@@ -59,6 +95,7 @@ script StageWaveRepositoryLogic
 				result.SpawnTriggerMode = triggerMode
 				result.ForceAfterTurns = math.max(0, math.floor(tonumber(dataSet:GetCell(rowIndex, "ForceAfterTurns")) or 0))
 				result.ForceAfterSeconds = math.max(0, tonumber(dataSet:GetCell(rowIndex, "ForceAfterSeconds")) or 0)
+				result.TriggerPhaseIndex = math.max(0, math.floor(tonumber(dataSet:GetCell(rowIndex, "TriggerPhaseIndex")) or 0))
 				local enemySpawnDefinition = self:GetEnemySpawnDefinition(result.EnemyPoolId, waveIndex, 1, runSeed)
 				result.EnemyModelId = enemySpawnDefinition.EnemyModelId or ""
 				result.EnemyDefinitionId = enemySpawnDefinition.EnemyDefinitionId or ""
@@ -71,7 +108,7 @@ script StageWaveRepositoryLogic
 				result.EnemyPatternId = enemySpawnDefinition.PatternId
 				result.EnemyMovementPolicy = enemySpawnDefinition.MovementPolicy
 				result.EnemyIsBoss = enemySpawnDefinition.IsBoss
-				if (triggerMode == "TURN_LIMIT" or triggerMode == "TURN_OR_TIME") and result.ForceAfterTurns <= 0 then
+				if (triggerMode == "LONE_ENEMY" or triggerMode == "TURN_LIMIT" or triggerMode == "TURN_OR_TIME") and result.ForceAfterTurns <= 0 then
 					result.Reason = "TURN_LIMIT_MISSING"
 					return result
 				end
@@ -79,10 +116,16 @@ script StageWaveRepositoryLogic
 					result.Reason = "TIME_LIMIT_MISSING"
 					return result
 				end
+				if triggerMode == "BOSS_PHASE" and result.TriggerPhaseIndex < 2 then
+					-- Phase 1 is the opening phase every boss starts in, so it can never act
+					-- as a reinforcement trigger. Require an actual transition target.
+					result.Reason = "BOSS_PHASE_INDEX_MISSING"
+					return result
+				end
 
 				result.Success = true
 				result.Reason = "OK"
-				log("[StageWaveData] wave loaded stage=" .. stageId .. " wave=" .. waveIndex .. " enemy=" .. result.EnemyDefinitionId .. " hp=" .. result.EnemyMaxHp .. " attack=" .. result.EnemyBasicAttackDamage .. " mode=" .. triggerMode .. " count=" .. result.SpawnCount .. " maxConcurrent=" .. result.MaxConcurrent .. " forceTurns=" .. result.ForceAfterTurns .. " forceSeconds=" .. result.ForceAfterSeconds)
+				log("[StageWaveData] wave loaded waveTable=" .. waveTableId .. " wave=" .. waveIndex .. " enemy=" .. result.EnemyDefinitionId .. " hp=" .. result.EnemyMaxHp .. " attack=" .. result.EnemyBasicAttackDamage .. " mode=" .. triggerMode .. " count=" .. result.SpawnCount .. " maxConcurrent=" .. result.MaxConcurrent .. " forceTurns=" .. result.ForceAfterTurns .. " forceSeconds=" .. result.ForceAfterSeconds .. " triggerPhase=" .. result.TriggerPhaseIndex)
 				return result
 			end
 		end
@@ -207,6 +250,20 @@ script StageWaveRepositoryLogic
 					result.InitialFacingPolicy = dataSet:GetCell(rowIndex, "InitialFacingPolicy") or "FACE_PLAYER"
 					result.TraitIds = dataSet:GetCell(rowIndex, "TraitIds") or ""
 					result.IsBoss = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "IsBoss"))
+					result.IdleMotionRuid = dataSet:GetCell(rowIndex, "IdleMotionRuid") or ""
+					result.IdleMotionPlayRate = math.max(0.1, tonumber(dataSet:GetCell(rowIndex, "IdleMotionPlayRate")) or 1)
+					result.MoveMotionRuid = dataSet:GetCell(rowIndex, "MoveMotionRuid") or ""
+					result.MoveMotionPlayRate = math.max(0.1, tonumber(dataSet:GetCell(rowIndex, "MoveMotionPlayRate")) or 1)
+					result.HitMotionRuid = dataSet:GetCell(rowIndex, "HitMotionRuid") or ""
+					result.HitMotionPlayRate = math.max(0.1, tonumber(dataSet:GetCell(rowIndex, "HitMotionPlayRate")) or 1)
+					result.HitMotionDuration = math.max(0.05, tonumber(dataSet:GetCell(rowIndex, "HitMotionDuration")) or 0.25)
+					result.AttackMotionRuid = dataSet:GetCell(rowIndex, "AttackMotionRuid") or ""
+					result.AttackMotionPlayRate = math.max(0.1, tonumber(dataSet:GetCell(rowIndex, "AttackMotionPlayRate")) or 1)
+					result.AttackMotionDuration = math.max(0.05, tonumber(dataSet:GetCell(rowIndex, "AttackMotionDuration")) or 0.35)
+					result.DeathMotionRuid = dataSet:GetCell(rowIndex, "DeathMotionRuid") or ""
+					result.DeathMotionPlayRate = math.max(0.1, tonumber(dataSet:GetCell(rowIndex, "DeathMotionPlayRate")) or 1)
+					result.DeathMotionDuration = math.max(0.05, tonumber(dataSet:GetCell(rowIndex, "DeathMotionDuration")) or 0.5)
+					result.VisualOffsetY = tonumber(dataSet:GetCell(rowIndex, "VisualOffsetY")) or 0
 				if result.PatternId == "" then
 					result.Reason = "ENEMY_PATTERN_MISSING"
 					return result
@@ -214,6 +271,22 @@ script StageWaveRepositoryLogic
 				if result.MovementPolicy ~= "TRACK_PLAYER" and result.MovementPolicy ~= "FIXED_FACING" then
 					result.Reason = "INVALID_ENEMY_MOVEMENT_POLICY"
 					return result
+				end
+				if string.sub(enemyDefinitionId, 1, 9) == "ellinia_" then
+					local requiredMotions = {
+						IdleMotionRuid = result.IdleMotionRuid,
+						MoveMotionRuid = result.MoveMotionRuid,
+						HitMotionRuid = result.HitMotionRuid,
+						AttackMotionRuid = result.AttackMotionRuid,
+						DeathMotionRuid = result.DeathMotionRuid
+					}
+					for fieldName, motionRuid in pairs(requiredMotions) do
+						if motionRuid == "" then
+							result.Reason = "ENEMY_PRESENTATION_MOTION_MISSING"
+							result.DetailReason = fieldName
+							return result
+						end
+					end
 				end
 					if result.InitialFacingPolicy ~= "FACE_PLAYER" and result.InitialFacingPolicy ~= "FIXED_LEFT" and result.InitialFacingPolicy ~= "FIXED_RIGHT" then
 					result.Reason = "INVALID_INITIAL_FACING_POLICY"
@@ -231,9 +304,17 @@ script StageWaveRepositoryLogic
 					result.DetailReason = patternValidation.DetailReason or patternValidation.Reason
 					return result
 				end
+				if result.IsBoss == true then
+					local phaseValidation = _BossPhaseContentValidatorLogic:ValidateByEnemyDefinitionId(enemyDefinitionId)
+					if phaseValidation.Success == false then
+						result.Reason = "INVALID_BOSS_PHASE_REFERENCE"
+						result.DetailReason = phaseValidation.DetailReason or phaseValidation.Reason
+						return result
+					end
+				end
 				result.Success = true
 				result.Reason = "OK"
-					log("[EnemyData] loaded id=" .. enemyDefinitionId .. " hp=" .. result.MaxHp .. " attack=" .. result.BasicAttackDamage .. " pattern=" .. result.PatternId .. " movement=" .. result.MovementPolicy .. " traits=" .. result.TraitIds)
+					log("[EnemyData] loaded id=" .. enemyDefinitionId .. " hp=" .. result.MaxHp .. " attack=" .. result.BasicAttackDamage .. " pattern=" .. result.PatternId .. " movement=" .. result.MovementPolicy .. " traits=" .. result.TraitIds .. " idleMotion=" .. result.IdleMotionRuid .. " attackMotion=" .. result.AttackMotionRuid)
 				return result
 			end
 		end
@@ -244,9 +325,11 @@ script StageWaveRepositoryLogic
 	method boolean IsValidSpawnTriggerMode(string triggerMode)
 		-- Recognizes the closed set of wave pressure policies supported by the runtime.
 		return triggerMode == "CLEAR_ONLY"
+			or triggerMode == "LONE_ENEMY"
 			or triggerMode == "TURN_LIMIT"
 			or triggerMode == "TIME_LIMIT"
 			or triggerMode == "TURN_OR_TIME"
+			or triggerMode == "BOSS_PHASE"
 	end
 
 	method boolean ParseBooleanCell(any cellValue)

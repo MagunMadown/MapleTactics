@@ -1,0 +1,435 @@
+@Logic
+script UpgradeSkillStageLogic extends Logic
+
+	property string UpgradeMapName = "new_upgrade_stage"
+	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Reports that the authoritative upgrade-stage adapter is available.
+		log("[UpgradeSkillStage] logic ready")
+	end
+
+	@ExecSpace("Server")
+	method void RequestUpgradeState()
+		-- Returns only the requesting player's currently owned job skills.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local state = self:BuildUpgradeState(playerEntity)
+		if state.Success == false then
+			log_warning("[UpgradeSkillStage] state rejected user=" .. senderUserId .. " reason=" .. state.Reason)
+			self:ReceiveUpgradeState("", "", "", "", "", "", "", "", "", "", state.Reason, senderUserId)
+			return
+		end
+		log("[UpgradeSkillStage] state ready user=" .. senderUserId .. " bases=" .. state.SkillIds .. " upgrades=" .. state.UpgradeSkillIds)
+		self:ReceiveUpgradeState(state.SkillIds, state.SkillNames, state.SkillIcons, state.SkillTiers, state.SkillDescriptions, state.UpgradeSkillIds, state.UpgradeSkillNames, state.UpgradeSkillIcons, state.UpgradeSkillTiers, state.UpgradeSkillDescriptions, "OK", senderUserId)
+		self:ReceiveUpgradePreviews(state.SkillIds, self:BuildPreviewCatalog(state.SkillIds, state.UpgradeSkillIds), senderUserId)
+		local owner = playerEntity:GetComponent("script.PlayerRunAugmentComponent")
+		self:ReceiveRerollInfo(owner.AvailableRerollCount, state.RerollRevision or 0, "OK", senderUserId)
+	end
+
+
+    @ExecSpace("ServerOnly")
+    method table BuildPreviewCatalog(string skillIds, string upgradeSkillIds)
+        -- Resolves the same authored cast/hit effects used by augmentation selection cards.
+        local previews = {}
+        for skillId in string.gmatch(skillIds .. "|" .. upgradeSkillIds, "([^|]+)") do
+            local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(string.match(skillId, "^([^~]+)") or skillId)
+            if definition.Success then
+                local ruid = definition.CastEffectRuid or ""
+                if ruid == "" then ruid = definition.HitEffectRuid or "" end
+                previews[skillId] = ruid
+            end
+        end
+        return previews
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveUpgradePreviews(string skillIds, table previews)
+        -- Delivers presentation-only effect identifiers to the local upgrade screen.
+        local entity = _EntityService:GetEntityByPath("/ui/UpgradeSkillStageUI/Controller")
+        if not isvalid(entity) then return end
+        local controller = entity:GetComponent("script.UpgradeSkillStageUIComponent")
+        if controller ~= nil then controller:ReceivePreviewCatalog(skillIds, previews) end
+    end
+
+	@ExecSpace("ServerOnly")
+	method table BuildUpgradeState(Entity playerEntity)
+		-- Cache a reward's mixed normal/augment offers on the existing per-player augment owner.
+		if not isvalid(playerEntity) then return { Success = false, Reason = "INVALID_PLAYER" } end
+		if playerEntity.CurrentMap == nil or playerEntity.CurrentMap.Name ~= self.UpgradeMapName then return { Success = false, Reason = "NOT_IN_UPGRADE_STAGE" } end
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if run == nil or run.SelectedJobId == "" then return { Success = false, Reason = "JOB_NOT_SELECTED" } end
+		if inventory == nil or inventory.ActiveRunSequence ~= run.RunSequence then return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" } end
+		if run.LastBattleRecordKey == "" then return { Success = false, Reason = "BATTLE_REWARD_CONTEXT_UNAVAILABLE" } end
+		local owner = _RunManagerLogic:GetOrCreateRunAugmentState(playerEntity)
+		if owner == nil or owner.ActiveRunSequence ~= run.RunSequence then return { Success = false, Reason = "RUN_AUGMENT_UNAVAILABLE" } end
+		local rewardKey = "upgrade_skill_stage:" .. run.LastBattleRecordKey
+		if inventory:ContainsDelimitedKey(inventory.AppliedRewardKeys, rewardKey) then return { Success = false, Reason = "UPGRADE_ALREADY_APPLIED" } end
+		local cacheKey = "max_tier_augments:" .. tostring(run.RunSequence) .. ":" .. rewardKey .. ":" .. tostring(inventory.SkillInventoryRevision) .. ":" .. tostring(owner.AugmentRevision)
+		local cached = owner._T.SkillUpgradeOffers
+		if cached ~= nil and cached.Key == cacheKey then return cached.State end
+		local catalog = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(run.SelectedJobId)
+		if not catalog.Success then return catalog end
+		local augments = _AugmentDefinitionRepositoryLogic:GetSkillAugmentCatalog()
+		if not augments.Success then return augments end
+		local normal = {}
+		local augmented = {}
+		local hiddenOffers = {}
+		local newSkills = {}
+		local canReplaceSold = inventory.PendingSoldSkillChoices > 0 and #inventory:GetDistinctOwnedSkillIds() < inventory.RunSkillBarSlotCount
+		for _, definition in ipairs(catalog.Skills) do
+			if canReplaceSold and definition.SkillTier == 1 and (definition.BaseSkillId or "") == "" and not inventory:HasOwnedSkillInFamily(definition.SkillId, catalog.Skills) then
+				local checked = _ContentValidatorLogic:ValidateSkillById(definition.SkillId)
+				if checked.Success then table.insert(newSkills, { Token = definition.SkillId .. "~NEW", Before = definition, After = definition, AugmentId = "", NewSkill = true }) end
+			end
+			local ownership = inventory:CanUseSkill(definition.SkillId)
+			if ownership.Success or ownership.Reason == "HEAL_CHARGES_EMPTY" then
+				local path = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(run.SelectedJobId, definition.SkillId)
+				if path.Success and definition.CostType ~= "HEAL_CHARGE" then
+					table.insert(normal, { Token = definition.SkillId, Before = definition, After = path.UpgradeDefinition, AugmentId = "" })
+				end
+				-- Only terminal tiers and skills without a tier path can offer normal or hidden augments.
+				if path.Reason == "NO_UPGRADE_PATH" then
+					local effects = _AugmentRuntimeLogic:GetEffectiveSkillBundle(playerEntity, definition.SkillId)
+					if effects.Success and #owner:GetSkillAugmentIds(definition.SkillId) < owner.MaxSkillAugmentStages then
+						local hidden = {}
+						for _, augment in ipairs(augments.Augments) do
+							local recharge = augment.Effects[1].ParamA == "HEAL_CHARGES"
+							if _AugmentRuntimeLogic:CanBindSkillAugment(effects.Data.Definition, effects.Data.EffectSteps, augment)
+								and (definition.CostType ~= "HEAL_CHARGE" or not inventory.HealUnlimited)
+								and (not recharge or inventory:GetHealCharges() < 4) then
+								table.insert(augment.Effects[1].ParamC == "HIDDEN" and hidden or augmented, { Token = definition.SkillId .. "~" .. augment.Definition.AugmentId, Before = definition, After = definition, AugmentId = augment.Definition.AugmentId })
+							end
+						end
+						-- One roll per eligible skill per cached reward, not one roll per hidden variant.
+						if #hidden > 0 and _UtilLogic:RandomIntegerRange(1, 100) <= 10 then
+							table.insert(hiddenOffers, hidden[_UtilLogic:RandomIntegerRange(1, #hidden)])
+						end
+					end
+				end
+			end
+		end
+		local allOffers = {}
+		-- A sold slot receives a dedicated basic-skill selection, never an upgraded skill.
+		if #newSkills > 0 then
+			self:ShuffleOffers(newSkills)
+			local offers = {}
+			for index, offer in ipairs(newSkills) do if index <= 3 then table.insert(offers, offer) end end
+			local state = { Success = true, Reason = "OK", Offers = offers, AllOffers = newSkills, RerollRevision = 0, RewardKey = rewardKey }
+			local formatted = self:FormatUpgradeOffers(playerEntity, state)
+			if not formatted.Success then return formatted end
+			owner._T.SkillUpgradeOffers = { Key = cacheKey, State = state }
+			return state
+		end
+		for _, list in ipairs({ normal, augmented, hiddenOffers }) do for _, offer in ipairs(list) do table.insert(allOffers, offer) end end
+		self:ShuffleOffers(normal)
+		self:ShuffleOffers(augmented)
+		self:ShuffleOffers(hiddenOffers)
+		local offers = {}
+		for _, offer in ipairs(hiddenOffers) do if #offers < 3 then table.insert(offers, offer) end end
+		if #offers < 3 and #augmented > 0 then table.insert(offers, table.remove(augmented, 1)) end
+		if #offers < 3 and #normal > 0 then table.insert(offers, table.remove(normal, 1)) end
+		local remaining = {}
+		for _, offer in ipairs(normal) do table.insert(remaining, offer) end
+		for _, offer in ipairs(augmented) do table.insert(remaining, offer) end
+		self:ShuffleOffers(remaining)
+		for _, offer in ipairs(remaining) do
+			if #offers < 3 then table.insert(offers, offer) end
+		end
+		local state = { Success = true, Reason = "OK", Offers = offers, AllOffers = allOffers, RerollRevision = 0, RewardKey = rewardKey }
+		local formatted = self:FormatUpgradeOffers(playerEntity, state)
+		if not formatted.Success then return formatted end
+		owner._T.SkillUpgradeOffers = { Key = cacheKey, State = state }
+		log("[SkillAugment] offers reward=" .. rewardKey .. " count=" .. #offers .. " augments=" .. #augmented)
+		return state
+	end
+
+	@ExecSpace("ServerOnly")
+	method string BuildSkillStatText(any definition)
+		return _SkillCodexProvider:BuildDescription(definition)
+
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetSkillDamageValue(any definition)
+		-- Sums all authored DAMAGE effect steps so upgrades compare their total damage consistently.
+		if definition == nil or definition.EffectSetId == nil or definition.EffectSetId == "" then
+			return 0
+		end
+		local effectResult = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId)
+		if effectResult.Success == false then
+			return 0
+		end
+		local totalDamage = 0
+		for _, effectStep in ipairs(effectResult.Steps) do
+			if effectStep.EffectType == "DAMAGE" then
+				totalDamage = totalDamage + (effectStep.Value or 0)
+			end
+		end
+		return totalDamage
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetSkillIconRuid(any definition)
+		-- Uses the same authored icon source as the owned-skill HUD and new-skill choices.
+		local iconRuid = definition.IconRuid or ""
+		if iconRuid ~= "" then
+			return iconRuid
+		end
+		local sourceRuid = definition.CastEffectRuid or ""
+		if sourceRuid == "" then
+			sourceRuid = definition.HitEffectRuid or ""
+		end
+		if sourceRuid ~= "" then
+			return "thumbnail://" .. sourceRuid
+		end
+		return self.DefaultSkillIconRuid
+	end
+
+	@ExecSpace("Server")
+	method void RequestApplyUpgrade(string skillId)
+		-- Only an offered server-owned token can consume this battle's single upgrade reward.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		local state = self:BuildUpgradeState(player)
+		if not state.Success then self:ReceiveApplyResult(false, state.Reason, skillId, "", 0, "", senderUserId) return end
+		local selected = nil
+		for _, offer in ipairs(state.Offers) do if offer.Token == skillId then selected = offer end end
+		if selected == nil then self:ReceiveApplyResult(false, "OFFER_NOT_AVAILABLE", skillId, "", 0, "", senderUserId) return end
+		local nextMap = _StageTransitionManagerLogic:GetNextStageMapNameForPlayer(player)
+		if nextMap == "" then self:ReceiveApplyResult(false, "NEXT_STAGE_MAP_UNAVAILABLE", skillId, "", 0, "", senderUserId) return end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		local applied = nil
+		if selected.NewSkill then
+			if inventory.PendingSoldSkillChoices <= 0 or #inventory:GetDistinctOwnedSkillIds() >= inventory.RunSkillBarSlotCount then
+				applied = { Success = false, Reason = "NO_SOLD_SKILL_SLOT" }
+			else
+				applied = inventory:GrantSkill(selected.After.SkillId, 1, state.RewardKey)
+				if applied.Success and applied.GrantedAmount == 1 then inventory.PendingSoldSkillChoices = inventory.PendingSoldSkillChoices - 1 end
+			end
+		elseif selected.AugmentId ~= "" then
+			local owner = player:GetComponent("script.PlayerRunAugmentComponent")
+			if selected.Before.CostType == "HEAL_CHARGE" and selected.AugmentId == "skill_heal" then
+				applied = inventory:GrantHealChargeReward(2, state.RewardKey)
+			else
+			applied = owner:SetSkillAugment(selected.Before.SkillId, selected.AugmentId, state.RewardKey)
+			if applied.Success then
+				inventory.AppliedRewardKeys = inventory:AppendDelimitedKey(inventory.AppliedRewardKeys, state.RewardKey)
+				if selected.AugmentId == "hidden_heal" then inventory.HealUnlimited = true; inventory.InventoryRevision = inventory.InventoryRevision + 1 end
+			end
+			end
+		else
+			applied = inventory:UpgradeSkill(selected.Before.SkillId, selected.After.SkillId, state.RewardKey)
+			if applied.Success and applied.ReplacedAmount ~= 1 then applied = { Success = false, Reason = "UPGRADE_ALREADY_APPLIED" } end
+		end
+		self:ReceiveApplyResult(applied.Success, applied.Reason, selected.Before.SkillId, selected.After.SkillId, selected.After.SkillTier, applied.Success and nextMap or "", senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestSkipUpgrade()
+		-- Skipping also consumes the shared reward receipt, preventing replay after a teleport failure.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		local state = self:BuildUpgradeState(player)
+		if not state.Success and state.Reason ~= "UPGRADE_ALREADY_APPLIED" then self:ReceiveSkipResult(false, state.Reason, "", senderUserId) return end
+		local nextMap = _StageTransitionManagerLogic:GetNextStageMapNameForPlayer(player)
+		if nextMap == "" then self:ReceiveSkipResult(false, "NEXT_STAGE_MAP_UNAVAILABLE", "", senderUserId) return end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if state.Success then inventory.AppliedRewardKeys = inventory:AppendDelimitedKey(inventory.AppliedRewardKeys, state.RewardKey) end
+		self:ReceiveSkipResult(true, "SKIPPED", nextMap, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveUpgradeState(string skillIds, string skillNames, string skillIcons, string skillTiers, string skillDescriptions, string upgradeSkillIds, string upgradeSkillNames, string upgradeSkillIcons, string upgradeSkillTiers, string upgradeSkillDescriptions, string reason)
+		-- Forwards the server-approved selection DTO to the client-only UI controller.
+		local controllerEntity = _EntityService:GetEntityByPath("/ui/UpgradeSkillStageUI/Controller")
+		if isvalid(controllerEntity) == false then
+			log_warning("[UpgradeSkillStage] UI controller entity unavailable reason=" .. reason)
+			return
+		end
+		local controller = controllerEntity:GetComponent("script.UpgradeSkillStageUIComponent")
+		if controller ~= nil then
+			controller:ReceiveState(skillIds, skillNames, skillIcons, skillTiers, skillDescriptions, upgradeSkillIds, upgradeSkillNames, upgradeSkillIcons, upgradeSkillTiers, upgradeSkillDescriptions, reason)
+		end
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveApplyResult(boolean success, string reason, string baseSkillId, string upgradeSkillId, integer upgradeTier, string nextStageMapName)
+		-- Forwards the authoritative apply result to the UI before map transition.
+		local controllerEntity = _EntityService:GetEntityByPath("/ui/UpgradeSkillStageUI/Controller")
+		if isvalid(controllerEntity) == false then
+			return
+		end
+		local controller = controllerEntity:GetComponent("script.UpgradeSkillStageUIComponent")
+		if controller ~= nil then
+			controller:ReceiveApplyResult(success, reason, baseSkillId, upgradeSkillId, upgradeTier, nextStageMapName)
+		end
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveSkipResult(boolean success, string reason, string nextStageMapName)
+		-- Forwards the authoritative skip result to the client-only UI controller.
+		local controllerEntity = _EntityService:GetEntityByPath("/ui/UpgradeSkillStageUI/Controller")
+		if isvalid(controllerEntity) == false then
+			return
+		end
+		local controller = controllerEntity:GetComponent("script.UpgradeSkillStageUIComponent")
+		if controller ~= nil then
+			controller:ReceiveSkipResult(success, reason, nextStageMapName)
+		end
+	end
+
+
+	method void ShuffleOffers(table offers)
+		-- Roll once per reward; client refresh never rerolls the cached selection.
+		for index = #offers, 2, -1 do
+			local other = _UtilLogic:RandomIntegerRange(1, index)
+			offers[index], offers[other] = offers[other], offers[index]
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method string BuildEffectiveStatText(table bundle)
+		-- Shows the same adjusted damage, hit count, range and cooldown used by combat.
+		local definition = bundle.Definition
+		local lines = { _SkillCodexProvider:BuildReadableDescription(definition, bundle.EffectSteps) }
+		if bundle.UnlimitedHeal then table.insert(lines, "사용 횟수: 무제한") end
+		if bundle.HealCharges ~= nil and not bundle.UnlimitedHeal then table.insert(lines, "사용 횟수: " .. tostring(bundle.HealCharges)) end
+		if bundle.AugmentId ~= "" then
+			-- Show each actual modifier on its own line, without redundant trade-off labels.
+			for effect in string.gmatch(bundle.Description or "", "[^/\n]+") do
+				local text = string.match(effect, "^%s*(.-)%s*$")
+				if text ~= "" and text ~= "불이익 없음" then
+					text = string.gsub(text, "대상별 직접 피해", "대상마다 피해")
+					text = string.gsub(text, "직접 피해", "피해")
+					table.insert(lines, "• " .. text)
+				end
+			end
+		end
+		return table.concat(lines, "\n")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table FormatUpgradeOffers(Entity playerEntity, table state)
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local fields = { "SkillIds", "SkillNames", "SkillIcons", "SkillTiers", "SkillDescriptions", "UpgradeSkillIds", "UpgradeSkillNames", "UpgradeSkillIcons", "UpgradeSkillTiers", "UpgradeSkillDescriptions" }
+		local columns = {}
+		for _, field in ipairs(fields) do columns[field] = {} end
+		for _, offer in ipairs(state.Offers) do
+			local beforeResult = _AugmentRuntimeLogic:GetEffectiveSkillBundle(playerEntity, offer.Before.SkillId)
+			if not beforeResult.Success then return { Success = false, Reason = "INVALID_SKILL_CONTENT" } end
+			local before = beforeResult.Data
+			local after = nil
+			if offer.AugmentId ~= "" then
+				local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(offer.After.EffectSetId)
+				if not effects.Success then return { Success = false, Reason = "INVALID_SKILL_CONTENT" } end
+				after = _AugmentRuntimeLogic:BuildSkillBundle(playerEntity, offer.After, effects.Steps, offer.AugmentId)
+			else
+				local afterResult = _AugmentRuntimeLogic:GetEffectiveSkillBundle(playerEntity, offer.After.SkillId)
+				if not afterResult.Success then return { Success = false, Reason = "INVALID_SKILL_CONTENT" } end
+				after = afterResult.Data
+				if not offer.NewSkill then
+					local owner = playerEntity:GetComponent("script.PlayerRunAugmentComponent")
+					for _, augmentId in ipairs(owner:GetSkillAugmentIds(offer.Before.SkillId)) do
+						after = _AugmentRuntimeLogic:ApplySkillModifier(after.Definition, after.EffectSteps, augmentId)
+					end
+				end
+			end
+			if before == nil or after == nil then return { Success = false, Reason = "INVALID_SKILL_CONTENT" } end
+			if offer.Before.CostType == "HEAL_CHARGE" and not offer.NewSkill then
+				before.HealCharges = inventory:GetHealCharges()
+				if offer.AugmentId == "hidden_heal" then after.UnlimitedHeal = true else after.HealCharges = math.min(5, before.HealCharges + 2) end
+			end
+			local name = offer.Before.DisplayName
+			local afterName = offer.After.DisplayName
+			if before.AugmentId ~= "" then name = name .. " · " .. before.AugmentName end
+			if offer.AugmentId ~= "" then afterName = afterName .. " · " .. after.AugmentName end
+			local values = {
+				offer.Token, name, self:GetSkillIconRuid(offer.Before), tostring(offer.Before.SkillTier),
+				self:BuildEffectiveStatText(before), offer.AugmentId ~= "" and offer.Token or offer.After.SkillId,
+				afterName, self:GetSkillIconRuid(offer.After), offer.AugmentId ~= "" and "AUGMENT" or tostring(offer.After.SkillTier),
+				self:BuildEffectiveStatText(after)
+			}
+			if offer.NewSkill then
+				values[4] = "NEW"
+				values[5] = "상태: 판매한 스킬의 빈 자리\n선택: 새 기본 스킬"
+				values[9] = "NEW"
+			else
+				local owner = playerEntity:GetComponent("script.PlayerRunAugmentComponent")
+				local stage = #owner:GetSkillAugmentIds(offer.Before.SkillId)
+				values[5] = values[5] .. "\n강화 횟수: " .. stage .. "/" .. owner.MaxSkillAugmentStages
+				values[10] = values[10] .. "\n강화 횟수: " .. (stage + (offer.AugmentId ~= "" and 1 or 0)) .. "/" .. owner.MaxSkillAugmentStages
+			end
+			for index, field in ipairs(fields) do table.insert(columns[field], values[index]) end
+		end
+		for _, field in ipairs(fields) do state[field] = table.concat(columns[field], "|") end
+		return state
+	end
+
+	@ExecSpace("Server")
+	method void RequestReroll(integer slotIndex, integer expectedRevision, string expectedToken)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		local state = self:BuildUpgradeState(player)
+		if not state.Success then self:ReceiveRerollInfo(0, -1, state.Reason, senderUserId); return end
+		local owner = player:GetComponent("script.PlayerRunAugmentComponent")
+		local revision = state.RerollRevision or 0
+		local old = state.Offers[slotIndex]
+		if slotIndex ~= math.floor(slotIndex) or slotIndex < 1 or slotIndex > 3 or old == nil
+			or expectedRevision ~= revision or old.Token ~= expectedToken then
+			self:ReceiveRerollInfo(owner.AvailableRerollCount, revision, "STALE_OFFER", senderUserId); return
+		end
+		if owner.AvailableRerollCount <= 0 then self:ReceiveRerollInfo(0, revision, "NO_REROLLS", senderUserId); return end
+		local cached = owner._T.SkillUpgradeOffers
+		-- Keep this reward's eligibility/hidden roll fixed; free failed retries must not farm rare offers.
+		local fresh = state
+		local candidates = {}
+		local hidden = {}
+		local shownAlternatives = {}
+		for _, offer in ipairs(fresh.AllOffers) do
+			-- A modifier reroll keeps its skill; a new-skill card must remain a new-skill card.
+			local duplicate = (old.NewSkill == true) ~= (offer.NewSkill == true)
+			if old.NewSkill ~= true then
+				duplicate = duplicate or offer.Before.SkillId ~= old.Before.SkillId
+					or offer.AugmentId == old.AugmentId
+			end
+			local alreadyShown = false
+			for _, shown in ipairs(state.Offers) do if offer.Token == shown.Token then alreadyShown = true end end
+			if not duplicate and alreadyShown and old.AugmentId ~= "" then
+				table.insert(shownAlternatives, offer)
+			end
+			duplicate = duplicate or alreadyShown
+			if not duplicate then
+				table.insert(candidates, offer)
+				if string.find(offer.AugmentId, "hidden_", 1, true) == 1 then table.insert(hidden, offer) end
+			end
+		end
+		local pool = #hidden > 0 and hidden or candidates
+		-- Other cards must not exhaust all modifier rerolls for this skill.
+		if #pool == 0 then pool = shownAlternatives end
+		if #pool == 0 then
+			self:ReceiveRerollInfo(owner.AvailableRerollCount, revision, "NO_ALTERNATIVE", senderUserId)
+			log("[AugmentReroll] unchanged without charge slot=" .. slotIndex .. " token=" .. old.Token)
+			return
+		end
+		local replacement = pool[_UtilLogic:RandomIntegerRange(1, #pool)]
+		local nextState = { Success = true, Reason = "OK", Offers = {}, AllOffers = fresh.AllOffers, RewardKey = state.RewardKey, RerollRevision = revision + 1 }
+		for index, offer in ipairs(state.Offers) do nextState.Offers[index] = index == slotIndex and replacement or offer end
+		local formatted = self:FormatUpgradeOffers(player, nextState)
+		if not formatted.Success then self:ReceiveRerollInfo(owner.AvailableRerollCount, revision, formatted.Reason, senderUserId); return end
+		-- Commit only after a different, valid replacement DTO.
+		owner.AvailableRerollCount = owner.AvailableRerollCount - 1
+		owner._T.SkillUpgradeOffers = { Key = cached.Key, State = nextState }
+		self:ReceiveUpgradeState(nextState.SkillIds, nextState.SkillNames, nextState.SkillIcons, nextState.SkillTiers, nextState.SkillDescriptions, nextState.UpgradeSkillIds, nextState.UpgradeSkillNames, nextState.UpgradeSkillIcons, nextState.UpgradeSkillTiers, nextState.UpgradeSkillDescriptions, "OK", senderUserId)
+		self:ReceiveUpgradePreviews(nextState.SkillIds, self:BuildPreviewCatalog(nextState.SkillIds, nextState.UpgradeSkillIds), senderUserId)
+		self:ReceiveRerollInfo(owner.AvailableRerollCount, nextState.RerollRevision, "REROLLED", senderUserId)
+		log("[AugmentReroll] slot=" .. slotIndex .. " old=" .. old.Token .. " new=" .. replacement.Token .. " remaining=" .. owner.AvailableRerollCount)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveRerollInfo(integer count, integer revision, string reason)
+		local entity = _EntityService:GetEntityByPath("/ui/UpgradeSkillStageUI/Controller")
+		if not isvalid(entity) then return end
+		local ui = entity:GetComponent("script.UpgradeSkillStageUIComponent")
+		if ui ~= nil then ui:ReceiveRerollInfo(count, revision, reason) end
+	end
+
+end

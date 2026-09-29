@@ -1,0 +1,112 @@
+@Logic
+script UnionEffectResolverLogic extends Logic
+
+    @ExecSpace("ServerOnly")
+    method table GetEffectSnapshot(Entity userEntity)
+        -- Resolves every permanent Union effect from the server-owned 2026 allocation.
+        local profileResult = _UnionProfileRepositoryLogic:GetUnionSnapshot(userEntity)
+        if profileResult.Success == false then return profileResult end
+        return self:ResolveFromProfile(profileResult.Snapshot)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ResolveFromProfile(table profile)
+        -- AllocatedUnionStats is the only production effect source; PurchasedLevels is legacy read-only data.
+        local validation = self:ValidateAllocatedUnionStats(profile)
+        if validation.Success == false then return validation end
+        local snapshot = self:CreateEmptyEffectSnapshot()
+        snapshot.RankId = validation.RankId
+        snapshot.RankDisplayName = validation.RankDisplayName
+        snapshot.UnlockedBoardTier = validation.UnlockedBoardTier
+        snapshot.RankUnlockDescription = validation.RankUnlockDescription
+        local allDefinitions = _UnionStatDefinitionRepositoryLogic:GetAllStats()
+        if allDefinitions.Success == false then return allDefinitions end
+        for _, definition in ipairs(allDefinitions.Stats) do
+            local effectiveLevel = math.floor(tonumber(profile.AllocatedUnionStats[definition.StatId]) or 0)
+            if effectiveLevel > 0 then
+                if definition.IsImplemented ~= true then
+                    return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "ALLOCATED_UNION_STAT_NOT_IMPLEMENTED", StatId = definition.StatId }
+                end
+                local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(definition.StatId, effectiveLevel)
+                if levelDefinition.Success == false or (levelDefinition.MatchCount or 0) ~= 1 then
+                    return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = levelDefinition.Reason or "INVALID_UNION_STAT_LEVEL_DEFINITION", StatId = definition.StatId, Level = effectiveLevel }
+                end
+                -- EffectValue is cumulative for the current level, so apply this row once rather than summing prior rows.
+                if self:ApplyEffectValue(snapshot, definition.EffectType, levelDefinition.EffectValue) == false then
+                    return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "UNKNOWN_OR_UNIMPLEMENTED_EFFECT_TYPE", StatId = definition.StatId, EffectType = definition.EffectType }
+                end
+            end
+        end
+        return { Success = true, Reason = "OK", EffectSnapshot = snapshot }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ValidateAllocatedUnionStats(table profile)
+        -- Defends the resolver boundary without consulting legacy PurchasedLevels.
+        if profile == nil or type(profile) ~= "table" then return { Success = false, Reason = "PROFILE_TABLE_MISSING" } end
+        if type(profile.AllocatedUnionStats) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "ALLOCATED_UNION_STATS_MISSING" }
+        end
+        local allocationValidation = _UnionProfileRepositoryLogic:ValidateAllocatedUnionStats(profile.AllocatedUnionStats)
+        if allocationValidation.Success == false then
+            return allocationValidation
+        end
+        local consistencyValidation = _UnionProfileRepositoryLogic:ValidateAllocatedUnionStatConsistency(profile)
+        if consistencyValidation.Success == false then
+            return consistencyValidation
+        end
+        local rank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(math.floor(tonumber(profile.LifetimeUnionPoints) or -1))
+        if rank.Success == false then return rank end
+        return {
+            Success = true,
+            Reason = "OK",
+            RankId = rank.RankId,
+            RankDisplayName = rank.DisplayName,
+            UnlockedBoardTier = rank.UnlockedBoardTier,
+            RankUnlockDescription = rank.UnlockDescription
+        }
+    end
+
+    method table CreateEmptyEffectSnapshot()
+        -- Creates the stable gameplay contract consumed by every STEP 4 integration point.
+        return {
+            MesoGainRate = 0,
+            ItemDropRate = 0,
+            AugmentRerollBonus = 0,
+            UnionPointGainRate = 0,
+            StartingPotionBonus = 0,
+            MaxHPBonus = 0,
+            InventorySlotBonus = 0,
+            StartingSkillBonus = 0,
+            StartingRandomRelicBonus = 0
+        }
+    end
+
+    method boolean ApplyEffectValue(table snapshot, string effectType, number effectValue)
+        -- Maps one validated cumulative level value into the central effect snapshot.
+        if effectType == "MESO_GAIN_RATE" then
+            snapshot.MesoGainRate = snapshot.MesoGainRate + effectValue
+        elseif effectType == "ITEM_DROP_RATE" then
+            snapshot.ItemDropRate = snapshot.ItemDropRate + effectValue
+        elseif effectType == "AUGMENT_REROLL" then
+            snapshot.AugmentRerollBonus = snapshot.AugmentRerollBonus + effectValue
+        elseif effectType == "UNION_POINT_GAIN_RATE" then
+            snapshot.UnionPointGainRate = snapshot.UnionPointGainRate + effectValue
+        elseif effectType == "STARTING_POTION" then
+            snapshot.StartingPotionBonus = snapshot.StartingPotionBonus + effectValue
+        elseif effectType == "MAX_HP" then
+            snapshot.MaxHPBonus = snapshot.MaxHPBonus + effectValue
+        elseif effectType == "INVENTORY_SLOT" then
+            snapshot.InventorySlotBonus = snapshot.InventorySlotBonus + effectValue
+        elseif effectType == "STARTING_SKILL" then
+            snapshot.StartingSkillBonus = snapshot.StartingSkillBonus + effectValue
+        elseif effectType == "STARTING_RANDOM_RELIC" then
+            snapshot.StartingRandomRelicBonus = snapshot.StartingRandomRelicBonus + effectValue
+        -- ADDITIONAL_SKILL_UNLOCK stays disabled until its gameplay rule is defined.
+        else
+            return false
+        end
+        return true
+    end
+
+end

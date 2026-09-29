@@ -1,0 +1,568 @@
+@Logic
+script BattleHudPresenterLogic extends Logic
+
+	property number RefreshInterval = 0.05
+	property number RefreshElapsed = 0
+	property integer StateRevision = 0
+	property integer LastCommandRevision = -1
+	property string LastSignature = ""
+	property table CurrentState = nil
+	property string PendingLocalCommand = ""
+	property integer PendingLocalCommandTimerId = 0
+	property number PendingLocalCommandTimeout = 0.40
+	property number InputBufferSeconds = 0.20
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self:ClearBufferedCommand("PRESENTER_BEGIN")
+		log("[BattleHudPresenter] ready")
+		self:RefreshState(true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		self:ClearBufferedCommand("PRESENTER_END")
+		self:ReleasePendingLocalCommand("", "PRESENTER_END")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		self:UpdateBufferedCommand()
+		self.RefreshElapsed = self.RefreshElapsed + delta
+		if self.RefreshElapsed < self.RefreshInterval then
+			return
+		end
+
+		self.RefreshElapsed = 0
+		self:RefreshState(false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetCurrentState()
+		if self.CurrentState == nil then
+			return {
+				Success = false,
+				ContextVisible = false,
+				ContextReason = "NOT_INITIALIZED",
+				Revision = self.StateRevision,
+				RevisionKey = "Unavailable:NOT_INITIALIZED"
+			}
+		end
+		return self.CurrentState
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsLocalInputBlocked()
+		-- A queued gameplay input must never survive a modal window or map transfer.
+		return self._T.HudTransferPending == true or _GameSettingsLogic:IsInputBlocked()
+			or _RunRelicInventoryUILogic.IsOpen or _SkillTestLogic.KeyboardCaptured == true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CanBufferLocalCommand(table uiState)
+		-- Only enemy-turn presentation can bridge into the next player turn.
+		return uiState ~= nil and uiState.Success == true and uiState.Phase == "EnemyTurn"
+			and uiState.BattleResult == "" and uiState.ContentValidation.IsReady == true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearBufferedCommand(string reason)
+		-- There is one reservation, never a list of future turns.
+		if self._T.BufferedCommand == nil then return end
+		log("[BattleInputBuffer] cleared reason=" .. reason)
+		self._T.BufferedCommand = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SubmitLocalCommand(string commandType, string tileId, integer direction)
+		-- The newest deliberate press replaces the previous reservation, even if invalid.
+		self:ClearBufferedCommand("REPLACED")
+		if self:IsLocalInputBlocked() then return end
+		local session = self:GetBattleSession()
+		if session == nil then return end
+		local uiState = session:GetBattleUiState()
+		if self:CanBufferLocalCommand(uiState) then
+			self._T.BufferedCommand = {
+				Type = commandType, TileId = tileId, Direction = direction,
+				PressedAt = _UtilLogic.ElapsedSeconds, Map = session.Entity,
+				Entry = session.EntryRequestId, Context = session.HudContextRevision,
+				Wave = uiState.Wave.Current, Turn = uiState.TurnNumber
+			}
+			self:PublishCommandResult(commandType, true, "INPUT_BUFFERED", 0)
+			log("[BattleInputBuffer] reserved command=" .. commandType .. " tile=" .. tileId .. " direction=" .. tostring(direction))
+			return
+		end
+		self:DispatchLocalCommand(commandType, tileId, direction)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateBufferedCommand()
+		-- Expiry uses press time, so even a stalled frame cannot replay an old press.
+		local buffered = self._T.BufferedCommand
+		if buffered == nil then return end
+		local age = _UtilLogic.ElapsedSeconds - buffered.PressedAt
+		if age < 0 or age > self.InputBufferSeconds or self:IsLocalInputBlocked() then
+			self:ClearBufferedCommand("EXPIRED_OR_BLOCKED")
+			return
+		end
+		local session = self:GetBattleSession()
+		if session == nil or session.Entity ~= buffered.Map or session.EntryRequestId ~= buffered.Entry
+			or session.HudContextRevision ~= buffered.Context or session.BattleResult ~= "" then
+			self:ClearBufferedCommand("CONTEXT_CHANGED")
+			return
+		end
+		local uiState = session:GetBattleUiState()
+		if uiState == nil or uiState.Success ~= true or uiState.Wave.Current ~= buffered.Wave
+			or uiState.BattleResult ~= "" or uiState.ContentValidation.IsReady ~= true then
+			self:ClearBufferedCommand("STATE_CHANGED")
+			return
+		end
+		-- Phase and turn number may arrive in separate sync updates. Wait within the same short expiry.
+		if uiState.Phase == "EnemyTurn" and (uiState.TurnNumber == buffered.Turn or uiState.TurnNumber == buffered.Turn + 1) then return end
+		if uiState.Phase == "PlayerTurn" and uiState.TurnNumber == buffered.Turn then return end
+		if uiState.Phase ~= "PlayerTurn" or uiState.TurnNumber ~= buffered.Turn + 1 then
+			self:ClearBufferedCommand("TURN_CHANGED")
+			return
+		end
+		if uiState.IsProcessing or self.PendingLocalCommand ~= "" then return end
+		-- Clear before dispatch: rejection or reentrant callbacks can never retry it.
+		self:ClearBufferedCommand("DISPATCH")
+		log("[BattleInputBuffer] dispatch command=" .. buffered.Type .. " age=" .. tostring(age))
+		self:DispatchLocalCommand(buffered.Type, buffered.TileId, buffered.Direction)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DispatchLocalCommand(string commandType, string tileId, integer direction)
+		-- Reuse both the current client guards and the original authoritative RPC validation.
+		if self:TryBeginLocalCommand(commandType) == false then return end
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:ReleasePendingLocalCommand(commandType, "SESSION_MISSING")
+			return
+		end
+		if commandType == "MOVE" then
+			session:RequestMove(direction)
+		elseif commandType == "QUEUE_TILE" then
+			session:RequestQueueTile(tileId)
+		elseif commandType == "EXECUTE_QUEUE" then
+			session:RequestExecuteQueuedTile()
+		elseif commandType == "TURN" then
+			session:PreviewLocalTurnFacing()
+			session:RequestTurn()
+		elseif commandType == "UTILITY" then
+			session:RequestUtilitySkill()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean TryBeginLocalCommand(string commandType)
+		self:ClearBufferedCommand("NEW_COMMAND")
+		if self:IsLocalInputBlocked() then return false end
+		-- Closes the client/server sync gap while BattleTurnComponent remains the authoritative lock owner.
+		if self.PendingLocalCommand ~= "" then
+			self:PublishCommandResult(commandType, false, "LOCAL_INPUT_PENDING", 0)
+			log("[BattleInputFeedback] blocked command=" .. commandType .. " pending=" .. self.PendingLocalCommand)
+			return false
+		end
+
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishCommandResult(commandType, false, "SESSION_MISSING", 0)
+			return false
+		end
+
+		local uiState = session:GetBattleUiState()
+		if uiState == nil or uiState.Success == false then
+			self:PublishCommandResult(commandType, false, uiState == nil and "UI_STATE_MISSING" or uiState.Reason, 0)
+			return false
+		end
+
+		local allowed = false
+		if commandType == "UTILITY" then
+			-- Frostbite only blocks self-moving utilities; the server rejects those with PLAYER_FROSTBITTEN.
+			allowed = uiState.Commands.CanTurn and not uiState.PlayerSealed and session.UtilitySkillId ~= "" and session.UtilityRemainingCooldown <= 0
+		elseif commandType == "MOVE" then
+			allowed = uiState.Commands.CanMove
+		elseif commandType == "TURN" then
+			allowed = uiState.Commands.CanTurn
+		elseif commandType == "QUEUE_TILE" then
+			allowed = uiState.Commands.CanQueue
+		elseif commandType == "EXECUTE_QUEUE" then
+			allowed = uiState.Commands.CanExecute
+		elseif commandType == "REMOVE_QUEUE_ITEM" then
+			allowed = uiState.Commands.CanClear
+		end
+
+		if allowed == false then
+			local reason = "INPUT_LOCKED_" .. tostring(uiState.PlayerActionState)
+			if uiState.PlayerSealed and (commandType == "UTILITY" or commandType == "QUEUE_TILE" or commandType == "EXECUTE_QUEUE") then reason = "PLAYER_SEALED" end
+			if uiState.PlayerFrostbitten and commandType == "MOVE" then reason = "PLAYER_FROSTBITTEN" end
+			if commandType == "EXECUTE_QUEUE" and uiState.PlayerQueue.Count <= 0 then
+				reason = "QUEUE_EMPTY"
+			end
+			self:PublishCommandResult(commandType, false, reason, 0)
+			log("[BattleInputFeedback] rejected command=" .. commandType .. " state=" .. tostring(uiState.PlayerActionState) .. " reason=" .. reason)
+			return false
+		end
+
+		self.PendingLocalCommand = commandType
+		self:PublishCommandResult(commandType, true, "INPUT_RECEIVED", 0)
+		local expectedCommand = commandType
+		local timeout = function()
+			if self.PendingLocalCommand == expectedCommand then
+				self:ReleasePendingLocalCommand(expectedCommand, "LOCAL_TIMEOUT")
+			end
+		end
+		self.PendingLocalCommandTimerId = _TimerService:SetTimerOnce(timeout, math.max(0.20, self.PendingLocalCommandTimeout))
+		log("[BattleInputFeedback] accepted command=" .. commandType .. " state=" .. tostring(uiState.PlayerActionState))
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReleasePendingLocalCommand(string commandType, string reason)
+		if self.PendingLocalCommand == "" then
+			return
+		end
+		if commandType ~= "" and self.PendingLocalCommand ~= commandType then
+			return
+		end
+
+		local releasedCommand = self.PendingLocalCommand
+		self.PendingLocalCommand = ""
+		if self.PendingLocalCommandTimerId > 0 then
+			_TimerService:ClearTimer(self.PendingLocalCommandTimerId)
+			self.PendingLocalCommandTimerId = 0
+		end
+		log("[BattleInputFeedback] released command=" .. releasedCommand .. " reason=" .. tostring(reason))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshState(boolean force)
+		local session = self:GetBattleSession()
+		if self._T.HudTransferPending == true then
+			local player = _UserService.LocalPlayer
+			local map = isvalid(player) and player.CurrentMap or nil
+			local changed = isvalid(map) and map ~= self._T.HudTransferMap
+			if session ~= nil and (session.EntryRequestId ~= self._T.HudTransferEntry or session.HudContextRevision ~= self._T.HudTransferRevision) then
+				changed = true
+			end
+			if changed == false then
+				self:PublishUnavailableState("MAP_TRANSFER_PENDING", force)
+				return
+			end
+			self._T.HudTransferPending = false
+		end
+		if session == nil then
+			self:PublishUnavailableState("BATTLE_CONTEXT_MISSING", force)
+			return
+		end
+
+		local uiState = session:GetBattleUiState()
+		if uiState == nil or uiState.Success == false then
+			self:PublishUnavailableState(uiState == nil and "UI_STATE_MISSING" or uiState.Reason, force)
+			return
+		end
+		if self.PendingLocalCommand ~= "" and uiState.PlayerActionState ~= "READY" and uiState.PlayerActionState ~= "PREPARING_ATTACK" then
+			self:ReleasePendingLocalCommand("", "AUTHORITATIVE_STATE_" .. tostring(uiState.PlayerActionState))
+		end
+
+		local waveState = self:GetBattleWaveState()
+		if waveState == nil then
+			self:PublishUnavailableState("WAVE_STATE_MISSING", force)
+			return
+		end
+
+		local runFlowUi = _RunManagerLogic:GetLocalRunFlowUiState()
+		local runFlowRevision = ""
+		if runFlowUi ~= nil and runFlowUi.Success == true then
+			runFlowRevision = runFlowUi.RevisionKey
+		end
+
+		-- Read the existing run reward accumulation; never substitute account balances.
+		local runUnion = nil
+		local localPlayer = _UserService.LocalPlayer
+		local unionState = isvalid(localPlayer) and localPlayer:GetComponent("script.PlayerRunUnionEffectComponent") or nil
+		if unionState ~= nil and unionState.RewardRunId > 0 and unionState.UnionRewardRevision > 0 then
+			runUnion = {
+				RewardRunId = unionState.RewardRunId,
+				Points = unionState.LastRewardWasCommitted and unionState.LastCommittedUnionPoints or unionState.PendingUnionPoints,
+				Revision = unionState.UnionRewardRevision
+			}
+		end
+		local runUnionSignature = runUnion ~= nil and (tostring(runUnion.RewardRunId) .. ":" .. tostring(runUnion.Revision) .. ":" .. tostring(runUnion.Points)) or ""
+		-- Quantizes only the existing DTO for display; never requests or mutates authoritative statistics.
+		local runStats = nil
+		local statsSource = uiState.RunStats
+		local runStatsSignature = "MISSING"
+		if statsSource ~= nil and statsSource.Success == true and (statsSource.RunSequence or 0) > 0 then
+			local elapsed = statsSource.ElapsedSeconds
+			if statsSource.IsRunning == false and statsSource.FinalElapsedSeconds ~= nil then
+				elapsed = statsSource.FinalElapsedSeconds
+			end
+			if type(elapsed) == "number" and type(statsSource.ConsumedTurns) == "number" and type(statsSource.HitsTaken) == "number" then
+				runStats = {
+					ElapsedSeconds = math.max(0, math.floor(elapsed)),
+					ConsumedTurns = statsSource.ConsumedTurns,
+					HitsTaken = statsSource.HitsTaken,
+					RunSequence = statsSource.RunSequence,
+					Revision = statsSource.Revision,
+					IsRunning = statsSource.IsRunning
+				}
+				runStatsSignature = tostring(runStats.RunSequence) .. ":" .. tostring(runStats.Revision)
+					.. ":" .. tostring(runStats.IsRunning) .. ":" .. tostring(runStats.ElapsedSeconds)
+					.. ":" .. tostring(runStats.ConsumedTurns) .. ":" .. tostring(runStats.HitsTaken)
+			end
+		end
+		local relics = self:GetRelicDisplayState(session)
+		local signature = tostring(session.ResultRewardSnapshot) .. ":" .. tostring(session.ResultReady) .. ":" .. tostring(session.ResultKillCount) .. ":" .. tostring(session.ResultElapsedSeconds) .. ":" .. tostring(session.ResultGold) .. ":" .. runStatsSignature .. ":" .. runUnionSignature .. ":" .. relics.Signature .. ":" .. session.HudProgressSnapshot .. ":" .. tostring(session.Entity.Id) .. ":" .. tostring(session.EntryRequestId) .. ":" .. tostring(session.HudContextRevision) .. ":" .. tostring(uiState.Stage.DisplayName) .. ":" .. tostring(uiState.Stage.StageType) .. ":" .. tostring(uiState.Wave.Total) .. ":" .. tostring(uiState.Wave.State) .. ":" .. tostring(uiState.RunInventory.CurrencySnapshot) .. ":" .. tostring(session.StageId) .. ":" .. tostring(session.StageNumber) .. ":" .. tostring(session.StageTurnNumber) .. ":" .. uiState.RevisionKey .. ":" .. tostring(waveState.CurrentWaveSpawnMode) .. ":" .. tostring(waveState.ForceAfterTurns) .. ":" .. tostring(waveState.WaveSpawnStageTurn) .. ":" .. tostring(waveState.ForceSpawnPending) .. ":" .. tostring(waveState.ForceSpawnPendingReason) .. ":" .. tostring(uiState.Drops.Revision) .. ":" .. tostring(uiState.RunInventory.Revision) .. ":" .. runFlowRevision .. ":" .. tostring(session.SkillSlotIds) .. ":" .. tostring(session.SkillSlotNames) .. ":" .. tostring(session.SkillSlotCooldownTurns) .. ":" .. tostring(session.SkillSlotRevision) .. ":" .. tostring(session.SkillSlotReorderReceiptRevision) .. ":" .. tostring(session.SkillIconSnapshot)
+		if force == false and self.LastSignature == signature and self._T.HudSessionEntity == session.Entity then
+			return
+		end
+
+		self._T.HudSessionEntity = session.Entity
+		self.LastSignature = signature
+		self.StateRevision = self.StateRevision + 1
+		self.CurrentState = {
+			Success = true,
+			ContextVisible = true,
+			ContextReason = "BATTLE_CONTEXT_READY",
+			Revision = self.StateRevision,
+			RevisionKey = signature,
+			ProgressSnapshot = session.HudProgressSnapshot,
+			RunUnion = runUnion,
+			RunStats = runStats,
+			Relics = relics.Items,
+			RelicSignature = relics.DisplayKey or "",
+			Session = {
+				MapId = session.Entity.Id,
+				EntryRequestId = session.EntryRequestId,
+				HudContextRevision = session.HudContextRevision,
+				StageId = session.StageId,
+				StageNumber = session.StageNumber,
+				StageTurnNumber = session.StageTurnNumber,
+				PreparedEnemyIntentState = session.PreparedEnemyIntentState,
+				PreparedEnemyActionType = session.PreparedEnemyActionType,
+				PreparedEnemyTileId = session.PreparedEnemyTileId,
+				PreparedEnemyTelegraphTurnsRemaining = session.PreparedEnemyTelegraphTurnsRemaining,
+				PreparedEnemyTurn = session.PreparedEnemyTurn,
+				BattleResult = session.BattleResult,
+				SkillSlotIds = session.SkillSlotIds,
+				SkillSlotNames = session.SkillSlotNames,
+				SkillSlotCooldownTurns = session.SkillSlotCooldownTurns,
+				SkillSlotRevision = session.SkillSlotRevision,
+				SkillSlotReorderReceiptRevision = session.SkillSlotReorderReceiptRevision,
+				SkillSlotLastRequestId = session.SkillSlotLastRequestId,
+				SkillSlotLastRequestSuccess = session.SkillSlotLastRequestSuccess,
+				SkillSlotLastRequestReason = session.SkillSlotLastRequestReason,
+				SkillSlotLastSourceIndex = session.SkillSlotLastSourceIndex,
+				SkillSlotLastTargetIndex = session.SkillSlotLastTargetIndex,
+				SkillIconSnapshot = session.SkillIconSnapshot
+			},
+			Turn = {
+				BattlePhase = uiState.Phase,
+				TurnNumber = uiState.TurnNumber,
+				QueuedTileIds = uiState.PlayerQueue.QueuedTileIds,
+				ExecutingTileIds = uiState.PlayerQueue.ExecutingTileIds,
+				ExecutingTileIndex = uiState.PlayerQueue.ExecutingIndex,
+				QueuedTileCount = uiState.PlayerQueue.Count,
+				TileQueueCapacity = uiState.PlayerQueue.EffectiveCapacity,
+				QueuedActionType = uiState.LastCommand.Type,
+				IsActionProcessing = uiState.IsProcessing,
+				PlayerActionState = uiState.PlayerActionState
+			},
+			Wave = {
+				CurrentWave = uiState.Wave.Current,
+				TotalWaves = uiState.Wave.Total,
+				WaveState = uiState.Wave.State,
+				CurrentWaveSpawnMode = waveState.CurrentWaveSpawnMode,
+				ForceAfterTurns = waveState.ForceAfterTurns,
+				WaveSpawnStageTurn = waveState.WaveSpawnStageTurn,
+				ForceSpawnPending = waveState.ForceSpawnPending,
+				ForceSpawnPendingReason = waveState.ForceSpawnPendingReason
+			},
+			UiState = uiState,
+			RunFlowUi = runFlowUi
+		}
+
+		self:PublishStateChanged("BATTLE_CONTEXT_READY")
+		self:PublishAuthoritativeCommandResult(uiState.LastCommand)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PrepareForMapTransfer()
+		-- Invalidates display snapshots until a different map or entry generation is observed.
+		local player = _UserService.LocalPlayer
+		local session = self:GetBattleSession()
+		self._T.HudTransferMap = isvalid(player) and player.CurrentMap or nil
+		self._T.HudTransferEntry = session ~= nil and session.EntryRequestId or 0
+		self._T.HudTransferRevision = session ~= nil and session.HudContextRevision or 0
+		self._T.HudTransferPending = true
+		self:PublishUnavailableState("MAP_TRANSFER_PENDING", true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PublishUnavailableState(string reason, boolean force)
+		self:ClearBufferedCommand(reason)
+		self._T.RelicJson = nil
+		self._T.RelicData = nil
+		local signature = "Unavailable:" .. tostring(reason)
+		if force == false and self.LastSignature == signature then
+			return
+		end
+
+		self.LastSignature = signature
+		self.StateRevision = self.StateRevision + 1
+		self.CurrentState = {
+			Success = false,
+			ContextVisible = false,
+			ContextReason = reason,
+			Revision = self.StateRevision,
+			RevisionKey = signature
+		}
+		self:PublishStateChanged(reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PublishStateChanged(string reason)
+		local state = self:GetCurrentState()
+		local event = BattleHudStateChangedEvent()
+		event.Revision = state.Revision
+		event.RevisionKey = state.RevisionKey
+		event.ContextVisible = state.ContextVisible
+		event.Reason = reason
+		self:SendEvent(event)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PublishAuthoritativeCommandResult(table lastCommand)
+		if lastCommand == nil or lastCommand.Revision == nil or lastCommand.Revision <= 0 or lastCommand.Type == nil or lastCommand.Type == "" then
+			return
+		end
+		if lastCommand.Revision <= self.LastCommandRevision then
+			return
+		end
+
+		self.LastCommandRevision = lastCommand.Revision
+		self:ReleasePendingLocalCommand(lastCommand.Type, "AUTHORITATIVE_RESULT_" .. tostring(lastCommand.Reason))
+		self:PublishCommandResult(lastCommand.Type, lastCommand.Success, lastCommand.Reason, lastCommand.Revision)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PublishCommandResult(string commandType, boolean success, string reason, integer revision)
+		local event = BattleHudCommandResultEvent()
+		event.CommandType = commandType
+		event.Success = success
+		event.Reason = reason
+		event.Revision = revision
+		self:SendEvent(event)
+		log("[BattleHudPresenter] command type=" .. tostring(commandType) .. " success=" .. tostring(success) .. " reason=" .. tostring(reason) .. " revision=" .. tostring(revision))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestQueueTile(string tileId)
+		-- Skill clicks and hotkeys share the same single-input reservation.
+		self:SubmitLocalCommand("QUEUE_TILE", tileId, 0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestReorderBattleSkillSlot(integer sourceIndex, integer targetIndex, integer requestId, integer expectedRevision)
+		if _RunRelicInventoryUILogic.IsOpen then return end
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishCommandResult("SWAP_SKILL_SLOTS", false, "SESSION_MISSING", 0)
+			return
+		end
+		session:RequestReorderBattleSkillSlot(sourceIndex, targetIndex, requestId, expectedRevision)
+		log("[BattleHudPresenter] skill slot swap requested request=" .. tostring(requestId) .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " expectedRevision=" .. tostring(expectedRevision))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestExecuteQueue()
+		-- Queue execution follows the same timing policy as movement and loading.
+		self:SubmitLocalCommand("EXECUTE_QUEUE", "", 0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestRemoveQueueItem(integer queueIndex)
+		-- Reuse the authoritative free single-item removal and the local pending-input guard.
+		if self:TryBeginLocalCommand("REMOVE_QUEUE_ITEM") == false then return end
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:ReleasePendingLocalCommand("REMOVE_QUEUE_ITEM", "SESSION_MISSING")
+			return
+		end
+		session:RequestRemoveQueuedTile(queueIndex)
+		log("[PlayerQueueInput] remove requested index=" .. tostring(queueIndex))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestClearQueue()
+		if _RunRelicInventoryUILogic.IsOpen then return end
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishCommandResult("CLEAR_QUEUE", false, "SESSION_MISSING", 0)
+			return
+		end
+		session:RequestClearQueuedTile()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestReturnToLobbyAfterDefeat()
+		-- Forwards the defeat-panel action to the server-owned reset and lobby-transfer boundary.
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:PublishCommandResult("RETURN_TO_LOBBY", false, "SESSION_MISSING", 0)
+			return
+		end
+		session:RequestReturnToLobbyAfterDefeat()
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetBattleSession()
+		local player = _UserService.LocalPlayer
+		if player == nil or player.CurrentMap == nil then
+			return nil
+		end
+		return player.CurrentMap:GetComponent("script.BattleSessionComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetBattleWaveState()
+		local player = _UserService.LocalPlayer
+		if player == nil or player.CurrentMap == nil then
+			return nil
+		end
+		local stateEntity = player.CurrentMap:GetChildByName("BattleWaveState")
+		if stateEntity == nil then
+			return player.CurrentMap:GetComponent("script.BattleWaveComponent")
+		end
+		return stateEntity:GetComponent("script.BattleWaveComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetRelicDisplayState(any session)
+		-- Decode only changed server display data; reject stale owner/run/entry generations.
+		local empty = { Items = {}, Signature = "" }
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) then return empty end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then return empty end
+		local snapshot = session.HudRelicSnapshot or ""
+		if snapshot == "" then return empty end
+		if self._T.RelicJson ~= snapshot then
+			self._T.RelicJson = snapshot
+			local ok, decoded = pcall(function() return _HttpService:JSONDecode(snapshot) end)
+			self._T.RelicData = ok and decoded or nil
+			self._T.RelicItemsKey = ok and type(decoded) == "table" and type(decoded.Items) == "table" and _HttpService:JSONEncode(decoded.Items) or ""
+		end
+		local data = self._T.RelicData
+		if type(data) ~= "table" or type(data.Items) ~= "table" then return empty end
+		if data.UserId ~= player.PlayerComponent.UserId or data.RunSequence ~= inventory.ActiveRunSequence
+			or data.InventoryRevision ~= inventory.InventoryRevision or data.ItemSnapshot ~= inventory.RunItemSnapshot
+			or data.MapId ~= session.Entity.Id or player.CurrentMap ~= session.Entity
+			or data.StageId ~= session.StageId or data.EntryRequestId ~= session.EntryRequestId
+			or data.HudContextRevision ~= session.HudContextRevision then return empty end
+		return { Items = data.Items, Signature = snapshot, DisplayKey = tostring(data.RunSequence) .. ":" .. tostring(data.MapId) .. ":" .. tostring(data.EntryRequestId) .. ":" .. tostring(data.HudContextRevision) .. ":" .. data.StageId .. ":" .. self._T.RelicItemsKey }
+	end
+
+end

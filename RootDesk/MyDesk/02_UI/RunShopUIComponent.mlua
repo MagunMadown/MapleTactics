@@ -1,0 +1,1003 @@
+@Component
+script RunShopUIComponent extends Component
+	property boolean UnionMode = false
+	property boolean UnionPending = false
+	property integer UnionRequestId = 0
+	property number UnionRequestAge = 0
+	property table UnionSnapshot = {}
+	property table UnionOwnedOffers = {}
+	property string UnionMessage = ""
+
+	property table Offers = {}
+	property table RowHandlers = {}
+	property table HoverHandlers = {}
+	property table TooltipHandlers = {}
+	property boolean TooltipSelling = false
+	property integer TooltipIndex = 0
+	property any CloseHandler = nil
+	property any BuyHandler = nil
+	property any SellHandler = nil
+	property table SellHandlers = {}
+	property table SellOffers = {}
+	property integer SelectedSellIndex = 0
+	property boolean SalePending = false
+	property integer PendingSaleRevision = -1
+	property string SaleMessage = ""
+	property boolean AvatarBound = false
+	property table SellIconSizes = {}
+	property integer SellRowCount = 40
+	property string SellFilter = "ALL"
+	property table FilterHandlers = {}
+	property number LastSellClickTime = -1
+	property string LastSellClickedId = ""
+	property number LastBuyClickTime = -1
+	property string LastBuyClickedId = ""
+	property boolean BuybackMode = false
+	property boolean BuybackPending = false
+	property integer BuybackPage = 1
+	property integer BuybackPageCount = 1
+	property string BuybackMessage = ""
+	property table BuybackHandlers = {}
+	property integer SelectedOfferIndex = 0
+	property integer PurchaseRequestId = 200000
+	property string LastRevisionKey = ""
+	property string LastShopContextKey = ""
+	property boolean WaitingForOpen = false
+	property string HoverSoundRUID = "159bf70a74634bfc8e91a29e527a4be5"
+	property string ClickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleUnionShopKey(KeyDownEvent event)
+		-- Escape closes the open shop (lobby union shop or run shop) without affecting run progression.
+		if event.key ~= KeyboardKey.Escape then return end
+		local popup = self:GetEntity("ShopPopup")
+		if self.UnionMode or (isvalid(popup) and popup.Enable) then self:CloseUi() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Connect both trading panes once for the lifetime of this UI.
+		for _, filter in ipairs({ "ALL", "ITEM", "CONSUMABLE", "SKILL" }) do
+			local selectedFilter = filter
+			local tab = self:GetEntity("ShopPopup/SellTabs/" .. filter)
+			if isvalid(tab) then self.FilterHandlers[filter] = tab:ConnectEvent(ButtonClickEvent, function() self:SelectSellFilter(selectedFilter) end) end
+		end
+		local sellButton = self:GetEntity("ShopPopup/SellButton")
+		if isvalid(sellButton) then self.SellHandler = sellButton:ConnectEvent(ButtonClickEvent, self.OnSellClicked) end
+		for index = 1, self.SellRowCount do
+			local row = self:GetEntity("ShopPopup/SellFrame/ListScroll/SellRow" .. tostring(index))
+			if isvalid(row) then
+				local selected = index
+				self.SellHandlers[index] = row:ConnectEvent(ButtonClickEvent, function() self:SelectSellOffer(selected) end)
+			end
+		end
+		local closeButton = self:GetEntity("ShopPopup/CloseButton")
+		local buyButton = self:GetEntity("ShopPopup/DetailPanel/BuyButton")
+		if isvalid(closeButton) then
+			self.CloseHandler = closeButton:ConnectEvent(ButtonClickEvent, self.OnCloseClicked)
+			self.HoverHandlers[18] = closeButton:ConnectEvent(UITouchEnterEvent, self.OnAnyHover)
+		end
+		if isvalid(buyButton) then
+			self.BuyHandler = buyButton:ConnectEvent(ButtonClickEvent, self.OnBuyClicked)
+			self.HoverHandlers[19] = buyButton:ConnectEvent(UITouchEnterEvent, self.OnAnyHover)
+		end
+		for rowIndex = 1, 17 do
+			local row = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex))
+			if isvalid(row) then
+				local capturedIndex = rowIndex
+				self.RowHandlers[rowIndex] = row:ConnectEvent(ButtonClickEvent, function() self:SelectOffer(capturedIndex) end)
+				self.HoverHandlers[rowIndex] = row:ConnectEvent(UITouchEnterEvent, self.OnAnyHover)
+			end
+		end
+		self:BindTooltipRows()
+		for name, action in pairs({BuyTab = function() self:SelectBuyMode(false) end,
+			BuybackTab = function() self:SelectBuyMode(true) end,
+			BuybackPrevious = function() self:ChangeBuybackPage(-1) end,
+			BuybackNext = function() self:ChangeBuybackPage(1) end,
+			BuybackButton = function() self:OnBuyClicked() end}) do
+			local button = self:GetEntity("ShopPopup/" .. name)
+			if isvalid(button) then self.BuybackHandlers[name] = button:ConnectEvent(ButtonClickEvent, action) end
+		end
+		self:SetPopupVisible(false)
+		log("[RunShopUI] controller ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCloseClicked()
+		_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 1)
+		self:CloseUi()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnAnyHover()
+		_GameSettingsLogic:PlayUISound(self.HoverSoundRUID, 1)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OpenUi()
+		-- Opens the existing shop and redraws its status even when the revision is unchanged.
+		if self.UnionMode then self:CloseUi() end
+		if _RunRelicInventoryUILogic.IsOpen then return end
+		local flow = _RunManagerLogic:GetLocalRunFlowUiState()
+		if flow.Success ~= true or flow.Transition.ContentType ~= "SHOP" or flow.Commands.CanCompleteContent ~= true then
+			self:SetStatus(flow.Reason or "SHOP_NOT_AVAILABLE")
+			return
+		end
+		self.WaitingForOpen = true
+		self.AvatarBound = false
+		self.LastRevisionKey = ""
+		self:SetPopupVisible(true)
+		self:SetStatus("상점 정보를 불러오는 중입니다.")
+		_RunShopLogic:RequestOpenSelectedShop()
+		log("[RunShopUI] open requested selected=" .. flow.Transition.ContentId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseUi()
+		-- Restore shared controls before returning this screen to the run shop.
+		if self.UnionMode then self:SetUnionLayout(false) end
+		self.UnionMode = false
+		self.UnionPending = false
+		self.UnionRequestId = self.UnionRequestId + 1
+		self.WaitingForOpen = false
+		self.LastBuyClickedId = ""
+		self.LastSellClickedId = ""
+		self:SetPopupVisible(false)
+		log("[RunShopUI] popup hidden without completing shop")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Refresh only changed synchronized data; retry portrait binding until the player exists.
+		local popup = self:GetEntity("ShopPopup")
+		if isvalid(popup) == false or popup.Enable == false then return end
+		if self.UnionMode then
+			local player = _UserService.LocalPlayer
+			if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then self:CloseUi() return end
+			self:UpdateTooltipPosition()
+			if not self.AvatarBound then self:BindPlayerAvatar() end
+			if self.UnionPending then
+				self.UnionRequestAge = self.UnionRequestAge + delta
+				if self.UnionRequestAge > 15 then
+					self.UnionPending = false
+					self.UnionSnapshot = {}
+					self.UnionMessage = "응답이 지연되고 있습니다. 상점을 다시 열어 주세요."
+					self:RefreshUnionShop()
+				end
+			end
+			return
+		end
+		self:UpdateTooltipPosition()
+		if not self.AvatarBound then self:BindPlayerAvatar() end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success ~= true then
+			self:SetStatus(state.Reason or "SHOP_STATE_UNAVAILABLE")
+			return
+		end
+		-- Synced fields may arrive after their revision; compare the rendered data too.
+		local refreshKey = table.concat({
+			state.RevisionKey or "", state.ShopState or "", state.ShopId or "",
+			state.NodeId or "", tostring(state.VisitSequence or 0), state.ShopDisplayName or "",
+			state.OfferSnapshot or "", state.PurchasedOfferIds or "",
+			state.CurrencySnapshot or "", state.ItemSnapshot or "",
+			state.SkillSnapshot or "", state.ConsumableSnapshot or "",
+			state.LastPurchase.OfferId or "", tostring(state.LastPurchase.Success),
+			state.LastPurchase.Reason or "", tostring(state.Commands.CanPurchase),
+			state.SellCatalogSnapshot or "", tostring(self.SalePending), self.SaleMessage,
+			state.BuybackSnapshot or "", tostring(self.BuybackPending), self.BuybackMessage
+		}, "\n")
+		if refreshKey == self.LastRevisionKey then return end
+		if state.ShopState == "OPEN" then self.WaitingForOpen = false end
+		self:RefreshFromState(state)
+		self.LastRevisionKey = refreshKey
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshFromState(table state)
+		-- Rebuilds the offer list with readable name, category, price, and sold-state labels.
+		self:HideItemTooltip()
+		local contextKey = (state.ShopId or "") .. ":" .. (state.NodeId or "") .. ":" .. tostring(state.VisitSequence or 0)
+		if contextKey ~= self.LastShopContextKey then
+			self.LastShopContextKey = contextKey
+			self.SelectedOfferIndex = 0
+			self.SelectedSellIndex = 0
+			self.SellFilter = "ALL"
+			self.SalePending = false
+			self.SaleMessage = ""
+			self.BuybackMode = false
+			self.BuybackPage = 1
+			self.BuybackPending = false
+			self.BuybackMessage = ""
+		end
+		self.Offers = self:ParseOffers(state.OfferSnapshot)
+		if self.BuybackMode then
+			local all = self:ParseOffers(state.BuybackSnapshot)
+			self.BuybackPageCount = math.max(1, math.ceil(#all / 17))
+			self.BuybackPage = math.min(self.BuybackPage, self.BuybackPageCount)
+			self.Offers = {}
+			for i = (self.BuybackPage - 1) * 17 + 1, math.min(self.BuybackPage * 17, #all) do table.insert(self.Offers, all[i]) end
+		end
+		self:RefreshBuybackControls(state)
+		self:SetText("ShopPopup/Title", "상점")
+		self:SetText("ShopPopup/GoldPanel/Fill/GoldText", tostring(self:GetSnapshotAmount(state.CurrencySnapshot, "gold")))
+		for rowIndex = 1, 17 do
+			local row = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex))
+			local offer = self.Offers[rowIndex]
+			if isvalid(row) then
+				local visible = offer ~= nil
+				row.Enable = visible
+				row.Visible = visible
+				if visible then
+					local sold = self:ContainsId(state.PurchasedOfferIds, offer.OfferId)
+					row.ButtonComponent.Enable = not sold
+					row.TextGUIRendererComponent.Text = offer.DisplayName
+					self:SetText("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex) .. "/CategoryText", offer.ItemCategory)
+					self:SetText("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex) .. "/PriceText", sold and "판매 완료" or (tostring(offer.Price) .. " 골드"))
+					local iconPath = "ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex) .. "/Icon"
+					if offer.RewardType == "CONSUMABLE" then self:SetSellImage(iconPath, offer.IconImageRUID) else self:SetImage(iconPath, offer.IconImageRUID) end
+					self:SetText("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex) .. "/Stock/Label", "남은 수량: " .. (sold and "0" or "1"))
+				end
+			end
+		end
+		if self.SelectedOfferIndex <= 0 or self.Offers[self.SelectedOfferIndex] == nil then
+			self.SelectedOfferIndex = #self.Offers > 0 and 1 or 0
+		end
+		self:RefreshSelectedOffer(state)
+		self:RefreshSellOffers(state)
+		if self.BuybackMode then
+			self:SetStatus(self.BuybackMessage ~= "" and self.BuybackMessage or (#self.Offers == 0 and "재구매할 유물이나 포션이 없습니다." or "판매했던 가격으로 1개씩 재구매합니다."))
+		elseif state.LastPurchase.Reason ~= "" and state.LastPurchase.Reason ~= "SHOP_OPENED" then
+			local reason = state.LastPurchase.Reason
+			if reason == "PURCHASE_APPLIED" or reason == "DUPLICATE_PURCHASE_IGNORED" or reason == "DUPLICATE_PURCHASE_REQUEST_IGNORED" then
+				self:SetStatus("구매가 완료되었습니다.")
+			elseif reason == "INSUFFICIENT_CURRENCY" then
+				self:SetStatus("골드가 부족합니다.")
+			elseif reason == "CONSUMABLE_CAPACITY_FULL" then
+				self:SetStatus("물약 보유 한도에 도달했습니다. 사용하거나 판매한 뒤 구매해 주세요.")
+			elseif reason == "SHOP_NOT_OPEN" then
+				self:SetStatus("상점을 다시 열어 주세요.")
+			else
+				self:SetStatus(reason)
+			end
+		elseif #self.Offers == 0 then
+			self:SetStatus("판매 중인 상품이 없습니다.")
+		else
+			self:SetStatus("더블클릭으로 아이템을 구매합니다.")
+		end
+		log("[RunShopUI] refreshed shop=" .. state.ShopId .. " offers=" .. tostring(#self.Offers) .. " items=" .. state.ItemSnapshot)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectOffer(integer rowIndex)
+		-- Union selections use the same list but a separate authoritative catalog.
+		if self.UnionMode then
+			self.SelectedOfferIndex = rowIndex
+			self:RefreshUnionShop()
+			return
+		end
+		if self.Offers[rowIndex] == nil then return end
+		_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 1)
+		self.SelectedOfferIndex = rowIndex
+		local now = _UtilLogic.ElapsedSeconds
+		local offerId = self.Offers[rowIndex].OfferId
+		local doubleClick = self.LastBuyClickedId == offerId and now - self.LastBuyClickTime <= 0.3
+		self.LastBuyClickedId = offerId
+		self.LastBuyClickTime = now
+		if doubleClick then self.LastBuyClickedId = "" self:OnBuyClicked() end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success == true then self:RefreshSelectedOffer(state) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshSelectedOffer(table state)
+		-- Updates the detail card and keeps the selected offer visually distinct in the list.
+		local offer = self.Offers[self.SelectedOfferIndex]
+		local buy = self:GetEntity("ShopPopup/DetailPanel/BuyButton")
+		self:RefreshOfferRowVisuals(state)
+		if offer == nil then
+			self:SetText("ShopPopup/DetailPanel/ItemName", "판매 중인 상품이 없습니다")
+			self:SetText("ShopPopup/DetailPanel/CategoryText", "")
+			self:SetText("ShopPopup/DetailPanel/OwnedText", "")
+			self:SetText("ShopPopup/DetailPanel/PriceText", "")
+			local icon = self:GetEntity("ShopPopup/DetailPanel/ItemIcon")
+			if isvalid(icon) then icon.Enable = false end
+			if isvalid(buy) then
+				buy.ButtonComponent.Enable = false
+				buy.TextGUIRendererComponent.Text = "구매"
+			end
+			return
+		end
+		local ownedSnapshot = state.ItemSnapshot
+		if offer.RewardType == "SKILL" then
+			ownedSnapshot = state.SkillSnapshot
+		elseif offer.RewardType == "CONSUMABLE" then
+			ownedSnapshot = state.ConsumableSnapshot
+		end
+		local owned = self:GetSnapshotAmount(ownedSnapshot, offer.RewardRefId)
+		local sold = self:ContainsId(state.PurchasedOfferIds, offer.OfferId)
+		self:SetText("ShopPopup/DetailPanel/ItemName", offer.DisplayName)
+		self:SetText("ShopPopup/DetailPanel/CategoryText", offer.EffectDescription)
+		self:SetText("ShopPopup/DetailPanel/OwnedText", "보유  " .. tostring(owned))
+		self:SetText("ShopPopup/DetailPanel/PriceText", "가격  " .. tostring(offer.Price) .. " 골드")
+		if isvalid(buy) then
+			buy.ButtonComponent.Enable = state.Commands.CanPurchase and not sold
+			buy.TextGUIRendererComponent.Text = sold and "판매 완료" or "구매"
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshOfferRowVisuals(table state)
+		-- Applies normal, selected, and sold colors without hiding item artwork.
+		for rowIndex = 1, 17 do
+			local row = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex))
+			local offer = self.Offers[rowIndex]
+			if isvalid(row) and row.Enable and offer ~= nil then
+				local sold = self:ContainsId(state.PurchasedOfferIds, offer.OfferId)
+				local selected = rowIndex == self.SelectedOfferIndex
+				local selectedBar = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex) .. "/SelectedBar")
+				if isvalid(selectedBar) then selectedBar.Enable = selected and not sold end
+				if row.SpriteGUIRendererComponent ~= nil then
+					if sold then
+						row.SpriteGUIRendererComponent.Color = Color(0.74, 0.77, 0.79, 1.0)
+					elseif selected then
+						row.SpriteGUIRendererComponent.Color = Color(0.77, 0.91, 0.94, 1.0)
+					else
+						row.SpriteGUIRendererComponent.Color = Color(0.82, 0.84, 0.85, 1.0)
+					end
+				end
+				if row.TextGUIRendererComponent ~= nil then
+					row.TextGUIRendererComponent.FontColor = sold and Color(0.42, 0.46, 0.49, 1.0) or Color(0.08, 0.10, 0.12, 1.0)
+				end
+			end
+		end
+		log("[RunShopUI] row visuals selected=" .. tostring(self.SelectedOfferIndex))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBuyClicked()
+		-- Never route Union purchases into the gold shop RPC.
+		if self.UnionMode then
+			local product = self.Offers[self.SelectedOfferIndex]
+			if product ~= nil then self:SendUnionAction(product.Kind == "SKIN" and _UnionShopServiceLogic:OwnsSkin(self.UnionSnapshot, product.Id) and "EQUIP" or "BUY", product.Id) end
+			return
+		end
+		if self.BuybackMode then
+			if self.BuybackPending then return end
+			local offer = self.Offers[self.SelectedOfferIndex]
+			local state = _RunShopLogic:GetLocalShopUiState()
+			if offer == nil or not state.Success or state.ShopState ~= "OPEN" then return end
+			self.BuybackPending = true
+			self.BuybackMessage = "재구매 중입니다."
+			self.LastRevisionKey = ""
+			_RunShopLogic:RequestBuybackItem(offer.OfferId, state.RunSequence, state.VisitSequence, state.InventoryRevision)
+			return
+		end
+		local offer = self.Offers[self.SelectedOfferIndex]
+		log("[RunShopUI] buy clicked selected=" .. tostring(self.SelectedOfferIndex))
+		if offer == nil then
+			self:SetStatus("더블클릭으로 아이템을 구매합니다.")
+			return
+		end
+		_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 1)
+		self.PurchaseRequestId = self.PurchaseRequestId + 1
+		self:SetStatus("구매를 요청했습니다.")
+		_RunShopLogic:RequestPurchaseOffer(offer.OfferId, self.PurchaseRequestId)
+		log("[RunShopUI] purchase requested offer=" .. offer.OfferId .. " request=" .. self.PurchaseRequestId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table ParseOffers(string snapshot)
+		-- Read numeric bonuses and their shared effect description after the original fields.
+		local offers = {}
+		for rawOffer in string.gmatch(snapshot or "", "([^|]+)") do
+			local fields = {}
+			for field in string.gmatch(rawOffer .. "~", "([^~]*)~") do table.insert(fields, field) end
+			if #fields >= 10 then
+				table.insert(offers, { OfferId = fields[1], DisplayName = fields[2], RewardType = fields[3], RewardRefId = fields[4], RewardAmount = tonumber(fields[5]) or 0, CurrencyId = fields[6], Price = tonumber(fields[7]) or 0, Order = tonumber(fields[8]) or 0, IconImageRUID = fields[9], ItemCategory = fields[10], AttackBonus = tonumber(fields[11]) or 0, MaxHpBonus = tonumber(fields[12]) or 0, DefenseBonus = tonumber(fields[13]) or 0, EffectDescription = fields[14] or "" })
+			end
+		end
+		return offers
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindPlayerAvatar()
+		-- Mirror the local player's actual equipped appearance in the personal header.
+		local player = _UserService.LocalPlayer
+		local avatar = self:GetEntity("ShopPopup/PersonalHeader/Avatar")
+		if not isvalid(player) or not isvalid(avatar) or player.CostumeManagerComponent == nil then return end
+		local target = avatar.CostumeManagerComponent
+		if target == nil then return end
+		target.UseCustomEquipOnly = true
+		for _, category in ipairs({ MapleAvatarItemCategory.Body, MapleAvatarItemCategory.Hair, MapleAvatarItemCategory.Face,
+			MapleAvatarItemCategory.Cap, MapleAvatarItemCategory.Cape, MapleAvatarItemCategory.Coat,
+			MapleAvatarItemCategory.Glove, MapleAvatarItemCategory.Longcoat, MapleAvatarItemCategory.Pants,
+			MapleAvatarItemCategory.Shoes, MapleAvatarItemCategory.OneHandedWeapon, MapleAvatarItemCategory.TwoHandedWeapon,
+			MapleAvatarItemCategory.SubWeapon, MapleAvatarItemCategory.FaceAccessory, MapleAvatarItemCategory.EyeAccessory,
+			MapleAvatarItemCategory.EarAccessory, MapleAvatarItemCategory.Ear }) do
+			target:SetEquip(category, player.CostumeManagerComponent:GetEquip(category))
+		end
+		self:SetText("ShopPopup/PersonalHeader/PlayerName", player.PlayerComponent.Nickname)
+		self.AvatarBound = true
+		log("[RunShopUI] personal avatar bound")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshSellOffers(table state)
+		-- Show owned relics and consumables using the visit's authoritative sell-price catalog.
+		local selectedId = self.SellOffers[self.SelectedSellIndex] ~= nil and self.SellOffers[self.SelectedSellIndex].ItemId or ""
+		self.SellOffers = {}
+		for raw in string.gmatch(state.SellCatalogSnapshot or "", "([^|]+)") do
+			local fields = {}
+			for field in string.gmatch(raw .. "~", "([^~]*)~") do table.insert(fields, field) end
+			if #fields >= 6 then
+				local itemType = fields[6]
+				local ownedSnapshot = itemType == "SKILL" and state.SkillSnapshot or (itemType == "ITEM" and state.ItemSnapshot or state.ConsumableSnapshot)
+				local count = self:GetSnapshotAmount(ownedSnapshot, fields[1])
+				if count > 0 and (self.SellFilter == "ALL" or self.SellFilter == itemType) then
+					table.insert(self.SellOffers, { ItemId = fields[1], DisplayName = fields[2], Icon = fields[3], Price = tonumber(fields[4]) or 0, Description = fields[5], Count = count, ItemType = itemType })
+				end
+			end
+		end
+		self.SelectedSellIndex = #self.SellOffers > 0 and 1 or 0
+		for index, offer in ipairs(self.SellOffers) do
+			if offer.ItemId == selectedId then self.SelectedSellIndex = index end
+		end
+		if self.SalePending and self.PendingSaleRevision >= 0 and (state.InventoryRevision or 0) >= self.PendingSaleRevision then
+			self.SalePending = false
+			self.PendingSaleRevision = -1
+		end
+		local empty = self:GetEntity("ShopPopup/SellFrame/Empty")
+		if isvalid(empty) then empty.Enable = #self.SellOffers == 0 end
+		for index = 1, self.SellRowCount do
+			local path = "ShopPopup/SellFrame/ListScroll/SellRow" .. tostring(index)
+			local row = self:GetEntity(path)
+			local offer = self.SellOffers[index]
+			if isvalid(row) then
+				row.Enable = offer ~= nil
+				row.Visible = offer ~= nil
+				if offer ~= nil then
+					row.TextGUIRendererComponent.Text = offer.DisplayName
+					self:SetSellImage(path .. "/Icon", offer.Icon)
+					self:SetText(path .. "/PriceText", tostring(offer.Price) .. " 골드")
+					self:SetText(path .. "/Stock/Label", "보유 수량: " .. tostring(offer.Count))
+				end
+			end
+		end
+		self:RefreshSellSelection(state)
+		for _, filter in ipairs({ "ALL", "ITEM", "CONSUMABLE", "SKILL" }) do
+			local tab = self:GetEntity("ShopPopup/SellTabs/" .. filter)
+			if isvalid(tab) then tab.SpriteGUIRendererComponent.Color = self.SellFilter == filter and Color(0.16, 0.70, 0.79, 1) or Color(0.43, 0.48, 0.54, 1) end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectSellFilter(string filter)
+		-- Filter owned items locally; transaction validation remains server-side.
+		if self.UnionMode then return end
+		self:HideItemTooltip()
+		self.SellFilter = filter
+		_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 1)
+		local scroll = self:GetEntity("ShopPopup/SellFrame/ListScroll")
+		if isvalid(scroll) then scroll.ScrollLayoutGroupComponent:ResetScrollPosition(UITransformAxis.Vertical) end
+		self.LastSellClickedId = ""
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success then self:RefreshSellOffers(state) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectSellOffer(integer index)
+		-- Select an inventory row without selling on an accidental first click.
+		if self.UnionMode then self.SelectedSellIndex = index self:RefreshUnionShop() return end
+		if self.SellOffers[index] == nil then return end
+		_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 1)
+		self.SelectedSellIndex = index
+		local now = _UtilLogic.ElapsedSeconds
+		local itemId = self.SellOffers[index].ItemId
+		local doubleClick = self.LastSellClickedId == itemId and now - self.LastSellClickTime <= 0.3
+		self.LastSellClickedId = itemId
+		self.LastSellClickTime = now
+		if doubleClick then self.LastSellClickedId = "" self:OnSellClicked() end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success then self:RefreshSellSelection(state) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshSellSelection(table state)
+		-- Keep selection, empty state, and transaction availability synchronized.
+		local offer = self.SellOffers[self.SelectedSellIndex]
+		self:SetText("ShopPopup/SellDetail/Name", offer ~= nil and offer.DisplayName or "판매할 아이템이 없습니다")
+		self:SetText("ShopPopup/SellDetail/Description", offer ~= nil and offer.Description or "획득한 유물과 소비 아이템을 판매할 수 있습니다.")
+		local button = self:GetEntity("ShopPopup/SellButton")
+		if isvalid(button) then
+			button.ButtonComponent.Enable = offer ~= nil and state.ShopState == "OPEN" and not self.SalePending
+			button.TextGUIRendererComponent.Text = self.SalePending and "판매 중" or "아이템 판매"
+			button.SpriteGUIRendererComponent.Color = button.ButtonComponent.Enable and Color(0.15, 0.67, 0.76, 1) or Color(0.36, 0.42, 0.46, 1)
+		end
+		for index = 1, self.SellRowCount do
+			local path = "ShopPopup/SellFrame/ListScroll/SellRow" .. tostring(index)
+			local row = self:GetEntity(path)
+			local selected = index == self.SelectedSellIndex
+			if isvalid(row) then row.SpriteGUIRendererComponent.Color = selected and Color(0.77, 0.91, 0.94, 1) or Color(0.82, 0.84, 0.85, 1) end
+			local bar = self:GetEntity(path .. "/SelectedBar")
+			if isvalid(bar) then bar.Enable = selected end
+		end
+		self:SetText("ShopPopup/SaleStatus", self.SaleMessage ~= "" and self.SaleMessage or "더블클릭으로 아이템을 1개 판매합니다.")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSellClicked()
+		-- Submit identity and expected inventory state, never an amount or a client-authored price.
+		if self.UnionMode then
+			local product = self.UnionOwnedOffers[self.SelectedSellIndex]
+			if product ~= nil and product.Kind == "SKIN" then self:SendUnionAction("EQUIP", product.Id) end
+			return
+		end
+		if self.SalePending then return end
+		local offer = self.SellOffers[self.SelectedSellIndex]
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if offer == nil or not state.Success or state.ShopState ~= "OPEN" then return end
+		_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 1)
+		self.SalePending = true
+		self.PendingSaleRevision = -1
+		self.SaleMessage = "판매를 요청했습니다."
+		self:RefreshSellSelection(state)
+		_RunShopLogic:RequestSellItem(offer.ItemId, state.RunSequence, state.VisitSequence, state.InventoryRevision)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleSaleResult(boolean success, string reason, integer committedRevision)
+		-- Wait for the committed inventory snapshot before enabling another sale.
+		self.SalePending = success
+		self.PendingSaleRevision = success and committedRevision or -1
+		if success then
+			self.SaleMessage = "판매가 완료되었습니다."
+		elseif reason == "INVENTORY_CHANGED" then
+			self.SaleMessage = "보유 수량이 변경되었습니다. 다시 선택해 주세요."
+		elseif reason == "LAST_SKILL_REQUIRED" then
+			self.SaleMessage = "전투를 위해 스킬을 최소 1개는 남겨야 합니다."
+		elseif reason == "ITEM_NOT_OWNED" then
+			self.SaleMessage = "이미 사용하거나 판매한 아이템입니다."
+		else
+			self.SaleMessage = "판매할 수 없습니다. 상점을 다시 열어 주세요."
+		end
+		self.LastRevisionKey = ""
+		log("[RunShopUI] sale result success=" .. tostring(success) .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetSellImage(string path, string ruid)
+		-- Replace reused row artwork first; thumbnails render directly without loading a raw sprite.
+		self:SetImage(path, ruid)
+		if string.sub(ruid, 1, 12) == "thumbnail://" then return end
+		local icon = self:GetEntity(path)
+		if not isvalid(icon) then return end
+		local size = self.SellIconSizes[ruid]
+		if size == nil then
+			local sprite = _ResourceService:LoadSpriteAndWait(ruid)
+			if not isvalid(icon) or sprite == nil or not sprite.IsLoadComplete or sprite.Width <= 0 or sprite.Height <= 0 then return end
+			local scale = 48 / math.max(sprite.Width, sprite.Height)
+			size = Vector2(sprite.Width * scale, sprite.Height * scale)
+			self.SellIconSizes[ruid] = size
+		end
+		icon.SpriteGUIRendererComponent.ImageRUID = DataRef(ruid)
+		icon.SpriteGUIRendererComponent.PreserveSprite = PreserveSpriteType.None
+		icon.UITransformComponent.RectSize = size
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer GetSnapshotAmount(string snapshot, string targetId)
+		for entry in string.gmatch(snapshot or "", "([^|]+)") do
+			local separator, _ = string.find(entry, "~", 1, true)
+			if separator ~= nil and string.sub(entry, 1, separator - 1) == targetId then return math.floor(tonumber(string.sub(entry, separator + 1)) or 0) end
+		end
+		return 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ContainsId(string snapshot, string targetId)
+		return string.find("|" .. (snapshot or "") .. "|", "|" .. targetId .. "|", 1, true) ~= nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetPopupVisible(boolean visible)
+		self:HideItemTooltip()
+		local popup = self:GetEntity("ShopPopup")
+		local dim = self:GetEntity("Dim")
+		if isvalid(popup) then
+			popup.Enable = visible
+			popup.Visible = visible
+		end
+		if isvalid(dim) then
+			dim.Enable = visible
+			dim.Visible = visible
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetStatus(string message)
+		self:SetText("ShopPopup/StatusText", message or "")
+		self:SetText("ShopPopup/TitleBar/Subtitle", message or "")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetText(string relativePath, string value)
+		local entity = self:GetEntity(relativePath)
+		if isvalid(entity) and entity.TextGUIRendererComponent ~= nil then entity.TextGUIRendererComponent.Text = value or "" end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetImage(string relativePath, string imageRuid)
+		local entity = self:GetEntity(relativePath)
+		if isvalid(entity) and entity.SpriteGUIRendererComponent ~= nil and imageRuid ~= nil and imageRuid ~= "" then
+			entity.SpriteGUIRendererComponent.ImageRUID = DataRef(imageRuid)
+			entity.SpriteGUIRendererComponent.PreserveSprite = PreserveSpriteType.AspectOnly
+			entity.UITransformComponent.RectSize = Vector2(48, 48)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetDetailImage(string imageRuid)
+		-- Restores the selected item artwork after an empty shop state.
+		local entity = self:GetEntity("ShopPopup/DetailPanel/ItemIcon")
+		if isvalid(entity) == false or entity.SpriteGUIRendererComponent == nil then return end
+		entity.Enable = imageRuid ~= nil and imageRuid ~= ""
+		if entity.Enable == false then return end
+		entity.SpriteGUIRendererComponent.ImageRUID = DataRef(imageRuid)
+		entity.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+		_UILogic:SetSiblingIndex(entity.UITransformComponent, 1000000)
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetEntity(string relativePath)
+		return _EntityService:GetEntityByPath("/ui/RunShopUI/" .. relativePath)
+	end
+
+
+	@ExecSpace("ClientOnly")
+	method void BindTooltipRows()
+		-- Track hover on both panes and hide stale descriptions when scrolling.
+		for _, selling in ipairs({ false, true }) do
+			local isSelling = selling
+			local base = selling and "ShopPopup/SellFrame/ListScroll" or "ShopPopup/ListFrame/ListScroll"
+			local count = selling and self.SellRowCount or 17
+			for index = 1, count do
+				local rowIndex = index
+				local row = self:GetEntity(base .. (selling and "/SellRow" or "/OfferRow") .. tostring(index))
+				if isvalid(row) then
+					local enter = row:ConnectEvent(UITouchEnterEvent, function() self:ShowItemTooltip(isSelling, rowIndex) end)
+					local leave = row:ConnectEvent(UITouchExitEvent, function() if self.TooltipSelling == isSelling and self.TooltipIndex == rowIndex then self:HideItemTooltip() end end)
+					table.insert(self.TooltipHandlers, {Entity=row, Event=UITouchEnterEvent, Subscription=enter})
+					table.insert(self.TooltipHandlers, {Entity=row, Event=UITouchExitEvent, Subscription=leave})
+				end
+			end
+			local scroll = self:GetEntity(base)
+			if isvalid(scroll) then
+				local sub = scroll:ConnectEvent(ScrollPositionChangedEvent, function() self:HideItemTooltip() end)
+				table.insert(self.TooltipHandlers, {Entity=scroll, Event=ScrollPositionChangedEvent, Subscription=sub})
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowItemTooltip(boolean selling, integer index)
+		-- Display the hovered item's actual description without changing the trading selection.
+		if self.UnionMode then self:ShowUnionTooltip(selling, index) return end
+		local offer = selling and self.SellOffers[index] or self.Offers[index]
+		local tooltip = self:GetEntity("ShopPopup/ItemTooltip")
+		if offer == nil or not isvalid(tooltip) then self:HideItemTooltip() return end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if not state.Success then return end
+		self.TooltipSelling = selling
+		self.TooltipIndex = index
+		local isConsumable = (selling and offer.ItemType == "CONSUMABLE") or (not selling and offer.RewardType == "CONSUMABLE")
+		local isSkill = selling and offer.ItemType == "SKILL"
+		local root = "ShopPopup/ItemTooltip/"
+		self:SetText(root .. "Name", offer.DisplayName)
+		self:SetText(root .. "Category", isSkill and "보유 스킬" or (isConsumable and "소비 아이템" or "이번 런에 적용되는 유물"))
+		self:SetText(root .. "Description", selling and offer.Description or offer.EffectDescription)
+		self:SetText(root .. "EffectHint", (not selling and self.BuybackMode) and "판매 당시 가격으로 되살 수 있습니다." or (isSkill and "스킬은 최소 1개 남겨야 합니다." or (isConsumable and "사용하면 보유 수량이 감소합니다." or "판매하면 유물 효과가 사라집니다.")))
+		self:SetText(root .. "Price", (selling and "판매 가격: " or (self.BuybackMode and "재구매 가격: " or "구매 가격: ")) .. tostring(offer.Price) .. " 골드")
+		local remaining = selling and offer.Count or (self:ContainsId(state.PurchasedOfferIds, offer.OfferId) and 0 or 1)
+		self:SetText(root .. "Quantity", (selling and "보유 수량: " or "남은 수량: ") .. tostring(remaining))
+		local icon = self:GetEntity(root .. "Icon")
+		local source = self:GetEntity(selling and ("ShopPopup/SellFrame/ListScroll/SellRow" .. tostring(index) .. "/Icon") or ("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(index) .. "/Icon"))
+		if isvalid(icon) and isvalid(source) then
+			icon.SpriteGUIRendererComponent.ImageRUID = source.SpriteGUIRendererComponent.ImageRUID
+			icon.SpriteGUIRendererComponent.PreserveSprite = source.SpriteGUIRendererComponent.PreserveSprite
+			local size = source.UITransformComponent.RectSize
+			icon.UITransformComponent.RectSize = Vector2(size.x * 1.75, size.y * 1.75)
+		end
+		tooltip.Enable = true
+		self:UpdateTooltipPosition()
+		log("[RunShopTooltip] show selling=" .. tostring(selling) .. " item=" .. (selling and offer.ItemId or offer.RewardRefId))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateTooltipPosition()
+		-- Follow the pointer with a gap and keep the complete tooltip within the reference canvas.
+		local tooltip = self:GetEntity("ShopPopup/ItemTooltip")
+		if not isvalid(tooltip) or not tooltip.Enable then return end
+		local pos = _UILogic:ScreenToUIPosition(_InputService:GetCursorPosition())
+		local x = pos.x + 277
+		if x + 255 > 948 then x = pos.x - 277 end
+		local y = pos.y - 174
+		tooltip.UITransformComponent.anchoredPosition = Vector2(math.max(-693, math.min(693, x)), math.max(-376, math.min(376, y)) - 40)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideItemTooltip()
+		-- Remove hover content on leave, close, filter, or inventory change.
+		local tooltip = self:GetEntity("ShopPopup/ItemTooltip")
+		if isvalid(tooltip) then tooltip.Enable = false end
+		self.TooltipIndex = 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		for name, subscription in pairs(self.BuybackHandlers) do
+			local button = self:GetEntity("ShopPopup/" .. name)
+			if isvalid(button) then button:DisconnectEvent(ButtonClickEvent, subscription) end
+		end
+		-- Release all purchase and sale event subscriptions.
+		for _, binding in ipairs(self.TooltipHandlers) do
+			if isvalid(binding.Entity) then binding.Entity:DisconnectEvent(binding.Event, binding.Subscription) end
+		end
+		self.TooltipHandlers = {}
+		for filter, eventHandler in pairs(self.FilterHandlers) do
+			local tab = self:GetEntity("ShopPopup/SellTabs/" .. filter)
+			if isvalid(tab) then tab:DisconnectEvent(ButtonClickEvent, eventHandler) end
+		end
+		local sellButton = self:GetEntity("ShopPopup/SellButton")
+		if isvalid(sellButton) and self.SellHandler ~= nil then sellButton:DisconnectEvent(ButtonClickEvent, self.SellHandler) end
+		for index = 1, self.SellRowCount do
+			local row = self:GetEntity("ShopPopup/SellFrame/ListScroll/SellRow" .. tostring(index))
+			if isvalid(row) and self.SellHandlers[index] ~= nil then row:DisconnectEvent(ButtonClickEvent, self.SellHandlers[index]) end
+		end
+		local closeButton = self:GetEntity("ShopPopup/CloseButton")
+		local buyButton = self:GetEntity("ShopPopup/DetailPanel/BuyButton")
+		if isvalid(closeButton) and self.CloseHandler ~= nil then closeButton:DisconnectEvent(ButtonClickEvent, self.CloseHandler) end
+		if isvalid(buyButton) and self.BuyHandler ~= nil then buyButton:DisconnectEvent(ButtonClickEvent, self.BuyHandler) end
+		if isvalid(closeButton) and self.HoverHandlers[18] ~= nil then closeButton:DisconnectEvent(UITouchEnterEvent, self.HoverHandlers[18]) end
+		if isvalid(buyButton) and self.HoverHandlers[19] ~= nil then buyButton:DisconnectEvent(UITouchEnterEvent, self.HoverHandlers[19]) end
+		for rowIndex = 1, 17 do
+			local row = self:GetEntity("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(rowIndex))
+			if isvalid(row) and self.RowHandlers[rowIndex] ~= nil then row:DisconnectEvent(ButtonClickEvent, self.RowHandlers[rowIndex]) end
+			if isvalid(row) and self.HoverHandlers[rowIndex] ~= nil then row:DisconnectEvent(UITouchEnterEvent, self.HoverHandlers[rowIndex]) end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectBuyMode(boolean buyback)
+		-- Union has no sell/buyback navigation.
+		if self.UnionMode then return end
+		self:HideItemTooltip()
+		self.BuybackMode = buyback
+		self.BuybackPage = 1
+		self.SelectedOfferIndex = 0
+		self.LastBuyClickedId = ""
+		self.BuybackMessage = ""
+		self.LastRevisionKey = ""
+		local scroll = self:GetEntity("ShopPopup/ListFrame/ListScroll")
+		if isvalid(scroll) then scroll.ScrollLayoutGroupComponent:ResetScrollPosition(UITransformAxis.Vertical) end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success then self:RefreshFromState(state) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ChangeBuybackPage(integer direction)
+		-- Union catalog fits one page.
+		if self.UnionMode then return end
+		self.BuybackPage = math.max(1, math.min(self.BuybackPageCount, self.BuybackPage + direction))
+		self.SelectedOfferIndex = 0
+		self.LastBuyClickedId = ""
+		self.LastRevisionKey = ""
+		local scroll = self:GetEntity("ShopPopup/ListFrame/ListScroll")
+		if isvalid(scroll) then scroll.ScrollLayoutGroupComponent:ResetScrollPosition(UITransformAxis.Vertical) end
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if state.Success then self:RefreshFromState(state) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshBuybackControls(table state)
+		for _, name in ipairs({"BuybackPrevious", "BuybackNext", "BuybackPage", "BuybackButton"}) do
+			local entity = self:GetEntity("ShopPopup/" .. name)
+			if isvalid(entity) then entity.Enable = self.BuybackMode end
+		end
+		local scroll = self:GetEntity("ShopPopup/ListFrame/ListScroll")
+		if isvalid(scroll) then
+			scroll.UITransformComponent.RectSize = Vector2(472, self.BuybackMode and 566 or 626)
+			scroll.UITransformComponent.anchoredPosition = Vector2(0, self.BuybackMode and 30 or 0)
+		end
+		local empty = self:GetEntity("ShopPopup/ListFrame/Empty")
+		if isvalid(empty) then empty.Enable = #self.Offers == 0 end
+		self:SetText("ShopPopup/ListFrame/Empty", self.BuybackMode and "재구매할 아이템이 없습니다." or "판매 중인 상품이 없습니다.")
+		self:SetText("ShopPopup/BuybackPage", tostring(self.BuybackPage) .. " / " .. tostring(self.BuybackPageCount))
+		self:SetText("ShopPopup/BuybackButton", self.BuybackPending and "재구매 중" or "선택 아이템 재구매")
+		local button = self:GetEntity("ShopPopup/BuybackButton")
+		if isvalid(button) then button.ButtonComponent.Enable = #self.Offers > 0 and state.ShopState == "OPEN" and not self.BuybackPending end
+		local previous = self:GetEntity("ShopPopup/BuybackPrevious")
+		local nextButton = self:GetEntity("ShopPopup/BuybackNext")
+		if isvalid(previous) then previous.ButtonComponent.Enable = self.BuybackPage > 1 end
+		if isvalid(nextButton) then nextButton.ButtonComponent.Enable = self.BuybackPage < self.BuybackPageCount end
+		for _, name in ipairs({"BuyTab", "BuybackTab"}) do
+			local tab = self:GetEntity("ShopPopup/" .. name)
+			local active = (name == "BuybackTab") == self.BuybackMode
+			if isvalid(tab) then tab.SpriteGUIRendererComponent.Color = active and Color(0.16, 0.70, 0.79, 1) or Color(0.43, 0.48, 0.54, 1) end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean OpenUnionUi()
+        -- Reuse the current shop artwork and rows from the dedicated lobby NPC.
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then return false end
+		self.UnionMode = true
+		self.UnionPending = false
+		self.UnionSnapshot = {}
+		self.UnionOwnedOffers = {}
+		self.SelectedOfferIndex = 1
+		self.SelectedSellIndex = 1
+		self.BuybackMode = false
+		self.AvatarBound = false
+		self:SetUnionLayout(true)
+		self:SetPopupVisible(true)
+		self:SendUnionAction("OPEN", "")
+		log("[UnionShopUI] opened")
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetUnionLayout(boolean enabled)
+		-- Preserve the normal shop's authored visibility while sharing its visual tree.
+		local paths = {"BuybackTab", "BuybackPrevious", "BuybackNext", "BuybackPage", "SellTabs", "ListFrame/Empty", "SellFrame/Empty"}
+		if enabled then self._T.unionVisibility = {} end
+		for _, path in ipairs(paths) do
+			local entity = self:GetEntity("ShopPopup/" .. path)
+			if isvalid(entity) then
+				if enabled then self._T.unionVisibility[path] = entity.Enable entity.Enable = false
+				else entity.Enable = self._T.unionVisibility[path] == true end
+			end
+		end
+		self:SetText("ShopPopup/BuyTab/Label", enabled and "유니온 상품" or "구매")
+		local icon = self:GetEntity("ShopPopup/GoldPanel/Fill/GoldIcon")
+		if isvalid(icon) then icon.SpriteGUIRendererComponent.ImageRUID = DataRef(enabled and "95632823c5e44dab89b9859ff439165b" or "4cc5ffc272224edc809a792b8efa16e3") end
+		local scroll = self:GetEntity("ShopPopup/ListFrame/ListScroll")
+		if isvalid(scroll) then
+			scroll.UITransformComponent.RectSize = Vector2(472, enabled and 566 or 626)
+			scroll.UITransformComponent.anchoredPosition = Vector2(0, enabled and 30 or 0)
+			scroll.ScrollLayoutGroupComponent:ResetScrollPosition(UITransformAxis.Vertical)
+		end
+		self.LastShopContextKey = ""
+		self.LastRevisionKey = ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SendUnionAction(string action, string productId)
+		-- One request in flight; expected revision rejects duplicate or delayed purchases.
+		if not self.UnionMode or self.UnionPending then return end
+		if action ~= "OPEN" and self.UnionSnapshot.Revision == nil then return end
+		self.UnionPending = true
+		self.UnionRequestAge = 0
+		self.UnionRequestId = self.UnionRequestId + 1
+		self.UnionMessage = action == "OPEN" and "유니온 상점을 불러오는 중입니다." or "요청을 처리하고 있습니다."
+		self:RefreshUnionShop()
+		_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 1)
+		_UnionShopServiceLogic:RequestShop(action, productId, self.UnionSnapshot.Revision or 0, self.UnionRequestId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReceiveUnionShop(integer requestId, boolean success, string reason, table snapshot)
+		-- Ignore replies from a previous opening of the shared popup.
+		if not self.UnionMode or requestId ~= self.UnionRequestId then return end
+		self.UnionPending = false
+		self.UnionSnapshot = snapshot
+		local messages = {OK="보급권은 다음 새 모험에, 꾸미기는 영구 적용됩니다.", PURCHASED="구매했습니다. 오른쪽에서 보유 상품을 확인하세요.", EQUIPPED="데미지 스타일을 장착했습니다.", SHOP_CHANGED="보유 상태가 갱신되었습니다. 다시 선택해 주세요.", ALREADY_OWNED="이미 보유한 스타일입니다.", SUPPLY_RESERVED="이미 다음 모험의 보급이 예약되어 있습니다.", INSUFFICIENT_UNION_COINS="유니온 코인이 부족합니다.", PRODUCT_UNAVAILABLE="현재 판매하지 않는 상품입니다.", LOBBY_ONLY="유니온 상점은 로비에서 이용할 수 있습니다."}
+		self.UnionMessage = messages[reason] or (success and "완료되었습니다." or "요청을 완료하지 못했습니다. 상점을 다시 열어 주세요.")
+		self:RefreshUnionShop()
+		log("[UnionShopUI] response success=" .. tostring(success) .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshUnionShop()
+		-- Left: catalog and purchase. Right: permanent styles and the one reserved supply.
+		self:HideItemTooltip()
+		local service = _UnionShopServiceLogic
+		local state = self.UnionSnapshot
+		local ready = state.Revision ~= nil and not self.UnionPending
+		self.Offers = service:GetCatalog()
+		self.UnionOwnedOffers = {}
+		self:SetText("ShopPopup/Title", "유니온 상점")
+		self:SetText("ShopPopup/GoldPanel/Fill/GoldText", state.Coins ~= nil and tostring(state.Coins) .. " 코인" or "불러오는 중")
+		for index = 1, 17 do
+			local path = "ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(index)
+			local row = self:GetEntity(path)
+			local product = self.Offers[index]
+			if isvalid(row) then
+				row.Enable = product ~= nil
+				row.Visible = product ~= nil
+				if product ~= nil then
+					local owned = product.Kind == "SKIN" and service:OwnsSkin(state, product.Id)
+					row.ButtonComponent.Enable = true
+					row.TextGUIRendererComponent.Text = product.Name
+					row.TextGUIRendererComponent.FontColor = Color(0.08, 0.10, 0.12, 1)
+					row.SpriteGUIRendererComponent.Color = index == self.SelectedOfferIndex and Color(0.77, 0.91, 0.94, 1) or Color(0.82, 0.84, 0.85, 1)
+					self:SetText(path .. "/CategoryText", product.Kind == "SKIN" and "영구 꾸미기" or (product.Kind == "SUPPLY" and "다음 모험 보급" or "추후 제공"))
+					self:SetText(path .. "/PriceText", owned and "보유 중" or (product.Kind == "FUTURE" and "준비 중" or tostring(product.Price) .. " 코인"))
+					self:SetText(path .. "/Stock/Label", product.Kind == "SUPPLY" and "1회 예약" or (product.Kind == "FUTURE" and "모든 직업 사용 가능" or "영구 보유"))
+					self:SetSellImage(path .. "/Icon", product.Icon ~= "" and product.Icon or "95632823c5e44dab89b9859ff439165b")
+					local bar = self:GetEntity(path .. "/SelectedBar")
+					if isvalid(bar) then bar.Enable = index == self.SelectedOfferIndex end
+					if owned or (product.Kind == "SUPPLY" and state.PendingSupply == product.Ref) then table.insert(self.UnionOwnedOffers, product) end
+				end
+			end
+		end
+		for index = 1, self.SellRowCount do
+			local path = "ShopPopup/SellFrame/ListScroll/SellRow" .. tostring(index)
+			local row = self:GetEntity(path)
+			local product = self.UnionOwnedOffers[index]
+			if isvalid(row) then
+				row.Enable = product ~= nil
+				row.Visible = product ~= nil
+				if product ~= nil then
+					row.ButtonComponent.Enable = true
+					row.TextGUIRendererComponent.Text = product.Name
+					row.SpriteGUIRendererComponent.Color = index == self.SelectedSellIndex and Color(0.77, 0.91, 0.94, 1) or Color(0.82, 0.84, 0.85, 1)
+					self:SetText(path .. "/PriceText", product.Kind == "SUPPLY" and "출발 시 자동 지급" or (state.EquippedSkin == product.Id and "장착 중" or "보유 중"))
+					self:SetText(path .. "/Stock/Label", product.Kind == "SUPPLY" and "예약 1개" or "영구 보유")
+					self:SetSellImage(path .. "/Icon", product.Icon ~= "" and product.Icon or "95632823c5e44dab89b9859ff439165b")
+				end
+				local bar = self:GetEntity(path .. "/SelectedBar")
+				if isvalid(bar) then bar.Enable = index == self.SelectedSellIndex end
+			end
+		end
+		local selected = self.Offers[self.SelectedOfferIndex]
+		local buy = self:GetEntity("ShopPopup/BuybackButton")
+		if isvalid(buy) then
+			buy.Enable = true
+			local owned = selected ~= nil and selected.Kind == "SKIN" and service:OwnsSkin(state, selected.Id)
+			buy.TextGUIRendererComponent.Text = self.UnionPending and "처리 중" or (owned and "선택 스타일 장착" or "선택 상품 구매")
+			buy.ButtonComponent.Enable = ready and selected ~= nil and selected.Kind ~= "FUTURE" and (selected.Kind ~= "SUPPLY" or state.PendingSupply == "") and (owned or (state.Coins or 0) >= selected.Price)
+		end
+		local equip = self:GetEntity("ShopPopup/SellButton")
+		local owned = self.UnionOwnedOffers[self.SelectedSellIndex]
+		if isvalid(equip) then
+			equip.TextGUIRendererComponent.Text = "스타일 장착"
+			equip.ButtonComponent.Enable = ready and owned ~= nil and owned.Kind == "SKIN"
+		end
+		self:SetStatus(self.UnionMessage)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowUnionTooltip(boolean owned, integer index)
+		-- Explain exact scope and cost without run-shop gold or sale text.
+		local product = owned and self.UnionOwnedOffers[index] or self.Offers[index]
+		local tooltip = self:GetEntity("ShopPopup/ItemTooltip")
+		if product == nil or not isvalid(tooltip) then return end
+		self.TooltipSelling = owned
+		self.TooltipIndex = index
+		local path = "ShopPopup/ItemTooltip/"
+		self:SetText(path .. "Name", product.Name)
+		self:SetText(path .. "Category", product.Kind == "SKIN" and "영구 데미지 꾸미기" or "유니온 상품")
+		self:SetText(path .. "Description", product.Description)
+		self:SetText(path .. "EffectHint", product.Kind == "SUPPLY" and "계속하기에는 지급되지 않습니다." or "현재 모든 직업이 열려 있습니다.")
+		self:SetText(path .. "Price", product.Kind == "FUTURE" and "판매 준비 중" or tostring(product.Price) .. " 유니온 코인")
+		self:SetText(path .. "Quantity", owned and "보유 상품" or "목록에서 선택 후 구매 버튼을 눌러 주세요.")
+		self:SetImage(path .. "Icon", product.Icon ~= "" and product.Icon or "95632823c5e44dab89b9859ff439165b")
+		tooltip.Enable = true
+		self:UpdateTooltipPosition()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleBuybackResult(boolean success, string reason)
+		self.BuybackPending = false
+		local messages = { INSUFFICIENT_CURRENCY = "골드가 부족합니다.", CONSUMABLE_CAPACITY_FULL = "포션 보유 한도에 도달했습니다.",
+			RELIC_ALREADY_OWNED = "이미 보유한 유물입니다.", RELIC_NOT_ELIGIBLE = "이미 보유했거나 획득할 수 없는 유물입니다.",
+			INVENTORY_CHANGED = "보유 상태가 변경되었습니다. 다시 선택해 주세요.", BUYBACK_NOT_AVAILABLE = "이미 재구매한 아이템입니다." }
+		self.BuybackMessage = success and "판매했던 가격으로 재구매했습니다." or (messages[reason] or "상점을 다시 열어 주세요.")
+		self.LastBuyClickedId = ""
+		self.LastRevisionKey = ""
+		log("[RunShopBuybackUI] success=" .. tostring(success) .. " reason=" .. reason)
+	end
+
+end

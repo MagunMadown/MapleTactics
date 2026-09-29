@@ -59,12 +59,11 @@ RootDesk/MyDesk/
 │     ├─ BTNodes/                # M1 기본 범위에서는 비움
 │     └─ BehaviourTrees/         # 복잡한 보스가 필요할 때만 추가
 │
-├─ 02_Deck/
-│  ├─ Components/
-│  │  ├─ AttackQueueComponent.mlua
-│  │  └─ TileInventoryComponent.mlua
-│  └─ Catalog/
-│     └─ TileCatalogLogic.mlua
+├─ 02_UI/
+│  ├─ BattleQueueHudComponent.mlua
+│  ├─ MapTeleportButton.mlua
+│  ├─ MapTeleportManager.mlua
+│  └─ MinimapUI.mlua
 │
 ├─ 03_Data/
 │  ├─ Combat/
@@ -80,9 +79,11 @@ RootDesk/MyDesk/
 │     ├─ AugmentOfferLogic.mlua
 │     └─ AugmentTriggerLogic.mlua
 │
-├─ 05_UI/
-│  ├─ HUD/BattleHUDLogic.mlua
-│  └─ Popup/AugmentSelectLogic.mlua
+├─ 05_Deck/                       # 보유·편성·드로우 기능 착수 시에만 생성
+│  ├─ Components/
+│  │  ├─ DeckLoadoutComponent.mlua
+│  │  └─ TileInventoryComponent.mlua
+│  └─ Catalog/TileCatalogLogic.mlua
 │
 ├─ 06_Characters/
 │  └─ Models/
@@ -246,6 +247,7 @@ StageFlowComponent
 - [x] 밀치기 후 ActionType/TileId를 유지하고 실행 시 현재 CellIndex/Facing으로 타깃 재계산.
 - [x] 하드코딩 Pattern과 향후 `EnemyPatternSteps`가 공유할 PreparedIntent 계약 구현.
 - [x] `EnemyIntentComponent` 상태 소유와 `EnemyIntentResolverLogic` 무상태 판정 분리. Maker에서 Prepared 유지, 두 적 순차 실행, UI DTO 회귀 검증 완료.
+- [x] 적 공격 타일을 사거리 판정 전에 등록하고 `INSERTING → TRACKING → ATTACK_READY → EXECUTING`으로 분리. 추적 중 타일 보존, 예고 후 고정 실행·Miss, QUICK·다중 적·강제 증원·Client DTO Maker 검증 완료.
 
 완료 기준:
 
@@ -254,6 +256,7 @@ StageFlowComponent
 - FreePlay만 적 턴을 넘기지 않는다.
 - 밀치기 후 다음 타일이 변경된 위치를 대상으로 계산한다.
 - 밀치기 후 적이 Intent를 다시 선택하지 않으며, HUD에 예고된 공격과 실제 실행 ActionType/TileId가 일치한다.
+- 적은 공격 타일을 보유한 채 사거리까지 추적하고, `ATTACK_READY` 이후 플레이어가 벗어나도 재추적하지 않고 예고 공격을 실행한다.
 
 협업/소유권 기준:
 
@@ -314,7 +317,7 @@ StageFlowComponent
 - [x] TURN/TIME 중 먼저 충족한 조건 하나만 소비하고 동일 Wave 중복 Spawn 방지.
 - [x] 겹친 Wave 생존 적 EnemyTurn 포함과 `MaxConcurrent`/빈 칸 부족 대기 처리.
 - [x] RunSeed 기반 결정적 빈 칸 선택(`BALANCED`/`ANY`).
-- [ ] 보스 Phase 조건과 PatternId 교체.
+- [x] 보스 Phase 조건과 PatternId 교체 — 1-4 머쉬맘에서 HP 50% 전환과 Phase 2 점프 착지 실행 검증.
 - [ ] Pattern만으로 표현할 수 없는 요구가 실제로 발생한 경우에만 BT Spike 수행.
 - [ ] 스테이지 완료 -> 증강 선택 -> 다음 스테이지 전환.
 - [ ] 양방향(플레이어 좌/우 동시 교전) 시나리오 회귀 테스트.

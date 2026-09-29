@@ -1,0 +1,135 @@
+@Component
+script BossPhaseStateComponent extends Component
+
+	@Sync property string EnemyDefinitionId = ""
+	@Sync property integer PhaseIndex = 0
+	@Sync property string PhaseId = ""
+	@Sync property string PatternId = ""
+	@Sync property integer PhaseRevision = 0
+
+	property table Definitions = nil
+	property integer NextReinforcementTurn = 0
+	property integer ReinforcementSequence = 0
+
+	@ExecSpace("ServerOnly")
+	method table InitializePhases(string enemyDefinitionId, number currentHp, number maxHp)
+		local validation = _BossPhaseContentValidatorLogic:ValidateByEnemyDefinitionId(enemyDefinitionId)
+		if validation.Success == false then return validation end
+		self.EnemyDefinitionId = enemyDefinitionId
+		self.Definitions = validation.Data.Definitions
+		return self:ApplyPhaseForHp(currentHp, maxHp, "INITIALIZE")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RefreshPhase(number currentHp, number maxHp, string reason)
+		if self.Definitions == nil then
+			return { Success = false, Reason = "BOSS_PHASE_RUNTIME_MISSING", Changed = false }
+		end
+		return self:ApplyPhaseForHp(currentHp, maxHp, reason or "HP_CHANGED")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyPhaseForHp(number currentHp, number maxHp, string reason)
+		-- Boss phases advance once; healing cannot return an awakened boss to dormancy.
+		if maxHp <= 0 then return { Success = false, Reason = "INVALID_BOSS_MAX_HP", Changed = false } end
+		local hpRatio = math.max(0, currentHp) / maxHp
+		local selected = nil
+		for _, definition in ipairs(self.Definitions or {}) do
+			if hpRatio <= definition.HpRatioLE then selected = definition end
+		end
+		if selected == nil then return { Success = false, Reason = "BOSS_PHASE_NOT_RESOLVED", Changed = false } end
+		if self.PhaseIndex >= selected.PhaseIndex then
+			return { Success = true, Reason = "BOSS_PHASE_UNCHANGED", Changed = false, PhaseIndex = self.PhaseIndex, PhaseId = self.PhaseId, PatternId = self.PatternId }
+		end
+		local runner = self.Entity:GetComponent("script.EnemyPatternRunnerComponent")
+		if runner == nil then return { Success = false, Reason = "PATTERN_RUNNER_MISSING", Changed = false } end
+		local patternResult = runner:InitializePattern(selected.PatternId, 1)
+		if patternResult.Success == false then return patternResult end
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then unit.EnemyPatternId = selected.PatternId end
+		local previousPhaseId = self.PhaseId
+		self.PhaseIndex = selected.PhaseIndex
+		self.PhaseId = selected.PhaseId
+		self.PatternId = selected.PatternId
+		local mapSession = self.Entity.CurrentMap:GetComponent("script.BattleSessionComponent")
+		self.NextReinforcementTurn = (mapSession ~= nil and mapSession.StageTurnNumber or 0) + (selected.ReinforcementIntervalTurns or 0)
+		self.PhaseRevision = self.PhaseRevision + 1
+		log("[BossPhase] changed enemy=" .. self.EnemyDefinitionId .. " from=" .. previousPhaseId .. " to=" .. self.PhaseId .. " index=" .. self.PhaseIndex .. " hpRatio=" .. tostring(hpRatio) .. " pattern=" .. self.PatternId .. " reason=" .. reason .. " revision=" .. self.PhaseRevision)
+		if previousPhaseId ~= "" then
+			local baseDefinition = _StageWaveRepositoryLogic:GetEnemyDefinition(self.EnemyDefinitionId)
+			if baseDefinition.Success == true then
+				self:ApplyPresentationOverrides(baseDefinition)
+			end
+			local currentMap = self.Entity.CurrentMap
+			local battleSession = currentMap ~= nil and currentMap:GetComponent("script.BattleSessionComponent") or nil
+			if battleSession ~= nil then
+				battleSession:PublishEnemyPlanSnapshot("BOSS_PHASE_CHANGED")
+				battleSession:NotifyBossPhaseAdvanced(self.PhaseIndex)
+			end
+		end
+		return { Success = true, Reason = "BOSS_PHASE_CHANGED", Changed = true, PhaseIndex = self.PhaseIndex, PhaseId = self.PhaseId, PatternId = self.PatternId, Revision = self.PhaseRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TrySpawnPhaseReinforcement(any session)
+		-- Phase-owned reinforcements are checked only between rounds, never during a resolving queue.
+		local boss = self.Entity:GetComponent("script.BattleUnitComponent")
+		if boss == nil or boss.IsDead or session.BattleResult ~= "" then return { Success = false, Reason = "BATTLE_ENDED" } end
+		local phase = nil
+		for _, definition in ipairs(self.Definitions or {}) do
+			if definition.PhaseIndex == self.PhaseIndex then phase = definition end
+		end
+		if phase == nil or (phase.ReinforcementPoolId or "") == "" then return { Success = false, Reason = "PHASE_REINFORCEMENTS_DISABLED" } end
+		if session.StageTurnNumber < self.NextReinforcementTurn then return { Success = false, Reason = "REINFORCEMENT_COOLDOWN" } end
+		local aliveAdds = 0
+		for _, entity in ipairs(session.BoardState:CollectLivingEnemies()) do
+			local unit = entity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil and unit.IsBoss == false then aliveAdds = aliveAdds + 1 end
+		end
+		if aliveAdds >= phase.ReinforcementMaxAlive then return { Success = false, Reason = "REINFORCEMENT_CAP" } end
+		local playerEntity = session:FindUnitEntity("player_01")
+		local player = isvalid(playerEntity) and playerEntity:GetComponent("script.BattleUnitComponent") or nil
+		if player == nil or player.IsDead then return { Success = false, Reason = "PLAYER_UNAVAILABLE" } end
+		if session.WaveRuntime:GetAvailableSlots(session) < 1 then return { Success = false, Reason = "BATTLE_CAPACITY_WAIT" } end
+		local targetCell = session.WaveRuntime:SelectSpawnCell(session, "FARTHEST", 1)
+		if targetCell < 0 then return { Success = false, Reason = "NO_FREE_CELL" } end
+		local spawn = _StageWaveRepositoryLogic:GetEnemySpawnDefinition(phase.ReinforcementPoolId, 1, self.ReinforcementSequence + 1, session.RunSeed)
+		if spawn.Success ~= true then return spawn end
+		local sequence = self.ReinforcementSequence + 1
+		local unitId = boss.UnitId .. "_reinforcement_" .. tostring(sequence)
+		local entity = session:SpawnWaveEnemy(unitId, targetCell, player.CellIndex < targetCell and "Left" or "Right", boss.SpawnOrder + sequence + 1000, spawn)
+		if isvalid(entity) == false then return { Success = false, Reason = "REINFORCEMENT_SPAWN_FAILED" } end
+		self.ReinforcementSequence = sequence
+		self.NextReinforcementTurn = session.StageTurnNumber + phase.ReinforcementIntervalTurns
+		log("[BossReinforcement] spawned boss=" .. boss.UnitId .. " phase=" .. self.PhaseIndex .. " turn=" .. session.StageTurnNumber .. " unit=" .. unitId .. " cell=" .. targetCell)
+		return { Success = true, Reason = "REINFORCEMENT_SPAWNED", UnitId = unitId }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyPresentationOverrides(table baseDefinition)
+		-- Rebuilds from base data every time, so blank later-phase cells restore the original form.
+		local profile = {}
+		local hasPhaseMotionOverrides = false
+		for key, value in pairs(baseDefinition) do profile[key] = value end
+		for _, definition in ipairs(self.Definitions or {}) do
+			for _, field in ipairs({ "IdleMotionRuid", "MoveMotionRuid", "HitMotionRuid", "DeathMotionRuid" }) do
+				if (definition[field] or "") ~= "" then hasPhaseMotionOverrides = true end
+			end
+			if definition.PhaseIndex == self.PhaseIndex then
+				for _, field in ipairs({ "IdleMotionRuid", "MoveMotionRuid", "HitMotionRuid", "DeathMotionRuid" }) do
+					if (definition[field] or "") ~= "" then profile[field] = definition[field] end
+				end
+			end
+		end
+		local currentMap = self.Entity.CurrentMap
+		local session = currentMap ~= nil and currentMap:GetComponent("script.BattleSessionComponent") or nil
+		local presentation = self.Entity:GetComponent("script.BattleUnitPresentationComponent")
+		if session == nil or presentation == nil then return end
+		session:ConfigureEnemyMovementPresentation(self.Entity, profile)
+		if hasPhaseMotionOverrides then
+			presentation:ApplyPhaseIdleMotion(presentation.IdleMotionRuid, presentation.IdleMotionPlayRate)
+		end
+		log("[BossPhaseMotion] applied enemy=" .. self.EnemyDefinitionId .. " phase=" .. self.PhaseIndex .. " idle=" .. presentation.IdleMotionRuid)
+	end
+
+end
