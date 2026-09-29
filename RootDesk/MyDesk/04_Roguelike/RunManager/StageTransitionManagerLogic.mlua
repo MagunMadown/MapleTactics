@@ -33,7 +33,7 @@ script StageTransitionManagerLogic extends Logic
 			log_warning("[StageTransition] reward map unresolved stage=" .. clearedStageId)
 			return
 		end
-		local nextStageMap = ""
+		local nextStageMap = graphTransition.NextShopMapId or ""
 		if graphTransition.NextBattleStageId ~= "" then
 			local nextStageRoute = _StageMapRouteRepositoryLogic:GetMapRoute(graphTransition.NextBattleStageId)
 			if nextStageRoute == nil or nextStageRoute.Success ~= true then
@@ -85,7 +85,7 @@ script StageTransitionManagerLogic extends Logic
 			if entryState ~= nil then
 				entryState:ResetToIdle("RUN_COMPLETED_RETURN")
 			end
-			_MapTeleportManager:TeleportPlayer(targetPlayer, "lobby", Vector3(-27.22, -7.92, 0), "RUN_COMPLETED_RETURN")
+			_MapTeleportManager:TeleportPlayer(targetPlayer, "lobby", Vector3(-27.3686, -7.92, 0), "RUN_COMPLETED_RETURN")
 			log("[StageTransition] completed run returned player=" .. targetPlayer.Name .. " sequence=" .. completedRunSequence .. " destination=lobby")
 		end, math.max(1.5, self.CompletedRunLobbyDelay))
 	end
@@ -191,6 +191,14 @@ script StageTransitionManagerLogic extends Logic
 		local nextBattle = _NodeDefinitionRepositoryLogic:GetNodeDefinition(currentBattle.NodeGraphId, nextBattleNodeId)
 		if nextBattle.Success == false then
 			return { Success = false, Reason = nextBattle.Reason or "NEXT_BATTLE_NODE_NOT_FOUND" }
+		end
+		if nextBattle.NodeType == "SHOP" then
+			local binding = _ShopNodeBindingRepositoryLogic:GetBinding(currentBattle.NodeGraphId, nextBattle.NodeId)
+			if binding.Success == false then return binding end
+			local bundle = _ShopDefinitionRepositoryLogic:GetShopBundle(binding.ShopId)
+			if bundle.Success == false then return bundle end
+			return { Success = true, Reason = "REWARD_THEN_SHOP", NodeGraphId = currentBattle.NodeGraphId,
+				RewardNodeId = rewardNode.NodeId, NextBattleNodeId = "", NextBattleStageId = "", NextShopMapId = bundle.Definition.MapId }
 		end
 		if nextBattle.NodeType ~= "BATTLE" and nextBattle.NodeType ~= "BOSS" then
 			return { Success = false, Reason = "NEXT_NODE_NOT_BATTLE", NextNodeId = nextBattle.NodeId }
@@ -330,4 +338,28 @@ script StageTransitionManagerLogic extends Logic
 		
 	end
 	
+	@ExecSpace("ServerOnly")
+	method table EnterRewardShop(Entity playerEntity)
+		local run = _RunManagerLogic:GetOrCreateRunState(playerEntity)
+		if run == nil or run.RunState ~= "Active" then return { Success = false, Reason = "ACTIVE_RUN_REQUIRED" } end
+		local route = self:ResolveGraphTransition(run.LastCompletedStageId)
+		if route.Success ~= true or (route.NextShopMapId or "") == "" then return { Success = false, Reason = "REWARD_SHOP_NOT_CONFIGURED" } end
+		if run.SelectedContentType == "SHOP" and run.ContentTransitionState == "READY" then
+			return _RunContentMapTransitionAdapterLogic:ConsumeSelectedShop(playerEntity)
+		end
+		if run.AvailableNodeIds == route.RewardNodeId then
+			local selected = _RunManagerLogic:SelectNextContent(playerEntity, route.RewardNodeId, 9000000 + run.RunFlowRevision)
+			if selected.Success == false then return selected end
+		end
+		if run.SelectedNodeId == route.RewardNodeId and run.SelectedContentType == "REST" then
+			local completed = _RunManagerLogic:CompleteCurrentContent(playerEntity, "REST", 9000000 + run.RunFlowRevision)
+			if completed.Success == false then return completed end
+		end
+		local reward = _NodeDefinitionRepositoryLogic:GetNodeDefinition(route.NodeGraphId, route.RewardNodeId)
+		local shopNodeId = self:GetSingleNextNodeId(reward.NextNodeIds)
+		local selected = _RunManagerLogic:SelectNextContent(playerEntity, shopNodeId, 9000000 + run.RunFlowRevision)
+		if selected.Success == false then return selected end
+		return _RunContentMapTransitionAdapterLogic:ConsumeSelectedShop(playerEntity)
+	end
+
 end

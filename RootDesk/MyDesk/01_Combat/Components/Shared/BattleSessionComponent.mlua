@@ -335,29 +335,18 @@ script BattleSessionComponent extends Component
 			return
 		end
 		if event.key == KeyboardKey.Mouse1 or _GameSettingsLogic:IsActionKey("UTILITY", event.key) then
-			if _BattleHudPresenterLogic:TryBeginLocalCommand("UTILITY") then
-				self:RequestUtilitySkill()
-			end
+			_BattleHudPresenterLogic:SubmitLocalCommand("UTILITY", "", 0)
 			return
 		end
 		if event.key == KeyboardKey.Mouse2 or _GameSettingsLogic:IsActionKey("TURN", event.key) then
-			if _BattleHudPresenterLogic:TryBeginLocalCommand("TURN") == false then
-				return
-			end
-			self:PreviewLocalTurnFacing()
-			log("[BattleInput] turn requested")
-			self:RequestTurn()
+			_BattleHudPresenterLogic:SubmitLocalCommand("TURN", "", 0)
 			return
 		end
 
 		local direction = _PlayerGridMovementLogic:GetDirection(event.key)
 
 		if direction ~= 0 then
-			if _BattleHudPresenterLogic:TryBeginLocalCommand("MOVE") == false then
-				return
-			end
-			log("[BattleInput] move requested direction=" .. direction)
-			self:RequestMove(direction)
+			_BattleHudPresenterLogic:SubmitLocalCommand("MOVE", "", direction)
 		end
 	end
 
@@ -2355,6 +2344,8 @@ script BattleSessionComponent extends Component
 			log_warning("[BattleEnemyIntent] compatibility cursor missing; selecting frozen plan turn=" .. self.TurnNumber)
 			local selection = self:PrepareNextEnemyIntent()
 			if selection.Success == false then
+				self.TurnState:BeginEnemyTurn("ENEMY_WAIT", 0, selection.Reason)
+				self:PublishTurnStateSnapshot("ENEMY_TURN_BEGIN")
 				self:CompleteEnemyTurn("WAIT", false, selection.Reason)
 				return
 			end
@@ -3630,13 +3621,24 @@ script BattleSessionComponent extends Component
 			return
 		end
 
+		if self.TurnState.BattlePhase ~= "EnemyTurn" then
+			log_warning("[BattleTurnTempo] completed enemy round ignored phase=" .. self.TurnState.BattlePhase .. " turn=" .. self.TurnState.TurnNumber .. " reason=" .. reason)
+			return
+		end
+
 		if self.TurnTransitionTimerId > 0 then
 			log_warning("[BattleTurnTempo] duplicate enemy-to-player transition blocked action=" .. actionType .. " reason=" .. reason)
 			return
 		end
 
 		local beatDuration = math.max(0.02, math.min(0.06, self.EnemyToPlayerBeatDuration))
+		local expectedEntry = self.EntryRequestId
+		local expectedTurn = self.TurnState.TurnNumber
 		local finishTransition = function()
+			if self.EntryRequestId ~= expectedEntry or self.TurnState.TurnNumber ~= expectedTurn then
+				log_warning("[BattleTurnTempo] stale enemy-to-player callback ignored entry=" .. expectedEntry .. " turn=" .. expectedTurn)
+				return
+			end
 			self:FinishEnemyToPlayerTransition(actionType, success, reason)
 		end
 		self.TurnTransitionTimerId = _TimerService:SetTimerOnce(finishTransition, beatDuration)
@@ -3647,6 +3649,10 @@ script BattleSessionComponent extends Component
 	method void FinishEnemyToPlayerTransition(string actionType, boolean success, string reason)
 		-- Called only after CompleteEnemyTurn confirmed the enemy round was finished.
 		-- This timer controls presentation tempo, never whether the round succeeded.
+		if self.TurnState.BattlePhase ~= "EnemyTurn" then
+			log_warning("[BattleTurnTempo] duplicate enemy-to-player callback ignored turn=" .. self.TurnState.TurnNumber)
+			return
+		end
 		self.TurnTransitionTimerId = 0
 		if self.BattleResult ~= "" then
 			self.TurnState:ClearTransientState("BATTLE_ENDED")
@@ -4636,6 +4642,41 @@ script BattleSessionComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ForfeitToLobby()
+		-- Menu "return to lobby": ends a running battle as an abandoned run, then reuses the defeat return.
+		if isvalid(self.PlayerEntity) == false then
+			return { Success = false, Reason = "PLAYER_MISSING" }
+		end
+		self:ClearSkillImpactTimers()
+		if self.ActionTimerId > 0 then
+			_TimerService:ClearTimer(self.ActionTimerId)
+			self.ActionTimerId = 0
+		end
+		if self.BattleResult == "" then
+			self.TurnState:ClearTransientState("PLAYER_FORFEIT")
+			self.TurnState:SetPhase("BattleEnded", "PLAYER_FORFEIT")
+			self:PublishTurnStateSnapshot("PLAYER_FORFEIT")
+			self.WaveRuntime:SetWaveState("Failed", "PLAYER_FORFEIT")
+			self.WaveRuntime:CancelPendingSpawns("PLAYER_FORFEIT")
+			self:PublishWaveStateSnapshot("PLAYER_FORFEIT")
+			if self.DropRuntime ~= nil then self.DropRuntime:DiscardPending("BATTLE_FORFEIT") end
+			local playerUnit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
+			if playerUnit ~= nil then playerUnit:ClearAttackBuffs() end
+			local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+			if relics ~= nil then relics:EndBattleEffects() end
+		end
+		self.BattleResult = "Defeat"
+		local resetResult = _RunManagerLogic:AbandonRun(self.PlayerEntity, "MENU_LOBBY_RETURN")
+		if resetResult.Success == false then
+			self.BattleResult = ""
+			return resetResult
+		end
+		self.ResultDefeatReset = resetResult
+		log("[BattleForfeit] run abandoned stage=" .. tostring(self.StageId) .. " turn=" .. tostring(self.TurnNumber))
+		return self:ReturnToLobbyAfterDefeat()
+	end
+
+	@ExecSpace("ServerOnly")
 	method table ReturnToLobbyAfterDefeat()
 		-- Resets the failed run and its entry payload before requesting the authoritative lobby transfer.
 		if self.BattleResult ~= "Defeat" then
@@ -4664,7 +4705,7 @@ script BattleSessionComponent extends Component
 		local navigationResult = _MapTeleportManager:TeleportPlayer(
 			self.PlayerEntity,
 			"lobby",
-			Vector3(-27.22, -7.92, 0),
+			Vector3(-27.3686, -7.92, 0),
 			"BATTLE_DEFEAT_RETURN"
 		)
 		if navigationResult.Success == false then
