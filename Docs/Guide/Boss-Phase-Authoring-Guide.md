@@ -138,6 +138,7 @@ Phase가 바뀌어도 현재 고정 행동의 PatternId는 옛 Pattern일 수 �
 | 예고 광역 | `region_kerning_dyle_tail_sweep`, 1턴 예고 후 전방 1~2칸, 피해 3 |
 | 격노 광역 | `region_kerning_dyle_tail_sweep_enraged`, 1턴 예고 후 전방 1~2칸, 피해 4 |
 | 증원 소환 | 양 페이즈 패턴 마지막 단계 `SUMMON_ENEMIES`. 모델의 `FaustSummonComponent`가 `region_kerning_swamp_mud_pool` 3개로 늪진흙괴물 3마리를 소환(`RequireEmptyBoard=true`, `SummonCooldownTurns=5`). 소환수가 모두 쓰러져 보스만 남았을 때만 다시 소환하며, 보스 처치 시 소환수는 함께 제거된다 |
+| 패턴 순환 | Phase 1: 물어뜯기 → 후퇴 → 대기 → 꼬리 휩쓸기 → 대기 → 소환. Phase 2: 격노 꼬리 휩쓸기 → 물어뜯기 → 후퇴 → 대기 → 소환. 후퇴(`MOVE_AWAY`, `CELL_FREE`)는 뒤 칸이 막혀 있으면 건너뛴다 |
 | 처치 드롭 | 골드 6~7, 소형 회복 물약 1개 |
 
 2026-09-27부터 Phase 2 전환 증원(리게이터 2마리, `BOSS_PHASE` Wave)은 제거하고 다일의 소환 스킬로 대체했다.
