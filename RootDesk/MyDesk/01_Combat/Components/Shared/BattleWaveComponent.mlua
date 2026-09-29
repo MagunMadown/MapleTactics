@@ -28,9 +28,14 @@ script BattleWaveComponent extends Component
 	property integer LoneEnemySinceTurn = -1
 	property integer WaveTimerId = 0
 	property integer ForceSpawnTimerId = 0
+	@Sync property integer SpawnVariantIndex = 0
+	property integer SpawnVariantSeed = 0
 
 	@ExecSpace("ServerOnly")
 	method void ResetWaveState(integer totalWaves, string reason)
+		-- Reset battle-owned variant state along with pending spawns and timers.
+		self.SpawnVariantIndex = 0
+		self.SpawnVariantSeed = 0
 		self:ClearAllTimers(reason)
 		self:CancelPendingSpawns(reason)
 		self.LastBoundaryTurn = -1
@@ -341,12 +346,15 @@ script BattleWaveComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method integer SelectSpawnCell(any session, string policy, integer ordinal)
-		-- Prefer alternating edges; phase reinforcements retain farthest-cell placement.
+		-- Apply seeded variants only to ordinary balanced waves; explicit policies stay authoritative.
 		local playerEntity = session:FindUnitEntity("player_01")
 		local player = isvalid(playerEntity) and playerEntity:GetComponent("script.BattleUnitComponent") or nil
 		local playerCell = player ~= nil and player.CellIndex or session.PlayerStartCell
 		local selected = -1
 		local bestDistance = -1
+		if policy == "BALANCED" and session.StageType ~= "BOSS" and not session.SkillTestMode and self.SpawnVariantIndex > 0 then
+			return self:SelectVariantSpawnCell(session, playerCell, ordinal)
+		end
 		for offset = 0, session.CellCount - 1 do
 			local cell = ordinal % 2 == 0 and session.CellCount - 1 - offset or offset
 			if policy == "LEFT" then cell = offset end
@@ -365,6 +373,30 @@ script BattleWaveComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method integer SelectVariantSpawnCell(any session, integer playerCell, integer ordinal)
+		-- A/B alternate opposite edges across waves; C deterministically distributes safe empty cells.
+		local fromRight = (self.CurrentWave + ordinal) % 2 ~= 0
+		if self.SpawnVariantIndex == 2 then fromRight = not fromRight end
+		local selected = -1
+		local bestScore = -1
+		for offset = 0, session.CellCount - 1 do
+			local cell = fromRight and session.CellCount - 1 - offset or offset
+			if math.abs(cell - playerCell) > 1 and self:IsSpawnCellFree(session, cell) then
+				if self.SpawnVariantIndex ~= 3 then return cell end
+				local key = tostring(self.CurrentWave) .. ":" .. tostring(ordinal) .. ":" .. tostring(cell)
+				local score = _StageWaveRepositoryLogic:GetSpawnHash(key, self.SpawnVariantSeed)
+				score = (score * 48271) % 2147483647
+				score = (score * 48271) % 2147483647
+				if score > bestScore then
+					selected = cell
+					bestScore = score
+				end
+			end
+		end
+		return selected
+	end
+
+	@ExecSpace("ServerOnly")
 	method void SpawnWave(any session, integer waveNumber)
 		-- Freeze one finite batch and retain unsent members until a later safe boundary.
 		if session.BattleResult ~= "" or waveNumber < 1 or waveNumber > self.TotalWaves then return end
@@ -373,6 +405,16 @@ script BattleWaveComponent extends Component
 			return
 		end
 		if waveNumber ~= self.CurrentWave + 1 then return end
+		local useVariant = session.StageType ~= "BOSS" and not session.SkillTestMode
+		if waveNumber == 1 then
+			self.SpawnVariantIndex = 0
+			self.SpawnVariantSeed = 0
+			if useVariant then
+				self.SpawnVariantIndex = _StageWaveRepositoryLogic:GetSpawnVariantIndex(session.StageId, session.RunSeed)
+				self.SpawnVariantSeed = _StageWaveRepositoryLogic:GetSpawnVariantSeed(session.StageId, session.RunSeed)
+			end
+			log("[BattleSpawnVariant] stage=" .. session.StageId .. " runSeed=" .. session.RunSeed .. " variant=" .. self.SpawnVariantIndex .. " spawnSeed=" .. self.SpawnVariantSeed)
+		end
 		local definition = _StageWaveRepositoryLogic:GetWaveDefinition(session.WaveTableId, waveNumber, session.RunSeed)
 		if definition.Success == false then
 			self:SetWaveState("DataError", "WAVE_DEFINITION_ERROR")
@@ -382,7 +424,12 @@ script BattleWaveComponent extends Component
 		local count = session.SkillTestMode and 1 or definition.SpawnCount
 		local roster = {}
 		for index = 1, count do
-			local enemy = _StageWaveRepositoryLogic:GetEnemySpawnDefinition(definition.EnemyPoolId, waveNumber, index, session.RunSeed)
+			local enemy = nil
+			if useVariant then
+				enemy = _StageWaveRepositoryLogic:GetVariantEnemySpawnDefinition(definition.EnemyPoolId, waveNumber, index, self.SpawnVariantSeed)
+			else
+				enemy = _StageWaveRepositoryLogic:GetEnemySpawnDefinition(definition.EnemyPoolId, waveNumber, index, session.RunSeed)
+			end
 			if enemy.Success == false then
 				self:SetWaveState("DataError", "ENEMY_DEFINITION_ERROR")
 				session:PublishWaveStateSnapshot("ENEMY_DEFINITION_ERROR")
@@ -439,6 +486,7 @@ script BattleWaveComponent extends Component
 				break
 			end
 			if isvalid(session.EnemyEntity) == false then session.EnemyEntity = enemy end
+			log("[BattleSpawnVariant] spawned stage=" .. session.StageId .. " variant=" .. self.SpawnVariantIndex .. " wave=" .. self.CurrentWave .. " slot=" .. index .. " cell=" .. cell .. " enemy=" .. self.PendingSpawnDefinitions[index].EnemyDefinitionId)
 			self.PendingSpawnCursor = index + 1
 			self.PendingSpawnCount = self.PendingSpawnCount - 1
 			budget = budget - 1
