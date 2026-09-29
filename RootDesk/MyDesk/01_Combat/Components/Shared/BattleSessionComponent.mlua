@@ -1989,7 +1989,7 @@ script BattleSessionComponent extends Component
 		self.UtilitySkillId = definition.SkillId
 		self.UtilitySkillIconRuid = definition.IconRuid
 		self.UtilityMaxCooldown = definition.CooldownTurns
-		runtime:StartCooldown(definition.SkillId, definition.CooldownTurns)
+		runtime:StartPlayerCooldown(definition.SkillId, definition.CooldownTurns)
 		local relicEffects = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		if relicEffects ~= nil then relicEffects:OnSkillCompleted(definition.SkillId) end
 		self.UtilityRemainingCooldown = runtime:GetRemainingCooldown(definition.SkillId)
@@ -2110,6 +2110,7 @@ script BattleSessionComponent extends Component
 		for _, targetId in ipairs(targetIds) do
 			for distance = 1, maxSteps do
 				local pushed = self:ResolvePushImpactOnTarget(sourceUnit.UnitId, targetId)
+				if definition.SkillId == "fairy_turn" then self:ApplyFairyTurnCollisionStun(targetId, pushed) end
 				if pushed.Success == false or pushed.Reason ~= "PUSHED" then break end
 				moved = moved + 1
 			end
@@ -2137,6 +2138,25 @@ script BattleSessionComponent extends Component
 			return { Success = true, Reason = "UTILITY_QUEUE_CANCELLED" }
 		end
 		return { Success = true, Reason = moved > 0 and "UTILITY_PUSHED" or "UTILITY_PUSH_BLOCKED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyFairyTurnCollisionStun(string targetId, table pushed)
+		-- Only physical wall/enemy collisions stun; HEAVY resistance alone is not a collision.
+		if not pushed.Success then return end
+		local collision = pushed.Reason == "PUSH_BLOCKED_OUT_OF_BOUNDS"
+		if pushed.Reason == "PUSH_BLOCKED_OCCUPIED" then
+			local blocker = self.BoardState:FindAtCell(pushed.ToCell, targetId)
+			local unit = isvalid(blocker) and blocker:GetComponent("script.BattleUnitComponent") or nil
+			collision = unit ~= nil and unit.Team == "Enemy"
+		end
+		if not collision then return end
+		local entity = self:FindUnitEntity(targetId)
+		local unit = isvalid(entity) and entity:GetComponent("script.BattleUnitComponent") or nil
+		if unit == nil or unit.IsDead or unit.Team ~= "Enemy" then return end
+		unit.StopActionTurns = math.max(unit.StopActionTurns, 1)
+		unit.StopMarkerRuid = "602b777092204ca7a4b191d538b72de9"
+		log("[FairyTurn] collision stun target=" .. targetId .. " reason=" .. pushed.Reason)
 	end
 
 	@ExecSpace("Server")
@@ -4233,7 +4253,7 @@ script BattleSessionComponent extends Component
 		local expectedEntry = self.EntryRequestId
 		local executingQueue = self.TurnState.ExecutingTileIds
 		-- Impact time is only a lower bound: do not cut the cast short to start the next tile.
-		local duration = math.max(actionResult.PresentationHandoffDuration or 0, self:GetSkillActionDuration(tileId))
+		local duration = self:GetQueueSkillHandoffDuration(tileId, actionResult)
 		local complete = function()
 			if self.EntryRequestId ~= expectedEntry or self.TurnState.ExecutingTileIds ~= executingQueue
 				or self.TurnState.ExecutingTileIndex ~= completedIndex then return end
@@ -4259,13 +4279,29 @@ script BattleSessionComponent extends Component
 			if self.EntryRequestId ~= expectedEntry or self.TurnState.ExecutingTileIds ~= executingQueue
 				or self.TurnState.ExecutingTileIndex ~= completedIndex then return end
 			-- Sequential flight timers can drift by a frame; never advance while a star is pending.
-			if actionResult.Reason == "PROJECTILE_VOLLEY_PENDING" and self.ImpactTimerId > 0 then
+			if self.ImpactTimerId > 0 then
 				self.ActionTimerId = _TimerService:SetTimerOnce(awaitImpact, 0.02)
 				return
 			end
 			self:WaitForMotionCompletion(complete)
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(awaitImpact, duration)
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetQueueSkillHandoffDuration(string skillId, table actionResult)
+		-- Queue chaining uses actual impacts; the motion gate still preserves full attack and hit playback.
+		local validation = self:GetEffectiveSkillValidation("player_01", skillId)
+		if validation.Success == false then return self:GetSkillActionDuration(skillId) end
+		local definition = validation.Data.Definition
+		local speed = self:GetSkillSpeedMultiplier()
+		local motion = self:GetSkillMotionProfile(definition.MotionProfileId)
+		local authored = math.max(0.1, definition.ActionDuration / speed, motion.Duration or 0)
+		if actionResult.Reason == "PROJECTILE_VOLLEY_PENDING" then
+			-- Each sequential shot owns ImpactTimerId until the final hit; its range estimate is not a delay.
+			return authored
+		end
+		return math.max(authored, actionResult.PresentationHandoffDuration or 0)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -6343,12 +6379,16 @@ script BattleSessionComponent extends Component
 		if not relicRepeat then
 			local reduction = relics ~= nil and relics:ConsumeLoadedCooldownReduction(skillId) or 0
 			local cooldownTurns = math.max(0, definition.CooldownTurns - reduction)
-			runtimeState:StartCooldown(skillId, cooldownTurns)
+			if sourceUnitId == "player_01" then runtimeState:StartPlayerCooldown(skillId, cooldownTurns)
+			else runtimeState:StartCooldown(skillId, cooldownTurns) end
 			-- Skills tagged `cooldown_group:<id>` enter cooldown together when any one of them is used.
 			local groupId = _SkillDefinitionRepositoryLogic:GetCooldownGroupId(definition.SkillTags)
 			if groupId ~= "" and cooldownTurns > 0 then
 				for _, memberId in ipairs(_SkillDefinitionRepositoryLogic:GetCooldownGroupSkillIds(groupId)) do
-					if memberId ~= skillId then runtimeState:StartCooldown(memberId, cooldownTurns) end
+					if memberId ~= skillId then
+						if sourceUnitId == "player_01" then runtimeState:StartPlayerCooldown(memberId, cooldownTurns)
+						else runtimeState:StartCooldown(memberId, cooldownTurns) end
+					end
 				end
 			end
 			if reduction > 0 then log("[RunRelic] loaded cooldown skill=" .. skillId .. " reduction=" .. reduction) end
@@ -7509,6 +7549,12 @@ script BattleSessionComponent extends Component
 		end
 		if damageResult.ReachedZero == true then
 			if batch ~= nil then self:FlushDamageNumberBatch(batch) end
+			-- Resolve the relic before the last enemy's death can clear encounter effects.
+			if not isFixedDamage and sourceUnit.Team == "Player" and targetUnit.Team == "Enemy"
+				and attackerEffects ~= nil and context ~= nil
+				and context.SourceUnitId == sourceUnitId and context.SkillId == attackId then
+				attackerEffects:OnSkillKill(attackId, self.TurnNumber)
+			end
 			self:HandleUnitDiedFromSource(targetUnitId, "DAMAGE", sourceUnitId)
 		end
 
@@ -8510,7 +8556,7 @@ script BattleSessionComponent extends Component
 			log_warning("[BattleCooldown] advance skipped reason=SKILL_RUNTIME_STATE_MISSING turn=" .. self.TurnNumber)
 			return
 		end
-		runtimeState:AdvanceCooldowns(1, reason)
+		runtimeState:AdvancePlayerCooldowns(reason)
 		self.UtilityRemainingCooldown = runtimeState:GetRemainingCooldown(self.UtilitySkillId)
 	end
 
@@ -9481,6 +9527,46 @@ script BattleSessionComponent extends Component
 		return { Success = true, Data = _AugmentRuntimeLogic:BuildSkillBundle(source, validation.Data.Definition, validation.Data.EffectSteps, "") }
 	end
 
+	@ExecSpace("ServerOnly")
+	method table BuildSkillHoverDamageSteps(table definition, table steps)
+		-- Preview outgoing damage without consuming buffs or modifying the effective skill bundle.
+		local preview = {}
+		local unit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
+		if unit == nil then return steps end
+		local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		local bonus = math.max(0, unit.NextAttackBonus) + math.max(0, unit.AttackBuffAmount)
+		if relics ~= nil and relics:IsCurrentRun() then
+			bonus = bonus + relics.AttackBonus
+			if relics:GetSpecialEffectValue("KILL_ATTACK_BATTLE") > 0 then bonus = bonus + relics.BattleKillAttackBonus end
+			if unit.CurrentHp >= unit.MaxHp then bonus = bonus + relics:GetSpecialEffectValue("FULL_HP_DAMAGE") end
+			if unit.CurrentHp * 2 <= unit.MaxHp then bonus = bonus + relics:GetSpecialEffectValue("LOW_HP_DAMAGE") end
+		end
+		local combo = unit.ComboBuffTurns > 0 and unit.ComboBuffAmount * (unit.ComboChainCount + 1) or 0
+		local extraHits = unit.NextArrowCount
+		if relics ~= nil then extraHits = extraHits + relics:GetExtraShurikenCount(definition) end
+		local buffHitIndex = 0
+		for _, original in ipairs(steps) do
+			local step = {}
+			for key, value in pairs(original) do step[key] = value end
+			if step.EffectType == "DAMAGE" then
+				local hits = _DamageEffectExecutorLogic:GetHitCount(step) + extraHits
+				extraHits = 0
+				local attackBuff = 0
+				for _, entry in pairs(unit.TimedBuffEntries) do
+					if entry.Stat == "ATTACK" and entry.Turns > buffHitIndex then attackBuff = attackBuff + entry.Amount end
+				end
+				local base = step.ParameterA == "SOURCE_BASIC_ATTACK" and unit.BasicAttackDamage or step.Value
+				local first = definition.ZeroDamage == true and 0 or math.max(0, base + bonus - math.max(0, unit.AttackBuffAmount) + attackBuff + combo)
+				local followup = definition.ZeroDamage == true and 0 or 1 + combo
+				step.PreviewDamageText = _BuffEffectExecutorLogic:FormatNumber(first)
+				if hits > 1 then step.PreviewDamageText = step.PreviewDamageText .. " + " .. _BuffEffectExecutorLogic:FormatNumber(followup) .. " × " .. tostring(hits - 1) .. "회" end
+				buffHitIndex = buffHitIndex + hits
+			end
+			table.insert(preview, step)
+		end
+		return preview
+	end
+
 	@ExecSpace("Server")
 	method void RequestSkillHover(string skillId, integer requestId)
 		if not self:IsValidPlayerRequest(senderUserId) then return end
@@ -9493,7 +9579,14 @@ script BattleSessionComponent extends Component
 		local validation = self:GetEffectiveSkillValidation("player_01", skillId)
 		if not validation.Success then return end
 		local definition = validation.Data.Definition
-		local text = definition.DisplayName .. "\n" .. _SkillCodexProvider:BuildReadableDescription(definition, validation.Data.EffectSteps)
+		local previewSteps = self:BuildSkillHoverDamageSteps(definition, validation.Data.EffectSteps)
+		local text = definition.DisplayName .. "\n" .. _SkillCodexProvider:BuildReadableDescription(definition, previewSteps)
+		for _, step in ipairs(previewSteps) do
+			if step.EffectType == "DAMAGE" then
+				text = text .. "\n현재 공격력·버프 반영 (대상별 추가 피해·방어 적용 전)"
+				break
+			end
+		end
 		local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
 		if skillId == "heal" and inventory ~= nil then
 			text = text .. "\n남은 횟수: " .. (inventory.HealUnlimited and "무제한" or tostring(math.max(0, inventory.HealCharges)))
