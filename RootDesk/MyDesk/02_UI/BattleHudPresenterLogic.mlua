@@ -10,20 +10,24 @@ script BattleHudPresenterLogic extends Logic
 	property string PendingLocalCommand = ""
 	property integer PendingLocalCommandTimerId = 0
 	property number PendingLocalCommandTimeout = 0.40
+	property number InputBufferSeconds = 0.20
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
+		self:ClearBufferedCommand("PRESENTER_BEGIN")
 		log("[BattleHudPresenter] ready")
 		self:RefreshState(true)
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
+		self:ClearBufferedCommand("PRESENTER_END")
 		self:ReleasePendingLocalCommand("", "PRESENTER_END")
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+		self:UpdateBufferedCommand()
 		self.RefreshElapsed = self.RefreshElapsed + delta
 		if self.RefreshElapsed < self.RefreshInterval then
 			return
@@ -48,8 +52,112 @@ script BattleHudPresenterLogic extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method boolean IsLocalInputBlocked()
+		-- A queued gameplay input must never survive a modal window or map transfer.
+		return self._T.HudTransferPending == true or _GameSettingsLogic:IsInputBlocked()
+			or _RunRelicInventoryUILogic.IsOpen or _SkillTestLogic.KeyboardCaptured == true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CanBufferLocalCommand(table uiState)
+		-- Only enemy-turn presentation can bridge into the next player turn.
+		return uiState ~= nil and uiState.Success == true and uiState.Phase == "EnemyTurn"
+			and uiState.BattleResult == "" and uiState.ContentValidation.IsReady == true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearBufferedCommand(string reason)
+		-- There is one reservation, never a list of future turns.
+		if self._T.BufferedCommand == nil then return end
+		log("[BattleInputBuffer] cleared reason=" .. reason)
+		self._T.BufferedCommand = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SubmitLocalCommand(string commandType, string tileId, integer direction)
+		-- The newest deliberate press replaces the previous reservation, even if invalid.
+		self:ClearBufferedCommand("REPLACED")
+		if self:IsLocalInputBlocked() then return end
+		local session = self:GetBattleSession()
+		if session == nil then return end
+		local uiState = session:GetBattleUiState()
+		if self:CanBufferLocalCommand(uiState) then
+			self._T.BufferedCommand = {
+				Type = commandType, TileId = tileId, Direction = direction,
+				PressedAt = _UtilLogic.ElapsedSeconds, Map = session.Entity,
+				Entry = session.EntryRequestId, Context = session.HudContextRevision,
+				Wave = uiState.Wave.Current, Turn = uiState.TurnNumber
+			}
+			self:PublishCommandResult(commandType, true, "INPUT_BUFFERED", 0)
+			log("[BattleInputBuffer] reserved command=" .. commandType .. " tile=" .. tileId .. " direction=" .. tostring(direction))
+			return
+		end
+		self:DispatchLocalCommand(commandType, tileId, direction)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateBufferedCommand()
+		-- Expiry uses press time, so even a stalled frame cannot replay an old press.
+		local buffered = self._T.BufferedCommand
+		if buffered == nil then return end
+		local age = _UtilLogic.ElapsedSeconds - buffered.PressedAt
+		if age < 0 or age > self.InputBufferSeconds or self:IsLocalInputBlocked() then
+			self:ClearBufferedCommand("EXPIRED_OR_BLOCKED")
+			return
+		end
+		local session = self:GetBattleSession()
+		if session == nil or session.Entity ~= buffered.Map or session.EntryRequestId ~= buffered.Entry
+			or session.HudContextRevision ~= buffered.Context or session.BattleResult ~= "" then
+			self:ClearBufferedCommand("CONTEXT_CHANGED")
+			return
+		end
+		local uiState = session:GetBattleUiState()
+		if uiState == nil or uiState.Success ~= true or uiState.Wave.Current ~= buffered.Wave
+			or uiState.BattleResult ~= "" or uiState.ContentValidation.IsReady ~= true then
+			self:ClearBufferedCommand("STATE_CHANGED")
+			return
+		end
+		-- Phase and turn number may arrive in separate sync updates. Wait within the same short expiry.
+		if uiState.Phase == "EnemyTurn" and (uiState.TurnNumber == buffered.Turn or uiState.TurnNumber == buffered.Turn + 1) then return end
+		if uiState.Phase == "PlayerTurn" and uiState.TurnNumber == buffered.Turn then return end
+		if uiState.Phase ~= "PlayerTurn" or uiState.TurnNumber ~= buffered.Turn + 1 then
+			self:ClearBufferedCommand("TURN_CHANGED")
+			return
+		end
+		if uiState.IsProcessing or self.PendingLocalCommand ~= "" then return end
+		-- Clear before dispatch: rejection or reentrant callbacks can never retry it.
+		self:ClearBufferedCommand("DISPATCH")
+		log("[BattleInputBuffer] dispatch command=" .. buffered.Type .. " age=" .. tostring(age))
+		self:DispatchLocalCommand(buffered.Type, buffered.TileId, buffered.Direction)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DispatchLocalCommand(string commandType, string tileId, integer direction)
+		-- Reuse both the current client guards and the original authoritative RPC validation.
+		if self:TryBeginLocalCommand(commandType) == false then return end
+		local session = self:GetBattleSession()
+		if session == nil then
+			self:ReleasePendingLocalCommand(commandType, "SESSION_MISSING")
+			return
+		end
+		if commandType == "MOVE" then
+			session:RequestMove(direction)
+		elseif commandType == "QUEUE_TILE" then
+			session:RequestQueueTile(tileId)
+		elseif commandType == "EXECUTE_QUEUE" then
+			session:RequestExecuteQueuedTile()
+		elseif commandType == "TURN" then
+			session:PreviewLocalTurnFacing()
+			session:RequestTurn()
+		elseif commandType == "UTILITY" then
+			session:RequestUtilitySkill()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
 	method boolean TryBeginLocalCommand(string commandType)
-		if _RunRelicInventoryUILogic.IsOpen then return false end
+		self:ClearBufferedCommand("NEW_COMMAND")
+		if self:IsLocalInputBlocked() then return false end
 		-- Closes the client/server sync gap while BattleTurnComponent remains the authoritative lock owner.
 		if self.PendingLocalCommand ~= "" then
 			self:PublishCommandResult(commandType, false, "LOCAL_INPUT_PENDING", 0)
@@ -294,6 +402,7 @@ script BattleHudPresenterLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void PublishUnavailableState(string reason, boolean force)
+		self:ClearBufferedCommand(reason)
 		self._T.RelicJson = nil
 		self._T.RelicData = nil
 		local signature = "Unavailable:" .. tostring(reason)
@@ -351,16 +460,8 @@ script BattleHudPresenterLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void RequestQueueTile(string tileId)
-		if self:TryBeginLocalCommand("QUEUE_TILE") == false then
-			return
-		end
-		local session = self:GetBattleSession()
-		if session == nil then
-			self:ReleasePendingLocalCommand("QUEUE_TILE", "SESSION_MISSING")
-			self:PublishCommandResult("QUEUE_TILE", false, "SESSION_MISSING", 0)
-			return
-		end
-		session:RequestQueueTile(tileId)
+		-- Skill clicks and hotkeys share the same single-input reservation.
+		self:SubmitLocalCommand("QUEUE_TILE", tileId, 0)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -377,16 +478,8 @@ script BattleHudPresenterLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void RequestExecuteQueue()
-		if self:TryBeginLocalCommand("EXECUTE_QUEUE") == false then
-			return
-		end
-		local session = self:GetBattleSession()
-		if session == nil then
-			self:ReleasePendingLocalCommand("EXECUTE_QUEUE", "SESSION_MISSING")
-			self:PublishCommandResult("EXECUTE_QUEUE", false, "SESSION_MISSING", 0)
-			return
-		end
-		session:RequestExecuteQueuedTile()
+		-- Queue execution follows the same timing policy as movement and loading.
+		self:SubmitLocalCommand("EXECUTE_QUEUE", "", 0)
 	end
 
 	@ExecSpace("ClientOnly")
