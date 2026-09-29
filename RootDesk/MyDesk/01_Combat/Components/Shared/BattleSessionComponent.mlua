@@ -1464,10 +1464,12 @@ script BattleSessionComponent extends Component
 					local queuedTileNames = ""
 					local queuedIconRuids = ""
 					local queuedIconBackgroundColors = ""
+					local queuedSpecialFlags = ""
 					if hasVisibleQueue then
 						queuedTileNames = self:GetEnemyQueueDisplayNames(plan.PlannedActionSnapshot)
 						queuedIconRuids = self:GetEnemyQueueIconRuids(plan.PlannedActionSnapshot)
 						queuedIconBackgroundColors = self:GetEnemyQueueIconBackgroundColors(plan.PlannedActionSnapshot)
+						queuedSpecialFlags = self:GetEnemyQueueSpecialFlags(plan.PlannedActionSnapshot)
 					end
 					local targetCellSnapshot = plan.TargetCellSnapshot
 					if actionType == "SUMMON_ENEMIES" then
@@ -1550,7 +1552,8 @@ script BattleSessionComponent extends Component
 						plan.CastState ~= "" and plan.CastState or "NONE",
 						plan.CastingSkillId ~= "" and plan.CastingSkillId or "-",
 						tostring(plan.InterruptHitsRequired),
-						tostring(plan.InterruptHitsReceived)
+						tostring(plan.InterruptHitsReceived),
+						queuedSpecialFlags ~= "" and queuedSpecialFlags or "-"
 					}, ","))
 				end
 			end
@@ -1629,6 +1632,99 @@ script BattleSessionComponent extends Component
 			end
 		end
 		return table.concat(colors, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueSpecialFlags(string actionSnapshot)
+		-- One 1/0 flag per queued slot so the client HUD can mark special attacks without the server-only skill tables.
+		local flags = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local fields = {}
+			for field in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(fields, field)
+			end
+			local tileId = fields[3] or ""
+			if tileId ~= "" and tileId ~= "-" then
+				table.insert(flags, self:IsEnemySpecialSkill(tileId) and "1" or "0")
+			end
+		end
+		return table.concat(flags, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsEnemySpecialSkill(string skillId)
+		-- Special = telegraphed/cast attacks or anything beyond plain damage (status, push, mist, buffs).
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success ~= true then return false end
+		local tags = "|" .. string.lower(definition.SkillTags or "") .. "|"
+		if string.find(tags, "|telegraph|", 1, true) ~= nil or string.find(tags, "|cast|", 1, true) ~= nil then return true end
+		local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId or "")
+		for _, step in ipairs(effects.Success and effects.Steps or {}) do
+			if step.EffectType ~= "DAMAGE" then return true end
+		end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method string BuildEnemySkillHoverText(any enemyUnit, table definition, table steps)
+		-- Player-facing summary of an enemy skill: range, cooldown, damage and every status it applies.
+		local special = self:IsEnemySpecialSkill(definition.SkillId)
+		local lines = { (definition.DisplayName or definition.SkillId) .. (special and "  [특수 공격]" or "") }
+		table.insert(lines, "범위: " .. _SkillCodexProvider:DescribeRange(definition))
+		local tags = "|" .. string.lower(definition.SkillTags or "") .. "|"
+		if string.find(tags, "|telegraph|", 1, true) ~= nil then table.insert(lines, "예고 후 발동: 표시된 칸을 피하세요") end
+		if (definition.CooldownTurns or 0) > 0 then table.insert(lines, "재사용 대기: " .. tostring(math.floor(definition.CooldownTurns)) .. "턴") end
+		for _, step in ipairs(steps or {}) do
+			local kind = step.EffectType
+			local value = _BuffEffectExecutorLogic:FormatNumber(step.Value or 0)
+			local turns = tostring(math.max(1, math.floor(tonumber(step.ParameterA) or 1)))
+			local text = ""
+			if kind == "DAMAGE" then
+				local amount = step.Value or 0
+				if step.ParameterA == "SOURCE_BASIC_ATTACK" and enemyUnit ~= nil then amount = enemyUnit.BasicAttackDamage end
+				text = "피해: " .. _BuffEffectExecutorLogic:FormatNumber(amount)
+			elseif kind == "IGNITE" then text = "효과: 화상 - " .. turns .. "행동 동안 스킬을 쓸 때마다 피해 " .. value
+			elseif kind == "FROSTBITE" then text = "효과: 동상 - " .. turns .. "행동 동안 이동 불가 (동상/혼란 중에는 안 걸림)"
+			elseif kind == "CONFUSE" then text = "효과: 혼란 - 다음 스킬 " .. turns .. "회는 몸이 반대로 돌아 시전 (동상/혼란 중에는 안 걸림)"
+			elseif kind == "SEAL" then text = "효과: 봉인 - " .. turns .. "턴 동안 스킬 예약/실행 불가"
+			elseif kind == "POISON_MIST" then text = "효과: 독안개 - " .. turns .. "턴 동안 해당 칸에서 피해 " .. value
+			elseif kind == "PUSH" then text = "효과: " .. value .. "칸 밀치기"
+			elseif kind == "PULL" then text = "효과: " .. value .. "칸 끌어오기"
+			elseif kind == "TURN_TARGET" then text = "효과: 대상의 방향을 뒤집음"
+			else text = _BuffEffectExecutorLogic:DescribeEffectSteps({step}) end
+			if text ~= "" then table.insert(lines, text) end
+		end
+		return table.concat(lines, "\n")
+	end
+
+	@ExecSpace("Server")
+	method void RequestEnemySkillHover(string enemyUnitId, string skillId, integer requestId)
+		-- Only describes a skill of a living enemy on this board; data tables stay server-only.
+		if not self:IsValidPlayerRequest(senderUserId) then return end
+		local now = _UtilLogic.ElapsedSeconds
+		if now < (self._T.NextEnemySkillHoverRequest or 0) then return end
+		self._T.NextEnemySkillHoverRequest = now + 0.08
+		local enemyEntity = self:FindUnitEntity(enemyUnitId)
+		local enemyUnit = isvalid(enemyEntity) and enemyEntity:GetComponent("script.BattleUnitComponent") or nil
+		if enemyUnit == nil or enemyUnit.IsDead or enemyUnit.Team ~= "Enemy" then return end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success ~= true then return end
+		local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId or "")
+		local text = self:BuildEnemySkillHoverText(enemyUnit, definition, effects.Success and effects.Steps or {})
+		local cells = {}
+		if definition.TargetingType ~= "SELF" and definition.TargetingType ~= "BOARD_PARITY" then
+			local target = _SkillTargetResolverLogic:Resolve(self, enemyUnitId, definition)
+			cells = target.Success and target.TargetCellIndices or {}
+		end
+		self:ReceiveEnemySkillHover(enemyUnitId .. ":" .. skillId, requestId, text, cells, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveEnemySkillHover(string hoverKey, integer requestId, string text, table cells)
+		-- Forwards the server-built enemy skill description to the shared mouse tooltip.
+		local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
+		local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
+		if tooltip ~= nil then tooltip:ReceiveEnemySkillHover(self.Entity, hoverKey, requestId, text, cells) end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1864,6 +1960,10 @@ script BattleSessionComponent extends Component
 		end
 		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(self.SelectedJobId)
 		if bundle.Success == false then return bundle end
+		-- Frostbite roots the player: self-moving utilities are blocked like grid moves.
+		if bundle.Step ~= nil and bundle.Step.EffectType == "MOVE_SELF" and self:IsPlayerFrostbitten() then
+			return { Success = false, Reason = "PLAYER_FROSTBITTEN" }
+		end
 		local definition = bundle.Definition
 		local runtime = self:GetSkillRuntimeState("player_01")
 		if runtime == nil then return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" } end
@@ -2075,6 +2175,10 @@ script BattleSessionComponent extends Component
 
 		if actionType == "MOVE" and direction ~= -1 and direction ~= 1 then
 			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+		if actionType == "MOVE" and self:IsPlayerFrostbitten() then
+			result.Reason = "PLAYER_FROSTBITTEN"
 			return result
 		end
 
@@ -2417,6 +2521,17 @@ script BattleSessionComponent extends Component
 			-- Only newly prepared actions may prioritize reinforcements; published plans stay frozen.
 			startStepIndex = 1
 		end
+		-- Resolve cooldowns before choosing a PatternStep, so an unavailable special
+		-- follows its authored failure link to the basic attack instead of queuing a wait.
+		local skillReadyById = {}
+		local skillRuntime = self:GetSkillRuntimeState(enemyUnitId)
+		if skillRuntime ~= nil then
+			for _, step in ipairs(patternValidation.Data.Steps) do
+				if step.TileId ~= nil and step.TileId ~= "" and skillReadyById[step.TileId] == nil then
+					skillReadyById[step.TileId] = skillRuntime:CanUseSkill(step.TileId).Success == true
+				end
+			end
+		end
 		return _EnemyIntentResolverLogic:ResolvePatternIntent({
 			SummonReady = summonReady,
 			EnemyUnitId = enemyUnitId,
@@ -2430,7 +2545,8 @@ script BattleSessionComponent extends Component
 			EnemyIsBoss = enemy.IsBoss,
 			EnemyIsAirborne = enemy.IsAirborne,
 			PlayerCellIndex = player.CellIndex,
-			CellFreeBySelector = self:BuildEnemyCellFreeSnapshot(enemyUnitId, enemy.CellIndex, enemy.Facing, player.CellIndex)
+			CellFreeBySelector = self:BuildEnemyCellFreeSnapshot(enemyUnitId, enemy.CellIndex, enemy.Facing, player.CellIndex),
+			SkillReadyById = skillReadyById
 		}, patternValidation.Data.Steps)
 	end
 
@@ -2739,11 +2855,20 @@ script BattleSessionComponent extends Component
 			end
 		end
 		local relative = _EnemyIntentResolverLogic:ResolveRelativeDirections(enemyUnit.CellIndex, enemyUnit.Facing, playerUnit.CellIndex)
+		local allyCells = {}
+		if self.BoardState ~= nil then
+			for _, allyEntity in ipairs(self.BoardState:CollectLivingEnemies()) do
+				local ally = allyEntity:GetComponent("script.BattleUnitComponent")
+				if ally ~= nil and ally.UnitId ~= enemyUnitId and not ally.IsDead then allyCells[ally.CellIndex] = true end
+			end
+		end
 		local readiness = _EnemyIntentResolverLogic:ResolveQueuedAttackReadiness({
 			EnemyCellIndex = enemyUnit.CellIndex,
 			EnemyFacing = enemyUnit.Facing,
 			PlayerCellIndex = playerUnit.CellIndex,
-			TowardPlayerCellFree = self:IsPatternCellFree(enemyUnit.CellIndex + relative.PlayerDirection, enemyUnitId)
+			TowardPlayerCellFree = self:IsPatternCellFree(enemyUnit.CellIndex + relative.PlayerDirection, enemyUnitId),
+			AllyCells = allyCells,
+			EnemyIsBoss = enemyUnit.IsBoss == true
 		}, definitionResult)
 		if readiness.Success == false then
 			return readiness
@@ -4973,6 +5098,7 @@ script BattleSessionComponent extends Component
 				local castingSkillId = ""
 				local interruptHitsRequired = 0
 				local interruptHitsReceived = 0
+				local queuedSpecialFlags = ""
 				if #fields >= 17 then
 					bossPhaseId = self:DecodeEnemyPlanField(fields[15])
 					bossPhaseIndex = math.floor(tonumber(fields[16]) or 0)
@@ -5013,6 +5139,9 @@ script BattleSessionComponent extends Component
 					interruptHitsRequired = math.floor(tonumber(fields[33]) or 0)
 					interruptHitsReceived = math.floor(tonumber(fields[34]) or 0)
 				end
+				if #fields >= 35 then
+					queuedSpecialFlags = self:DecodeEnemyPlanField(fields[35])
+				end
 				local queuedTileIds = ""
 				-- Keep the client read model aligned with the server DTO: a completed or merely
 				-- selected action is not a newly filled enemy queue slot.
@@ -5044,6 +5173,7 @@ script BattleSessionComponent extends Component
 					queuedTileNames = ""
 					queuedIconRuids = ""
 					queuedIconBackgroundColors = ""
+					queuedSpecialFlags = ""
 				end
 				-- Frozen summon plans are visible during the player turn before the enemy summons.
 				-- Summoning is a command without a TileId, but still occupies a monster skill queue slot.
@@ -5081,6 +5211,7 @@ script BattleSessionComponent extends Component
 					QueuedTileNames = queuedTileNames,
 					QueuedIconRuids = queuedIconRuids,
 					QueuedIconBackgroundColors = queuedIconBackgroundColors,
+					QueuedSpecialFlags = queuedSpecialFlags,
 					TelegraphKind = telegraphKind,
 					LandingCell = landingCell,
 					DeferredUntilTurn = deferredUntilTurn,
@@ -5238,10 +5369,16 @@ script BattleSessionComponent extends Component
 		end
 
 		local playerSealed = self:IsPlayerSealed()
+		local statusUnit = self:GetPlayerStatusUnit()
+		local playerFrostbitten = statusUnit ~= nil and statusUnit.FrostbiteTurns > 0
 		return {
 			Success = true,
 			Reason = "OK",
 			PlayerSealed = playerSealed,
+			PlayerFrostbitten = playerFrostbitten,
+			PlayerConfused = statusUnit ~= nil and statusUnit.ConfuseTurns > 0,
+			PlayerBurnDamage = statusUnit ~= nil and statusUnit.BurnDamage or 0,
+			PlayerBurnTurns = statusUnit ~= nil and statusUnit.BurnTurns or 0,
 			PoisonMistCells = self.PoisonMistCellSnapshot,
 			PlayerActionState = playerActionState,
 			RunStats = runStats,
@@ -5289,7 +5426,7 @@ script BattleSessionComponent extends Component
 				SchemaVersion = self.StageSchemaVersion
 			},
 			Commands = {
-				CanMove = isIdlePlayerTurn,
+				CanMove = isIdlePlayerTurn and not playerFrostbitten,
 				CanTurn = isIdlePlayerTurn,
 				CanQueue = isIdlePlayerTurn and not playerSealed and queueCount < effectiveCapacity,
 				CanExecute = isIdlePlayerTurn and not playerSealed and queueCount > 0,
@@ -5653,7 +5790,8 @@ script BattleSessionComponent extends Component
 				if definition.EffectType == "HEAL" and unit.CurrentHp >= unit.MaxHp then usable = false; reason = "HP_ALREADY_FULL" end
 				if definition.EffectType == "COOLDOWN_REDUCTION" and #result.Skills == 0 then usable = false; reason = "NO_COOLDOWN_SKILLS" end
 				-- Cleanse is available while a real hostile status is active.
-				if definition.EffectType == "CLEANSE" and unit.SealTurns <= 0 then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
+				if definition.EffectType == "CLEANSE" and unit.SealTurns <= 0 and unit.FrostbiteTurns <= 0 and unit.ConfuseTurns <= 0
+					and unit.BurnDamage <= 0 then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
 				table.insert(result.Items, { ConsumableId = itemId, DisplayOrder = definition.RowIndex, DisplayName = definition.DisplayName, Count = tonumber(count), EffectType = definition.EffectType, EffectValue = definition.EffectValue, IconKey = definition.IconKey, Description = definition.Description, Usable = usable, Reason = reason })
 			end
 		end
@@ -6119,6 +6257,7 @@ script BattleSessionComponent extends Component
 		local bundle = validation.Data
 		local definition = {}
 		for key, value in pairs(bundle.Definition) do definition[key] = value end
+		if sourceUnitId == "player_01" and not relicRepeat then self:ResolvePlayerConfusion(skillId, definition) end
 		local effectSteps = bundle.EffectSteps
 		local contextResult = _SkillExecutionLogic:BuildContext(self, sourceUnitId, skillId, definition)
 		if contextResult.Success == false then
@@ -7450,6 +7589,8 @@ script BattleSessionComponent extends Component
 		self:RemovePoisonMistsForSource(unitId)
 		if unit.Team == "Player" then
 			unit.SealTurns = 0
+			unit.FrostbiteTurns = 0
+			unit.ConfuseTurns = 0
 			self:ClearPoisonMists()
 		end
 		if unit.Team == "Enemy" then
@@ -9097,10 +9238,45 @@ script BattleSessionComponent extends Component
 
 	method boolean IsPlayerSealed()
 		-- Reads synchronized status on either side without exposing mutation to the client.
+		local unit = self:GetPlayerStatusUnit()
+		return unit ~= nil and unit.SealTurns > 0
+	end
+
+	method any GetPlayerStatusUnit()
+		-- Resolves the player's battle unit on either side for synchronized status reads.
 		local player = self.PlayerEntity
 		if self:IsClient() then player = _UserService.LocalPlayer end
-		local unit = isvalid(player) and player:GetComponent("script.BattleUnitComponent") or nil
-		return unit ~= nil and unit.SealTurns > 0
+		if not isvalid(player) then return nil end
+		return player:GetComponent("script.BattleUnitComponent")
+	end
+
+	method boolean IsPlayerFrostbitten()
+		-- Frostbite blocks grid moves and self-moving utilities, not attacks or facing.
+		local unit = self:GetPlayerStatusUnit()
+		return unit ~= nil and unit.FrostbiteTurns > 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResolvePlayerConfusion(string skillId, table definition)
+		-- Spin before targeting, but do not spend a charge on a cast already blocked by cooldown or cost.
+		local unit = self:GetPlayerStatusUnit()
+		if unit == nil or unit.IsDead or unit.ConfuseTurns <= 0 then return end
+		local runtime = self:GetSkillRuntimeState("player_01")
+		if runtime == nil or runtime:CanUseSkill(skillId).Success ~= true then return end
+		if definition.CostType == "HEAL_CHARGE" then
+			local player = self:FindUnitEntity("player_01")
+			local inventory = isvalid(player) and player:GetComponent("script.PlayerRunInventoryComponent") or nil
+			if inventory == nil or (not inventory.HealUnlimited and inventory:GetHealCharges() < definition.CostValue)
+				or unit.CurrentHp >= unit.MaxHp then return end
+		end
+		unit.ConfuseTurns = unit.ConfuseTurns - 1
+		local turned = self:TryTurn("player_01")
+		log("[BattleStatus] confusion reversed skill=" .. skillId .. " facing=" .. unit.Facing .. " turned=" .. tostring(turned.Success))
+	end
+
+	method boolean IsHostileStatusEffect(string effectType)
+		-- Enemy-only player statuses routed through the hostile special-effect path.
+		return effectType == "IGNITE" or effectType == "FROSTBITE" or effectType == "CONFUSE"
 	end
 
 	@ExecSpace("ServerOnly")
@@ -9113,6 +9289,20 @@ script BattleSessionComponent extends Component
 		end
 		local turns = math.floor(tonumber(step.ParameterA) or 0)
 		if turns < 1 then return { Success = false, Reason = "INVALID_HOSTILE_EFFECT_DURATION" } end
+		if self:IsHostileStatusEffect(step.EffectType) then
+			local hit = false
+			local reason = "MISS_EMPTY"
+			for _, targetId in ipairs(_SkillTargetResolverLogic:SelectEffectTargets(context, step.TargetSelector)) do
+				local target = self:FindUnitEntity(targetId)
+				local targetUnit = isvalid(target) and target:GetComponent("script.BattleUnitComponent") or nil
+				if targetUnit ~= nil and not targetUnit.IsDead and targetUnit.Team == "Player" then
+					local applied = targetUnit:ApplyHostileStatus(step.EffectType, turns, step.Value or 0, context.SourceUnitId)
+					reason = applied.Reason
+					hit = hit or applied.Hit == true
+				end
+			end
+			return { Success = true, Hit = hit, EffectType = step.EffectType, Reason = reason }
+		end
 		if step.EffectType == "SEAL" then
 			local hit = false
 			for _, targetId in ipairs(context.TargetUnitIds or {}) do
