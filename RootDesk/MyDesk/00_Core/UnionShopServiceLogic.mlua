@@ -1,0 +1,163 @@
+@Logic
+script UnionShopServiceLogic extends Logic
+
+    method table GetCatalog()
+        -- Server-owned prices; job unlocks are display-only until job locking is introduced.
+        return {
+            {Id="supply_potion", Name="출발 보급권", Kind="SUPPLY", Ref="orange_potion", Price=20, Icon="2debf574d6d04f7083e980dbc8f462d9", Description="다음 새 모험을 주황 포션 1개를 더 가진 상태로 시작합니다. 보급권 1장은 한 번의 출발에 사용됩니다."},
+            {Id="maple_default", Name="기본 데미지 스타일", Kind="SKIN", Ref="maple_default", Price=0, Icon="", Description="기본 숫자와 기본 표시 연출입니다. 언제든 무료로 장착할 수 있습니다."},
+            {Id="union_blade", Name="블레이드 데미지 스타일", Kind="SKIN", Ref="union_blade", Price=150, Icon="", Description="기본 숫자에 블레이드 표시 연출을 적용합니다. 영구 보유하며 전투 능력에는 영향을 주지 않습니다."},
+            {Id="union_volcano", Name="볼케이노 데미지 스타일", Kind="SKIN", Ref="union_volcano", Price=150, Icon="", Description="기본 숫자에 볼케이노 표시 연출을 적용합니다. 영구 보유하며 전투 능력에는 영향을 주지 않습니다."},
+            {Id="job_unlock", Name="직업 해제권 · 준비 중", Kind="FUTURE", Ref="", Price=0, Icon="", Description="현재 모든 직업을 자유롭게 사용할 수 있습니다. 직업 잠금 도입 후 판매할 예정입니다."}
+        }
+    end
+
+    method any GetProduct(string productId)
+        -- Resolve only known catalog identifiers.
+        for _, product in ipairs(self:GetCatalog()) do if product.Id == productId then return product end end
+        return nil
+    end
+
+    method table DefaultState()
+        -- Fixed scalar fields serialize safely even for a new account.
+        return {Revision=0, OwnedSkins="", EquippedSkin="maple_default", PendingSupply="", LastSupplyRunId=0, LastSupplyItem=""}
+    end
+
+    method table CopyState(table source)
+        -- Never share mutable profile tables with callers.
+        local copy = self:DefaultState()
+        if source ~= nil then for key, _ in pairs(copy) do copy[key] = source[key] end end
+        -- Preserve previously purchased reservations when replacing the initial supply catalog.
+        if copy.PendingSupply == "red_potion" or copy.PendingSupply == "time_sand" then copy.PendingSupply = "orange_potion" end
+        return copy
+    end
+
+    method boolean OwnsSkin(table state, string skinId)
+        -- The base style is always available.
+        return skinId == "maple_default" or string.find("|" .. (state.OwnedSkins or "") .. "|", "|" .. skinId .. "|", 1, true) ~= nil
+    end
+
+    method boolean ValidateState(any state)
+        -- Reject malformed saves rather than replacing purchased ownership with defaults.
+        if type(state) ~= "table" then return false end
+        for _, key in ipairs({"Revision", "LastSupplyRunId"}) do
+            local value = state[key]
+            if type(value) ~= "number" or value < 0 or value ~= math.floor(value) or value > 9007199254740990 then return false end
+        end
+        if type(state.OwnedSkins) ~= "string" or #state.OwnedSkins > 128 then return false end
+        local seen = {}
+        for id in string.gmatch(state.OwnedSkins, "[^|]+") do
+            if (id ~= "union_blade" and id ~= "union_volcano") or seen[id] then return false end
+            seen[id] = true
+        end
+        if state.OwnedSkins ~= "" and state.OwnedSkins ~= "union_blade" and state.OwnedSkins ~= "union_volcano" and state.OwnedSkins ~= "union_blade|union_volcano" and state.OwnedSkins ~= "union_volcano|union_blade" then return false end
+        local skin = self:GetProduct(state.EquippedSkin)
+        if skin == nil or skin.Kind ~= "SKIN" or not self:OwnsSkin(state, state.EquippedSkin) then return false end
+        for _, key in ipairs({"PendingSupply", "LastSupplyItem"}) do
+            if state[key] ~= "" and state[key] ~= "orange_potion" and state[key] ~= "red_potion" and state[key] ~= "time_sand" then return false end
+        end
+        return true
+    end
+
+    method table EvaluateAction(table profile, string action, string productId, integer expectedRevision, integer runId)
+        -- Pure candidate mutation: called only inside the profile repository's lock/CAS boundary.
+        local state = profile.UnionShop
+        if not self:ValidateState(state) then return {Success=false, Reason="INVALID_SHOP_SAVE"} end
+        if action == "CLAIM" then
+            if runId <= 0 or runId ~= profile.NextRewardRunId then return {Success=false, Reason="INVALID_RUN"} end
+            if state.LastSupplyRunId == runId then return {Success=true, Changed=false, Item=state.LastSupplyItem} end
+            if state.PendingSupply == "" then return {Success=true, Changed=false, Item=""} end
+            state.LastSupplyRunId = runId
+            state.LastSupplyItem = state.PendingSupply
+            state.PendingSupply = ""
+            state.Revision = state.Revision + 1
+            return {Success=true, Changed=true, Item=state.LastSupplyItem}
+        end
+        if expectedRevision ~= state.Revision then return {Success=false, Reason="SHOP_CHANGED"} end
+        local product = self:GetProduct(productId)
+        if product == nil or product.Kind == "FUTURE" then return {Success=false, Reason="PRODUCT_UNAVAILABLE"} end
+        if action == "EQUIP" then
+            if product.Kind ~= "SKIN" or not self:OwnsSkin(state, product.Id) then return {Success=false, Reason="NOT_OWNED"} end
+            if state.EquippedSkin == product.Id then return {Success=true, Changed=false, Reason="EQUIPPED"} end
+            state.EquippedSkin = product.Id
+        elseif action == "BUY" then
+            if product.Kind == "SKIN" and self:OwnsSkin(state, product.Id) then return {Success=false, Reason="ALREADY_OWNED"} end
+            if product.Kind == "SUPPLY" and state.PendingSupply ~= "" then return {Success=false, Reason="SUPPLY_RESERVED"} end
+            if profile.UnionPoints < product.Price then return {Success=false, Reason="INSUFFICIENT_UNION_COINS"} end
+            profile.UnionPoints = profile.UnionPoints - product.Price
+            if product.Kind == "SKIN" then
+                state.OwnedSkins = state.OwnedSkins == "" and product.Id or state.OwnedSkins .. "|" .. product.Id
+            else
+                state.PendingSupply = product.Ref
+            end
+        else
+            return {Success=false, Reason="INVALID_ACTION"}
+        end
+        state.Revision = state.Revision + 1
+        return {Success=true, Changed=true, Reason=action == "EQUIP" and "EQUIPPED" or "PURCHASED"}
+    end
+
+    @ExecSpace("Server")
+    method void RequestShop(string action, string productId, integer expectedRevision, integer requestId)
+        -- Identity, map, action and price are all checked on the server.
+        local player = _UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then
+            self:ReceiveShop(requestId, false, "LOBBY_ONLY", {}, senderUserId)
+            return
+        end
+        local result = {Success=true, Reason="OK"}
+        if action == "BUY" or action == "EQUIP" then
+            result = _UnionProfileRepositoryLogic:TryCommitUnionShopAction(player, action, productId, expectedRevision, 0)
+        elseif action ~= "OPEN" then
+            result = {Success=false, Reason="INVALID_ACTION"}
+        end
+        local loaded = _UnionProfileRepositoryLogic:GetUnionProfile(player)
+        if loaded.Success then
+            local snapshot = self:CopyState(loaded.Profile.UnionShop)
+            snapshot.Coins = loaded.Profile.UnionPoints
+            self:ReceiveShop(requestId, result.Success, result.Reason or "OK", snapshot, senderUserId)
+            if result.Success and action == "EQUIP" then self:ApplyEquippedSkin(player) end
+        else
+            self:ReceiveShop(requestId, false, loaded.Reason or "LOAD_FAILED", {}, senderUserId)
+        end
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveShop(integer requestId, boolean success, string reason, table snapshot)
+        -- Deliver private state only to the requesting player's existing shop controller.
+        local ui = _EntityService:GetEntityByPath("/ui/RunShopUI")
+        local controller = isvalid(ui) and ui:GetComponent("script.RunShopUIComponent") or nil
+        if controller ~= nil then controller:ReceiveUnionShop(requestId, success, reason, snapshot) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ApplyEquippedSkin(Entity player)
+        -- Apply after presentation attachment and after a successful equip save.
+        if not isvalid(player) or player.PlayerComponent == nil then return end
+        local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
+        if presentation == nil then return end
+        local loaded = _UnionProfileRepositoryLogic:GetUnionProfile(player)
+        if loaded.Success then presentation:SetDamageSkin(loaded.Profile.UnionShop.EquippedSkin, false) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GrantDepartureSupply(Entity player, any inventory, integer runId)
+        -- Claim once per persistent run ID, then use the inventory's idempotent reward key.
+        local loaded = _UnionProfileRepositoryLogic:GetUnionProfile(player)
+        if not loaded.Success then return loaded end
+        local state = loaded.Profile.UnionShop
+        local item = state.LastSupplyRunId == runId and state.LastSupplyItem or state.PendingSupply
+        if item == "" then return {Success=true, Reason="NO_SUPPLY"} end
+        local key = "union:supply:" .. tostring(runId)
+        if inventory:ContainsDelimitedKey(inventory.AppliedRewardKeys, key) then return {Success=true, Reason="ALREADY_DELIVERED"} end
+        local space = inventory:GetConsumableGrantSpace(item)
+        if not space.Success then return space end
+        if space.Amount < 1 then return {Success=true, Reason="SUPPLY_HELD_FOR_NEXT_RUN"} end
+        local claim = _UnionProfileRepositoryLogic:TryCommitUnionShopAction(player, "CLAIM", "", 0, runId)
+        if not claim.Success then return claim end
+        if claim.Item == nil or claim.Item == "" then return {Success=true, Reason="NO_SUPPLY"} end
+        local grant = inventory:GrantRunReward("CONSUMABLE", claim.Item, 1, key)
+        log("[UnionShop] departure supply run=" .. tostring(runId) .. " item=" .. claim.Item .. " success=" .. tostring(grant.Success))
+        return grant
+    end
+end

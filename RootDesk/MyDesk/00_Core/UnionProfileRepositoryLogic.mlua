@@ -1196,6 +1196,7 @@ script UnionProfileRepositoryLogic extends Logic
                 UnionPoints = 0,
                 LifetimeUnionPoints = 0,
                 NextRewardRunId = 0,
+                UnionShop = _UnionShopServiceLogic:DefaultState(),
                 CommittedRewardKeys = {},
                 JobUnionProgress = self:CreateDefaultJobUnionProgress(),
                 AllocatedUnionStats = {},
@@ -1222,6 +1223,12 @@ script UnionProfileRepositoryLogic extends Logic
             return defaultResult
         end
         local profile = defaultResult.Profile
+        if source.UnionShop ~= nil then
+            if not _UnionShopServiceLogic:ValidateState(source.UnionShop) then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_SHOP" }
+            end
+            profile.UnionShop = _UnionShopServiceLogic:CopyState(source.UnionShop)
+        end
         local unionPointsResult = self:ReadNonNegativeInteger(source.UnionPoints, "INVALID_UNION_POINTS")
         if unionPointsResult.Success == false then
             return unionPointsResult
@@ -1457,6 +1464,9 @@ script UnionProfileRepositoryLogic extends Logic
         if profile.SchemaVersion ~= self.CurrentSchemaVersion then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_SCHEMA_VERSION" }
         end
+        if not _UnionShopServiceLogic:ValidateState(profile.UnionShop) then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_SHOP" }
+        end
         if self:IsNonNegativeInteger(profile.UnionPoints) == false then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_POINTS" }
         end
@@ -1631,6 +1641,7 @@ script UnionProfileRepositoryLogic extends Logic
             UnionPoints = source.UnionPoints,
             LifetimeUnionPoints = source.LifetimeUnionPoints,
             NextRewardRunId = source.NextRewardRunId,
+            UnionShop = _UnionShopServiceLogic:CopyState(source.UnionShop),
             CommittedRewardKeys = self:CopyRewardReceiptMap(source.CommittedRewardKeys),
             JobUnionProgress = self:CopyLevelMap(source.JobUnionProgress),
             AllocatedUnionStats = self:CopyLevelMap(source.AllocatedUnionStats),
@@ -1648,6 +1659,28 @@ script UnionProfileRepositoryLogic extends Logic
         if self:CountTableEntries(result.AllocatedUnionStats) == 0 then
             result.AllocatedUnionStats[self.JsonEmptyMapMarker] = 0
         end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryCommitUnionShopAction(Entity userEntity, string action, string productId, integer expectedRevision, integer runId)
+        -- Coins and purchased ownership commit together through the existing profile CAS writer.
+        local loaded = self:GetUnionProfile(userEntity)
+        if not loaded.Success then return loaded end
+        local key = loaded.StorageUserKey
+        if not self:TryAcquireMutationLock(key) then return {Success=false, Reason="PROFILE_MUTATION_IN_PROGRESS"} end
+        local candidate = self:GetCachedSnapshot(key)
+        if candidate == nil then
+            self:ReleaseMutationLock(key)
+            return {Success=false, Reason="PROFILE_CACHE_MISSING"}
+        end
+        local result = _UnionShopServiceLogic:EvaluateAction(candidate, action, productId, expectedRevision, runId)
+        if result.Success and result.Changed then
+            local persisted = self:PersistProfileCandidate(key, candidate)
+            if not persisted.Success then result = persisted end
+        end
+        self:ReleaseMutationLock(key)
+        log("[UnionShop] commit action=" .. action .. " product=" .. productId .. " success=" .. tostring(result.Success))
         return result
     end
 
