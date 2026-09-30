@@ -101,7 +101,7 @@ script AugmentRuntimeLogic extends Logic
 		-- Skill tier upgrades and skill augments are independent.
 		local effect = augment.Effects[1]
 		if effect == nil or not _AugmentContentValidatorLogic:IsSkillModifierValid(effect) then return false end
-		if definition.CostType == "HEAL_CHARGE" then return effect.ParamA == "HEAL_CHARGES" or effect.ParamA == "HEAL_UNLIMITED" end
+		if definition.CostType == "HEAL_CHARGE" and effect.ParamA ~= "REGEN_HEAL" then return effect.ParamA == "HEAL_CHARGES" or effect.ParamA == "HEAL_UNLIMITED" end
 		if effect.ParamA == "HEAL_CHARGES" or effect.ParamA == "HEAL_UNLIMITED" then return false end
 		if effect.ParamA == "HIDDEN_COOLDOWN" then return definition.CooldownTurns > 1 end
 		local damage = nil
@@ -118,6 +118,14 @@ script AugmentRuntimeLogic extends Logic
 			if step.EffectType == "MOVE_SELF" then moving = true end
 		end
 		local kind = effect.ParamA
+		if kind == "REGEN_HEAL" then return heal ~= nil and heal.Value > effect.Amount and (definition.RegenHealAmount or 0) == 0 end
+		if kind == "BUFF_DURATION" then
+			if (definition.BuffDurationStacks or 0) >= 2 then return false end
+			for _, step in ipairs(steps) do
+				if self:IsExtendableBuff(step.EffectType) and (tonumber(step.ParameterA) or 0) > 0 then return true end
+			end
+			return false
+		end
 		if kind == "BUFF_COOLDOWN" then return buff and damageCount == 0 and definition.CooldownTurns > 1 end
 		if buff and damageCount == 0 then
 			return kind == "ZERO_DAMAGE_FREE_LOAD" and definition.ZeroDamage ~= true and definition.FreePlay ~= true
@@ -129,7 +137,23 @@ script AugmentRuntimeLogic extends Logic
 		if definition.ZeroDamage == true and kind ~= "RANGE" then return false end
 		local hits = _DamageEffectExecutorLogic:GetHitCount(damage)
 		local single = damage.TargetSelector == "PRIMARY_TARGET" or definition.TargetingType == "FRONT_CELL" or definition.TargetingType == "FIRST_ENEMY_FORWARD"
-		if kind == "QUICK" then
+		if kind == "FIRST_STRIKE" then
+			return damage.Value > 0 and (definition.FirstStrikeStacks or 0) < 2
+		elseif kind == "EXECUTE" then
+			return damage.Value > 0 and (definition.ExecuteStacks or 0) < 2
+		elseif kind == "KILL_REFUND" then
+			return damage.Value > 0 and definition.CooldownTurns > 1 and (definition.KillRefund or 0) == 0
+		elseif kind == "SHOCKWAVE" then
+			return damage.Value > 0 and single and (definition.ShockwaveDamage or 0) == 0
+		elseif kind == "HEAVY_PUSH" then
+			if damage.Value <= 0 or moving or (definition.HeavyPush or 0) > 0 then return false end
+			for _, step in ipairs(steps) do
+				if step.EffectType == "PUSH" or step.EffectType == "PULL" then return false end
+			end
+			return true
+		elseif kind == "BATTLE_STANCE" then
+			return damage.Value > 0 and (definition.BattleStance or 0) == 0
+		elseif kind == "QUICK" then
 			return hits == 1 and damage.Value - effect.Amount >= 1
 		elseif kind == "POWER" or kind == "PRECISE" then
 			if hits ~= 1 or not single then return false end
@@ -182,7 +206,7 @@ script AugmentRuntimeLogic extends Logic
 			end
 		end
 		result.AugmentName = names[#names] or ""
-		result.Description = descriptions[#descriptions] or ""
+		result.Description = table.concat(descriptions, "\n")
 		result.AugmentStage = #ids
 		result.Definition.SkillAugmentName = result.AugmentName
 		result.Definition.SkillAugmentDescription = result.Description
@@ -223,6 +247,10 @@ script AugmentRuntimeLogic extends Logic
 			tuned.ZeroDamage = true
 		end
 		for _, step in ipairs(result.EffectSteps) do
+			if kind == "REGEN_HEAL" and step.EffectType == "HEAL" then step.Value = math.max(1, step.Value - amount) end
+			if kind == "BUFF_DURATION" and self:IsExtendableBuff(step.EffectType) then
+				step.ParameterA = tostring((tonumber(step.ParameterA) or 0) + amount)
+			end
 			if step.EffectType == "DAMAGE" then
 				if kind == "ZERO_DAMAGE_FREE_LOAD" then step.Value = 0 end
 				if kind == "POWER" or kind == "AREA" then step.Value = step.Value + amount end
@@ -250,6 +278,18 @@ script AugmentRuntimeLogic extends Logic
 		result.AugmentId = augmentId
 		result.AugmentName = checked.Data.Definition.NameKey
 		result.Description = checked.Data.Definition.DescriptionKey
+		if kind == "FIRST_STRIKE" then
+			tuned.FirstStrikeStacks = (definition.FirstStrikeStacks or 0) + 1
+			tuned.FirstStrikeDamage = (definition.FirstStrikeDamage or 0) + amount
+		elseif kind == "EXECUTE" then
+			tuned.ExecuteStacks = (definition.ExecuteStacks or 0) + 1
+			tuned.ExecuteDamage = (definition.ExecuteDamage or 0) + amount
+		elseif kind == "KILL_REFUND" then tuned.KillRefund = amount
+		elseif kind == "SHOCKWAVE" then tuned.ShockwaveDamage = amount
+		elseif kind == "HEAVY_PUSH" then tuned.HeavyPush = amount
+		elseif kind == "BATTLE_STANCE" then tuned.BattleStance = amount
+		elseif kind == "REGEN_HEAL" then tuned.RegenHealAmount = amount
+		elseif kind == "BUFF_DURATION" then tuned.BuffDurationStacks = (definition.BuffDurationStacks or 0) + 1 end
 		tuned.AugmentCooldownFloor = 1
 		tuned.SkillAugmentId = augmentId
 		tuned.SkillAugmentName = result.AugmentName
@@ -264,6 +304,142 @@ script AugmentRuntimeLogic extends Logic
 		local checked = _ContentValidatorLogic:ValidateSkillById(skillId)
 		if not checked.Success then return checked end
 		return { Success = true, Data = self:BuildSkillBundle(player, checked.Data.Definition, checked.Data.EffectSteps, "") }
+	end
+
+	method boolean IsExtendableBuff(string effectType)
+		-- Only turn-based buffs extend; attack/venom hit charges and combo queues keep their budgets.
+		return effectType == "DEFENSE_BUFF" or effectType == "MAX_HP_BUFF"
+			or effectType == "GUARD_BUFF" or effectType == "DAMAGE_CAP_BUFF"
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method number GetConditionalDamageBonus(table context, string sourceUnitId, string skillId, any targetUnit)
+		-- Sample HP on the first direct hit per target/cast, shared by melee and delayed projectiles.
+		if context == nil or context.SourceUnitId ~= sourceUnitId or context.SkillId ~= skillId
+			or context.Definition == nil or context.Definition.ZeroDamage == true then return 0 end
+		context.AugmentDamageTargets = context.AugmentDamageTargets or {}
+		if context.AugmentDamageTargets[targetUnit.UnitId] then return 0 end
+		context.AugmentDamageTargets[targetUnit.UnitId] = true
+		local bonus = 0
+		if targetUnit.CurrentHp >= targetUnit.MaxHp then bonus = bonus + (context.Definition.FirstStrikeDamage or 0) end
+		if targetUnit.CurrentHp > 0 and targetUnit.CurrentHp * 10 <= targetUnit.MaxHp * 3 then
+			bonus = bonus + (context.Definition.ExecuteDamage or 0)
+		end
+		return bonus
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnSkillDamageApplied(table context, Entity sourceEntity, any targetUnit, table damageResult)
+		-- Record once-per-cast follow-ups before death handling can finish the encounter.
+		if context == nil or context.Definition == nil or context.Definition.ZeroDamage == true
+			or damageResult.AppliedAmount <= 0 then return end
+		local definition = context.Definition
+		local session = context.BattleSession
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or sourceUnit.Team ~= "Player" or targetUnit.Team ~= "Enemy" then return end
+		if (definition.KillRefund or 0) > 0 and damageResult.ReachedZero == true and not context.AugmentKillRefunded then
+			context.AugmentKillRefunded = true
+			local cooldown = session:GetSkillRuntimeState(context.SourceUnitId)
+			if cooldown ~= nil then
+				cooldown:ReduceCooldown(context.SkillId, math.min(definition.KillRefund, math.max(0, cooldown:GetRemainingCooldown(context.SkillId) - 1)))
+				log("[SkillAugment] kill refund skill=" .. context.SkillId)
+			end
+		end
+		if (definition.BattleStance or 0) > 0 and not context.AugmentStanceApplied then
+			context.AugmentStanceApplied = true
+			-- Shared stance key refreshes one defensive stance instead of stacking it across skills.
+			sourceUnit:ApplyTimedBuff("AUGMENT_BATTLE_STANCE", "DEFENSE", definition.BattleStance, 1)
+		end
+		if (definition.ShockwaveDamage or 0) > 0 and context.AugmentShockwaveCell == nil then
+			context.AugmentShockwaveCell = targetUnit.CellIndex
+			context.AugmentShockwavePrimary = targetUnit.UnitId
+		end
+		if (definition.HeavyPush or 0) > 0 then
+			context.AugmentPushTargets = context.AugmentPushTargets or {}
+			context.AugmentPushSeen = context.AugmentPushSeen or {}
+			if not context.AugmentPushSeen[targetUnit.UnitId] then
+				context.AugmentPushSeen[targetUnit.UnitId] = true
+				table.insert(context.AugmentPushTargets, targetUnit.UnitId)
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompleteSkillAugment(table context)
+		-- Resolve extra hits/displacement after all original hits, without changing volley targeting mid-cast.
+		if context.AugmentCompletionNotified then return end
+		context.AugmentCompletionNotified = true
+		local session = context.BattleSession
+		if session == nil or session.EntryRequestId ~= context.EntryRequestId or session.BattleResult ~= "" then return end
+		local source = session:FindUnitEntity(context.SourceUnitId)
+		if not isvalid(source) then return end
+		local unit = source:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead or unit.Team ~= "Player" then return end
+		local definition = context.Definition
+		if definition.ZeroDamage == true then return end
+		if context.AugmentShockwaveCell ~= nil and (definition.ShockwaveDamage or 0) > 0 then
+			local seen = {}
+			for _, offset in ipairs({ -1, 1 }) do
+				if session.EntryRequestId ~= context.EntryRequestId or session.BattleResult ~= "" then break end
+				local cell = context.AugmentShockwaveCell + offset
+				local target = session.BoardState:FindAtCell(cell, context.SourceUnitId)
+				if session:IsValidCell(cell) and isvalid(target) then
+					local enemy = target:GetComponent("script.BattleUnitComponent")
+					if enemy ~= nil and enemy.Team == "Enemy" and not enemy.IsDead
+						and enemy.UnitId ~= context.AugmentShockwavePrimary and not seen[enemy.UnitId] then
+						seen[enemy.UnitId] = true
+						-- A distinct fixed-damage ID blocks attack bonuses, venom, refunds and recursive shockwaves.
+						session:ApplyDamage(context.SourceUnitId, enemy.UnitId, definition.ShockwaveDamage, "AUGMENT_SHOCKWAVE")
+					end
+				end
+			end
+			log("[SkillAugment] shockwave skill=" .. context.SkillId .. " cell=" .. context.AugmentShockwaveCell)
+		end
+		for _, targetId in ipairs(context.AugmentPushTargets or {}) do
+			if session.EntryRequestId ~= context.EntryRequestId or session.BattleResult ~= "" then break end
+			session:ResolvePushImpactOnTarget(context.SourceUnitId, targetId)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean QueueSkillRegeneration(table context, any targetUnit)
+		-- One heal-over-time entry per skill/target; recasting refreshes two future ticks.
+		if context == nil or context.Definition == nil or (context.Definition.RegenHealAmount or 0) <= 0
+			or targetUnit.IsDead then return false end
+		local session = context.BattleSession
+		if session == nil then return false end
+		targetUnit._T.AugmentRegeneration = targetUnit._T.AugmentRegeneration or {}
+		targetUnit._T.AugmentRegeneration[context.SkillId] = {
+			Amount = context.Definition.RegenHealAmount, Remaining = 2, LastTurn = session.TurnNumber,
+			Entry = session.EntryRequestId, MapId = tostring(session.Entity.Id)
+		}
+		log("[SkillAugment] regeneration queued skill=" .. context.SkillId .. " target=" .. targetUnit.UnitId)
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceSkillRegeneration(any session, any unit)
+		-- Never heal on the cast turn, duplicate triggers, death, or a different battle entry.
+		local entries = unit._T.AugmentRegeneration
+		if entries == nil then return end
+		local remove = {}
+		for skillId, entry in pairs(entries) do
+			if unit.IsDead or entry.Entry ~= session.EntryRequestId or entry.MapId ~= tostring(session.Entity.Id) or session.BattleResult ~= "" then
+				table.insert(remove, skillId)
+			elseif session.TurnNumber > entry.LastTurn then
+				entry.LastTurn = session.TurnNumber
+				entry.Remaining = entry.Remaining - 1
+				local healed = unit:ApplyHealing(entry.Amount)
+				if healed.Success then
+					session:PlayActiveHitEffect(unit.UnitId)
+					session:RefreshPlayerHpSnapshot("AUGMENT_REGENERATION")
+				end
+				log("[SkillAugment] regeneration tick skill=" .. skillId .. " remaining=" .. entry.Remaining)
+				if entry.Remaining <= 0 then table.insert(remove, skillId) end
+			end
+		end
+		for _, skillId in ipairs(remove) do entries[skillId] = nil end
 	end
 
 end
