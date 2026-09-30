@@ -4,18 +4,25 @@ script GameMenuLogic extends Logic
 	-- Esc menu with Settings, Coupon, Return to Lobby and Quit. The windows are cloned from the settings window so all share one look.
 	property boolean IsOpen = false
 	property boolean IsCouponOpen = false
+	property boolean IsAdminConsoleOpen = false
+	property integer CouponRequestId = 0
+	property integer CouponPendingRequestId = 0
 	property string PendingConfirm = ""
 	property number ConfirmRemaining = 0
 	property number RefreshRemaining = 0
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
+		-- Initializes menu and coupon windows for this client session.
 		self._T.Screen = nil
 		self._T.CouponScreen = nil
 		self._T.CouponInput = nil
 		self._T.Buttons = {}
 		self._T.Links = {}
 		self._T.OtherWindowOpen = false
+		self.IsAdminConsoleOpen = false
+		self.CouponRequestId = 0
+		self.CouponPendingRequestId = 0
 		_GameSettingsLogic.IsMenuOpen = false
 	end
 
@@ -247,21 +254,45 @@ script GameMenuLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OpenCoupon()
+		-- Shows the shared input window in player or operator mode.
 		if self.IsCouponOpen or self:EnsureCouponWindow() == false then return end
 		self.IsCouponOpen = true
+		self.CouponPendingRequestId = 0
 		-- Gameplay keys stay paused while a number is typed.
 		_GameSettingsLogic.IsMenuOpen = true
 		if self._T.CouponInput ~= nil then self._T.CouponInput.Text = "" end
-		self:SetCouponStatus("")
+		local window = self._T.CouponScreen:GetChildByName("Window")
+		local title = isvalid(window) and window:GetChildByName("Title") or nil
+		if isvalid(title) then
+			title.TextGUIRendererComponent.Text = self.IsAdminConsoleOpen and "쿠폰 관리" or "쿠폰 입력"
+		end
+		if self._T.CouponInput ~= nil then
+			self._T.CouponInput.PlaceHolder = self.IsAdminConsoleOpen and "create CODE COMMON JOB_TOKEN 1" or "쿠폰 번호를 입력하세요"
+			self._T.CouponInput.CharacterLimit = self.IsAdminConsoleOpen and 96 or 32
+		end
+		self:StyleButton("CouponConfirm", self.IsAdminConsoleOpen and "실행" or "확인", true, false)
+		self:SetCouponStatus(self.IsAdminConsoleOpen and "create / info / revoke 명령을 입력하세요" or "")
 		_GameUIPolishLogic:BringUIGroupToFront(_EntityService:GetEntityByPath("/ui/SettingsUI"))
 		_GameUIPolishLogic:SetWindowVisible(self._T.CouponScreen, true)
 		log("[Coupon] open")
 	end
 
 	@ExecSpace("ClientOnly")
+	method void OpenAdminConsole()
+		-- The server grants entry; the server separately authorizes every command.
+		if self.IsCouponOpen then self:CloseCoupon() end
+		if self.IsOpen then self:CloseMenu() end
+		self.IsAdminConsoleOpen = true
+		self:OpenCoupon()
+	end
+
+	@ExecSpace("ClientOnly")
 	method void CloseCoupon()
+		-- Hides either coupon mode and clears the operator state.
 		if self.IsCouponOpen == false then return end
 		self.IsCouponOpen = false
+		self.IsAdminConsoleOpen = false
+		self.CouponPendingRequestId = 0
 		_GameSettingsLogic.IsMenuOpen = false
 		_GameUIPolishLogic:SetWindowVisible(self._T.CouponScreen, false)
 		log("[Coupon] close")
@@ -275,15 +306,34 @@ script GameMenuLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnCouponSubmit()
-		-- The window only collects the number for now; there is no coupon redemption service to send it to.
+		-- Sends operator commands or one account-bound redemption request to the server.
+		if self.CouponPendingRequestId ~= 0 then return end
 		local raw = self._T.CouponInput ~= nil and self._T.CouponInput.Text or ""
 		local code = string.match(raw or "", "^%s*(.-)%s*$") or ""
 		if code == "" then
-			self:SetCouponStatus("쿠폰 번호를 입력해 주세요.")
+			self:SetCouponStatus(self.IsAdminConsoleOpen and "명령을 입력해 주세요." or "쿠폰 번호를 입력해 주세요.")
 			return
 		end
-		self:SetCouponStatus("쿠폰 사용 기능은 아직 준비 중입니다.")
-		log("[Coupon] submitted length=" .. tostring(string.len(code)))
+		if self.IsAdminConsoleOpen then
+			self:SetCouponStatus("처리 중...")
+			_CouponServiceLogic:RequestAdminCommand(code)
+			return
+		end
+		self.CouponRequestId = self.CouponRequestId + 1
+		self.CouponPendingRequestId = self.CouponRequestId
+		self:SetCouponStatus("보상 지급 중...")
+		self:StyleButton("CouponConfirm", "처리 중...", false, false)
+		_CouponServiceLogic:RequestRedeemCoupon(code, self.CouponRequestId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReceiveCouponRedemption(integer requestId, boolean success, string message)
+		-- Ignores stale responses after closing/reopening and restores the submit button after persistence.
+		if requestId ~= self.CouponPendingRequestId then return end
+		self.CouponPendingRequestId = 0
+		if not self.IsCouponOpen or self.IsAdminConsoleOpen then return end
+		self:StyleButton("CouponConfirm", "확인", true, false)
+		self:SetCouponStatus(message)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -389,6 +439,12 @@ script GameMenuLogic extends Logic
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
 	handler HandleMenuKeyDown(KeyDownEvent event)
+		if event.key == KeyboardKey.Backslash then
+			if self.IsOpen == false and self.IsCouponOpen == false and self:IsEscWindowOpen() == false then
+				_CouponServiceLogic:RequestAdminAccess()
+			end
+			return
+		end
 		if event.key ~= KeyboardKey.Escape then return end
 		-- A key capture in the settings window uses Esc to cancel.
 		if _GameSettingsLogic.IsCapturingKey then return end
@@ -413,6 +469,8 @@ script GameMenuLogic extends Logic
 		self._T.Links = {}
 		self.IsOpen = false
 		self.IsCouponOpen = false
+		self.IsAdminConsoleOpen = false
+		self.CouponPendingRequestId = 0
 		_GameSettingsLogic.IsMenuOpen = false
 	end
 

@@ -1199,6 +1199,7 @@ script UnionProfileRepositoryLogic extends Logic
                 UnionShop = _UnionShopServiceLogic:DefaultState(),
                 SkillTree = _SkillTreeServiceLogic:DefaultState(),
                 CommittedRewardKeys = {},
+                RedeemedCouponCodes = "",
                 PaidPurchaseReceipts = {},
                 MagnetPetPurchaseId = "",
                 MagnetPetGiftId = "",
@@ -1262,6 +1263,12 @@ script UnionProfileRepositoryLogic extends Logic
             return rewardReceiptResult
         end
         profile.CommittedRewardKeys = rewardReceiptResult.Receipts
+        local redeemedCodes = source.RedeemedCouponCodes
+        if redeemedCodes == nil then redeemedCodes = "" end
+        if not self:ValidateCouponReceiptCodes(redeemedCodes) then
+            return {Success = false, Reason = "INVALID_COUPON_RECEIPTS"}
+        end
+        profile.RedeemedCouponCodes = redeemedCodes
         local paid = self:NormalizePaidPurchaseReceipts(source.PaidPurchaseReceipts)
         if paid.Success == false then return paid end
         profile.PaidPurchaseReceipts = paid.Receipts
@@ -1282,6 +1289,8 @@ script UnionProfileRepositoryLogic extends Logic
 
         local wasMigrated = sourceSchemaVersion < self.CurrentSchemaVersion
         local wasSanitized = rewardReceiptResult.WasSanitized == true or source.UnionShop == nil or source.UnionShop.JobTokens == nil
+        -- Optional Schema 5 extension: do not rerun the legacy refund/reset migration.
+        wasSanitized = wasSanitized or source.RedeemedCouponCodes == nil
         wasSanitized = wasSanitized or (source.UnionShop ~= nil and profile.UnionShop.EquippedSkin ~= source.UnionShop.EquippedSkin)
         local legacyUpgradeRefund = 0
         local legacyBlockRefund = 0
@@ -1492,6 +1501,9 @@ script UnionProfileRepositoryLogic extends Logic
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_SHOP" }
         end
         if not _SkillTreeServiceLogic:ValidateState(profile.SkillTree) then return {Success=false, Reason="INVALID_TREE_SAVE"} end
+        if not self:ValidateCouponReceiptCodes(profile.RedeemedCouponCodes) then
+            return {Success = false, Reason = "INVALID_COUPON_RECEIPTS"}
+        end
         if self:IsNonNegativeInteger(profile.UnionPoints) == false then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_POINTS" }
         end
@@ -1677,6 +1689,7 @@ script UnionProfileRepositoryLogic extends Logic
             UnionShop = _UnionShopServiceLogic:CopyState(source.UnionShop),
             SkillTree = _SkillTreeServiceLogic:CopyState(source.SkillTree),
             CommittedRewardKeys = self:CopyRewardReceiptMap(source.CommittedRewardKeys),
+            RedeemedCouponCodes = source.RedeemedCouponCodes or "",
             PaidPurchaseReceipts = self:CopyPaidPurchaseReceipts(source.PaidPurchaseReceipts),
             MagnetPetPurchaseId = source.MagnetPetPurchaseId or "",
             MagnetPetGiftId = source.MagnetPetGiftId or "",
@@ -1721,6 +1734,57 @@ script UnionProfileRepositoryLogic extends Logic
         end
         self:ReleaseMutationLock(key)
         log("[UnionShop] commit action=" .. action .. " product=" .. productId .. " success=" .. tostring(result.Success))
+        return result
+    end
+
+    method boolean ValidateCouponReceiptCodes(any codes)
+        -- Permanent receipts are never pruned; malformed or oversized ledgers cannot enable a second claim.
+        if type(codes) ~= "string" or #codes > 3200 then return false end
+        if codes == "" then return true end
+        local seen, canonical = {}, {}
+        for code in string.gmatch(codes, "[^|]+") do
+            if #code < 4 or #code > 24 or string.match(code, "^[A-Z0-9%-]+$") == nil or seen[code] then return false end
+            seen[code] = true
+            table.insert(canonical, code)
+        end
+        return #canonical <= 128 and table.concat(canonical, "|") == codes
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryGrantJobTokenCoupon(Entity userEntity, string couponCode, integer amount)
+        -- Commits the receipt, token balance and shop revision in the same existing profile CAS write.
+        if not self:ValidateCouponReceiptCodes(couponCode) or couponCode == "" or string.find(couponCode, "|", 1, true) ~= nil then
+            return {Success = false, Reason = "INVALID_COUPON_CODE"}
+        end
+        if amount < 1 or amount > 1000000 then return {Success = false, Reason = "INVALID_COUPON_REWARD"} end
+        local loaded = self:GetUnionProfile(userEntity)
+        if not loaded.Success then return loaded end
+        local key = loaded.StorageUserKey
+        if not self:TryAcquireMutationLock(key) then return {Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS"} end
+        local ok, result = pcall(function()
+            local candidate = self:GetCachedSnapshot(key)
+            if candidate == nil then return {Success = false, Reason = "PROFILE_CACHE_MISSING"} end
+            local receipts = candidate.RedeemedCouponCodes
+            if string.find("|" .. receipts .. "|", "|" .. couponCode .. "|", 1, true) ~= nil then
+                return {Success = false, Reason = "COUPON_ALREADY_REDEEMED", JobTokens = candidate.UnionShop.JobTokens}
+            end
+            local nextReceipts = receipts == "" and couponCode or receipts .. "|" .. couponCode
+            if not self:ValidateCouponReceiptCodes(nextReceipts) then return {Success = false, Reason = "COUPON_RECEIPT_LIMIT"} end
+            local nextTokens = candidate.UnionShop.JobTokens + amount
+            if nextTokens > 1000000 then return {Success = false, Reason = "TOKEN_LIMIT"} end
+            candidate.RedeemedCouponCodes = nextReceipts
+            candidate.UnionShop.JobTokens = nextTokens
+            candidate.UnionShop.Revision = candidate.UnionShop.Revision + 1
+            local saved = self:PersistProfileCandidate(key, candidate)
+            if not saved.Success then return saved end
+            return {Success = true, Reason = "COUPON_REDEEMED", Amount = amount, JobTokens = nextTokens}
+        end)
+        self:ReleaseMutationLock(key)
+        if not ok then
+            self:EvictProfile(key, "")
+            log_error("[Coupon] profile reward save exception")
+            return {Success = false, Reason = "COUPON_REWARD_SAVE_EXCEPTION"}
+        end
         return result
     end
 
