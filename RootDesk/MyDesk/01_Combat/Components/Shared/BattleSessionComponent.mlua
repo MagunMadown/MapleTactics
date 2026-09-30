@@ -2774,6 +2774,9 @@ script BattleSessionComponent extends Component
 				patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, result.Reason)
 				return result
 			end
+			if intent.ActionType == "EXECUTE_TILE" and self:IsTelegraphFollowUp(patternRunner, intent.PatternId, intent.TileId) then
+				actionPlan:LockTelegraphFollowUp()
+			end
 			if intent.ActionType == "SUMMON_ENEMIES" then
 				local summoner = preparedEnemyEntity:GetComponent("script.FaustSummonComponent")
 				if summoner ~= nil then
@@ -2813,6 +2816,21 @@ script BattleSessionComponent extends Component
 			intentRuntime:ResetIntent(reason)
 		end
 		self:PublishEnemyIntentSnapshot(reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsTelegraphFollowUp(any patternRunner, string patternId, string tileId)
+		-- True when the step just completed was a successful warning (TELEGRAPH_TILE or cast start) for the same skill.
+		if patternRunner == nil or tileId == nil or tileId == "" then
+			return false
+		end
+		if patternRunner.PatternId ~= patternId or patternRunner.LastCompletionSuccess ~= true or patternRunner.LastCompletedStepIndex <= 0 then
+			return false
+		end
+		local previous = _EnemyPatternStepRepositoryLogic:GetPatternStep(patternId, patternRunner.LastCompletedStepIndex)
+		return previous.Success == true and previous.Step ~= nil
+			and (previous.Step.ActionType == "TELEGRAPH_TILE" or previous.Step.ActionType == "CAST_INTERRUPTIBLE")
+			and previous.Step.TileId == tileId
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2865,6 +2883,29 @@ script BattleSessionComponent extends Component
 				}
 			end
 		end
+		if actionPlan.TelegraphLocked == true then
+			-- The warned cells are final: fire along the current facing without turning, approaching or re-targeting.
+			local locked = self:BuildSkillAreaTelegraph(enemyUnit, action.TileId)
+			local lockedCells = locked.Success == true and locked.TargetCells or ""
+			local lockedResult = actionPlan:MarkAttackReady("TELEGRAPH_LOCKED", lockedCells)
+			if lockedResult.Success == false then
+				return lockedResult
+			end
+			return {
+				Success = true,
+				Reason = "TELEGRAPH_LOCKED",
+				Readiness = "READY",
+				NextCommandType = "EXECUTE_TILE",
+				Direction = 0,
+				TargetCellSnapshot = lockedCells,
+				PatternId = action.PatternId,
+				StepIndex = action.StepIndex,
+				PatternStepCount = action.PatternStepCount,
+				TileId = action.TileId,
+				PreparedTurn = action.PreparedTurn,
+				TelegraphTurnsRemaining = action.TelegraphTurnsRemaining
+			}
+		end
 		local relative = _EnemyIntentResolverLogic:ResolveRelativeDirections(enemyUnit.CellIndex, enemyUnit.Facing, playerUnit.CellIndex)
 		local allyCells = {}
 		if self.BoardState ~= nil then
@@ -2883,6 +2924,17 @@ script BattleSessionComponent extends Component
 		}, definitionResult)
 		if readiness.Success == false then
 			return readiness
+		end
+		local holdsPosition = action.ActionType == "TELEGRAPH_TILE" or _EnemyTraitRouterLogic:HasTrait(enemyUnit.EnemyTraitIds, "HOLD_POSITION")
+		if holdsPosition and (readiness.Readiness == "NEEDS_MOVE" or (readiness.Readiness == "BLOCKED" and readiness.Reason == "BLOCKED")) then
+			-- Telegraphs and HOLD_POSITION enemies stay put: they may face the player first, but never walk toward
+			-- them; once facing, the warning commits to the current cells even if the player is out of reach.
+			local stayed = self:BuildSkillAreaTelegraph(enemyUnit, action.TileId)
+			readiness.Readiness = "READY"
+			readiness.Reason = "READY_HOLD_POSITION"
+			readiness.NextCommandType = action.ActionType
+			readiness.Direction = 0
+			readiness.TargetCellSnapshot = stayed.Success == true and stayed.TargetCells or ""
 		end
 		if readiness.Readiness == "READY" then
 			local readyResult = actionPlan:MarkAttackReady(readiness.Reason, readiness.TargetCellSnapshot)
