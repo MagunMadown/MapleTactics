@@ -1,0 +1,59 @@
+@Logic
+script UnionCoinPurchaseServiceLogic extends Logic
+
+    -- Register two repeatable Item products, then fill these IDs. Never reuse an ID for another amount.
+    property string Coin2000ProductId = ""
+    property string Coin4000ProductId = ""
+    -- Enable only after Maker and published-world payment verification.
+    property boolean SalesEnabled = false
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        -- Native purchase notifications are the sole authority for paid currency grants.
+        _WorldShopService:SetProcessPurchaseCallback(function(info)
+            return self:ProcessPurchase(info)
+        end)
+        log("[UnionPurchase] native callback registered; sales=" .. tostring(self.SalesEnabled))
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean ProcessPurchase(any info)
+        -- Fulfill even if sales have since closed: already-paid receipts must still be delivered.
+        if info == nil or info.UserId == nil or info.UserId == "" or info.PurchaseId == nil or info.PurchaseId == "" then return false end
+        local premiumId = _PremiumBenefitsLogic.MagnetPetProductId
+        if premiumId ~= "" and (premiumId == self.Coin2000ProductId or premiumId == self.Coin4000ProductId) then return false end
+        if premiumId ~= "" and info.ProductId == premiumId then
+            local buyer = _UserService:GetUserEntityByUserId(info.UserId)
+            if not isvalid(buyer) then return false end
+            local result = _UnionProfileRepositoryLogic:TryGrantMagnetPetPass(buyer, info.PurchaseId)
+            log("[MagnetPet] purchase saved=" .. tostring(result.Success))
+            return result.Success == true
+        end
+        local amount = 0
+        if self.Coin2000ProductId ~= "" and self.Coin2000ProductId ~= self.Coin4000ProductId and info.ProductId == self.Coin2000ProductId then amount = 2000 end
+        if self.Coin4000ProductId ~= "" and self.Coin2000ProductId ~= self.Coin4000ProductId and info.ProductId == self.Coin4000ProductId then amount = 4000 end
+        if amount == 0 then
+            log_warning("[UnionPurchase] unknown or ambiguous product; receipt left pending")
+            return false
+        end
+        local buyer = _UserService:GetUserEntityByUserId(info.UserId)
+        if isvalid(buyer) == false then return false end
+        local result = _UnionProfileRepositoryLogic:TryCommitPaidUnionCoins(buyer, info.PurchaseId, info.ProductId, amount)
+        log("[UnionPurchase] product=" .. info.ProductId .. " amount=" .. tostring(amount) .. " success=" .. tostring(result.Success) .. " duplicate=" .. tostring(result.Duplicate == true))
+        return result.Success == true
+    end
+
+    @ExecSpace("Server")
+    method void RequestWallet(integer requestId)
+        -- Cached read only: polling never loads or saves DataStorage and never accepts a player ID.
+        local repo = _UnionProfileRepositoryLogic
+        local key = repo.StorageUserKeyByUserId[senderUserId]
+        local profile = key ~= nil and repo.ProfilesByStorageUserKey[key] or nil
+        local ready = profile ~= nil and repo.LoadStateByStorageUserKey[key] == "LOADED"
+        local durable = ready and repo.StoredRecordExistsByStorageUserKey[key] == true
+        local sales = self.SalesEnabled and durable and self.Coin2000ProductId ~= self.Coin4000ProductId
+        local premium = _PremiumBenefitsLogic
+        local premiumSales = premium.SalesEnabled and durable and premium.MagnetPetProductId ~= self.Coin2000ProductId and premium.MagnetPetProductId ~= self.Coin4000ProductId
+        _UnionCoinShopLogic:ReceiveWallet(requestId, ready, ready and profile.UnionPoints or 0, sales and self.Coin2000ProductId or "", sales and self.Coin4000ProductId or "", premiumSales and premium.MagnetPetProductId or "", ready and (profile.MagnetPetPurchaseId or "") ~= "", senderUserId)
+    end
+end

@@ -1198,6 +1198,8 @@ script UnionProfileRepositoryLogic extends Logic
                 NextRewardRunId = 0,
                 UnionShop = _UnionShopServiceLogic:DefaultState(),
                 CommittedRewardKeys = {},
+                PaidPurchaseReceipts = {},
+                MagnetPetPurchaseId = "",
                 JobUnionProgress = self:CreateDefaultJobUnionProgress(),
                 AllocatedUnionStats = {},
                 PurchasedLevels = self:CopyLevelMap(zeroResult.Levels)
@@ -1250,6 +1252,13 @@ script UnionProfileRepositoryLogic extends Logic
             return rewardReceiptResult
         end
         profile.CommittedRewardKeys = rewardReceiptResult.Receipts
+        local paid = self:NormalizePaidPurchaseReceipts(source.PaidPurchaseReceipts)
+        if paid.Success == false then return paid end
+        profile.PaidPurchaseReceipts = paid.Receipts
+        if source.MagnetPetPurchaseId ~= nil and type(source.MagnetPetPurchaseId) ~= "string" then
+            return {Success = false, Reason = "INVALID_MAGNET_PET_ENTITLEMENT"}
+        end
+        profile.MagnetPetPurchaseId = source.MagnetPetPurchaseId or ""
 
         local purchasedResult = self:NormalizePurchasedLevelsStrict(source.PurchasedLevels)
         if purchasedResult.Success == false then
@@ -1487,6 +1496,11 @@ script UnionProfileRepositoryLogic extends Logic
                 return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_COMMITTED_REWARD_RECEIPT", RewardKey = tostring(rewardKey or "") }
             end
         end
+        if type(profile.MagnetPetPurchaseId) ~= "string" then
+            return {Success = false, Reason = "INVALID_MAGNET_PET_ENTITLEMENT"}
+        end
+        local paidValidation = self:NormalizePaidPurchaseReceipts(profile.PaidPurchaseReceipts)
+        if paidValidation.Success == false then return paidValidation end
         local jobValidation = self:ValidateJobUnionProgress(profile.JobUnionProgress)
         if jobValidation.Success == false then
             return jobValidation
@@ -1643,6 +1657,8 @@ script UnionProfileRepositoryLogic extends Logic
             NextRewardRunId = source.NextRewardRunId,
             UnionShop = _UnionShopServiceLogic:CopyState(source.UnionShop),
             CommittedRewardKeys = self:CopyRewardReceiptMap(source.CommittedRewardKeys),
+            PaidPurchaseReceipts = self:CopyPaidPurchaseReceipts(source.PaidPurchaseReceipts),
+            MagnetPetPurchaseId = source.MagnetPetPurchaseId or "",
             JobUnionProgress = self:CopyLevelMap(source.JobUnionProgress),
             AllocatedUnionStats = self:CopyLevelMap(source.AllocatedUnionStats),
             PurchasedLevels = self:CopyLevelMap(source.PurchasedLevels)
@@ -1653,6 +1669,9 @@ script UnionProfileRepositoryLogic extends Logic
         -- MSW's JSON encoder cannot infer the object type of a newly-created empty Lua table.
         -- A reserved marker is added only to the serialized clone and stripped during normalization.
         local result = self:CloneProfile(source)
+        if self:CountTableEntries(result.PaidPurchaseReceipts) == 0 then
+            result.PaidPurchaseReceipts[self.JsonEmptyMapMarker] = 0
+        end
         if self:CountTableEntries(result.CommittedRewardKeys) == 0 then
             result.CommittedRewardKeys[self.JsonEmptyMapMarker] = 0
         end
@@ -2205,6 +2224,96 @@ script UnionProfileRepositoryLogic extends Logic
         if userId ~= nil and userId ~= "" then
             self.StorageUserKeyByUserId[userId] = nil
         end
+    end
+
+    method table NormalizePaidPurchaseReceipts(any source)
+        -- Paid receipts are permanent; malformed data must never be silently discarded.
+        if source == nil then return {Success = true, Receipts = {}} end
+        if type(source) ~= "table" then return {Success = false, Reason = "INVALID_PAID_RECEIPTS"} end
+        local result = {}
+        for purchaseId, receipt in pairs(source) do
+            if purchaseId ~= self.JsonEmptyMapMarker or receipt ~= 0 then
+                if type(purchaseId) ~= "string" or purchaseId == "" or purchaseId == self.JsonEmptyMapMarker
+                    or type(receipt) ~= "table" or type(receipt.ProductId) ~= "string" or receipt.ProductId == ""
+                    or (receipt.Amount ~= 2000 and receipt.Amount ~= 4000) then
+                    return {Success = false, Reason = "INVALID_PAID_RECEIPTS"}
+                end
+                result[purchaseId] = {ProductId = receipt.ProductId, Amount = receipt.Amount}
+            end
+        end
+        return {Success = true, Receipts = result}
+    end
+
+    method table CopyPaidPurchaseReceipts(table source)
+        -- Deep-copies verified receipt records without sharing nested tables.
+        local result = {}
+        for purchaseId, receipt in pairs(source or {}) do
+            result[purchaseId] = {ProductId = receipt.ProductId, Amount = receipt.Amount}
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryCommitPaidUnionCoins(Entity buyer, string purchaseId, string productId, integer amount)
+        -- Only the native purchase callback calls this; receipt and credit share one CAS write.
+        if purchaseId == "" or purchaseId == self.JsonEmptyMapMarker or productId == ""
+            or (amount ~= 2000 and amount ~= 4000) then return {Success = false, Reason = "INVALID_PURCHASE"} end
+        local loaded = self:EnsureProfileLoaded(buyer)
+        if loaded.Success == false then return loaded end
+        local key = loaded.StorageUserKey
+        if not self:TryAcquireMutationLock(key) then return {Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS"} end
+        local ok, result = pcall(function()
+            local candidate = self:GetCachedSnapshot(key)
+            if candidate == nil then return {Success = false, Reason = "PROFILE_CACHE_MISSING"} end
+            local receipt = candidate.PaidPurchaseReceipts[purchaseId]
+            if receipt ~= nil then
+                return {Success = receipt.ProductId == productId and receipt.Amount == amount, Duplicate = true, Reason = "RECEIPT_EXISTS"}
+            end
+            -- Require an existing durable record so payment never uses an unconditional first-write Set.
+            if self.StoredRecordExistsByStorageUserKey[key] ~= true then
+                return {Success = false, Reason = "PROFILE_NOT_PERSISTED"}
+            end
+            local balance = candidate.UnionPoints + amount
+            if balance <= candidate.UnionPoints or balance > 9007199254740991 then
+                return {Success = false, Reason = "BALANCE_OVERFLOW"}
+            end
+            candidate.UnionPoints = balance
+            candidate.PaidPurchaseReceipts[purchaseId] = {ProductId = productId, Amount = amount}
+            -- Purchased currency does not raise earned lifetime currency or receive earning bonuses.
+            return self:PersistProfileCandidate(key, candidate)
+        end)
+        self:ReleaseMutationLock(key)
+        if not ok then
+            self:EvictProfile(key, "")
+            log_error("[UnionPurchase] storage exception; native receipt remains pending")
+            return {Success = false, Reason = "PURCHASE_STORAGE_EXCEPTION"}
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryGrantMagnetPetPass(Entity buyer, string purchaseId)
+        -- Native verified purchase only. Permanent ownership is a durable, non-stacking entitlement.
+        if purchaseId == nil or purchaseId == "" then return {Success = false, Reason = "INVALID_PURCHASE"} end
+        local loaded = self:EnsureProfileLoaded(buyer)
+        if loaded.Success == false then return loaded end
+        local key = loaded.StorageUserKey
+        if not self:TryAcquireMutationLock(key) then return {Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS"} end
+        local ok, result = pcall(function()
+            local candidate = self:GetCachedSnapshot(key)
+            if candidate == nil then return {Success = false, Reason = "PROFILE_CACHE_MISSING"} end
+            if candidate.MagnetPetPurchaseId ~= "" then return {Success = true, Duplicate = true, Reason = "ALREADY_OWNED"} end
+            if self.StoredRecordExistsByStorageUserKey[key] ~= true then return {Success = false, Reason = "PROFILE_NOT_PERSISTED"} end
+            candidate.MagnetPetPurchaseId = purchaseId
+            return self:PersistProfileCandidate(key, candidate)
+        end)
+        self:ReleaseMutationLock(key)
+        if not ok then
+            self:EvictProfile(key, "")
+            log_error("[MagnetPet] entitlement save failed; purchase remains pending")
+            return {Success = false, Reason = "PURCHASE_STORAGE_EXCEPTION"}
+        end
+        return result
     end
 
 end

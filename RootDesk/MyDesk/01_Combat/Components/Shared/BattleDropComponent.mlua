@@ -5,6 +5,7 @@ script BattleDropComponent extends Component
 	@Sync property integer PendingDropCount = 0
 	@Sync property integer DropRevision = 0
 	property string ProcessedKillKeys = ""
+	property string LastEnemyKillKey = ""
 	property any Presentation = nil
 
 	@ExecSpace("ServerOnly")
@@ -22,19 +23,24 @@ script BattleDropComponent extends Component
 		self.PendingDropSnapshot = ""
 		self.PendingDropCount = 0
 		self.ProcessedKillKeys = ""
+		self.LastEnemyKillKey = ""
 		self.DropRevision = self.DropRevision + 1
 		log("[BattleDrop] reset reason=" .. reason .. " revision=" .. self.DropRevision)
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ResolveEnemyDeath(integer runSeed, string stageId, integer waveIndex, string enemyDefinitionId, string unitId, integer spawnOrder, integer cellIndex, string triggerSnapshot, number itemDropRate)
+	method table ResolveEnemyDeath(integer runSeed, string stageId, integer waveIndex, string enemyDefinitionId, string unitId, integer spawnOrder, integer cellIndex, string triggerSnapshot, number itemDropRate, boolean premiumItemDropBonus)
 		-- Resolves one death exactly once across an ordered set of contextual trigger contracts.
+		local killKey = stageId .. ":" .. tostring(waveIndex) .. ":" .. tostring(spawnOrder) .. ":" .. unitId
+		if self:ContainsKey(self.ProcessedKillKeys, killKey) == false then
+			-- Track even an empty or failed roll: an older monster must never become the fallback.
+			self.LastEnemyKillKey = killKey
+		end
 		local contentValidation = _ContentValidatorLogic:ValidateEnemyDrops()
 		if contentValidation.Success == false then
 			log_error("[BattleDrop] resolution blocked reason=" .. contentValidation.Reason .. " detail=" .. (contentValidation.DetailReason or ""))
 			return { Success = false, Reason = contentValidation.Reason, DetailReason = contentValidation.DetailReason, AddedCount = 0 }
 		end
-		local killKey = stageId .. ":" .. tostring(waveIndex) .. ":" .. tostring(spawnOrder) .. ":" .. unitId
 		if self:ContainsKey(self.ProcessedKillKeys, killKey) then
 			log_warning("[BattleDrop] duplicate kill ignored key=" .. killKey)
 			return { Success = true, Reason = "DUPLICATE_KILL_IGNORED", AddedCount = 0 }
@@ -42,7 +48,7 @@ script BattleDropComponent extends Component
 		local addedCount = 0
 		local resolvedTriggers = 0
 		for triggerType in string.gmatch(triggerSnapshot or "", "([^|]+)") do
-			local rollResult = _EnemyDropDefinitionRepositoryLogic:ResolveDrops(enemyDefinitionId, triggerType, runSeed, stageId, waveIndex, unitId, spawnOrder, itemDropRate)
+			local rollResult = _EnemyDropDefinitionRepositoryLogic:ResolveDrops(enemyDefinitionId, triggerType, runSeed, stageId, waveIndex, unitId, spawnOrder, itemDropRate, premiumItemDropBonus)
 			if rollResult.Success == false then
 				log_error("[BattleDrop] resolution failed enemy=" .. enemyDefinitionId .. " unit=" .. unitId .. " trigger=" .. triggerType .. " reason=" .. rollResult.Reason)
 				return { Success = false, Reason = rollResult.Reason, AddedCount = addedCount, ResolvedTriggerCount = resolvedTriggers }
@@ -142,7 +148,25 @@ script BattleDropComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method table AutoCollectAll(Entity playerEntity, string battleRecordKey)
+	method table AutoCollectLastEnemy(Entity playerEntity, string battleRecordKey)
+		return self:CollectPendingDrops(playerEntity, battleRecordKey, false)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table AutoCollectMagnetDrops(Entity playerEntity, string battleRecordKey)
+		if not isvalid(playerEntity) then return {Success = false, Reason = "INVALID_PLAYER"} end
+		local state = playerEntity:GetComponent("script.PlayerRunUnionEffectComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if state == nil or inventory == nil or not state.IsInitialized or not state.MagnetPetOwned
+			or state.ActiveRunSequence ~= inventory.ActiveRunSequence then
+			return {Success = false, Reason = "MAGNET_PET_NOT_ACTIVE"}
+		end
+		return self:CollectPendingDrops(playerEntity, battleRecordKey, true)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CollectPendingDrops(Entity playerEntity, string battleRecordKey, boolean collectAll)
+		-- Ordinary clears collect the final death only; a verified magnet owner collects all pending drops.
 		local result = { Success = false, Reason = "UNKNOWN", CollectedCount = 0, FailedCount = 0 }
 		if isvalid(playerEntity) == false then
 			result.Reason = "INVALID_PLAYER"
@@ -154,27 +178,30 @@ script BattleDropComponent extends Component
 		end
 
 		local failedRecords = {}
+		local killPrefix = (self.LastEnemyKillKey or "") .. ":"
 		for record in string.gmatch(self.PendingDropSnapshot, "([^|]+)") do
 			local fields = {}
 			for field in string.gmatch(record, "([^~]+)") do
 				table.insert(fields, field)
 			end
-			if #fields == 5 then
+			local isLastEnemyDrop = self.LastEnemyKillKey ~= "" and #fields == 5
+				and string.sub(fields[1], 1, string.len(killPrefix)) == killPrefix
+			if isLastEnemyDrop or (collectAll and #fields == 5) then
 				local rewardKey = battleRecordKey .. ":drop:" .. fields[1]
 				local grantResult = _RunManagerLogic:GrantRunReward(playerEntity, fields[2], fields[3], math.floor(tonumber(fields[4]) or 0), rewardKey)
 				if grantResult.Success == true then
 					result.CollectedCount = result.CollectedCount + 1
 					local presentation = self:EnsurePresentation()
 					if presentation ~= nil then
-						presentation:RemoveDrop(fields[1], "AUTO_COLLECTED")
+						presentation:RemoveDrop(fields[1], collectAll and "MAGNET_AUTO_COLLECTED" or "LAST_ENEMY_AUTO_COLLECTED")
 					end
 				else
 					table.insert(failedRecords, record)
 					result.FailedCount = result.FailedCount + 1
 				end
 			else
+				-- A non-target record is left on the floor, not treated as a grant failure.
 				table.insert(failedRecords, record)
-				result.FailedCount = result.FailedCount + 1
 			end
 		end
 
@@ -182,8 +209,9 @@ script BattleDropComponent extends Component
 		self.PendingDropCount = #failedRecords
 		self.DropRevision = self.DropRevision + 1
 		result.Success = result.FailedCount == 0
-		result.Reason = result.Success and "AUTO_COLLECTED" or "AUTO_COLLECT_PARTIAL"
-		log("[BattleDrop] auto collect result=" .. result.Reason .. " collected=" .. result.CollectedCount .. " failed=" .. result.FailedCount .. " remaining=" .. self.PendingDropCount .. " revision=" .. self.DropRevision)
+		local prefix = collectAll and "MAGNET" or "LAST_ENEMY"
+		result.Reason = prefix .. (result.Success and "_AUTO_COLLECTED" or "_AUTO_COLLECT_PARTIAL")
+		log("[BattleDrop] " .. prefix .. " auto collect key=" .. self.LastEnemyKillKey .. " result=" .. result.Reason .. " collected=" .. result.CollectedCount .. " failed=" .. result.FailedCount .. " remaining=" .. self.PendingDropCount .. " revision=" .. self.DropRevision)
 		return result
 	end
 

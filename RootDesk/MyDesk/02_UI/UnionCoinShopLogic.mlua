@@ -1,0 +1,197 @@
+@Logic
+script UnionCoinShopLogic extends Logic
+
+    property EntityRef Wallet = "99c8dc9b-eb61-4182-ba12-3f1bbfcd1254"
+    property EntityRef Balance = "b70ad1bb-f177-4206-955d-232b0b5b2660"
+    property EntityRef OpenButton = "8852ee9e-0f3f-42c9-9978-b1ccaad9adcf"
+    property EntityRef Screen = "e870e3fa-ac01-4b60-9dec-5ecb23fa20cf"
+    property EntityRef CloseButton = "e9416639-9904-46c3-9b01-7947ef8de542"
+    property EntityRef ShopBalance = "e22e7adb-e3ff-4a2a-8485-a0e48db9cfc8"
+    property EntityRef SmallButton = "721f1621-7016-4027-954b-99de97a5db3c"
+    property EntityRef LargeButton = "1c9d9b72-777c-4d61-892b-a29d797f9415"
+    property EntityRef PremiumButton = "9aba35c8-57c2-4976-9ab2-9dca96597c37"
+    property boolean IsOpen = false
+    property number RefreshRemaining = 0
+    property integer RequestId = 0
+    property integer LastReceivedId = 0
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Keep the lobby wallet below every menu, including Maker-renumbered UI groups.
+        local hud = _EntityService:GetEntityByPath("/ui/LobbyUnionCoinHUD")
+        if isvalid(hud) and hud.UIGroupComponent ~= nil and hud.UITransformComponent ~= nil then
+            hud.UIGroupComponent.GroupOrder = 0
+            _UILogic:SetSiblingIndex(hud.UITransformComponent, 0)
+            log("[UnionCoinShop] wallet placed behind menus")
+        end
+        -- Bind persistent HUD and modal controls once for the client session.
+        self._T.Links = {}
+        self._T.Products = {}
+        self._T.ProductIds = {"", "", ""}
+        self._T.InLobby = false
+        self:Bind(self.OpenButton, function() self:OpenShop() end)
+        self:Bind(self.CloseButton, function() self:CloseShop() end)
+        self:Bind(self.SmallButton, function() self:Buy(1) end)
+        self:Bind(self.LargeButton, function() self:Buy(2) end)
+        self:Bind(self.PremiumButton, function() self:Buy(3) end)
+        if isvalid(self.Wallet) then self.Wallet.Enable = false end
+        if isvalid(self.Screen) then self.Screen.Enable = false end
+        self:ResetProducts()
+        log("[UnionCoinShop] lobby wallet initialized")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(Entity button, any callback)
+        -- Track every click subscription so it can be disconnected at session end.
+        if isvalid(button) == false then return end
+        local link = button:ConnectEvent(ButtonClickEvent, function()
+            _GameUIPolishLogic:PlayClick()
+            callback()
+        end)
+        table.insert(self._T.Links, {Entity = button, Handler = link})
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean InLobby()
+        -- Restrict wallet and shop presentation to the lobby map.
+        local player = _UserService.LocalPlayer
+        return isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name == "lobby"
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Poll only cached server balances; no datastore or product lookup runs here.
+        local inLobby = self:InLobby()
+        if self._T.InLobby ~= inLobby then
+            self._T.InLobby = inLobby
+            if isvalid(self.Wallet) then self.Wallet.Enable = inLobby end
+            self.RefreshRemaining = 0
+            if not inLobby then self:CloseShop() end
+        end
+        if not inLobby then return end
+        self.RefreshRemaining = self.RefreshRemaining - delta
+        if self.RefreshRemaining <= 0 then
+            self.RefreshRemaining = 2
+            self.RequestId = self.RequestId + 1
+            _UnionCoinPurchaseServiceLogic:RequestWallet(self.RequestId)
+        end
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveWallet(integer requestId, boolean ready, integer amount, string smallId, string largeId, string premiumId, boolean premiumOwned)
+        -- Apply authoritative balance only; clients never send a coin amount to the server.
+        if requestId < self.LastReceivedId then return end
+        self.LastReceivedId = requestId
+        local label = ready and self:FormatCoins(amount) or "불러오는 중"
+        self:SetText(self.Balance, label)
+        self:SetText(self.ShopBalance, ready and ("보유 유니온 코인  " .. label) or "코인 정보를 불러오는 중입니다")
+        if self._T.ProductIds == nil then self._T.ProductIds = {"", "", ""} end
+        local changed = self._T.ProductIds[1] ~= smallId or self._T.ProductIds[2] ~= largeId or self._T.ProductIds[3] ~= premiumId or self._T.PremiumOwned ~= premiumOwned
+        self._T.ProductIds = {smallId, largeId, premiumId}
+        self._T.PremiumOwned = premiumOwned
+        if changed then
+            self:ResetProducts()
+            if self.IsOpen then self:LoadProducts() end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string FormatCoins(integer amount)
+        -- Display the full integer with separators without rounding large balances.
+        local value = string.format("%.0f", amount)
+        local reversed = string.reverse(value)
+        local grouped = string.gsub(reversed, "(%d%d%d)", "%1,")
+        return string.gsub(string.reverse(grouped), "^,", "")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetText(Entity entity, string value)
+        -- Keep translated and changing labels within their authored rectangles.
+        if isvalid(entity) and entity.TextGUIRendererComponent ~= nil then
+            entity.TextGUIRendererComponent.Text = value
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ResetProducts()
+        -- Missing configuration must remain visibly unavailable, with no purchase prompt.
+        self._T.Products = {}
+        for index, button in ipairs({self.SmallButton, self.LargeButton, self.PremiumButton}) do
+            if isvalid(button) then
+                button.ButtonComponent.Enable = false
+                self:SetText(button, index == 3 and self._T.PremiumOwned and "보유 중 · 영구 적용" or "판매 준비 중")
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void LoadProducts()
+        -- Fetch real platform prices only when opening the shop or configuration changes.
+        local ids = self._T.ProductIds or {"", "", ""}
+        for index, productId in ipairs(ids) do
+            local button = index == 1 and self.SmallButton or (index == 2 and self.LargeButton or self.PremiumButton)
+            local expectedType = index == 3 and WorldShopProductType.Pass or WorldShopProductType.Item
+            if productId ~= "" and not (index == 3 and self._T.PremiumOwned) then
+                local ok, product = pcall(function() return _WorldShopService:GetProductAndWait(productId) end)
+                if self.IsOpen == false or self._T.ProductIds[index] ~= productId or (index == 3 and self._T.PremiumOwned) then return end
+                if ok and product ~= nil and product.Id == productId and product.Type == expectedType and product.Status == WorldShopProductStatus.Ing then
+                    self._T.Products[index] = productId
+                    if isvalid(button) then
+                        self:SetText(button, self:FormatCoins(product.Price) .. " 월드 코인")
+                        button.ButtonComponent.Enable = true
+                    end
+                else
+                    self:SetText(button, "현재 구매할 수 없습니다")
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenShop()
+        -- Avoid stacking with settings, the world map, character selection, or Union menus.
+        if self.IsOpen or not self:InLobby() or _GameSettingsLogic:IsInputBlocked() then return end
+        if _UnionSystemUILogic:IsOpen() or _UnionSystemUILogic:IsOtherLobbyPopupOpen() then return end
+        if isvalid(self.Screen) == false then return end
+        self.IsOpen = true
+        self.Screen.Enable = true
+        _GameUIPolishLogic:BringUIGroupToFront(_EntityService:GetEntityByPath("/ui/UnionCoinShopUI"))
+        self:ResetProducts()
+        self:LoadProducts()
+        log("[UnionCoinShop] opened")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CloseShop()
+        -- Close immediately on map exit and on the modal's close or Escape action.
+        self.IsOpen = false
+        if isvalid(self.Screen) then self.Screen.Enable = false end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Buy(integer index)
+        -- Open the platform confirmation only; fulfillment happens exclusively on the server.
+        if not self.IsOpen or not self:InLobby() then return end
+        if index == 3 and self._T.PremiumOwned then return end
+        local productId = self._T.Products[index]
+        if productId == nil or productId == "" or productId ~= self._T.ProductIds[index] then return end
+        _WorldShopService:PromptPurchase(productId)
+    end
+
+    @ExecSpace("ClientOnly")
+    @EventSender("Service", "InputService")
+    handler HandleKeyDown(KeyDownEvent event)
+        -- Consume Escape through the shared menu modal ownership convention.
+        if self.IsOpen and event.key == KeyboardKey.Escape then self:CloseShop() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Disconnect subscriptions and release client-only presentation state.
+        for _, link in ipairs(self._T.Links or {}) do
+            if isvalid(link.Entity) then link.Entity:DisconnectEvent(ButtonClickEvent, link.Handler) end
+        end
+        self._T.Links = {}
+        self:CloseShop()
+    end
+end
