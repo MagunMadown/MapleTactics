@@ -6514,22 +6514,26 @@ script BattleSessionComponent extends Component
 		local context = contextResult.Data
 		local expectedEntry = self.EntryRequestId
 		local safeImpactDelay = math.max(0, motionProfile.ImpactDelay)
+		self:ClearSkillImpactTimers()
+		local castSequence = self._T.projectileCastSequence
 		local resolveEffects = function()
-			self.ImpactTimerId = 0
+			if self._T.projectileCastSequence ~= castSequence then return end
 			-- A delayed impact belongs to this living actor and this battle entry only.
 			if self.EntryRequestId ~= expectedEntry or self.BattleResult ~= ""
 				or not isvalid(sourceEntity) or sourceUnit.IsDead or sourceUnit.CurrentHp <= 0
 				or self:FindUnitEntity(sourceUnitId) ~= sourceEntity then
+				self.ImpactTimerId = 0
 				log("[SkillExecution] stale impact cancelled source=" .. sourceUnitId .. " skill=" .. skillId)
 				return
 			end
+			-- Resource loads inside death/drop handling can yield; keep the queue blocked until they return.
 			local effectResult = _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
+			if self._T.projectileCastSequence == castSequence then self.ImpactTimerId = 0 end
 			if effectResult.Success == false then
 				log_warning("[SkillExecution] failed skill=" .. skillId .. " source=" .. sourceUnitId .. " reason=" .. effectResult.Reason)
 			end
 		end
 
-		self:ClearSkillImpactTimers()
 		if self:IsSequentialProjectileVolley(definition, effectSteps) then
 			return self:LaunchSequentialProjectileVolley(context, effectSteps[1])
 		end
@@ -6686,8 +6690,10 @@ script BattleSessionComponent extends Component
 		end
 		local fireNext
 		fireNext = function()
-			if self._T.projectileCastSequence == castSequence then self.ImpactTimerId = 0 end
-			if not stillActive() then return end
+			if not stillActive() then
+				if self._T.projectileCastSequence == castSequence then self.ImpactTimerId = 0 end
+				return
+			end
 			shotIndex = shotIndex + 1
 			local targetId = ""
 			local aimCell = cells[#cells]
@@ -6703,6 +6709,7 @@ script BattleSessionComponent extends Component
 			if aimCell == nil then
 				_SkillExecutionLogic:NotifyRelicSkillCompleted(context)
 				_SkillExecutionLogic:ConsumeNextAttackBonusOnHit(context, results)
+				if self._T.projectileCastSequence == castSequence then self.ImpactTimerId = 0 end
 				return
 			end
 			if pierces and #cells > 0 then aimCell = cells[#cells] end
@@ -6724,8 +6731,10 @@ script BattleSessionComponent extends Component
 			self:SpawnSkillProjectile(context.SkillId, "SkillProjectile_" .. tostring(self.ProjectileSpawnCount), startPosition, endPosition, speed, shotRuid, definition.ProjectileScale or 1, direction > 0)
 			log("[SkillProjectile] volley launched skill=" .. context.SkillId .. " shot=" .. shotIndex .. "/" .. shotCount .. " target=" .. targetId .. " cell=" .. aimCell .. " flight=" .. flight)
 			self.ImpactTimerId = _TimerService:SetTimerOnce(function()
-				if self._T.projectileCastSequence == castSequence then self.ImpactTimerId = 0 end
-				if not stillActive() then return end
+				if not stillActive() then
+					if self._T.projectileCastSequence == castSequence then self.ImpactTimerId = 0 end
+					return
+				end
 				if targetId ~= "" then
 					local damage = shotIndex > 1 and 1 or effectStep.Value
 					local previousHit = self._T.AttackBuffHit
@@ -6747,8 +6756,11 @@ script BattleSessionComponent extends Component
 				if shotIndex >= shotCount or self.BattleResult ~= "" then
 					_SkillExecutionLogic:NotifyRelicSkillCompleted(context)
 					_SkillExecutionLogic:ConsumeNextAttackBonusOnHit(context, results)
+					if self._T.projectileCastSequence == castSequence then self.ImpactTimerId = 0 end
 				elseif stillActive() then
 					self.ImpactTimerId = _TimerService:SetTimerOnce(fireNext, math.max(0.001, interval))
+				elseif self._T.projectileCastSequence == castSequence then
+					self.ImpactTimerId = 0
 				end
 			end, flight)
 		end
@@ -7720,6 +7732,10 @@ script BattleSessionComponent extends Component
 			return
 		end
 
+		-- Keep death identity stable even if a yielding drop load overlaps entity cleanup.
+		local deathTeam = unit.Team
+		local deathIsBoss = unit.IsBoss
+		local deathEntry = self.EntryRequestId
 		local deathState = unit:MarkDead()
 		if deathState.Success == false then
 			log_error("[BattleDeath] state transition failed unit=" .. unitId .. " reason=" .. deathState.Reason)
@@ -7792,7 +7808,8 @@ script BattleSessionComponent extends Component
 				log_error("[BattleDeath] drop failed unit=" .. unitId .. " reason=" .. dropResult.Reason)
 			end
 		end
-		if unit.Team == "Enemy" and unit.IsBoss then
+		if self.EntryRequestId ~= deathEntry or self.BattleResult ~= "" then return end
+		if deathTeam == "Enemy" and deathIsBoss then
 			self._T.BossDefeated = true
 			self.WaveRuntime:CancelPendingSpawns("BOSS_DEFEATED")
 			self:ClearPoisonMists()
@@ -7807,25 +7824,39 @@ script BattleSessionComponent extends Component
 			end
 			log("[BattleBoss] defeated; remaining enemies removed unit=" .. unitId)
 		end
-		if unit.Team == "Enemy" and self.BoardState ~= nil then
+		if deathTeam == "Enemy" and self.BoardState ~= nil then
 			local livingEnemies = self.BoardState:CollectLivingEnemies()
 			if #livingEnemies > 0 then
 				log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=CONTINUE livingEnemies=" .. #livingEnemies)
 				return
 			end
 		end
-		if unit.Team == "Enemy" and not unit.IsBoss and self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0 then
+		if deathTeam == "Enemy" and not deathIsBoss and self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0 then
 			-- Keep the frozen queue alive so healing/buffs resolve before wave or victory settlement.
 			self:ClearForcedSpawnSchedule("QUEUE_CLEAR_PENDING")
 			self._T.PendingClear = { UnitId = unitId, Cause = cause, Entry = self.EntryRequestId }
 			log("[BattleQueueBoundary] clear deferred until queue completion unit=" .. unitId)
 			return
 		end
-		self:FinishEmptyBattlefield(unitId, cause, unit.Team)
+		self:FinishEmptyBattlefield(unitId, cause, deathTeam)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void FinishEmptyBattlefield(string unitId, string cause, string team)
+		-- Settle only a confirmed opposing-team clear or the actual player death.
+		if self.BattleResult ~= "" then return end
+		if team == "Enemy" then
+			if self.BoardState == nil or #self.BoardState:CollectLivingEnemies() > 0 then return end
+		elseif team == "Player" then
+			local playerUnit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
+			if playerUnit == nil or playerUnit.UnitId ~= unitId or not playerUnit.IsDead then
+				log_warning("[BattleResult] settlement rejected unit=" .. unitId .. " reason=PLAYER_NOT_DEAD")
+				return
+			end
+		else
+			log_warning("[BattleResult] settlement rejected unit=" .. unitId .. " reason=INVALID_DEATH_TEAM team=" .. tostring(team))
+			return
+		end
 		self._T.PendingClear = nil
 		self:ClearForcedSpawnSchedule("ALL_ENEMIES_DEFEATED")
 		self:ClearTurnTransitionTimer("ALL_ENEMIES_DEFEATED")
