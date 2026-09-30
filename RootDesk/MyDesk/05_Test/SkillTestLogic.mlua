@@ -13,6 +13,8 @@ script SkillTestLogic extends Logic
 	property number OverrideWatchElapsed = 0
 	-- Client-local: the test panel sets this while a stat input has focus so battle keys stay idle.
 	property boolean KeyboardCaptured = false
+	-- skillId -> jobId for the one utility each job owns; utilities live outside the normal skill datasets.
+	property table UtilityJobBySkillId = {}
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
@@ -54,6 +56,7 @@ script SkillTestLogic extends Logic
 	method void RefreshCatalog()
 		-- Serializes every player skill as skillId~name~icon~job~tier; skill datasets are server-only.
 		local records = {}
+		self.UtilityJobBySkillId = {}
 		for jobId in string.gmatch(self.CatalogJobIds, "([^,]+)") do
 			local catalog = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(jobId)
 			if catalog.Success == true then
@@ -63,9 +66,24 @@ script SkillTestLogic extends Logic
 						self:SafeField(definition.DisplayName),
 						self:SafeField(definition.IconRuid),
 						jobId,
-						tostring(definition.SkillTier or 1)
+						tostring(definition.SkillTier or 1),
+						""
 					}, "~"))
 				end
+			end
+			-- The utility is listed with its job; its trailing "U" flag lets the panel equip it instead of slotting it.
+			local utility = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(jobId)
+			if utility.Success == true then
+				local definition = utility.Definition
+				self.UtilityJobBySkillId[definition.SkillId] = jobId
+				table.insert(records, table.concat({
+					self:SafeField(definition.SkillId),
+					self:SafeField(definition.DisplayName),
+					self:SafeField(definition.IconRuid),
+					jobId,
+					"1",
+					"U"
+				}, "~"))
 			end
 		end
 		self.SkillCatalogSnapshot = table.concat(records, "|")
@@ -195,8 +213,78 @@ script SkillTestLogic extends Logic
 	end
 
 	@ExecSpace("ServerOnly")
+	method table GetDefinitionAny(string skillId)
+		-- Utilities live outside the ordinary skill datasets, so they resolve through their job's utility bundle.
+		local jobId = self.UtilityJobBySkillId[skillId]
+		if jobId == nil then
+			return _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		end
+		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(jobId)
+		if bundle.Success == false then
+			return { Success = false, Reason = bundle.DetailReason or bundle.Reason }
+		end
+		return bundle.Definition
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateSkillAny(string skillId)
+		if self.UtilityJobBySkillId[skillId] == nil then
+			return _ContentValidatorLogic:ValidateSkillById(skillId)
+		end
+		local catalog = _ContentValidatorLogic:ValidateUtilitySkills()
+		if catalog.Success == false then
+			return { Success = false, Reason = catalog.Reason, DetailReason = catalog.DetailReason }
+		end
+		return { Success = true, Reason = "OK" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildUtilityDetail(string skillId)
+		-- Utilities are shown read-only: the stat/override layer only covers the normal skill datasets.
+		local jobId = self.UtilityJobBySkillId[skillId]
+		local bundle = jobId ~= nil and _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(jobId) or { Success = false }
+		if bundle.Success == false then
+			return {}
+		end
+		local definition = bundle.Definition
+		local step = bundle.Step
+		local detail = {
+			SkillId = skillId,
+			DisplayName = definition.DisplayName or skillId,
+			IconRuid = definition.IconRuid or "",
+			JobId = jobId,
+			Tier = "1",
+			HasProjectile = (definition.ProjectileRuid or "") ~= "" and "true" or "false"
+		}
+		local overridden = {}
+		for _, spec in ipairs(self:GetDefinitionFieldSpecs()) do
+			detail["F_" .. spec.Field] = self:FormatValue(definition[spec.Field])
+			if _SkillDefinitionRepositoryLogic:GetTestDefinitionOverride(skillId, spec.Field) ~= nil then
+				table.insert(overridden, spec.Field)
+			end
+		end
+		detail.Steps = table.concat({
+			tostring(step.StepIndex),
+			self:SafeField(step.EffectType),
+			self:SafeField(step.TargetSelector),
+			self:FormatValue(step.Value),
+			self:SafeField(step.ParameterA)
+		}, "~")
+		for _, field in ipairs({ "Value", "ParameterA" }) do
+			if _SkillDefinitionRepositoryLogic:GetTestEffectOverride(definition.EffectSetId, step.StepIndex, field) ~= nil then
+				table.insert(overridden, "S" .. tostring(step.StepIndex) .. "." .. field)
+			end
+		end
+		detail.Overridden = table.concat(overridden, "|")
+		return detail
+	end
+
+	@ExecSpace("ServerOnly")
 	method table BuildSkillDetail(string skillId)
 		-- Flat string table of the effective (overridden) values the panel edits.
+		if self.UtilityJobBySkillId[skillId] ~= nil then
+			return self:BuildUtilityDetail(skillId)
+		end
 		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
 		if definition.Success == false then
 			return {}
@@ -257,6 +345,7 @@ script SkillTestLogic extends Logic
 		local result = self:TrySetDefinitionStat(skillId, field, valueText)
 		if result.Success == true then
 			access.Session:RefreshSkillTestPresentation("SKILL_TEST_STAT")
+			access.Session:RefreshSkillTestUtility()
 		end
 		self:ReceiveSkillTestResult("SET_STAT", result.Success, result.Reason, self:BuildSkillDetail(skillId), senderUserId)
 	end
@@ -279,7 +368,7 @@ script SkillTestLogic extends Logic
 		local previousOffsets = _SkillDefinitionRepositoryLogic:GetTestDefinitionOverride(skillId, "TargetOffsets")
 		if field == "TargetingType" and value == "RANGE_OFFSETS" then
 			-- RANGE_OFFSETS needs explicit cells; seed 1..Range so the switch works without a second edit.
-			local current = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+			local current = self:GetDefinitionAny(skillId)
 			local range = math.max(1, current.Range or 1)
 			if current.Success == true and _ContentValidatorLogic:AreValidTargetOffsets(current.TargetOffsets, range) == false then
 				local cells = {}
@@ -291,7 +380,7 @@ script SkillTestLogic extends Logic
 			end
 		end
 		_SkillDefinitionRepositoryLogic:SetTestDefinitionOverride(skillId, field, value)
-		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		local validation = self:ValidateSkillAny(skillId)
 		if validation.Success == false then
 			-- Keep the previous effective state; an invalid row would make the skill unusable mid-test.
 			_SkillDefinitionRepositoryLogic:SetTestDefinitionOverride(skillId, field, previous)
@@ -314,6 +403,7 @@ script SkillTestLogic extends Logic
 		local result = self:TrySetEffectStat(skillId, stepIndex, field, valueText)
 		if result.Success == true then
 			access.Session:RefreshSkillTestPresentation("SKILL_TEST_EFFECT")
+			access.Session:RefreshSkillTestUtility()
 		end
 		self:ReceiveSkillTestResult("SET_STAT", result.Success, result.Reason, self:BuildSkillDetail(skillId), senderUserId)
 	end
@@ -323,7 +413,7 @@ script SkillTestLogic extends Logic
 		if field ~= "Value" and field ~= "ParameterA" then
 			return { Success = false, Reason = "FIELD_NOT_EDITABLE" }
 		end
-		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		local definition = self:GetDefinitionAny(skillId)
 		if definition.Success == false then
 			return { Success = false, Reason = definition.Reason }
 		end
@@ -334,7 +424,7 @@ script SkillTestLogic extends Logic
 		end
 		local previous = _SkillDefinitionRepositoryLogic:GetTestEffectOverride(definition.EffectSetId, stepIndex, field)
 		_SkillDefinitionRepositoryLogic:SetTestEffectOverride(definition.EffectSetId, stepIndex, field, parsed.Value)
-		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		local validation = self:ValidateSkillAny(skillId)
 		if validation.Success == false then
 			_SkillDefinitionRepositoryLogic:SetTestEffectOverride(definition.EffectSetId, stepIndex, field, previous)
 			local reason = validation.DetailReason or validation.Reason
@@ -352,9 +442,10 @@ script SkillTestLogic extends Logic
 			self:ReceiveSkillTestResult("RESET_STATS", false, access.Reason, {}, senderUserId)
 			return
 		end
-		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		local definition = self:GetDefinitionAny(skillId)
 		_SkillDefinitionRepositoryLogic:ClearTestOverridesForSkill(skillId, definition.EffectSetId or "")
 		access.Session:RefreshSkillTestPresentation("SKILL_TEST_RESET_STATS")
+		access.Session:RefreshSkillTestUtility()
 		self:ReceiveSkillTestResult("RESET_STATS", true, "OK", self:BuildSkillDetail(skillId), senderUserId)
 	end
 
@@ -379,6 +470,12 @@ script SkillTestLogic extends Logic
 			local original = repository:GetSkillDefinition(skillId)
 			repository.TestOverridesSuspended = false
 			local csvName = self:FindSkillDataSetName(skillId) .. ".csv"
+			if self.UtilityJobBySkillId[skillId] ~= nil then
+				csvName = "UtilitySkillDefinitions.csv"
+				repository.TestOverridesSuspended = true
+				original = self:GetDefinitionAny(skillId)
+				repository.TestOverridesSuspended = false
+			end
 			for field, value in pairs(overrides) do
 				local fromText = original.Success == true and self:FormatValue(original[field]) or "?"
 				local toText = self:FormatValue(value)
@@ -390,6 +487,18 @@ script SkillTestLogic extends Logic
 		for effectSetId, setOverrides in pairs(repository.TestEffectOverrides) do
 			repository.TestOverridesSuspended = true
 			local original = repository:GetEffectSteps(effectSetId)
+			local effectCsvName = repository.EffectStepDataSetName
+			if original.Success == false then
+				-- Not an ordinary effect set: read the utility bundle's step instead.
+				effectCsvName = "UtilitySkillEffectSteps"
+				original = { Steps = {} }
+				for _, utilityJobId in pairs(self.UtilityJobBySkillId) do
+					local bundle = repository:GetUtilitySkillBundle(utilityJobId)
+					if bundle.Success == true and bundle.Definition.EffectSetId == effectSetId then
+						original.Steps = { bundle.Step }
+					end
+				end
+			end
 			repository.TestOverridesSuspended = false
 			for stepIndex, stepOverrides in pairs(setOverrides) do
 				local originalStep = nil
@@ -402,7 +511,7 @@ script SkillTestLogic extends Logic
 					local fromText = originalStep ~= nil and self:FormatValue(originalStep[field]) or "?"
 					local toText = self:FormatValue(value)
 					if fromText ~= toText then
-						table.insert(lines, "csv=" .. repository.EffectStepDataSetName .. ".csv effectSet=" .. effectSetId .. " step=" .. tostring(stepIndex) .. " field=" .. field .. " from=" .. fromText .. " to=" .. toText)
+						table.insert(lines, "csv=" .. effectCsvName .. ".csv effectSet=" .. effectSetId .. " step=" .. tostring(stepIndex) .. " field=" .. field .. " from=" .. fromText .. " to=" .. toText)
 					end
 				end
 			end
@@ -440,6 +549,23 @@ script SkillTestLogic extends Logic
 		end
 		local result = access.Session:TrySkillTestAssignSlot(slotIndex, skillId)
 		self:ReceiveSkillTestResult("ASSIGN", result.Success, result.Reason, { SkillId = skillId, SlotIndex = tostring(slotIndex) }, senderUserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestAssignUtility(string skillId)
+		-- Points the battle bar's utility button at the chosen utility so it can be cast on the dummy.
+		local access = self:ResolveTestSession(senderUserId)
+		if access.Success == false then
+			self:ReceiveSkillTestResult("ASSIGN_UTILITY", false, access.Reason, {}, senderUserId)
+			return
+		end
+		local jobId = self.UtilityJobBySkillId[skillId]
+		if jobId == nil then
+			self:ReceiveSkillTestResult("ASSIGN_UTILITY", false, "NOT_A_UTILITY_SKILL", {}, senderUserId)
+			return
+		end
+		local result = access.Session:TrySkillTestAssignUtility(jobId)
+		self:ReceiveSkillTestResult("ASSIGN_UTILITY", result.Success, result.Reason, self:BuildSkillDetail(skillId), senderUserId)
 	end
 
 	@ExecSpace("Server")
@@ -489,7 +615,8 @@ script SkillTestLogic extends Logic
 					DisplayName = fields[2],
 					IconRuid = fields[3],
 					JobId = fields[4],
-					Tier = tonumber(fields[5]) or 1
+					Tier = tonumber(fields[5]) or 1,
+					IsUtility = fields[6] == "U"
 				})
 			end
 		end

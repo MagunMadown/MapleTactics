@@ -175,13 +175,20 @@
           if(d.CostType||Number(d.CostValue)!==0)fail("CostValue","UTILITY_COST_UNSUPPORTED");
           if(d.FreePlay!=="false")fail("FreePlay","UTILITY_FREE_PLAY_UNSUPPORTED");
           if(Number(d.SkillTier)!==1||d.BaseSkillId)fail("SkillTier","UTILITY_UPGRADE_UNSUPPORTED");
-          if(d.ProjectileRuid)fail("ProjectileRuid","UTILITY_PROJECTILE_UNSUPPORTED");
-          if(Number(d.ProjectileHeight)>0||Number(d.ProjectileCount)>1||Number(d.ProjectileInterval)>0)fail("ProjectileCount","PROJECTILE_WITHOUT_PROJECTILE");
+          if(d.ProjectileRuid){
+            if(!(Number(d.ProjectileSpeed)>0))fail("ProjectileSpeed","INVALID_PROJECTILE_SPEED");
+            if(d.TargetingType==="SELF")fail("ProjectileRuid","PROJECTILE_ON_SELF_TARGETING");
+            if(Number(d.ProjectileCount||1)>1&&!(Number(d.ProjectileInterval)>0))fail("ProjectileInterval","PROJECTILE_VOLLEY_WITHOUT_INTERVAL");
+          }else if(Number(d.ProjectileHeight)>0||Number(d.ProjectileCount)>1||Number(d.ProjectileInterval)>0)fail("ProjectileCount","PROJECTILE_WITHOUT_PROJECTILE");
           if(d.HudIconBackgroundColor&&!/^#[a-f0-9]{8}$/i.test(d.HudIconBackgroundColor))fail("HudIconBackgroundColor","INVALID_HUD_ICON_BACKGROUND_COLOR");
           if(d.CasterMotionRuid&&(!numberOK(d.CasterMotionPlayRate,0.000001,false)||!numberOK(d.CasterMotionDuration,0.000001,false)))fail("CasterMotionRuid","INVALID_CASTER_MOTION");
           const steps=effects.rows.filter(s=>s.EffectSetId===d.EffectSetId);
           if(steps.length!==1)fail("EffectSetId","UTILITY_EFFECT_COUNT_INVALID");
-          else {const reason=effectReason(d,steps[0]);if(reason)fail("EffectSetId",reason);}
+          else {
+            const reason=effectReason(d,steps[0]);if(reason)fail("EffectSetId",reason);
+            // Only the push utility launches its visual projectile.
+            if(d.ProjectileRuid&&steps[0].EffectType!=="PUSH_DISTANCE")fail("ProjectileRuid","UTILITY_PROJECTILE_UNSUPPORTED");
+          }
         });
         for(const j of tables.JobDefinitions?.rows||[])if(!seenJobs.has(j.JobId))add("UtilitySkillDefinitions",0,"RequiredJobTag","UTILITY_JOB_MISSING:"+j.JobId);
         effects.rows.forEach((s,i)=>{

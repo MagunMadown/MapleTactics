@@ -254,6 +254,8 @@ script BattleSessionComponent extends Component
 	property string PrototypeTestStageOverride = ""
 	-- Skill test map: one passive dummy with refilling HP, no reinforcement waves, and a test-editable skill bar.
 	property boolean SkillTestMode = false
+	-- Skill test map only: the job whose utility the utility button uses instead of the run job. Empty = run job.
+	property string SkillTestUtilityJobId = ""
 	property string SkillTestStageId = "henesys_stage_01"
 	property integer SkillTestDummyCell = 1
 	-- Kept small on purpose: the world HP HUD draws one pip per HP point. Lethal hits refill instead of killing.
@@ -1948,7 +1950,9 @@ script BattleSessionComponent extends Component
 		if unit == nil or unit.IsDead or unit.IsAirborne then
 			return { Success = false, Reason = "UNIT_UNAVAILABLE" }
 		end
-		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(self.SelectedJobId)
+		local utilityJobId = self.SelectedJobId
+		if self.SkillTestMode == true and self.SkillTestUtilityJobId ~= "" then utilityJobId = self.SkillTestUtilityJobId end
+		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(utilityJobId)
 		if bundle.Success == false then return bundle end
 		-- Frostbite roots the player: self-moving utilities are blocked like grid moves.
 		if bundle.Step ~= nil and bundle.Step.EffectType == "MOVE_SELF" and self:IsPlayerFrostbitten() then
@@ -1973,8 +1977,8 @@ script BattleSessionComponent extends Component
 			if unit.IsDead or self.BattleResult ~= "" then return { Success = true, Reason = "BURN_LETHAL" } end
 		end
 		-- A utility effect resolves synchronously, so this is still cast time; arming the presentation only
-		-- after acceptance keeps a rejected cast (no target, blocked destination) silent. Utility rows author
-		-- no cast/hit clip today, so in practice this presents the authored cast sound alone.
+		-- after acceptance keeps a rejected cast (no target, blocked destination) silent. This presents the
+		-- authored cast clip and sound; hit clips are played by the effect itself (throw, push).
 		self:BeginSkillEffectPresentation(unit.UnitId, definition)
 		self.UtilitySkillId = definition.SkillId
 		self.UtilitySkillIconRuid = definition.IconRuid
@@ -2094,6 +2098,33 @@ script BattleSessionComponent extends Component
 		table.sort(targetIds, function(left, right)
 			return math.abs(targets.TargetCellsByUnitId[left] - sourceCell) > math.abs(targets.TargetCellsByUnitId[right] - sourceCell)
 		end)
+		-- The shot is cosmetic: the push below resolves at once, so the aim cell is read before anything moves and
+		-- the authored hit clip/sound land on the pushed targets when the shot arrives.
+		local hitTargetIds = {}
+		for _, id in ipairs(targetIds) do table.insert(hitTargetIds, id) end
+		local hitDelay = 0
+		if self:HasSkillProjectile(definition) then
+			local launchDelay = self:GetProjectileLaunchDelay(definition)
+			hitDelay = launchDelay + self:LaunchSkillProjectile(sourceUnit.UnitId, definition, launchDelay)
+		end
+		if (definition.HitEffectRuid or "") ~= "" or (definition.HitSoundRuid or "") ~= "" then
+			local flipX = sourceUnit.Facing == "Right"
+			local playHit = function()
+				for _, id in ipairs(hitTargetIds) do
+					local hitEntity = self:FindUnitEntity(id)
+					local hitPresentation = isvalid(hitEntity) and hitEntity:GetComponent("script.BattleUnitPresentationComponent") or nil
+					if hitPresentation ~= nil then
+						hitPresentation:PlaySkillEffect(id, "HIT", definition.HitEffectRuid or "", definition.EffectScale or 1, flipX, self:GetSkillSpeedMultiplier())
+						hitPresentation:PlaySkillSound(id, "HIT", definition.HitSoundRuid or "", self:GetSkillSoundVolume())
+					end
+				end
+			end
+			if hitDelay > 0 then
+				_TimerService:SetTimerOnce(playHit, hitDelay)
+			else
+				playHit()
+			end
+		end
 		local maxSteps = step.ParameterA == "MAX" and self.CellCount or math.max(0, math.floor(step.Value))
 		local moved = 0
 		local cancelled = 0
@@ -4765,6 +4796,7 @@ script BattleSessionComponent extends Component
 			runOwner = self.PlayerEntity
 		end
 		self.SelectedJobId = runState.SelectedJobId
+		self.SkillTestUtilityJobId = ""
 		self.SelectedJobMechanicId = runState.SelectedJobMechanicId
 		self.SelectedJobPassiveSetId = runState.SelectedJobPassiveSetId
 		local utility = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(self.SelectedJobId)
@@ -4948,6 +4980,56 @@ script BattleSessionComponent extends Component
 		self:RefreshSkillTestPresentation("SKILL_TEST_ASSIGN")
 		log("[SkillTest] slot assigned slot=" .. tostring(slotIndex) .. " skill=" .. skillId .. " slots=" .. self.SkillSlotIds)
 		return { Success = true, Reason = "OK", SlotIds = self.SkillSlotIds }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TrySkillTestAssignUtility(string jobId)
+		-- Skill test map only: makes the utility button use another job's utility so every utility can be tried.
+		if self.SkillTestMode ~= true then
+			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
+		end
+		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(jobId)
+		if bundle.Success == false then
+			return bundle
+		end
+		local definition = bundle.Definition
+		self.SkillTestUtilityJobId = jobId
+		self.UtilitySkillId = definition.SkillId
+		self.UtilitySkillIconRuid = definition.IconRuid
+		self.UtilityMaxCooldown = definition.CooldownTurns
+		local runtime = self:GetSkillRuntimeState("player_01")
+		if runtime ~= nil then
+			runtime:ResetSkillRuntimeState("SKILL_TEST_UTILITY_ASSIGN")
+		end
+		self.UtilityRemainingCooldown = 0
+		-- Warm the new utility's clips and sounds so its first cast looks like every later one.
+		local ruids = {}
+		local seen = {}
+		for _, ruid in ipairs({ definition.CastEffectRuid, definition.HitEffectRuid, definition.ProjectileRuid, definition.CastSoundRuid, definition.HitSoundRuid }) do
+			self:CollectPresentationRuid(ruids, seen, ruid)
+		end
+		if #ruids > 0 and isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
+			self:PreloadSkillPresentation(table.concat(ruids, "|"), self.PlayerEntity.PlayerComponent.UserId)
+		end
+		self:PublishTurnStateSnapshot("SKILL_TEST_UTILITY")
+		log("[SkillTest] utility assigned job=" .. jobId .. " skill=" .. definition.SkillId)
+		return { Success = true, Reason = "OK", SkillId = definition.SkillId }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshSkillTestUtility()
+		-- Re-reads the equipped utility so an edited cooldown or icon reaches the utility HUD.
+		if self.SkillTestMode ~= true or self.UtilitySkillId == "" then
+			return
+		end
+		local jobId = self.SkillTestUtilityJobId ~= "" and self.SkillTestUtilityJobId or self.SelectedJobId
+		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(jobId)
+		if bundle.Success == false then
+			return
+		end
+		self.UtilitySkillIconRuid = bundle.Definition.IconRuid
+		self.UtilityMaxCooldown = bundle.Definition.CooldownTurns
+		self.UtilityRemainingCooldown = math.min(self.UtilityRemainingCooldown, self.UtilityMaxCooldown)
 	end
 
 	@ExecSpace("ServerOnly")
