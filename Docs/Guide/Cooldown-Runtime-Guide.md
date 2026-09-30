@@ -52,6 +52,13 @@ CooldownSnapshot                (Client 표시 전용)
 | 0 | 0 | 0 | 0 |
 | 1 | 1 | 0 | 0 |
 | 2 | 2 | 1 | 0 |
+| 4 | 4 | 3 | 2 |
+
+어떤 스킬이 어떤 설정값을 갖는지는 이 문서가 아니라
+[`Skill-Authoring-Guide.md`](./Skill-Authoring-Guide.md) "저작값 규칙"이 소유한다. 현재는
+직업별 스킬이 `CooldownTurns == SkillTier`(1단계 `1` / 2단계 `2`), 유틸리티 스킬이 전 행
+`4`다. 런타임은 값의 출처를 구분하지 않고 `CooldownTurns`만 읽으므로 이 표의 감소 규칙은
+어떤 값에도 그대로 적용된다.
 
 향후 적이 Cooldown 스킬을 사용할 때도 같은 컴포넌트를 재사용하되, 적 Turn 전체가 아닌
 각 적의 행동 주기 경계에서 `AdvanceCooldowns`를 호출하도록 Turn Controller를

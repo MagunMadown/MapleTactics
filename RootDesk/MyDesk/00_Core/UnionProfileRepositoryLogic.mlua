@@ -1,0 +1,2319 @@
+@Logic
+script UnionProfileRepositoryLogic extends Logic
+
+	property integer CurrentSchemaVersion = 5
+	property integer RewardReceiptRetention = 64
+	property integer BlockPurchaseReceiptRetention = 32
+    property string StorageKey = "UnionProfile"
+    property string JsonEmptyMapMarker = "__EMPTY_MAP__"
+    property table ProfilesByStorageUserKey = {}
+    property table RawByStorageUserKey = {}
+    property table StoredRecordExistsByStorageUserKey = {}
+    property table LoadStateByStorageUserKey = {}
+    property table MutationLocksByStorageUserKey = {}
+    property table StorageUserKeyByUserId = {}
+    property boolean DefinitionValidationAttempted = false
+    property boolean DefinitionsValid = false
+    property string DefinitionValidationReason = "NOT_VALIDATED"
+    property any UserEnterHandler = nil
+    property any UserReconnectHandler = nil
+    property any UserLeaveHandler = nil
+
+    @ExecSpace("ServerOnly")
+    method void OnBeginPlay()
+        -- Wires one server-side profile lifecycle and preloads users already present in the world instance.
+        self.UserEnterHandler = _UserService:ConnectEvent(UserEnterEvent, self.HandleUserEnterEvent)
+        self.UserReconnectHandler = _UserService:ConnectEvent(UserReconnectEvent, self.HandleUserReconnectEvent)
+        self.UserLeaveHandler = _UserService:ConnectEvent(UserLeaveEvent, self.HandleUserLeaveEvent)
+        for _, userEntity in ipairs(_UserService.UserEntities.Values) do
+            if isvalid(userEntity) then
+                self:EnsureProfileLoaded(userEntity)
+            end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEndPlay()
+        -- Disconnects lifecycle handlers and releases the in-memory cache at world-session shutdown.
+        if self.UserEnterHandler ~= nil then
+            _UserService:DisconnectEvent(UserEnterEvent, self.UserEnterHandler)
+        end
+        if self.UserReconnectHandler ~= nil then
+            _UserService:DisconnectEvent(UserReconnectEvent, self.UserReconnectHandler)
+        end
+        if self.UserLeaveHandler ~= nil then
+            _UserService:DisconnectEvent(UserLeaveEvent, self.UserLeaveHandler)
+        end
+        self.UserEnterHandler = nil
+        self.UserReconnectHandler = nil
+        self.UserLeaveHandler = nil
+        self.ProfilesByStorageUserKey = {}
+        self.RawByStorageUserKey = {}
+        self.StoredRecordExistsByStorageUserKey = {}
+        self.LoadStateByStorageUserKey = {}
+        self.MutationLocksByStorageUserKey = {}
+        self.StorageUserKeyByUserId = {}
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HandleUserEnterEvent(UserEnterEvent event)
+        -- Loads the Union profile once when the server receives a user-enter event.
+        local userEntity = _UserService:GetUserEntityByUserId(event.UserId)
+        if isvalid(userEntity) then
+            self:EnsureProfileLoaded(userEntity)
+            return
+        end
+        self:LoadProfileByIdentity(event.ProfileCode or "", event.UserId or "")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HandleUserReconnectEvent(UserReconnectEvent event)
+        -- Reuses a valid cache or reloads persisted source data after a network reconnect.
+        local userEntity = _UserService:GetUserEntityByUserId(event.UserId)
+        if isvalid(userEntity) then
+            self:EnsureProfileLoaded(userEntity)
+            return
+        end
+        self:LoadProfileByIdentity(event.ProfileCode or "", event.UserId or "")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HandleUserLeaveEvent(UserLeaveEvent event)
+        -- Evicts a fully persisted cache after the user-leave event without issuing a redundant save.
+        local storageUserKey = event.ProfileCode or ""
+        if storageUserKey == "" then
+            storageUserKey = self.StorageUserKeyByUserId[event.UserId or ""] or (event.UserId or "")
+        end
+        if storageUserKey == "" then
+            return
+        end
+        if self.MutationLocksByStorageUserKey[storageUserKey] == true then
+            log_warning("[UnionProfile] leave received during mutation key=" .. storageUserKey)
+            return
+        end
+        _UnionStatAllocationServiceLogic:ClearRequestReceipts(storageUserKey)
+        self:EvictProfile(storageUserKey, event.UserId or "")
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetUnionProfile(Entity userEntity)
+        -- Returns a defensive copy of the server-authoritative persisted source profile.
+        local loaded = self:EnsureProfileLoaded(userEntity)
+        if loaded.Success == false then
+            return loaded
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            Profile = self:CloneProfile(self.ProfilesByStorageUserKey[loaded.StorageUserKey]),
+            StorageUserKey = loaded.StorageUserKey
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetUnionSnapshot(Entity userEntity)
+        -- Returns client-safe permanent progression data without storage internals or calculated bonuses.
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            Snapshot = profileResult.Profile
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetUnionCoins(Entity userEntity)
+        -- UnionPoints remains the single persisted source; this API exposes its canonical Union Coin meaning.
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return { Success = true, Reason = "OK", UnionCoins = profileResult.Profile.UnionPoints, Snapshot = profileResult.Profile }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetLifetimeUnionGrowth(Entity userEntity)
+        -- LifetimeUnionPoints remains the non-spendable persisted source for Union Rank progression.
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return { Success = true, Reason = "OK", LifetimeUnionGrowth = profileResult.Profile.LifetimeUnionPoints, Snapshot = profileResult.Profile }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetJobUnionProgress(Entity userEntity, string jobId)
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        if self:IsKnownUnionJobId(jobId) == false then
+            return { Success = false, Reason = "UNKNOWN_JOB_ID", JobId = jobId or "", Progress = 0, Snapshot = profileResult.Profile }
+        end
+        return { Success = true, Reason = "OK", JobId = jobId, Progress = profileResult.Profile.JobUnionProgress[jobId], Snapshot = profileResult.Profile }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryAdvanceJobUnionProgress(Entity userEntity, string jobId, integer completedProgressValue, string reason)
+        -- Persists only monotonic milestone improvement through the existing profile lock and CAS boundary.
+        if self:IsKnownUnionJobId(jobId) == false then
+            return { Success = false, Reason = "UNKNOWN_JOB_ID", JobId = jobId or "", WasImproved = false }
+        end
+        if self:IsNonNegativeInteger(completedProgressValue) == false or completedProgressValue <= 0 then
+            return { Success = false, Reason = "INVALID_JOB_UNION_MILESTONE_PROGRESS", JobId = jobId, WasImproved = false }
+        end
+        if reason == nil or reason == "" then
+            return { Success = false, Reason = "INVALID_JOB_UNION_PROGRESS_REASON", JobId = jobId, WasImproved = false }
+        end
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        local storageUserKey = profileResult.StorageUserKey
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", JobId = jobId, WasImproved = false, Snapshot = profileResult.Profile }
+        end
+        local candidate = self:GetCachedSnapshot(storageUserKey)
+        if candidate == nil then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", JobId = jobId, WasImproved = false }
+        end
+        local previousProgress = candidate.JobUnionProgress[jobId] or 0
+        if completedProgressValue <= previousProgress then
+            self:ReleaseMutationLock(storageUserKey)
+            return {
+                Success = true,
+                Reason = "UNION_JOB_MILESTONE_ALREADY_RECORDED",
+                JobId = jobId,
+                PreviousProgress = previousProgress,
+                NewProgress = previousProgress,
+                WasImproved = false,
+                WasWritten = false,
+                Snapshot = candidate
+            }
+        end
+        candidate.JobUnionProgress[jobId] = completedProgressValue
+        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        self:ReleaseMutationLock(storageUserKey)
+        if persisted.Success == false then
+            return {
+                Success = false,
+                Reason = persisted.Reason,
+                DetailReason = persisted.DetailReason or "",
+                ErrorCode = persisted.ErrorCode or 0,
+                JobId = jobId,
+                PreviousProgress = previousProgress,
+                NewProgress = previousProgress,
+                WasImproved = false,
+                Snapshot = self:GetCachedSnapshot(storageUserKey)
+            }
+        end
+        log("[UnionJobProgress] advanced job=" .. jobId .. " previous=" .. tostring(previousProgress) .. " new=" .. tostring(completedProgressValue) .. " reason=" .. reason)
+        return {
+            Success = true,
+            Reason = "UNION_JOB_MILESTONE_APPLIED",
+            JobId = jobId,
+            PreviousProgress = previousProgress,
+            NewProgress = completedProgressValue,
+            WasImproved = true,
+            WasWritten = persisted.WasWritten == true,
+            Snapshot = self:CloneProfile(candidate)
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetAllocatedUnionStats(Entity userEntity)
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return { Success = true, Reason = "OK", AllocatedUnionStats = self:CopyLevelMap(profileResult.Profile.AllocatedUnionStats), Snapshot = profileResult.Profile }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryIncreaseAllocatedUnionStat(Entity userEntity, string statId)
+        -- Resolves the persistent identity, then delegates to the lock/CAS mutation boundary.
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return self:TryIncreaseAllocatedUnionStatByStorageKey(profileResult.StorageUserKey, statId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryIncreaseAllocatedUnionStatByStorageKey(string storageUserKey, string statId)
+        -- Re-checks all mutable allocation state while holding the existing per-profile mutation lock.
+        if storageUserKey == nil or storageUserKey == "" then
+            return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING", StatId = statId or "", WasApplied = false }
+        end
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", StatId = statId or "", WasApplied = false, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        end
+        local candidate = self:GetCachedSnapshot(storageUserKey)
+        if candidate == nil then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", StatId = statId or "", WasApplied = false }
+        end
+        local evaluation = _UnionStatAllocationServiceLogic:EvaluateIncreaseFromProfile(candidate, statId)
+        if evaluation.Success == false or evaluation.CanIncrease ~= true then
+            self:ReleaseMutationLock(storageUserKey)
+            evaluation.WasApplied = false
+            evaluation.Snapshot = candidate
+            return evaluation
+        end
+        local previousLevel = evaluation.CurrentLevel
+        local coinCost = math.floor(tonumber(evaluation.RequiredCoinCost) or 0)
+        local remainingCoins = candidate.UnionPoints - coinCost
+        if coinCost <= 0 or remainingCoins < 0 then
+            self:ReleaseMutationLock(storageUserKey)
+            return {
+                Success = false,
+                Reason = coinCost <= 0 and "INVALID_UNION_COIN_COST" or "INSUFFICIENT_UNION_COINS",
+                StatId = statId,
+                PreviousLevel = previousLevel,
+                NewLevel = previousLevel,
+                RequiredCoinCost = coinCost,
+                UnionCoins = candidate.UnionPoints,
+                WasApplied = false,
+                Snapshot = candidate
+            }
+        end
+        candidate.UnionPoints = remainingCoins
+        candidate.AllocatedUnionStats[statId] = evaluation.NextLevel
+        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        self:ReleaseMutationLock(storageUserKey)
+        if persisted.Success == false then
+            return {
+                Success = false,
+                Reason = persisted.Reason,
+                DetailReason = persisted.DetailReason or "",
+                ErrorCode = persisted.ErrorCode or 0,
+                StatId = statId,
+                PreviousLevel = previousLevel,
+                NewLevel = previousLevel,
+                WasApplied = false,
+                Snapshot = self:GetCachedSnapshot(storageUserKey)
+            }
+        end
+        log("[UnionCoinUpgrade] persisted stat=" .. statId .. " previous=" .. tostring(previousLevel) .. " new=" .. tostring(evaluation.NextLevel) .. " cost=" .. tostring(coinCost) .. " remaining=" .. tostring(remainingCoins))
+        return {
+            Success = true,
+            Reason = "UNION_STAT_INCREASED",
+            StatId = statId,
+            PreviousLevel = previousLevel,
+            NewLevel = evaluation.NextLevel,
+            RequiredCoinCost = coinCost,
+            RemainingUnionCoins = remainingCoins,
+            WasApplied = true,
+            WasWritten = persisted.WasWritten == true,
+            Snapshot = self:CloneProfile(candidate)
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryResetAllocatedUnionStats(Entity userEntity)
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return self:TryResetAllocatedUnionStatsByStorageKey(profileResult.StorageUserKey)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryReplaceAllocatedUnionStats(Entity userEntity, table allocationMap)
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then return profileResult end
+        return self:TryReplaceAllocatedUnionStatsByStorageKey(profileResult.StorageUserKey, allocationMap)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryReplaceAllocatedUnionStatsByStorageKey(string storageUserKey, table allocationMap)
+        -- Atomically replaces only AllocatedUnionStats after a second full validation under the profile lock.
+        if storageUserKey == nil or storageUserKey == "" then
+            return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING", WasReplaced = false }
+        end
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", WasReplaced = false, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        end
+        local candidate = self:GetCachedSnapshot(storageUserKey)
+        if candidate == nil then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", WasReplaced = false }
+        end
+        local validation = _UnionStatAllocationServiceLogic:ValidateUnionStatAllocationFromProfile(candidate, allocationMap)
+        if validation.Success == false then
+            self:ReleaseMutationLock(storageUserKey)
+            validation.WasReplaced = false
+            validation.Snapshot = candidate
+            return validation
+        end
+        local previousSignature = _UnionStatAllocationServiceLogic:BuildAllocationSignature(candidate.AllocatedUnionStats)
+        local nextSignature = _UnionStatAllocationServiceLogic:BuildAllocationSignature(validation.NormalizedAllocation)
+        if previousSignature == nextSignature then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = true, Reason = "UNION_STATS_UNCHANGED", WasReplaced = false, WasWritten = false, Snapshot = candidate }
+        end
+        candidate.AllocatedUnionStats = self:CopyLevelMap(validation.NormalizedAllocation)
+        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        self:ReleaseMutationLock(storageUserKey)
+        if persisted.Success == false then
+            return {
+                Success = false,
+                Reason = persisted.Reason,
+                DetailReason = persisted.DetailReason or "",
+                ErrorCode = persisted.ErrorCode or 0,
+                WasReplaced = false,
+                Snapshot = self:GetCachedSnapshot(storageUserKey)
+            }
+        end
+        log("[UnionStatAllocation] persisted whole allocation spent=" .. tostring(validation.SpentUnionStatPoints))
+        return {
+            Success = true,
+            Reason = "UNION_STATS_APPLIED",
+            WasReplaced = true,
+            WasWritten = persisted.WasWritten == true,
+            Snapshot = self:CloneProfile(candidate)
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryResetAllocatedUnionStatsByStorageKey(string storageUserKey)
+        -- Refunds every server-priced purchased level and clears the allocation in one persisted mutation.
+        if storageUserKey == nil or storageUserKey == "" then
+            return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING", WasReset = false }
+        end
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", WasReset = false, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        end
+        local candidate = self:GetCachedSnapshot(storageUserKey)
+        if candidate == nil then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", WasReset = false }
+        end
+        local validation = self:ValidateProfileData(candidate)
+        if validation.Success == false then
+            self:ReleaseMutationLock(storageUserKey)
+            validation.WasReset = false
+            validation.Snapshot = candidate
+            return validation
+        end
+        local previousAllocationCount = self:CountTableEntries(candidate.AllocatedUnionStats)
+        if previousAllocationCount == 0 then
+            self:ReleaseMutationLock(storageUserKey)
+            return {
+                Success = true,
+                Reason = "UNION_STATS_ALREADY_RESET",
+                WasReset = false,
+                WasWritten = false,
+                RefundedUnionCoins = 0,
+                RemainingUnionCoins = candidate.UnionPoints,
+                Snapshot = candidate
+            }
+        end
+        local refund = _UnionStatAllocationServiceLogic:CalculateUnionCoinRefund(candidate.AllocatedUnionStats)
+        if refund.Success == false then
+            self:ReleaseMutationLock(storageUserKey)
+            refund.WasReset = false
+            refund.Snapshot = candidate
+            return refund
+        end
+        candidate.UnionPoints = math.floor(tonumber(candidate.UnionPoints) or 0) + refund.RefundedUnionCoins
+        candidate.AllocatedUnionStats = {}
+        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        self:ReleaseMutationLock(storageUserKey)
+        if persisted.Success == false then
+            return {
+                Success = false,
+                Reason = persisted.Reason,
+                DetailReason = persisted.DetailReason or "",
+                ErrorCode = persisted.ErrorCode or 0,
+                WasReset = false,
+                RefundedUnionCoins = 0,
+                Snapshot = self:GetCachedSnapshot(storageUserKey)
+            }
+        end
+        log("[UnionCoinReset] persisted cleared=" .. tostring(previousAllocationCount) .. " refunded=" .. tostring(refund.RefundedUnionCoins) .. " remaining=" .. tostring(candidate.UnionPoints))
+        return {
+            Success = true,
+            Reason = "UNION_STATS_RESET",
+            WasReset = true,
+            WasWritten = persisted.WasWritten == true,
+            RefundedUnionCoins = refund.RefundedUnionCoins,
+            RemainingUnionCoins = candidate.UnionPoints,
+            Snapshot = self:CloneProfile(candidate)
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table AddUnionPoints(Entity userEntity, integer amount, string reason)
+        -- Adds positive Union currency on the server and persists the candidate before exposing it in cache.
+        if amount == nil or amount <= 0 then
+            return { Success = false, Reason = "INVALID_POINT_AMOUNT", Snapshot = nil }
+        end
+        if reason == nil or reason == "" then
+            return { Success = false, Reason = "INVALID_POINT_REASON", Snapshot = nil }
+        end
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        local storageUserKey = profileResult.StorageUserKey
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", Snapshot = profileResult.Profile }
+        end
+        local candidate = profileResult.Profile
+        local previousLifetimeUnionPoints = candidate.LifetimeUnionPoints
+        local newUnionPoints = candidate.UnionPoints + amount
+        local newLifetimeUnionPoints = candidate.LifetimeUnionPoints + amount
+        if newUnionPoints < candidate.UnionPoints or newLifetimeUnionPoints < candidate.LifetimeUnionPoints then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "POINT_AMOUNT_OVERFLOW", Snapshot = candidate }
+        end
+        candidate.UnionPoints = newUnionPoints
+        candidate.LifetimeUnionPoints = newLifetimeUnionPoints
+        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        self:ReleaseMutationLock(storageUserKey)
+        if persisted.Success == false then
+            return { Success = false, Reason = persisted.Reason, DetailReason = persisted.DetailReason or "", ErrorCode = persisted.ErrorCode or 0, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        end
+        _UnionRankProgressionLogic:NotifyRankTransition(userEntity, previousLifetimeUnionPoints, candidate.LifetimeUnionPoints)
+        log("[UnionProfile] points added amount=" .. amount .. " reason=" .. reason .. " balance=" .. candidate.UnionPoints)
+        return { Success = true, Reason = "OK", AddedAmount = amount, Snapshot = self:CloneProfile(candidate) }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table AllocateUnionRewardRunId(Entity userEntity, string reason)
+        -- Persists a monotonic account-scoped run ID before gameplay starts using it as an award key.
+        if reason == nil or reason == "" then
+            return { Success = false, Reason = "INVALID_REWARD_RUN_REASON" }
+        end
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        local storageUserKey = profileResult.StorageUserKey
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", Snapshot = profileResult.Profile }
+        end
+        local candidate = self:GetCachedSnapshot(storageUserKey)
+        if candidate == nil then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING" }
+        end
+        local rewardRunId = candidate.NextRewardRunId + 1
+        if rewardRunId <= candidate.NextRewardRunId then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "REWARD_RUN_ID_OVERFLOW", Snapshot = candidate }
+        end
+        candidate.NextRewardRunId = rewardRunId
+        self:PruneCommittedRewardKeys(candidate.CommittedRewardKeys, rewardRunId)
+        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        self:ReleaseMutationLock(storageUserKey)
+        if persisted.Success == false then
+            return { Success = false, Reason = persisted.Reason, DetailReason = persisted.DetailReason or "", ErrorCode = persisted.ErrorCode or 0, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        end
+        log("[UnionProfile] reward run allocated id=" .. rewardRunId .. " reason=" .. reason)
+        return { Success = true, Reason = "OK", RewardRunId = rewardRunId, Snapshot = self:CloneProfile(candidate) }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryCommitUnionReward(Entity userEntity, integer amount, string rewardKey, string reason)
+        -- Atomically records the idempotency receipt and both point balances in one DataStorage mutation.
+        if amount == nil or amount < 0 or amount ~= math.floor(amount) then
+            return { Success = false, Reason = "INVALID_POINT_AMOUNT" }
+        end
+        if rewardKey == nil or rewardKey == "" then
+            return { Success = false, Reason = "INVALID_REWARD_KEY" }
+        end
+        if reason == nil or reason == "" then
+            return { Success = false, Reason = "INVALID_POINT_REASON" }
+        end
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        local existingAmount = profileResult.Profile.CommittedRewardKeys[rewardKey]
+        if existingAmount ~= nil then
+            return {
+                Success = true,
+                Reason = "DUPLICATE_REWARD_IGNORED",
+                WasDuplicate = true,
+                RewardKey = rewardKey,
+                CommittedAmount = existingAmount,
+                Snapshot = profileResult.Profile
+            }
+        end
+        local storageUserKey = profileResult.StorageUserKey
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", RewardKey = rewardKey, Snapshot = profileResult.Profile }
+        end
+        local candidate = self:GetCachedSnapshot(storageUserKey)
+        if candidate == nil then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", RewardKey = rewardKey }
+        end
+        existingAmount = candidate.CommittedRewardKeys[rewardKey]
+        if existingAmount ~= nil then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = true, Reason = "DUPLICATE_REWARD_IGNORED", WasDuplicate = true, RewardKey = rewardKey, CommittedAmount = existingAmount, Snapshot = candidate }
+        end
+        local previousLifetimeUnionPoints = candidate.LifetimeUnionPoints
+        local newUnionPoints = candidate.UnionPoints + amount
+        local newLifetimeUnionPoints = candidate.LifetimeUnionPoints + amount
+        if newUnionPoints < candidate.UnionPoints or newLifetimeUnionPoints < candidate.LifetimeUnionPoints then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "POINT_AMOUNT_OVERFLOW", RewardKey = rewardKey, Snapshot = candidate }
+        end
+        candidate.UnionPoints = newUnionPoints
+        candidate.LifetimeUnionPoints = newLifetimeUnionPoints
+        candidate.CommittedRewardKeys[rewardKey] = amount
+        self:PruneCommittedRewardKeys(candidate.CommittedRewardKeys, candidate.NextRewardRunId)
+        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        self:ReleaseMutationLock(storageUserKey)
+        if persisted.Success == false then
+            return { Success = false, Reason = persisted.Reason, DetailReason = persisted.DetailReason or "", ErrorCode = persisted.ErrorCode or 0, RewardKey = rewardKey, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        end
+        _UnionRankProgressionLogic:NotifyRankTransition(userEntity, previousLifetimeUnionPoints, candidate.LifetimeUnionPoints)
+        log("[UnionProfile] reward committed key=" .. rewardKey .. " amount=" .. amount .. " balance=" .. candidate.UnionPoints .. " reason=" .. reason)
+        return {
+            Success = true,
+            Reason = "OK",
+            WasDuplicate = false,
+            RewardKey = rewardKey,
+            CommittedAmount = amount,
+            Snapshot = self:CloneProfile(candidate)
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetOwnedUnionBlocks(Entity userEntity)
+        -- Schema 5 removed canonical block ownership after its one-time migration refund.
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return {
+            Success = true,
+            Reason = "LEGACY_UNION_SYSTEM_DISABLED",
+            OwnedUnionBlocks = {},
+            Snapshot = profileResult.Profile
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetOwnedBlockCount(Entity userEntity, string blockId)
+        -- Compatibility query for the disabled block experiment.
+        local definition = _UnionBlockDefinitionRepositoryLogic:GetBlock(blockId or "")
+        if definition.Success == false then
+            return { Success = false, Reason = definition.Reason or "UNKNOWN_UNION_BLOCK", BlockId = blockId or "", OwnedQuantity = 0 }
+        end
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            profileResult.OwnedQuantity = 0
+            return profileResult
+        end
+        return {
+            Success = true,
+            Reason = "LEGACY_UNION_SYSTEM_DISABLED",
+            BlockId = blockId,
+            OwnedQuantity = 0,
+            Snapshot = profileResult.Profile
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table OwnsUnionBlock(Entity userEntity, string blockId)
+        -- Convenience ownership query used by future board-placement authorization.
+        local ownedResult = self:GetOwnedBlockCount(userEntity, blockId)
+        if ownedResult.Success == false then
+            ownedResult.OwnsBlock = false
+            return ownedResult
+        end
+        ownedResult.OwnsBlock = ownedResult.OwnedQuantity > 0
+        return ownedResult
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryCommitUnionBlockPurchase(Entity userEntity, string blockId, string requestId)
+        -- Performs the full purchase under the sole profile mutation lock and persists one atomic candidate.
+        if self.CurrentSchemaVersion >= 5 then
+            return { Success = false, Reason = "LEGACY_UNION_SYSTEM_DISABLED", BlockId = blockId or "", WasDuplicate = false }
+        end
+        if blockId == nil or blockId == "" then
+            return { Success = false, Reason = "INVALID_BLOCK_ID", BlockId = blockId or "" }
+        end
+        if self:IsValidBlockPurchaseRequestId(requestId) == false then
+            return { Success = false, Reason = "INVALID_PURCHASE_REQUEST_ID", BlockId = blockId }
+        end
+        local identity = self:ResolveUserIdentity(userEntity)
+        if identity.Success == false then
+            return identity
+        end
+        local loaded = self:EnsureProfileLoaded(userEntity)
+        if loaded.Success == false then
+            return loaded
+        end
+        if self:TryAcquireMutationLock(identity.StorageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_BUSY", BlockId = blockId, Snapshot = self:GetCachedSnapshot(identity.StorageUserKey) }
+        end
+        local candidate = self:GetCachedSnapshot(identity.StorageUserKey)
+        if candidate == nil then
+            self:ReleaseMutationLock(identity.StorageUserKey)
+            return { Success = false, Reason = "PROFILE_NOT_LOADED", BlockId = blockId }
+        end
+        local priorReceipt = candidate.BlockPurchaseReceipts[requestId]
+        if priorReceipt ~= nil then
+            self:ReleaseMutationLock(identity.StorageUserKey)
+            if priorReceipt.BlockId ~= blockId then
+                return { Success = false, Reason = "PURCHASE_REQUEST_ID_REUSED", BlockId = blockId, Snapshot = candidate }
+            end
+            return {
+                Success = true,
+                Reason = "DUPLICATE_REQUEST_REPLAYED",
+                WasDuplicate = true,
+                BlockId = blockId,
+                Cost = priorReceipt.Cost,
+                OwnedQuantity = priorReceipt.OwnedQuantity,
+                Snapshot = candidate
+            }
+        end
+        local blockDefinition = _UnionBlockDefinitionRepositoryLogic:GetBlock(blockId)
+        if blockDefinition.Success == false then
+            self:ReleaseMutationLock(identity.StorageUserKey)
+            return { Success = false, Reason = blockDefinition.Reason or "UNKNOWN_UNION_BLOCK", BlockId = blockId, Snapshot = candidate }
+        end
+        local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(candidate.LifetimeUnionPoints)
+        if currentRank.Success == false then
+            self:ReleaseMutationLock(identity.StorageUserKey)
+            return { Success = false, Reason = currentRank.Reason, BlockId = blockId, Snapshot = candidate }
+        end
+        local requiredRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(blockDefinition.RequiredUnionRank)
+        if requiredRank.Success == false then
+            self:ReleaseMutationLock(identity.StorageUserKey)
+            return { Success = false, Reason = "INVALID_REQUIRED_UNION_RANK", BlockId = blockId, Snapshot = candidate }
+        end
+        if currentRank.SortOrder < requiredRank.SortOrder then
+            self:ReleaseMutationLock(identity.StorageUserKey)
+            return { Success = false, Reason = "UNION_RANK_LOCKED", BlockId = blockId, Snapshot = candidate }
+        end
+        local ownedQuantity = self:ClampNonNegativeInteger(candidate.OwnedUnionBlocks[blockId])
+        if ownedQuantity >= blockDefinition.MaxOwned then
+            self:ReleaseMutationLock(identity.StorageUserKey)
+            return { Success = false, Reason = "MAX_OWNED", BlockId = blockId, OwnedQuantity = ownedQuantity, Snapshot = candidate }
+        end
+        local serverCost = self:ClampNonNegativeInteger(blockDefinition.ShopCost)
+        if candidate.UnionPoints < serverCost then
+            self:ReleaseMutationLock(identity.StorageUserKey)
+            return { Success = false, Reason = "INSUFFICIENT_UNION_COIN", BlockId = blockId, Cost = serverCost, OwnedQuantity = ownedQuantity, Snapshot = candidate }
+        end
+        candidate.UnionPoints = candidate.UnionPoints - serverCost
+        candidate.OwnedUnionBlocks[blockId] = ownedQuantity + 1
+        candidate.NextBlockPurchaseReceiptOrder = candidate.NextBlockPurchaseReceiptOrder + 1
+        candidate.BlockPurchaseReceipts[requestId] = {
+            BlockId = blockId,
+            Cost = serverCost,
+            OwnedQuantity = ownedQuantity + 1,
+            UnionPoints = candidate.UnionPoints,
+            ReceiptOrder = candidate.NextBlockPurchaseReceiptOrder
+        }
+        self:PruneBlockPurchaseReceipts(candidate.BlockPurchaseReceipts)
+        local persisted = self:PersistProfileCandidate(identity.StorageUserKey, candidate)
+        self:ReleaseMutationLock(identity.StorageUserKey)
+        if persisted.Success == false then
+            return { Success = false, Reason = persisted.Reason, BlockId = blockId, Snapshot = self:GetCachedSnapshot(identity.StorageUserKey) }
+        end
+        log("[UnionBlockShop] purchase committed blockId=" .. blockId .. " cost=" .. tostring(serverCost) .. " owned=" .. tostring(ownedQuantity + 1) .. " balance=" .. tostring(candidate.UnionPoints))
+        return {
+            Success = true,
+            Reason = "OK",
+            WasDuplicate = false,
+            BlockId = blockId,
+            Cost = serverCost,
+            OwnedQuantity = ownedQuantity + 1,
+            Snapshot = self:CloneProfile(candidate)
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table CanPurchaseUpgrade(Entity userEntity, string upgradeId)
+        -- Resolves rank, prerequisite, next level, and price exclusively from server-side data.
+        if upgradeId == nil or upgradeId == "" then
+            return { Success = false, CanPurchase = false, Reason = "INVALID_UPGRADE_ID", UpgradeId = upgradeId or "" }
+        end
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            profileResult.CanPurchase = false
+            return profileResult
+        end
+        if self.CurrentSchemaVersion >= 5 then
+            local currentLevel = self:ReadLevel(profileResult.Profile.PurchasedLevels, upgradeId)
+            return {
+                Success = true,
+                CanPurchase = false,
+                Reason = "LEGACY_UNION_SYSTEM_DISABLED",
+                UpgradeId = upgradeId,
+                CurrentLevel = currentLevel,
+                UnionPoints = profileResult.Profile.UnionPoints,
+                Snapshot = profileResult.Profile
+            }
+        end
+        local definition = _UnionUpgradeDefinitionRepositoryLogic:GetDefinition(upgradeId)
+        if definition.Success == false or (definition.MatchCount or 0) ~= 1 then
+            return { Success = false, CanPurchase = false, Reason = definition.Reason or "INVALID_UPGRADE_DEFINITION", UpgradeId = upgradeId, Snapshot = profileResult.Profile }
+        end
+        local currentLevel = self:ReadLevel(profileResult.Profile.PurchasedLevels, upgradeId)
+        if currentLevel >= definition.MaxLevel then
+            return { Success = true, CanPurchase = false, Reason = "MAX_LEVEL_REACHED", UpgradeId = upgradeId, CurrentLevel = currentLevel, MaxLevel = definition.MaxLevel, Snapshot = profileResult.Profile }
+        end
+        local nextLevel = currentLevel + 1
+        local levelDefinition = _UnionUpgradeDefinitionRepositoryLogic:GetLevelDefinition(upgradeId, nextLevel)
+        if levelDefinition.Success == false or (levelDefinition.MatchCount or 0) ~= 1 then
+            return { Success = false, CanPurchase = false, Reason = levelDefinition.Reason or "INVALID_UPGRADE_LEVEL_DEFINITION", UpgradeId = upgradeId, CurrentLevel = currentLevel, NextLevel = nextLevel, Snapshot = profileResult.Profile }
+        end
+        if levelDefinition.Cost < 0 then
+            return { Success = false, CanPurchase = false, Reason = "INVALID_UPGRADE_COST", UpgradeId = upgradeId, CurrentLevel = currentLevel, NextLevel = nextLevel, Snapshot = profileResult.Profile }
+        end
+        local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(profileResult.Profile.LifetimeUnionPoints)
+        if currentRank.Success == false then
+            return { Success = false, CanPurchase = false, Reason = currentRank.Reason or "UNION_RANK_UNAVAILABLE", UpgradeId = upgradeId, CurrentLevel = currentLevel, NextLevel = nextLevel, Snapshot = profileResult.Profile }
+        end
+        local requiredRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(levelDefinition.RequiredUnionRank)
+        if requiredRank.Success == false or (requiredRank.MatchCount or 0) ~= 1 then
+            return { Success = false, CanPurchase = false, Reason = "INVALID_REQUIRED_UNION_RANK", UpgradeId = upgradeId, CurrentLevel = currentLevel, NextLevel = nextLevel, Snapshot = profileResult.Profile }
+        end
+        if currentRank.UnlockedBoardTier < requiredRank.UnlockedBoardTier then
+            return {
+                Success = true,
+                CanPurchase = false,
+                Reason = "UNION_RANK_LOCKED",
+                UpgradeId = upgradeId,
+                CurrentLevel = currentLevel,
+                NextLevel = nextLevel,
+                MaxLevel = definition.MaxLevel,
+                Cost = levelDefinition.Cost,
+                UnionPoints = profileResult.Profile.UnionPoints,
+                CurrentRankId = currentRank.RankId,
+                CurrentBoardTier = currentRank.UnlockedBoardTier,
+                RequiredRankId = requiredRank.RankId,
+                RequiredRankDisplayName = requiredRank.DisplayName,
+                RequiredBoardTier = requiredRank.UnlockedBoardTier,
+                RequiredUpgradeId = levelDefinition.RequiredUpgradeId,
+                RequiredUpgradeLevel = levelDefinition.RequiredUpgradeLevel,
+                Snapshot = profileResult.Profile
+            }
+        end
+        if levelDefinition.RequiredUpgradeId ~= "" then
+            local prerequisiteLevel = self:ReadLevel(profileResult.Profile.PurchasedLevels, levelDefinition.RequiredUpgradeId)
+            if prerequisiteLevel < levelDefinition.RequiredUpgradeLevel then
+                local prerequisiteDefinition = _UnionUpgradeDefinitionRepositoryLogic:GetDefinition(levelDefinition.RequiredUpgradeId)
+                return {
+                    Success = true,
+                    CanPurchase = false,
+                    Reason = "UNION_PREREQUISITE_LOCKED",
+                    UpgradeId = upgradeId,
+                    CurrentLevel = currentLevel,
+                    NextLevel = nextLevel,
+                    MaxLevel = definition.MaxLevel,
+                    Cost = levelDefinition.Cost,
+                    UnionPoints = profileResult.Profile.UnionPoints,
+                    CurrentRankId = currentRank.RankId,
+                    CurrentBoardTier = currentRank.UnlockedBoardTier,
+                    RequiredRankId = requiredRank.RankId,
+                    RequiredRankDisplayName = requiredRank.DisplayName,
+                    RequiredBoardTier = requiredRank.UnlockedBoardTier,
+                    RequiredUpgradeId = levelDefinition.RequiredUpgradeId,
+                    RequiredUpgradeDisplayName = prerequisiteDefinition.Success == true and prerequisiteDefinition.DisplayName or levelDefinition.RequiredUpgradeId,
+                    RequiredUpgradeLevel = levelDefinition.RequiredUpgradeLevel,
+                    Snapshot = profileResult.Profile
+                }
+            end
+        end
+        if profileResult.Profile.UnionPoints < levelDefinition.Cost then
+            return {
+                Success = true,
+                CanPurchase = false,
+                Reason = "INSUFFICIENT_UNION_POINTS",
+                UpgradeId = upgradeId,
+                CurrentLevel = currentLevel,
+                NextLevel = nextLevel,
+                MaxLevel = definition.MaxLevel,
+                Cost = levelDefinition.Cost,
+                UnionPoints = profileResult.Profile.UnionPoints,
+                CurrentRankId = currentRank.RankId,
+                CurrentBoardTier = currentRank.UnlockedBoardTier,
+                RequiredRankId = requiredRank.RankId,
+                RequiredRankDisplayName = requiredRank.DisplayName,
+                RequiredBoardTier = requiredRank.UnlockedBoardTier,
+                RequiredUpgradeId = levelDefinition.RequiredUpgradeId,
+                RequiredUpgradeLevel = levelDefinition.RequiredUpgradeLevel,
+                Snapshot = profileResult.Profile
+            }
+        end
+        return {
+            Success = true,
+            CanPurchase = true,
+            Reason = "OK",
+            UpgradeId = upgradeId,
+            CurrentLevel = currentLevel,
+            NextLevel = nextLevel,
+            MaxLevel = definition.MaxLevel,
+            Cost = levelDefinition.Cost,
+            UnionPoints = profileResult.Profile.UnionPoints,
+            CurrentRankId = currentRank.RankId,
+            CurrentBoardTier = currentRank.UnlockedBoardTier,
+            RequiredRankId = requiredRank.RankId,
+            RequiredRankDisplayName = requiredRank.DisplayName,
+            RequiredBoardTier = requiredRank.UnlockedBoardTier,
+            RequiredUpgradeId = levelDefinition.RequiredUpgradeId,
+            RequiredUpgradeLevel = levelDefinition.RequiredUpgradeLevel,
+            Snapshot = profileResult.Profile
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryPurchaseUpgrade(Entity userEntity, string upgradeId)
+        -- Executes one sequential purchase under a per-profile lock and compare-and-swap persistence.
+        if self.CurrentSchemaVersion >= 5 then
+            return { Success = false, Reason = "LEGACY_UNION_SYSTEM_DISABLED", UpgradeId = upgradeId or "" }
+        end
+        local identity = self:ResolveUserIdentity(userEntity)
+        if identity.Success == false then
+            return identity
+        end
+        local loaded = self:EnsureProfileLoaded(userEntity)
+        if loaded.Success == false then
+            return loaded
+        end
+        local storageUserKey = identity.StorageUserKey
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PURCHASE_IN_PROGRESS", UpgradeId = upgradeId or "", Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        end
+        local purchaseCheck = self:CanPurchaseUpgrade(userEntity, upgradeId)
+        if purchaseCheck.Success == false or purchaseCheck.CanPurchase == false then
+            self:ReleaseMutationLock(storageUserKey)
+            return purchaseCheck
+        end
+        local candidate = self:CloneProfile(purchaseCheck.Snapshot)
+        local remainingPoints = candidate.UnionPoints - purchaseCheck.Cost
+        if remainingPoints < 0 then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "NEGATIVE_CURRENCY_GUARD", UpgradeId = upgradeId, Snapshot = candidate }
+        end
+        local currentLevel = self:ReadLevel(candidate.PurchasedLevels, upgradeId)
+        if purchaseCheck.NextLevel ~= currentLevel + 1 then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "LEVEL_SKIP_GUARD", UpgradeId = upgradeId, Snapshot = candidate }
+        end
+        candidate.UnionPoints = remainingPoints
+        candidate.PurchasedLevels[upgradeId] = purchaseCheck.NextLevel
+        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        self:ReleaseMutationLock(storageUserKey)
+        if persisted.Success == false then
+            return { Success = false, Reason = persisted.Reason, DetailReason = persisted.DetailReason or "", ErrorCode = persisted.ErrorCode or 0, UpgradeId = upgradeId, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        end
+        local effectResult = _UnionEffectResolverLogic:GetEffectSnapshot(userEntity)
+        if effectResult.Success == false then
+            log_warning("[UnionPurchase] effect refresh failed id=" .. upgradeId .. " reason=" .. (effectResult.Reason or "UNKNOWN"))
+        end
+        log("[UnionPurchase] success id=" .. upgradeId .. " level=" .. purchaseCheck.NextLevel .. " cost=" .. purchaseCheck.Cost .. " remaining=" .. candidate.UnionPoints)
+        return {
+            Success = true,
+            Reason = "OK",
+            UpgradeId = upgradeId,
+            PurchasedLevel = purchaseCheck.NextLevel,
+            Cost = purchaseCheck.Cost,
+            Snapshot = self:CloneProfile(candidate),
+            EffectSnapshot = effectResult.Success == true and effectResult.EffectSnapshot or nil,
+            EffectRefreshReason = effectResult.Reason or "UNKNOWN"
+        }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetPurchasedLevel(Entity userEntity, string upgradeId)
+        -- Returns one validated purchased level from the server profile cache.
+        local definition = _UnionUpgradeDefinitionRepositoryLogic:GetDefinition(upgradeId or "")
+        if definition.Success == false or (definition.MatchCount or 0) ~= 1 then
+            return { Success = false, Reason = definition.Reason or "INVALID_UPGRADE_ID", UpgradeId = upgradeId or "", Level = 0 }
+        end
+        local profileResult = self:GetUnionProfile(userEntity)
+        if profileResult.Success == false then
+            return profileResult
+        end
+        return { Success = true, Reason = "OK", UpgradeId = upgradeId, Level = self:ReadLevel(profileResult.Profile.PurchasedLevels, upgradeId) }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table SetActiveUpgradeLevel(Entity userEntity, string upgradeId, integer level)
+        -- Rejects legacy loadout calls; purchased upgrades are now always effective.
+        local snapshotResult = self:GetUnionSnapshot(userEntity)
+        return { Success = false, Reason = "UNION_LOADOUT_REMOVED", UpgradeId = upgradeId or "", Level = level or 0, Snapshot = snapshotResult.Success == true and snapshotResult.Snapshot or nil }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table ReloadUnionProfile(Entity userEntity)
+        -- Drops only the in-memory Union cache and reloads the persisted profile for reconnect testing.
+        local identity = self:ResolveUserIdentity(userEntity)
+        if identity.Success == false then
+            return identity
+        end
+        if self.MutationLocksByStorageUserKey[identity.StorageUserKey] == true then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS" }
+        end
+        self:EvictProfile(identity.StorageUserKey, identity.UserId)
+        local loaded = self:LoadProfileByIdentity(identity.ProfileCode, identity.UserId)
+        if loaded.Success == false then
+            return loaded
+        end
+        log("[UnionProfile] reload verified key=" .. identity.StorageUserKey)
+        return self:GetUnionSnapshot(userEntity)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table EnsureProfileLoaded(Entity userEntity)
+        -- Resolves the persistent identity and loads the profile at most once per world-instance cache.
+        local identity = self:ResolveUserIdentity(userEntity)
+        if identity.Success == false then
+            return identity
+        end
+        return self:LoadProfileByIdentity(identity.ProfileCode, identity.UserId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table LoadProfileByIdentity(string profileCode, string userId)
+        -- Loads, migrates, validates, and caches one UserDataStorage Union profile.
+        local storageUserKey = profileCode or ""
+        if storageUserKey == "" then
+            storageUserKey = userId or ""
+        end
+        if storageUserKey == "" then
+            return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING" }
+        end
+        if userId ~= nil and userId ~= "" then
+            self.StorageUserKeyByUserId[userId] = storageUserKey
+        end
+        if self.LoadStateByStorageUserKey[storageUserKey] == "LOADED" and self.ProfilesByStorageUserKey[storageUserKey] ~= nil then
+            return { Success = true, Reason = "OK", StorageUserKey = storageUserKey, WasCached = true }
+        end
+        if self.LoadStateByStorageUserKey[storageUserKey] == "LOADING" then
+            return { Success = false, Reason = "PROFILE_LOAD_IN_PROGRESS", StorageUserKey = storageUserKey }
+        end
+        local definitionsValidation = self:EnsureUpgradeDefinitionsValid()
+        if definitionsValidation.Success == false then
+            return definitionsValidation
+        end
+        self.LoadStateByStorageUserKey[storageUserKey] = "LOADING"
+        local storage = _DataStorageService:GetUserDataStorage(storageUserKey)
+        if storage == nil then
+            self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+            return { Success = false, Reason = "USER_DATA_STORAGE_UNAVAILABLE", StorageUserKey = storageUserKey }
+        end
+        local errorCode, raw = storage:GetAndWait(self.StorageKey)
+        if errorCode == 1000002 then
+            local defaultResult = self:CreateDefaultProfile()
+            if defaultResult.Success == false then
+                self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+                return defaultResult
+            end
+            self.ProfilesByStorageUserKey[storageUserKey] = defaultResult.Profile
+            self.RawByStorageUserKey[storageUserKey] = ""
+            self.StoredRecordExistsByStorageUserKey[storageUserKey] = false
+            self.LoadStateByStorageUserKey[storageUserKey] = "LOADED"
+            log("[UnionProfile] default initialized key=" .. storageUserKey .. " points=0")
+            return { Success = true, Reason = "OK", StorageUserKey = storageUserKey, IsNewProfile = true }
+        end
+        if errorCode ~= 0 then
+            self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+            log_error("[UnionProfile] load failed key=" .. storageUserKey .. " error=" .. errorCode)
+            return { Success = false, Reason = "PROFILE_LOAD_FAILED", ErrorCode = errorCode, StorageUserKey = storageUserKey }
+        end
+        if raw == nil or raw == "" then
+            local emptyResult = self:CreateDefaultProfile()
+            if emptyResult.Success == false then
+                self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+                return emptyResult
+            end
+            self.ProfilesByStorageUserKey[storageUserKey] = emptyResult.Profile
+            self.RawByStorageUserKey[storageUserKey] = raw or ""
+            -- An empty payload has no CAS source value; the first real mutation must use SetAndWait.
+            self.StoredRecordExistsByStorageUserKey[storageUserKey] = false
+            self.LoadStateByStorageUserKey[storageUserKey] = "LOADED"
+            return { Success = true, Reason = "OK", StorageUserKey = storageUserKey, IsNewProfile = true }
+        end
+        local decodeOk, decoded = pcall(function()
+            return _HttpService:JSONDecode(raw)
+        end)
+        if decodeOk == false or type(decoded) ~= "table" then
+            self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+            log_error("[UnionProfile] decode failed key=" .. storageUserKey)
+            return { Success = false, Reason = "PROFILE_DECODE_FAILED", StorageUserKey = storageUserKey }
+        end
+        local normalized = self:NormalizeProfile(decoded)
+        if normalized.Success == false then
+            self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+            log_error("[UnionProfile] validation rejected key=" .. storageUserKey .. " reason=" .. (normalized.DetailReason or normalized.Reason or "UNKNOWN"))
+            return normalized
+        end
+        local normalizedRaw = _HttpService:JSONEncode(self:BuildJsonSafeProfile(normalized.Profile))
+        if normalized.NeedsPersistence == true then
+            local updateCode, updatedRaw = storage:UpdateAndWait(self.StorageKey, raw, normalizedRaw)
+            if updateCode ~= 0 then
+                self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+                log_error("[UnionProfile] normalized save failed key=" .. storageUserKey .. " error=" .. updateCode)
+                return { Success = false, Reason = updateCode == 2000000 and "PROFILE_WRITE_CONFLICT" or "PROFILE_NORMALIZATION_SAVE_FAILED", ErrorCode = updateCode, StorageUserKey = storageUserKey }
+            end
+            raw = updatedRaw or normalizedRaw
+        end
+        self.ProfilesByStorageUserKey[storageUserKey] = normalized.Profile
+        self.RawByStorageUserKey[storageUserKey] = raw
+        self.StoredRecordExistsByStorageUserKey[storageUserKey] = true
+        self.LoadStateByStorageUserKey[storageUserKey] = "LOADED"
+        log("[UnionProfile] loaded key=" .. storageUserKey .. " schema=" .. normalized.Profile.SchemaVersion .. " points=" .. normalized.Profile.UnionPoints)
+        return { Success = true, Reason = "OK", StorageUserKey = storageUserKey, WasMigrated = normalized.WasMigrated, WasSanitized = normalized.WasSanitized }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table PersistProfileCandidate(string storageUserKey, table candidate)
+        -- Validates and durably writes one source-data candidate before replacing the in-memory cache.
+        if self.LoadStateByStorageUserKey[storageUserKey] ~= "LOADED" then
+            return { Success = false, Reason = "PROFILE_NOT_LOADED" }
+        end
+        local validation = self:ValidateProfileData(candidate)
+        if validation.Success == false then
+            return validation
+        end
+        local jsonSafeCandidate = self:BuildJsonSafeProfile(candidate)
+        local encodeOk, newRaw = pcall(function()
+            return _HttpService:JSONEncode(jsonSafeCandidate)
+        end)
+        if encodeOk == false or newRaw == nil or newRaw == "" then
+            return { Success = false, Reason = "PROFILE_ENCODE_FAILED" }
+        end
+        local oldRaw = self.RawByStorageUserKey[storageUserKey] or ""
+        if self.StoredRecordExistsByStorageUserKey[storageUserKey] == true and newRaw == oldRaw then
+            self.ProfilesByStorageUserKey[storageUserKey] = self:CloneProfile(candidate)
+            return { Success = true, Reason = "OK", WasWritten = false }
+        end
+        local storage = _DataStorageService:GetUserDataStorage(storageUserKey)
+        if storage == nil then
+            return { Success = false, Reason = "USER_DATA_STORAGE_UNAVAILABLE" }
+        end
+        local errorCode = 0
+        local persistedRaw = newRaw
+        if self.StoredRecordExistsByStorageUserKey[storageUserKey] == true then
+            errorCode, persistedRaw = storage:UpdateAndWait(self.StorageKey, oldRaw, newRaw)
+        else
+            errorCode = storage:SetAndWait(self.StorageKey, newRaw)
+        end
+        if errorCode ~= 0 then
+            if errorCode == 2000000 then
+                self:EvictProfile(storageUserKey, "")
+            end
+            log_error("[UnionProfile] save failed key=" .. storageUserKey .. " error=" .. errorCode)
+            return { Success = false, Reason = errorCode == 2000000 and "PROFILE_WRITE_CONFLICT" or "PROFILE_SAVE_FAILED", ErrorCode = errorCode }
+        end
+        self.ProfilesByStorageUserKey[storageUserKey] = self:CloneProfile(candidate)
+        self.RawByStorageUserKey[storageUserKey] = persistedRaw or newRaw
+        self.StoredRecordExistsByStorageUserKey[storageUserKey] = true
+        self.LoadStateByStorageUserKey[storageUserKey] = "LOADED"
+        log("[UnionProfile] saved key=" .. storageUserKey .. " bytes=" .. string.len(newRaw))
+        return { Success = true, Reason = "OK", WasWritten = true }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table EnsureUpgradeDefinitionsValid()
+        -- Runs the STEP 1 dataset validator once before profiles can initialize or mutate.
+        if self.DefinitionValidationAttempted == true then
+            return { Success = self.DefinitionsValid, Reason = self.DefinitionValidationReason }
+        end
+        self.DefinitionValidationAttempted = true
+        local validation = _UnionUpgradeDefinitionRepositoryLogic:ValidateDefinitions()
+        local rankValidation = _UnionRankDefinitionRepositoryLogic:ValidateDefinitions()
+		local blockValidation = _UnionBlockDefinitionRepositoryLogic:ValidateDefinitions()
+		local statValidation = _UnionStatDefinitionRepositoryLogic:ValidateDefinitions()
+		local jobGradeValidation = _UnionJobGradeDefinitionRepositoryLogic:ValidateDefinitions()
+		local jobMilestoneValidation = _UnionJobMilestoneDefinitionRepositoryLogic:ValidateDefinitions()
+		self.DefinitionsValid = validation.Success == true and rankValidation.Success == true and blockValidation.Success == true
+			and statValidation.Success == true and jobGradeValidation.Success == true and jobMilestoneValidation.Success == true
+        if validation.Success == false then
+            self.DefinitionValidationReason = validation.DetailReason or validation.Reason or "UNION_DEFINITION_VALIDATION_FAILED"
+        elseif rankValidation.Success == false then
+            self.DefinitionValidationReason = rankValidation.ErrorSnapshot or rankValidation.Reason or "UNION_RANK_DEFINITION_VALIDATION_FAILED"
+		elseif blockValidation.Success == false then
+			self.DefinitionValidationReason = blockValidation.ErrorSnapshot or blockValidation.Reason or "UNION_BLOCK_DEFINITION_VALIDATION_FAILED"
+		elseif statValidation.Success == false then
+			self.DefinitionValidationReason = statValidation.ErrorSnapshot or statValidation.Reason or "UNION_STAT_DEFINITION_VALIDATION_FAILED"
+		elseif jobGradeValidation.Success == false then
+			self.DefinitionValidationReason = jobGradeValidation.ErrorSnapshot or jobGradeValidation.Reason or "UNION_JOB_GRADE_DEFINITION_VALIDATION_FAILED"
+		elseif jobMilestoneValidation.Success == false then
+			self.DefinitionValidationReason = jobMilestoneValidation.ErrorSnapshot or jobMilestoneValidation.Reason or "UNION_JOB_MILESTONE_DEFINITION_VALIDATION_FAILED"
+        else
+            self.DefinitionValidationReason = "OK"
+        end
+        if self.DefinitionsValid == false then
+            log_error("[UnionProfile] definition validation failed reason=" .. self.DefinitionValidationReason)
+        end
+        return { Success = self.DefinitionsValid, Reason = self.DefinitionValidationReason }
+    end
+
+    method table ResolveUserIdentity(Entity userEntity)
+        -- Resolves ProfileCode as the persistent key and falls back to UserId only when ProfileCode is unavailable.
+        if userEntity == nil or isvalid(userEntity) == false then
+            return { Success = false, Reason = "INVALID_USER_ENTITY" }
+        end
+        local playerComponent = userEntity.PlayerComponent
+        if playerComponent == nil or isvalid(playerComponent) == false then
+            return { Success = false, Reason = "PLAYER_COMPONENT_MISSING" }
+        end
+        local profileCode = playerComponent.ProfileCode or ""
+        local userId = playerComponent.UserId or ""
+        local storageUserKey = profileCode
+        if storageUserKey == "" then
+            storageUserKey = userId
+        end
+        if storageUserKey == "" then
+            return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING" }
+        end
+        if userId ~= "" then
+            self.StorageUserKeyByUserId[userId] = storageUserKey
+        end
+        return { Success = true, Reason = "OK", ProfileCode = profileCode, UserId = userId, StorageUserKey = storageUserKey }
+    end
+
+    method table CreateDefaultProfile()
+        -- Creates Schema 5 defaults while PurchasedLevels remains persisted legacy read-only data.
+        local zeroResult = self:BuildZeroLevelMap()
+        if zeroResult.Success == false then
+            return zeroResult
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            Profile = {
+                SchemaVersion = self.CurrentSchemaVersion,
+                UnionPoints = 0,
+                LifetimeUnionPoints = 0,
+                NextRewardRunId = 0,
+                UnionShop = _UnionShopServiceLogic:DefaultState(),
+                CommittedRewardKeys = {},
+                PaidPurchaseReceipts = {},
+                MagnetPetPurchaseId = "",
+                JobUnionProgress = self:CreateDefaultJobUnionProgress(),
+                AllocatedUnionStats = {},
+                PurchasedLevels = self:CopyLevelMap(zeroResult.Levels)
+            }
+        }
+    end
+
+    method table NormalizeProfile(table source)
+        -- Converts one persisted profile into the canonical Schema 5 shape before the caller performs atomic CAS.
+        if source == nil or type(source) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "PROFILE_TABLE_MISSING" }
+        end
+        local rawSchemaVersion = tonumber(source.SchemaVersion)
+        if rawSchemaVersion ~= nil and (rawSchemaVersion < 0 or rawSchemaVersion ~= math.floor(rawSchemaVersion)) then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_SCHEMA_VERSION" }
+        end
+        local sourceSchemaVersion = math.floor(rawSchemaVersion or 0)
+        if sourceSchemaVersion > self.CurrentSchemaVersion then
+            return { Success = false, Reason = "UNSUPPORTED_PROFILE_SCHEMA", SchemaVersion = sourceSchemaVersion }
+        end
+        local defaultResult = self:CreateDefaultProfile()
+        if defaultResult.Success == false then
+            return defaultResult
+        end
+        local profile = defaultResult.Profile
+        if source.UnionShop ~= nil then
+            if not _UnionShopServiceLogic:ValidateState(source.UnionShop) then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_SHOP" }
+            end
+            profile.UnionShop = _UnionShopServiceLogic:CopyState(source.UnionShop)
+        end
+        local unionPointsResult = self:ReadNonNegativeInteger(source.UnionPoints, "INVALID_UNION_POINTS")
+        if unionPointsResult.Success == false then
+            return unionPointsResult
+        end
+        local lifetimeResult = self:ReadNonNegativeInteger(source.LifetimeUnionPoints, "INVALID_LIFETIME_UNION_POINTS")
+        if lifetimeResult.Success == false then
+            return lifetimeResult
+        end
+        local rewardRunResult = self:ReadNonNegativeInteger(source.NextRewardRunId, "INVALID_NEXT_REWARD_RUN_ID")
+        if rewardRunResult.Success == false then
+            return rewardRunResult
+        end
+        profile.UnionPoints = unionPointsResult.Value
+        profile.LifetimeUnionPoints = lifetimeResult.Value
+        profile.NextRewardRunId = rewardRunResult.Value
+
+        local rewardReceiptResult = self:NormalizeRewardReceiptMap(source.CommittedRewardKeys, profile.NextRewardRunId)
+        if rewardReceiptResult.Success == false then
+            return rewardReceiptResult
+        end
+        profile.CommittedRewardKeys = rewardReceiptResult.Receipts
+        local paid = self:NormalizePaidPurchaseReceipts(source.PaidPurchaseReceipts)
+        if paid.Success == false then return paid end
+        profile.PaidPurchaseReceipts = paid.Receipts
+        if source.MagnetPetPurchaseId ~= nil and type(source.MagnetPetPurchaseId) ~= "string" then
+            return {Success = false, Reason = "INVALID_MAGNET_PET_ENTITLEMENT"}
+        end
+        profile.MagnetPetPurchaseId = source.MagnetPetPurchaseId or ""
+
+        local purchasedResult = self:NormalizePurchasedLevelsStrict(source.PurchasedLevels)
+        if purchasedResult.Success == false then
+            return purchasedResult
+        end
+        profile.PurchasedLevels = purchasedResult.Levels
+
+        local wasMigrated = sourceSchemaVersion < self.CurrentSchemaVersion
+        local wasSanitized = rewardReceiptResult.WasSanitized == true
+        local legacyUpgradeRefund = 0
+        local legacyBlockRefund = 0
+        local blockRefundSource = "NONE"
+        if wasMigrated == true then
+            local upgradeRefundResult = self:CalculateLegacyUpgradeRefund(profile.PurchasedLevels)
+            if upgradeRefundResult.Success == false then
+                return upgradeRefundResult
+            end
+            local blockRefundResult = self:CalculateLegacyBlockRefund(source)
+            if blockRefundResult.Success == false then
+                return blockRefundResult
+            end
+            legacyUpgradeRefund = upgradeRefundResult.RefundAmount
+            legacyBlockRefund = blockRefundResult.RefundAmount
+            blockRefundSource = blockRefundResult.RefundSource
+            local totalLegacyRefund = legacyUpgradeRefund + legacyBlockRefund
+            local refundedBalance = profile.UnionPoints + totalLegacyRefund
+            if refundedBalance < profile.UnionPoints or refundedBalance < totalLegacyRefund then
+                return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "LEGACY_REFUND_OVERFLOW" }
+            end
+            profile.UnionPoints = refundedBalance
+            profile.JobUnionProgress = self:CreateDefaultJobUnionProgress()
+            profile.AllocatedUnionStats = {}
+            log("[UnionProfileMigration] schema=" .. tostring(sourceSchemaVersion) .. "->5 upgradeRefund=" .. tostring(legacyUpgradeRefund) .. " blockRefund=" .. tostring(legacyBlockRefund) .. " blockSource=" .. blockRefundSource .. " unionCoins=" .. tostring(profile.UnionPoints))
+        else
+            local jobProgressResult = self:NormalizeJobUnionProgress(source.JobUnionProgress)
+            if jobProgressResult.Success == false then
+                return jobProgressResult
+            end
+            profile.JobUnionProgress = jobProgressResult.Progress
+            local allocationResult = self:NormalizeAllocatedUnionStats(source.AllocatedUnionStats)
+            if allocationResult.Success == false then
+                return allocationResult
+            end
+            profile.AllocatedUnionStats = allocationResult.Levels
+            wasSanitized = wasSanitized or jobProgressResult.WasSanitized == true or allocationResult.WasSanitized == true
+            local legacyBlockEntries = self:CountLegacyBlockEntries(source)
+            if legacyBlockEntries > 0 then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "LEGACY_BLOCK_DATA_PRESENT_IN_SCHEMA_5" }
+            end
+        end
+
+        if source.UnionStatPoints ~= nil or source.TotalUnionStatPoints ~= nil then
+            wasSanitized = true
+        end
+        local validation = self:ValidateProfileData(profile)
+        if validation.Success == false then
+            return validation
+        end
+        return {
+            Success = true,
+            Reason = "OK",
+            Profile = profile,
+            WasMigrated = wasMigrated,
+            WasSanitized = wasSanitized,
+            NeedsPersistence = wasMigrated or wasSanitized,
+            LegacyUpgradeRefund = legacyUpgradeRefund,
+            LegacyBlockRefund = legacyBlockRefund,
+            TotalLegacyRefund = legacyUpgradeRefund + legacyBlockRefund,
+            BlockRefundSource = blockRefundSource
+        }
+    end
+
+    method table NormalizeProfileV4Deprecated(table source)
+        -- Migrates legacy or partial Union source data into the current schema without losing old progression.
+        local sourceSchemaVersion = math.floor(tonumber(source.SchemaVersion) or 0)
+        if sourceSchemaVersion > self.CurrentSchemaVersion then
+            return { Success = false, Reason = "UNSUPPORTED_PROFILE_SCHEMA", SchemaVersion = sourceSchemaVersion }
+        end
+        local defaultResult = self:CreateDefaultProfile()
+        if defaultResult.Success == false then
+            return defaultResult
+        end
+        local profile = defaultResult.Profile
+        local wasSanitized = sourceSchemaVersion ~= self.CurrentSchemaVersion
+        profile.UnionPoints = self:ClampNonNegativeInteger(source.UnionPoints)
+        profile.LifetimeUnionPoints = self:ClampNonNegativeInteger(source.LifetimeUnionPoints)
+        if tonumber(source.UnionPoints) ~= profile.UnionPoints or tonumber(source.LifetimeUnionPoints) ~= profile.LifetimeUnionPoints then
+            wasSanitized = true
+        end
+        if profile.LifetimeUnionPoints < profile.UnionPoints then
+            profile.LifetimeUnionPoints = profile.UnionPoints
+            wasSanitized = true
+        end
+        profile.NextRewardRunId = self:ClampNonNegativeInteger(source.NextRewardRunId)
+        if tonumber(source.NextRewardRunId) ~= profile.NextRewardRunId then
+            wasSanitized = true
+        end
+        local sourceRewardKeys = type(source.CommittedRewardKeys) == "table" and source.CommittedRewardKeys or {}
+        if type(source.CommittedRewardKeys) ~= "table" then
+            wasSanitized = true
+        end
+        for rewardKey, committedAmount in pairs(sourceRewardKeys) do
+            local normalizedKey = tostring(rewardKey or "")
+            local normalizedAmount = self:ClampNonNegativeInteger(committedAmount)
+            if normalizedKey == self.JsonEmptyMapMarker then
+                -- JSON object marker is serialization-only and never becomes progression data.
+            elseif normalizedKey ~= "" and normalizedAmount == tonumber(committedAmount) then
+                profile.CommittedRewardKeys[normalizedKey] = normalizedAmount
+            else
+                wasSanitized = true
+            end
+        end
+        local receiptCountBeforePrune = self:CountTableEntries(profile.CommittedRewardKeys)
+        self:PruneCommittedRewardKeys(profile.CommittedRewardKeys, profile.NextRewardRunId)
+        if self:CountTableEntries(profile.CommittedRewardKeys) ~= receiptCountBeforePrune then
+            wasSanitized = true
+        end
+        local allBlocks = _UnionBlockDefinitionRepositoryLogic:GetAllBlocks()
+        if allBlocks.Success == false then
+            return { Success = false, Reason = allBlocks.Reason }
+        end
+        local knownBlockIds = {}
+        local sourceOwnedBlocks = type(source.OwnedUnionBlocks) == "table" and source.OwnedUnionBlocks or {}
+        if type(source.OwnedUnionBlocks) ~= "table" then
+            wasSanitized = true
+        end
+        for _, blockDefinition in ipairs(allBlocks.Blocks) do
+            knownBlockIds[blockDefinition.BlockId] = blockDefinition
+            local ownedQuantity = math.max(0, math.min(self:ClampNonNegativeInteger(sourceOwnedBlocks[blockDefinition.BlockId]), blockDefinition.MaxOwned))
+            if ownedQuantity > 0 then
+                profile.OwnedUnionBlocks[blockDefinition.BlockId] = ownedQuantity
+            end
+            if sourceOwnedBlocks[blockDefinition.BlockId] ~= nil and tonumber(sourceOwnedBlocks[blockDefinition.BlockId]) ~= ownedQuantity then
+                wasSanitized = true
+            end
+        end
+        for savedBlockId, _ in pairs(sourceOwnedBlocks) do
+            if savedBlockId ~= self.JsonEmptyMapMarker and knownBlockIds[savedBlockId] == nil then
+                wasSanitized = true
+                log_warning("[UnionProfile] unknown saved Union block id removed blockId=" .. tostring(savedBlockId))
+            end
+        end
+        profile.NextBlockPurchaseReceiptOrder = self:ClampNonNegativeInteger(source.NextBlockPurchaseReceiptOrder)
+        if tonumber(source.NextBlockPurchaseReceiptOrder) ~= profile.NextBlockPurchaseReceiptOrder then
+            wasSanitized = true
+        end
+        local sourceBlockReceipts = type(source.BlockPurchaseReceipts) == "table" and source.BlockPurchaseReceipts or {}
+        if type(source.BlockPurchaseReceipts) ~= "table" then
+            wasSanitized = true
+        end
+        for requestId, sourceReceipt in pairs(sourceBlockReceipts) do
+            local normalizedRequestId = tostring(requestId or "")
+            local blockId = type(sourceReceipt) == "table" and tostring(sourceReceipt.BlockId or "") or ""
+            local receiptOrder = type(sourceReceipt) == "table" and self:ClampNonNegativeInteger(sourceReceipt.ReceiptOrder) or 0
+            if normalizedRequestId == self.JsonEmptyMapMarker then
+                -- JSON object marker is serialization-only and never becomes a purchase receipt.
+            elseif self:IsValidBlockPurchaseRequestId(normalizedRequestId) == true and knownBlockIds[blockId] ~= nil and receiptOrder > 0 and receiptOrder <= profile.NextBlockPurchaseReceiptOrder then
+                profile.BlockPurchaseReceipts[normalizedRequestId] = {
+                    BlockId = blockId,
+                    Cost = self:ClampNonNegativeInteger(sourceReceipt.Cost),
+                    OwnedQuantity = self:ClampNonNegativeInteger(sourceReceipt.OwnedQuantity),
+                    UnionPoints = self:ClampNonNegativeInteger(sourceReceipt.UnionPoints),
+                    ReceiptOrder = receiptOrder
+                }
+            else
+                wasSanitized = true
+            end
+        end
+        local blockReceiptCountBeforePrune = self:CountTableEntries(profile.BlockPurchaseReceipts)
+        self:PruneBlockPurchaseReceipts(profile.BlockPurchaseReceipts)
+        if self:CountTableEntries(profile.BlockPurchaseReceipts) ~= blockReceiptCountBeforePrune then
+            wasSanitized = true
+        end
+        local allDefinitions = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        if allDefinitions.Success == false then
+            return { Success = false, Reason = allDefinitions.Reason }
+        end
+        local knownUpgradeIds = {}
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            knownUpgradeIds[definition.UpgradeId] = true
+        end
+        local sourcePurchased = type(source.PurchasedLevels) == "table" and source.PurchasedLevels or {}
+        if type(source.PurchasedLevels) ~= "table" then wasSanitized = true end
+        if self:HasUnknownUpgradeIds(sourcePurchased, knownUpgradeIds) then
+            wasSanitized = true
+            log_warning("[UnionProfile] unknown saved purchased upgrade id removed")
+        end
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            local purchasedLevel = self:ClampLevel(sourcePurchased[definition.UpgradeId], definition.MaxLevel)
+            profile.PurchasedLevels[definition.UpgradeId] = purchasedLevel
+            if tonumber(sourcePurchased[definition.UpgradeId]) ~= purchasedLevel then wasSanitized = true end
+        end
+        if source.ActiveLevels ~= nil or source.ActivePresetIndex ~= nil or source.Presets ~= nil then
+            log("[UnionProfile] legacy loadout fields ignored schema=" .. tostring(sourceSchemaVersion))
+        end
+        if wasSanitized == true then
+            log_warning("[UnionProfile] saved Union source data was normalized safely")
+        end
+        local validation = self:ValidateProfileData(profile)
+        if validation.Success == false then
+            return validation
+        end
+        local wasMigrated = sourceSchemaVersion ~= self.CurrentSchemaVersion
+        return { Success = true, Reason = "OK", Profile = profile, WasMigrated = wasMigrated, WasSanitized = wasSanitized, NeedsPersistence = wasMigrated or wasSanitized }
+    end
+
+    method table ValidateProfileData(table profile)
+        -- Validates only canonical Schema 5 source fields; total Union Stat Points remain derived.
+        if profile == nil or type(profile) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "PROFILE_TABLE_MISSING" }
+        end
+        if profile.SchemaVersion ~= self.CurrentSchemaVersion then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_SCHEMA_VERSION" }
+        end
+        if not _UnionShopServiceLogic:ValidateState(profile.UnionShop) then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_SHOP" }
+        end
+        if self:IsNonNegativeInteger(profile.UnionPoints) == false then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_POINTS" }
+        end
+        if self:IsNonNegativeInteger(profile.LifetimeUnionPoints) == false then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_LIFETIME_UNION_POINTS" }
+        end
+        if self:IsNonNegativeInteger(profile.NextRewardRunId) == false then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_NEXT_REWARD_RUN_ID" }
+        end
+        if type(profile.CommittedRewardKeys) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "COMMITTED_REWARD_KEYS_MISSING" }
+        end
+        if self:CountTableEntries(profile.CommittedRewardKeys) > self.RewardReceiptRetention then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "REWARD_RECEIPT_RETENTION_EXCEEDED" }
+        end
+        for rewardKey, committedAmount in pairs(profile.CommittedRewardKeys) do
+            if type(rewardKey) ~= "string" or rewardKey == "" or self:IsNonNegativeInteger(committedAmount) == false then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_COMMITTED_REWARD_RECEIPT", RewardKey = tostring(rewardKey or "") }
+            end
+        end
+        if type(profile.MagnetPetPurchaseId) ~= "string" then
+            return {Success = false, Reason = "INVALID_MAGNET_PET_ENTITLEMENT"}
+        end
+        local paidValidation = self:NormalizePaidPurchaseReceipts(profile.PaidPurchaseReceipts)
+        if paidValidation.Success == false then return paidValidation end
+        local jobValidation = self:ValidateJobUnionProgress(profile.JobUnionProgress)
+        if jobValidation.Success == false then
+            return jobValidation
+        end
+        local allocationValidation = self:ValidateAllocatedUnionStats(profile.AllocatedUnionStats)
+        if allocationValidation.Success == false then
+            return allocationValidation
+        end
+        local allocationConsistency = self:ValidateAllocatedUnionStatConsistency(profile)
+        if allocationConsistency.Success == false then
+            return allocationConsistency
+        end
+        local purchasedResult = self:NormalizePurchasedLevelsStrict(profile.PurchasedLevels)
+        if purchasedResult.Success == false then
+            return purchasedResult
+        end
+        for upgradeId, level in pairs(profile.PurchasedLevels) do
+            if purchasedResult.Levels[upgradeId] ~= level then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "NON_CANONICAL_PURCHASED_LEVEL", UpgradeId = tostring(upgradeId) }
+            end
+        end
+        if profile.OwnedUnionBlocks ~= nil or profile.NextBlockPurchaseReceiptOrder ~= nil or profile.BlockPurchaseReceipts ~= nil then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "LEGACY_BLOCK_DATA_PRESENT" }
+        end
+        if profile.UnionStatPoints ~= nil or profile.TotalUnionStatPoints ~= nil then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "DERIVED_UNION_STAT_POINTS_MUST_NOT_BE_SAVED" }
+        end
+        return { Success = true, Reason = "OK" }
+    end
+
+    method table ValidateProfileDataV4Deprecated(table profile)
+        -- Rejects any candidate that could persist negative currency, invalid levels, or calculated bonus data.
+        if profile == nil or type(profile) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "PROFILE_TABLE_MISSING" }
+        end
+        if profile.SchemaVersion ~= self.CurrentSchemaVersion then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_SCHEMA_VERSION" }
+        end
+        if profile.UnionPoints == nil or profile.UnionPoints < 0 then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "NEGATIVE_UNION_POINTS" }
+        end
+        if profile.LifetimeUnionPoints == nil or profile.LifetimeUnionPoints < profile.UnionPoints then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_LIFETIME_UNION_POINTS" }
+        end
+        if profile.NextRewardRunId == nil or profile.NextRewardRunId < 0 or profile.NextRewardRunId ~= math.floor(profile.NextRewardRunId) then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_NEXT_REWARD_RUN_ID" }
+        end
+        if type(profile.CommittedRewardKeys) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "COMMITTED_REWARD_KEYS_MISSING" }
+        end
+        if self:CountTableEntries(profile.CommittedRewardKeys) > self.RewardReceiptRetention then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "REWARD_RECEIPT_RETENTION_EXCEEDED" }
+        end
+        for rewardKey, committedAmount in pairs(profile.CommittedRewardKeys) do
+            if type(rewardKey) ~= "string" or rewardKey == "" then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_COMMITTED_REWARD_KEY" }
+            end
+            if committedAmount == nil or committedAmount < 0 or committedAmount ~= math.floor(committedAmount) then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_COMMITTED_REWARD_AMOUNT", RewardKey = rewardKey }
+            end
+        end
+        if type(profile.OwnedUnionBlocks) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "OWNED_UNION_BLOCKS_MISSING" }
+        end
+        if profile.NextBlockPurchaseReceiptOrder == nil or profile.NextBlockPurchaseReceiptOrder < 0 or profile.NextBlockPurchaseReceiptOrder ~= math.floor(profile.NextBlockPurchaseReceiptOrder) then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_BLOCK_PURCHASE_RECEIPT_ORDER" }
+        end
+        if type(profile.BlockPurchaseReceipts) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "BLOCK_PURCHASE_RECEIPTS_MISSING" }
+        end
+        if self:CountTableEntries(profile.BlockPurchaseReceipts) > self.BlockPurchaseReceiptRetention then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "BLOCK_PURCHASE_RECEIPT_RETENTION_EXCEEDED" }
+        end
+        local allBlocks = _UnionBlockDefinitionRepositoryLogic:GetAllBlocks()
+        if allBlocks.Success == false then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = allBlocks.Reason }
+        end
+        local knownBlockIds = {}
+        for _, blockDefinition in ipairs(allBlocks.Blocks) do
+            knownBlockIds[blockDefinition.BlockId] = blockDefinition
+        end
+        for blockId, ownedQuantity in pairs(profile.OwnedUnionBlocks) do
+            local blockDefinition = knownBlockIds[blockId]
+            if blockDefinition == nil then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "UNKNOWN_OWNED_UNION_BLOCK_ID", BlockId = blockId }
+            end
+            if ownedQuantity == nil or ownedQuantity < 0 or ownedQuantity > blockDefinition.MaxOwned or ownedQuantity ~= math.floor(ownedQuantity) then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_OWNED_UNION_BLOCK_QUANTITY", BlockId = blockId }
+            end
+        end
+        for requestId, receipt in pairs(profile.BlockPurchaseReceipts) do
+            if self:IsValidBlockPurchaseRequestId(requestId) == false or type(receipt) ~= "table" or knownBlockIds[receipt.BlockId] == nil then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_BLOCK_PURCHASE_RECEIPT", RequestId = requestId }
+            end
+            if receipt.Cost == nil or receipt.Cost < 0 or receipt.Cost ~= math.floor(receipt.Cost)
+                or receipt.OwnedQuantity == nil or receipt.OwnedQuantity < 0 or receipt.OwnedQuantity ~= math.floor(receipt.OwnedQuantity)
+                or receipt.UnionPoints == nil or receipt.UnionPoints < 0 or receipt.UnionPoints ~= math.floor(receipt.UnionPoints)
+                or receipt.ReceiptOrder == nil or receipt.ReceiptOrder <= 0 or receipt.ReceiptOrder > profile.NextBlockPurchaseReceiptOrder or receipt.ReceiptOrder ~= math.floor(receipt.ReceiptOrder) then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_BLOCK_PURCHASE_RECEIPT_VALUE", RequestId = requestId }
+            end
+        end
+        if type(profile.PurchasedLevels) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "PROFILE_LEVEL_TABLE_MISSING" }
+        end
+        local allDefinitions = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        if allDefinitions.Success == false then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = allDefinitions.Reason }
+        end
+        local knownUpgradeIds = {}
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            knownUpgradeIds[definition.UpgradeId] = true
+        end
+        if self:HasUnknownUpgradeIds(profile.PurchasedLevels, knownUpgradeIds) then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "UNKNOWN_PURCHASED_UPGRADE_ID" }
+        end
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            local purchasedLevel = profile.PurchasedLevels[definition.UpgradeId]
+            if purchasedLevel == nil or purchasedLevel < 0 or purchasedLevel > definition.MaxLevel or purchasedLevel ~= math.floor(purchasedLevel) then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_PURCHASED_LEVEL", UpgradeId = definition.UpgradeId }
+            end
+        end
+        return { Success = true, Reason = "OK" }
+    end
+
+    method boolean HasUnknownUpgradeIds(table levels, table knownUpgradeIds)
+        -- Detects saved or candidate keys that are absent from the server definition dataset.
+        for upgradeId, _ in pairs(levels or {}) do
+            if knownUpgradeIds[upgradeId] ~= true then
+                return true
+            end
+        end
+        return false
+    end
+
+    method table BuildZeroLevelMap()
+        -- Builds an explicit zero entry for every server-validated Union upgrade definition.
+        local allDefinitions = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        if allDefinitions.Success == false then
+            return { Success = false, Reason = allDefinitions.Reason, Levels = {} }
+        end
+        local levels = {}
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            levels[definition.UpgradeId] = 0
+        end
+        return { Success = true, Reason = "OK", Levels = levels }
+    end
+
+    method table CloneProfile(table source)
+        -- Deep-copies only the persisted source fields and excludes all storage/cache metadata.
+        return {
+            SchemaVersion = source.SchemaVersion,
+            UnionPoints = source.UnionPoints,
+            LifetimeUnionPoints = source.LifetimeUnionPoints,
+            NextRewardRunId = source.NextRewardRunId,
+            UnionShop = _UnionShopServiceLogic:CopyState(source.UnionShop),
+            CommittedRewardKeys = self:CopyRewardReceiptMap(source.CommittedRewardKeys),
+            PaidPurchaseReceipts = self:CopyPaidPurchaseReceipts(source.PaidPurchaseReceipts),
+            MagnetPetPurchaseId = source.MagnetPetPurchaseId or "",
+            JobUnionProgress = self:CopyLevelMap(source.JobUnionProgress),
+            AllocatedUnionStats = self:CopyLevelMap(source.AllocatedUnionStats),
+            PurchasedLevels = self:CopyLevelMap(source.PurchasedLevels)
+        }
+    end
+
+    method table BuildJsonSafeProfile(table source)
+        -- MSW's JSON encoder cannot infer the object type of a newly-created empty Lua table.
+        -- A reserved marker is added only to the serialized clone and stripped during normalization.
+        local result = self:CloneProfile(source)
+        if self:CountTableEntries(result.PaidPurchaseReceipts) == 0 then
+            result.PaidPurchaseReceipts[self.JsonEmptyMapMarker] = 0
+        end
+        if self:CountTableEntries(result.CommittedRewardKeys) == 0 then
+            result.CommittedRewardKeys[self.JsonEmptyMapMarker] = 0
+        end
+        if self:CountTableEntries(result.AllocatedUnionStats) == 0 then
+            result.AllocatedUnionStats[self.JsonEmptyMapMarker] = 0
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryCommitUnionShopAction(Entity userEntity, string action, string productId, integer expectedRevision, integer runId)
+        -- Coins and purchased ownership commit together through the existing profile CAS writer.
+        local loaded = self:GetUnionProfile(userEntity)
+        if not loaded.Success then return loaded end
+        local key = loaded.StorageUserKey
+        if not self:TryAcquireMutationLock(key) then return {Success=false, Reason="PROFILE_MUTATION_IN_PROGRESS"} end
+        local candidate = self:GetCachedSnapshot(key)
+        if candidate == nil then
+            self:ReleaseMutationLock(key)
+            return {Success=false, Reason="PROFILE_CACHE_MISSING"}
+        end
+        local result = _UnionShopServiceLogic:EvaluateAction(candidate, action, productId, expectedRevision, runId)
+        if result.Success and result.Changed then
+            local persisted = self:PersistProfileCandidate(key, candidate)
+            if not persisted.Success then result = persisted end
+        end
+        self:ReleaseMutationLock(key)
+        log("[UnionShop] commit action=" .. action .. " product=" .. productId .. " success=" .. tostring(result.Success))
+        return result
+    end
+
+    method table NormalizeRewardReceiptMap(any source, integer nextRewardRunId)
+        local receipts = {}
+        local wasSanitized = false
+        if source == nil then
+            return { Success = true, Reason = "OK", Receipts = receipts, WasSanitized = true }
+        end
+        if type(source) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_COMMITTED_REWARD_KEYS" }
+        end
+        for rewardKey, amount in pairs(source) do
+            local normalizedKey = tostring(rewardKey or "")
+            if normalizedKey == self.JsonEmptyMapMarker then
+                -- Ignore the serialization marker without scheduling an identical rewrite.
+            elseif normalizedKey == "" or self:IsNonNegativeInteger(amount) == false then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_COMMITTED_REWARD_RECEIPT", RewardKey = normalizedKey }
+            else
+                receipts[normalizedKey] = math.floor(tonumber(amount))
+            end
+        end
+        local beforePrune = self:CountTableEntries(receipts)
+        self:PruneCommittedRewardKeys(receipts, nextRewardRunId)
+        if self:CountTableEntries(receipts) ~= beforePrune then
+            wasSanitized = true
+        end
+        return { Success = true, Reason = "OK", Receipts = receipts, WasSanitized = wasSanitized }
+    end
+
+    method table NormalizePurchasedLevelsStrict(any source)
+        local sourceLevels = source
+        if sourceLevels == nil then
+            sourceLevels = {}
+        elseif type(sourceLevels) ~= "table" then
+            return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "INVALID_PURCHASED_LEVEL_TABLE" }
+        end
+        local allDefinitions = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        if allDefinitions.Success == false then
+            return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = allDefinitions.Reason }
+        end
+        local knownUpgradeIds = {}
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            knownUpgradeIds[definition.UpgradeId] = definition
+        end
+        for upgradeId, _ in pairs(sourceLevels) do
+            if upgradeId ~= self.JsonEmptyMapMarker and knownUpgradeIds[upgradeId] == nil then
+                return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "UNKNOWN_PURCHASED_UPGRADE_ID", UpgradeId = tostring(upgradeId) }
+            end
+        end
+        local levels = {}
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            local rawLevel = sourceLevels[definition.UpgradeId]
+            if rawLevel == nil then
+                levels[definition.UpgradeId] = 0
+            else
+                local numericLevel = tonumber(rawLevel)
+                if numericLevel == nil or numericLevel < 0 or numericLevel > definition.MaxLevel or numericLevel ~= math.floor(numericLevel) then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "INVALID_PURCHASED_LEVEL", UpgradeId = definition.UpgradeId }
+                end
+                levels[definition.UpgradeId] = math.floor(numericLevel)
+            end
+        end
+        return { Success = true, Reason = "OK", Levels = levels }
+    end
+
+    method table CalculateLegacyUpgradeRefund(table purchasedLevels)
+        local allDefinitions = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        if allDefinitions.Success == false then
+            return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = allDefinitions.Reason }
+        end
+        local refundAmount = 0
+        for _, definition in ipairs(allDefinitions.Definitions) do
+            local purchasedLevel = purchasedLevels[definition.UpgradeId] or 0
+            for level = 1, purchasedLevel do
+                local levelDefinition = _UnionUpgradeDefinitionRepositoryLogic:GetLevelDefinition(definition.UpgradeId, level)
+                if levelDefinition.Success == false or (levelDefinition.MatchCount or 0) ~= 1 or self:IsNonNegativeInteger(levelDefinition.Cost) == false then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "LEGACY_UPGRADE_REFUND_COST_UNRESOLVED", UpgradeId = definition.UpgradeId, Level = level }
+                end
+                local nextRefund = refundAmount + levelDefinition.Cost
+                if nextRefund < refundAmount then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "LEGACY_UPGRADE_REFUND_OVERFLOW", UpgradeId = definition.UpgradeId }
+                end
+                refundAmount = nextRefund
+            end
+        end
+        return { Success = true, Reason = "OK", RefundAmount = refundAmount }
+    end
+
+    method table CalculateLegacyBlockRefund(table source)
+        local sourceOwnedBlocks = source.OwnedUnionBlocks
+        if sourceOwnedBlocks == nil then
+            sourceOwnedBlocks = {}
+        elseif type(sourceOwnedBlocks) ~= "table" then
+            return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "INVALID_OWNED_UNION_BLOCK_TABLE" }
+        end
+        local sourceReceipts = source.BlockPurchaseReceipts
+        if sourceReceipts == nil then
+            sourceReceipts = {}
+        elseif type(sourceReceipts) ~= "table" then
+            return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "INVALID_BLOCK_PURCHASE_RECEIPT_TABLE" }
+        end
+        local nextOrderResult = self:ReadNonNegativeInteger(source.NextBlockPurchaseReceiptOrder, "INVALID_BLOCK_PURCHASE_RECEIPT_ORDER")
+        if nextOrderResult.Success == false then
+            return nextOrderResult
+        end
+        local allBlocks = _UnionBlockDefinitionRepositoryLogic:GetAllBlocks()
+        if allBlocks.Success == false then
+            return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = allBlocks.Reason }
+        end
+        local knownBlocks = {}
+        for _, definition in ipairs(allBlocks.Blocks) do
+            knownBlocks[definition.BlockId] = definition
+        end
+
+        local ownedByBlockId = {}
+        for blockId, rawQuantity in pairs(sourceOwnedBlocks) do
+            if blockId ~= self.JsonEmptyMapMarker then
+                local definition = knownBlocks[blockId]
+                if definition == nil then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "UNKNOWN_OWNED_UNION_BLOCK_ID", BlockId = tostring(blockId) }
+                end
+                local quantityResult = self:ReadNonNegativeInteger(rawQuantity, "INVALID_OWNED_UNION_BLOCK_QUANTITY")
+                if quantityResult.Success == false or quantityResult.Value > definition.MaxOwned then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "INVALID_OWNED_UNION_BLOCK_QUANTITY", BlockId = blockId }
+                end
+                ownedByBlockId[blockId] = quantityResult.Value
+            end
+        end
+
+        local receiptGroups = {}
+        local seenReceiptOrders = {}
+        for requestId, receipt in pairs(sourceReceipts) do
+            if requestId ~= self.JsonEmptyMapMarker then
+                if self:IsValidBlockPurchaseRequestId(tostring(requestId or "")) == false or type(receipt) ~= "table" then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "INVALID_BLOCK_PURCHASE_RECEIPT", RequestId = tostring(requestId or "") }
+                end
+                local blockId = tostring(receipt.BlockId or "")
+                local definition = knownBlocks[blockId]
+                if definition == nil then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "UNKNOWN_BLOCK_PURCHASE_RECEIPT_ID", BlockId = blockId, RequestId = tostring(requestId) }
+                end
+                local costResult = self:ReadNonNegativeInteger(receipt.Cost, "INVALID_BLOCK_PURCHASE_RECEIPT_COST")
+                local quantityResult = self:ReadNonNegativeInteger(receipt.OwnedQuantity, "INVALID_BLOCK_PURCHASE_RECEIPT_QUANTITY")
+                local balanceResult = self:ReadNonNegativeInteger(receipt.UnionPoints, "INVALID_BLOCK_PURCHASE_RECEIPT_BALANCE")
+                local orderResult = self:ReadNonNegativeInteger(receipt.ReceiptOrder, "INVALID_BLOCK_PURCHASE_RECEIPT_ORDER")
+                if costResult.Success == false or quantityResult.Success == false or balanceResult.Success == false or orderResult.Success == false
+                    or quantityResult.Value <= 0 or quantityResult.Value > definition.MaxOwned
+                    or orderResult.Value <= 0 or orderResult.Value > nextOrderResult.Value then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "INVALID_BLOCK_PURCHASE_RECEIPT_VALUE", BlockId = blockId, RequestId = tostring(requestId) }
+                end
+                if seenReceiptOrders[orderResult.Value] == true then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "DUPLICATE_BLOCK_PURCHASE_RECEIPT_ORDER", RequestId = tostring(requestId) }
+                end
+                seenReceiptOrders[orderResult.Value] = true
+                local group = receiptGroups[blockId]
+                if group == nil then
+                    group = { Count = 0, Cost = 0, OwnedQuantities = {} }
+                    receiptGroups[blockId] = group
+                end
+                if group.OwnedQuantities[quantityResult.Value] == true then
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "DUPLICATE_BLOCK_PURCHASE_OWNED_QUANTITY", BlockId = blockId }
+                end
+                group.OwnedQuantities[quantityResult.Value] = true
+                group.Count = group.Count + 1
+                group.Cost = group.Cost + costResult.Value
+            end
+        end
+
+        local refundAmount = 0
+        local usedReceipts = false
+        local usedDefinitions = false
+        for blockId, definition in pairs(knownBlocks) do
+            local ownedQuantity = ownedByBlockId[blockId] or 0
+            local group = receiptGroups[blockId]
+            local receiptCount = group ~= nil and group.Count or 0
+            if ownedQuantity == 0 and receiptCount > 0 then
+                return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "BLOCK_RECEIPT_WITHOUT_OWNERSHIP", BlockId = blockId }
+            end
+            if ownedQuantity > 0 then
+                if receiptCount == 0 then
+                    if self:IsNonNegativeInteger(definition.ShopCost) == false then
+                        return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "BLOCK_SHOP_COST_UNRESOLVED", BlockId = blockId }
+                    end
+                    refundAmount = refundAmount + (ownedQuantity * definition.ShopCost)
+                    usedDefinitions = true
+                elseif receiptCount == ownedQuantity then
+                    for quantity = 1, ownedQuantity do
+                        if group.OwnedQuantities[quantity] ~= true then
+                            return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "INCOMPLETE_BLOCK_PURCHASE_RECEIPT_SEQUENCE", BlockId = blockId }
+                        end
+                    end
+                    refundAmount = refundAmount + group.Cost
+                    usedReceipts = true
+                else
+                    return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "PARTIAL_BLOCK_PURCHASE_RECEIPTS", BlockId = blockId }
+                end
+            end
+        end
+        local refundSource = "NONE"
+        if usedReceipts == true and usedDefinitions == true then
+            refundSource = "MIXED"
+        elseif usedReceipts == true then
+            refundSource = "RECEIPTS"
+        elseif usedDefinitions == true then
+            refundSource = "DEFINITIONS"
+        end
+        return { Success = true, Reason = "OK", RefundAmount = refundAmount, RefundSource = refundSource }
+    end
+
+    method table NormalizeJobUnionProgress(any source)
+        local progress = self:CreateDefaultJobUnionProgress()
+        local wasSanitized = false
+        if source == nil then
+            return { Success = true, Reason = "OK", Progress = progress, WasSanitized = true }
+        end
+        if type(source) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_JOB_UNION_PROGRESS_TABLE" }
+        end
+        for jobId, value in pairs(source) do
+            if jobId ~= self.JsonEmptyMapMarker and self:IsKnownUnionJobId(jobId) == false then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "UNKNOWN_JOB_UNION_PROGRESS_ID", JobId = tostring(jobId) }
+            end
+        end
+        for _, jobId in ipairs({ "warrior", "mage", "archer", "thief", "pirate" }) do
+            local value = source[jobId]
+            if value == nil then
+                wasSanitized = true
+                progress[jobId] = 0
+            elseif self:IsNonNegativeInteger(value) == false then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_JOB_UNION_PROGRESS", JobId = jobId }
+            else
+                progress[jobId] = math.floor(tonumber(value))
+            end
+        end
+        return { Success = true, Reason = "OK", Progress = progress, WasSanitized = wasSanitized }
+    end
+
+    method table ValidateJobUnionProgress(table source)
+        local normalized = self:NormalizeJobUnionProgress(source)
+        if normalized.Success == false then
+            return normalized
+        end
+        if normalized.WasSanitized == true or self:CountTableEntries(source) ~= 5 then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "NON_CANONICAL_JOB_UNION_PROGRESS" }
+        end
+        return { Success = true, Reason = "OK" }
+    end
+
+    method table NormalizeAllocatedUnionStats(any source)
+        local levels = {}
+        local wasSanitized = false
+        if source == nil then
+            return { Success = true, Reason = "OK", Levels = levels, WasSanitized = true }
+        end
+        if type(source) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_ALLOCATED_UNION_STATS_TABLE" }
+        end
+        for statId, rawLevel in pairs(source) do
+            if statId == self.JsonEmptyMapMarker then
+                -- Ignore the serialization marker without scheduling an identical rewrite.
+            else
+                local definition = _UnionStatDefinitionRepositoryLogic:GetStat(statId)
+                local level = tonumber(rawLevel)
+                if definition.Success == false then
+                    return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "UNKNOWN_ALLOCATED_UNION_STAT_ID", StatId = tostring(statId) }
+                end
+                if definition.IsImplemented ~= true then
+                    return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "ALLOCATED_UNION_STAT_NOT_IMPLEMENTED", StatId = tostring(statId) }
+                end
+                if level == nil or level < 0 or level > definition.MaxLevel or level ~= math.floor(level) then
+                    return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_ALLOCATED_UNION_STAT_LEVEL", StatId = statId }
+                end
+                if level > 0 then
+                    levels[statId] = math.floor(level)
+                else
+                    wasSanitized = true
+                end
+            end
+        end
+        return { Success = true, Reason = "OK", Levels = levels, WasSanitized = wasSanitized }
+    end
+
+    method table ValidateAllocatedUnionStats(table source)
+        local normalized = self:NormalizeAllocatedUnionStats(source)
+        if normalized.Success == false then
+            return normalized
+        end
+        if normalized.WasSanitized == true or self:CountTableEntries(source) ~= self:CountTableEntries(normalized.Levels) then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "NON_CANONICAL_ALLOCATED_UNION_STATS" }
+        end
+        return { Success = true, Reason = "OK" }
+    end
+
+    method table ValidateAllocatedUnionStatConsistency(table profile)
+        -- Coin-purchased stat levels are permanent and no longer capped by derived job-grade points.
+        local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(profile.LifetimeUnionPoints)
+        if currentRank.Success == false then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = currentRank.Reason or "INVALID_CURRENT_UNION_RANK" }
+        end
+        for statId, allocatedLevel in pairs(profile.AllocatedUnionStats) do
+            local definition = _UnionStatDefinitionRepositoryLogic:GetStat(statId)
+            if definition.Success == false then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = definition.Reason or "UNKNOWN_ALLOCATED_UNION_STAT_ID", StatId = statId }
+            end
+            local definitionRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(definition.RequiredUnionRank)
+            if definitionRank.Success == false then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_ALLOCATED_UNION_STAT_REQUIRED_RANK", StatId = statId }
+            end
+            if currentRank.SortOrder < definitionRank.SortOrder then
+                return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "ALLOCATED_UNION_STAT_RANK_LOCKED", StatId = statId, RequiredUnionRank = definition.RequiredUnionRank }
+            end
+            for level = 1, allocatedLevel do
+                local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(statId, level)
+                if levelDefinition.Success == false then
+                    return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = levelDefinition.Reason or "MISSING_ALLOCATED_UNION_STAT_LEVEL", StatId = statId, Level = level }
+                end
+                local levelRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(levelDefinition.RequiredUnionRank)
+                if levelRank.Success == false or currentRank.SortOrder < levelRank.SortOrder then
+                    return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "ALLOCATED_UNION_STAT_RANK_LOCKED", StatId = statId, Level = level, RequiredUnionRank = levelDefinition.RequiredUnionRank }
+                end
+            end
+        end
+        return { Success = true, Reason = "OK" }
+    end
+
+    method table CreateDefaultJobUnionProgress()
+        return { warrior = 0, mage = 0, archer = 0, thief = 0, pirate = 0 }
+    end
+
+    method boolean IsKnownUnionJobId(string jobId)
+        return jobId == "warrior" or jobId == "mage" or jobId == "archer" or jobId == "thief" or jobId == "pirate"
+    end
+
+    method table ReadNonNegativeInteger(any value, string detailReason)
+        if value == nil then
+            return { Success = true, Reason = "OK", Value = 0 }
+        end
+        if self:IsNonNegativeInteger(value) == false then
+            return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = detailReason or "INVALID_NON_NEGATIVE_INTEGER" }
+        end
+        return { Success = true, Reason = "OK", Value = math.floor(tonumber(value)) }
+    end
+
+    method boolean IsNonNegativeInteger(any value)
+        local numericValue = tonumber(value)
+        return numericValue ~= nil and numericValue >= 0 and numericValue == math.floor(numericValue)
+    end
+
+    method integer CountLegacyBlockEntries(table source)
+        local count = 0
+        if type(source.OwnedUnionBlocks) == "table" then
+            for blockId, _ in pairs(source.OwnedUnionBlocks) do
+                if blockId ~= self.JsonEmptyMapMarker then count = count + 1 end
+            end
+        elseif source.OwnedUnionBlocks ~= nil then
+            count = count + 1
+        end
+        if type(source.BlockPurchaseReceipts) == "table" then
+            for requestId, _ in pairs(source.BlockPurchaseReceipts) do
+                if requestId ~= self.JsonEmptyMapMarker then count = count + 1 end
+            end
+        elseif source.BlockPurchaseReceipts ~= nil then
+            count = count + 1
+        end
+        if tonumber(source.NextBlockPurchaseReceiptOrder) ~= nil and tonumber(source.NextBlockPurchaseReceiptOrder) > 0 then
+            count = count + 1
+        end
+        return count
+    end
+
+    method table CopyLevelMap(table source)
+        -- Copies a string-to-integer upgrade level map without sharing mutable table references.
+        local result = {}
+        for upgradeId, level in pairs(source or {}) do
+            result[upgradeId] = math.floor(tonumber(level) or 0)
+        end
+        return result
+    end
+
+    method table CopyRewardReceiptMap(table source)
+        -- Copies opaque server receipt keys and their committed point amounts.
+        local result = {}
+        for rewardKey, amount in pairs(source or {}) do
+            result[tostring(rewardKey)] = self:ClampNonNegativeInteger(amount)
+        end
+        return result
+    end
+
+    method table CopyOwnedUnionBlockMap(table source)
+        -- Copies the persistent block ownership source data without sharing mutable references.
+        local result = {}
+        for blockId, quantity in pairs(source or {}) do
+            result[tostring(blockId)] = self:ClampNonNegativeInteger(quantity)
+        end
+        return result
+    end
+
+    method table CopyBlockPurchaseReceiptMap(table source)
+        -- Copies bounded purchase receipts used for reconnect-safe idempotency.
+        local result = {}
+        for requestId, receipt in pairs(source or {}) do
+            if type(receipt) == "table" then
+                result[tostring(requestId)] = {
+                    BlockId = tostring(receipt.BlockId or ""),
+                    Cost = self:ClampNonNegativeInteger(receipt.Cost),
+                    OwnedQuantity = self:ClampNonNegativeInteger(receipt.OwnedQuantity),
+                    UnionPoints = self:ClampNonNegativeInteger(receipt.UnionPoints),
+                    ReceiptOrder = self:ClampNonNegativeInteger(receipt.ReceiptOrder)
+                }
+            end
+        end
+        return result
+    end
+
+    method void PruneCommittedRewardKeys(table receiptMap, integer newestRewardRunId)
+        -- Bounds DataStorage growth while retaining enough recent run receipts for retries and reconnects.
+        local minimumRunId = math.max(1, (newestRewardRunId or 0) - self.RewardReceiptRetention + 1)
+        for rewardKey, _ in pairs(receiptMap or {}) do
+            local rewardRunId = tonumber(string.match(rewardKey, "^union_run:(%d+)$"))
+            if rewardRunId ~= nil and rewardRunId < minimumRunId then
+                receiptMap[rewardKey] = nil
+            end
+        end
+        while self:CountTableEntries(receiptMap) > self.RewardReceiptRetention do
+            local oldestKey = nil
+            local oldestRunId = nil
+            for rewardKey, _ in pairs(receiptMap) do
+                local rewardRunId = tonumber(string.match(rewardKey, "^union_run:(%d+)$")) or 0
+                if oldestRunId == nil or rewardRunId < oldestRunId or (rewardRunId == oldestRunId and rewardKey < oldestKey) then
+                    oldestKey = rewardKey
+                    oldestRunId = rewardRunId
+                end
+            end
+            if oldestKey == nil then
+                break
+            end
+            receiptMap[oldestKey] = nil
+        end
+    end
+
+    method void PruneBlockPurchaseReceipts(table receiptMap)
+        -- Bounds persistent request receipts by monotonically increasing server receipt order.
+        while self:CountTableEntries(receiptMap) > self.BlockPurchaseReceiptRetention do
+            local oldestRequestId = nil
+            local oldestOrder = nil
+            for requestId, receipt in pairs(receiptMap or {}) do
+                local receiptOrder = type(receipt) == "table" and self:ClampNonNegativeInteger(receipt.ReceiptOrder) or 0
+                if oldestOrder == nil or receiptOrder < oldestOrder or (receiptOrder == oldestOrder and requestId < oldestRequestId) then
+                    oldestRequestId = requestId
+                    oldestOrder = receiptOrder
+                end
+            end
+            if oldestRequestId == nil then
+                break
+            end
+            receiptMap[oldestRequestId] = nil
+        end
+    end
+
+    method boolean IsValidBlockPurchaseRequestId(string requestId)
+        -- Accepts only compact opaque request tokens suitable for a bounded persistent map key.
+        if requestId == nil or requestId == "" or string.len(requestId) > 96 then
+            return false
+        end
+        return string.match(requestId, "^[%w_:%-]+$") ~= nil
+    end
+
+    method integer CountTableEntries(table source)
+        local count = 0
+        for _, _ in pairs(source or {}) do
+            count = count + 1
+        end
+        return count
+    end
+
+    method integer ReadLevel(table levels, string upgradeId)
+        -- Reads a normalized non-negative integer level from a source-data map.
+        return self:ClampNonNegativeInteger(levels ~= nil and levels[upgradeId] or 0)
+    end
+
+    method integer ClampLevel(any value, integer maxLevel)
+        -- Clamps migrated level data to the current server definition range.
+        return math.max(0, math.min(self:ClampNonNegativeInteger(value), maxLevel))
+    end
+
+    method integer ClampNonNegativeInteger(any value)
+        -- Converts missing, fractional, or negative persisted numbers into safe non-negative integers.
+        return math.max(0, math.floor(tonumber(value) or 0))
+    end
+
+    method boolean TryAcquireMutationLock(string storageUserKey)
+        -- Prevents overlapping point, purchase, and reward writes for the same persistent profile.
+        if self.MutationLocksByStorageUserKey[storageUserKey] == true then
+            return false
+        end
+        self.MutationLocksByStorageUserKey[storageUserKey] = true
+        return true
+    end
+
+    method void ReleaseMutationLock(string storageUserKey)
+        -- Releases the per-profile mutation guard after persistence returns.
+        self.MutationLocksByStorageUserKey[storageUserKey] = nil
+    end
+
+    method table GetCachedSnapshot(string storageUserKey)
+        -- Returns a defensive cached snapshot when a failed mutation needs authoritative recovery data.
+        local profile = self.ProfilesByStorageUserKey[storageUserKey]
+        if profile == nil then
+            return nil
+        end
+        return self:CloneProfile(profile)
+    end
+
+    method void EvictProfile(string storageUserKey, string userId)
+        -- Removes one Union cache entry without deleting or overwriting persistent DataStorage.
+        self.ProfilesByStorageUserKey[storageUserKey] = nil
+        self.RawByStorageUserKey[storageUserKey] = nil
+        self.StoredRecordExistsByStorageUserKey[storageUserKey] = nil
+        self.LoadStateByStorageUserKey[storageUserKey] = nil
+        self.MutationLocksByStorageUserKey[storageUserKey] = nil
+        if userId ~= nil and userId ~= "" then
+            self.StorageUserKeyByUserId[userId] = nil
+        end
+    end
+
+    method table NormalizePaidPurchaseReceipts(any source)
+        -- Paid receipts are permanent; malformed data must never be silently discarded.
+        if source == nil then return {Success = true, Receipts = {}} end
+        if type(source) ~= "table" then return {Success = false, Reason = "INVALID_PAID_RECEIPTS"} end
+        local result = {}
+        for purchaseId, receipt in pairs(source) do
+            if purchaseId ~= self.JsonEmptyMapMarker or receipt ~= 0 then
+                if type(purchaseId) ~= "string" or purchaseId == "" or purchaseId == self.JsonEmptyMapMarker
+                    or type(receipt) ~= "table" or type(receipt.ProductId) ~= "string" or receipt.ProductId == ""
+                    or (receipt.Amount ~= 2000 and receipt.Amount ~= 4000) then
+                    return {Success = false, Reason = "INVALID_PAID_RECEIPTS"}
+                end
+                result[purchaseId] = {ProductId = receipt.ProductId, Amount = receipt.Amount}
+            end
+        end
+        return {Success = true, Receipts = result}
+    end
+
+    method table CopyPaidPurchaseReceipts(table source)
+        -- Deep-copies verified receipt records without sharing nested tables.
+        local result = {}
+        for purchaseId, receipt in pairs(source or {}) do
+            result[purchaseId] = {ProductId = receipt.ProductId, Amount = receipt.Amount}
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryCommitPaidUnionCoins(Entity buyer, string purchaseId, string productId, integer amount)
+        -- Only the native purchase callback calls this; receipt and credit share one CAS write.
+        if purchaseId == "" or purchaseId == self.JsonEmptyMapMarker or productId == ""
+            or (amount ~= 2000 and amount ~= 4000) then return {Success = false, Reason = "INVALID_PURCHASE"} end
+        local loaded = self:EnsureProfileLoaded(buyer)
+        if loaded.Success == false then return loaded end
+        local key = loaded.StorageUserKey
+        if not self:TryAcquireMutationLock(key) then return {Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS"} end
+        local ok, result = pcall(function()
+            local candidate = self:GetCachedSnapshot(key)
+            if candidate == nil then return {Success = false, Reason = "PROFILE_CACHE_MISSING"} end
+            local receipt = candidate.PaidPurchaseReceipts[purchaseId]
+            if receipt ~= nil then
+                return {Success = receipt.ProductId == productId and receipt.Amount == amount, Duplicate = true, Reason = "RECEIPT_EXISTS"}
+            end
+            -- Require an existing durable record so payment never uses an unconditional first-write Set.
+            if self.StoredRecordExistsByStorageUserKey[key] ~= true then
+                return {Success = false, Reason = "PROFILE_NOT_PERSISTED"}
+            end
+            local balance = candidate.UnionPoints + amount
+            if balance <= candidate.UnionPoints or balance > 9007199254740991 then
+                return {Success = false, Reason = "BALANCE_OVERFLOW"}
+            end
+            candidate.UnionPoints = balance
+            candidate.PaidPurchaseReceipts[purchaseId] = {ProductId = productId, Amount = amount}
+            -- Purchased currency does not raise earned lifetime currency or receive earning bonuses.
+            return self:PersistProfileCandidate(key, candidate)
+        end)
+        self:ReleaseMutationLock(key)
+        if not ok then
+            self:EvictProfile(key, "")
+            log_error("[UnionPurchase] storage exception; native receipt remains pending")
+            return {Success = false, Reason = "PURCHASE_STORAGE_EXCEPTION"}
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryGrantMagnetPetPass(Entity buyer, string purchaseId)
+        -- Native verified purchase only. Permanent ownership is a durable, non-stacking entitlement.
+        if purchaseId == nil or purchaseId == "" then return {Success = false, Reason = "INVALID_PURCHASE"} end
+        local loaded = self:EnsureProfileLoaded(buyer)
+        if loaded.Success == false then return loaded end
+        local key = loaded.StorageUserKey
+        if not self:TryAcquireMutationLock(key) then return {Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS"} end
+        local ok, result = pcall(function()
+            local candidate = self:GetCachedSnapshot(key)
+            if candidate == nil then return {Success = false, Reason = "PROFILE_CACHE_MISSING"} end
+            if candidate.MagnetPetPurchaseId ~= "" then return {Success = true, Duplicate = true, Reason = "ALREADY_OWNED"} end
+            if self.StoredRecordExistsByStorageUserKey[key] ~= true then return {Success = false, Reason = "PROFILE_NOT_PERSISTED"} end
+            candidate.MagnetPetPurchaseId = purchaseId
+            return self:PersistProfileCandidate(key, candidate)
+        end)
+        self:ReleaseMutationLock(key)
+        if not ok then
+            self:EvictProfile(key, "")
+            log_error("[MagnetPet] entitlement save failed; purchase remains pending")
+            return {Success = false, Reason = "PURCHASE_STORAGE_EXCEPTION"}
+        end
+        return result
+    end
+
+end

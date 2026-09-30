@@ -1,0 +1,641 @@
+@Component
+script EnemyIntentHudComponent extends Component
+
+	property Entity EnemyIntentTemplate = "d5f09cd1-452c-4674-9c59-0f7a503abd7f"
+	property Entity TelegraphTemplate = "53397448-0a56-4d0f-a79d-50798e6e9e62"
+	property number RefreshInterval = 0.05
+	property number RefreshElapsed = 0
+	property integer LastPlanRevision = -1
+	property string DefaultSkillIconRuid = "1705e3c5b2c146ac9a699f96fb067408"
+	property string BasicAttackIconRuid = "ad4304f4d5654158aca63c8c142d5035"
+	property string RangedAttackIconRuid = "ee74ad8d798c489d957a32cf3c375490"
+	property string PoisonMistRuid = "5d133a20758e4ccc97b46354cd7911c1"
+	property boolean UseStaticSkillThumbnail = true
+	property number QueueOffsetX = 0
+	property number QueueOffsetY = 112
+	-- Distance from the head marker to the FIRST queue slot's center. Slots are 76px tall and
+	-- centre-pivoted, so anything below ~38 puts the slot's lower half back over the sprite.
+	property number QueueGapAboveHead = 66
+	property string HeadMarkerChildName = "BattleHeadAnchor"
+	property number QueueSlotSpacing = 84
+	property number SkillIconOffsetX = 0
+	property number SkillIconOffsetY = 0
+	property number MoveArrowOffsetY = -16
+	property number MoveArrowFontSize = 18
+	property number SkillIconSize = 56
+	property number ReadyLabelWidth = 180
+	property number ReadyLabelHeight = 32
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self._T.EnemyViews = {}
+		self._T.TelegraphViews = {}
+		self._T.AirborneBossRuid = {}
+		self._T.ActiveEnemyIds = {}
+		self._T.ActiveTelegraphKeys = {}
+		self._T.ViewQueues = {}
+		self._T.HoverElapsed = 0
+		if self.EnemyIntentTemplate ~= nil then
+			self.EnemyIntentTemplate.Enable = false
+			self:EnsureSpecialMarkers(self.EnemyIntentTemplate)
+		end
+		if self.TelegraphTemplate ~= nil then
+			self.TelegraphTemplate.Enable = false
+		end
+		log("[EnemyIntentHUD] ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Hide combat overlays immediately when the synchronized battle result arrives.
+		local player = _UserService.LocalPlayer
+		local session = self:GetBattleSession(player)
+		if session == nil then
+			self._T.FeedbackEntry = nil
+			self:HideAllViews("NOT_IN_BATTLE")
+			self:HideEnemySkillHover()
+			return
+		end
+		self:RefreshCombatFeedback(session)
+		if session.BattleResult ~= nil and session.BattleResult ~= "" then
+			self:HideAllViews("BATTLE_ENDED")
+			self:HideEnemySkillHover()
+			self.RefreshElapsed = 0
+			return
+		end
+
+		self:UpdateViewPositions(session)
+		self:RefreshEnemySkillHover(player, session, delta)
+		self.RefreshElapsed = self.RefreshElapsed + delta
+		if self.RefreshElapsed < self.RefreshInterval then
+			return
+		end
+		self.RefreshElapsed = 0
+
+		-- Enemy overlays need only the synchronized plan, not inventory/queue/reward UI DTOs.
+		local uiState = {
+			Success = true,
+			BattleResult = session.BattleResult,
+			EnemyIntents = session:ParseEnemyPlanSnapshot(session.EnemyPlanSnapshot),
+			EnemyPlanRevision = session.EnemyPlanRevision,
+			PoisonMistCells = session.PoisonMistCellSnapshot
+		}
+		if uiState == nil or uiState.Success == false then
+			self:HideAllViews("SNAPSHOT_UNAVAILABLE")
+			return
+		end
+		self:RefreshIntentViews(player.CurrentMap, session, uiState)
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetBattleSession(Entity player)
+		if isvalid(player) == false or player.CurrentMap == nil then
+			return nil
+		end
+		return player.CurrentMap:GetComponent("script.BattleSessionComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshIntentViews(Entity currentMap, any session, table uiState)
+		-- Reject terminal snapshots so stale enemy queues cannot cover the result controls.
+		if uiState.BattleResult ~= nil and uiState.BattleResult ~= "" then
+			self:HideAllViews("BATTLE_ENDED")
+			return
+		end
+		self._T.LastHideReason = nil
+		self._T.ActiveEnemyIds = {}
+		self._T.ActiveTelegraphKeys = {}
+		local cellOccupantCounts = {}
+		local attackCells = {}
+		for _, intent in ipairs(uiState.EnemyIntents or {}) do
+			local enemyEntity = self:ResolveEnemyEntity(currentMap, intent)
+			if isvalid(enemyEntity) then
+				local view = self:GetOrCreateEnemyView(intent.UnitId, enemyEntity)
+				if isvalid(view) then
+					self._T.ActiveEnemyIds[intent.UnitId] = true
+					local record = self._T.EnemyViews[intent.UnitId]
+					local headOffsetUiY = 0
+					if record ~= nil and record.HeadOffsetUiY ~= nil then
+						headOffsetUiY = record.HeadOffsetUiY
+					end
+					self:ApplyEnemyIntent(view, intent, headOffsetUiY)
+				end
+				local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+				if intent.TelegraphKind == "BOSS_LANDING" and enemyUnit ~= nil and enemyUnit.IsAirborne == true then
+					self:ShowAirborneBossPreview(session, intent, enemyEntity)
+				end
+			end
+			if intent.CastState ~= "INTERRUPTED" and (intent.IsAttackReady == true or intent.TelegraphKind == "BOSS_LANDING" or intent.TelegraphKind == "CHARGE_LINE" or intent.TelegraphKind == "SKILL_AREA" or intent.CastState == "CASTING") then
+				for cellToken in string.gmatch(intent.TargetCells or "", "([^|]+)") do
+					local cellIndex = math.floor(tonumber(cellToken) or -1)
+					if cellIndex >= 0 and session:IsValidCell(cellIndex) then
+						attackCells[cellIndex] = true
+					end
+				end
+			end
+		end
+		self:UpdateAttackPlatforms(currentMap, attackCells)
+		-- Persistent poison reuses floor markers without appearing as a fake monster in the queue.
+		for cellToken in string.gmatch(uiState.PoisonMistCells or "", "([^|]+)") do
+			local cellIndex = tonumber(cellToken)
+			if cellIndex ~= nil and session:IsValidCell(cellIndex) then
+				cellOccupantCounts[cellIndex] = (cellOccupantCounts[cellIndex] or 0) + 1
+				self:ShowTelegraph(session, { UnitId = "poison_mist_area" }, cellIndex, cellOccupantCounts[cellIndex])
+			end
+		end
+		self:HideInactiveEnemyViews()
+		self:HideInactiveTelegraphs()
+		self.LastPlanRevision = uiState.EnemyPlanRevision or self.LastPlanRevision
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateAttackPlatforms(Entity map, table cells)
+		-- Share authoritative telegraph cells with both world and UI platform renderers.
+		local root = _EntityService:GetEntityByPath("/ui/BattlePlatformHUD")
+		if not isvalid(root) then return end
+		local platforms = root:GetComponent("script.BattlePlatformUIComponent")
+		if platforms ~= nil then platforms:SetEnemyRange(map, cells) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshCombatFeedback(any session)
+		-- A stage-local kill counter produces one compact notice per synchronized batch.
+		if self._T.FeedbackEntry ~= session.EntryRequestId then
+			self._T.FeedbackEntry = session.EntryRequestId
+			self._T.FeedbackKills = 0
+		end
+		local kills = session.ResultKillCount or 0
+		if kills > (self._T.FeedbackKills or 0) and _GameUIPolishLogic.ToastRemaining <= 0 then
+			_GameUIPolishLogic:ShowToast("몬스터 처치", "이번 전투에서 " .. tostring(kills) .. "마리 처치 · 획득 보상은 결과 화면에서 확인할 수 있습니다.")
+		end
+		self._T.FeedbackKills = kills
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity ResolveEnemyEntity(Entity currentMap, table intent)
+		if isvalid(currentMap) == false then
+			return nil
+		end
+		local entityName = intent.EntityName or ""
+		if entityName == "" then
+			return nil
+		end
+		return currentMap:GetChildByName(entityName, false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetOrCreateEnemyView(string unitId, Entity enemyEntity)
+		local record = self._T.EnemyViews[unitId]
+		if record ~= nil and isvalid(record.View) then
+			record.Enemy = enemyEntity
+			if isvalid(record.HeadMarker) == false then
+				record.HeadMarker = self:ResolveHeadMarker(enemyEntity)
+			end
+			return record.View
+		end
+		if isvalid(self.EnemyIntentTemplate) == false then
+			return nil
+		end
+		local view = self.EnemyIntentTemplate:Clone("EnemyIntent_" .. unitId)
+		view.Enable = true
+		self._T.EnemyViews[unitId] = {
+			View = view,
+			Enemy = enemyEntity,
+			HeadMarker = self:ResolveHeadMarker(enemyEntity),
+			HeadOffsetUiY = 0
+		}
+		return view
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity ResolveHeadMarker(Entity enemyEntity)
+		-- Each monster provides a transform-only BattleHeadAnchor at its authored head height.
+		if isvalid(enemyEntity) == false then
+			return nil
+		end
+		local marker = enemyEntity:GetChildByName(self.HeadMarkerChildName, false)
+		if isvalid(marker) then
+			log("[EnemyIntentHUD] head anchor resolved enemy=" .. tostring(enemyEntity.Name) .. " marker=" .. self.HeadMarkerChildName .. " localY=" .. tostring(marker.TransformComponent.Position.y))
+		else
+			log_warning("[EnemyIntentHUD] head anchor missing enemy=" .. tostring(enemyEntity.Name) .. " marker=" .. self.HeadMarkerChildName .. " reason=FALLBACK_TO_FIXED_OFFSET")
+		end
+		return marker
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyEnemyIntent(Entity view, table intent, number headOffsetUiY)
+		-- Stacks the queue above the monster's head marker so the icons never cover the sprite.
+		view.Enable = true
+		local queueBaseY = self.QueueOffsetY
+		if headOffsetUiY > 0 then
+			queueBaseY = headOffsetUiY + self.QueueGapAboveHead
+		end
+		local queuedIds = self:SplitTokens(intent.QueuedTileIds or "")
+		local queuedIconRuids = self:SplitTokens(intent.QueuedIconRuids or "")
+		local queuedIconBackgroundColors = self:SplitTokens(intent.QueuedIconBackgroundColors or "")
+		local queuedSpecialFlags = self:SplitTokens(intent.QueuedSpecialFlags or "")
+		self._T.ViewQueues[intent.UnitId] = queuedIds
+		for slotIndex = 1, 3 do
+			local slot = view:GetChildByName("QueueSlot0" .. tostring(slotIndex))
+			local tileId = queuedIds[slotIndex] or ""
+			if isvalid(slot) then
+				slot.Enable = tileId ~= ""
+				slot.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, queueBaseY + (slotIndex - 1) * self.QueueSlotSpacing)
+				self:ApplyQueueSlotColor(slot, intent.State)
+				-- Special attacks (telegraph/status/control) get a gold frame and a corner tag.
+				local special = tileId ~= "" and queuedSpecialFlags[slotIndex] == "1"
+				local specialFrame = slot:GetChildByName("SpecialFrame")
+				if isvalid(specialFrame) then specialFrame.Enable = special end
+				local specialTag = slot:GetChildByName("SpecialTag")
+				if isvalid(specialTag) then specialTag.Enable = special end
+				local icon = slot:GetChildByName("SkillIcon")
+				if isvalid(icon) and icon.SpriteGUIRendererComponent ~= nil and tileId ~= "" then
+					local iconRuid = queuedIconRuids[slotIndex] or ""
+					if iconRuid == "" or iconRuid == "-" then
+						iconRuid = self:GetEnemySkillFallbackIconRuid(tileId)
+					end
+					local innerBackground = slot:GetChildByName("InnerBackground")
+					if isvalid(innerBackground) and innerBackground.SpriteGUIRendererComponent ~= nil then
+						-- Restore the default too, because these slots are reused across skills.
+						innerBackground.SpriteGUIRendererComponent.Color = self:GetQueueIconBackgroundColor(queuedIconBackgroundColors[slotIndex] or "")
+					end
+					icon.UITransformComponent.anchoredPosition = Vector2(self.SkillIconOffsetX, self.SkillIconOffsetY)
+					icon.UITransformComponent.RectSize = Vector2(self.SkillIconSize, self.SkillIconSize)
+					icon.SpriteGUIRendererComponent.ImageRUID = DataRef(self:NormalizeHudIconRuid(iconRuid))
+				end
+			end
+		end
+
+		local readyBadge = view:GetChildByName("ReadyBadge")
+		local readyLabel = view:GetChildByName("ReadyLabel")
+		local casting = intent.CastState == "CASTING"
+		local interrupted = intent.CastState == "INTERRUPTED"
+		-- The gold slot frame and tag identify specials. Reserve the floating label
+		-- for casting/interruption so multiple enemies do not cover the battlefield with text.
+		local showStatus = casting or interrupted
+		if isvalid(readyBadge) then
+			readyBadge.Enable = showStatus
+			readyBadge.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, queueBaseY + 54 + math.max(0, #queuedIds - 1) * self.QueueSlotSpacing)
+			readyBadge.UITransformComponent.RectSize = Vector2(self.ReadyLabelWidth + 16, self.ReadyLabelHeight + 8)
+		end
+		if isvalid(readyLabel) then
+			readyLabel.Enable = showStatus
+			if readyLabel.TextGUIRendererComponent ~= nil then
+				if casting then
+					local remaining = math.max(0, (intent.InterruptHitsRequired or 1) - (intent.InterruptHitsReceived or 0))
+					-- The world-space badge is intentionally compact; full interrupt details belong in a tooltip.
+					readyLabel.TextGUIRendererComponent.Text = "충전 " .. tostring(remaining)
+				elseif interrupted then
+					readyLabel.TextGUIRendererComponent.Text = "중단!"
+				end
+			end
+			readyLabel.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, queueBaseY + 54 + math.max(0, #queuedIds - 1) * self.QueueSlotSpacing)
+			readyLabel.UITransformComponent.RectSize = Vector2(self.ReadyLabelWidth, self.ReadyLabelHeight)
+		end
+		local moveArrow = view:GetChildByName("MoveArrow")
+		if isvalid(moveArrow) and moveArrow.TextGUIRendererComponent ~= nil then
+			local marker = self:GetMovementMarker(intent)
+			moveArrow.Enable = marker ~= ""
+			moveArrow.TextGUIRendererComponent.Text = marker
+			moveArrow.TextGUIRendererComponent.FontSize = self.MoveArrowFontSize
+			if moveArrow.UITransformComponent ~= nil then
+				moveArrow.UITransformComponent.anchoredPosition = Vector2(0, self.MoveArrowOffsetY)
+				moveArrow.UITransformComponent.RectSize = Vector2(30, 24)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnsureSpecialMarkers(Entity template)
+		-- Builds the special-attack frame and tag once on the template; every cloned enemy view inherits them.
+		local readyLabel = template:GetChildByName("ReadyLabel")
+		for slotIndex = 1, 3 do
+			local slot = template:GetChildByName("QueueSlot0" .. tostring(slotIndex))
+			local background = isvalid(slot) and slot:GetChildByName("Background") or nil
+			if isvalid(background) and not isvalid(slot:GetChildByName("SpecialFrame")) then
+				local frame = background:Clone("SpecialFrame")
+				if isvalid(frame) then
+					frame.UITransformComponent.RectSize = Vector2(84, 84)
+					frame.SpriteGUIRendererComponent.Color = Color(1, 0.76, 0.29, 1)
+					_UILogic:SetSiblingIndex(frame.UITransformComponent, 1)
+					frame.Enable = false
+				end
+			end
+			if isvalid(slot) and isvalid(readyLabel) and not isvalid(slot:GetChildByName("SpecialTag")) then
+				local tag = readyLabel:Clone("SpecialTag")
+				if isvalid(tag) and tag:AttachTo(slot) then
+					tag.UITransformComponent.anchoredPosition = Vector2(24, 34)
+					tag.UITransformComponent.RectSize = Vector2(44, 20)
+					if tag.SpriteGUIRendererComponent ~= nil then tag.SpriteGUIRendererComponent.Color = Color(1, 0.76, 0.29, 1) end
+					if tag.TextGUIRendererComponent ~= nil then
+						tag.TextGUIRendererComponent.Text = "특수"
+						tag.TextGUIRendererComponent.FontSize = 13
+						tag.TextGUIRendererComponent.FontColor = Color(0.16, 0.09, 0, 1)
+					end
+					tag.Enable = false
+				elseif isvalid(tag) then
+					tag:Destroy()
+				end
+			end
+		end
+		log("[EnemyIntentHUD] special markers ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshEnemySkillHover(Entity player, any session, number delta)
+		-- Polls the cursor over visible enemy queue slots and asks the server for that skill's description.
+		self._T.HoverElapsed = (self._T.HoverElapsed or 0) + delta
+		if self._T.HoverElapsed < 0.12 then return end
+		self._T.HoverElapsed = 0
+		local cursor = _InputService:GetCursorPosition()
+		for unitId, record in pairs(self._T.EnemyViews or {}) do
+			local view = record.View
+			if isvalid(view) and view.EnabledInHierarchy then
+				local queuedIds = self._T.ViewQueues[unitId] or {}
+				for slotIndex = 1, 3 do
+					local slot = view:GetChildByName("QueueSlot0" .. tostring(slotIndex))
+					local tileId = queuedIds[slotIndex] or ""
+					if tileId ~= "" and tileId ~= "boss_summon" and isvalid(slot) and slot.EnabledInHierarchy then
+						local transform = slot.UITransformComponent
+						local point = _UILogic:ScreenToLocalUIPosition(cursor, transform)
+						local half = transform.RectSize * 0.5
+						if math.abs(point.x) <= half.x and math.abs(point.y) <= half.y then
+							local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
+							local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
+							if tooltip ~= nil then
+								local signature = tostring(session.EntryRequestId) .. ":" .. tostring(session.TurnNumber) .. ":" .. tostring(session.EnemyPlanRevision)
+								tooltip:RequestEnemySkillHover(player.CurrentMap, unitId, tileId, signature)
+							end
+							return
+						end
+					end
+				end
+			end
+		end
+		self:HideEnemySkillHover()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideEnemySkillHover()
+		-- Releases only the tooltip this HUD owns; player skill hovers keep their own owner key.
+		local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
+		local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
+		if tooltip ~= nil and tooltip.ActiveOwnerKey == "enemy_skill" then tooltip:Hide("enemy_skill") end
+	end
+
+	@ExecSpace("ClientOnly")
+	method Color GetQueueIconBackgroundColor(string encodedColor)
+		-- Snapshot colors are eight hex digits without the record separator #.
+		if string.match(encodedColor or "", "^%x%x%x%x%x%x%x%x$") then
+			return Color.FromHexCode("#" .. encodedColor)
+		end
+		return Color(0.105, 0.075, 0.052, 0.99)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyQueueSlotColor(Entity slot, string state)
+		local background = slot:GetChildByName("Background")
+		if isvalid(background) == false or background.SpriteGUIRendererComponent == nil then
+			return
+		end
+		if state == "INSERTING" then
+			background.SpriteGUIRendererComponent.Color = Color(0.38, 0.43, 0.50, 0.92)
+		elseif state == "TRACKING" then
+			background.SpriteGUIRendererComponent.Color = Color(0.92, 0.66, 0.26, 1)
+		elseif state == "ATTACK_READY" then
+			background.SpriteGUIRendererComponent.Color = Color(0.88, 0.16, 0.14, 1)
+		elseif state == "EXECUTING" then
+			background.SpriteGUIRendererComponent.Color = Color(0.95, 0.88, 0.42, 1)
+		else
+			background.SpriteGUIRendererComponent.Color = Color(0.20, 0.24, 0.29, 0.92)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetEnemySkillFallbackIconRuid(string tileId)
+		if tileId == "enemy_basic_attack" or tileId == "boss_sweeping_strike" then
+			return self.BasicAttackIconRuid
+		elseif tileId == "enemy_ranged_shot" then
+			return self.RangedAttackIconRuid
+		end
+		return self.DefaultSkillIconRuid
+	end
+
+	@ExecSpace("ClientOnly")
+	method string NormalizeHudIconRuid(string iconRuid)
+		local normalized = iconRuid or ""
+		if normalized == "" then
+			normalized = self.DefaultSkillIconRuid
+		end
+		if self.UseStaticSkillThumbnail == true and string.sub(normalized, 1, 12) ~= "thumbnail://" then
+			return "thumbnail://" .. normalized
+		end
+		return normalized
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetMovementMarker(table intent)
+		-- Authored retreat and turn actions are PREPARED, not TRACKING.
+		local commandType = intent.NextCommandType or ""
+		local direction = intent.NextCommandDirection or 0
+		if commandType ~= "MOVE_TOWARD" and commandType ~= "MOVE_AWAY"
+			and commandType ~= "MOVE_FIXED_FACING" and commandType ~= "TURN_TO_PLAYER" then
+			commandType = intent.CommandType or ""
+			direction = intent.Direction or 0
+		end
+		if commandType == "MOVE_TOWARD" or commandType == "MOVE_AWAY" or commandType == "MOVE_FIXED_FACING" then
+			if direction < 0 then
+				return "◀"
+			elseif direction > 0 then
+				return "▶"
+			end
+		elseif commandType == "TURN_TO_PLAYER" then
+			if direction < 0 then
+				return "↶"
+			end
+			return "↷"
+		elseif commandType == "WAIT" then
+			return "·"
+		end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowTelegraph(any session, table intent, integer cellIndex, integer overlapIndex)
+		local key = intent.UnitId .. ":" .. tostring(cellIndex)
+		local view = self._T.TelegraphViews[key]
+		if isvalid(view) == false then
+			if isvalid(self.TelegraphTemplate) == false then
+				return
+			end
+			view = self.TelegraphTemplate:Clone("Telegraph_" .. intent.UnitId .. "_" .. tostring(cellIndex))
+			if intent.UnitId == "poison_mist_area" and view.SpriteGUIRendererComponent ~= nil then
+				-- Set once: polling must not restart the looping cloud animation.
+				local sprite = view.SpriteGUIRendererComponent
+				sprite.ImageRUID = DataRef(self.PoisonMistRuid)
+				sprite.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+				sprite.Type = ImageType.Simple
+				sprite.Color = Color(1, 1, 1, 0.65)
+			end
+			self._T.TelegraphViews[key] = view
+		end
+		view.Enable = true
+		self._T.ActiveTelegraphKeys[key] = true
+		local cellPosition = session:GetCellPosition(cellIndex)
+		-- Match the foothold used to place monsters, including Kerning's lowered floor.
+		-- Spawn height alone can still be above the floor while stage properties synchronize.
+		local footholds = session.Entity.FootholdComponent
+		if footholds ~= nil then
+			local foothold = footholds:Raycast(Vector2(cellPosition.x, cellPosition.y + 0.5), Vector2(0, -1), 10)
+			if foothold ~= nil and foothold:IsVertical() == false then
+				cellPosition = Vector2(cellPosition.x, foothold:GetYByX(cellPosition.x) + 0.12)
+			end
+		end
+		local screenPosition = _UILogic:WorldToScreenPosition(cellPosition)
+		local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
+		view.UITransformComponent.anchoredPosition = Vector2(uiPosition.x + (overlapIndex - 1) * 8, uiPosition.y - 42)
+		if intent.UnitId == "poison_mist_area" then
+			-- Fit the hazard to one board cell at the current camera zoom.
+			local nextScreen = _UILogic:WorldToScreenPosition(Vector2(cellPosition.x + session.CellSpacing, cellPosition.y))
+			local nextUI = _UILogic:ScreenToUIPosition(nextScreen)
+			local width = math.max(1, math.abs(nextUI.x - uiPosition.x))
+			local height = width * 0.75
+			view.UITransformComponent.RectSize = Vector2(width, height)
+			view.UITransformComponent.anchoredPosition = Vector2(uiPosition.x, uiPosition.y + height * 0.5)
+		end
+		local label = view:GetChildByName("Label")
+		if isvalid(label) and label.TextGUIRendererComponent ~= nil then
+			-- The floor color/shape is the telegraph. Text is intentionally hidden to keep the board readable.
+			label.TextGUIRendererComponent.Text = ""
+			label.TextGUIRendererComponent.Enable = false
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowAirborneBossPreview(any session, table intent, Entity enemyEntity)
+		-- Loop the boss's authored idle motion above the locked landing cell while its world body is untargetable.
+		local landingCell = intent.LandingCell or -1
+		local presentation = enemyEntity:GetComponent("script.BattleUnitPresentationComponent")
+		local idleRuid = presentation ~= nil and presentation.IdleMotionRuid or ""
+		if landingCell < 0 or session:IsValidCell(landingCell) == false or idleRuid == "" then
+			return
+		end
+		local key = "airborne:" .. intent.UnitId
+		local view = self._T.TelegraphViews[key]
+		if isvalid(view) == false then
+			if isvalid(self.TelegraphTemplate) == false then return end
+			view = self.TelegraphTemplate:Clone("AirborneBoss_" .. intent.UnitId)
+			self._T.TelegraphViews[key] = view
+		end
+		if view.SpriteGUIRendererComponent == nil or view.UITransformComponent == nil then return end
+		view.Enable = true
+		self._T.ActiveTelegraphKeys[key] = true
+		local sprite = view.SpriteGUIRendererComponent
+		if self._T.AirborneBossRuid[key] ~= idleRuid then
+			sprite.ImageRUID = DataRef(idleRuid)
+			self._T.AirborneBossRuid[key] = idleRuid
+			log("[EnemyIntentHUD] airborne idle preview enemy=" .. intent.UnitId .. " cell=" .. landingCell .. " ruid=" .. idleRuid)
+		end
+		sprite.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+		sprite.PlayRate = math.max(0.1, presentation.IdleMotionPlayRate or 1)
+		sprite.Type = ImageType.Simple
+		sprite.Color = Color(1, 1, 1, 1)
+		view.UITransformComponent.RectSize = Vector2(128, 128)
+		local position = session:GetCellPosition(landingCell)
+		local screenPosition = _UILogic:WorldToScreenPosition(Vector2(position.x, position.y + 1.45))
+		view.UITransformComponent.anchoredPosition = _UILogic:ScreenToUIPosition(screenPosition)
+		local label = view:GetChildByName("Label")
+		if isvalid(label) then label.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateViewPositions(any session)
+		-- Tracks each enemy and measures how far above its origin the head marker sits, in UI
+		-- pixels, so the queue can clear sprites of any height at the current camera zoom.
+		for _, record in pairs(self._T.EnemyViews or {}) do
+			if record ~= nil and isvalid(record.View) and isvalid(record.Enemy) and record.Enemy.TransformComponent ~= nil then
+				local worldPosition = record.Enemy.TransformComponent.WorldPosition
+				local screenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y))
+				local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
+				record.View.UITransformComponent.anchoredPosition = uiPosition
+
+				local headOffsetUiY = 0
+				if isvalid(record.HeadMarker) and record.HeadMarker.TransformComponent ~= nil then
+					local headWorldPosition = record.HeadMarker.TransformComponent.WorldPosition
+					local headScreenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, headWorldPosition.y))
+					local headUiPosition = _UILogic:ScreenToUIPosition(headScreenPosition)
+					headOffsetUiY = headUiPosition.y - uiPosition.y
+				end
+				record.HeadOffsetUiY = headOffsetUiY
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method table SplitTokens(string serialized)
+		local tokens = {}
+		for token in string.gmatch(serialized or "", "([^|]+)") do
+			table.insert(tokens, token)
+		end
+		return tokens
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideInactiveEnemyViews()
+		for unitId, record in pairs(self._T.EnemyViews or {}) do
+			if record ~= nil and isvalid(record.View) then
+				record.View.Enable = self._T.ActiveEnemyIds[unitId] == true
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideInactiveTelegraphs()
+		for key, view in pairs(self._T.TelegraphViews or {}) do
+			if isvalid(view) then
+				view.Enable = self._T.ActiveTelegraphKeys[key] == true
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideAllViews(string reason)
+		-- Disable both overlay trees and log each hide transition only once.
+		self:UpdateAttackPlatforms(nil, {})
+		if self._T.LastHideReason ~= reason then
+			log("[EnemyIntentHUD] hidden reason=" .. reason)
+			self._T.LastHideReason = reason
+		end
+		self._T.ActiveEnemyIds = {}
+		self._T.ActiveTelegraphKeys = {}
+		for _, record in pairs(self._T.EnemyViews or {}) do
+			if record ~= nil and isvalid(record.View) then
+				record.View.Enable = false
+			end
+		end
+		for _, view in pairs(self._T.TelegraphViews or {}) do
+			if isvalid(view) then
+				view.Enable = false
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Remove attack highlights together with their intent views.
+		self:UpdateAttackPlatforms(nil, {})
+		for _, record in pairs(self._T.EnemyViews or {}) do
+			if record ~= nil and isvalid(record.View) then
+				record.View:Destroy()
+			end
+		end
+		for _, view in pairs(self._T.TelegraphViews or {}) do
+			if isvalid(view) then
+				view:Destroy()
+			end
+		end
+		self._T.EnemyViews = {}
+		self._T.TelegraphViews = {}
+	end
+
+end

@@ -1,0 +1,337 @@
+@Component
+script BattleConsumableHudComponent extends Component
+
+	property Entity Panel = "9922716a-136b-45f0-a2c2-8a056f7a3c12"
+	property Entity SlotTemplate = "72df6a7d-16e9-4746-9d4c-3768acbcab7c"
+	property Entity Selector = "d571ff1c-2835-4550-a340-3a3c3f10ac7d"
+	property Entity SkillTemplate = "82652b2f-e2ef-408f-a9ff-86bc31134b11"
+	property Entity CancelButton = "a5657dcb-9c6b-4f77-ad78-3ddfefc7b349"
+	property Entity PreviousButton = "6204d07f-b572-4eba-9395-d6192d90f202"
+	property Entity NextButton = "d5193ed7-adbb-485c-97c7-40fab8da0a65"
+	property TextGUIRendererComponent MessageText = "0580ba05-c44a-4c45-81c9-84fa5b7719e2"
+	property integer SkillsPerPage = 4
+	property string ClickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+	property table Slots = {}
+	property table SkillRows = {}
+	property table EventLinks = {}
+	property integer QueryId = 0
+	property integer SkillPage = 1
+	property string SelectedConsumableId = ""
+	property table IconSizes = {}
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Keeps the root controller alive and toggles only the two child panels.
+		self.Panel.Enable = false
+		self.Selector.Enable = false
+		self.SlotTemplate.Enable = false
+		self.SkillTemplate.Enable = false
+		self:HideTooltip()
+		self:ConnectButton(self.CancelButton, function() self:CloseSelection() end)
+		self:ConnectButton(self.PreviousButton, function() self.SkillPage = math.max(1, self.SkillPage - 1); self:RenderSkills() end)
+		self:ConnectButton(self.NextButton, function() self.SkillPage = self.SkillPage + 1; self:RenderSkills() end)
+		log("[BattleConsumableHUD] ready")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConnectButton(Entity button, any callback)
+		-- Stores every event subscription for cleanup; children do not intercept button raycasts.
+		local eventHandler = button:ConnectEvent(ButtonClickEvent, function()
+			_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 0.5)
+			callback()
+		end)
+		table.insert(self.EventLinks, { Entity = button, EventType = ButtonClickEvent, EventHandler = eventHandler })
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Requests metadata only when synchronized gameplay state changes, with retry for delayed initialization.
+		local session = _BattleHudPresenterLogic:GetBattleSession()
+		local player = _UserService.LocalPlayer
+		if session == nil or not isvalid(player) or session.BattleResult ~= "" or session.ContentValidationState ~= "VALID" then
+			self.Panel.Enable = false
+			self:HideTooltip()
+			self:CloseSelection()
+			self._T.Context = ""
+			return
+		end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		local runtime = player:GetComponent("script.SkillRuntimeStateComponent")
+		local unit = player:GetComponent("script.BattleUnitComponent")
+		if inventory == nil or runtime == nil or unit == nil then
+			self.Panel.Enable = false
+			self:HideTooltip()
+			self:CloseSelection()
+			return
+		end
+		local context = tostring(session.Entity.Id) .. ":" .. tostring(session.EntryRequestId) .. ":" .. tostring(inventory.ActiveRunSequence)
+		if context ~= self._T.Context then
+			self._T.Context = context
+			self._T.Signature = ""
+			self._T.ReceiptRevision = session._T.ConsumableReceiptRevision or 0
+			self._T.Data = nil
+			self.MessageText.Text = ""
+			self:HideTooltip()
+			self:CloseSelection()
+		end
+		self._T.Session = session
+		local receipt = session._T.ConsumableReceiptRevision or 0
+		if receipt ~= self._T.ReceiptRevision then
+			self._T.ReceiptRevision = receipt
+			local result = session._T.ConsumableUseResult
+			self.MessageText.Text = result.Success and (result.Action == "DISCARD" and "1개 버렸습니다 · 턴 유지" or "사용 완료 · 턴 유지") or self:ReasonText(result.Reason)
+			self:CloseSelection()
+		end
+		local signature = tostring(inventory.InventoryRevision) .. ":" .. tostring(inventory.ConsumableCapacity) .. ":" .. tostring(runtime.CooldownRevision) .. ":" .. tostring(unit.CurrentHp) .. ":" .. tostring(unit.MaxHp) .. ":" .. session.BattlePhase .. ":" .. tostring(session.IsActionProcessing) .. ":" .. tostring(receipt)
+		local data = session._T.ConsumableHudState
+		self._T.RetryElapsed = (self._T.RetryElapsed or 0) + delta
+		if signature ~= self._T.Signature or ((data == nil or not data.Success or data.EntryId ~= session.EntryRequestId or data.RunSequence ~= inventory.ActiveRunSequence or data.InventoryRevision ~= inventory.InventoryRevision or data.Capacity ~= inventory.ConsumableCapacity or data.CooldownRevision ~= runtime.CooldownRevision or data.CurrentHp ~= unit.CurrentHp or data.MaxHp ~= unit.MaxHp) and self._T.RetryElapsed >= 2) then
+			self._T.Signature = signature
+			self._T.RetryElapsed = 0
+			self.QueryId = math.max(self.QueryId, session._T.ConsumableHudQuery or 0) + 1
+			session:RequestConsumableHudState(self.QueryId, session.EntryRequestId)
+		end
+		if data == nil or not data.Success or data.EntryId ~= session.EntryRequestId or data.RunSequence ~= inventory.ActiveRunSequence then
+			self.Panel.Enable = false
+			self:HideTooltip()
+			return
+		end
+		self._T.Data = data
+		if session._T.ConsumablePendingEntry ~= session.EntryRequestId or session._T.ConsumablePendingRun ~= inventory.ActiveRunSequence then
+			session._T.ConsumablePending = false
+		end
+		self._T.CanInteract = session.BattlePhase == "PlayerTurn" and not session.IsActionProcessing and not session._T.ConsumablePending and data.InventoryRevision == inventory.InventoryRevision and data.CooldownRevision == runtime.CooldownRevision and data.CurrentHp == unit.CurrentHp and data.MaxHp == unit.MaxHp and not unit.IsDead
+		self.Panel.Enable = true
+		if self._T.RenderedData ~= data or self._T.RenderedInteract ~= self._T.CanInteract then
+			self:RenderSlots()
+			self._T.RenderedData = data
+			self._T.RenderedInteract = self._T.CanInteract
+		end
+		if not self._T.CanInteract then self:CloseSelection() end
+		if self.SelectedConsumableId ~= "" then self:RenderSkills() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderSlots()
+		-- UI-only expansion of the server count snapshot: one item, one visible slot.
+		local data = self._T.Data
+		local count = math.min(5, math.max(3, data.Capacity))
+		self._T.SlotItems = {}
+		for _, item in ipairs(data.Items) do
+			for copy = 1, math.min(item.Count, count - #self._T.SlotItems) do
+				table.insert(self._T.SlotItems, item)
+			end
+		end
+		log("[BattleConsumableHUD] rendered capacity=" .. count .. " occupied=" .. #self._T.SlotItems .. " revision=" .. tostring(data.InventoryRevision))
+		for index = #self.Slots + 1, count do
+			local slot = self.SlotTemplate:Clone("ConsumableSlot" .. tostring(index))
+			-- The engine ColorTint transition can overwrite the transparent hit-target color.
+			slot.ButtonComponent.Transition = TransitionType.None
+			slot.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0)
+			slot.SpriteGUIRendererComponent.ImageRUID = DataRef("98c34caab88ee34459cb3e5807ac4219")
+			-- Use the RUID supplied after the user imported the PNG in Maker.
+			local frame = slot:GetChildByName("SlotSkin")
+			frame.SpriteGUIRendererComponent.ImageRUID = DataRef("65061d6a2e7642ab916b51bac9c6933b")
+			frame.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+			_UILogic:SetSiblingIndex(frame.UITransformComponent, 1)
+			_UILogic:SetSiblingIndex(slot:GetChildByName("Icon").UITransformComponent, 2)
+			log("[BattleConsumableHUD] skin-import-v3 slot=" .. tostring(index) .. " source=65061d6a2e7642ab916b51bac9c6933b")
+			local capturedIndex = index
+			self:ConnectButton(slot, function() self:ClickSlot(capturedIndex) end)
+			self:ConnectButton(slot:GetChildByName("Discard"), function() self:DiscardSlot(capturedIndex) end)
+			local hover = slot:ConnectEvent(ButtonStateChangeEvent, function(event)
+				if event.state == ButtonState.Hover then
+					self._T.HoveredSlot = capturedIndex
+					self:DescribeSlot(capturedIndex)
+				elseif event.state == ButtonState.Normal then
+					if self._T.HoveredSlot == capturedIndex then self:HideTooltip() end
+				end
+			end)
+			table.insert(self.EventLinks, { Entity = slot, EventType = ButtonStateChangeEvent, EventHandler = hover })
+			table.insert(self.Slots, slot)
+		end
+		self.Panel.UITransformComponent.RectSize = Vector2(count * 80 - 8, 72)
+		for index, slot in ipairs(self.Slots) do
+			slot.Enable = index <= count
+			if slot.Enable then
+				slot.UITransformComponent.anchoredPosition = Vector2((index - 1) * 80, 0)
+				local item = self._T.SlotItems[index]
+				local discard = slot:GetChildByName("Discard")
+				discard.Enable = item ~= nil
+				discard.ButtonComponent.Enable = item ~= nil and self._T.CanInteract == true
+				local icon = slot:GetChildByName("Icon")
+				icon.Enable = item ~= nil
+				slot.TextGUIRendererComponent.Text = ""
+				-- Keep hover available on unavailable items; clicks still obey both guards.
+				slot.ButtonComponent.Enable = true
+				if item ~= nil then
+					self:ApplyItemIcon(icon, item.IconKey)
+					icon.SpriteGUIRendererComponent.Color = (item.Usable and self._T.CanInteract) and Color(1, 1, 1, 1) or Color(0.7, 0.7, 0.7, 1)
+				end
+			end
+		end
+		if (self._T.HoveredSlot or 0) > 0 then self:DescribeSlot(self._T.HoveredSlot) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyItemIcon(Entity icon, string ruid)
+		-- Fit the resource aspect into the existing 52px box without preserving its source pivot.
+		icon.SpriteGUIRendererComponent.ImageRUID = DataRef(ruid)
+		local size = self.IconSizes[ruid]
+		if size == nil then
+			local sprite = _ResourceService:LoadSpriteAndWait(ruid)
+			if not isvalid(icon) then return end
+			if sprite == nil or not sprite.IsLoadComplete or sprite.Width <= 0 or sprite.Height <= 0 then
+				log_warning("[BattleConsumableHUD] icon resource metadata unavailable source=" .. ruid)
+				return
+			end
+			local scale = 52 / math.max(sprite.Width, sprite.Height)
+			size = Vector2(sprite.Width * scale, sprite.Height * scale)
+			self.IconSizes[ruid] = size
+		end
+		local transform = icon.UITransformComponent
+		local renderer = icon.SpriteGUIRendererComponent
+		renderer.ImageRUID = DataRef(ruid)
+		renderer.Type = ImageType.Simple
+		renderer.PreserveSprite = PreserveSpriteType.None
+		renderer.LocalPosition = Vector2(0, 0)
+		renderer.LocalScale = Vector2(1, 1)
+		renderer.RaycastTarget = false
+		transform.AnchorsMin = Vector2(0.5, 0.5)
+		transform.AnchorsMax = Vector2(0.5, 0.5)
+		transform.Pivot = Vector2(0.5, 0.5)
+		transform.anchoredPosition = Vector2(0, 0)
+		transform.RectSize = size
+		transform.UIScale = Vector3(1, 1, 1)
+		transform.UIRotation = Vector3(0, 0, 0)
+		_UILogic:SetSiblingIndex(transform, 2)
+		log("[BattleConsumableHUD] icon-fit path=" .. icon.Path .. " id=" .. icon.Id .. " parent=" .. icon.Parent.Path .. " source=" .. ruid .. " size=" .. tostring(size) .. " local=(0,0) preserve=None sibling=" .. tostring(_UILogic:GetSiblingIndex(transform)))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DescribeSlot(integer index)
+		-- Reuses the description binding as a transient tooltip to the right of the hovered slot.
+		local item = (self._T.SlotItems or {})[index]
+		if item == nil then self:HideTooltip(); return end
+		local detail = item.Description
+		if not item.Usable then detail = self:ReasonText(item.Reason) end
+		if item.Usable and not self._T.CanInteract then detail = "현재 사용할 수 없습니다." end
+		self.MessageText.Text = item.DisplayName .. "\n" .. detail
+		local height = math.min(144, math.max(76, self.MessageText:GetPreferredHeight(self.MessageText.Text, 276) + 24))
+		self.MessageText.Entity.UITransformComponent.RectSize = Vector2(300, height)
+		self.MessageText.Entity.UITransformComponent.anchoredPosition = Vector2((index - 1) * 80 + 84, 12)
+		self.MessageText.Entity.Enable = self._T.HoveredSlot == index and self.SelectedConsumableId == ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideTooltip()
+		-- Clears pointer ownership immediately when the pointer leaves or the battle context closes.
+		self._T.HoveredSlot = 0
+		self.MessageText.Entity.Enable = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClickSlot(integer index)
+		-- Time sand opens a target list; all other items use the same authenticated request path.
+		self:DescribeSlot(index)
+		if not self._T.CanInteract or self._T.Data == nil then return end
+		local item = (self._T.SlotItems or {})[index]
+		if item == nil then return end
+		if not item.Usable then return end
+		if item.EffectType == "COOLDOWN_REDUCTION" then
+			self.Selector.UITransformComponent.anchoredPosition = Vector2(116 + (index - 1) * 80, 268)
+			self.MessageText.Entity.Enable = false
+			self.SelectedConsumableId = item.ConsumableId
+			self.SkillPage = 1
+			self:RenderSkills()
+			return
+		end
+		self._T.Session:SubmitConsumableUse(item.ConsumableId, "")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DiscardSlot(integer index)
+		if not self._T.CanInteract or self._T.Data == nil then return end
+		local item = (self._T.SlotItems or {})[index]
+		if item == nil then return end
+		-- A stale displayed slot must never discard a replacement item after an inventory update.
+		local player = _UserService.LocalPlayer
+		local inventory = isvalid(player) and player:GetComponent("script.PlayerRunInventoryComponent") or nil
+		if inventory == nil or inventory.InventoryRevision ~= self._T.Data.InventoryRevision then return end
+		self:CloseSelection()
+		self:HideTooltip()
+		self._T.Session:SubmitConsumableDiscard(item.ConsumableId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RenderSkills()
+		-- Lists only owned skills with a positive cooldown; pagination keeps the minimal panel in bounds.
+		local data = self._T.Data
+		if self.SelectedConsumableId == "" or data == nil or #data.Skills == 0 then self:CloseSelection(); return end
+		local pageSize = math.max(1, self.SkillsPerPage)
+		self.SkillPage = math.min(self.SkillPage, math.ceil(#data.Skills / pageSize))
+		local visibleRows = math.min(pageSize, #data.Skills - (self.SkillPage - 1) * pageSize)
+		self.Selector.UITransformComponent.RectSize = Vector2(304, 84 + visibleRows * 48)
+		self.Selector.Enable = true
+		self.PreviousButton.ButtonComponent.Enable = self.SkillPage > 1
+		self.NextButton.ButtonComponent.Enable = self.SkillPage * pageSize < #data.Skills
+		for index = #self.SkillRows + 1, pageSize do
+			local row = self.SkillTemplate:Clone("CooldownSkill" .. tostring(index))
+			local capturedIndex = index
+			self:ConnectButton(row, function() self:ClickSkill(capturedIndex) end)
+			table.insert(self.SkillRows, row)
+		end
+		for index, row in ipairs(self.SkillRows) do
+			local skill = data.Skills[(self.SkillPage - 1) * pageSize + index]
+			row.Enable = index <= pageSize and skill ~= nil
+			if row.Enable then
+				row.UITransformComponent.anchoredPosition = Vector2(10, -36 - (index - 1) * 48)
+				row.TextGUIRendererComponent.Text = skill.DisplayName .. "  CD " .. tostring(skill.Cooldown)
+				row.ButtonComponent.Enable = self._T.CanInteract == true
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClickSkill(integer index)
+		-- The server rechecks ownership and cooldown at use time, including after a delayed selection.
+		if not self._T.CanInteract or self.SelectedConsumableId == "" then return end
+		local skill = self._T.Data.Skills[(self.SkillPage - 1) * math.max(1, self.SkillsPerPage) + index]
+		if skill == nil or skill.Cooldown <= 0 then return end
+		self._T.Session:SubmitConsumableUse(self.SelectedConsumableId, skill.SkillId)
+		self:CloseSelection()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseSelection()
+		-- Cancelling selection never sends a use request or changes quantity.
+		self.SelectedConsumableId = ""
+		self.Selector.Enable = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method string ReasonText(string reason)
+		-- Presents actionable local messages for rejected or ineffective uses.
+		if reason == "HP_ALREADY_FULL" then return "HP가 가득 찼습니다." end
+		if reason == "NO_NEGATIVE_STATUS_EFFECTS" then return "제거할 상태이상이 없습니다." end
+		if reason == "NO_COOLDOWN_SKILLS" or reason == "SKILL_NOT_ON_COOLDOWN" then return "쿨다운 중인 스킬이 없습니다." end
+		if reason == "STALE_INVENTORY" then return "인벤토리가 갱신되었습니다. 다시 선택하세요." end
+		if reason == "CONSUMABLE_NOT_OWNED" then return "아이템이 없습니다." end
+		return "현재 사용할 수 없습니다."
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Releases cloned controls and event subscriptions when the UI is unloaded.
+		self:HideTooltip()
+		for _, link in ipairs(self.EventLinks) do
+			if isvalid(link.Entity) then link.Entity:DisconnectEvent(link.EventType, link.EventHandler) end
+		end
+		for _, slot in ipairs(self.Slots) do if isvalid(slot) then slot:Destroy() end end
+		for _, row in ipairs(self.SkillRows) do if isvalid(row) then row:Destroy() end end
+		self.EventLinks = {}
+		self.Slots = {}
+		self.SkillRows = {}
+	end
+
+end

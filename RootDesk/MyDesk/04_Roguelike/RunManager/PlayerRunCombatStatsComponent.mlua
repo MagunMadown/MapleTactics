@@ -1,0 +1,101 @@
+@Component
+script PlayerRunCombatStatsComponent extends Component
+
+	@TargetUserSync property integer ActiveRunSequence = 0
+	@TargetUserSync property number RunStartTime = 0
+	@TargetUserSync property number FinalElapsedSeconds = 0
+	@TargetUserSync property integer ConsumedPlayerTurns = 0
+	@TargetUserSync property integer PlayerHitsTaken = 0
+	@TargetUserSync property boolean IsRunning = false
+	@TargetUserSync property integer StatsRevision = 0
+	property string LastConsumedTurnKey = ""
+
+	@ExecSpace("ServerOnly")
+	method void BeginRun(integer runSequence)
+		-- Initializes only a new authoritative run; re-entry and rebuild preserve the same sequence.
+		if runSequence <= 0 or self.ActiveRunSequence == runSequence then
+			return
+		end
+		self.ActiveRunSequence = runSequence
+		self.RunStartTime = _UtilLogic.ServerElapsedSeconds
+		self.FinalElapsedSeconds = 0
+		self.ConsumedPlayerTurns = 0
+		self.PlayerHitsTaken = 0
+		self.LastConsumedTurnKey = ""
+		self.IsRunning = true
+		self.StatsRevision = self.StatsRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishRun()
+		-- Freezes elapsed time once without scheduling timers or persisting account records.
+		if self.IsRunning == false then
+			return
+		end
+		self.FinalElapsedSeconds = math.max(0, _UtilLogic.ServerElapsedSeconds - self.RunStartTime)
+		self.IsRunning = false
+		self.StatsRevision = self.StatsRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearRun()
+		-- Follows the existing failed-run cleanup boundary before the next challenge.
+		self.ActiveRunSequence = 0
+		self.RunStartTime = 0
+		self.FinalElapsedSeconds = 0
+		self.ConsumedPlayerTurns = 0
+		self.PlayerHitsTaken = 0
+		self.LastConsumedTurnKey = ""
+		self.IsRunning = false
+		self.StatsRevision = self.StatsRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean CanRecord()
+		-- Rejects stale or ended run events without changing combat behavior.
+		local runState = self.Entity:GetComponent("script.PlayerRunStateComponent")
+		return self.IsRunning and runState ~= nil and runState.RunState == "Active"
+			and runState.RunSequence == self.ActiveRunSequence
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RecordConsumedTurn(string consumptionKey)
+		-- Counts the committed action once; the key identifies a commit, never a turn-number total.
+		if self:CanRecord() == false or consumptionKey == "" or self.LastConsumedTurnKey == consumptionKey then
+			return
+		end
+		self.LastConsumedTurnKey = consumptionKey
+		self.ConsumedPlayerTurns = self.ConsumedPlayerTurns + 1
+		self.StatsRevision = self.StatsRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RecordHit(number appliedAmount, number hpBefore, number hpAfter)
+		-- Counts each actual positive HP damage commit, including the lethal commit before finalization.
+		if self:CanRecord() == false or appliedAmount <= 0 or hpAfter >= hpBefore then
+			return
+		end
+		self.PlayerHitsTaken = self.PlayerHitsTaken + 1
+		self.StatsRevision = self.StatsRevision + 1
+	end
+
+	method table GetSnapshot()
+		-- Returns a fresh read-only DTO on either side; client elapsed is presentation-only extrapolation.
+		local elapsed = self.FinalElapsedSeconds
+		if self.IsRunning then
+			elapsed = math.max(0, _UtilLogic.ServerElapsedSeconds - self.RunStartTime)
+		end
+		return {
+			Success = self.ActiveRunSequence > 0,
+			RunSequence = self.ActiveRunSequence,
+			RunStartTime = self.RunStartTime,
+			ElapsedSeconds = elapsed,
+			FinalElapsedSeconds = self.FinalElapsedSeconds,
+			IsRunning = self.IsRunning,
+			ConsumedTurns = self.ConsumedPlayerTurns,
+			HitsTaken = self.PlayerHitsTaken,
+			Revision = self.StatsRevision
+		}
+	end
+
+end

@@ -1,0 +1,180 @@
+@Component
+script WorldMapStageButtonComponent extends Component
+
+	property string TargetStageId = "henesys_stage_01"
+	property string StageDisplayName = "지역 1 - 스테이지 1"
+	property string ClickSoundRUID = "972843e759204d3e9ad84e7d3fa94f83"
+	property number SoundVolume = 1
+	property boolean IsRequestingEntry = false
+	property integer EntryDelayTimerId = 0
+	property number TravelCompletionPadding = 0.5
+	property number MapTransferDelay = 0.3
+	property integer RequiredCompletedStageCount = 0
+	property string RequiredWorldMapBranch = ""
+	property string TravelTargetCityPath = "HenesysCityBranchBtn"
+	property ButtonComponent StageButton = nil
+	property any ClickHandler = nil
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self:EnsureClickHandler("BEGIN_PLAY")
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureClickHandler(string reason)
+		self.StageButton = self.Entity.ButtonComponent
+		if self.StageButton == nil then
+			log_error("[WorldMapStage] button missing stage=" .. self.TargetStageId)
+			return false
+		end
+		if self.ClickHandler == nil then
+			self.ClickHandler = self.Entity:ConnectEvent(ButtonClickEvent, self.OnStageClicked)
+		end
+		log("[WorldMapStage] click handler ready stage=" .. self.TargetStageId .. " reason=" .. (reason or "UNSPECIFIED"))
+		return self.ClickHandler ~= nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean RebindClickHandler(string reason)
+		if self.ClickHandler ~= nil then self.Entity:DisconnectEvent(ButtonClickEvent, self.ClickHandler) end
+		self.ClickHandler = nil
+		return self:EnsureClickHandler(reason or "REBIND")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetForLobby(string reason)
+		if self.EntryDelayTimerId > 0 then
+			_TimerService:ClearTimer(self.EntryDelayTimerId)
+			self.EntryDelayTimerId = 0
+		end
+		self.IsRequestingEntry = false
+		self:EnsureClickHandler(reason or "LOBBY_RESET")
+		local snapshot = self:GetProgressSnapshot()
+		self:RefreshState(snapshot.CompletedStageCount, snapshot.SelectedWorldMapBranch, reason or "LOBBY_RESET")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshState(integer completedStageCount, string selectedBranch, string reason)
+		self:EnsureClickHandler("REFRESH_STATE")
+		local stateKey = self:ResolveState(completedStageCount, selectedBranch)
+		local tooltipText = self.StageDisplayName
+		if stateKey == "COMPLETED" then
+			tooltipText = string.gsub(tooltipText, " · 전투 시작", "") .. " · 클리어 완료"
+		elseif stateKey == "LOCKED" then
+			tooltipText = string.gsub(tooltipText, " · 전투 시작", "") .. " · 잠김"
+		end
+		local presentation = self:GetPresentation()
+		if presentation ~= nil then presentation:ApplyState(stateKey, tooltipText) end
+		log("[WorldMapStage] refreshed stage=" .. self.TargetStageId .. " state=" .. stateKey .. " clears=" .. tostring(completedStageCount) .. " branch=" .. (selectedBranch or "") .. " reason=" .. (reason or "UNSPECIFIED"))
+	end
+
+	@ExecSpace("ClientOnly")
+	method string ResolveState(integer completedStageCount, string selectedBranch)
+		if completedStageCount > self.RequiredCompletedStageCount then return "COMPLETED" end
+		if completedStageCount < self.RequiredCompletedStageCount then return "LOCKED" end
+		if self.RequiredWorldMapBranch ~= "" and selectedBranch ~= self.RequiredWorldMapBranch then return "LOCKED" end
+		return "AVAILABLE"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnStageClicked()
+		if self.IsRequestingEntry then
+			log("[WorldMapStage] click ignored stage=" .. self.TargetStageId .. " reason=REQUEST_IN_PROGRESS")
+			return
+		end
+		local snapshot = self:GetProgressSnapshot()
+		local stateKey = self:ResolveState(snapshot.CompletedStageCount, snapshot.SelectedWorldMapBranch)
+		self:RefreshState(snapshot.CompletedStageCount, snapshot.SelectedWorldMapBranch, "CLICK_RECHECK")
+		if stateKey ~= "AVAILABLE" then
+			local presentation = self:GetPresentation()
+			if presentation ~= nil then presentation:ShowTooltip() end
+			log("[WorldMapStage] click blocked stage=" .. self.TargetStageId .. " state=" .. stateKey)
+			return
+		end
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or isvalid(player.CurrentMap) == false or player.CurrentMap.Name ~= "lobby" then
+			log_warning("[WorldMapStage] click rejected stage=" .. self.TargetStageId .. " reason=NOT_IN_LOBBY")
+			return
+		end
+		self.IsRequestingEntry = true
+		self.StageButton.Enable = false
+		_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, self.SoundVolume)
+		local minimapUI = self:GetMinimapUI()
+		if minimapUI == nil then
+			self:RequestStageEntry()
+			return
+		end
+		minimapUI:PlayTravelAnimation(self.TravelTargetCityPath)
+		self.EntryDelayTimerId = _TimerService:SetTimerOnce(function()
+			self.EntryDelayTimerId = 0
+			self:CloseWorldMapAndScheduleEntry()
+		end, minimapUI.TravelDuration + self.TravelCompletionPadding)
+		if self.EntryDelayTimerId == 0 then self:CloseWorldMapAndScheduleEntry() end
+		log("[WorldMapStage] travel started stage=" .. self.TargetStageId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseWorldMapAndScheduleEntry()
+		local minimapUI = self:GetMinimapUI()
+		if minimapUI ~= nil then minimapUI:CloseWorldMapForTransfer(self.TargetStageId) end
+		self.EntryDelayTimerId = _TimerService:SetTimerOnce(function()
+			self.EntryDelayTimerId = 0
+			self:RequestStageEntry()
+		end, self.MapTransferDelay)
+		if self.EntryDelayTimerId == 0 then self:RequestStageEntry() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RequestStageEntry()
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or isvalid(player.CurrentMap) == false or player.CurrentMap.Name ~= "lobby" then
+			self.IsRequestingEntry = false
+			if self.StageButton ~= nil then self.StageButton.Enable = true end
+			log_warning("[WorldMapStage] delayed request rejected stage=" .. self.TargetStageId .. " reason=NOT_IN_LOBBY")
+			return
+		end
+		log("[WorldMapStage] entry requested stage=" .. self.TargetStageId)
+		_BattleGatewayLogic:RequestPrepareLobbyStageEntry(self.TargetStageId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HandleEntryResult(boolean success, string reason)
+		local minimapUI = self:GetMinimapUI()
+		if success then
+			if minimapUI ~= nil then minimapUI:CloseWorldMapForTransfer(self.TargetStageId) end
+			log("[WorldMapStage] entry accepted stage=" .. self.TargetStageId .. " reason=" .. reason)
+			return
+		end
+		self.IsRequestingEntry = false
+		if self.StageButton ~= nil then self.StageButton.Enable = true end
+		if minimapUI ~= nil then minimapUI:OpenWorldMap("stage_entry_failed") end
+		log_warning("[WorldMapStage] entry failed stage=" .. self.TargetStageId .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetProgressSnapshot()
+		local player = _UserService.LocalPlayer
+		local runState = isvalid(player) and player:GetComponent("script.PlayerRunStateComponent") or nil
+		if runState == nil then return { CompletedStageCount = 0, SelectedWorldMapBranch = "" } end
+		return runState:GetWorldMapProgressSnapshot()
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetPresentation()
+		return self.Entity:GetComponent("script.WorldMapButtonPresentationComponent")
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetMinimapUI()
+		local root = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		return isvalid(root) and root:GetComponent("script.MinimapUI") or nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		if self.EntryDelayTimerId > 0 then _TimerService:ClearTimer(self.EntryDelayTimerId) end
+		if self.ClickHandler ~= nil then self.Entity:DisconnectEvent(ButtonClickEvent, self.ClickHandler) end
+		self.ClickHandler = nil
+	end
+
+end

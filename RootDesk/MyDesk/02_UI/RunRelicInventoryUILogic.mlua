@@ -1,0 +1,382 @@
+@Logic
+script RunRelicInventoryUILogic extends Logic
+
+	property boolean IsOpen = false
+	property boolean IsReady = false
+	property string LastSnapshot = ""
+	property string SelectedRelicId = ""
+	property table Items = {}
+	property table Totals = {}
+	property string HoveredRowId = ""
+	property table Bindings = {}
+	property table RowBindings = {}
+	property Entity Root = nil
+	property Entity Modal = nil
+	property Entity OpenButton = nil
+	property any Grid = nil
+	property table SlotIds = {}
+	property table ItemsById = {}
+	property integer SlotRunSequence = -1
+	property integer Page = 1
+	property integer PageCount = 1
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Watch the owner snapshot so map transitions and shop changes need no battle session.
+		if not self:EnsureUI() then return end
+		if self.IsOpen then self:UpdateTooltipPosition() end
+		local player = _UserService.LocalPlayer
+		local run = isvalid(player) and player:GetComponent("script.PlayerRunStateComponent") or nil
+		local effects = isvalid(player) and player:GetComponent("script.PlayerRunRelicEffectComponent") or nil
+		local session = isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap:GetComponent("script.BattleSessionComponent") or nil
+		local available = run ~= nil and effects ~= nil and run.RunState == "Active" and effects.ActiveRunSequence == run.RunSequence
+			and (session == nil or not session.SkillTestMode)
+		self.OpenButton.Enable = available
+		if not available then
+			self:SetOpen(false)
+			self:ClearRunDisplay()
+			return
+		end
+		if effects.InventoryDisplaySnapshot ~= self.LastSnapshot or self.SlotRunSequence ~= run.RunSequence then
+			self:CancelDrag()
+			if self.SlotRunSequence ~= run.RunSequence then
+				self.SlotRunSequence = run.RunSequence
+				self.SlotIds = {}
+				self.Page = 1
+			end
+			self.LastSnapshot = effects.InventoryDisplaySnapshot
+			self.Items = {}
+			self.Totals = {}
+			if self.LastSnapshot ~= "" then
+				local data = _HttpService:JSONDecode(self.LastSnapshot)
+				if data ~= nil and data.RunSequence == run.RunSequence then self.Items = data.Items or {}; self.Totals = data.Totals or {} end
+			end
+			self:SyncSlots()
+			self:RefreshList()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearRunDisplay()
+		-- An empty new-run snapshot must never reuse a previous run's rows or stat totals.
+		if self.SlotRunSequence == -1 and self.LastSnapshot == "" and #self.Items == 0 then return end
+		self:CancelDrag()
+		self:HideTooltip()
+		self.LastSnapshot = ""
+		self.Items = {}
+		self.Totals = {}
+		self.ItemsById = {}
+		self.SlotIds = {}
+		self.SelectedRelicId = ""
+		self.SlotRunSequence = -1
+		self.Page = 1
+		self.PageCount = 1
+		self:RefreshList()
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureUI()
+		-- Bind the authored native GridView once, keeping the global UI root active.
+		if self.IsReady then return true end
+		self.Root = _EntityService:GetEntityByPath("/ui/RunRelicInventoryUI")
+		if not isvalid(self.Root) then return false end
+		self.Modal = self.Root:GetChildByName("Modal")
+		self.OpenButton = self.Root:GetChildByName("Open")
+		local window = self.Modal:GetChildByName("Window")
+		self.Grid = window:GetChildByName("List").GridViewComponent
+		self.Grid.OnRefresh = function(index, row) self:RefreshRow(index, row) end
+		self.Grid.OnClear = function(index, row) self:ClearRow(row) end
+		self.Grid.ItemEntity = window:GetChildByName("Row")
+		self:BindButton(self.OpenButton, function() self:SetOpen(not self.IsOpen) end)
+		self:BindButton(window:GetChildByName("TitleBar"):GetChildByName("Close"), function() self:SetOpen(false) end)
+		self:BindButton(window:GetChildByName("Prev"), function() self:ChangePage(-1) end)
+		self:BindButton(window:GetChildByName("Next"), function() self:ChangePage(1) end)
+		local title = window:GetChildByName("TitleBar")
+		local drag = title:ConnectEvent(UITouchDragEvent, function(event)
+			local previous = _UILogic:ScreenToUIPosition(event.TouchPoint - event.TouchDelta)
+			local current = _UILogic:ScreenToUIPosition(event.TouchPoint)
+			local pos = window.UITransformComponent.anchoredPosition + current - previous
+			window.UITransformComponent.anchoredPosition = Vector2(math.max(-286, math.min(718, pos.x)), math.max(-203, math.min(203, pos.y)))
+			self:HideTooltip()
+		end)
+		table.insert(self.Bindings, { Entity = title, EventType = UITouchDragEvent, Handle = drag })
+		self.Modal.Enable = false
+		self.IsReady = true
+		self:RefreshList()
+		log("[RelicInventory] ready")
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindButton(Entity entity, any callback)
+		-- Retain the connection handle for world-session cleanup.
+		table.insert(self.Bindings, { Entity = entity, Handle = entity:ConnectEvent(ButtonClickEvent, callback) })
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearRow(Entity row)
+		-- Recycled rows must release the previous selection callback.
+		local binding = self.RowBindings[row.Id]
+		if binding ~= nil then
+			for _, link in ipairs(binding.Links) do row:DisconnectEvent(link.EventType, link.Handle) end
+		end
+		if self.HoveredRowId == row.Id then self:HideTooltip() end
+		self.RowBindings[row.Id] = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshRow(integer index, Entity row)
+		-- GridView indexes are zero based; data and selection use stable relic IDs.
+		self:ClearRow(row)
+		local slot = (self.Page - 1) * 30 + index + 1
+		local item = self.ItemsById[self.SlotIds[slot] or ""]
+		-- Reapply selection when GridView reuses a row; match the existing blue skill highlight.
+		row.SpriteGUIRendererComponent.OutlineColor = Color(0.45, 0.85, 1.0, 0.9)
+		row.SpriteGUIRendererComponent.Outline = item ~= nil and item.RelicId == self.SelectedRelicId
+		local icon = row:GetChildByName("Icon")
+		icon.Enable = item ~= nil
+		if item ~= nil then icon.SpriteGUIRendererComponent.ImageRUID = DataRef(item.IconImageRUID) end
+		local links = {}
+		local bind = function(eventType, callback)
+			table.insert(links, { EventType = eventType, Handle = row:ConnectEvent(eventType, callback) })
+		end
+		bind(ButtonClickEvent, function()
+			if item == nil or self._T.DragSlot ~= nil then return end
+			self.SelectedRelicId = item.RelicId
+			self:RefreshDetail()
+		end)
+		bind(UITouchBeginDragEvent, function(event) self:BeginDrag(slot, event.TouchId, event.TouchPoint) end)
+		bind(UITouchDragEvent, function(event) if self._T.DragTouch == event.TouchId then self:MoveDrag(event.TouchPoint) end end)
+		bind(UITouchEndDragEvent, function(event) if self._T.DragTouch == event.TouchId then self:EndDrag(event.TouchPoint) end end)
+		self.RowBindings[row.Id] = { Entity = row, RelicId = item ~= nil and item.RelicId or "", Slot = slot, Links = links }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SyncSlots()
+		-- Keep display positions across snapshot updates; only the server decides ownership.
+		self.ItemsById = {}
+		for _, item in ipairs(self.Items) do self.ItemsById[item.RelicId] = item end
+		local placed = {}
+		local highest = 0
+		for slot, id in pairs(self.SlotIds) do
+			if self.ItemsById[id] == nil or placed[id] then self.SlotIds[slot] = nil
+			else placed[id] = true; highest = math.max(highest, slot) end
+		end
+		for _, item in ipairs(self.Items) do
+			if not placed[item.RelicId] then
+				local slot = 1
+				while self.SlotIds[slot] ~= nil do slot = slot + 1 end
+				self.SlotIds[slot] = item.RelicId
+				highest = math.max(highest, slot)
+			end
+		end
+		self.PageCount = math.max(1, math.ceil((highest + 1) / 30))
+		self.Page = math.min(self.Page, self.PageCount)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ChangePage(integer direction)
+		-- Cancel a pending drag before recycling the visible thirty slots.
+		self:CancelDrag()
+		self.Page = math.max(1, math.min(self.PageCount, self.Page + direction))
+		self:RefreshList()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BeginDrag(integer slot, integer touchId, Vector2 point)
+		-- The floating icon is visual only; the source remains owned until drop completes.
+		if not self.IsOpen then return end
+		local item = self.ItemsById[self.SlotIds[slot] or ""]
+		if item == nil then return end
+		self:CancelDrag()
+		self:HideTooltip()
+		self._T.DragSlot = slot
+		self._T.DragTouch = touchId
+		local ghost = self.Modal:GetChildByName("DragGhost")
+		ghost.SpriteGUIRendererComponent.ImageRUID = DataRef(item.IconImageRUID)
+		ghost.Enable = true
+		self:MoveDrag(point)
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer FindDropSlot(Vector2 point)
+		-- GridView positions recycled cells internally; hit-test its authored layout, not row transforms.
+		local transform = self.Modal:GetChildByName("Window"):GetChildByName("List").UITransformComponent
+		local localPoint = _UILogic:ScreenToLocalUIPosition(point, transform)
+		local x = localPoint.x + transform.RectSize.x * transform.Pivot.x
+		local y = transform.RectSize.y * (1 - transform.Pivot.y) - localPoint.y
+		local size = self.Grid.CellSize
+		local step = size + self.Grid.Spacing
+		if x < 0 or y < 0 then return 0 end
+		local column = math.floor(x / step.x)
+		local row = math.floor(y / step.y)
+		if column >= 5 or row >= 6 or x - column * step.x > size.x or y - row * step.y > size.y then return 0 end
+		return (self.Page - 1) * 30 + row * 5 + column + 1
+	end
+
+	@ExecSpace("ClientOnly")
+	method void MoveDrag(Vector2 point)
+		-- Highlight the destination while keeping the ghost outside the grid's input path.
+		if self._T.DragSlot == nil then return end
+		self.Modal:GetChildByName("DragGhost").UITransformComponent.anchoredPosition = _UILogic:ScreenToUIPosition(point)
+		local target = self:FindDropSlot(point)
+		for _, binding in pairs(self.RowBindings) do
+			if isvalid(binding.Entity) then binding.Entity.SpriteGUIRendererComponent.Outline = binding.Slot == target end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EndDrag(Vector2 point)
+		-- Outside drops cancel; occupied destinations swap, empty destinations move.
+		local source = self._T.DragSlot
+		local target = self:FindDropSlot(point)
+		if source ~= nil and target > 0 and source ~= target then
+			self.SlotIds[source], self.SlotIds[target] = self.SlotIds[target], self.SlotIds[source]
+			log("[RelicInventory] moved slot=" .. tostring(source) .. " to=" .. tostring(target))
+		end
+		self:CancelDrag()
+		self:RefreshList()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelDrag()
+		-- Closing, paging or receiving fresh ownership data cannot leave a ghost behind.
+		self._T.DragSlot = nil
+		self._T.DragTouch = nil
+		if isvalid(self.Modal) then
+			local ghost = self.Modal:GetChildByName("DragGhost")
+			if isvalid(ghost) then ghost.Enable = false end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetJobLabel(string jobId)
+		-- Display the same restriction used by server-side acquisition and effects.
+		local jobs = { warrior = "전사 전용", mage = "마법사 전용", archer = "궁수 전용", thief = "도적 전용", pirate = "해적 전용" }
+		return jobs[jobId] or "공용"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshList()
+		-- TotalCount is the whole inventory, independent of the compact HUD slot count.
+		self:HideTooltip()
+		local window = self.Modal:GetChildByName("Window")
+		window:GetChildByName("Empty").Enable = false
+		window:GetChildByName("Count").Enable = false
+		window:GetChildByName("Page").TextGUIRendererComponent.Text = tostring(self.Page) .. " / " .. tostring(self.PageCount)
+		self.Grid.TotalCount = 30
+		self:RefreshDetail()
+		self.Grid:Refresh(false, true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshDetail()
+		-- Keep selection after updates, or select the first surviving relic after removal.
+		local panel = self.Modal:GetChildByName("Window"):GetChildByName("StatsPanel")
+		for _, stat in ipairs({ "Attack", "Defense", "MaxHp" }) do
+			local value = self.Totals[stat] or 0
+			local valueText = value % 1 == 0 and tostring(math.floor(value)) or tostring(value)
+			panel:GetChildByName(stat):GetChildByName("Value").TextGUIRendererComponent.Text = (value >= 0 and "+" or "") .. valueText
+		end
+		local body = panel:GetChildByName("Effects"):GetChildByName("Scroll"):GetChildByName("Text")
+		local description = self.Totals.SpecialDescription or ""
+		if description == "" then description = "적용 중인 특수 효과가 없습니다." end
+		body.TextGUIRendererComponent.Text = description
+		body.UITransformComponent.RectSize = Vector2(354, math.max(310, body.TextGUIRendererComponent:GetPreferredHeight(description, 354) + 16))
+		local selected = nil
+		for _, item in ipairs(self.Items) do if item.RelicId == self.SelectedRelicId then selected = item end end
+		if selected == nil then selected = self.Items[1] end
+		self.SelectedRelicId = selected ~= nil and selected.RelicId or ""
+		-- Selection only repaints existing rows; rebuilding the grid here can move recycled cells.
+		for _, binding in pairs(self.RowBindings) do
+			if isvalid(binding.Entity) then
+				binding.Entity.SpriteGUIRendererComponent.Outline = binding.RelicId == self.SelectedRelicId
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowTooltip(Entity row, table item)
+		-- Hover uses the bound item without rebuilding or reordering the grid.
+		if not self.IsOpen then return end
+		self.HoveredRowId = row.Id
+		local tooltip = self.Modal:GetChildByName("Tooltip")
+		tooltip:GetChildByName("Name").TextGUIRendererComponent.Text = item.DisplayName
+		local description = self:GetJobLabel(item.RequiredJobId) .. "\n\n" .. item.EffectDescription
+		if item.RemainingUses >= 0 then description = description .. "\n남은 방어 횟수: " .. tostring(item.RemainingUses) end
+		if not item.Active then description = description .. "\n현재 직업에는 적용되지 않습니다." end
+		local body = tooltip:GetChildByName("Description")
+		body.TextGUIRendererComponent.Text = description
+		local screenEdge = _UILogic:ScreenToUIPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
+		local height = math.min(math.max(80, screenEdge.y * 2 - 140), math.max(150, body.TextGUIRendererComponent:GetPreferredHeight(description, 416) + 16))
+		body.UITransformComponent.RectSize = Vector2(430, height)
+		tooltip.UITransformComponent.RectSize = Vector2(470, height + 100)
+		tooltip.Enable = true
+		self:UpdateTooltipPosition()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateTooltipPosition()
+		-- Keep the hover card inside the screen and offset from the pointer.
+		local tooltip = self.Modal:GetChildByName("Tooltip")
+		if not tooltip.Enable then return end
+		local cursor = _UILogic:ScreenToUIPosition(_InputService:GetCursorPosition())
+		local height = tooltip.UITransformComponent.RectSize.y
+		local edge = _UILogic:ScreenToUIPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
+		local x = cursor.x + 24
+		if x + 470 > edge.x - 12 then x = cursor.x - 494 end
+		tooltip.UITransformComponent.anchoredPosition = Vector2(math.max(-edge.x + 12, math.min(edge.x - 482, x)), math.max(-edge.y + 12 + height, math.min(edge.y - 12, cursor.y - 16)))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideTooltip()
+		-- Remove stale hover content on close, inventory changes, and row recycling.
+		self.HoveredRowId = ""
+		if isvalid(self.Modal) then self.Modal:GetChildByName("Tooltip").Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetOpen(boolean open)
+		-- Modal input focus never pauses timers or running combat presentation.
+		if not self.IsReady then return end
+		if self.IsOpen == open then return end
+		if open and not self.OpenButton.Enable then return end
+		if not open then self:HideTooltip() end
+		if not open then self:CancelDrag() end
+		self.IsOpen = open
+		-- Keep the HUD button behind the world map; raise only while the inventory is open.
+		if open then
+			_GameUIPolishLogic:BringUIGroupToFront(self.Root)
+		else
+			self.Root.UIGroupComponent.GroupOrder = 12
+		end
+		self.Modal.Enable = open
+		if open then self:RefreshList() end
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleInventoryKey(KeyDownEvent event)
+		-- The skill-test map keeps its existing I-key panel.
+		if not self.IsReady or not self.OpenButton.Enable or _GameSettingsLogic.IsMenuOpen then return end
+		if event.key == KeyboardKey.I then self:SetOpen(not self.IsOpen)
+		elseif event.key == KeyboardKey.Escape then self:SetOpen(false) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Release persistent UI callbacks when the world session ends.
+		for _, binding in ipairs(self.Bindings) do
+			if isvalid(binding.Entity) then binding.Entity:DisconnectEvent(binding.EventType or ButtonClickEvent, binding.Handle) end
+		end
+		if self.Grid ~= nil then self.Grid.OnRefresh = nil; self.Grid.OnClear = nil end
+		for _, binding in pairs(self.RowBindings) do
+			if isvalid(binding.Entity) then
+				for _, link in ipairs(binding.Links) do binding.Entity:DisconnectEvent(link.EventType, link.Handle) end
+			end
+		end
+		self.Bindings = {}
+		self.RowBindings = {}
+	end
+
+end

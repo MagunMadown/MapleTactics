@@ -137,6 +137,7 @@ Repository의 행 객체 + ContentReferenceResolverLogic Registry
 | Run Seed, 현재 Stage, 완료 Stage | `PlayerRunStateComponent` | `RunManagerLogic` | 플레이어 Run |
 | 런 재화, 소모품, 지급·사용 멱등 키 | `PlayerRunInventoryComponent` | `RunManagerLogic` | 플레이어 Run |
 | 보유 증강, 스택, 획득 순서, 지급 멱등 키 | `PlayerRunAugmentComponent` | `RunManagerLogic` | 플레이어 Run |
+| 스킬별 증강 단계(`SkillAugmentSnapshot`, 최대 6), 리롤권(`AvailableRerollCount`), 보상 제안 캐시 | `PlayerRunAugmentComponent` | `UpgradeSkillStageLogic`(선택·리롤), `NewSkillStageChoiceComponent`(리롤), Session 승리 처리(`GrantClearReroll`), 상점 판매(`RemoveSkillAugments`) | 플레이어 Run |
 | BattlePhase, Turn, 행동 큐, 입력 잠금 | `BattleTurnComponent` | Turn 공개 API | 전투 맵 |
 | 승패, Stage 연결, 전체 실행 조정 | `BattleSessionComponent` | Session 공개 API | 전투 맵 |
 | Wave, 증원 예약, Spawn Timer | `BattleWaveComponent` | Wave 공개 API | 전투 맵 |
@@ -194,25 +195,43 @@ RootDesk/MyDesk/
 │   │   └── EffectRouterLogic.mlua
 │   ├── Jobs/
 │   │   └── JobMechanicRouterLogic.mlua
+│   ├── Augments/
+│   │   └── AugmentRuntimeLogic.mlua (Trigger 파이프라인 + 스킬 증강 판정·적용)
 │   └── Events/
+├── 00_Core/
+│   └── Lobby/
+│       ├── LobbyCharacterSelectionLogic.mlua
+│       ├── LobbyJobSelectionProvider.mlua
+│       ├── LobbyCodexLogic.mlua (+ Monster/Skill/ItemCodexProvider)
+│       └── LobbyInteractionComponent.mlua
+├── 02_UI/
+│   ├── BattleHudPresenterLogic.mlua
+│   ├── BattleQueueHudComponent.mlua (전투 HUD View — `ui/BattleQueueHUD`에 부착, Presenter 이벤트 구독)
+│   ├── MapTeleportManager.mlua / MapTeleportButton.mlua
+│   └── MinimapUI.mlua
 ├── 03_Data/
 │   ├── Repositories/
 │   ├── StageDefinitions.userdataset
+│   ├── RegionDefinitions.userdataset
 │   ├── StageEnemyWaves.userdataset
 │   ├── EnemyDefinitions.userdataset
 │   ├── EnemySpawnPools.userdataset
-│   ├── SkillDefinitions.userdataset
-│   ├── SkillEffectSteps.userdataset
 │   ├── EnemyPatternSteps.userdataset
+│   ├── BossPhaseDefinitions.userdataset
+│   ├── SkillDefinitions.userdataset (공용, 현재 0행 — 실제 스킬은 §11.2 참고)
+│   ├── {Warrior,Mage,Archer,Thief,Pirate,Enemy}SkillDefinitions.userdataset
+│   ├── SkillEffectSteps.userdataset
 │   ├── JobDefinitions.userdataset
 │   ├── JobStartingSkillEntries.userdataset
-│   ├── AugmentDefinitions.userdataset
-│   └── ItemDefinitions.userdataset
-├── 04_Roguelike/
-│   └── RunManager/
-└── 05_UI/
-    ├── HUD/
-    └── Popup/
+│   ├── AugmentDefinitions.userdataset / AugmentEffects.userdataset (직업 패시브 + 스킬 증강)
+│   ├── ConsumableDefinitions.userdataset (§12.2의 옛 ItemDefinitions 계획을 대체)
+│   ├── CurrencyDefinitions.userdataset
+│   └── StageRewardDefinitions.userdataset
+└── 04_Roguelike/
+    ├── RunManager/
+    ├── SkillStage/ (UpgradeSkillStageLogic, NewSkillStageChoiceComponent — 전투 후 보상 3택·리롤)
+    ├── Shop/
+    └── Flow/
 ```
 
 MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은 `map/`,
@@ -220,6 +239,17 @@ MSW 인식 규칙에 따라 `.mlua`와 `.model`은 `RootDesk/MyDesk/`, `.map`은
 `.codeblock`은 직접 수정하지 않는다.
 
 폴더 이동은 기능 마이그레이션과 동시에 수행한다. 빈 폴더를 먼저 대량 생성하지 않는다.
+
+`02_UI/`를 런타임 UI 스크립트의 단일 진입 폴더로 사용한다(`05_UI`는 2026-08 중 여기로
+통합·삭제됐다). Deck은 현재 범위에 포함하지 않으며, 보유 타일·장착 구성·드로우/셔플 같은
+독립 덱 기능을 실제로 개발할 때만 `05_Deck/`을 생성한다. 전투 행동 큐의 실행 상태는 Deck이
+아니라 Combat Runtime이 소유한다.
+
+로비(캐릭터/직업 선택, 도감)는 `00_Core/Lobby/` 아래에서 전투와 분리된 자체 컴포넌트로
+구현한다. 로비 이동 `00_Core/LobbyGridMovementComponent`는 `BoardStateComponent`나
+`BattleSessionComponent.TryMove()`의 논리 Cell/점유 판정을 쓰지 않고 `MinX`/`MaxX` 범위로만
+제한하지만, 방향 입력·이동 시간·곡선·홉 연출은 전투와 같은 `00_Core/Movement/PlayerGridMovementLogic`
+을 공유한다(2026-09-05 통합).
 
 ---
 
@@ -476,7 +506,6 @@ UI 표시 문구는 Reason ID와 분리한다. 서버 Reason을 그대로 사용
 | `PlayerStartCell` | integer | O | Player 시작 Cell |
 | `QueueCapacity` | integer | O | 기본 타일 큐 용량 |
 | `WaveTableId` | string | O | Wave 묶음 ID |
-| `NextStageId` | string |  | 마지막이면 빈 문자열 |
 | `StageRuleId` | string |  | 특수 규칙 Handler ID |
 
 Map Entity에는 가능하면 `StageId`만 설정하고 세부 값은 Repository에서 읽는다.
@@ -551,6 +580,14 @@ SkillDefinition
 현재 `FRONT_CELL`, `FIRST_ENEMY_FORWARD`, `RANGE_OFFSETS`를 지원한다.
 `SkillTargetResolverLogic`이 실제 타격 시점에 대상 Snapshot을 한 번 만들고, 모든 Effect
 Executor와 UI DTO는 이 결과를 공유한다. Session이나 UI에서 별도로 사거리 판정을 복제하지 않는다.
+
+위 필드 스키마는 **같은 열 구성을 가진 7개 Dataset**(`SkillDefinitions`, `{Warrior,Mage,
+Archer,Thief,Pirate}SkillDefinitions`, `EnemySkillDefinitions`)에 공통으로 적용된다 — 스킬은
+직업별 테이블로 분리돼 있고 공용 `SkillDefinitions`는 현재 헤더만 있는 빈 테이블이다. 어느
+테이블에 있는지는 호출부가 알 필요 없이 `SkillDefinitionRepositoryLogic`이 전체를 순회해서
+찾는다. 정확한 테이블 목록·조회 경로·플레이어 지급 가능 스킬 구분은
+[`MapleTactics-M1-Data-Dictionary.md` §4.1](../MapleTactics-M1-Data-Dictionary.md)을 단일
+기준으로 한다.
 
 ### 11.3 SkillEffectSteps — 실제 Dataset 전환 완료
 
@@ -633,7 +670,9 @@ Context는 요청 동안만 사용하는 값이다. Executor가 Context를 전�
 이 영역은 직업 정의와 시작 스킬 로더/검증기, 런 직업 스냅샷, 첫 실제
 `FORWARD_PUSH` JobMechanic, 런 스킬 소유권과 큐 허용 검사까지 구현되었다. 또한
 `JobPassiveSetId → AugmentId` 참조, 플레이어별 증강 상태, 최소 Trigger→Condition→Effect
-파이프라인까지 구현되었다. 증강 후보 풀·충돌/다중 스택 정책과 실제 상점 구매 어댑터는 후속 단계다.
+파이프라인까지 구현되었다. 강화가 끝난 스킬에 붙는 **스킬 증강**(14종, 스킬당 6단계 누적)과
+업그레이드 스테이지 3택·슬롯 리롤도 구현되었다(§12.5). 전역 증강의 후보 풀·충돌/다중 스택
+정책과 상점 구매 어댑터는 후속 단계다.
 
 직업의 고정 선택값은 `PlayerRunStateComponent`, 런 중 추가될 수 있는 스킬 수량은
 `PlayerRunInventoryComponent`가 소유한다. BattleSession과 외부 노드는 두 Component를
@@ -665,7 +704,13 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 `JobMechanic`은 `SkillDefinitions`가 아니므로 스킬 큐·스킬 쿨타임·EffectSet을 자동 적용하지
 않는다. 턴 소비 여부는 실행 결과의 `ConsumedTurn`, UI 표시는 `GetUiState`로 명시한다.
 
-### 12.2 ItemDefinitions
+### 12.2 ItemDefinitions — 계획됨(미구현), 실제로는 ConsumableDefinitions로 대체됨
+
+아래 표는 v0.1 초안 당시의 장비·소비 통합 계획이며 `ItemDefinitions` Dataset은 실제로 만들어진
+적이 없다. 실제 소비 아이템 파이프라인은 `ConsumableDefinitions`(사용 시점·턴 소비·효과 DTO)
++ `ConsumableEffectRouterLogic`(원시 EffectType Router) + `ConsumableHealEffectLogic` 등
+독립 Handler로 §6.11에 이미 **구현됨** 상태로 존재한다. 장비(EquipSlot 개념)는 아직 어떤
+형태로도 구현되지 않았다.
 
 | 필드 | 설명 |
 |---|---|
@@ -678,18 +723,20 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 | `PassiveEffectSetId` | 패시브 효과 |
 | `RequiredJobTag` | 직업 제한 |
 
-### 12.3 AugmentDefinitions
+### 12.3 AugmentDefinitions / AugmentEffects — 구현됨
 
-| 필드 | 설명 |
-|---|---|
-| `AugmentId` | 증강 ID |
-| `DisplayName` | 표시 이름 |
-| `TriggerType` | 적용 시점 |
-| `FilterTags` | 적용 대상 Skill/Effect 태그 |
-| `ModifierType` | ADD, MULTIPLY, APPEND_EFFECT 등 |
-| `TargetField` | 변경 대상 필드 |
-| `Value` | 변경 값 |
-| `Priority` | 적용 순서 |
+v0.1 초안의 단일 표(`FilterTags`/`ModifierType`/`TargetField`/`Value`) 계획은 쓰지 않는다. 실제 구현은
+정의와 효과를 두 Dataset으로 나눈다. 열 정의는 Data Dictionary §14~15가 단일 기준이다.
+
+| Dataset | 역할 | 핵심 열 |
+|---|---|---|
+| `AugmentDefinitions` | 증강 1개당 1행 | `AugmentId`, `NameKey`, `DescriptionKey`, `Rarity`, `StackPolicy`, `MaxStacks`, `ExclusiveGroup`, `Enabled` |
+| `AugmentEffects` | 효과 행 (`Seq` 순) | `TriggerType`, `ConditionType`, `EffectType`, `TargetType`, `Priority`, `Amount`, `ParamA~C` |
+
+두 계열이 같은 표를 쓴다.
+
+- 직업 패시브·전역 증강: `TURN_START` 등 Trigger → Router 파이프라인(`AugmentRuntimeLogic.ProcessTrigger`)
+- 스킬 증강: `ExclusiveGroup=SKILL_AUGMENT`, `SKILL_BUILD`/`SKILL_MODIFIER`/`SKILL` 1행. 이벤트로 실행하지 않고 스킬 정의를 읽을 때 적용한다(§12.5).
 
 ### 12.4 Modifier 적용 순서
 
@@ -707,6 +754,32 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 - Modifier 적용 결과는 재현 가능해야 한다.
 - Run Seed가 필요한 확률 효과는 공용 결정 규칙을 사용한다.
 
+현재 구현된 순서는 다음과 같다. 직업·아이템 Modifier 단계는 아직 없다.
+
+```text
+검증된 SkillDefinition + EffectSteps (ContentValidatorLogic.ValidateSkillById)
+→ 스킬 증강 단계를 획득 순서대로 적용 (AugmentRuntimeLogic.BuildSkillBundle → ApplySkillModifier)
+→ 전투 실행 (BattleSessionComponent.GetEffectiveSkillValidation)
+→ 피해 적용 시 유물·버프 보정 (무위의 준비가 붙은 스킬은 피해 0 고정)
+```
+
+### 12.5 스킬 증강·업그레이드 3택·리롤 — 구현됨
+
+세부 규칙과 수치는 [`Skill-Augment-Reroll-Guide.md`](./Skill-Augment-Reroll-Guide.md)가 단일 기준이다.
+여기서는 소유권과 호출 방향만 고정한다.
+
+- 상태: 스킬별 증강 목록, 리롤권, 보상 제안 캐시는 `PlayerRunAugmentComponent`가 소유한다. 힐 횟수와 무한 치유는 `PlayerRunInventoryComponent`가 소유한다.
+- 판정·적용: `AugmentRuntimeLogic.CanBindSkillAugment` / `ApplySkillModifier`만 사용한다. 보상 카드, 전투, 큐 시간, HUD는 모두 `BuildSkillBundle`의 결과를 읽고 증강 효과를 따로 계산하지 않는다.
+- 누적: 한 스킬 최대 6단계(`MaxSkillAugmentStages`, 힐 제외)다. 각 단계는 앞 단계까지 적용된 스킬로 다시 판정하며, 맞지 않는 단계는 건너뛴다.
+- 보상 흐름: `StageTransitionManagerLogic.DetermineIntermediateMap` → `UpgradeSkillStageLogic`(서버) ↔ `UpgradeSkillStageUIComponent`(클라이언트).
+  - 선택·건너뛰기·리롤은 모두 서버 Request다.
+  - 보상 키 `upgrade_skill_stage:<LastBattleRecordKey>`로 한 번만 처리하며, 요청은 리비전과 카드 토큰으로 오래된 요청을 거절한다.
+- 리롤권: 런 시작 시 `BaseRerollCount` + 유니온 `AUGMENT_REROLL`, 전투 승리 시 `GrantClearReroll`(보스 확정, 그 외 20%)로 얻는다.
+  - 업그레이드 스테이지와 새 스킬 스테이지가 같은 개수를 쓴다.
+  - 카드가 실제로 바뀐 경우에만 차감한다.
+- 판매: 상점 스킬 판매(`ApplySkillSale`)는 그 스킬의 증강을 모두 제거하고 다음 업그레이드 보상을 새 기본 스킬 선택으로 바꾼다.
+- 데이터 추가: 새 `ParamA` 종류는 Validator(`IsSkillModifierValid`), `CanBindSkillAugment`, `ApplySkillModifier`, Balance Studio 어휘 카탈로그를 한 변경으로 함께 고친다.
+
 ---
 
 ## 13. Enemy Pattern 규격
@@ -718,7 +791,7 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 | `PatternId` | 패턴 ID |
 | `StepIndex` | 실행 순서 |
 | `ConditionType` | `ALWAYS`, `DISTANCE_EQ`, `HP_RATIO_LE`, `CELL_FREE` |
-| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `EXECUTE_TILE` |
+| `ActionType` | `WAIT`, `TURN_TO_PLAYER`, `MOVE_TOWARD`, `MOVE_AWAY`, `MOVE_FIXED_FACING`, `TELEGRAPH_TILE`, `CAST_INTERRUPTIBLE`, `EXECUTE_TILE`, `BOSS_JUMP_TELEGRAPH`, `BOSS_LAND_OPPOSITE` |
 | `TileId` | 예고·실행할 스킬 타일 ID |
 | `TelegraphTurns` | `TELEGRAPH_TILE` 예고 턴 수, 1 이상 |
 | `ParamA/B/C` | 조건·행동별 인자 |
@@ -731,6 +804,8 @@ Handler로 위임한다. 데이터는 Mechanic ID와 수치를 보관하고 알�
 `BattleSessionComponent`는 준비·실행·완료 순서와 실제 보드 명령만 조정한다.
 
 UI는 Pattern 조건을 다시 계산하지 않고 Prepared Intent Snapshot만 표시한다.
+보스 점프의 공중 여부와 고정 착지 칸은 보스의 `BattleUnitComponent`가 소유하며,
+`BoardStateComponent`는 공중 보스를 Cell 점유·공격 대상으로 노출하지 않는다.
 
 ---
 
@@ -786,7 +861,9 @@ Event는 이미 완료된 사실을 전달한다. Event 수신자가 같은 상�
 [ContentValidation]
 ```
 
-Positive log에는 최소한 ID와 결과를 포함한다.
+개발·검증 중 사용하는 Positive log에는 최소한 ID와 결과를 포함한다. 확인 결과를 작업
+기록에 남기고, 기능 완료 전에 반복 성공 로그를 제거한다. 운영에 필요한 드문 주요 사건만
+유지한다. 세부 기준은 [`Runtime-Logging-Guide.md`](./Runtime-Logging-Guide.md)를 따른다.
 
 ```text
 [SkillExecution] resolved skill=basic_slash source=player_01 success=true reason=OK
@@ -903,11 +980,35 @@ Positive log에는 최소한 ID와 결과를 포함한다.
 | `ConsumableDefinitionRepositoryLogic` | Consumable Definition Repository | 구현됨 |
 | `ConsumableEffectRouterLogic` | Consumable primitive effect Router | HEAL Handler 구현됨 |
 | `RunManagerLogic` | Run Coordinator | 유지 |
-| `BattleQueueHudComponent` | HUD Request/Presentation | 유지 후 Skill Definition 표시 연결 |
+| `BattleQueueHudComponent` | 전투 HUD View (큐·스킬바·힐 횟수 표시) | **사용 중** — `ui/BattleQueueHUD`의 Controller에 부착. `BattleHudPresenterLogic`의 `BattleHudStateChangedEvent`/`BattleHudCommandResultEvent`를 구독하고 `GetCurrentState()`를 읽는다. `MapTeleportManager`, `MapTransitionUIComponent`, `SkillTestUIComponent`가 호출. (2026-09-28 정정: 이전 판의 "죽은 코드" 기록은 틀림) |
+| `BattleHudPresenterLogic` | 전투 HUD 상태를 Event(`BattleHudStateChangedEvent`/`BattleHudCommandResultEvent`)로 발행하는 Client 전용 Presenter | 구현됨. View는 `BattleQueueHudComponent` |
+| `AugmentRuntimeLogic` | 증강 Trigger 파이프라인 + 스킬 증강 판정·적용(`CanBindSkillAugment`/`BuildSkillBundle`) | 구현됨 |
+| `PlayerRunAugmentComponent` | 런 증강·스킬별 증강 단계·리롤권 상태 | 구현됨 |
+| `UpgradeSkillStageLogic` / `UpgradeSkillStageUIComponent` | 업그레이드 스테이지 3택·적용·건너뛰기·슬롯 리롤 (서버 / 클라이언트) | 구현됨, Maker 화면 검증 필요 |
+| `NewSkillStageChoiceComponent` / `NewSkillSelectionUILogic` | 새 스킬 스테이지 선택·교체·슬롯 리롤 | 구현됨 |
+| `StageTransitionManagerLogic` | 전투 후 보상 맵(new_upgrade_stage / new_skill_stage) 결정 | 구현됨. 주석(75/25)과 코드(업그레이드 25%)가 반대 — 의도 확인 필요 |
+| `RegionDefinitionRepositoryLogic` | Region Definition Repository | 구현됨 |
+| `BossPhaseDefinitionRepositoryLogic` | 보스 Phase 임계치·Pattern 교체 Repository | 구현됨 |
+| `LobbyCharacterSelectionLogic` / `LobbyJobSelectionProvider` / `LobbyCodexLogic` | 로비 캐릭터·직업 선택, 도감(Codex) | 구현됨, 규격 문서화는 미완 |
+| `LobbyGridMovementComponent` | 로비 좌우 이동(전투 Board 점유 판정 없음, 이동 연출은 `PlayerGridMovementLogic` 공유) | 구현됨 |
 
 ---
 
 ## 21. 규격 변경 절차
+
+### 스킬 증강 누적·리롤 (2026-09-28)
+
+- `AugmentDefinitions`/`AugmentEffects`에 새 열 없이 `ExclusiveGroup=SKILL_AUGMENT` 행으로 스킬 증강을 추가했다. 현재 14종이며 스킬당 6단계까지 누적된다.
+- 상태는 `PlayerRunAugmentComponent`(`SkillAugmentSnapshot`, `AvailableRerollCount`)가 소유한다. 판정·적용은 `AugmentRuntimeLogic` 한 곳에서 한다.
+- 세부 규칙은 `Skill-Augment-Reroll-Guide.md`에 문서화했고 §12.3~12.5, §20을 갱신했다. `BattleQueueHudComponent`를 "죽은 코드"로 적은 이전 기록은 정정했다.
+
+### 유물 특수능력 확장 (2026-09-24)
+
+- `RelicDefinitions`는 기존 능력치 열을 유지하고 선택 열 `SpecialEffectType`, `SpecialEffectValue`를 추가한다. 빈 효과는 기존 능력치 유물로 읽는다.
+- `PlayerRunRelicEffectComponent`가 런에 고정된 정의·합산 효과와 전투별 발동 횟수를 소유한다. HP·Cooldown·재화 원본은 기존 소유자에 남는다.
+- Session의 전투 시작·처치 확정 → 유물 API → Unit/SkillRuntime 공개 API, RunManager의 승리 처리 → 유물 API → 보상 Facade 순서로 호출한다.
+- 특정 RelicId 분기는 전투 코어에 추가하지 않는다. 상점·HUD는 Repository가 생성한 동일한 설명을 사용한다.
+- 구현 및 검증 범위와 초기 수치는 `Run-Shop-Authoring-Guide.md`의 유물 특수능력 규격을 따른다. Maker 미검증 상태는 구현 완료와 구별한다.
 
 1. 변경 이유와 영향을 받는 Definition/Component를 기록한다.
 2. 기존 Stage 1 데이터가 새 Repository에서 계속 읽히는지 확인한다.

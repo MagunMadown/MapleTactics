@@ -12,13 +12,19 @@ Milestone: M1 playable vertical slice
 
 ```text
 직업 선택
--> 스테이지 시작
+-> 월드맵에서 현재 마을 선택
+-> 마을 스테이지 시작
 -> 이동/회전/타일 큐 등록/큐 실행
 -> 적 Intent 해결
 -> 승리
 -> 증강 3택
--> 다음 스테이지
+-> 마을 클리어
+-> 다음 마을로 가는 경로 상점 방문
+-> 다음 마을 해금
 ```
+
+M1 수직 슬라이스는 헤네시스와 첫 분기만 검증한다. 이후 콘텐츠 확장에서도
+`마을 전투 → 경로 상점 → 다음 마을` 순서는 동일하게 재사용한다.
 
 ## 3. 핵심 규칙
 
@@ -29,9 +35,10 @@ Milestone: M1 playable vertical slice
 - 일반 타일을 등록해 적 턴을 보낸 뒤에도 큐는 유지되며, 다음 플레이어 턴에 이동·회전·추가 등록 후 별도 실행 명령으로 한 번에 해소한다.
 - 턴과 큐 항목은 1:1이 아니다. FreePlay 등록·제거·순서 변경은 턴을 넘기지 않고 여러 번 수행할 수 있으며, 일반 등록과 전체 큐 실행만 각각 하나의 턴 소비 Command다.
 - 큐 실행 중 각 타일은 현재 보드에서 타깃을 다시 계산한다.
-- 적의 다음 행동은 플레이어에게 미리 표시된다.
-- 적 Intent는 플레이어 턴 전에 준비되어 ActionType/TileId가 고정되며, 플레이어가 위치를 바꿔도 실행 직전에 다른 행동으로 재선택하지 않는다.
-- 준비된 공격은 TargetId를 저장하지 않고 실행 시점의 현재 CellIndex/Facing과 타일 Target 규칙으로 명중 셀을 계산한다.
+- 적의 공격 타일 보유 상태와 공격 예고 상태를 분리한다. 적은 공격 타일을 먼저 등록하고, 사거리·방향이 맞지 않으면 타일을 유지한 채 회전·추적한다.
+- 공격 조건이 맞아 `ATTACK_READY`가 된 다음 행동만 플레이어에게 공격으로 미리 표시하며, 그 사이 플레이어 대응 Command 1회를 허용한다.
+- `ATTACK_READY` Intent는 ActionType/TileId가 고정되며, 플레이어가 위치를 바꿔도 실행 직전에 추적이나 다른 행동으로 재선택하지 않는다.
+- 예고된 공격은 TargetId를 저장하지 않고 실행 시점의 현재 CellIndex/Facing과 타일 Target 규칙으로 명중 셀을 계산하므로 피하면 빗나갈 수 있다.
 - 전투 월드 위치와 논리 CellIndex를 분리한다.
 - 적은 플레이어 좌우 어느 빈 칸에도 배치될 수 있어, 방향 전환은 전투 내내 반복적으로 필요한 핵심 조작이다.
 
@@ -49,6 +56,39 @@ Milestone: M1 playable vertical slice
 | 원시 EnemyActionType | 7 |
 
 구조 검증은 직업 1종, 적 2종, 보스 1종, 타일 4종, 증강 3종으로 먼저 수행한다. 구조가 통과한 뒤 값으로 목표 수량까지 확장한다.
+
+### 4.1 확장 월드맵 콘텐츠 목표
+
+M1 이후에는 다음 6개 마을을 하나의 도시 경로 그래프로 확장한다.
+
+| 순서 | 출발 마을 | 경로 상점 | 도착 마을 | 경로 |
+|---:|---|---|---|---|
+| 1 | 헤네시스 | 헤네시스→커닝시티 상점 | 커닝시티 | `UPPER` |
+| 2 | 헤네시스 | 헤네시스→엘리니아 상점 | 엘리니아 | `LOWER` |
+| 3 | 커닝시티 | 커닝시티→페리온 상점 | 페리온 | `UPPER` |
+| 4 | 엘리니아 | 엘리니아→노틸러스 상점 | 노틸러스 | `LOWER` |
+| 5 | 페리온 | 페리온→슬리피우드 상점 | 슬리피우드 | `UPPER` |
+| 6 | 노틸러스 | 노틸러스→슬리피우드 상점 | 슬리피우드 | `LOWER` |
+
+- 한 Run에서는 헤네시스 이후 `UPPER` 또는 `LOWER` 중 하나를 선택하며, 선택하지 않은 경로는 해당 Run 동안 잠긴다.
+- 위쪽은 `헤네시스 → 커닝시티 → 페리온 → 슬리피우드`, 아래쪽은 `헤네시스 → 엘리니아 → 노틸러스 → 슬리피우드` 순서다.
+- 슬리피우드는 두 경로가 합류하는 공통 후반 지역이다.
+- 각 마을은 독립 `RegionId`와 복수 전투/보스 노드를 가질 수 있으며, 실제 스테이지 수는 지역 데이터로 확장한다.
+
+마을별 Region과 물리 맵 명명 규칙:
+
+| RegionId | 마을 | 일반전 MapId | 보스전 MapId | 경로 순서 |
+|---|---|---|---|---|
+| `region_01` | 헤네시스 | `region_01_battle` | `region_01_boss` | 시작 지역 |
+| `region_02` | 커닝시티 | `region_02_battle` | `region_02_boss` | `UPPER` 2번째 |
+| `region_03` | 엘리니아 | `region_03_battle` | `region_03_boss` | `LOWER` 2번째 |
+| `region_04` | 페리온 | `region_04_battle` | `region_04_boss` | `UPPER` 3번째 |
+| `region_05` | 노틸러스 | `nautilus_battle` | `nautilus_boss` | `LOWER` 3번째 |
+| `region_06` | 슬리피우드 | `sleepywood_ant_tunnel` | `sleepywood_food_cart_boss` | 공통 합류 지역 |
+
+- 일반전 물리 맵 재사용 범위는 같은 Region 내부로 제한한다. 예를 들어 커닝시티의 여러 일반 Stage는 `region_02_battle`을 함께 사용하지만 헤네시스의 `region_01_battle`은 사용하지 않는다.
+- 보스전은 지역별 배경과 전조 연출을 독립 제작할 수 있도록 각 Region의 `region_XX_boss` 맵으로 분리한다.
+- `StageId`는 콘텐츠 식별자이고 `MapId`는 물리 맵이므로 계속 분리한다. 표시용 `2-1` 같은 번호는 Region/Stage 데이터에서 결정한다.
 
 ## 5. 직업 설계 원칙
 
@@ -68,8 +108,10 @@ M1 직업 슬롯:
 ## 6. 적과 스테이지 원칙
 
 - 일반 적은 `EnemyPatternSteps`의 순차 패턴으로 행동한다.
-- `EnemyPatternRunnerComponent`는 표의 다음 Step을 `PreparedIntent` 런타임 Snapshot으로 만들고 `Prepare → Hold → Execute → Complete` 상태를 관리한다.
-- 밀치기나 이동은 준비된 ActionType/TileId를 바꾸지 않는다. 위치가 달라져 사거리가 맞지 않으면 예고 공격이 빗나간다.
+- `EnemyActionPlanComponent`는 공격 타일의 `INSERTING → TRACKING → ATTACK_READY → EXECUTING` 상태를 적별로 소유한다.
+- `EnemyPatternRunnerComponent`는 공격 주기 중 StepIndex를 유지하며, 추적 이동이 아니라 공격 실행이 끝난 뒤에만 다음 Step으로 전진한다.
+- `ATTACK_READY` 뒤의 밀치기나 이동은 준비된 ActionType/TileId를 바꾸지 않는다. 위치가 달라져 사거리가 맞지 않으면 예고 공격이 빗나간다.
+- `QUICK`은 현재 사거리·방향이 맞을 때만 타일 등록과 `ATTACK_READY`를 같은 적 행동에서 처리한다.
 - 보스는 HP 조건에 따라 PatternId를 바꾼다.
 - BT는 PatternStep으로 표현하기 어려운 요구가 확인된 후에만 도입한다.
 - 적의 초기 `Facing`은 생성 순간 한 번 결정한다. 기본 정책은 `FACE_PLAYER`이며, 특수 적이나 연출은 `FIXED_LEFT`/`FIXED_RIGHT` 또는 스테이지 배치의 `FacingOverride`를 사용한다.
@@ -86,6 +128,17 @@ M1 직업 슬롯:
 - 스테이지는 AugmentPoolId를 데이터로 정의한다.
 - 여러 스테이지는 `RegionDefinitions`/`NodeDefinitions`로 묶은 지역 단위 지도판·노드맵으로 진행한다. 지역 하나는 일반 전투 노드 여러 개와 보스 노드 하나로 구성되고, 다음 지역은 `UnlockRegionId`로 이전 지역 보스 클리어를 조건으로 연다.
 - 지역별 등장 몬스터는 `EnemySpawnPools`(MonsterPoolId)로 정의하며, 헤네시스/엘리니아/슬리피우드처럼 지역마다 다른 몬스터 구성을 원시 타입 변경 없이 표로 교체한다.
+- 모든 마을 간 연결은 `출발 마을 → SHOP 노드 → 도착 마을`의 3단계 Edge로 정의한다. 도시 UI가 상점 로직을 직접 소유하지 않는다.
+- 출발 마을의 클리어 조건을 만족하면 해당 Edge의 상점이 열리고, 상점 방문을 마치면 연결된 다음 마을이 선택 가능해진다.
+- 현재 프로토타입은 헤네시스 `1-1` 클리어를 첫 Edge 해금 조건으로 사용한다. 정식 지역 확장 시에는 각 `RegionDefinitions`의 최종 노드 또는 보스 클리어를 기본 조건으로 사용한다.
+- 상점 방문 여부, 구매 결과, 선택 경로와 현재 마을은 서버 권위의 플레이어 Run 상태가 소유한다. 월드맵 UI는 이 Snapshot을 표시하고 요청만 전송한다.
+- 각 Edge 상점은 서로 다른 방문 `NodeId`를 유지하고 공통 `shop_relic`을 사용하며 `ShopVisitBtn` UI와 공통 Shop Controller를 재사용한다.
+- `StageMapRoutes`는 각 StageId를 소속 Region의 `region_XX_battle` 또는 `region_XX_boss`로 라우팅한다. 서로 다른 마을을 하나의 Region 물리 맵으로 합치지 않는다.
+- 헤네시스 보스 뒤에는 위·아래 상점 중 하나를 고르는 배타적 분기가 있다. 서버가 승인한 `SelectedNodeId`와 상점 방문 상태의 `ActiveNodeId`가 현재 런의 경로 원본이며, 상점 완료 뒤에도 반대 경로는 잠긴다.
+- 두 분기는 같은 `shop` 물리 맵과 공통 `shop_relic`의 33종을 사용한다. 미보유 유물 중 동일 가중치로 하나만 진열하고 같은 방문에서는 재추첨하지 않는다. 구매 후 판매 완료로 남으며 미구매 퇴장과 전체 보유 시 빈 상점 퇴장을 허용한다.
+- 유물 가격은 1골드, 보유는 현재 런 한정이다. 안경·펜던트·귀고리는 공격력 +1, 모자·신발은 최대 및 현재 체력 +1, 견장·벨트·옷은 방어력 +1이다. 여러 능력치와 서로 다른 유물 효과를 합산한다.
+- 서버가 ID 정렬 후보를 RunSeed·NodeId·방문 순번으로 결정적으로 추첨하고 진열 ID만 구매 허용한다. 데이터 정의와 가격은 새 런에 캡처하며 진행 중인 런에는 변경을 소급하지 않는다.
+- 체력은 이전 적용 합계와 차이만 반영해 5/10→6/11을 유지한다. 실제 양수 타격마다 공격력을 더하고 방어력을 빼되 최소 피해 1, UtilityGuardActive는 0을 유지한다. 빗나감·회복에는 적용하지 않는다.
 
 ## 7. 증강 원칙
 
@@ -95,7 +148,7 @@ M1 직업 슬롯:
 - 최종 규격은 Unique, StackAdd, StackRefresh, ExclusiveGroup 정책을 지원한다. 현재 구현은 Unique 1스택뿐이며 나머지는 계획 단계다.
 - 이벤트 무한 재귀를 막기 위해 SourceTag와 MaxDepth를 둔다.
 - 계획된 확률 기반 증강(예: "50% 확률로 후방 공격")은 `ConditionType=CHANCE_ROLL`과 `ConditionValue`(0.0~1.0)로 표현하며, 판정은 RunSeed 기반 결정적 롤을 사용한다. Router/Validator 구현 전에는 실전 데이터에 사용하지 않는다.
-- 유물(상점에서 얻는 시작 증강 포함)도 같은 `AugmentDefinitions`/`AugmentEffects` 스키마를 사용한다. 유물 전용 별도 테이블을 만들지 않는다.
+- 증강은 `AugmentDefinitions`/`AugmentEffects`를 사용하고, 런 상점 유물은 `RelicDefinitions`의 `AttackBonus`·`MaxHpBonus`·`DefenseBonus`를 사용한다. 유물 효과는 `PlayerRunRelicEffectComponent`가 관리한다.
 
 ## 8. MSW 구현 결정
 
@@ -104,6 +157,7 @@ M1 직업 슬롯:
 | 전투 세션 | 맵 엔티티 `BattleSessionComponent` |
 | 보드 점유와 다중 유닛 | 맵 엔티티 `BoardStateComponent` |
 | 개별 적 패턴 상태 | 적 엔티티 `EnemyPatternRunnerComponent` |
+| 개별 적 공격 큐 상태 | 적 엔티티 `EnemyActionPlanComponent` |
 | 적 Intent 읽기 모델 | 서버 `PreparedIntent` Snapshot + Client용 읽기 전용 DTO/Event |
 | 스테이지/웨이브 진행 | 맵 엔티티 `StageFlowComponent` |
 | 전투 격리 | 플레이어당 Instance Room/Instance Map |
@@ -111,10 +165,12 @@ M1 직업 슬롯:
 | 정적 데이터 | UserDataSet + CSV |
 | UI | `.ui` + UIBuilder + ClientOnly Logic |
 | 적/플레이어 엔티티 | `.model` + ModelBuilder |
-| 맵 배치 | `.map` + MapBuilder |
+| 맵 배치 | Region별 `region_XX_battle.map` + `region_XX_boss.map`; 같은 Region 내부 일반 Stage만 전투 맵을 재사용하고 `StageId`와 `MapId`는 CSV로 분리 라우팅 |
+| 월드맵 진행 | `RegionDefinitions` + `NodeDefinitions` + 서버 `PlayerRunStateComponent` Snapshot |
+| 마을 간 상점 | Edge별 `NodeId`, 공통 `shop_relic` 및 `ShopVisitBtn`, RUN_SCOPED Shop Controller |
 | 전투 이벤트 | `@Event extends EventType` |
 | 무상태 규칙 | `@Logic` Resolver/Router |
-| 권장 맵 타입 | SideViewRectTile(2) |
+| 현재 전투 맵 타입 | MapleTile(0); 전투 유닛 이동은 물리 이동이 아닌 서버 권위 Cell Snapshot |
 
 협업 시 소유권은 다음과 같이 분리한다.
 
@@ -127,12 +183,23 @@ M1 직업 슬롯:
 ## 9. 로드맵
 
 - [ ] Phase 0 — 맵/이동/RPC/데이터/큐 재타깃 기술 검증
-- [ ] Phase 1 — 전투 코어 수직 슬라이스
+- [ ] Phase 1 — 전투 코어 수직 슬라이스 + CSV 기반 단일 전투 맵 재사용
+  - 🟡 통합 유물 상점 — 33종 미보유 랜덤 1개, 방문 고정·구매 검증·효과 합산·HP 차이 적용·단일 행/HUD·경로 잠금. 로컬 Lua 검증 완료, Maker Refresh·Play 검증 대기
+  - 🟡 엘리니아 전투 무대 1차 시각 패스 — 전투 구조는 유지하고 헤네시스 복제 장식을 엘리니아 숲 테마로 교체, Maker 화면 검토 대기
 - [ ] Phase 2 — 데이터 기반 타일과 일반 적
 - [ ] Phase 3 — 스테이지와 보스 패턴
 - [ ] Phase 4 — 직업 4종과 증강
 - [ ] Phase 5 — 제작자 검증 도구와 재현 테스트
 - [ ] Phase 6 — 연출, 저장, 출시 준비
+
+M1 이후 콘텐츠 확장 트랙:
+
+- [ ] 헤네시스 첫 분기 계약을 Dataset 기반 공통 City/Shop Edge로 전환
+- [ ] 커닝시티 지역 + 커닝시티→페리온 상점
+- [ ] 엘리니아 지역 + 엘리니아→노틸러스 상점
+- [ ] 페리온 지역 + 페리온→슬리피우드 상점
+- [ ] 노틸러스 지역 + 노틸러스→슬리피우드 상점
+- [ ] 슬리피우드 합류 지역과 양쪽 경로 회귀 검증
 
 세부 완료 조건은 `MapleTactics-M1-Implementation-Plan.md`를 따른다.
 
@@ -142,7 +209,9 @@ M1 직업 슬롯:
 - 새로운 효과를 완전히 무코드로 정의하는 범용 스크립팅 언어는 만들지 않는다.
 - 모든 일반 적을 BT로 제작하지 않는다.
 - 메타 진행, 과금 연동, 랭킹은 M1 코어 루프 이후로 미룬다.
-- M1은 `ShopDefinitions`/`ShopEntries` 기반 RUN_SCOPED 런 상점의 서버 흐름과 디버그 DTO를 포함한다. 최종 상점 UI와 `ShopItemDefinitions` 기반 Meta/World Shop, 영구 구매 상태, 실제 결제 연동은 이후 범위다.
+- M1은 `ShopDefinitions`/`ShopEntries` 기반 RUN_SCOPED 런 상점의 서버 흐름, NPC 상점 UI와 디버그 DTO를 포함한다. `ShopItemDefinitions` 기반 Meta/World Shop, 장착, 영구 구매 상태, 실제 결제 연동은 이후 범위다.
+- 커닝시티·엘리니아·페리온·노틸러스·슬리피우드의 완성 전투 콘텐츠는 M1 수직 슬라이스 이후 범위다. M1에서는 6개 도시 표시, 첫 분기, 공통 상점 Edge 계약까지만 검증한다.
+- 상점 퇴장 뒤 엘리니아·커닝시티 경로의 잠금 표시는 M1에 포함하지만 실제 목적지 맵과 Stage 연결은 후속 Backlog다.
 - 스테이지 클리어 보상(`StageRewardDefinitions`)으로 `RUN_SCOPED`/`META_PERSISTENT` 재화를 지급하는 흐름은 M1 범위에 포함한다. `PREMIUM_CASH` 재화는 보상으로 지급하지 않는다.
 
 ## 11. 성공 기준
@@ -157,6 +226,7 @@ M1 직업 슬롯:
 
 | 날짜 | 유형 | 변경 | 이유 | 영향 |
 |---|---|---|---|---|
+| 2026-08-30 | 추가 | `ellinia_battle` 1차 시각 패스를 Phase 1 준비 작업으로 선행 | 아래쪽 상점 경로의 다음 지역 분위기를 먼저 확정하기 위함 | 전투 구조·Stage 라우팅은 유지하고 맵 장식만 변경; 실제 엘리니아 Stage 연결은 Roadmap Backlog 유지 |
 | 2026-07-17 | 수정 | 일반 Lua 상속/인터페이스에서 MSW Component 조합으로 변경 | mLua 등록과 실행 공간에 맞추기 위함 | 구현 구조 전반 |
 | 2026-07-17 | 수정 | Service 확장 Manager를 BattleSessionComponent/Logic으로 변경 | 사용자 스크립트 수명과 상태 권한 교정 | 00_Core/01_Combat |
 | 2026-07-17 | 수정 | 일반 적 BT+FSM+Pattern 중첩을 Pattern Runner로 단순화 | 상태 권한 중복과 제작 난이도 감소 | AI 구조 |
@@ -176,3 +246,12 @@ M1 직업 슬롯:
 | 2026-08-01 | 수정 | 일반 타일 등록과 큐 실행을 분리하고, 등록 후 적 턴에도 큐를 유지하는 쇼군식 흐름 및 기본+Modifier 큐 용량 계약을 확정 | 큐를 쌓는 동안 위치·방향을 조정한 뒤 별도 실행 키로 전체 큐를 해소하는 핵심 플레이를 구현하기 위함 | BattleTurn/BattleSession, BattleQueueHUD, UI 상태 DTO, Queue Modifier API |
 | 2026-08-01 | 수정 | 직업 시작 스킬과 직업 고유 메커니즘을 분리하고 구 TileDefinitions 명칭을 실제 SkillDefinitions 규격으로 통합 | 쇼군식 공격 타일과 캐릭터 고유 이동·전투 규칙은 실행 수명과 턴/쿨타임 계약이 다르므로 독립 확장점이 필요함 | JobDefinitions, JobStartingSkillEntries, JobMechanic Router, Data Dictionary §2~5 |
 | 2026-08-03 | 수정 | 구현 상태 표기와 상점 책임을 정리하고, 증강 허용값·StackPolicy·EnemyDrop 장 번호를 실제 코드에 맞춤 | 표 기반 제작자가 미구현 값을 지원 값으로 오해하거나 런 상점과 Meta/World Shop 데이터를 혼용하지 않도록 하기 위함 | Data-Dictionary §1/§14/§15/§20~23, GDD §7/§10, 관련 제작 가이드 |
+| 2026-08-15 | 수정 | 적 공격 타일 등록과 공격 예고를 분리하고, 타일을 보유한 채 사거리까지 추적한 뒤 대응 턴 후 고정 실행하는 흐름으로 확장 | 사거리 진입 뒤에야 큐를 만드는 현재 동작을 참고작의 읽을 수 있는 적 공격 주기에 맞추고, 회피·밀치기로 예고 공격을 빗나가게 하는 전술을 보존하기 위함 | GDD §3/§6/§8, Phase 1 Slice 10.6, Shogun Queue Plan Slice 6, 전용 수정 계획 |
+| 2026-08-22 | 수정 | 모든 전투 StageId를 `region_01_battle` 물리 맵으로 라우팅하고 스테이지 콘텐츠는 CSV의 StageId로만 선택 | 전투 맵을 한 번만 꾸미고 여러 스테이지가 동일한 컴포넌트 구성을 재사용하도록 하기 위함 | StageMapRoutes, BattleSession 맵 설정, SectorConfig, Phase 1 Slice 14; Static Map 운영을 위해 월드 최대 인원 1명으로 제한 |
+| 2026-08-22 | 수정 | 1-1~1-3은 헤네시스 일반전 공용 맵을 유지하고 1-4는 `region_01_boss` 전용 물리 맵으로 분리 | 일반 스테이지 재사용 이점은 유지하면서 머쉬맘 보스전의 배경·전조 가독성과 공간 연출을 독립 조정하기 위함 | StageMapRoutes, 물리 맵 2종, Phase 1 Slice 14~15 |
+| 2026-08-25 | 수정 | 등록 CSV 자산으로 6도시 월드맵을 재구성하고 헤네시스 클리어 후 위·아래 상점 중 하나를 선택하는 분기 추가. 위쪽은 커닝시티, 아래쪽은 엘리니아의 동일 1-2 전투로 연결 | 참고 이미지의 상·하 경로 선택과 다음 전투 전 선택적 상점 동선을 구현하기 위함 | `PopupGroup.ui`, `MinimapUI`, `PlayerRunStateComponent`, `RunManagerLogic`, 월드맵 Stage 버튼, Phase 1 Slice 16 |
+| 2026-08-26 | 수정 | 6개 마을 전체 경로와 모든 마을 사이의 Edge 상점을 확정하고 각 마을을 `region_01`~`region_06` 독립 Region·물리 맵 세트로 분리 | 첫 분기 전용 구현을 반복 가능한 구조로 확장하면서 마을별 배경·몬스터·보스 연출을 독립 제작하기 위함 | GDD 플레이 루프·지역/맵 규칙·MSW 구현 결정·로드맵, Phase 1 후속 확장 순서 |
+| 2026-08-29 | 추가 | 헤네시스 보스 뒤 위·아래 런 상점 분기와 선택 경로 잠금, 33종 무능력치 런 아이템 상점 UI를 M1에 추가 | 보스 뒤 선택·소비·다음 지역 예고까지 하나의 플레이 가능한 런 흐름으로 연결하기 위함 | GDD §6/§9/§10, Phase 1 분기형 런 상점, NodeDefinitions·ShopDefinitions·ShopEntries, 월드맵·shop.map |
+| 2026-08-29 | 수정 | 전투 맵 타입 문서를 실제 `MapleTile(0)` 구현에 맞추고 `region_05` 노틸러스 콘텐츠 확장을 시작 | 문서의 SideViewRectTile 표기가 실제 전투 맵·Foothold 구성과 달랐으며, 지역 번호와 진행 난이도를 분리해야 함 | GDD §8, Region/Stage/Map 데이터, 노틸러스 제작 가이드 |
+| 2026-09-03 | 추가 | 적 Pattern 공용 행동에 피해 스킬로 끊을 수 있는 `CAST_INTERRUPTIBLE`을 추가하고 킹크랑 2 Phase 버블 캐논에 적용 | 플레이어가 보스의 강한 공격을 수동적으로 피하기만 하지 않고 큐 구성과 공격 횟수로 대응하게 하며, 보스 ID 하드코딩 없이 다른 적도 같은 규격을 재사용하기 위함 | EnemyPatternSteps, EnemyActionPlan, Battle UI DTO, Boss 제작 가이드 |
+| 2026-09-12 | 수정 | 두 상점 목록을 shop_relic 33종 랜덤 단일 진열로 통합하고 유물 세 능력치 추가 | 사용자 확정 계획 구현 | 데이터 사전 §20, Phase 1; 경로 식별은 NodeId 유지, Maker 검증 대기 |

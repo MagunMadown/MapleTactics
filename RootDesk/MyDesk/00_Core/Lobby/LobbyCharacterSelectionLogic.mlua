@@ -1,0 +1,873 @@
+@Logic
+script LobbyCharacterSelectionLogic extends Logic
+
+	property string JobSelectionScreenPath = "/ui/CharacterSelectionUI/JobSelectionScreen"
+	property string JobNameTextPath = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/JobNameText"
+	property string JobDescriptionTextPath = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/JobDescriptionText"
+	property string SelectionStatusTextPath = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/SelectionStatusText"
+	property string ConfirmJobButtonPath = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/ConfirmJobButton"
+	property string CancelJobButtonPath = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/CancelJobButton"
+	property string CharacterPreviewPath = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/CharacterPreviewArea/CharacterPreview"
+	property string StartingSkillsTitleTextPath = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/StartingSkillsTitleText"
+	property string StartingSkillSlot01Path = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/StartingSkillSlot01"
+	property string StartingSkillSlot02Path = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/StartingSkillSlot02"
+	property string StartingSkillIcon01Path = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/StartingSkillSlot01/StartingSkillIcon01"
+	property string StartingSkillIcon02Path = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/StartingSkillSlot02/StartingSkillIcon02"
+	property string InteractionZonePath = "/maps/lobby/Lobby_2F/FutureZones/CharacterSelectZone"
+	property string JobOrderCsv = "warrior,archer,mage,thief,pirate"
+
+	-- UI banner images only. These do not drive player equipment or preview weapon selection.
+	-- Empty values intentionally leave the reserved image slots blank.
+	property string WarriorCardImageRuid = ""
+	property string ArcherCardImageRuid = ""
+	property string MageCardImageRuid = ""
+	property string ThiefCardImageRuid = ""
+	property string PirateCardImageRuid = ""
+	-- Title frames are independent UI-only slots; empty values render no image.
+	property string WarriorTitleIconRUID = "9d5405ee7c69409cb54fa980e0d1cf42"
+	property string ArcherTitleIconRUID = "6fa6efdb073a4d83b7e9f6e94f833bdd"
+	property string MagicianTitleIconRUID = "3b67b689bc5d40d1b1277a9aafc8b824"
+	property string ThiefTitleIconRUID = "f4f744958bcc4a938e38606200581a0d"
+	property string PirateTitleIconRUID = "c82cf8bda4894c75a5ed9d86823db9b0"
+	-- Optional center images; empty values keep the UI-only stage visible.
+	property string WarriorCenterBackgroundRUID = "5f5e9d295551497eae3929525ea47e7d"
+	property string ArcherCenterBackgroundRUID = "e792c03aac5041f381e9cb9524c16178"
+	property string MagicianCenterBackgroundRUID = "efca36ec2d7842c59c9a1183bc286f4a"
+	property string ThiefCenterBackgroundRUID = "91dd229c0f284039a221eb208024b6fb"
+	property string PirateCenterBackgroundRUID = "e3b173acc0054e4386b848d43b998f12"
+	-- Shared UI effect fallback; per-job background overrides remain independent.
+	property string CenterBackgroundEffectRUID = "cee8164a77ea46e2b89f4ebb4e0721b2"
+	property Entity CenterBackgroundEntity = nil
+
+	property Entity JobSelectionScreen = nil
+	property TextGUIRendererComponent JobNameText = nil
+	property TextGUIRendererComponent JobDescriptionText = nil
+	property TextGUIRendererComponent SelectionStatusText = nil
+	property TextGUIRendererComponent StartingSkillsTitleText = nil
+	property TextGUIRendererComponent StartingSkillSlot01Text = nil
+	property TextGUIRendererComponent StartingSkillSlot02Text = nil
+	property SpriteGUIRendererComponent StartingSkillIcon01Renderer = nil
+	property SpriteGUIRendererComponent StartingSkillIcon02Renderer = nil
+	property AvatarGUIRendererComponent CharacterPreviewRenderer = nil
+	property ButtonComponent ConfirmJobButton = nil
+	property ButtonComponent CancelJobButton = nil
+	property any ConfirmClickHandler = nil
+	property any CancelClickHandler = nil
+	property any AvailableClasses = nil
+	property boolean IsUiConnected = false
+	property boolean IsPopupOpen = false
+	property boolean IsApplyPending = false
+	property boolean NeedsPreviewRefresh = false
+	property boolean IsPreviewAppearanceReady = false
+	property boolean PreviewAppearanceFailureLogged = false
+	property integer PreviewAppearanceRetryCount = 0
+	property integer MaxPreviewAppearanceRetryCount = 120
+	property integer PreviewWeaponRetryCount = 0
+	property integer MaxPreviewWeaponRetryCount = 120
+	property string AppliedPreviewWeaponJobId = ""
+	property string PendingClassId = ""
+	property string SelectedClassId = ""
+	property integer SelectedJobIndex = 1
+	property integer RequestId = 0
+	property integer PreviewRevision = 0
+	property table JobCardBindings = {}
+	property Entity PassiveSlot = "62795ccd-6a12-47a9-8844-cdb36b5a001a"
+	property any PassiveEnterHandler = nil
+	property any PassiveExitHandler = nil
+	property boolean IsPassiveHovered = false
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleSelectionKeyDown(KeyDownEvent event)
+		if self.IsPopupOpen == false or self.IsApplyPending then
+			return
+		end
+		-- This popup only handles closing; cards and the confirm button own selection.
+		if event.key == KeyboardKey.Escape then
+			self:OnCancelClicked()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Initialize the existing selection flow; banners replace the old page dots.
+		self.AvailableClasses = {}
+		self.IsPreviewAppearanceReady = false
+		self.PreviewAppearanceFailureLogged = false
+		self.PreviewAppearanceRetryCount = 0
+		self.PreviewWeaponRetryCount = 0
+		self.AppliedPreviewWeaponJobId = ""
+		self:LoadAvailableJobs()
+		self:EnsureUiConnection()
+		self:SetPopupEnabled(false)
+		log("[LobbyClassSelect] cards ready availableJobs=" .. #self.AvailableClasses)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Keep a superseded preview request from consuming the latest refresh.
+		if self.IsPopupOpen and self.NeedsPreviewRefresh then
+			local revision = self.PreviewRevision
+			local ready = self:RefreshCharacterPreview()
+			if revision == self.PreviewRevision then
+				self.NeedsPreviewRefresh = ready == false
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		self:DisconnectUiEvents()
+		self.IsPopupOpen = false
+		self.IsApplyPending = false
+		self.NeedsPreviewRefresh = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean OpenPopup()
+		-- Reuse the confirmed state and refresh the single preview on every open.
+		if self.IsPopupOpen then
+			log("[LobbyCharacterSelect] open ignored reason=ALREADY_OPEN")
+			return false
+		end
+		if self:EnsureUiConnection() == false then
+			log_error("[LobbyCharacterSelect] open failed reason=UI_BINDING_MISSING")
+			return false
+		end
+
+		self:LoadAvailableJobs()
+		if #self.AvailableClasses == 0 then
+			log_error("[LobbyClassSelect] open failed reason=NO_AVAILABLE_JOB")
+			return false
+		end
+		self.PreviewRevision = self.PreviewRevision + 1
+		self.SelectedClassId = self:GetSelectedClassId()
+		self.SelectedJobIndex = self:FindJobIndex(self.SelectedClassId)
+		if self.SelectedJobIndex == 0 then
+			self.SelectedJobIndex = 1
+		end
+		self.PendingClassId = self.AvailableClasses[self.SelectedJobIndex].Id
+		self.IsApplyPending = false
+		self.IsPreviewAppearanceReady = false
+		self.PreviewAppearanceFailureLogged = false
+		self.PreviewAppearanceRetryCount = 0
+		self.PreviewWeaponRetryCount = 0
+		self.AppliedPreviewWeaponJobId = ""
+		self.IsPopupOpen = true
+		self:SetPopupEnabled(true)
+		self:SetStatus("")
+		self:RefreshView()
+		log("[LobbyClassSelect] opened previewJob=" .. self.PendingClassId .. " selectedJob=" .. self.SelectedClassId)
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClosePopup(boolean selectionApplied)
+		-- Invalidate in-flight preview work while preserving the existing cancel rules.
+		if self.IsPopupOpen == false then
+			return
+		end
+		self.PreviewRevision = self.PreviewRevision + 1
+		self.IsPopupOpen = false
+		self.IsApplyPending = false
+		self.NeedsPreviewRefresh = false
+		self.IsPreviewAppearanceReady = false
+		self.PreviewAppearanceFailureLogged = false
+		self.PreviewAppearanceRetryCount = 0
+		self.PreviewWeaponRetryCount = 0
+		self.AppliedPreviewWeaponJobId = ""
+		self.PendingClassId = ""
+		self:SetPopupEnabled(false)
+		self:RestoreInteractionPrompt()
+		log("[LobbyClassSelect] closed applied=" .. tostring(selectionApplied) .. " selectedJob=" .. self.SelectedClassId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsOpen()
+		return self.IsPopupOpen
+	end
+
+
+
+
+	@ExecSpace("ClientOnly")
+	method void SelectJobIndex(integer index)
+		-- Update only the existing client-side pending selection.
+		if self.IsPopupOpen == false or self.IsApplyPending or self.AvailableClasses[index] == nil then
+			return
+		end
+		-- A different job restarts the shared effect without touching the avatar.
+		if self.PendingClassId ~= self.AvailableClasses[index].Id and isvalid(self.CenterBackgroundEntity) then
+			local renderer = self.CenterBackgroundEntity.SpriteGUIRendererComponent
+			renderer.Enable = false
+			renderer.ImageRUID = DataRef("")
+			renderer.PlayRate = 1
+		end
+		self.PreviewRevision = self.PreviewRevision + 1
+		self.SelectedJobIndex = index
+		self.PendingClassId = self.AvailableClasses[self.SelectedJobIndex].Id
+		self.PreviewWeaponRetryCount = 0
+		self:SetStatus("")
+		self:RefreshView()
+		log("[LobbyClassSelect] preview changed index=" .. self.SelectedJobIndex .. " jobId=" .. self.PendingClassId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCancelClicked()
+		if self.IsApplyPending == false then
+			self:ClosePopup(false)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnConfirmClicked()
+		if self.IsPopupOpen == false or self.IsApplyPending then
+			return
+		end
+		if self:IsAvailableClass(self.PendingClassId) == false then
+			self:SetStatus("사용 가능한 직업을 선택하세요.")
+			self:RefreshView()
+			return
+		end
+
+		self.IsApplyPending = true
+		self.RequestId = self.RequestId + 1
+		self:SetStatus("선택을 적용하는 중입니다...")
+		self:RefreshView()
+		log("[LobbyClassSelect] confirm requested id=" .. self.PendingClassId .. " request=" .. self.RequestId)
+		self:RequestConfirmClass(self.PendingClassId, self.RequestId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestConfirmClass(string classId, integer requestId)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if isvalid(player) == false or player.PlayerComponent == nil then
+			self:NotifyConfirmResult(requestId, false, "PLAYER_UNAVAILABLE", classId, senderUserId)
+			return
+		end
+
+		local jobDefinition = _JobDefinitionRepositoryLogic:GetJobDefinition(classId)
+		if jobDefinition.Success == false or jobDefinition.Enabled == false then
+			log_warning("[LobbyClassSelect] confirm rejected user=" .. senderUserId .. " jobId=" .. classId .. " reason=JOB_UNAVAILABLE")
+			self:NotifyConfirmResult(requestId, false, "JOB_UNAVAILABLE", classId, senderUserId)
+			return
+		end
+
+		local state = self:GetOrCreateTemporaryClassState(player)
+		if state == nil then
+			self:NotifyConfirmResult(requestId, false, "TEMPORARY_CLASS_STATE_UNAVAILABLE", classId, senderUserId)
+			return
+		end
+		-- Apply the same data-driven weapon as the preview to the actual lobby avatar.
+		local weapon = _WeaponDefinitionRepositoryLogic:GetWeaponDefinition(jobDefinition.PreviewWeaponId or "")
+		if weapon == nil or weapon.Success == false then
+			self:NotifyConfirmResult(requestId, false, "JOB_WEAPON_UNAVAILABLE", classId, senderUserId)
+			return
+		end
+		local equipped = _PrototypeWeaponController:EquipWeaponDefinition(player, weapon)
+		if equipped.Success == false then
+			self:NotifyConfirmResult(requestId, false, equipped.Reason, classId, senderUserId)
+			return
+		end
+		state:SetSelectedJobId(classId)
+		self:OnClassConfirmed(player, classId)
+		log("[LobbyClassSelect] confirm success user=" .. senderUserId .. " classId=" .. classId)
+		self:NotifyConfirmResult(requestId, true, "OK", classId, senderUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateTemporaryClassState(Entity player)
+		local state = player:GetComponent("script.TemporaryClassSelectionStateComponent")
+		if state == nil then
+			state = player:AddComponent("TemporaryClassSelectionStateComponent")
+		end
+		return state
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnClassConfirmed(Entity player, string classId)
+		local event = TemporaryClassConfirmedEvent()
+		event.ClassId = classId
+		player:SendEvent(event)
+		log("[LobbyClassSelect] OnClassConfirmed player=" .. player.Name .. " classId=" .. classId)
+	end
+
+	@ExecSpace("Client")
+	method void NotifyConfirmResult(integer requestId, boolean success, string reason, string classId)
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.PlayerComponent == nil then
+			return
+		end
+		if self.IsPopupOpen == false or self.IsApplyPending == false or requestId ~= self.RequestId then
+			return
+		end
+
+		self.IsApplyPending = false
+		if success then
+			self.SelectedClassId = classId
+			self:SetStatus("선택이 적용되었습니다.")
+			self:ClosePopup(true)
+			return
+		end
+
+		self:SetStatus("선택 적용 실패: " .. reason)
+		self:RefreshView()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void LoadAvailableJobs()
+		local providerEntries = _LobbyJobSelectionProvider:GetEntries()
+		local entriesById = {}
+		for _, entry in ipairs(providerEntries) do
+			entriesById[entry.Id] = entry
+		end
+		self.AvailableClasses = {}
+		for jobId in string.gmatch(self.JobOrderCsv or "", "([^,]+)") do
+			local entry = entriesById[jobId]
+			if entry ~= nil then
+				table.insert(self.AvailableClasses, entry)
+				entriesById[jobId] = nil
+			end
+		end
+		for _, entry in ipairs(providerEntries) do
+			if entriesById[entry.Id] ~= nil then
+				table.insert(self.AvailableClasses, entry)
+				entriesById[entry.Id] = nil
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshView()
+		-- Refresh all presentation from the same pending job and provider snapshot.
+		if self.IsPopupOpen == false then
+			return
+		end
+		local selected = self.AvailableClasses[self.SelectedJobIndex]
+		if selected == nil then
+			self.JobNameText.Text = "선택 가능한 직업이 없습니다"
+			self.JobDescriptionText.Entity:SetEnable(false)
+			self:SetStartingSkill(self.StartingSkillSlot01Text, self.StartingSkillIcon01Renderer, "", "")
+			self:SetStartingSkill(self.StartingSkillSlot02Text, self.StartingSkillIcon02Renderer, "", "")
+			self.StartingSkillsTitleText.Entity:SetEnable(false)
+		else
+			self.PendingClassId = selected.Id
+			self.JobNameText.Text = selected.Name
+			local description = self:GetJobIntroduction(selected.Id)
+			local hasDescription = description ~= ""
+			self.JobDescriptionText.Entity:SetEnable(hasDescription)
+			if hasDescription then
+				self.JobDescriptionText.Text = description
+			end
+			self:SetStartingSkill(self.StartingSkillSlot01Text, self.StartingSkillIcon01Renderer, selected.StartingSkill01, selected.StartingSkill01IconRuid)
+			self:SetStartingSkill(self.StartingSkillSlot02Text, self.StartingSkillIcon02Renderer, selected.StartingSkill02, selected.StartingSkill02IconRuid)
+			local hasStartingSkill = (selected.StartingSkill01 or "") ~= "" or (selected.StartingSkill02 or "") ~= ""
+			self.StartingSkillsTitleText.Entity:SetEnable(hasStartingSkill)
+		end
+
+		self:RefreshPassiveSlot()
+		self:RefreshJobCards()
+		local confirmLabel = self.ConfirmJobButton.Entity.TextGUIRendererComponent
+		if confirmLabel ~= nil then
+			confirmLabel.Text = self.IsApplyPending and "적용 중..." or (selected ~= nil and selected.Name .. " 선택" or "직업 선택")
+		end
+		self.NeedsPreviewRefresh = true
+		local canConfirm = selected ~= nil and self.IsApplyPending == false
+		self.ConfirmJobButton.Enable = canConfirm
+		if self.ConfirmJobButton.Entity.SpriteGUIRendererComponent ~= nil then
+			if canConfirm then
+				self.ConfirmJobButton.Entity.SpriteGUIRendererComponent.Color = Color(0.20, 0.55, 0.32, 1.00)
+			else
+				self.ConfirmJobButton.Entity.SpriteGUIRendererComponent.Color = Color(0.24, 0.24, 0.24, 0.75)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetStartingSkill(TextGUIRendererComponent renderer, SpriteGUIRendererComponent iconRenderer, string displayName, string iconRuid)
+		-- Keep the row and its separate icon/label children on the same data state.
+		if renderer == nil or isvalid(renderer.Entity) == false then
+			return
+		end
+		local hasSkill = displayName ~= nil and displayName ~= ""
+		if isvalid(renderer.Entity.Parent) then
+			renderer.Entity.Parent:SetEnable(hasSkill)
+		end
+		renderer.Entity:SetEnable(hasSkill)
+		if hasSkill then
+			renderer.Text = displayName
+		end
+		if iconRenderer == nil or isvalid(iconRenderer.Entity) == false then
+			return
+		end
+		local hasIcon = hasSkill and iconRuid ~= nil and iconRuid ~= ""
+		if hasIcon then
+			iconRenderer.ImageRUID = DataRef(iconRuid)
+			iconRenderer:SetAlpha(1.0)
+			iconRenderer.Entity:SetEnable(true)
+		else
+			iconRenderer:SetAlpha(0.0)
+			iconRenderer.Entity:SetEnable(false)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetJobIntroduction(string jobId)
+		-- Describe the current skill kit; these introductions do not change combat balance.
+		if jobId == "warrior" then return "돌진으로 거리를 좁히고\n방어 강화로 정면을 버팁니다." end
+		if jobId == "archer" then return "사거리를 활용해 적을 노리고\n공격 순서로 연계를 완성합니다." end
+		if jobId == "mage" then return "빙결·독·화상으로 압박하고\n회복과 보호로 위기를 넘깁니다." end
+		if jobId == "thief" then return "적의 뒤를 넘나들며\n표창 연타와 독으로 몰아칩니다." end
+		if jobId == "pirate" then return "연속 사격과 근접 공격을 섞고\n밀치기·후퇴로 거리를 조절합니다." end
+		return ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetPassivePresentation()
+		-- Show the same validated utility skill that combat assigns to this job.
+		local selected = self.AvailableClasses[self.SelectedJobIndex]
+		if selected == nil then
+			return { Label = "없음", Text = "직업을 선택하면 고유 능력을 확인할 수 있습니다." }
+		end
+		local utility = selected.Utility
+		if utility == nil then return { Label = "로딩 중", Text = "고유 스킬 정보를 불러오는 중입니다." } end
+		local step = utility.Step
+		local description = ""
+		if step.EffectType == "GUARD" then
+			description = "다음 자신의 턴까지 받는 모든 피해를 막습니다."
+		elseif step.EffectType == "PUSH_DISTANCE" then
+			description = "앞칸의 적을 최대 " .. tostring(step.Value) .. "칸 밀어냅니다.\n이동할 칸이 막혀 있으면 그 앞에서 멈춥니다."
+			if step.EffectSetId == "fairy_turn_effects" then description = description .. "\n벽이나 몬스터에 막히면 밀리던 적이 1턴 기절합니다.\nHEAVY 특성의 적은 밀려나지 않습니다." end
+		elseif step.EffectType == "THROW_BEHIND" then
+			description = "앞칸의 적을 자신의 뒤 " .. tostring(step.Value) .. "칸으로 넘깁니다.\n착지할 칸이 비어 있어야 하며, 무거운 적은 넘길 수 없습니다."
+		elseif step.ParameterA == "FARTHEST_EMPTY_FORWARD" then
+			description = "바라보는 방향에서 가장 먼 빈칸으로 순간이동합니다."
+		elseif step.ParameterA == "BEHIND_FARTHEST_ENEMY_FORWARD" then
+			description = "바라보는 방향의 가장 먼 적 뒤로 이동한 뒤\n그 적을 향해 돌아섭니다. 착지할 칸이 비어 있어야 합니다."
+		end
+		local label, replacements = string.gsub(utility.Name, " ", "\n")
+		return { Label = label, Text = selected.Name .. " · " .. utility.Name .. "\n" .. description .. "\n재사용 대기시간: " .. tostring(utility.Cooldown) .. "턴" }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshPassiveSlot()
+		-- Update the existing compact slot and an already-open tooltip when selection changes.
+		if not isvalid(self.PassiveSlot) or self.PassiveSlot.TextGUIRendererComponent == nil then return end
+		local presentation = self:GetPassivePresentation()
+		self.PassiveSlot.TextGUIRendererComponent.Text = presentation.Label
+		if self.IsPassiveHovered then self:ShowPassiveTooltip() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowPassiveTooltip()
+		-- Reuse the shared cursor-following tooltip; this slot never activates a combat action.
+		if not self.IsPopupOpen then return end
+		self.IsPassiveHovered = true
+		local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
+		local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
+		if tooltip ~= nil then
+			tooltip:Show("job_passive", self:GetPassivePresentation().Text)
+			log("[LobbyClassSelect] passive tooltip job=" .. self.PendingClassId)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HidePassiveTooltip()
+		-- Owner-scoped hiding cannot dismiss another screen's tooltip.
+		self.IsPassiveHovered = false
+		local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
+		local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
+		if tooltip ~= nil then tooltip:Hide("job_passive") end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshJobCards()
+		-- A border plus a text marker identifies selection; family cells are informational.
+		local centerImages = { warrior = self.WarriorCenterBackgroundRUID, archer = self.ArcherCenterBackgroundRUID, mage = self.MagicianCenterBackgroundRUID, thief = self.ThiefCenterBackgroundRUID, pirate = self.PirateCenterBackgroundRUID }
+		local centerPath = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/CharacterPreviewArea/CharacterPreviewBackgroundViewport/"
+		local centerImage = _EntityService:GetEntityByPath(centerPath .. "CharacterPreviewBackground")
+		local centerOverlay = _EntityService:GetEntityByPath(centerPath .. "ImageOverlay")
+		local centerRuid = centerImages[self.PendingClassId] or ""
+		if centerRuid == "" then centerRuid = self.CenterBackgroundEffectRUID end
+		if isvalid(centerImage) and centerImage.SpriteGUIRendererComponent ~= nil then
+			local renderer = centerImage.SpriteGUIRendererComponent
+			self.CenterBackgroundEntity = centerImage
+			-- Keep every job aura looping, including the fallback effect.
+			renderer.PlayRate = 1
+			renderer.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+			if renderer.ImageRUID.DataId ~= centerRuid then
+				renderer.Enable = false
+				renderer.PlayRate = 1
+				renderer.ImageRUID = DataRef(centerRuid)
+			end
+			renderer.Enable = centerRuid ~= ""
+		end
+		if isvalid(centerOverlay) then centerOverlay:SetEnable(centerRuid ~= "") end
+		for _, binding in ipairs(self.JobCardBindings) do
+			local selected = binding.JobId == self.PendingClassId
+			local available = self:IsAvailableClass(binding.JobId)
+			binding.Button.Enable = available and self.IsApplyPending == false
+			binding.Card.SpriteGUIRendererComponent.Outline = true
+			binding.Card.SpriteGUIRendererComponent.OutlineWidth = 1
+			binding.Card.SpriteGUIRendererComponent.OutlineColor = selected and binding.Accent or Color(binding.Accent.r, binding.Accent.g, binding.Accent.b, 0.36)
+			-- Native hover tint affects only the card fill; selection border and marker are independent.
+			local base = binding.BaseColor
+			local lift = selected and 0.13 or 0
+			binding.Card.SpriteGUIRendererComponent.Color = Color(base.r + lift, base.g + lift, base.b + lift, 1)
+			binding.Marker.Text = selected and "선택 중" or (available and "" or "사용 불가")
+			binding.Family:SetEnable(selected)
+			binding.Theme:SetEnable(selected)
+			if selected then self.JobNameText.FontColor = binding.TitleColor end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean ConnectJobCards()
+		-- Validate all five card trees before subscribing; resolve indices at click time.
+		local root = "/ui/CharacterSelectionUI/JobSelectionScreen/JobSelectionPanel/"
+		local jobs = { "warrior", "archer", "mage", "thief", "pirate" }
+		local cardImages = { self.WarriorCardImageRuid, self.ArcherCardImageRuid, self.MageCardImageRuid, self.ThiefCardImageRuid, self.PirateCardImageRuid }
+		local titleImages = { self.WarriorTitleIconRUID, self.ArcherTitleIconRUID, self.MagicianTitleIconRUID, self.ThiefTitleIconRUID, self.PirateTitleIconRUID }
+		local accents = { Color(0.95,0.59,0.60,1), Color(0.61,0.87,0.67,1), Color(0.79,0.66,1,1), Color(0.65,0.73,0.93,1), Color(0.94,0.81,0.53,1) }
+		local titles = { Color(0.57,0.25,0.28,1), Color(0.18,0.39,0.27,1), Color(0.37,0.23,0.59,1), Color(0.24,0.31,0.49,1), Color(0.49,0.35,0.13,1) }
+		local backgrounds = { Color(0.329,0.231,0.278,1), Color(0.188,0.306,0.275,1), Color(0.286,0.239,0.388,1), Color(0.204,0.263,0.361,1), Color(0.357,0.294,0.212,1) }
+		local bindings = {}
+		for index, jobId in ipairs(jobs) do
+			local card = _EntityService:GetEntityByPath(root .. "JobCards/Card_" .. jobId)
+			local image = _EntityService:GetEntityByPath(root .. "JobCards/Card_" .. jobId .. "/Symbol/WeaponImage")
+			if isvalid(image) and image.SpriteGUIRendererComponent ~= nil then
+				local imageRuid = cardImages[index] or ""
+				local renderer = image.SpriteGUIRendererComponent
+				renderer.Enable = false
+				renderer.ImageRUID = DataRef(imageRuid)
+				renderer.Enable = imageRuid ~= ""
+			end
+			local marker = _EntityService:GetEntityByPath(root .. "JobCards/Card_" .. jobId .. "/SelectedMark")
+			local family = _EntityService:GetEntityByPath(root .. "InnerContentPanel/Family_" .. jobId)
+			local titleImage = _EntityService:GetEntityByPath(root .. "InnerContentPanel/Family_" .. jobId .. "/JobEmblem/Image")
+			if isvalid(titleImage) and titleImage.SpriteGUIRendererComponent ~= nil then
+				local titleRuid = titleImages[index] or ""
+				titleImage.SpriteGUIRendererComponent.Enable = false
+				titleImage.SpriteGUIRendererComponent.ImageRUID = DataRef(titleRuid)
+				titleImage.SpriteGUIRendererComponent.Enable = titleRuid ~= ""
+			end
+			local theme = _EntityService:GetEntityByPath(root .. "CharacterPreviewArea/Theme_" .. jobId)
+			if isvalid(card) == false or isvalid(marker) == false or isvalid(family) == false or isvalid(theme) == false then return false end
+			if card.ButtonComponent == nil or card.SpriteGUIRendererComponent == nil or marker.TextGUIRendererComponent == nil then return false end
+			table.insert(bindings, { JobId = jobId, Card = card, Button = card.ButtonComponent, Marker = marker.TextGUIRendererComponent, Family = family, Theme = theme, Accent = accents[index], TitleColor = titles[index], BaseColor = backgrounds[index] })
+		end
+		for _, binding in ipairs(bindings) do
+			local capturedJobId = binding.JobId
+			binding.ClickHandler = binding.Card:ConnectEvent(ButtonClickEvent, function()
+				self:SelectJobIndex(self:FindJobIndex(capturedJobId))
+			end)
+		end
+		self.JobCardBindings = bindings
+		log("[LobbyClassSelect] renewal cards connected count=" .. #bindings)
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean RefreshCharacterPreview()
+		-- Copies the local player's appearance once per popup, then updates only the preview weapon.
+		local previewJobId = self.PendingClassId
+		local revision = self.PreviewRevision
+		local weaponRetryPending = false
+		if self.CharacterPreviewRenderer == nil then
+			return false
+		end
+		local avatarRoot = self.CharacterPreviewRenderer:GetAvatarRootEntity()
+		if isvalid(avatarRoot) == false then
+			return false
+		end
+
+		local previewEntity = self.CharacterPreviewRenderer.Entity
+		if isvalid(previewEntity) == false then
+			return false
+		end
+		local costume = previewEntity.CostumeManagerComponent
+		if costume == nil then
+			costume = avatarRoot.CostumeManagerComponent
+		end
+		if costume == nil then
+			self:LogPreviewAppearanceFailure("PREVIEW_COSTUME_MANAGER_MISSING")
+			return false
+		end
+
+		if self.IsPreviewAppearanceReady == false and self.PreviewAppearanceRetryCount < self.MaxPreviewAppearanceRetryCount then
+			self.PreviewAppearanceRetryCount = self.PreviewAppearanceRetryCount + 1
+			if self:CopyCurrentPlayerAppearance(costume) then
+				self.IsPreviewAppearanceReady = true
+				self.PreviewAppearanceFailureLogged = false
+				self.AppliedPreviewWeaponJobId = ""
+			elseif self.PreviewAppearanceRetryCount >= self.MaxPreviewAppearanceRetryCount then
+				self:LogPreviewAppearanceFailure("APPEARANCE_RETRY_LIMIT")
+			end
+		end
+
+		if self.IsPopupOpen == false or revision ~= self.PreviewRevision then return false end
+		if self.AppliedPreviewWeaponJobId ~= previewJobId then
+			local preview = _PrototypeWeaponController:GetJobWeaponPreview(previewJobId)
+			if self.IsPopupOpen == false or revision ~= self.PreviewRevision then return false end
+			self:ClearPreviewWeaponSlots(costume)
+			local weaponApplied = false
+			local retryable = preview ~= nil and preview.Retryable == true
+			if retryable then
+				self.PreviewWeaponRetryCount = self.PreviewWeaponRetryCount + 1
+				if self.PreviewWeaponRetryCount >= self.MaxPreviewWeaponRetryCount then
+					retryable = false
+					_PrototypeWeaponController:LogPreviewWarningOnce(self.PendingClassId, "CACHE_RETRY_LIMIT")
+				else
+					weaponRetryPending = true
+				end
+			else
+				self.PreviewWeaponRetryCount = 0
+			end
+			if preview ~= nil and preview.Success and preview.WeaponRUID ~= nil and preview.WeaponRUID ~= "" then
+				costume:SetEquip(preview.Category, preview.WeaponRUID)
+				if preview.SubWeaponRUID ~= nil and preview.SubWeaponRUID ~= "" then
+					costume:SetEquip(MapleAvatarItemCategory.SubWeapon, preview.SubWeaponRUID)
+				end
+				weaponApplied = true
+			end
+			if retryable == false then
+				if self.IsPopupOpen == false or revision ~= self.PreviewRevision then return false end
+				self.AppliedPreviewWeaponJobId = previewJobId
+				log("[LobbyClassSelect] preview weapon updated job=" .. self.PendingClassId .. " applied=" .. tostring(weaponApplied))
+			end
+		end
+
+		local appearanceReady = self.IsPreviewAppearanceReady or self.PreviewAppearanceRetryCount >= self.MaxPreviewAppearanceRetryCount
+		return appearanceReady and weaponRetryPending == false
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean CopyCurrentPlayerAppearance(any previewCostume)
+		-- Copies every effective non-weapon costume slot from the local player into the UI avatar.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CostumeManagerComponent == nil then
+			self:LogPreviewAppearanceFailure("LOCAL_PLAYER_COSTUME_MISSING")
+			return false
+		end
+
+		local sourceCostume = player.CostumeManagerComponent
+		local categories = {
+			MapleAvatarItemCategory.Body,
+			MapleAvatarItemCategory.Hair,
+			MapleAvatarItemCategory.Face,
+			MapleAvatarItemCategory.Cap,
+			MapleAvatarItemCategory.Cape,
+			MapleAvatarItemCategory.Coat,
+			MapleAvatarItemCategory.Longcoat,
+			MapleAvatarItemCategory.Pants,
+			MapleAvatarItemCategory.Glove,
+			MapleAvatarItemCategory.Shoes,
+			MapleAvatarItemCategory.FaceAccessory,
+			MapleAvatarItemCategory.EyeAccessory,
+			MapleAvatarItemCategory.EarAccessory,
+			MapleAvatarItemCategory.Ear
+		}
+		local resolvedItems = {}
+		local resolvedCount = 0
+		for _, category in ipairs(categories) do
+			local itemRuid = sourceCostume:GetEquip(category) or ""
+			table.insert(resolvedItems, { Category = category, ItemRuid = itemRuid })
+			if itemRuid ~= "" then
+				resolvedCount = resolvedCount + 1
+			end
+		end
+		if resolvedCount == 0 then
+			self:LogPreviewAppearanceFailure("LOCAL_PLAYER_APPEARANCE_NOT_READY")
+			return false
+		end
+
+		previewCostume.DefaultEquipUserId = ""
+		previewCostume.UseCustomEquipOnly = true
+		for _, item in ipairs(resolvedItems) do
+			previewCostume:SetEquip(item.Category, item.ItemRuid)
+		end
+		log("[LobbyClassSelect] preview appearance copied player=" .. player.Name .. " resolvedSlots=" .. resolvedCount)
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearPreviewWeaponSlots(any costume)
+		-- Removes inherited main-hand, two-hand, and sub-weapon visuals before applying a job weapon.
+		if costume == nil then
+			return
+		end
+		costume:SetEquip(MapleAvatarItemCategory.OneHandedWeapon, "")
+		costume:SetEquip(MapleAvatarItemCategory.TwoHandedWeapon, "")
+		costume:SetEquip(MapleAvatarItemCategory.SubWeapon, "")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void LogPreviewAppearanceFailure(string reason)
+		-- Emits one diagnostic per popup attempt while the default preview and weapon flow remain active.
+		if self.PreviewAppearanceFailureLogged then
+			return
+		end
+		self.PreviewAppearanceFailureLogged = true
+		log_warning("[LobbyClassSelect] preview appearance fallback reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureUiConnection()
+		-- Resolve the five cards, confirm, close, and the existing data/preview bindings.
+		if self.IsUiConnected then
+			return true
+		end
+
+		self.JobSelectionScreen = _EntityService:GetEntityByPath(self.JobSelectionScreenPath)
+		local nameEntity = _EntityService:GetEntityByPath(self.JobNameTextPath)
+		local descriptionEntity = _EntityService:GetEntityByPath(self.JobDescriptionTextPath)
+		local statusEntity = _EntityService:GetEntityByPath(self.SelectionStatusTextPath)
+		local confirmEntity = _EntityService:GetEntityByPath(self.ConfirmJobButtonPath)
+		local cancelEntity = _EntityService:GetEntityByPath(self.CancelJobButtonPath)
+		local previewEntity = _EntityService:GetEntityByPath(self.CharacterPreviewPath)
+		local skillsTitleEntity = _EntityService:GetEntityByPath(self.StartingSkillsTitleTextPath)
+		local skill01Entity = _EntityService:GetEntityByPath(self.StartingSkillSlot01Path .. "/SkillName")
+		local skill02Entity = _EntityService:GetEntityByPath(self.StartingSkillSlot02Path .. "/SkillName")
+		local skillIcon01Entity = _EntityService:GetEntityByPath(self.StartingSkillIcon01Path)
+		local skillIcon02Entity = _EntityService:GetEntityByPath(self.StartingSkillIcon02Path)
+
+		if isvalid(self.JobSelectionScreen) == false or isvalid(nameEntity) == false or isvalid(descriptionEntity) == false
+			or isvalid(statusEntity) == false or isvalid(confirmEntity) == false or isvalid(cancelEntity) == false
+			or isvalid(previewEntity) == false
+			or isvalid(skillsTitleEntity) == false or isvalid(skill01Entity) == false or isvalid(skill02Entity) == false
+			or isvalid(skillIcon01Entity) == false or isvalid(skillIcon02Entity) == false then
+			return false
+		end
+
+		self.JobNameText = nameEntity.TextGUIRendererComponent
+		self.JobDescriptionText = descriptionEntity.TextGUIRendererComponent
+		self.SelectionStatusText = statusEntity.TextGUIRendererComponent
+		self.ConfirmJobButton = confirmEntity.ButtonComponent
+		self.CancelJobButton = cancelEntity.ButtonComponent
+		self.CharacterPreviewRenderer = previewEntity.AvatarGUIRendererComponent
+		self.StartingSkillsTitleText = skillsTitleEntity.TextGUIRendererComponent
+		self.StartingSkillSlot01Text = skill01Entity.TextGUIRendererComponent
+		self.StartingSkillSlot02Text = skill02Entity.TextGUIRendererComponent
+		self.StartingSkillIcon01Renderer = skillIcon01Entity.SpriteGUIRendererComponent
+		self.StartingSkillIcon02Renderer = skillIcon02Entity.SpriteGUIRendererComponent
+
+		if self.JobNameText == nil or self.JobDescriptionText == nil or self.SelectionStatusText == nil
+			or self.CharacterPreviewRenderer == nil or self.StartingSkillsTitleText == nil
+			or self.StartingSkillSlot01Text == nil or self.StartingSkillSlot02Text == nil
+			or self.StartingSkillIcon01Renderer == nil or self.StartingSkillIcon02Renderer == nil then
+			return false
+		end
+
+		if not isvalid(self.PassiveSlot) or self.PassiveSlot.UITouchReceiveComponent == nil then return false end
+		if self:ConnectJobCards() == false then return false end
+		self.PassiveEnterHandler = self.PassiveSlot:ConnectEvent(UITouchEnterEvent, function() self:ShowPassiveTooltip() end)
+		self.PassiveExitHandler = self.PassiveSlot:ConnectEvent(UITouchExitEvent, function() self:HidePassiveTooltip() end)
+		self.ConfirmClickHandler = confirmEntity:ConnectEvent(ButtonClickEvent, self.OnConfirmClicked)
+		self.CancelClickHandler = cancelEntity:ConnectEvent(ButtonClickEvent, self.OnCancelClicked)
+		self.IsUiConnected = true
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DisconnectUiEvents()
+		-- Disconnect every card subscription along with the original buttons.
+		self:HidePassiveTooltip()
+		if isvalid(self.PassiveSlot) then
+			if self.PassiveEnterHandler ~= nil then self.PassiveSlot:DisconnectEvent(UITouchEnterEvent, self.PassiveEnterHandler) end
+			if self.PassiveExitHandler ~= nil then self.PassiveSlot:DisconnectEvent(UITouchExitEvent, self.PassiveExitHandler) end
+		end
+		self.PassiveEnterHandler = nil
+		self.PassiveExitHandler = nil
+		self.CenterBackgroundEntity = nil
+		if self.IsUiConnected == false then
+			return
+		end
+		self:DisconnectButtonEvent(self.ConfirmJobButton, self.ConfirmClickHandler)
+		self:DisconnectButtonEvent(self.CancelJobButton, self.CancelClickHandler)
+		for _, binding in ipairs(self.JobCardBindings) do
+			self:DisconnectButtonEvent(binding.Button, binding.ClickHandler)
+		end
+		self.JobCardBindings = {}
+		self.ConfirmClickHandler = nil
+		self.CancelClickHandler = nil
+		self.IsUiConnected = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DisconnectButtonEvent(ButtonComponent button, any handlerId)
+		if button ~= nil and isvalid(button.Entity) and handlerId ~= nil then
+			button.Entity:DisconnectEvent(ButtonClickEvent, handlerId)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetPopupEnabled(boolean enabled)
+		-- Reopen from frame zero; ordinary card refreshes preserve looping playback.
+		if not enabled then self:HidePassiveTooltip() end
+		if enabled and isvalid(self.CenterBackgroundEntity) then
+			local renderer = self.CenterBackgroundEntity.SpriteGUIRendererComponent
+			renderer.Enable = false
+			renderer.ImageRUID = DataRef("")
+			renderer.PlayRate = 1
+		end
+		if isvalid(self.JobSelectionScreen) then
+			_GameUIPolishLogic:SetWindowVisible(self.JobSelectionScreen, enabled)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetStatus(string message)
+		if self.SelectionStatusText ~= nil then
+			self.SelectionStatusText.Text = message or ""
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetSelectedClassId()
+		local player = _UserService.LocalPlayer
+		if isvalid(player) then
+			local state = player:GetComponent("script.TemporaryClassSelectionStateComponent")
+			if state ~= nil and state.SelectedJobId ~= "" then
+				return state.SelectedJobId
+			end
+		end
+		return self.SelectedClassId
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer FindJobIndex(string classId)
+		for index, character in ipairs(self.AvailableClasses) do
+			if character.Id == classId then
+				return index
+			end
+		end
+		return 0
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetAvailableClass(string classId)
+		local index = self:FindJobIndex(classId)
+		if index == 0 then
+			return nil
+		end
+		return self.AvailableClasses[index]
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsAvailableClass(string classId)
+		return self:GetAvailableClass(classId) ~= nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreInteractionPrompt()
+		local zone = _EntityService:GetEntityByPath(self.InteractionZonePath)
+		if isvalid(zone) == false then
+			return
+		end
+		local interaction = zone:GetComponent("script.LobbyInteractionComponent")
+		if interaction ~= nil and interaction.IsPlayerInRange then
+			interaction:ShowPrompt()
+		end
+	end
+
+end

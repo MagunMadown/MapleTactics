@@ -2,7 +2,7 @@
 script EnemyTraitRouterLogic extends Logic
 
 	@ExecSpace("ServerOnly")
-	method table BuildActionPlan(string traitIds, table baseIntent)
+	method table BuildActionPlan(string traitIds, table baseIntent, boolean isBoss)
 		-- Traits decorate an already-resolved pattern intent; they do not own pattern or board state.
 		local result = { Success = false, Reason = "INVALID_BASE_INTENT", Actions = {}, TraitIds = traitIds or "" }
 		if baseIntent == nil or baseIntent.ActionType == nil or baseIntent.ActionType == "" then
@@ -14,6 +14,22 @@ script EnemyTraitRouterLogic extends Logic
 			local repeated = self:CopyIntent(baseIntent)
 			repeated.Reason = "TRAIT_DOUBLE_STRIKE"
 			table.insert(result.Actions, repeated)
+		end
+
+		-- Shogun Showdown-style default: ordinary enemies step away after resolving
+		-- an attack. AGGRO reverses that movement; HOLD_POSITION opts out. Bosses
+		-- opt in to the same recovery using RETREAT_AFTER_ATTACK in EnemyDefinitions.TraitIds.
+		if baseIntent.ActionType == "EXECUTE_TILE" and (isBoss ~= true or self:HasTrait(traitIds, "RETREAT_AFTER_ATTACK")) then
+			local postAttackActionType = self:GetPostAttackActionType(traitIds)
+			if postAttackActionType ~= "" then
+				local postAttackAction = self:CopyIntent(baseIntent)
+				postAttackAction.ActionType = postAttackActionType
+				postAttackAction.TileId = ""
+				postAttackAction.Direction = 0
+				postAttackAction.TelegraphTurnsRemaining = 0
+				postAttackAction.Reason = "POST_ATTACK_" .. postAttackActionType
+				table.insert(result.Actions, postAttackAction)
+			end
 		end
 
 		result.Success = true
@@ -43,6 +59,16 @@ script EnemyTraitRouterLogic extends Logic
 		return false
 	end
 
+	method string GetPostAttackActionType(string traitIds)
+		if self:HasTrait(traitIds, "HOLD_POSITION") then
+			return ""
+		end
+		if self:HasTrait(traitIds, "AGGRO") then
+			return "MOVE_TOWARD"
+		end
+		return "MOVE_AWAY"
+	end
+
 	method number GetEnemyThinkDuration(string traitIds, number defaultDuration)
 		if self:HasTrait(traitIds, "QUICK") then
 			return math.min(math.max(0.05, defaultDuration), 0.05)
@@ -55,7 +81,7 @@ script EnemyTraitRouterLogic extends Logic
 	end
 
 	method table ValidateTraitIds(string traitIds)
-		local supported = { QUICK = true, HEAVY = true, DOUBLE_STRIKE = true, EXPLOSIVE = true, REACTIVE_SHIELD = true }
+		local supported = { QUICK = true, HEAVY = true, DOUBLE_STRIKE = true, EXPLOSIVE = true, REACTIVE_SHIELD = true, AGGRO = true, HOLD_POSITION = true, RETREAT_AFTER_ATTACK = true }
 		local seen = {}
 		for traitId in string.gmatch(traitIds or "", "([^|]+)") do
 			if supported[traitId] ~= true then
@@ -65,6 +91,12 @@ script EnemyTraitRouterLogic extends Logic
 				return { Success = false, Reason = "DUPLICATE_ENEMY_TRAIT", TraitId = traitId }
 			end
 			seen[traitId] = true
+		end
+		if seen.AGGRO == true and seen.HOLD_POSITION == true then
+			return { Success = false, Reason = "CONFLICTING_POST_ATTACK_TRAITS", TraitId = "AGGRO|HOLD_POSITION" }
+		end
+		if seen.RETREAT_AFTER_ATTACK == true and (seen.AGGRO == true or seen.HOLD_POSITION == true) then
+			return { Success = false, Reason = "CONFLICTING_POST_ATTACK_TRAITS", TraitId = "RETREAT_AFTER_ATTACK" }
 		end
 		return { Success = true, Reason = "OK" }
 	end

@@ -1,5 +1,5 @@
 @Logic
-script EnemyDropDefinitionRepositoryLogic
+script EnemyDropDefinitionRepositoryLogic extends Logic
 
 	property string DataSetName = "EnemyDropDefinitions"
 	property integer SupportedSchemaVersion = 1
@@ -104,7 +104,7 @@ script EnemyDropDefinitionRepositoryLogic
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ResolveDrops(string enemyDefinitionId, string triggerType, integer runSeed, string stageId, integer waveIndex, string unitId, integer spawnOrder)
+	method table ResolveDrops(string enemyDefinitionId, string triggerType, integer runSeed, string stageId, integer waveIndex, string unitId, integer spawnOrder, number itemDropRate, boolean premiumItemDropBonus)
 		local definitions = self:GetDropEntries(enemyDefinitionId, triggerType)
 		local result = {
 			Success = definitions.Success,
@@ -126,10 +126,28 @@ script EnemyDropDefinitionRepositoryLogic
 				.. ":" .. (unitId or "")
 				.. ":" .. entry.DropEntryId
 			local roll = self:ComputeStableRoll(seedKey, 1000)
-			if roll <= entry.ChancePermille then
+			-- Keep currency outcomes unchanged; item drops use a fresh server-side roll per death.
+			if entry.DropType ~= "CURRENCY" then roll = _UtilLogic:RandomIntegerRange(1, 1000) end
+			local effectiveChancePermille = entry.ChancePermille
+			if entry.ChancePermille > 0 and entry.ChancePermille < 1000 then
+				-- Potions receive half the Union bonus: max rank adds 5 percentage points instead of 10.
+				local bonus = math.max(0, tonumber(itemDropRate) or 0)
+				if entry.DropType == "CONSUMABLE" and (entry.DropRefId == "red_potion" or entry.DropRefId == "orange_potion"
+					or entry.DropRefId == "white_potion" or entry.DropRefId == "all_cure_potion") then bonus = bonus * 0.5 end
+				effectiveChancePermille = math.floor(entry.ChancePermille + 1000 * bonus + 0.000001)
+			end
+			effectiveChancePermille = math.max(0, math.min(1000, effectiveChancePermille))
+			local threshold = effectiveChancePermille
+			if premiumItemDropBonus == true and entry.DropType ~= "CURRENCY" then
+				effectiveChancePermille = _PremiumBenefitsLogic:ApplyItemDropBonus(effectiveChancePermille, true)
+				threshold = math.floor(effectiveChancePermille * 1000 + 0.000001)
+				roll = _UtilLogic:RandomIntegerRange(1, 1000000)
+			end
+			if roll <= threshold then
 				local amount = entry.MinAmount
 				if entry.MaxAmount > entry.MinAmount then
 					amount = entry.MinAmount + self:ComputeStableRoll(seedKey .. ":amount", entry.MaxAmount - entry.MinAmount + 1) - 1
+					if entry.DropType ~= "CURRENCY" then amount = _UtilLogic:RandomIntegerRange(entry.MinAmount, entry.MaxAmount) end
 				end
 				table.insert(result.Drops, {
 					DropEntryId = entry.DropEntryId,
@@ -137,11 +155,12 @@ script EnemyDropDefinitionRepositoryLogic
 					DropRefId = entry.DropRefId,
 					Amount = amount,
 					Roll = roll,
-					ChancePermille = entry.ChancePermille
+					ChancePermille = effectiveChancePermille,
+					BaseChancePermille = entry.ChancePermille
 				})
-				log("[EnemyDropRoll] success enemy=" .. enemyDefinitionId .. " unit=" .. unitId .. " entry=" .. entry.DropEntryId .. " roll=" .. roll .. "/" .. entry.ChancePermille .. " reward=" .. entry.DropType .. ":" .. entry.DropRefId .. " amount=" .. amount)
+				log("[EnemyDropRoll] success enemy=" .. enemyDefinitionId .. " unit=" .. unitId .. " entry=" .. entry.DropEntryId .. " roll=" .. roll .. "/" .. threshold .. " reward=" .. entry.DropType .. ":" .. entry.DropRefId .. " amount=" .. amount)
 			else
-				log("[EnemyDropRoll] miss enemy=" .. enemyDefinitionId .. " unit=" .. unitId .. " entry=" .. entry.DropEntryId .. " roll=" .. roll .. "/" .. entry.ChancePermille)
+				log("[EnemyDropRoll] miss enemy=" .. enemyDefinitionId .. " unit=" .. unitId .. " entry=" .. entry.DropEntryId .. " roll=" .. roll .. "/" .. threshold)
 			end
 		end
 		result.Reason = #result.Drops > 0 and "DROP_ROLLED" or "NO_DROP_ROLLED"
@@ -216,10 +235,10 @@ script EnemyDropDefinitionRepositoryLogic
 		end
 		if enemyDefinitionId == "early_mushroom" then
 			table.insert(entries, self:BuildCompatibilityEntry("early_gold", enemyDefinitionId, "CURRENCY", "gold", 1000, 1, 1))
-			table.insert(entries, self:BuildCompatibilityEntry("early_potion", enemyDefinitionId, "CONSUMABLE", "potion_hp_small", 250, 1, 1))
+			table.insert(entries, self:BuildCompatibilityEntry("early_potion", enemyDefinitionId, "CONSUMABLE", "red_potion", 250, 1, 1))
 		elseif enemyDefinitionId == "guard_mushroom" then
 			table.insert(entries, self:BuildCompatibilityEntry("guard_gold", enemyDefinitionId, "CURRENCY", "gold", 1000, 1, 2))
-			table.insert(entries, self:BuildCompatibilityEntry("guard_potion", enemyDefinitionId, "CONSUMABLE", "potion_hp_small", 150, 1, 1))
+			table.insert(entries, self:BuildCompatibilityEntry("guard_potion", enemyDefinitionId, "CONSUMABLE", "orange_potion", 150, 1, 1))
 		end
 		return entries
 	end

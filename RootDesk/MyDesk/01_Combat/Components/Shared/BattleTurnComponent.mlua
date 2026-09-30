@@ -14,8 +14,11 @@ script BattleTurnComponent extends Component
 	@Sync property integer QueueCapacityBonus = 0
 	@Sync property integer TileQueueCapacity = 3
 	@Sync property integer QueueCapacityMin = 1
-	@Sync property integer QueueCapacityMax = 6
+	@Sync property integer QueueCapacityMax = 3
 	@Sync property integer QueueCapacityRevision = 0
+	-- Changes only when the editable queued SkillId sequence changes. Future reorder requests
+	-- use this narrower revision instead of the unrelated turn/capacity revisions.
+	@Sync property integer QueueOrderRevision = 0
 	@Sync property string QueueCapacityModifierSnapshot = ""
 	@Sync property string LastCommandType = ""
 	@Sync property boolean LastCommandSuccess = false
@@ -64,8 +67,8 @@ script BattleTurnComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void ConfigureQueueCapacity(integer baseCapacity, integer minCapacity, integer maxCapacity, string reason)
 		-- Configures the base queue capacity and its runtime clamp range.
-		self.QueueCapacityMin = math.max(1, minCapacity)
-		self.QueueCapacityMax = math.max(self.QueueCapacityMin, maxCapacity)
+		self.QueueCapacityMin = math.max(1, math.min(3, minCapacity))
+		self.QueueCapacityMax = math.min(3, math.max(self.QueueCapacityMin, maxCapacity))
 		self.BaseQueueCapacity = math.max(self.QueueCapacityMin, math.min(self.QueueCapacityMax, baseCapacity))
 		self:RecalculateQueueCapacity(reason)
 		log("[BattleTurn] capacity configured reason=" .. reason .. " base=" .. self.BaseQueueCapacity .. " min=" .. self.QueueCapacityMin .. " max=" .. self.QueueCapacityMax .. " effective=" .. self.TileQueueCapacity)
@@ -146,7 +149,7 @@ script BattleTurnComponent extends Component
 			bonus = bonus + math.floor(tonumber(addValue) or 0)
 		end
 		self.QueueCapacityBonus = bonus
-		self.TileQueueCapacity = math.max(self.QueueCapacityMin, math.min(self.QueueCapacityMax, self.BaseQueueCapacity + bonus))
+		self.TileQueueCapacity = math.min(3, math.max(self.QueueCapacityMin, math.min(self.QueueCapacityMax, self.BaseQueueCapacity + bonus)))
 		self.QueueCapacityRevision = self.QueueCapacityRevision + 1
 		self:IncrementStateRevision()
 		log("[BattleQueueCapacity] recalculated reason=" .. reason .. " base=" .. self.BaseQueueCapacity .. " bonus=" .. bonus .. " effective=" .. self.TileQueueCapacity .. " queued=" .. self.QueuedTileCount)
@@ -232,6 +235,7 @@ script BattleTurnComponent extends Component
 
 		self.QueuedTileIds = self:AppendTileId(self.QueuedTileIds, skillId)
 		self.QueuedTileCount = self:GetTileIdCount(self.QueuedTileIds)
+		self:IncrementQueueOrderRevision()
 		result.Success = true
 		result.Reason = "QUEUED"
 		result.QueueIndex = self.QueuedTileCount
@@ -260,6 +264,7 @@ script BattleTurnComponent extends Component
 		self.ExecutingTileIndex = 1
 		self.QueuedTileIds = ""
 		self.QueuedTileCount = 0
+		self:IncrementQueueOrderRevision()
 		self.IsActionProcessing = true
 		self:IncrementStateRevision()
 		result.Success = true
@@ -309,6 +314,7 @@ script BattleTurnComponent extends Component
 		end
 		self.QueuedTileIds = ""
 		self.QueuedTileCount = 0
+		self:IncrementQueueOrderRevision()
 		self:IncrementStateRevision()
 		result.Success = true
 		result.Reason = "CLEARED"
@@ -344,6 +350,7 @@ script BattleTurnComponent extends Component
 		end
 		self.QueuedTileIds = table.concat(remaining, "|")
 		self.QueuedTileCount = #remaining
+		self:IncrementQueueOrderRevision()
 		self:IncrementStateRevision()
 		result.Success = true
 		result.Reason = "REMOVED"
@@ -382,6 +389,7 @@ script BattleTurnComponent extends Component
 		table.insert(queuedSkills, toIndex, movedSkillId)
 		self.QueuedTileIds = table.concat(queuedSkills, "|")
 		self.QueuedTileCount = #queuedSkills
+		self:IncrementQueueOrderRevision()
 		self:IncrementStateRevision()
 		result.Success = true
 		result.Reason = "MOVED"
@@ -435,8 +443,12 @@ script BattleTurnComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void ClearTransientState(string reason)
 		self:ClearActionState(reason)
+		local queueChanged = self.QueuedTileIds ~= "" or self.QueuedTileCount > 0
 		self.QueuedTileIds = ""
 		self.QueuedTileCount = 0
+		if queueChanged then
+			self:IncrementQueueOrderRevision()
+		end
 		self:IncrementStateRevision()
 		if reason ~= "" then
 			log("[BattleTurn] transient cleared reason=" .. reason)
@@ -457,6 +469,12 @@ script BattleTurnComponent extends Component
 	method void IncrementStateRevision()
 		-- Advances the synchronized revision used by client read models.
 		self.StateRevision = self.StateRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void IncrementQueueOrderRevision()
+		-- Invalidates every client index snapshot whenever membership or order changes.
+		self.QueueOrderRevision = self.QueueOrderRevision + 1
 	end
 
 	method string AppendTileId(string serializedQueue, string tileId)

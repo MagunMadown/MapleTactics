@@ -1,5 +1,5 @@
 @Logic
-script SkillExecutionLogic
+script SkillExecutionLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table BuildContext(any battleSession, string sourceUnitId, string skillId, table definition)
@@ -92,19 +92,29 @@ script SkillExecutionLogic
 
 		log("[SkillExecution] effects started skill=" .. result.SkillId .. " steps=" .. #effectSteps .. " targeting=" .. targetResult.TargetingType .. " targets=" .. #targetResult.TargetUnitIds)
 		for _, effectStep in ipairs(effectSteps) do
+			local previousContext = context.BattleSession._T.RelicDamageContext
+			context.BattleSession._T.RelicDamageContext = context
 			local stepResult = _EffectRouterLogic:ExecuteEffectStep(context, effectStep)
+			context.BattleSession._T.RelicDamageContext = previousContext
 			table.insert(result.Results, stepResult)
 			if stepResult.Success == false then
 				result.Reason = stepResult.Reason
 				result.FailedStepIndex = effectStep.StepIndex
+				self:ConsumeNextAttackBonusOnHit(context, result.Results)
 				log_warning("[SkillExecution] effects stopped skill=" .. result.SkillId .. " step=" .. effectStep.StepIndex .. " effect=" .. effectStep.EffectType .. " reason=" .. stepResult.Reason)
 				return result
 			end
 
 			result.CompletedSteps = result.CompletedSteps + 1
+			if effectStep.EffectType == "MOVE_SELF" and stepResult.Hit == true and result.CompletedSteps < #effectSteps then
+				-- The caster just moved, so later steps (e.g. "dash, then strike") aim from where it landed.
+				self:RefreshTargets(context)
+			end
 			if context.BattleSession.BattleResult ~= "" then
 				result.Success = true
 				result.Reason = "BATTLE_ENDED"
+				self:NotifyRelicSkillCompleted(context)
+				self:ConsumeNextAttackBonusOnHit(context, result.Results)
 				log("[SkillExecution] effects completed skill=" .. result.SkillId .. " steps=" .. result.CompletedSteps .. " reason=" .. result.Reason)
 				return result
 			end
@@ -112,8 +122,68 @@ script SkillExecutionLogic
 
 		result.Success = true
 		result.Reason = "OK"
+		self:NotifyRelicSkillCompleted(context)
+		self:ConsumeNextAttackBonusOnHit(context, result.Results)
 		log("[SkillExecution] effects completed skill=" .. result.SkillId .. " steps=" .. result.CompletedSteps .. " reason=" .. result.Reason)
 		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void NotifyRelicSkillCompleted(table context)
+		-- A completed skill spends the first-use effect even if its cooldown is zero.
+		if context.RelicCompletionNotified then return end
+		context.RelicCompletionNotified = true
+		local source = context.BattleSession:FindUnitEntity(context.SourceUnitId)
+		if not isvalid(source) then return end
+		local effects = source:GetComponent("script.PlayerRunRelicEffectComponent")
+		if effects ~= nil then effects:OnSkillCompleted(context.SkillId) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshTargets(table context)
+		-- Re-runs the skill's own targeting from the caster's current cell and republishes the snapshot.
+		local targetResult = _SkillTargetResolverLogic:Resolve(context.BattleSession, context.SourceUnitId, context.Definition)
+		if targetResult.Success == false then
+			return
+		end
+		context.PrimaryTargetUnitId = targetResult.PrimaryTargetUnitId
+		context.TargetUnitIds = targetResult.TargetUnitIds
+		context.TargetCellIndices = targetResult.TargetCellIndices
+		context.TargetCellsByUnitId = targetResult.TargetCellsByUnitId
+		context.BattleSession:PublishSkillTargetResolution(
+			context.SkillId,
+			targetResult.TargetingType,
+			_SkillTargetResolverLogic:SerializeStrings(targetResult.TargetUnitIds),
+			_SkillTargetResolverLogic:SerializeIntegers(targetResult.TargetCellIndices),
+			targetResult.Reason
+		)
+		log("[SkillExecution] targets refreshed after move skill=" .. tostring(context.SkillId) .. " targets=" .. #targetResult.TargetUnitIds)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConsumeNextAttackBonusOnHit(table context, table stepResults)
+		-- A zero-damage setup skill does not spend a stored attack bonus.
+		if context.Definition ~= nil and context.Definition.ZeroDamage == true then return end
+		-- A next-attack bonus boosts every target of one damaging skill, so it is spent only after that skill's
+		-- steps have resolved and at least one DAMAGE step actually landed.
+		local landed = false
+		for _, stepResult in ipairs(stepResults or {}) do
+			if stepResult.EffectType == "DAMAGE" and stepResult.Hit == true then
+				landed = true
+				break
+			end
+		end
+		if landed == false then
+			return
+		end
+		local sourceEntity = context.BattleSession:FindUnitEntity(context.SourceUnitId)
+		if isvalid(sourceEntity) == false then
+			return
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit ~= nil then
+			sourceUnit:ConsumeNextAttackBonus()
+		end
 	end
 
 end

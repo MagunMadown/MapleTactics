@@ -1,5 +1,5 @@
 @Logic
-script SkillTargetResolverLogic
+script SkillTargetResolverLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table Resolve(any battleSession, string sourceUnitId, table definition)
@@ -38,6 +38,10 @@ script SkillTargetResolverLogic
 			return result
 		end
 
+		if definition.TargetingType == "BOARD_PARITY" then
+			return self:ResolveBoardParity(battleSession, sourceUnit, definition, result)
+		end
+
 		local facingDirection = sourceUnit.Facing == "Right" and 1 or -1
 		local offsets = self:BuildOffsets(definition.TargetingType, definition.Range, definition.TargetOffsets)
 		if offsets.Success == false then
@@ -52,13 +56,18 @@ script SkillTargetResolverLogic
 				local targetEntity = battleSession.BoardState:FindAtCell(targetCell, sourceUnitId)
 				if isvalid(targetEntity) then
 					local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
-					if targetUnit ~= nil and targetUnit.IsDead == false and targetUnit.Team ~= sourceUnit.Team then
+					if targetUnit ~= nil and targetUnit.IsDead == false and (targetUnit.Team ~= sourceUnit.Team or sourceUnit.Team == "Enemy") then
 						table.insert(result.TargetUnitIds, targetUnit.UnitId)
 						result.TargetCellsByUnitId[targetUnit.UnitId] = targetCell
 						if result.PrimaryTargetUnitId == "" then
 							result.PrimaryTargetUnitId = targetUnit.UnitId
 						end
 						if definition.TargetingType == "FIRST_ENEMY_FORWARD" then
+							break
+						end
+						if definition.TargetingType == "FIRST_ENEMY_PIERCE" then
+							-- The shot passes through the first enemy and also hits the one cell behind it, even past Range.
+							self:AppendEnemyAtCell(battleSession, sourceUnit, targetCell + facingDirection, result)
 							break
 						end
 					end
@@ -72,12 +81,55 @@ script SkillTargetResolverLogic
 		return result
 	end
 
+	@ExecSpace("ServerOnly")
+	method table ResolveBoardParity(any battleSession, any sourceUnit, table definition, table result)
+		-- Every board cell of one parity (even or odd index) except the caster's own, regardless of facing.
+		-- The session fixes the parity when the attack is queued, so the warning and the impact agree.
+		local parity = battleSession:GetBoardParity(sourceUnit.UnitId, definition.SkillId)
+		for cell = 0, battleSession.CellCount - 1 do
+			if cell % 2 == parity and cell ~= sourceUnit.CellIndex then
+				self:AppendEnemyAtCell(battleSession, sourceUnit, cell, result)
+			end
+		end
+		if #result.TargetUnitIds > 0 then
+			result.PrimaryTargetUnitId = result.TargetUnitIds[1]
+		end
+		result.Success = true
+		result.Reason = #result.TargetUnitIds > 0 and "TARGETS_RESOLVED" or "NO_TARGET"
+		log("[SkillTarget] resolved skill=" .. result.SkillId .. " type=BOARD_PARITY parity=" .. parity .. " source=" .. result.SourceUnitId .. " cells=" .. self:SerializeIntegers(result.TargetCellIndices) .. " targets=" .. self:SerializeStrings(result.TargetUnitIds) .. " reason=" .. result.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AppendEnemyAtCell(any battleSession, any sourceUnit, integer cellIndex, table result)
+		-- Adds one extra cell to the snapshot and, when a living enemy stands there, that enemy as a target.
+		if battleSession:IsValidCell(cellIndex) == false then
+			return
+		end
+		table.insert(result.TargetCellIndices, cellIndex)
+		local entity = battleSession.BoardState:FindAtCell(cellIndex, sourceUnit.UnitId)
+		if isvalid(entity) == false then
+			return
+		end
+		local unit = entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil and unit.IsDead == false and (unit.Team ~= sourceUnit.Team or sourceUnit.Team == "Enemy") then
+			table.insert(result.TargetUnitIds, unit.UnitId)
+			result.TargetCellsByUnitId[unit.UnitId] = cellIndex
+		end
+	end
+
 	method table BuildOffsets(string targetingType, integer range, string serializedOffsets)
 		local result = { Success = true, Reason = "OK", Values = {} }
-		if targetingType == "FRONT_CELL" then
+		if targetingType == "SELF" or targetingType == "BOARD_PARITY" then
+			-- A self-targeted skill occupies no board cell: it resolves through the SELF_UNIT effect
+			-- selector instead, so it stays castable even with no enemy on the board.
+			-- BOARD_PARITY picks absolute board cells in Resolve, so it has no facing-relative offsets.
+			return result
+		elseif targetingType == "FRONT_CELL" then
 			result.Values = { 1 }
 			return result
-		elseif targetingType == "FIRST_ENEMY_FORWARD" then
+		elseif targetingType == "FIRST_ENEMY_FORWARD" or targetingType == "FIRST_ENEMY_PIERCE" then
+			-- The pierce cell behind the first enemy is added by Resolve once that enemy is known.
 			for offset = 1, math.max(1, range) do
 				table.insert(result.Values, offset)
 			end
@@ -101,9 +153,13 @@ script SkillTargetResolverLogic
 	end
 
 	method table SelectEffectTargets(table context, string targetSelector)
-		-- Effect rows choose either the primary target or every target from the shared skill snapshot.
+		-- Effect rows choose the caster, the primary target, or every target from the shared skill snapshot.
 		local selected = {}
-		if targetSelector == "ALL_SKILL_TARGETS" then
+		if targetSelector == "SELF_UNIT" then
+			if context.SourceUnitId ~= nil and context.SourceUnitId ~= "" then
+				table.insert(selected, context.SourceUnitId)
+			end
+		elseif targetSelector == "ALL_SKILL_TARGETS" then
 			for _, unitId in ipairs(context.TargetUnitIds or {}) do
 				table.insert(selected, unitId)
 			end

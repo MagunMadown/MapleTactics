@@ -1,0 +1,168 @@
+@Logic
+script MapTeleportManager extends Logic
+	property number PreTransferUiDelay = 0.15
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Announces the single server-side boundary used by every map transfer flow.
+		log("[MapNavigation] ready")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TeleportPlayer(Entity playerEntity, string destinationMapName, Vector3 targetPosition, string source)
+		-- Validates and dispatches one authoritative map transfer for server-owned flows.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			DestinationMapName = destinationMapName or "",
+			Source = source or "UNSPECIFIED"
+		}
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			result.Reason = "INVALID_PLAYER"
+			log_warning("[MapNavigation] transfer rejected source=" .. result.Source .. " reason=" .. result.Reason)
+			return result
+		end
+		if destinationMapName == nil or destinationMapName == "" then
+			result.Reason = "DESTINATION_MAP_MISSING"
+			log_warning("[MapNavigation] transfer rejected player=" .. playerEntity.Name .. " source=" .. result.Source .. " reason=" .. result.Reason)
+			return result
+		end
+
+		self:PrepareClientForMapTransfer(result.Source, playerEntity.PlayerComponent.UserId)
+		local targetPlayer = playerEntity
+		local targetMapName = destinationMapName
+		local targetMapPosition = targetPosition
+		local transferSource = result.Source
+		local requestTransfer = function()
+			if isvalid(targetPlayer) == false then
+				log_warning("[MapNavigation] delayed transfer cancelled map=" .. targetMapName .. " source=" .. transferSource .. " reason=PLAYER_INVALIDATED")
+				return
+			end
+			_TeleportService:TeleportToMapPosition(targetPlayer, targetMapPosition, targetMapName)
+			log("[MapNavigation] transfer requested player=" .. targetPlayer.Name .. " map=" .. targetMapName .. " pos=" .. tostring(targetMapPosition) .. " source=" .. transferSource)
+		end
+		local transferTimerId = _TimerService:SetTimerOnce(requestTransfer, math.max(0.05, self.PreTransferUiDelay))
+		if transferTimerId == 0 then
+			log_warning("[MapNavigation] pre-transfer delay unavailable map=" .. destinationMapName .. " source=" .. result.Source .. " fallback=IMMEDIATE")
+			requestTransfer()
+		end
+		result.Success = true
+		result.Reason = "TRANSFER_REQUESTED"
+		log("[MapNavigation] transfer scheduled player=" .. playerEntity.Name .. " map=" .. destinationMapName .. " delay=" .. tostring(self.PreTransferUiDelay) .. " source=" .. result.Source)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TeleportPlayerToSpawn(Entity playerEntity, string destinationMapName, string spawnEntityName, string source)
+		-- Transfers to the destination map entity so the map-owned SpawnLocation remains authoritative.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			DestinationMapName = destinationMapName or "",
+			Source = source or "UNSPECIFIED"
+		}
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			result.Reason = "INVALID_PLAYER"
+			log_warning("[MapNavigation] spawn transfer rejected source=" .. result.Source .. " reason=" .. result.Reason)
+			return result
+		end
+		if destinationMapName == nil or destinationMapName == "" then
+			result.Reason = "DESTINATION_MAP_MISSING"
+			log_warning("[MapNavigation] spawn transfer rejected player=" .. playerEntity.Name .. " source=" .. result.Source .. " reason=" .. result.Reason)
+			return result
+		end
+
+		local resolvedSpawnName = spawnEntityName or "SpawnLocation"
+		if resolvedSpawnName == "" then
+			resolvedSpawnName = "SpawnLocation"
+		end
+		local destinationEntityPath = "/maps/" .. destinationMapName .. "/" .. resolvedSpawnName
+		self:PrepareClientForMapTransfer(result.Source, playerEntity.PlayerComponent.UserId)
+		local targetPlayer = playerEntity
+		local targetPath = destinationEntityPath
+		local transferSource = result.Source
+		local requestTransfer = function()
+			if isvalid(targetPlayer) == false then
+				log_warning("[MapNavigation] delayed spawn transfer cancelled path=" .. targetPath .. " source=" .. transferSource .. " reason=PLAYER_INVALIDATED")
+				return
+			end
+			_TeleportService:TeleportToEntityPath(targetPlayer, targetPath)
+			log("[MapNavigation] spawn transfer requested player=" .. targetPlayer.Name .. " path=" .. targetPath .. " source=" .. transferSource)
+		end
+		local transferTimerId = _TimerService:SetTimerOnce(requestTransfer, math.max(0.05, self.PreTransferUiDelay))
+		if transferTimerId == 0 then
+			log_warning("[MapNavigation] pre-transfer delay unavailable path=" .. destinationEntityPath .. " source=" .. result.Source .. " fallback=IMMEDIATE")
+			requestTransfer()
+		end
+		result.Success = true
+		result.Reason = "SPAWN_TRANSFER_REQUESTED"
+		result.SpawnEntityPath = destinationEntityPath
+		log("[MapNavigation] spawn transfer scheduled player=" .. playerEntity.Name .. " path=" .. destinationEntityPath .. " delay=" .. tostring(self.PreTransferUiDelay) .. " source=" .. result.Source)
+		return result
+	end
+
+	@ExecSpace("Client")
+	method void PrepareClientForMapTransfer(string source)
+		-- Covers the old map and clears persistent UI before the destination is shown.
+		local transitionRoot = _EntityService:GetEntityByPath("/ui/MapTransitionUI")
+		if isvalid(transitionRoot) then
+			local controller = transitionRoot:GetChildByName("Controller", false)
+			if isvalid(controller) then
+				local transition = controller:GetComponent("script.MapTransitionUIComponent")
+				if transition ~= nil then
+					transition:BeginTransfer(source)
+				end
+			end
+		end
+		local battleHudRoot = _EntityService:GetEntityByPath("/ui/BattleQueueHUD")
+		if isvalid(battleHudRoot) then
+			local battleHud = battleHudRoot:GetComponent("script.BattleQueueHudComponent")
+			if battleHud == nil then
+				local controller = battleHudRoot:GetChildByName("Controller", false)
+				if isvalid(controller) then
+					battleHud = controller:GetComponent("script.BattleQueueHudComponent")
+				end
+			end
+			if battleHud ~= nil then
+				battleHud:PrepareForMapTransfer(source)
+			end
+		end
+		local defaultUiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		if isvalid(defaultUiRoot) then
+			local minimapUI = defaultUiRoot:GetComponent("script.MinimapUI")
+			if minimapUI ~= nil then
+				minimapUI:CloseWorldMapForTransfer(source)
+			end
+		end
+		log("[MapNavigation] client UI prepared source=" .. (source or "UNSPECIFIED"))
+	end
+
+	@ExecSpace("Server")
+	method void RequestTeleport(string destinationMapName, Vector3 targetPosition, string source)
+		-- Accepts a client request only when it matches the server-stored next run map.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		if isvalid(playerEntity) == false then
+			log_warning("[MapNavigation] client transfer rejected user=" .. senderUserId .. " reason=INVALID_PLAYER")
+			return
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local expectedMapName = ""
+		if runState ~= nil and runState.PendingNextStageMapName ~= nil then
+			expectedMapName = runState.PendingNextStageMapName
+		end
+		if destinationMapName == nil or destinationMapName == "" or destinationMapName ~= expectedMapName then
+			log_warning("[MapNavigation] client transfer rejected user=" .. senderUserId .. " requested=" .. tostring(destinationMapName) .. " expected=" .. expectedMapName .. " reason=DESTINATION_NOT_AUTHORIZED")
+			return
+		end
+		local rewardRoute = _StageTransitionManagerLogic:ResolveGraphTransition(runState.LastCompletedStageId)
+		if rewardRoute.Success == true and rewardRoute.NextShopMapId == destinationMapName then
+			local transferred = _StageTransitionManagerLogic:EnterRewardShop(playerEntity)
+			if transferred.Success then runState.PendingNextStageMapName = ""
+			else log_warning("[MapNavigation] reward shop transfer failed reason=" .. transferred.Reason) end
+			return
+		end
+		runState.PendingNextStageMapName = ""
+		self:TeleportPlayer(playerEntity, destinationMapName, targetPosition, source)
+	end
+
+end

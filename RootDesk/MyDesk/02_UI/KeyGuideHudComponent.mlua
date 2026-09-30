@@ -1,0 +1,400 @@
+@Component
+script KeyGuideHudComponent extends Component
+
+    property Entity LobbyPanel = "e4a47300-3158-425b-8092-0e3e1fd8241e"
+    property Entity BattlePanel = "94bb6a49-696a-4c7d-ba7f-1beb6fe57586"
+    property string CurrentContext = ""
+    property number RefreshRemaining = 0
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Resolve the initial context while keeping the controller active outside hidden panels.
+        self.CurrentContext = ""
+        self.RefreshRemaining = 0.2
+        self._T.KeyCapSignature = ""
+        self._T.RowCaps = {}
+        self._T.AlternativeOrigins = {}
+        self._T.PanelAuthored = {}
+        -- Authored pieces reused to build key caps: a key-cap container with a Glyph sprite, and a small label.
+        self._T.CapPrototype = _EntityService:GetEntityByPath("/ui/KeyGuideHUD/BattlePanel/Row1/Key/Icon1")
+        self._T.LabelPrototype = _EntityService:GetEntityByPath("/ui/KeyGuideHUD/BattlePanel/Row5/Key/Range")
+        log("[KeyGuideHUD] begin")
+        self:RefreshKeyCaps()
+        self:RefreshContext()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Check at most five times per second without allocating timers or input handlers.
+        self.RefreshRemaining = self.RefreshRemaining - delta
+        if self.RefreshRemaining > 0 then return end
+        self.RefreshRemaining = 0.2
+        self:RefreshKeyCaps()
+        self:RefreshContext()
+    end
+
+    @ExecSpace("ClientOnly")
+    method table GetRowSpecs()
+        -- Which settings actions each guide row shows. Key 1 of every action comes first, then key 2.
+        -- Row 8 (right-click a queued item) is mouse-only and keeps its authored content.
+        return {
+            { Panel = "LobbyPanel", Row = "Row1", Actions = { "MOVE_LEFT", "MOVE_RIGHT" } },
+            { Panel = "LobbyPanel", Row = "Row2", Actions = { "TURN" } },
+            { Panel = "LobbyPanel", Row = "Row3", Actions = { "INTERACT" } },
+            { Panel = "BattlePanel", Row = "Row1", Actions = { "MOVE_LEFT", "MOVE_RIGHT" } },
+            { Panel = "BattlePanel", Row = "Row2", Actions = { "TURN" } },
+            { Panel = "BattlePanel", Row = "Row3", Actions = { "UTILITY" } },
+            { Panel = "BattlePanel", Row = "Row4", Actions = { "EXECUTE" } },
+            { Panel = "BattlePanel", Row = "Row5", Slots = true },
+            { Panel = "BattlePanel", Row = "Row6", Actions = { "CLEAR_QUEUE" } }
+        }
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshKeyCaps()
+        -- Rebuilds the key caps only when a binding changed.
+        local parts = {}
+        for _, action in ipairs(_GameSettingsLogic:GetActions()) do
+            table.insert(parts, tostring(_GameSettingsLogic:GetBinding(action.Id, 1)) .. "," .. tostring(_GameSettingsLogic:GetBinding(action.Id, 2)))
+        end
+        local signature = table.concat(parts, ";")
+        if signature == self._T.KeyCapSignature then return end
+        if isvalid(self._T.CapPrototype) == false or isvalid(self._T.LabelPrototype) == false then return end
+        self._T.KeyCapSignature = signature
+        -- Rows are laid out against the authored (generous) panel size, then the panel is shrunk to its measured content.
+        for _, panelName in ipairs({ "LobbyPanel", "BattlePanel" }) do
+            self:RestoreAuthoredPanelSize(panelName)
+        end
+        for _, spec in ipairs(self:GetRowSpecs()) do
+            self:LayoutRow(spec)
+        end
+        for _, panelName in ipairs({ "LobbyPanel", "BattlePanel" }) do
+            self:FitPanelToContent(panelName)
+        end
+        log("[KeyGuideHUD] key caps rebuilt")
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity GetPanelEntity(string panelName)
+        return panelName == "LobbyPanel" and self.LobbyPanel or self.BattlePanel
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RestoreAuthoredPanelSize(string panelName)
+        -- Remembers the authored sizes once, then puts them back before every layout so shrinking never compounds.
+        local panel = self:GetPanelEntity(panelName)
+        if isvalid(panel) == false then return end
+        local authored = self._T.PanelAuthored[panelName]
+        if authored == nil then
+            authored = { Size = panel.UITransformComponent.RectSize, Rows = {} }
+            for _, row in ipairs(panel.Children:ToTable()) do
+                local description = row:GetChildByName("Description")
+                if string.find(row.Name, "^Row") ~= nil and isvalid(description) then
+                    authored.Rows[row.Name] = { Width = row.UITransformComponent.RectSize.x, DescriptionWidth = description.UITransformComponent.RectSize.x }
+                end
+            end
+            self._T.PanelAuthored[panelName] = authored
+        end
+        panel.UITransformComponent.RectSize = authored.Size
+        for rowName, sizes in pairs(authored.Rows) do
+            local row = panel:GetChildByName(rowName)
+            local description = isvalid(row) and row:GetChildByName("Description") or nil
+            if isvalid(description) then
+                row.UITransformComponent.RectSize = Vector2(sizes.Width, row.UITransformComponent.RectSize.y)
+                description.UITransformComponent.RectSize = Vector2(sizes.DescriptionWidth, description.UITransformComponent.RectSize.y)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void FitPanelToContent(string panelName)
+        -- Sizes the panel to the widest key/hint block plus the widest description, and to the last visible row.
+        local panel = self:GetPanelEntity(panelName)
+        if isvalid(panel) == false then return end
+        local rowGap = 16
+        local sideMargin = 18
+        local bottomMargin = 24
+        local maxLeft = 0
+        local maxDescription = 0
+        local bottom = 0
+        local rows = {}
+        for _, row in ipairs(panel.Children:ToTable()) do
+            local description = row:GetChildByName("Description")
+            if string.find(row.Name, "^Row") ~= nil and row.Enable and isvalid(description) then
+                table.insert(rows, { Row = row, Description = description })
+                local key = row:GetChildByName("Key")
+                local left = isvalid(key) and key.UITransformComponent.RectSize.x or 0
+                local alternative = row:GetChildByName("Alternative")
+                if isvalid(alternative) then
+                    local childRight = 0
+                    local hasChild = false
+                    for _, child in ipairs(alternative.Children:ToTable()) do
+                        if child.Enable then
+                            hasChild = true
+                            childRight = math.max(childRight, child.UITransformComponent.anchoredPosition.x + child.UITransformComponent.RectSize.x)
+                        end
+                    end
+                    local altText = alternative.TextGUIRendererComponent
+                    if hasChild == false and altText ~= nil and altText.Enable then
+                        childRight = math.ceil(altText:GetPreferredWidth(altText.Text))
+                    end
+                    left = math.max(left, alternative.UITransformComponent.anchoredPosition.x + childRight)
+                end
+                maxLeft = math.max(maxLeft, left)
+                local text = description.TextGUIRendererComponent
+                if text ~= nil then maxDescription = math.max(maxDescription, math.ceil(text:GetPreferredWidth(text.Text)) + 4) end
+                local rowTransform = row.UITransformComponent
+                bottom = math.max(bottom, -rowTransform.anchoredPosition.y + rowTransform.RectSize.y)
+            end
+        end
+        if #rows == 0 then return end
+        -- The header (title on the left, context tag on the right) must also fit on one line.
+        local rowWidth = maxLeft + rowGap + maxDescription
+        local title = panel:GetChildByName("Title")
+        local context = panel:GetChildByName("Context")
+        local headerWidth = (isvalid(title) and title.UITransformComponent.RectSize.x or 0) + (isvalid(context) and context.UITransformComponent.RectSize.x or 0) + 8
+        local edge = _UILogic:ScreenToUIPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
+        local maxWidth = math.max(260, math.min(560, edge.x * 0.8))
+        rowWidth = math.min(maxWidth - sideMargin * 2, math.ceil(math.max(rowWidth, headerWidth)))
+        maxDescription = math.max(80, rowWidth - maxLeft - rowGap)
+        for _, entry in ipairs(rows) do
+            entry.Row.UITransformComponent.RectSize = Vector2(rowWidth, entry.Row.UITransformComponent.RectSize.y)
+            entry.Description.UITransformComponent.RectSize = Vector2(maxDescription, entry.Description.UITransformComponent.RectSize.y)
+        end
+        panel.UITransformComponent.RectSize = Vector2(rowWidth + sideMargin * 2, math.ceil(bottom + bottomMargin))
+        log("[KeyGuideHUD] fit " .. panelName .. " size=" .. tostring(rowWidth + sideMargin * 2) .. "x" .. tostring(math.ceil(bottom + bottomMargin)))
+    end
+
+    @ExecSpace("ClientOnly")
+    method table GetRowItems(table spec)
+        -- Key codes to draw in order; "~" draws the authored range mark between the first and last slot keys.
+        local items = {}
+        if spec.Slots == true then
+            local codes = {}
+            local consecutive = true
+            for slot = 1, 6 do
+                codes[slot] = _GameSettingsLogic:GetBinding("SLOT_" .. tostring(slot), 1)
+                if codes[slot] == 0 or (slot > 1 and codes[slot] ~= codes[slot - 1] + 1) then consecutive = false end
+            end
+            if consecutive then return { codes[1], "~", codes[6] } end
+            for slot = 1, 6 do
+                if codes[slot] ~= 0 then table.insert(items, codes[slot]) end
+            end
+            return items
+        end
+        for slot = 1, 2 do
+            for _, actionId in ipairs(spec.Actions) do
+                local code = _GameSettingsLogic:GetBinding(actionId, slot)
+                if code ~= 0 then table.insert(items, code) end
+            end
+        end
+        return items
+    end
+
+    @ExecSpace("ClientOnly")
+    method void LayoutRow(table spec)
+        local panel = spec.Panel == "LobbyPanel" and self.LobbyPanel or self.BattlePanel
+        local row = isvalid(panel) and panel:GetChildByName(spec.Row) or nil
+        local key = isvalid(row) and row:GetChildByName("Key") or nil
+        if isvalid(key) == false then return end
+        local rowId = spec.Panel .. "/" .. spec.Row
+        for _, cap in ipairs(self._T.RowCaps[rowId] or {}) do
+            if isvalid(cap) then cap:Destroy() end
+        end
+        local caps = {}
+        self._T.RowCaps[rowId] = caps
+        -- The authored key images are replaced by caps built from the current bindings.
+        for _, child in ipairs(key.Children:ToTable()) do
+            child.Enable = false
+        end
+        local range = key:GetChildByName("Range")
+        local pieces = {}
+        local naturalWidth = 0
+        for _, item in ipairs(self:GetRowItems(spec)) do
+            local piece = nil
+            local gap = 6
+            if item == "~" then
+                if isvalid(range) then
+                    range.Enable = true
+                    piece = range
+                    gap = 4
+                end
+            else
+                piece = self:CreateCap(key, item, spec.Row .. "Cap" .. tostring(#caps + 1))
+                if isvalid(piece) then table.insert(caps, piece) end
+            end
+            if isvalid(piece) then
+                table.insert(pieces, { Entity = piece, Gap = gap })
+                naturalWidth = naturalWidth + piece.UITransformComponent.RectSize.x + gap
+            end
+        end
+        naturalWidth = math.max(0, naturalWidth - 6)
+        -- Shrink the whole row of caps when it would run into the description on the right.
+        local altExtent = self:PlaceAlternative(row, rowId, 0)
+        local description = row:GetChildByName("Description")
+        local available = row.UITransformComponent.RectSize.x - 10 - altExtent
+        if isvalid(description) then available = available - description.UITransformComponent.RectSize.x end
+        local scale = 1
+        if naturalWidth > 0 and naturalWidth > available then scale = math.max(0.6, available / naturalWidth) end
+        local x = 0
+        for _, piece in ipairs(pieces) do
+            local transform = piece.Entity.UITransformComponent
+            transform.UIScale = Vector3(scale, scale, 1)
+            transform.anchoredPosition = Vector2(x, 0)
+            x = x + (transform.RectSize.x + piece.Gap) * scale
+        end
+        local keyWidth = math.max(0, x - 6 * scale)
+        key.UITransformComponent.RectSize = Vector2(keyWidth, key.UITransformComponent.RectSize.y)
+        self:PlaceAlternative(row, rowId, keyWidth)
+    end
+
+    @ExecSpace("ClientOnly")
+    method number PlaceAlternative(Entity row, string rowId, number keyWidth)
+        -- Mouse hints (and their "필드" scope) follow the key caps; the authored arrow images are now caps of their own.
+        -- Returns the width the mouse hints take after the caps (0 when the row has none).
+        local alternative = row:GetChildByName("Alternative")
+        if isvalid(alternative) == false then return 0 end
+        local origin = self._T.AlternativeOrigins[rowId]
+        if origin == nil then
+            origin = { Y = alternative.UITransformComponent.anchoredPosition.y }
+            self._T.AlternativeOrigins[rowId] = origin
+        end
+        -- Some authored rows anchor their hint container to the row center, which throws the hints onto the description.
+        local containerTransform = alternative.UITransformComponent
+        containerTransform.AnchorsMin = Vector2(0, 0.5)
+        containerTransform.AnchorsMax = Vector2(0, 0.5)
+        containerTransform.Pivot = Vector2(0, 0.5)
+        containerTransform.anchoredPosition = Vector2(keyWidth + 10, origin.Y)
+        for _, child in ipairs(alternative.Children:ToTable()) do
+            child.Enable = false
+        end
+        -- Mouse icon then its scope label, laid out left to right and centered on the row, whatever the authored offsets were.
+        local extent = 0
+        local x = 0
+        for _, name in ipairs({ "Mouse", "Scope" }) do
+            local child = alternative:GetChildByName(name)
+            if isvalid(child) then
+                child.Enable = true
+                local transform = child.UITransformComponent
+                transform.AnchorsMin = Vector2(0, 0.5)
+                transform.AnchorsMax = Vector2(0, 0.5)
+                transform.Pivot = Vector2(0, 0.5)
+                transform.anchoredPosition = Vector2(x, 0)
+                -- The Mouse container keeps a default "Text" label under its glyph; only the glyph should draw.
+                if name == "Mouse" then
+                    if child.TextGUIRendererComponent ~= nil then child.TextGUIRendererComponent.Enable = false end
+                    -- The authored glyph offsets are stale (they sit far below the row), so center it in its container.
+                    local glyph = child:GetChildByName("Glyph")
+                    if isvalid(glyph) then
+                        glyph.Enable = true
+                        glyph.UITransformComponent.anchoredPosition = Vector2(0, 0)
+                    end
+                end
+                x = x + transform.RectSize.x + 6
+                extent = x + 4
+            end
+        end
+        return extent
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity CreateCap(Entity parent, integer code, string name)
+        -- Uses the authored key image when one exists, otherwise draws a cream cap with a dark border and the key name.
+        local cap = self._T.CapPrototype:Clone(name)
+        if isvalid(cap) == false then return nil end
+        cap:AttachTo(parent)
+        cap.Enable = true
+        local glyph = cap:GetChildByName("Glyph")
+        if isvalid(glyph) == false then return cap end
+        glyph.Enable = true
+        local image = _GameSettingsLogic:GetKeyGlyph(code)
+        if image ~= nil then
+            glyph.SpriteGUIRendererComponent.ImageRUID = DataRef(image.Ruid)
+            glyph.UITransformComponent.RectSize = Vector2(image.Width, image.Height)
+            cap.UITransformComponent.RectSize = Vector2(image.Width, image.Height)
+            return cap
+        end
+        -- Border and fill first so the label, attached last, draws on top of both.
+        local border = glyph.SpriteGUIRendererComponent
+        border.ImageRUID = DataRef("2860136c06ab075439721c027de365af")
+        border.Type = ImageType.Sliced
+        border.PreserveSprite = PreserveSpriteType.None
+        border.Color = Color(0.12, 0.1, 0.09, 1)
+        glyph.UITransformComponent.anchoredPosition = Vector2(0, 0)
+        local fill = glyph:Clone("Fill")
+        fill:AttachTo(cap)
+        fill.SpriteGUIRendererComponent.Color = Color(0.97, 0.94, 0.86, 1)
+        local label = self._T.LabelPrototype:Clone("Label")
+        label:AttachTo(cap)
+        label.Enable = true
+        local text = label.TextGUIRendererComponent
+        text.Text = _GameSettingsLogic:GetKeyShortLabel(code)
+        _GameUIPolishLogic:FitLabel(text, string.len(text.Text) <= 1 and 22 or 18)
+        text.FontStyle = FontStyleType.Bold
+        text.FontColor = Color(0.08, 0.07, 0.06, 1)
+        text.HorizontalAlignment = TextHorizontalAlignmentOption.Center
+        local width = math.max(36, math.ceil(text:GetPreferredWidth(text.Text)) + 14)
+        local height = 36
+        cap.UITransformComponent.RectSize = Vector2(width, height)
+        glyph.UITransformComponent.RectSize = Vector2(width, height)
+        fill.UITransformComponent.RectSize = Vector2(width - 4, height - 4)
+        local transform = label.UITransformComponent
+        transform.AnchorsMin = Vector2(0.5, 0.5)
+        transform.AnchorsMax = Vector2(0.5, 0.5)
+        transform.Pivot = Vector2(0.5, 0.5)
+        transform.anchoredPosition = Vector2(0, 0)
+        transform.RectSize = Vector2(width, height)
+        return cap
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RefreshContext()
+        -- Show only the guide supported by the local player's current map on PC, unless the player turned it off.
+        if not isvalid(self.LobbyPanel) or not isvalid(self.BattlePanel) then return end
+        local context = "HIDDEN"
+        local player = _UserService.LocalPlayer
+        -- The player can switch the guide off in the settings window's game tab.
+        if _GameSettingsLogic.ShowKeyGuide and Environment:IsPCPlatform() and isvalid(player) and isvalid(player.CurrentMap) then
+            local map = player.CurrentMap
+            local battle = map:GetComponent("script.BattleSessionComponent")
+            local lobby = map:GetComponent("script.LobbyGridMovementComponent")
+            if isvalid(battle) and battle.Enable then
+                context = "BATTLE"
+            elseif isvalid(lobby) and lobby.Enable then
+                context = "LOBBY"
+            end
+        end
+        if context == self.CurrentContext then return end
+        self.LobbyPanel.Enable = context == "LOBBY"
+        self.BattlePanel.Enable = context == "BATTLE"
+        if context == "LOBBY" then self:FitKeyLabels(self.LobbyPanel) end
+        if context == "BATTLE" then self:FitKeyLabels(self.BattlePanel) end
+        self.CurrentContext = context
+        log("[KeyGuideHUD] context=" .. context)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void FitKeyLabels(Entity panel)
+        -- Measure the actual font and keep ten pixels of padding on each side.
+        for _, row in ipairs(panel.Children:ToTable()) do
+            local key = row:GetChildByName("Key")
+            if not isvalid(key) then continue end
+            local label = key:GetChildByName("Label")
+            if not isvalid(label) then continue end
+            local text = label.TextGUIRendererComponent
+            local width = math.ceil(text:GetPreferredWidth(text.Text)) + 20
+            local height = key.UITransformComponent.RectSize.y
+            key.UITransformComponent.RectSize = Vector2(width, height)
+            label.UITransformComponent.RectSize = Vector2(width, height)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Clear panel visibility and cached context before the next play session.
+        if isvalid(self.LobbyPanel) then self.LobbyPanel.Enable = false end
+        if isvalid(self.BattlePanel) then self.BattlePanel.Enable = false end
+        self.CurrentContext = ""
+        self.RefreshRemaining = 0
+    end
+end

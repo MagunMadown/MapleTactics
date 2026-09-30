@@ -78,8 +78,35 @@ Session의 기존 Wave `@Sync` 필드는 외부 시스템 보호용 복사본이
 
 - 일반 Stage 추가는 `BattleWaveComponent`나 Session을 수정하지 않는다.
 - `StageEnemyWaves`에서 `SpawnTriggerMode`, 제한 값, Spawn 수를 설정한다.
-- `CLEAR_ONLY`, `TURN_LIMIT`, `TIME_LIMIT`, `TURN_OR_TIME` 외 규칙이 필요할 때만
+- `CLEAR_ONLY`, `TURN_LIMIT`, `TIME_LIMIT`, `TURN_OR_TIME`, `BOSS_PHASE` 외 규칙이 필요할 때만
   Wave 공개 API와 Validator를 함께 확장한다.
+
+### 5.1 `BOSS_PHASE` 트리거
+
+보스가 특정 Phase에 도달하는 순간 다음 Wave를 증원한다. 트리거는 **현재 Wave 행**에 적으며
+`TriggerPhaseIndex`에 목표 Phase 번호를 넣는다.
+
+```csv
+WaveTableId,WaveIndex,SpawnTriggerMode,EnemyPoolId,SpawnCount,MaxConcurrent,...,TriggerPhaseIndex
+region_kerning_stage_04_waves,1,BOSS_PHASE,region_kerning_stage_04_boss_pool,1,3,...,2
+region_kerning_stage_04_waves,2,CLEAR_ONLY,region_kerning_stage_04_ligator_pool,2,3,...,0
+```
+
+동작 순서:
+
+```text
+BossPhaseStateComponent.ApplyPhaseForHp (HP 임계 도달)
+→ BattleSessionComponent.NotifyBossPhaseAdvanced(phaseIndex)
+→ BattleWaveComponent.ApplyBossPhaseTrigger → MarkSpawnPending(next, "BOSS_PHASE")
+→ EvaluateForcedSpawnAtTurnBoundary → Session.SpawnWave
+```
+
+- Phase 1은 모든 보스의 시작 Phase이므로 트리거가 될 수 없다. `TriggerPhaseIndex < 2`는
+  Repository가 `BOSS_PHASE_INDEX_MISSING`으로 거절한다.
+- 실제 Spawn은 즉시가 아니라 **다음 턴 경계**에서 일어난다. 행동 해석 도중에 적이 끼어들지 않는다.
+- 이미 pending이 걸려 있으면 중복 증원하지 않는다(`SPAWN_ALREADY_PENDING`).
+- `MaxConcurrent`는 보스 + 증원 수를 모두 수용해야 한다. 보스 1 + 리게이터 2면 3 이상.
+- 검증 로그: `[BattleWaveState] phase trigger armed` → `phase trigger fired` → `[BattleWave] spawned ... wave=2/2`.
 - Timer callback에서 직접 적을 생성하지 않는다. 항상 Session Spawn 경로를 사용한다.
 - `SpawnByModelId`의 parent는 전투 맵 Entity여야 한다.
 

@@ -93,3 +93,25 @@ local ui = _RunManagerLogic:GetLocalRunFlowUiState()
 현재 SHOP은 전환 준비·거래·완료까지 구현됐다. EVENT/REST 소비기, 실제 최종 상점 화면,
 StageId→MapId 이동은 후속 시스템이 이 계약 위에 구현한다. 상세 상점 계약은
 [`Run-Shop-Authoring-Guide.md`](./Run-Shop-Authoring-Guide.md)를 따른다.
+
+## Region 1 연동 경계
+
+`NodeDefinitions`는 Region 1의 전투와 보상 구간을 다음 순서로 연결한다.
+
+```text
+BATTLE(StageId=region_01_stage_01)
+→ REST
+→ BATTLE(StageId=region_01_stage_02)
+→ REST
+→ BATTLE(StageId=region_01_stage_03)
+→ REST
+→ 종료 (1-4 맵과 Route 추가 전까지)
+```
+
+- `NodeType`으로 BATTLE/REST를 구분하며 NodeId 문자열을 파싱하지 않는다.
+- 신규 보스 Node도 `NodeType=BATTLE`을 쓰고 보스 여부는 `StageDefinitions.StageType=BOSS`에서 읽는다.
+- BATTLE의 `ContentId`는 StageId, REST의 `ContentId`는 NodeId다.
+- REST 완료는 `CompleteCurrentContent(player, "REST", requestId)` 경계만 사용한다.
+- 전투 팀은 다른 팀의 NodeId, REST 데이터, `NextNodeIds`를 임의로 변경하지 않는다.
+- `StageTransitionManagerLogic`은 이 그래프의 `BATTLE → REST → BATTLE` 체인에서 다음 StageId를 해석한다.
+- 첫 전투의 REST 보상 맵은 항상 `new_skill_stage`이며 이후 보상 맵은 보상 정책으로 결정한다.

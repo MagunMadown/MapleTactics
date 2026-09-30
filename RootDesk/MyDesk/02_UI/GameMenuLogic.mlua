@@ -1,0 +1,267 @@
+@Logic
+script GameMenuLogic extends Logic
+
+	-- Esc menu with Settings, Return to Lobby and Quit. The window is cloned from the settings window so both share one look.
+	property boolean IsOpen = false
+	property string PendingConfirm = ""
+	property number ConfirmRemaining = 0
+	property number RefreshRemaining = 0
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self._T.Screen = nil
+		self._T.Buttons = {}
+		self._T.Links = {}
+		self._T.OtherWindowOpen = false
+		_GameSettingsLogic.IsMenuOpen = false
+	end
+
+	-- ---------- window construction ----------
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureMenu()
+		-- Builds the menu once from the settings window's dimmer, panel and button styling.
+		if isvalid(self._T.Screen) then return true end
+		local root = _EntityService:GetEntityByPath("/ui/SettingsUI")
+		local source = _EntityService:GetEntityByPath("/ui/SettingsUI/Screen")
+		if isvalid(root) == false or isvalid(source) == false then
+			log_warning("[GameMenu] settings window missing; menu unavailable")
+			return false
+		end
+		local screen = source:Clone("MenuScreen")
+		if isvalid(screen) == false then return false end
+		screen:AttachTo(root)
+		local window = screen:GetChildByName("Window")
+		if isvalid(window) == false then screen:Destroy() return false end
+		for _, child in ipairs(window.Children:ToTable()) do
+			local keep = child.Name == "Title" or child.Name == "HeaderLine" or child.Name == "CloseButton" or child.Name == "FooterCloseButton"
+			if keep == false then child:Destroy() end
+		end
+		window.UITransformComponent.RectSize = Vector2(560, 560)
+
+		local title = window:GetChildByName("Title")
+		if isvalid(title) then
+			title.UITransformComponent.anchoredPosition = Vector2(0, 216)
+			title.TextGUIRendererComponent.Text = "메뉴"
+			title.TextGUIRendererComponent.HorizontalAlignment = TextHorizontalAlignmentOption.Center
+		end
+		local line = window:GetChildByName("HeaderLine")
+		if isvalid(line) then
+			line.UITransformComponent.anchoredPosition = Vector2(0, 172)
+			line.UITransformComponent.RectSize = Vector2(500, 2)
+		end
+		local close = window:GetChildByName("CloseButton")
+		if isvalid(close) then
+			close.UITransformComponent.anchoredPosition = Vector2(226, 216)
+			self:Connect(close, function() self:CloseMenu() end)
+		end
+
+		local prototype = window:GetChildByName("FooterCloseButton")
+		if isvalid(prototype) then
+			local layout = {
+				{ Id = "Settings", Y = 70, Label = "설정", OnClick = function() self:OnSettingsClicked() end },
+				{ Id = "Lobby", Y = -30, Label = "로비로 가기", OnClick = function() self:OnLobbyClicked() end },
+				{ Id = "Exit", Y = -130, Label = "게임 종료", OnClick = function() self:OnExitClicked() end }
+			}
+			for _, entry in ipairs(layout) do
+				local button = prototype:Clone(entry.Id .. "MenuButton")
+				button:AttachTo(window)
+				button.UITransformComponent.RectSize = Vector2(420, 74)
+				button.UITransformComponent.anchoredPosition = Vector2(0, entry.Y)
+				_GameUIPolishLogic:FitLabel(button.TextGUIRendererComponent, 26)
+				self._T.Buttons[entry.Id] = button
+				self:Connect(button, entry.OnClick)
+			end
+			prototype:Destroy()
+		end
+		self._T.Screen = screen
+		_GameUIPolishLogic:HideWindowImmediately(screen)
+		log("[GameMenu] window built")
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Connect(Entity button, any callback)
+		-- Buttons play the shared click sound; handlers are released in OnEndPlay.
+		if isvalid(button) == false then return end
+		local eventHandler = button:ConnectEvent(ButtonClickEvent, function()
+			_GameUIPolishLogic:PlayClick()
+			callback()
+		end)
+		table.insert(self._T.Links, { Entity = button, Handler = eventHandler })
+	end
+
+	-- ---------- state ----------
+
+	@ExecSpace("ClientOnly")
+	method boolean IsLocalPlayerInLobby()
+		local player = _UserService.LocalPlayer
+		return isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name == "lobby"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StyleButton(string id, string label, boolean enabled, boolean confirming)
+		local button = self._T.Buttons[id]
+		if isvalid(button) == false then return end
+		button.ButtonComponent.Enable = enabled
+		local text = button.TextGUIRendererComponent
+		text.Text = label
+		_GameUIPolishLogic:FitLabel(text, confirming and 22 or 26)
+		local sprite = button.SpriteGUIRendererComponent
+		if enabled == false then
+			sprite.Color = Color(0.09, 0.105, 0.15, 1)
+			text.FontColor = Color(0.42, 0.46, 0.54, 1)
+		elseif confirming then
+			sprite.Color = Color(0.95, 0.72, 0.28, 1)
+			text.FontColor = Color(0.08, 0.09, 0.14, 1)
+		else
+			sprite.Color = Color(0.12, 0.15, 0.22, 1)
+			text.FontColor = Color(0.95, 0.96, 0.98, 1)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshButtons()
+		self:StyleButton("Settings", "설정", true, false)
+		-- Returning to the lobby only makes sense while a run is in progress.
+		local lobbyLabel = self.PendingConfirm == "lobby" and "다시 누르면 로비로 이동합니다" or "로비로 가기"
+		self:StyleButton("Lobby", lobbyLabel, self:IsLocalPlayerInLobby() == false, self.PendingConfirm == "lobby")
+		local exitLabel = self.PendingConfirm == "exit" and "다시 누르면 게임을 종료합니다" or "게임 종료"
+		self:StyleButton("Exit", exitLabel, true, self.PendingConfirm == "exit")
+	end
+
+	-- ---------- open / close ----------
+
+	@ExecSpace("ClientOnly")
+	method void OpenMenu()
+		if self.IsOpen or self:EnsureMenu() == false then return end
+		self.IsOpen = true
+		_GameSettingsLogic.IsMenuOpen = true
+		self.PendingConfirm = ""
+		self.RefreshRemaining = 0.25
+		_GameUIPolishLogic:BringUIGroupToFront(_EntityService:GetEntityByPath("/ui/SettingsUI"))
+		self:RefreshButtons()
+		_GameUIPolishLogic:SetWindowVisible(self._T.Screen, true)
+		log("[GameMenu] open")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseMenu()
+		if self.IsOpen == false then return end
+		self.IsOpen = false
+		_GameSettingsLogic.IsMenuOpen = false
+		self.PendingConfirm = ""
+		_GameUIPolishLogic:SetWindowVisible(self._T.Screen, false)
+		log("[GameMenu] close")
+	end
+
+	-- ---------- buttons ----------
+
+	@ExecSpace("ClientOnly")
+	method void OnSettingsClicked()
+		self:CloseMenu()
+		local controller = _EntityService:GetEntityByPath("/ui/SettingsUI/Controller")
+		local settings = isvalid(controller) and controller:GetComponent("script.SettingsUIComponent") or nil
+		if settings ~= nil then settings:SetOpen(true) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnLobbyClicked()
+		if self:IsLocalPlayerInLobby() then return end
+		-- Abandoning a run cannot be undone, so the first press only arms the button.
+		if self.PendingConfirm ~= "lobby" then
+			self.PendingConfirm = "lobby"
+			self.ConfirmRemaining = 3
+			self:RefreshButtons()
+			return
+		end
+		self:CloseMenu()
+		_RunAbandonLogic:RequestAbandonRun()
+		log("[GameMenu] return to lobby requested")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnExitClicked()
+		if self.PendingConfirm ~= "exit" then
+			self.PendingConfirm = "exit"
+			self.ConfirmRemaining = 3
+			self:RefreshButtons()
+			return
+		end
+		self:CloseMenu()
+		self:RequestExitGame()
+		log("[GameMenu] exit requested")
+	end
+
+	@ExecSpace("Server")
+	method void RequestExitGame()
+		-- MSW has no direct quit call; removing the user from the world is the closest exit.
+		_UserService:KickUser(senderUserId, KickReason.WorldContent)
+	end
+
+	-- ---------- Esc handling ----------
+
+	@ExecSpace("ClientOnly")
+	method boolean IsEscWindowOpen()
+		-- Windows that close themselves on Esc; the same key press must not also open the menu.
+		if _GameSettingsLogic.IsWindowOpen or _GameSettingsLogic.IsCapturingKey then return true end
+		if _UnionCoinShopLogic.IsOpen or _LobbyCodexLogic:IsOpen() or _LobbyCharacterSelectionLogic:IsOpen() or _UnionSystemUILogic:IsOpen() or _RunRelicInventoryUILogic.IsOpen then
+			return true
+		end
+		if _SkillTestLogic ~= nil and _SkillTestLogic.KeyboardCaptured == true then return true end
+		local skillTest = _EntityService:GetEntityByPath("/ui/SkillTestUI/Controller")
+		local panel = isvalid(skillTest) and skillTest:GetComponent("script.SkillTestUIComponent") or nil
+		if panel ~= nil and panel.IsOpen == true then return true end
+		local shop = _EntityService:GetEntityByPath("/ui/RunShopUI/ShopPopup")
+		if isvalid(shop) and shop.Enable then return true end
+		local uiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		local minimap = isvalid(uiRoot) and uiRoot:GetComponent("script.MinimapUI") or nil
+		return minimap ~= nil and minimap:IsWorldMapOpen()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Remember last frame's window state: another window's Esc handler may close it before ours runs.
+		self._T.OtherWindowOpen = self:IsEscWindowOpen()
+		if self.PendingConfirm ~= "" then
+			self.ConfirmRemaining = self.ConfirmRemaining - delta
+			if self.ConfirmRemaining <= 0 then
+				self.PendingConfirm = ""
+				if self.IsOpen then self:RefreshButtons() end
+			end
+		end
+		if self.IsOpen then
+			self.RefreshRemaining = self.RefreshRemaining - delta
+			if self.RefreshRemaining <= 0 then
+				self.RefreshRemaining = 0.25
+				self:RefreshButtons()
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleMenuKeyDown(KeyDownEvent event)
+		if event.key ~= KeyboardKey.Escape then return end
+		-- A key capture in the settings window uses Esc to cancel.
+		if _GameSettingsLogic.IsCapturingKey then return end
+		if self.IsOpen then
+			self:CloseMenu()
+			return
+		end
+		-- Another window owns this Esc press (it closes itself); the menu opens only on a clean press.
+		if self._T.OtherWindowOpen == true or self:IsEscWindowOpen() then return end
+		self:OpenMenu()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		for _, link in ipairs(self._T.Links or {}) do
+			if isvalid(link.Entity) then link.Entity:DisconnectEvent(ButtonClickEvent, link.Handler) end
+		end
+		self._T.Links = {}
+		self.IsOpen = false
+		_GameSettingsLogic.IsMenuOpen = false
+	end
+
+end

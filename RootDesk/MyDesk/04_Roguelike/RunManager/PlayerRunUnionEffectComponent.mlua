@@ -1,0 +1,258 @@
+@Component
+script PlayerRunUnionEffectComponent extends Component
+
+	property integer ActiveRunSequence = 0
+	property boolean IsInitialized = false
+	property boolean MagnetPetOwned = false
+	property number MesoGainRate = 0
+	property number MesoRewardRemainder = 0
+	property number ItemDropRate = 0
+	property integer AugmentRerollBonus = 0
+	property number UnionPointGainRate = 0
+	property integer StartingPotionBonus = 0
+	property number MaxHPBonus = 0
+	property integer InventorySlotBonus = 0
+	property integer StartingSkillBonus = 0
+	property integer StartingRandomRelicBonus = 0
+	@TargetUserSync property integer RewardRunId = 0
+	@TargetUserSync property integer PendingBaseUnionPoints = 0
+	@TargetUserSync property integer PendingUnionPoints = 0
+	@TargetUserSync property integer LastCommittedBaseUnionPoints = 0
+	@TargetUserSync property integer LastCommittedUnionPoints = 0
+	@TargetUserSync property integer LastCommittedBonusUnionPoints = 0
+	@TargetUserSync property string LastRewardCommitKey = ""
+	@TargetUserSync property boolean LastRewardWasCommitted = false
+	@TargetUserSync property boolean LastRewardWasDuplicate = false
+	@TargetUserSync property boolean UnionRewardRunEnded = false
+	@TargetUserSync property string UnionRewardRunEndReason = ""
+	@TargetUserSync property integer UnionRewardRevision = 0
+	property string AccumulatedUnionRewardKeys = ""
+
+	@ExecSpace("ServerOnly")
+	method table CaptureForRun(integer runSequence, table effectSnapshot)
+		-- Captures one immutable-at-runtime Union snapshot and refuses same-sequence recapture.
+		if runSequence == nil or runSequence <= 0 then
+			return { Success = false, Reason = "INVALID_RUN_SEQUENCE" }
+		end
+		if self.IsInitialized == true and self.ActiveRunSequence == runSequence then
+			local duplicate = self:GetSnapshot()
+			duplicate.Reason = "RUN_SNAPSHOT_ALREADY_CAPTURED"
+			return duplicate
+		end
+		if effectSnapshot == nil or type(effectSnapshot) ~= "table" then
+			return { Success = false, Reason = "UNION_EFFECT_SNAPSHOT_MISSING" }
+		end
+		local premium = _PremiumBenefitsLogic:GetBenefits(self.Entity)
+		if premium.Success == false then return premium end
+		self.MagnetPetOwned = premium.MagnetPetOwned == true
+		self.ActiveRunSequence = runSequence
+		self.MesoRewardRemainder = 0
+		self.MesoGainRate = math.max(0, tonumber(effectSnapshot.MesoGainRate) or 0)
+		self.ItemDropRate = math.max(0, tonumber(effectSnapshot.ItemDropRate) or 0)
+		self.AugmentRerollBonus = math.max(0, math.floor(tonumber(effectSnapshot.AugmentRerollBonus) or 0))
+		self.UnionPointGainRate = math.max(0, tonumber(effectSnapshot.UnionPointGainRate) or 0)
+		self.StartingPotionBonus = math.max(0, math.floor(tonumber(effectSnapshot.StartingPotionBonus) or 0))
+		self.MaxHPBonus = math.max(0, tonumber(effectSnapshot.MaxHPBonus) or 0)
+		self.InventorySlotBonus = math.max(0, math.floor(tonumber(effectSnapshot.InventorySlotBonus) or 0))
+		self.StartingSkillBonus = math.max(0, math.floor(tonumber(effectSnapshot.StartingSkillBonus) or 0))
+		self.StartingRandomRelicBonus = math.max(0, math.floor(tonumber(effectSnapshot.StartingRandomRelicBonus) or 0))
+		self.IsInitialized = true
+		log("[UnionEffect] RunStart sequence=" .. self.ActiveRunSequence
+			.. " MesoGainRate=" .. self.MesoGainRate
+			.. " ItemDropRate=" .. self.ItemDropRate
+			.. " AugmentRerollBonus=" .. self.AugmentRerollBonus
+			.. " UnionPointGainRate=" .. self.UnionPointGainRate
+			.. " PotionBonus=" .. self.StartingPotionBonus
+			.. " MaxHPBonus=" .. self.MaxHPBonus
+			.. " InventorySlotBonus=" .. self.InventorySlotBonus
+			.. " StartingSkillBonus=" .. self.StartingSkillBonus
+			.. " StartingRandomRelicBonus=" .. self.StartingRandomRelicBonus)
+		return self:GetSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearRunSnapshot(string reason)
+		-- Clears only the run-scoped copy; permanent Union profile data remains untouched.
+		self.ActiveRunSequence = 0
+		self.IsInitialized = false
+		self.MagnetPetOwned = false
+		self.MesoGainRate = 0
+		self.MesoRewardRemainder = 0
+		self.ItemDropRate = 0
+		self.AugmentRerollBonus = 0
+		self.UnionPointGainRate = 0
+		self.StartingPotionBonus = 0
+		self.MaxHPBonus = 0
+		self.InventorySlotBonus = 0
+		self.StartingSkillBonus = 0
+		self.StartingRandomRelicBonus = 0
+		self.RewardRunId = 0
+		self.PendingBaseUnionPoints = 0
+		self.PendingUnionPoints = 0
+		self.LastCommittedBaseUnionPoints = 0
+		self.LastCommittedUnionPoints = 0
+		self.LastCommittedBonusUnionPoints = 0
+		self.LastRewardCommitKey = ""
+		self.LastRewardWasCommitted = false
+		self.LastRewardWasDuplicate = false
+		self.UnionRewardRunEnded = false
+		self.UnionRewardRunEndReason = ""
+		self.AccumulatedUnionRewardKeys = ""
+		self.UnionRewardRevision = self.UnionRewardRevision + 1
+		log("[UnionEffect] cleared reason=" .. (reason or ""))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BeginUnionRewardRun(integer runSequence, integer rewardRunId)
+		-- Resets pending reward state once for the captured run and stores the persistent award identity.
+		if self.IsInitialized == false or self.ActiveRunSequence ~= runSequence then
+			return { Success = false, Reason = "RUN_UNION_SEQUENCE_MISMATCH" }
+		end
+		if rewardRunId == nil or rewardRunId <= 0 then
+			return { Success = false, Reason = "INVALID_REWARD_RUN_ID" }
+		end
+		if self.RewardRunId == rewardRunId then
+			local duplicate = self:GetRewardSnapshot()
+			duplicate.Reason = "REWARD_RUN_ALREADY_INITIALIZED"
+			return duplicate
+		end
+		self.RewardRunId = rewardRunId
+		self.PendingBaseUnionPoints = 0
+		self.PendingUnionPoints = 0
+		self.LastCommittedBaseUnionPoints = 0
+		self.LastCommittedUnionPoints = 0
+		self.LastCommittedBonusUnionPoints = 0
+		self.LastRewardCommitKey = ""
+		self.LastRewardWasCommitted = false
+		self.LastRewardWasDuplicate = false
+		self.UnionRewardRunEnded = false
+		self.UnionRewardRunEndReason = ""
+		self.AccumulatedUnionRewardKeys = ""
+		self.UnionRewardRevision = self.UnionRewardRevision + 1
+		log("[UnionReward] run begun sequence=" .. runSequence .. " rewardRunId=" .. rewardRunId .. " rate=" .. self.UnionPointGainRate)
+		return self:GetRewardSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table AccumulateUnionReward(integer baseUnionPoints, string rewardKey)
+		-- Adds only authored base points; the stable run multiplier is applied once to the accumulated total.
+		if self.IsInitialized == false or self.RewardRunId <= 0 then
+			return { Success = false, Reason = "UNION_REWARD_RUN_NOT_INITIALIZED" }
+		end
+		if baseUnionPoints == nil or baseUnionPoints < 0 or baseUnionPoints ~= math.floor(baseUnionPoints) then
+			return { Success = false, Reason = "INVALID_BASE_UNION_POINTS" }
+		end
+		if rewardKey == nil or rewardKey == "" then
+			return { Success = false, Reason = "INVALID_REWARD_KEY" }
+		end
+		if self:HasAccumulatedRewardKey(rewardKey) then
+			local duplicate = self:GetRewardSnapshot()
+			duplicate.Reason = "DUPLICATE_PENDING_REWARD_IGNORED"
+			duplicate.WasDuplicate = true
+			return duplicate
+		end
+		self.AccumulatedUnionRewardKeys = self.AccumulatedUnionRewardKeys .. "|" .. rewardKey .. "|"
+		self.PendingBaseUnionPoints = self.PendingBaseUnionPoints + baseUnionPoints
+		self.PendingUnionPoints = self:CalculateUnionPointReward(self.PendingBaseUnionPoints)
+		self.UnionRewardRevision = self.UnionRewardRevision + 1
+		local snapshot = self:GetRewardSnapshot()
+		snapshot.Reason = "PENDING_REWARD_ADDED"
+		snapshot.WasDuplicate = false
+		log("[UnionReward] pending key=" .. rewardKey .. " baseTotal=" .. self.PendingBaseUnionPoints .. " finalTotal=" .. self.PendingUnionPoints)
+		return snapshot
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkUnionRewardRunEnded(boolean runEnded, string reason)
+		self.UnionRewardRunEnded = runEnded == true
+		self.UnionRewardRunEndReason = reason or ""
+		self.UnionRewardRevision = self.UnionRewardRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyUnionRewardCommit(string commitKey, integer committedAmount, boolean wasDuplicate)
+		if commitKey == nil or commitKey == "" then
+			return { Success = false, Reason = "INVALID_REWARD_COMMIT_KEY" }
+		end
+		self.LastRewardCommitKey = commitKey
+		self.LastCommittedBaseUnionPoints = self.PendingBaseUnionPoints
+		self.LastCommittedUnionPoints = math.max(0, math.floor(committedAmount or 0))
+		self.LastCommittedBonusUnionPoints = math.max(0, self.LastCommittedUnionPoints - self.LastCommittedBaseUnionPoints)
+		self.LastRewardWasCommitted = true
+		self.LastRewardWasDuplicate = wasDuplicate == true
+		self.UnionRewardRevision = self.UnionRewardRevision + 1
+		return self:GetRewardSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRewardSnapshot()
+		return {
+			Success = self.IsInitialized and self.RewardRunId > 0,
+			Reason = self.IsInitialized and self.RewardRunId > 0 and "OK" or "UNION_REWARD_RUN_NOT_INITIALIZED",
+			RunSequence = self.ActiveRunSequence,
+			RewardRunId = self.RewardRunId,
+			UnionPointGainRate = self.UnionPointGainRate,
+			PendingBaseUnionPoints = self.PendingBaseUnionPoints,
+			PendingUnionPoints = self.PendingUnionPoints,
+			BaseUnionPoints = self.LastRewardWasCommitted and self.LastCommittedBaseUnionPoints or self.PendingBaseUnionPoints,
+			FinalUnionPoints = self.LastRewardWasCommitted and self.LastCommittedUnionPoints or self.PendingUnionPoints,
+			BonusUnionPoints = self.LastRewardWasCommitted and self.LastCommittedBonusUnionPoints or math.max(0, self.PendingUnionPoints - self.PendingBaseUnionPoints),
+			CommitKey = self.LastRewardCommitKey,
+			WasCommitted = self.LastRewardWasCommitted,
+			WasDuplicate = self.LastRewardWasDuplicate,
+			RunEnded = self.UnionRewardRunEnded,
+			RunEndReason = self.UnionRewardRunEndReason,
+			Revision = self.UnionRewardRevision
+		}
+	end
+
+	method boolean HasAccumulatedRewardKey(string rewardKey)
+		return string.find(self.AccumulatedUnionRewardKeys, "|" .. rewardKey .. "|", 1, true) ~= nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetSnapshot()
+		-- Returns the stable per-run contract consumed by existing gameplay owners.
+		return {
+			Success = self.IsInitialized,
+			Reason = self.IsInitialized and "OK" or "RUN_UNION_SNAPSHOT_NOT_INITIALIZED",
+			RunSequence = self.ActiveRunSequence,
+			MesoGainRate = self.MesoGainRate,
+			MagnetPetOwned = self.MagnetPetOwned,
+			ItemDropRate = self.ItemDropRate,
+			AugmentRerollBonus = self.AugmentRerollBonus,
+			UnionPointGainRate = self.UnionPointGainRate,
+			StartingPotionBonus = self.StartingPotionBonus,
+			MaxHPBonus = self.MaxHPBonus,
+			InventorySlotBonus = self.InventorySlotBonus,
+			StartingSkillBonus = self.StartingSkillBonus,
+			StartingRandomRelicBonus = self.StartingRandomRelicBonus
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer CalculateMesoReward(integer baseMeso)
+		-- Preview only; carry is committed after a successful, non-duplicate grant.
+		if baseMeso == nil or baseMeso <= 0 then
+			return 0
+		end
+		return math.max(0, math.floor((baseMeso * (1 + self.MesoGainRate) * (self.MagnetPetOwned and 1.1 or 1)) + self.MesoRewardRemainder + 0.000001))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CommitMesoReward(integer baseMeso, integer grantedMeso)
+		if baseMeso <= 0 then return end
+		self.MesoRewardRemainder = math.max(0, math.min(0.999999999, baseMeso * (1 + self.MesoGainRate) * (self.MagnetPetOwned and 1.1 or 1) + self.MesoRewardRemainder - grantedMeso))
+		log("[UnionEffect] meso base=" .. baseMeso .. " granted=" .. grantedMeso .. " remainder=" .. self.MesoRewardRemainder)
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer CalculateUnionPointReward(integer baseUnionPoints)
+		-- Applies the captured Union Coin gain rate without mutating the permanent Union profile.
+		if baseUnionPoints == nil or baseUnionPoints <= 0 then
+			return 0
+		end
+		return math.max(0, math.floor((baseUnionPoints * (1 + self.UnionPointGainRate)) + 0.000001))
+	end
+
+end

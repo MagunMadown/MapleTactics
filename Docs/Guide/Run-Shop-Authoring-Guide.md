@@ -2,13 +2,14 @@
 
 ## 범위
 
-이 상점은 한 로그라이크 Run에서 획득한 `RUN_SCOPED` 골드로 스킬이나 소모품을 구매하는
+이 상점은 한 로그라이크 Run에서 획득한 `RUN_SCOPED` 골드로 런 능력치 유물, 소모품을 구매하는
 시스템이다. 영구 상품·캐시 결제·DB 구매 횟수를 사용하는 WorldShop과 분리한다.
 
-데이터 사전 §20.1~20.2의 `ShopDefinitions`/`ShopEntries`가 이 시스템의 기준 규격이다.
+데이터 사전 §20.1~20.2의 `ShopDefinitions`/`ShopEntries`와
+`ShopNodeBindings`가 이 시스템의 기준 규격이다.
 §20.3의 `ShopItemDefinitions`는 Meta/World Shop용 `PLANNED` 스키마이며 런 상점에서 읽지 않는다.
 
-현재 UI는 구현하지 않는다. 상점 화면 담당자는 서버 DTO와 Request API만 사용한다.
+현재 `RunShopUI`는 서버 DTO와 Request API만 사용하며 Dataset을 직접 읽지 않는다.
 
 ## 기본 흐름
 
@@ -27,14 +28,26 @@ Node 선택 → OPEN_SHOP
 
 ## ShopDefinitions
 
-`ShopDefinitions.csv`는 상점과 Node를 연결한다.
+`ShopDefinitions.csv`는 재사용 가능한 상점 카탈로그를 정의한다.
+
+| 열 | 의미 |
+|---|---|
+| `SchemaVersion` | 현재 `2` |
+| `ShopId` | 상점 카탈로그 고유 ID |
+| `DisplayName` | 화면 표시 이름 |
+| `MapId` | 상점 진입 목적지 맵 |
+| `Enabled` | 활성 여부 |
+
+## ShopNodeBindings
+
+`ShopNodeBindings.csv`는 고유한 런 그래프 방문 노드를 상점 카탈로그에 연결한다.
+하나의 `ShopId`를 여러 `NodeId`에서 재사용할 수 있지만 `(NodeGraphId, NodeId)`는 중복될 수 없다.
 
 | 열 | 의미 |
 |---|---|
 | `SchemaVersion` | 현재 `1` |
-| `ShopId` | 상점 고유 ID. 현재 SHOP NodeId와 같아야 한다. |
-| `DisplayName` | 화면 표시 이름 |
-| `NodeGraphId`, `NodeId` | `NodeDefinitions`의 SHOP 노드 참조 |
+| `NodeGraphId`, `NodeId` | `NodeDefinitions`의 고유한 SHOP 노드 |
+| `ShopId` | `ShopDefinitions`의 상점 카탈로그 |
 | `Enabled` | 활성 여부 |
 
 ## ShopEntries
@@ -44,26 +57,33 @@ Node 선택 → OPEN_SHOP
 | `ShopEntryId` | 전체 상점에서 유일한 상품 ID |
 | `ShopId` | 소속 상점 |
 | `DisplayName` | 상품 표시 이름 |
-| `RewardType` | 현재 `SKILL`, `CONSUMABLE` |
+| `RewardType` | 공통 `shop_relic`은 `ITEM` |
 | `RewardRefId`, `RewardAmount` | 지급 대상과 수량 |
 | `PriceCurrencyId`, `PriceAmount` | RUN_SCOPED 가격 재화와 수량 |
 | `DisplayOrder` | 오름차순 표시 순서 |
-| `MaxPurchasesPerVisit` | 현재 규격은 `1`만 지원 |
+| `MaxPurchasesPerRun` | 현재 규격은 `1`만 지원 |
 | `Enabled` | 활성 여부 |
 
-현재 예제 상품은 `heavy_slash` 골드 5, `potion_hp_small` 골드 2다.
+현재 33종 유물의 가격은 `ShopEntries.csv`의 `PriceAmount`에서 관리한다. 일반 유물은 최대 체력 +1 = 35골드, 공격력 +1 = 40골드, 방어력 +1 = 45골드다. 특수 유물은 회복 소모품 강화 50, 전투 시작 회복 55, 승리 회복·승리 골드 60, 첫 처치 쿨다운 감소 65, 첫 피격 무효화 70, 처치 회복 75, 치명상 생존 80골드다. 모든 유물은 물약의 최고 가격 30골드보다 비싸고, 모든 특수 유물은 일반 유물보다 비싸다. 물약 가격은 `ConsumableDefinitionRepositoryLogic.ShopBasePrices`에서 구매·판매 계산에 함께 사용한다.
+
+가격 기준은 첫 상점까지 헤네시스 4전투의 확정 골드 31(5+6+8+12)과 드롭 기대값 4.5(일반 적 14마리 × 25% × 1 + 보스 1마리 × 25% × 4), 합계 35.5골드다. 유니온 보너스·판매·소모품 초과 보상·특수 유물 수입은 제외한 기준이며 실제 드롭 수입은 달라진다. 첫 상점에서 가장 저렴한 유물이 예상 수입 대부분을 소모하며, 그보다 비싼 유물은 판매나 이후 상점을 위한 저축이 필요하다. 첫 상점 구매가 보장되지는 않는다. 승리 골드 유물은 60골드 / 승리당 5골드로, 판매와 유니온 보너스를 제외하면 12승에 구매 비용을 회수한다. 판매가는 기존 규칙대로 구매가의 70%를 내림한다.
+
+`RelicDefinitions`에 같은 RewardRefId와 세 보너스(0 이상의 정수), 선택적인 특수능력을 등록한다. 기존 ItemCategory·IconImageRUID는 유지한다. 미보유·미구매 활성 유물 중 서로 다른 3개를 일반:특수 개별 가중치 3:1로 순차 추첨한다. 추첨된 유물은 후보에서 제외하며, 후보가 3개 미만이면 남은 수만 진열한다. 재열기·구매 후 재추첨하지 않는다. 물약 3종은 별도로 진열하며 전체 유물 보유 시에도 물약 구매와 퇴장이 가능하다.
+`ShopEntries.csv`는 유물 추첨 목록이다. `RunShopLogic.BuildPotionOffers`는 빨간 포션(HP 2, 10골드), 주황 포션(HP 4, 20골드), 하얀 포션(HP 6, 30골드)을 별도로 추가하며, 효과 설명과 아이콘은 `ConsumableDefinitions`에서 가져온다. 매 방문마다 각 1개를 진열하고 방문별 상품 ID로 구매 영수증을 구분한다. 동일 방문의 UI 재열기는 재고·가격·유물 추첨을 유지하며, 새로운 상점 노드 방문에서 물약 재고를 보충한다. 유물 풀이 비어 있어도 물약은 구매할 수 있다. 구매 상품은 서버의 `OfferedEntries`에서만 조회한다.
+
+소비 아이템은 같은 종류도 1개당 가방 한 칸을 사용하며 총 용량은 기존 3~5칸을 따른다. 상점 구매 시 공간이 부족하면 `CONSUMABLE_CAPACITY_FULL`로 거절하고 골드·재고를 보존한다. 보상 획득의 초과 재화 전환 정책은 유지한다. 물약 판매가는 구매가의 70%인 7/14/21골드다. 물약 가격·표시 정보는 방문 시작에 캡처하며, 유물 정의·가격은 기존처럼 새 런에 캡처한다.
 
 ## 서버 API
 
 ```lua
-_RunShopLogic:RequestOpenShop("shop_after_stage01")
-_RunShopLogic:RequestPurchaseOffer("shop01_heavy_slash", requestId)
+_RunShopLogic:RequestOpenSelectedShop()
+_RunShopLogic:RequestPurchaseOffer(displayedOfferId, requestId)
 _RunShopLogic:RequestCloseShop(requestId)
 ```
 
 서버 직접 통합과 테스트에서는 `OpenShop(player, shopId)`와
 `PurchaseOffer(player, shopEntryId, requestId)`를 사용한다. Client가 가격이나 지급 내용을
-인자로 보내지 않으며 서버가 Dataset 행을 다시 조회한다.
+인자로 보내지 않으며 서버가 새 런에 캡처한 현재 진열 행과 비교한다. 정의·가격 변경은 다음 새 런부터 반영한다.
 
 구매는 선택 사항이다. 아무 상품도 구매하지 않은 상태에서도 `RequestCloseShop()`으로 상점을
 건너뛸 수 있다. 서버는 `RunManagerLogic.CompleteCurrentContent()`를 통해 현재 SHOP 노드만
@@ -77,9 +97,9 @@ local ui = _RunShopLogic:GetLocalShopUiState()
 
 주요 값:
 
-- `OfferSnapshot`: `OfferId~DisplayName~RewardType~RewardRefId~RewardAmount~CurrencyId~Price~Order`
-- `PurchasedOfferIds`: 현재 방문에서 구매 완료한 Offer ID 목록
-- `CurrencySnapshot`, `ConsumableSnapshot`, `SkillSnapshot`
+- `OfferSnapshot`: `OfferId~DisplayName~RewardType~RewardRefId~RewardAmount~CurrencyId~Price~Order~IconImageRUID~ItemCategory~AttackBonus~MaxHpBonus~DefenseBonus~EffectDescription`
+- `PurchasedOfferIds`: 현재 런에서 구매 완료한 Offer ID 목록
+- `CurrencySnapshot`, `ConsumableSnapshot`, `SkillSnapshot`, `ItemSnapshot`, `NodeId`
 - `LastPurchase.OfferId/Success/Reason`
 - `Completion.RunState/RunFlowState/LastCompletedContentType/LastCompletedContentId`
 - `RevisionKey`, `Commands.CanPurchase/CanClose/CanSkip`
@@ -92,20 +112,60 @@ UI는 표를 직접 읽거나 잔액을 차감하지 않는다. Snapshot은 `|`,
 - 서버가 현재 Run의 선택된 SHOP 전환 상태를 확인한다.
 - 가격 재화는 `RUN_SCOPED`만 허용한다.
 - 상품 참조는 전체 콘텐츠 검증에서 확인한다.
-- `RunSequence + VisitSequence + ShopEntryId` 구매 키로 같은 상품을 방문당 한 번만 지급한다.
-- `RunSequence + requestId`로 성공한 Client 요청 재전송을 무시한다.
+- `RunSequence + ShopEntryId` 구매 키로 같은 상품을 한 Run에서 한 번만 지급한다.
+- `RunSequence + VisitSequence + requestId`로 성공한 Client 요청 재전송을 무시한다.
 - 상점 완료도 `RunSequence + requestId`를 사용하며 동일 종료 요청은
   `DUPLICATE_CONTENT_COMPLETION_IGNORED`로 처리한다.
-- 골드 차감과 스킬·소모품 지급은 `PlayerRunInventoryComponent.ApplyShopPurchase` 한 경계에서 처리한다.
+- 골드 차감과 유물 지급은 `PlayerRunInventoryComponent.ApplyShopPurchase` 한 경계에서 처리한다.
 - 잔액 부족이나 잘못된 상품은 인벤토리를 변경하지 않는다.
 - 종료가 확정되면 Shop State는 `CLOSED`가 되고 구매·닫기·건너뛰기 명령이 비활성화된다.
 
 ## 확장 규칙
 
-1. 상품 추가는 우선 CSV 행만 추가한다.
+1. 상품 추가는 ShopEntries와 RelicDefinitions에 동일 ID의 행을 추가한다. 능력치·특수능력 변경은 RelicDefinitions 수치를 수정하고 새 런에서 확인한다.
 2. 새 RewardType은 전용 상태 소유자와 원자적 거래 경계를 먼저 설계한다.
-3. 방문당 2회 이상 구매나 재입고가 필요하면 숫자를 먼저 풀지 말고 Shop State의 구매 수량
+3. Run당 2회 이상 구매나 재입고가 필요하면 숫자를 먼저 풀지 말고 Shop State의 구매 수량
    Snapshot과 Validator를 함께 확장한다.
 4. 메타 재화·현금성 상품은 이 시스템에 넣지 않고 WorldShop 계층으로 분리한다.
 5. 상점 이후 흐름을 바꿀 때는 Shop Logic에 다음 목적지를 하드코딩하지 않고
    `NodeDefinitions.NextNodeIds`를 수정한다.
+6. 새 방문 지점은 `ShopDefinitions → ShopEntries → ShopNodeBindings → NodeDefinitions` 순서로
+   추가한다. 재방문은 새 고유 `NodeId`를 만들고 기존 `ShopId`에 바인딩한다.
+
+경로는 shop_upper/shop_lower NodeId로 구분하며 두 바인딩의 ShopId는 shop_relic이다. 퇴장 UI도 NodeId로 다음 경로를 선택한다.
+
+## 유물 특수능력 (2026-09-24)
+
+기존 33종 중 아래 8종의 능력치 보너스를 0으로 바꾸고 특수능력으로 대체한다. 나머지 25종은 그대로다.
+
+| RelicId | SpecialEffectType | SpecialEffectValue | 효과 |
+|---|---|---:|---|
+| romeo_pendant | KILL_HEAL | 1 | 플레이어가 적을 처치하면 HP 1 회복 |
+| juliet_pendant | VICTORY_HEAL | 2 | 최종 전투 승리 시 HP 2 회복 |
+| ice_knight_shoulder | FIRST_HIT_GUARD | 1 | 전투마다 첫 유효 피격 1회 무효화 |
+| von_leon_war_belt | LETHAL_SURVIVAL | 1 | 전투마다 치명적인 피해 1회를 HP 1로 버팀 |
+| rice_cake_one | BATTLE_START_HEAL | 1 | 전투 시작 시 HP 1 회복 |
+| tangyoon_chef_hat | CONSUMABLE_HEAL_BONUS | 1 | HEAL 소모품 회복량 +1 |
+| altaire_earring | FIRST_KILL_COOLDOWN | 1 | 전투마다 첫 처치 시 전체 스킬 쿨다운 1 감소 |
+| greedy_davy_john_hat | VICTORY_MESO | 5 | 최종 전투 승리 시 기본 추가 메소 5 지급 |
+
+### 데이터·수명 계약
+
+- `SpecialEffectType`은 위 열거값 또는 빈 문자열, `SpecialEffectValue`는 양의 정수다. 효과가 없으면 0/빈칸이며 열이 없는 구형 표도 허용한다. 방어·생존 효과 값은 1만 허용한다.
+- `EffectDescription`은 편집용 참고값이며 런타임 설명은 검증된 능력치·특수능력에서 생성한다. 설명은 기존 상점 Snapshot과 전투 HUD DTO로 전달한다.
+- 보유 수량과 무관하게 유물별 1회 합산한다. 동일 효과 종류의 수치형 효과는 합산한다. 정의는 새 Run 시작 시 캡처되므로 변경 확인은 새 런에서 한다.
+- 전투 키는 `RunSequence:StageId:EntryRequestId`다. 같은 전투 재초기화·재진입과 웨이브 전환은 횟수를 충전하지 않는다. 다른 전투 키·새 런에서는 초기화한다.
+- 유틸리티 가드와 GUARD 버프가 먼저 막는다. 막힌 공격은 유물 방어/생존을 소비하지 않는다. 유물 첫 피격 무효가 생존보다 우선하며, HP 1에서도 생존 효과는 정상 발동한다.
+- 다단히트는 피해 적용 1회를 피격 1회로 본다. 처치는 확정된 적 사망마다 1회이며, 보스 처치 후 제거되는 잡몹은 추가 처치가 아니다.
+- 첫 처치에 감소할 쿨다운이 없어도 첫 처치 기회는 소비한다. HP가 가득 차면 회복은 무효이며 부활시키지 않는다.
+- 승리 효과는 웨이브 클리어나 패배에 발동하지 않는다. 메소는 RunManager 보상 Facade와 기존 멱등 키를 사용하며 유니온 메소 보너스가 적용된다. 결과 재시도에서 회복·재화를 중복 지급하지 않는다.
+
+### 변경 영향 및 검증
+
+- `[CORE-LOCK] BattleSession` 작업 종료·잠금 해제: 수정 지점은 `TryStartBattle`, `HandleUnitDiedFromSource`의 유물 호출이며 기존 턴·웨이브 순서는 유지한다.
+- 피해 방어는 `BattleUnit.ApplyDamage`에서 HP 변경 전 처리하고, 포션 보너스는 `ConsumableHealEffectLogic.Execute`에 연결한다. 승리 효과는 `RunManager.RecordBattleResult`에 연결한다.
+- 기존 저장 데이터 형식과 유물 ID는 유지한다. 새 모델·맵·UI 파일이나 코드블록 수동 변경은 없다.
+- 검증 대상: 8종 단독/동시 보유, 만피/치명상/HP 1, 기존 가드, 중복 처치/승리/진입, 웨이브 유지, 런 초기화, 잘못된 정의 거부, 기존 능력치 유물 회귀.
+- Maker Build/Play 검증은 연결된 Maker MCP가 없어 미실행. 로컬 메서드 테스트는 엔진·동기화 검증을 대체하지 않는다.
+- 로컬 검증: `node Artifacts/tests/relic-special-effects-test.cjs`에서 실제 mLua 메서드 146개 assertion 통과. `node --test tools/balance-schema.test.cjs` 23개 테스트 통과. 기존 25종은 변경 전 데이터와 모든 기존 열이 동일함을 비교한다.
+- Maker 후속 확인: 편집 모드 Refresh → Build/Normal 로그 확인 → 새 런 시작 → 각 유물 보유 상태에서 위 효과 및 전투 간 초기화 확인 → `[RunRelic] triggered` 로그와 실제 HP/쿨다운/메소 대조 → Stop.

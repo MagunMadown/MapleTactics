@@ -1,0 +1,175 @@
+@Logic
+script StageMapRouteRepositoryLogic
+
+	property string DataSetName = "StageMapRoutes"
+	property integer SupportedSchemaVersion = 1
+
+	@ExecSpace("ServerOnly")
+	method table GetMapRoute(string stageId)
+		local result = {
+			Success = false,
+			Reason = "STAGE_MAP_ROUTE_NOT_FOUND",
+			StageId = stageId or "",
+			MapId = "",
+			SpawnX = 0,
+			SpawnY = 0,
+			Source = ""
+		}
+		if stageId == nil or stageId == "" then
+			result.Reason = "INVALID_STAGE_ID"
+			log_warning("[StageMapRoute] lookup rejected reason=INVALID_STAGE_ID")
+			return result
+		end
+
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		if dataSet == nil then
+			result.Reason = "STAGE_MAP_ROUTE_DATASET_MISSING"
+			log_error("[StageMapRoute] dataset missing name=" .. self.DataSetName)
+			return result
+		end
+
+		local matchedRoute = nil
+		local matchCount = 0
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "StageId") == stageId then
+				matchCount = matchCount + 1
+				if matchedRoute == nil then
+					matchedRoute = self:ConvertRow(dataSet, rowIndex)
+				end
+			end
+		end
+
+		if matchCount > 1 then
+			result.Reason = "DUPLICATE_STAGE_MAP_ROUTE"
+			log_error("[StageMapRoute] duplicate stage=" .. stageId .. " count=" .. matchCount)
+			return result
+		end
+		if matchedRoute == nil then
+			log_warning("[StageMapRoute] missing stage=" .. stageId .. " dataset=" .. self.DataSetName)
+			return result
+		end
+
+		local validation = self:ValidateRoute(matchedRoute)
+		if validation.Success == false then
+			return validation
+		end
+		return validation
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetDefaultStageForMap(string mapId)
+		-- Shared Maker-play lookup: choose the lowest StageIndex routed to this physical map.
+		-- Production transitions still resolve by exact StageId through GetMapRoute.
+		local result = {
+			Success = false,
+			Reason = "STAGE_MAP_ROUTE_NOT_FOUND",
+			StageId = "",
+			MapId = mapId or "",
+			SpawnX = 0,
+			SpawnY = 0,
+			CandidateCount = 0,
+			Source = ""
+		}
+		if mapId == nil or mapId == "" then
+			result.Reason = "INVALID_MAP_ID"
+			return result
+		end
+
+		local dataSet = _DataService:GetTable(self.DataSetName)
+		if dataSet == nil then
+			result.Reason = "STAGE_MAP_ROUTE_DATASET_MISSING"
+			log_error("[StageMapRoute] dataset missing name=" .. self.DataSetName)
+			return result
+		end
+
+		local selectedRoute = nil
+		local selectedStageIndex = 2147483647
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if dataSet:GetCell(rowIndex, "MapId") == mapId and self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")) == true then
+				local route = self:ConvertRow(dataSet, rowIndex)
+				local validation = self:ValidateRoute(route)
+				if validation.Success == false then
+					return validation
+				end
+				local stage = _StageDefinitionRepositoryLogic:GetStageDefinition(route.StageId)
+				if stage.Success == false then
+					result.Reason = "CONTENT_VALIDATION_FAILED"
+					result.DetailReason = "DEFAULT_STAGE_DEFINITION_INVALID"
+					result.StageId = route.StageId
+					return result
+				end
+				result.CandidateCount = result.CandidateCount + 1
+				if selectedRoute == nil or stage.StageIndex < selectedStageIndex then
+					selectedRoute = validation
+					selectedStageIndex = stage.StageIndex
+				end
+			end
+		end
+
+		if selectedRoute == nil then
+			log_warning("[StageMapRoute] no default stage for map=" .. mapId)
+			return result
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		result.StageId = selectedRoute.StageId
+		result.SpawnX = selectedRoute.SpawnX
+		result.SpawnY = selectedRoute.SpawnY
+		result.Source = "MAP_DEFAULT"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ConvertRow(any dataSet, integer rowIndex)
+		return {
+			Success = false,
+			Reason = "NOT_VALIDATED",
+			SchemaVersion = math.floor(tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")) or 0),
+			StageId = dataSet:GetCell(rowIndex, "StageId") or "",
+			MapId = dataSet:GetCell(rowIndex, "MapId") or "",
+			SpawnX = tonumber(dataSet:GetCell(rowIndex, "SpawnX")) or 0,
+			SpawnY = tonumber(dataSet:GetCell(rowIndex, "SpawnY")) or 0,
+			Enabled = self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")),
+			RowIndex = rowIndex,
+			Source = "DATASET"
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateRoute(table route)
+		if route.SchemaVersion ~= self.SupportedSchemaVersion then
+			return self:RejectRoute(route, "UNSUPPORTED_STAGE_MAP_ROUTE_SCHEMA")
+		end
+		if route.StageId == "" then
+			return self:RejectRoute(route, "STAGE_MAP_ROUTE_STAGE_ID_MISSING")
+		end
+		if route.MapId == "" then
+			return self:RejectRoute(route, "STAGE_MAP_ROUTE_MAP_ID_MISSING")
+		end
+		if route.Enabled ~= true then
+			return self:RejectRoute(route, "STAGE_MAP_ROUTE_DISABLED")
+		end
+		route.Success = true
+		route.Reason = "OK"
+		return route
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RejectRoute(table route, string detailReason)
+		route.Success = false
+		route.Reason = "CONTENT_VALIDATION_FAILED"
+		route.DetailReason = detailReason
+		log_error("[StageMapRoute] rejected stage=" .. (route.StageId or "") .. " row=" .. tostring(route.RowIndex or 0) .. " reason=" .. detailReason)
+		return route
+	end
+
+	method boolean ParseBooleanCell(any cellValue)
+		if cellValue == true then
+			return true
+		end
+		local normalized = string.lower(tostring(cellValue or ""))
+		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+end

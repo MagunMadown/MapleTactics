@@ -1,8 +1,9 @@
 @Logic
-script DamageEffectExecutorLogic
+script DamageEffectExecutorLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table Execute(table context, table effectStep)
+		-- Each authored hit enters the normal damage path, including relic bonuses and defenses.
 		local result = {
 			Success = false,
 			Reason = "INVALID_EFFECT_CONTEXT",
@@ -43,34 +44,70 @@ script DamageEffectExecutorLogic
 			return result
 		end
 
+		local hitCount = self:GetHitCount(effectStep) + (context.ExtraShurikenCount or 0)
+		context.ExtraShurikenCount = 0
+		local extraHits = context.ExtraArrowCount or 0
+		context.ExtraArrowCount = 0
+		local buffHits = {}
 		for _, targetUnitId in ipairs(targetUnitIds) do
-			local damageResult = battleSession:ResolveSkillDamageImpact(
-				context.SourceUnitId,
-				context.SkillId,
-				targetUnitId,
-				context.TargetCellsByUnitId[targetUnitId] or -1,
-				damageAmount
-			)
-			table.insert(result.Results, damageResult)
-			if damageResult.Success == false then
-				result.Reason = damageResult.Reason
-				return result
+			local targetHit = false
+			local count = hitCount
+			if targetUnitId == context.PrimaryTargetUnitId then count = count + extraHits end
+			local previousBatch = battleSession._T.damageNumberBatch
+			local batch = nil
+			if count > 1 then
+				batch = { SourceUnitId = context.SourceUnitId, TargetUnitId = targetUnitId, Damages = {}, HitCount = 0 }
 			end
-			if damageResult.Hit == true then
-				result.Hit = true
-				table.insert(result.TargetUnitIds, targetUnitId)
-				if result.TargetUnitId == "" then
-					result.TargetUnitId = targetUnitId
+			battleSession._T.damageNumberBatch = batch
+			for hitIndex = 1, count do
+				local targetEntity = battleSession:FindUnitEntity(targetUnitId)
+				local targetUnit = isvalid(targetEntity) and targetEntity:GetComponent("script.BattleUnitComponent") or nil
+				if targetUnit == nil or targetUnit.IsDead or targetUnit.CurrentHp <= 0 then break end
+				local previousHit = battleSession._T.AttackBuffHit
+				local followup = hitIndex > 1 or (previousHit ~= nil and previousHit.SourceUnitId == context.SourceUnitId and previousHit.SkillId == context.SkillId and previousHit.FixedFollowup == true)
+				buffHits[hitIndex] = buffHits[hitIndex] or { SourceUnitId = context.SourceUnitId, SkillId = context.SkillId, FixedFollowup = followup }
+				battleSession._T.AttackBuffHit = buffHits[hitIndex]
+				local damageResult = battleSession:ResolveSkillDamageImpact(
+					context.SourceUnitId,
+					context.SkillId,
+					targetUnitId,
+					context.TargetCellsByUnitId[targetUnitId] or -1,
+					hitIndex > 1 and 1 or damageAmount
+				)
+				battleSession._T.AttackBuffHit = previousHit
+				table.insert(result.Results, damageResult)
+				if damageResult.Success == false then
+					if batch ~= nil then battleSession:FlushDamageNumberBatch(batch) end
+					battleSession._T.damageNumberBatch = previousBatch
+					result.Reason = damageResult.Reason
+					return result
+				end
+				if damageResult.Hit == true then
+					result.Hit = true
+					if not targetHit then table.insert(result.TargetUnitIds, targetUnitId) end
+					targetHit = true
+					if result.TargetUnitId == "" then
+						result.TargetUnitId = targetUnitId
+					end
+				end
+				if battleSession.BattleResult ~= "" then
+					break
 				end
 			end
-			if battleSession.BattleResult ~= "" then
-				break
-			end
+			if batch ~= nil then battleSession:FlushDamageNumberBatch(batch) end
+			battleSession._T.damageNumberBatch = previousBatch
+			if battleSession.BattleResult ~= "" then break end
 		end
 		result.Success = true
 		result.Reason = result.Hit and "HIT" or "MISS_EMPTY"
 		result.Value = damageAmount
 		return result
+	end
+
+	method integer GetHitCount(table effectStep)
+		-- ParameterB is the authored hit count only for MULTI_HIT damage rows.
+		if effectStep.ParameterA ~= "MULTI_HIT" then return 1 end
+		return math.max(1, math.floor(tonumber(effectStep.ParameterB) or 1))
 	end
 
 end

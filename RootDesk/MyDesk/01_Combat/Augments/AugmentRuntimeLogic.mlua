@@ -1,5 +1,5 @@
 @Logic
-script AugmentRuntimeLogic
+script AugmentRuntimeLogic extends Logic
 
 	property integer MaxEventDepth = 4
 
@@ -31,7 +31,7 @@ script AugmentRuntimeLogic
 			if bundle.Success == true then
 				for _, effect in ipairs(bundle.Effects) do
 					if effect.TriggerType == triggerType then
-						table.insert(candidates, { Effect = effect, Stacks = owned.Stacks, AcquiredOrder = owned.AcquiredOrder })
+						table.insert(candidates, { Effect = effect, Stacks = owned.Stacks, AcquiredOrder = owned.AcquiredOrder, SourceType = owned.SourceType })
 					end
 				end
 			end
@@ -53,7 +53,11 @@ script AugmentRuntimeLogic
 			local effect = candidate.Effect
 			local effectSourceTag = "AUGMENT:" .. effect.AugmentId .. ":" .. tostring(effect.Seq)
 			local sourceTag = context ~= nil and context.SourceTag or ""
-			if sourceTag == effectSourceTag then
+			if candidate.SourceType == "JOB" and triggerType == "TURN_START" and effect.EffectType == "HEAL" then
+				result.SkippedCount = result.SkippedCount + 1
+				table.insert(result.Effects, { Success = false, Reason = "JOB_TURN_HEAL_DISABLED", AugmentId = effect.AugmentId, Seq = effect.Seq, SourceTag = effectSourceTag })
+				log("[AugmentRuntime] automatic job heal skipped augment=" .. effect.AugmentId .. " trigger=" .. triggerType)
+			elseif sourceTag == effectSourceTag then
 				result.SkippedCount = result.SkippedCount + 1
 				table.insert(result.Effects, { Success = false, Reason = "SOURCE_TAG_REENTRY_BLOCKED", AugmentId = effect.AugmentId, Seq = effect.Seq, SourceTag = effectSourceTag })
 			else
@@ -89,6 +93,177 @@ script AugmentRuntimeLogic
 		result.Reason = "PROCESSED"
 		log("[AugmentRuntime] trigger=" .. triggerType .. " candidates=" .. result.CandidateCount .. " executed=" .. result.ExecutedCount .. " skipped=" .. result.SkippedCount .. " depth=" .. depth)
 		return result
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method boolean CanBindSkillAugment(table definition, table steps, table augment)
+		-- Skill tier upgrades and skill augments are independent.
+		local effect = augment.Effects[1]
+		if effect == nil or not _AugmentContentValidatorLogic:IsSkillModifierValid(effect) then return false end
+		if definition.CostType == "HEAL_CHARGE" then return effect.ParamA == "HEAL_CHARGES" or effect.ParamA == "HEAL_UNLIMITED" end
+		if effect.ParamA == "HEAL_CHARGES" or effect.ParamA == "HEAL_UNLIMITED" then return false end
+		if effect.ParamA == "HIDDEN_COOLDOWN" then return definition.CooldownTurns > 1 end
+		local damage = nil
+		local damageCount = 0
+		local heal = nil
+		local control = false
+		local moving = false
+		local buff = false
+		for _, step in ipairs(steps) do
+			if step.EffectType == "DAMAGE" then damage = step; damageCount = damageCount + 1 end
+			if step.EffectType == "HEAL" then heal = step end
+			if _BuffEffectExecutorLogic:IsBuffEffectType(step.EffectType) then buff = true end
+			if step.EffectType == "STUN" or step.EffectType == "FREEZE" then control = true end
+			if step.EffectType == "MOVE_SELF" then moving = true end
+		end
+		local kind = effect.ParamA
+		if kind == "BUFF_COOLDOWN" then return buff and damageCount == 0 and definition.CooldownTurns > 1 end
+		if buff and damageCount == 0 then
+			return kind == "ZERO_DAMAGE_FREE_LOAD" and definition.ZeroDamage ~= true and definition.FreePlay ~= true
+		end
+		local cooldown = tonumber(effect.ParamB)
+		if cooldown < 0 and definition.CooldownTurns <= 1 then return false end
+		if damageCount ~= 1 or damage.ParameterA == "SOURCE_BASIC_ATTACK" then return false end
+		if kind == "ZERO_DAMAGE_FREE_LOAD" then return definition.ZeroDamage ~= true and definition.FreePlay ~= true and damage.Value > 0 end
+		if definition.ZeroDamage == true and kind ~= "RANGE" then return false end
+		local hits = _DamageEffectExecutorLogic:GetHitCount(damage)
+		local single = damage.TargetSelector == "PRIMARY_TARGET" or definition.TargetingType == "FRONT_CELL" or definition.TargetingType == "FIRST_ENEMY_FORWARD"
+		if kind == "QUICK" then
+			return hits == 1 and damage.Value - effect.Amount >= 1
+		elseif kind == "POWER" or kind == "PRECISE" then
+			if hits ~= 1 or not single then return false end
+			return true
+		elseif kind == "VOLLEY" then
+			return hits >= 2 and (definition.WeaponType == "BOW" or definition.WeaponType == "CROSSBOW" or definition.WeaponType == "CLAW" or definition.WeaponType == "GUN")
+		elseif kind == "COMPACT" then
+			return hits >= 3 and hits - effect.Amount >= 2
+		elseif kind == "AREA" then
+			return hits == 1 and not single
+		elseif kind == "RANGE" then
+			if moving or definition.Range >= 6 or (definition.ProjectileRuid or "") == "" then return false end
+			if definition.TargetingType == "FIRST_ENEMY_FORWARD" or definition.TargetingType == "FIRST_ENEMY_PIERCE" then return true end
+			if definition.TargetingType ~= "RANGE_OFFSETS" then return false end
+			for offset in string.gmatch(definition.TargetOffsets or "", "([^|]+)") do
+				if (tonumber(offset) or 0) <= 0 then return false end
+			end
+			return (definition.TargetOffsets or "") ~= ""
+		end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetBoundSkillAugment(Entity player, string skillId)
+		-- Ignores stale run state and keeps enemy/global skill definitions immutable.
+		if not isvalid(player) then return "" end
+		local run = player:GetComponent("script.PlayerRunStateComponent")
+		local state = player:GetComponent("script.PlayerRunAugmentComponent")
+		if run == nil or state == nil or run.RunSequence <= 0 or state.ActiveRunSequence ~= run.RunSequence then return "" end
+		return state:GetSkillAugmentId(skillId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildSkillBundle(Entity player, table definition, table steps, string overrideAugmentId)
+		local result = self:ApplySkillModifier(definition, steps, "")
+		local owner = isvalid(player) and player:GetComponent("script.PlayerRunAugmentComponent") or nil
+		local run = isvalid(player) and player:GetComponent("script.PlayerRunStateComponent") or nil
+		local ids = {}
+		if overrideAugmentId ~= "NONE" and owner ~= nil and run ~= nil and owner.ActiveRunSequence == run.RunSequence then
+			ids = owner:GetSkillAugmentIds(definition.SkillId)
+		end
+		if overrideAugmentId ~= "" and overrideAugmentId ~= "NONE" then table.insert(ids, overrideAugmentId) end
+		local names = {}
+		local descriptions = {}
+		for _, id in ipairs(ids) do
+			result = self:ApplySkillModifier(result.Definition, result.EffectSteps, id)
+			if result.AugmentId ~= "" then
+				table.insert(names, result.AugmentName)
+				table.insert(descriptions, result.Description)
+			end
+		end
+		result.AugmentName = names[#names] or ""
+		result.Description = descriptions[#descriptions] or ""
+		result.AugmentStage = #ids
+		result.Definition.SkillAugmentName = result.AugmentName
+		result.Definition.SkillAugmentDescription = result.Description
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplySkillModifier(table definition, table steps, string augmentId)
+		-- Copies the current accumulated bundle before applying one validated trade-off.
+		local result = { Definition = {}, EffectSteps = {}, AugmentId = "", AugmentName = "", Description = "" }
+		for key, value in pairs(definition) do result.Definition[key] = value end
+		for _, step in ipairs(steps) do
+			local copied = {}
+			for key, value in pairs(step) do copied[key] = value end
+			table.insert(result.EffectSteps, copied)
+		end
+		if augmentId == "" or augmentId == "NONE" then return result end
+		local checked = _AugmentContentValidatorLogic:ValidateById(augmentId)
+		-- Eligibility is checked when granting/offering. Replaying owned modifiers must survive tier upgrades.
+		if not checked.Success then return result end
+		local effect = checked.Data.Effects[1]
+		local kind = effect.ParamA
+		if kind == "HEAL_CHARGES" then
+			-- Preview metadata only. This reward never changes the combat skill or binds a modifier.
+			if augmentId ~= "" then
+				result.AugmentId = augmentId
+				result.AugmentName = checked.Data.Definition.NameKey
+				result.Description = checked.Data.Definition.DescriptionKey
+			end
+			return result
+		end
+		local amount = effect.Amount
+		local tuned = result.Definition
+		tuned.CooldownTurns = math.max(1, definition.CooldownTurns + tonumber(effect.ParamB))
+		if kind == "HEAL_UNLIMITED" then tuned.CostValue = 0 end
+		if kind == "ZERO_DAMAGE_FREE_LOAD" then
+			tuned.FreePlay = true
+			tuned.ZeroDamage = true
+		end
+		for _, step in ipairs(result.EffectSteps) do
+			if step.EffectType == "DAMAGE" then
+				if kind == "ZERO_DAMAGE_FREE_LOAD" then step.Value = 0 end
+				if kind == "POWER" or kind == "AREA" then step.Value = step.Value + amount end
+				if kind == "QUICK" then step.Value = math.max(1, step.Value - amount) end
+				if kind == "VOLLEY" or kind == "COMPACT" then
+					local delta = kind == "VOLLEY" and amount or -amount
+					step.ParameterB = tostring(_DamageEffectExecutorLogic:GetHitCount(step) + delta)
+					if (tuned.ProjectileRuid or "") ~= "" then tuned.ProjectileCount = tonumber(step.ParameterB) end
+				end
+			end
+		end
+		if kind == "RANGE" then
+			tuned.Range = math.min(6, tuned.Range + amount)
+			if tuned.TargetingType == "RANGE_OFFSETS" then
+				local offsets = {}
+				local last = 0
+				for token in string.gmatch(tuned.TargetOffsets, "([^|]+)") do
+					table.insert(offsets, token)
+					last = math.max(last, tonumber(token) or 0)
+				end
+				for index = 1, amount do table.insert(offsets, tostring(last + index)) end
+				tuned.TargetOffsets = table.concat(offsets, "|")
+			end
+		end
+		result.AugmentId = augmentId
+		result.AugmentName = checked.Data.Definition.NameKey
+		result.Description = checked.Data.Definition.DescriptionKey
+		tuned.AugmentCooldownFloor = 1
+		tuned.SkillAugmentId = augmentId
+		tuned.SkillAugmentName = result.AugmentName
+		tuned.SkillAugmentDescription = result.Description
+		tuned.PreciseRefund = (definition.PreciseRefund or 0) + (kind == "PRECISE" and amount or 0)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEffectiveSkillBundle(Entity player, string skillId)
+		-- One validated read model serves execution, queue duration and skill HUD.
+		local checked = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if not checked.Success then return checked end
+		return { Success = true, Data = self:BuildSkillBundle(player, checked.Data.Definition, checked.Data.EffectSteps, "") }
 	end
 
 end
