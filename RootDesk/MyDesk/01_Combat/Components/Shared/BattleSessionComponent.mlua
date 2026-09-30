@@ -6085,6 +6085,7 @@ script BattleSessionComponent extends Component
 	method table RebuildBattleState(string reason)
 		self._T.PendingClear = nil
 		self._T.BossDefeated = false
+		self._T.EnemyDeathSettlement = nil
 		-- Clears transient battle state, then rebuilds the selected Stage through the normal spawn path.
 		local result = {
 			Success = false,
@@ -7833,8 +7834,20 @@ script BattleSessionComponent extends Component
 		local deathTeam = unit.Team
 		local deathIsBoss = unit.IsBoss
 		local deathEntry = self.EntryRequestId
+		-- Reserve death order before sound, collection, or drop resource loading can yield.
+		local settlement = nil
+		if deathTeam == "Enemy" then
+			settlement = self._T.EnemyDeathSettlement
+			if settlement == nil or settlement.Entry ~= deathEntry then
+				settlement = { Entry = deathEntry, PendingCount = 0, LastKillKey = "" }
+				self._T.EnemyDeathSettlement = settlement
+			end
+			settlement.PendingCount = settlement.PendingCount + 1
+			settlement.LastKillKey = self.StageId .. ":" .. tostring(self.CurrentWave) .. ":" .. tostring(unit.SpawnOrder) .. ":" .. unit.UnitId
+		end
 		local deathState = unit:MarkDead()
 		if deathState.Success == false then
+			if settlement ~= nil then settlement.PendingCount = settlement.PendingCount - 1 end
 			log_error("[BattleDeath] state transition failed unit=" .. unitId .. " reason=" .. deathState.Reason)
 			return
 		end
@@ -7908,6 +7921,7 @@ script BattleSessionComponent extends Component
 				log_error("[BattleDeath] drop failed unit=" .. unitId .. " reason=" .. dropResult.Reason)
 			end
 		end
+		if settlement ~= nil then settlement.PendingCount = settlement.PendingCount - 1 end
 		if self.EntryRequestId ~= deathEntry or self.BattleResult ~= "" then return end
 		if deathTeam == "Enemy" and deathIsBoss then
 			self._T.BossDefeated = true
@@ -7947,6 +7961,11 @@ script BattleSessionComponent extends Component
 		if self.BattleResult ~= "" then return end
 		if team == "Enemy" then
 			if self.BoardState == nil or #self.BoardState:CollectLivingEnemies() > 0 then return end
+			local settlement = self._T.EnemyDeathSettlement
+			if settlement ~= nil and settlement.Entry == self.EntryRequestId and settlement.PendingCount > 0 then
+				log("[BattleResult] waiting for enemy drops pending=" .. tostring(settlement.PendingCount))
+				return
+			end
 		elseif team == "Player" then
 			local playerUnit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
 			if playerUnit == nil or playerUnit.UnitId ~= unitId or not playerUnit.IsDead then
@@ -8013,6 +8032,10 @@ script BattleSessionComponent extends Component
 			if playerUnit ~= nil then playerUnit:ClearAttackBuffs() end
 			if self.BattleResult == "Victory" and self.DropRuntime ~= nil then
 				local dropRecordKey = self.StageId .. ":" .. tostring(self.EntryRequestId)
+				local settlement = self._T.EnemyDeathSettlement
+				if settlement ~= nil and settlement.Entry == self.EntryRequestId then
+					self.DropRuntime.LastEnemyKillKey = settlement.LastKillKey
+				end
 				local collectResult = self.DropRuntime:AutoCollectLastEnemy(self.PlayerEntity, dropRecordKey)
 				if collectResult.Success == false then
 					log_error("[BattleResult] drop auto collect failed reason=" .. collectResult.Reason .. " remaining=" .. collectResult.FailedCount)

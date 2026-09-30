@@ -14,23 +14,55 @@ script DamageSkinDefinitionRepositoryLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void PreloadSkin(string skinId)
-		-- Native resource validation is async and cosmetic only; it must never block a turn.
+		-- Validate each resource once and record native readiness before any number playback.
 		local result = self:GetDefinition(skinId)
 		if result.Success == false then
 			log_warning("[DamageSkinData] preload skipped skin=" .. skinId .. " reason=" .. result.Reason)
 			return
 		end
 		if self._T.preloads == nil then self._T.preloads = {} end
+		local states = self._T.preloads
 		local ruid = result.Definition.ResourceRuid
-		if self._T.preloads[ruid] then return end
-		self._T.preloads[ruid] = true
-		_DamageSkinService:PreloadAsync(ruid, function(success)
-			if success then
-				log("[DamageSkinData] preloaded skin=" .. skinId)
-			else
-				log_warning("[DamageSkinData] native resource failed skin=" .. skinId .. " ruid=" .. ruid)
-			end
+		if states[ruid] ~= nil then return end
+		states[ruid] = "loading"
+		local typeSuccess, resourceType = pcall(function()
+			return _ResourceService:GetTypeAndWait(ruid)
 		end)
+		if self._T.preloads ~= states then return end
+		if typeSuccess == false or resourceType ~= ResourceType.DamageSkin then
+			states[ruid] = "failed"
+			log_warning("[DamageSkinData] invalid resource type skin=" .. skinId .. " ruid=" .. ruid .. " type=" .. tostring(resourceType))
+			return
+		end
+		local dispatched = pcall(function()
+			_DamageSkinService:PreloadAsync(ruid, function(success)
+				if self._T.preloads ~= states then return end
+				states[ruid] = success and "ready" or "failed"
+				if success then
+					log("[DamageSkinData] preloaded skin=" .. skinId)
+				else
+					log_warning("[DamageSkinData] native resource failed skin=" .. skinId .. " ruid=" .. ruid)
+				end
+			end)
+		end)
+		if dispatched == false and self._T.preloads == states then
+			states[ruid] = "failed"
+			log_warning("[DamageSkinData] preload dispatch failed skin=" .. skinId .. " ruid=" .. ruid)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetPlaybackDefinition(string skinId, boolean incoming)
+		-- Keep combat immediate: use a ready default while the selected skin is loading or unavailable.
+		local result = self:GetDefinition(skinId)
+		local states = self._T.preloads or {}
+		if result.Success and states[result.Definition.ResourceRuid] == "ready" then return result end
+		local fallback = self:GetDefinition(incoming and self.DefaultIncomingSkinId or self.DefaultOutgoingSkinId)
+		if fallback.Success == false then return fallback end
+		if states[fallback.Definition.ResourceRuid] ~= "ready" then
+			return { Success = false, Reason = "DAMAGE_SKIN_NOT_READY" }
+		end
+		return { Success = true, Reason = "OK", Definition = fallback.Definition, UsedFallback = true }
 	end
 
 	method table GetAllDefinitions()

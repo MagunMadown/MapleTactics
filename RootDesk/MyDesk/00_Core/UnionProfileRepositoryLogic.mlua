@@ -1201,6 +1201,7 @@ script UnionProfileRepositoryLogic extends Logic
                 CommittedRewardKeys = {},
                 PaidPurchaseReceipts = {},
                 MagnetPetPurchaseId = "",
+                MagnetPetGiftId = "",
                 JobUnionProgress = self:CreateDefaultJobUnionProgress(),
                 AllocatedUnionStats = {},
                 PurchasedLevels = self:CopyLevelMap(zeroResult.Levels)
@@ -1231,6 +1232,10 @@ script UnionProfileRepositoryLogic extends Logic
                 return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_SHOP" }
             end
             profile.UnionShop = _UnionShopServiceLogic:CopyState(source.UnionShop)
+        end
+        if source.UnionShop == nil then
+            profile.UnionShop.UnlockedJobs = "warrior|archer|mage|thief|pirate"
+            profile.UnionShop.JobTokens = 0
         end
         if source.SkillTree ~= nil then
             if not _SkillTreeServiceLogic:ValidateState(source.SkillTree) then return {Success=false, Reason="INVALID_TREE_SAVE"} end
@@ -1264,6 +1269,10 @@ script UnionProfileRepositoryLogic extends Logic
             return {Success = false, Reason = "INVALID_MAGNET_PET_ENTITLEMENT"}
         end
         profile.MagnetPetPurchaseId = source.MagnetPetPurchaseId or ""
+        if source.MagnetPetGiftId ~= nil and type(source.MagnetPetGiftId) ~= "string" then
+            return {Success = false, Reason = "INVALID_MAGNET_PET_GIFT"}
+        end
+        profile.MagnetPetGiftId = source.MagnetPetGiftId or ""
 
         local purchasedResult = self:NormalizePurchasedLevelsStrict(source.PurchasedLevels)
         if purchasedResult.Success == false then
@@ -1272,7 +1281,8 @@ script UnionProfileRepositoryLogic extends Logic
         profile.PurchasedLevels = purchasedResult.Levels
 
         local wasMigrated = sourceSchemaVersion < self.CurrentSchemaVersion
-        local wasSanitized = rewardReceiptResult.WasSanitized == true
+        local wasSanitized = rewardReceiptResult.WasSanitized == true or source.UnionShop == nil or source.UnionShop.JobTokens == nil
+        wasSanitized = wasSanitized or (source.UnionShop ~= nil and profile.UnionShop.EquippedSkin ~= source.UnionShop.EquippedSkin)
         local legacyUpgradeRefund = 0
         local legacyBlockRefund = 0
         local blockRefundSource = "NONE"
@@ -1505,6 +1515,9 @@ script UnionProfileRepositoryLogic extends Logic
         if type(profile.MagnetPetPurchaseId) ~= "string" then
             return {Success = false, Reason = "INVALID_MAGNET_PET_ENTITLEMENT"}
         end
+        if type(profile.MagnetPetGiftId) ~= "string" then
+            return {Success = false, Reason = "INVALID_MAGNET_PET_GIFT"}
+        end
         local paidValidation = self:NormalizePaidPurchaseReceipts(profile.PaidPurchaseReceipts)
         if paidValidation.Success == false then return paidValidation end
         local jobValidation = self:ValidateJobUnionProgress(profile.JobUnionProgress)
@@ -1666,6 +1679,7 @@ script UnionProfileRepositoryLogic extends Logic
             CommittedRewardKeys = self:CopyRewardReceiptMap(source.CommittedRewardKeys),
             PaidPurchaseReceipts = self:CopyPaidPurchaseReceipts(source.PaidPurchaseReceipts),
             MagnetPetPurchaseId = source.MagnetPetPurchaseId or "",
+            MagnetPetGiftId = source.MagnetPetGiftId or "",
             JobUnionProgress = self:CopyLevelMap(source.JobUnionProgress),
             AllocatedUnionStats = self:CopyLevelMap(source.AllocatedUnionStats),
             PurchasedLevels = self:CopyLevelMap(source.PurchasedLevels)
@@ -2338,6 +2352,41 @@ script UnionProfileRepositoryLogic extends Logic
             self:EvictProfile(key, "")
             log_error("[MagnetPet] entitlement save failed; purchase remains pending")
             return {Success = false, Reason = "PURCHASE_STORAGE_EXCEPTION"}
+        end
+        return result
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryGrantMagnetPetGift(Entity recipient)
+        -- The creator-authorized gift targets only the native, case-sensitive profile code.
+        if not isvalid(recipient) or recipient.PlayerComponent == nil then
+            return {Success = false, Reason = "INVALID_PLAYER"}
+        end
+        local profileCode = recipient.PlayerComponent.ProfileCode or ""
+        if string.sub(profileCode, 1, 1) == "#" then profileCode = string.sub(profileCode, 2) end
+        if not _PremiumBenefitsLogic:IsMagnetPetGiftRecipient(recipient) then
+            return {Success = false, Reason = "MAGNET_GIFT_NOT_AUTHORIZED"}
+        end
+        local loaded = self:EnsureProfileLoaded(recipient)
+        if loaded.Success == false then return loaded end
+        local key = loaded.StorageUserKey
+        if not self:TryAcquireMutationLock(key) then return {Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS"} end
+        local ok, result = pcall(function()
+            local candidate = self:GetCachedSnapshot(key)
+            if candidate == nil then return {Success = false, Reason = "PROFILE_CACHE_MISSING"} end
+            if (candidate.MagnetPetPurchaseId or "") ~= "" or (candidate.MagnetPetGiftId or "") ~= "" then
+                return {Success = true, Duplicate = true, Reason = "ALREADY_OWNED"}
+            end
+            candidate.MagnetPetGiftId = "creator_gift_20261001_" .. profileCode
+            local saved = self:PersistProfileCandidate(key, candidate)
+            if saved.Success then log("[MagnetPetGift] saved profile=" .. profileCode) end
+            return saved
+        end)
+        self:ReleaseMutationLock(key)
+        if not ok then
+            self:EvictProfile(key, "")
+            log_error("[MagnetPetGift] entitlement save exception")
+            return {Success = false, Reason = "MAGNET_GIFT_STORAGE_EXCEPTION"}
         end
         return result
     end

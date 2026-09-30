@@ -15,7 +15,7 @@
     StageMapRoutes:["StageId"], StageEnemyWaves:["WaveTableId","WaveIndex"], StageRewardDefinitions:["StageRewardEntryId"],
     TopHudThemeDefinitions:["RegionId"], CurrencyDefinitions:["CurrencyId"], ShopDefinitions:["ShopId"],
     ShopEntries:["ShopEntryId"], ShopNodeBindings:["NodeGraphId","NodeId"], RelicDefinitions:["RelicId"],
-    ConsumableDefinitions:["ConsumableId"], UnionRankDefinitions:["RankId"], UnionRewardDefinitions:["RewardId"],
+    ConsumableDefinitions:["ConsumableId"], UnionShopProducts:["ProductId"], UnionRankDefinitions:["RankId"], UnionRewardDefinitions:["RewardId"],
     UnionJobGradeDefinitions:["GradeId"], UnionJobMilestoneDefinitions:["MilestoneId"], UnionStatDefinitions:["StatId"],
     UnionStatLevelDefinitions:["StatId","Level"], UnionUpgradeDefinitions:["UpgradeId"], UnionUpgradeLevels:["UpgradeId","Level"],
     UnionBlockDefinitions:["BlockId"], UnionBlockShapeDefinitions:["ShapeId"], UnionBoardCellDefinitions:["CellId"],
@@ -43,6 +43,12 @@
     UnionStatLevelDefinitions:{StatId:{ref:["UnionStatDefinitions","StatId"]},RequiredUnionRank:{ref:["UnionRankDefinitions","RankId"]}},
     UnionUpgradeLevels:{UpgradeId:{ref:["UnionUpgradeDefinitions","UpgradeId"]},RequiredUpgradeId:{ref:["UnionUpgradeDefinitions","UpgradeId"],optional:true}},
     UnionStatDefinitions:{IsImplemented:{note:"ADDITIONAL_SKILL_UNLOCK은 규칙 미정으로 비활성. STARTING_RANDOM_RELIC은 현재 Repository에서 true로 보정됨. CSV 값만으로 구현 여부를 단정하지 마세요.",readonly:true}},
+    UnionShopProducts:{
+      ProductId:{note:"저장 데이터가 참조하는 고유 상품 ID. 기존 구매 이력이 있으면 삭제하거나 변경하지 마세요."},
+      RefId:{note:"SUPPLY: orange_potion / red_potion / time_sand. JOB_TOKEN: job_unlock. SKIN: ProductId와 동일. 은퇴·삭제 스킨은 호환 검증만 유지하며 native 데미지 스킨 참조를 요구하지 않음."},
+      Price:{label:"유니온 코인 가격",note:"1 이상의 안전한 정수. 서버가 이 값을 차감합니다."},
+      SortOrder:{note:"중복 없는 1 이상의 안전한 정수. 표시 순서는 이 값을 따릅니다."}
+    },
     UtilitySkillDefinitions:{
       RequiredJobTag:{ref:["JobDefinitions","JobId"]},
       EffectSetId:{ref:["UtilitySkillEffectSteps","EffectSetId"]},
@@ -122,11 +128,52 @@
     } else return "UNKNOWN_UTILITY_EFFECT";
     return "INVALID_UTILITY_EFFECT_PARAMETERS";
   }
+  // Mirrors UnionShopProductRepositoryLogic; ProductId duplicates use the registered primary key.
+  function unionShopProductIssues(rows, skinRows = []) {
+    const issues = [], orders = new Set();
+    const add = (row, column, code) => issues.push({row, column, code});
+    const token = v => typeof v === "string" && /^[A-Za-z0-9_-]+$/.test(v);
+    const text = v => typeof v === "string" && /\S/.test(v);
+    const positive = v => text(v) && Number.isFinite(Number(v)) && Number.isInteger(Number(v)) && Number(v) > 0 && Number(v) <= 9007199254740990;
+    const boolean = v => /^(true|1|yes)$/i.test(v) ? true : /^(false|0|no)$/i.test(v) ? false : null;
+    if (!rows.length) add(0, "ProductId", "NO_PRODUCT_ROWS");
+    rows.forEach((r, row) => {
+      if (Number(r.SchemaVersion) !== 1) add(row, "SchemaVersion", "UNSUPPORTED_SCHEMA");
+      if (!token(r.ProductId)) add(row, "ProductId", "INVALID_PRODUCT_ID");
+      if (!["SUPPLY", "JOB_TOKEN", "SKIN", "FUTURE"].includes(r.Kind)) add(row, "Kind", "UNKNOWN_PRODUCT_KIND");
+      const enabled = boolean(r.Enabled), retired = boolean(r.Retired), removed = boolean(r.Removed);
+      for (const field of ["Enabled", "Retired", "Removed"]) if (boolean(r[field]) === null) add(row, field, "INVALID_PRODUCT_FLAGS");
+      if ((retired || removed) && enabled) add(row, "Enabled", "RETIRED_PRODUCT_ENABLED");
+      if (removed && !retired) add(row, "Retired", "REMOVED_PRODUCT_NOT_RETIRED");
+      if (!text(r.DisplayName)) add(row, "DisplayName", "REQUIRED_FIELD_MISSING");
+      if (!token(r.RefId)) add(row, "RefId", "REQUIRED_FIELD_MISSING");
+      for (const field of ["Price", "SortOrder"]) if (!positive(r[field])) add(row, field, "INVALID_PRODUCT_NUMBER");
+      if (positive(r.SortOrder)) {
+        const order = Number(r.SortOrder);
+        if (orders.has(order)) add(row, "SortOrder", "DUPLICATE_SORT_ORDER");
+        orders.add(order);
+      }
+      if (enabled) {
+        if (!text(r.Description)) add(row, "Description", "INVALID_PRODUCT_PRESENTATION");
+        if (!/^[0-9a-f]{32}$/i.test(r.IconRUID || "")) add(row, "IconRUID", "INVALID_PRODUCT_PRESENTATION");
+      }
+      if (r.Kind === "SUPPLY" && !["orange_potion", "red_potion", "time_sand"].includes(r.RefId)) add(row, "RefId", "UNSUPPORTED_SUPPLY_REF");
+      if (r.Kind === "JOB_TOKEN" && r.RefId !== "job_unlock") add(row, "RefId", "UNSUPPORTED_JOB_TOKEN_REF");
+      if (r.Kind === "SKIN" && r.RefId !== r.ProductId) add(row, "RefId", "INVALID_SKIN_REF");
+      if (enabled && r.Kind === "SKIN") {
+        const registered = skinRows.some(skin => skin.SkinId === r.RefId);
+        const alias = ["union_blade", "union_volcano"].includes(r.RefId) && skinRows.some(skin => skin.SkinId === "maple_default");
+        if (!registered && !alias) add(row, "RefId", "UNKNOWN_DAMAGE_SKIN_REF");
+      }
+    });
+    return issues;
+  }
   function validate(tables) {
     const issues=[];
     const add=(table,row,column,code)=>issues.push({table,row,column,code});
     for(const [name,t] of Object.entries(tables)){
       const m=meta(name),seen=new Set();
+      if(name==="UnionShopProducts") for(const issue of unionShopProductIssues(t.rows,tables.DamageSkinDefinitions?.rows)) add(name,issue.row+2,issue.column,issue.code);
       for(const h of m.key) if(!t.headers.includes(h))add(name,1,h,"REQUIRED_KEY_COLUMN");
       t.rows.forEach((r,i)=>{
         const row=i+2;
@@ -202,5 +249,5 @@
     }
     return issues;
   }
-  return {meta,keys,legacy,columns,parseCSV,serializeCSV,validate,effectReason};
+  return {meta,keys,legacy,columns,parseCSV,serializeCSV,validate,effectReason,unionShopProductIssues};
 });

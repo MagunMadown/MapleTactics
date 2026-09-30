@@ -68,6 +68,8 @@ script LobbyCharacterSelectionLogic extends Logic
 	property string PendingClassId = ""
 	property string SelectedClassId = ""
 	property integer SelectedJobIndex = 1
+	property any JobAccess = nil
+	property integer AccessRequestId = 0
 	property integer RequestId = 0
 	property integer PreviewRevision = 0
 	property table JobCardBindings = {}
@@ -155,7 +157,10 @@ script LobbyCharacterSelectionLogic extends Logic
 		self.PreviewAppearanceRetryCount = 0
 		self.PreviewWeaponRetryCount = 0
 		self.AppliedPreviewWeaponJobId = ""
+		self.JobAccess = nil
+		self.AccessRequestId = self.AccessRequestId + 1
 		self.IsPopupOpen = true
+		self:RequestJobAccess("", -1, self.AccessRequestId)
 		self:SetPopupEnabled(true)
 		self:SetStatus("")
 		self:RefreshView()
@@ -232,12 +237,56 @@ script LobbyCharacterSelectionLogic extends Logic
 			return
 		end
 
+		if self.JobAccess == nil then return end
+		if not _UnionShopServiceLogic:IsJobUnlocked(self.JobAccess, self.PendingClassId) then
+			if (self.JobAccess.JobTokens or 0) < 1 then return end
+			self.IsApplyPending = true
+			self.AccessRequestId = self.AccessRequestId + 1
+			self:RequestJobAccess(self.PendingClassId, self.JobAccess.Revision, self.AccessRequestId)
+			self:RefreshView()
+			return
+		end
 		self.IsApplyPending = true
 		self.RequestId = self.RequestId + 1
 		self:SetStatus("선택을 적용하는 중입니다...")
 		self:RefreshView()
 		log("[LobbyClassSelect] confirm requested id=" .. self.PendingClassId .. " request=" .. self.RequestId)
 		self:RequestConfirmClass(self.PendingClassId, self.RequestId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestJobAccess(string unlockJobId, integer revision, integer requestId)
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then
+			self:ReceiveJobAccess(requestId, false, "LOBBY_ONLY", {}, senderUserId)
+			return
+		end
+		local result = {Success=true, Reason="OK"}
+		if unlockJobId ~= "" then
+			local definition = _JobDefinitionRepositoryLogic:GetJobDefinition(unlockJobId)
+			if not definition.Success or not definition.Enabled then
+				result = {Success=false, Reason="JOB_UNAVAILABLE"}
+			else
+				result = _UnionProfileRepositoryLogic:TryCommitUnionShopAction(player, "UNLOCK_JOB", unlockJobId, revision, 0)
+			end
+		end
+		local loaded = _UnionProfileRepositoryLogic:GetUnionProfile(player)
+		if not loaded.Success then
+			self:ReceiveJobAccess(requestId, false, loaded.Reason, {}, senderUserId)
+			return
+		end
+		self:ReceiveJobAccess(requestId, result.Success, result.Reason, _UnionShopServiceLogic:CopyState(loaded.Profile.UnionShop), senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveJobAccess(integer requestId, boolean success, string reason, table snapshot)
+		if not self.IsPopupOpen or requestId ~= self.AccessRequestId then return end
+		self.IsApplyPending = false
+		self.JobAccess = snapshot.Revision ~= nil and snapshot or nil
+		self:RefreshView()
+		local tokens = self.JobAccess ~= nil and self.JobAccess.JobTokens or 0
+		local messages = {JOB_UNLOCKED="직업을 해금했습니다. 선택 버튼을 눌러 주세요.", NO_JOB_TOKEN="토큰이 부족합니다. 유니온 상점에서 구매할 수 있습니다.", SHOP_CHANGED="보유 상태가 바뀌었습니다. 다시 시도해 주세요.", JOB_ALREADY_UNLOCKED="이미 해금된 직업입니다."}
+		self:SetStatus((messages[reason] or (success and "첫 접속 시 토큰 1개 지급 · 직업 하나를 영구 해금할 수 있습니다." or "불러오기 실패: " .. tostring(reason))) .. "  보유 토큰: " .. tostring(tokens))
 	end
 
 	@ExecSpace("Server")
@@ -248,6 +297,15 @@ script LobbyCharacterSelectionLogic extends Logic
 			return
 		end
 
+		if not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then
+			self:NotifyConfirmResult(requestId, false, "LOBBY_ONLY", classId, senderUserId)
+			return
+		end
+		local access = _UnionShopServiceLogic:CanSelectJob(player, classId)
+		if not access.Success then
+			self:NotifyConfirmResult(requestId, false, access.Reason, classId, senderUserId)
+			return
+		end
 		local jobDefinition = _JobDefinitionRepositoryLogic:GetJobDefinition(classId)
 		if jobDefinition.Success == false or jobDefinition.Enabled == false then
 			log_warning("[LobbyClassSelect] confirm rejected user=" .. senderUserId .. " jobId=" .. classId .. " reason=JOB_UNAVAILABLE")
@@ -369,12 +427,14 @@ script LobbyCharacterSelectionLogic extends Logic
 
 		self:RefreshPassiveSlot()
 		self:RefreshJobCards()
+		local unlocked = selected ~= nil and _UnionShopServiceLogic:IsJobUnlocked(self.JobAccess, selected.Id)
+		local tokens = self.JobAccess ~= nil and self.JobAccess.JobTokens or 0
 		local confirmLabel = self.ConfirmJobButton.Entity.TextGUIRendererComponent
 		if confirmLabel ~= nil then
-			confirmLabel.Text = self.IsApplyPending and "적용 중..." or (selected ~= nil and selected.Name .. " 선택" or "직업 선택")
+			confirmLabel.Text = self.IsApplyPending and "적용 중..." or (self.JobAccess == nil and "불러오는 중..." or (unlocked and selected.Name .. " 선택" or (tokens > 0 and "토큰 1개로 해금" or "해제 토큰 필요")))
 		end
 		self.NeedsPreviewRefresh = true
-		local canConfirm = selected ~= nil and self.IsApplyPending == false
+		local canConfirm = self.JobAccess ~= nil and selected ~= nil and self.IsApplyPending == false and (unlocked or tokens > 0)
 		self.ConfirmJobButton.Enable = canConfirm
 		if self.ConfirmJobButton.Entity.SpriteGUIRendererComponent ~= nil then
 			if canConfirm then
@@ -531,7 +591,7 @@ script LobbyCharacterSelectionLogic extends Logic
 			local base = binding.BaseColor
 			local lift = selected and 0.13 or 0
 			binding.Card.SpriteGUIRendererComponent.Color = Color(base.r + lift, base.g + lift, base.b + lift, 1)
-			binding.Marker.Text = selected and "선택 중" or (available and "" or "사용 불가")
+			binding.Marker.Text = not _UnionShopServiceLogic:IsJobUnlocked(self.JobAccess, binding.JobId) and "잠김" or (selected and "선택 중" or (available and "" or "사용 불가"))
 			binding.Family:SetEnable(selected)
 			binding.Theme:SetEnable(selected)
 			if selected then self.JobNameText.FontColor = binding.TitleColor end
