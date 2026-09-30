@@ -54,7 +54,7 @@ script UpgradeSkillStageLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table BuildUpgradeState(Entity playerEntity)
-		-- Cache a reward's mixed normal/augment offers on the existing per-player augment owner.
+		-- Cache random augment choices; permanent inheritance is purchased only in the lobby.
 		if not isvalid(playerEntity) then return { Success = false, Reason = "INVALID_PLAYER" } end
 		if playerEntity.CurrentMap == nil or playerEntity.CurrentMap.Name ~= self.UpgradeMapName then return { Success = false, Reason = "NOT_IN_UPGRADE_STAGE" } end
 		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
@@ -66,7 +66,7 @@ script UpgradeSkillStageLogic extends Logic
 		if owner == nil or owner.ActiveRunSequence ~= run.RunSequence then return { Success = false, Reason = "RUN_AUGMENT_UNAVAILABLE" } end
 		local rewardKey = "upgrade_skill_stage:" .. run.LastBattleRecordKey
 		if inventory:ContainsDelimitedKey(inventory.AppliedRewardKeys, rewardKey) then return { Success = false, Reason = "UPGRADE_ALREADY_APPLIED" } end
-		local cacheKey = "max_tier_augments:" .. tostring(run.RunSequence) .. ":" .. rewardKey .. ":" .. tostring(inventory.SkillInventoryRevision) .. ":" .. tostring(owner.AugmentRevision)
+		local cacheKey = "skill_augments:" .. tostring(run.RunSequence) .. ":" .. rewardKey .. ":" .. tostring(inventory.SkillInventoryRevision) .. ":" .. tostring(owner.AugmentRevision)
 		local cached = owner._T.SkillUpgradeOffers
 		if cached ~= nil and cached.Key == cacheKey then return cached.State end
 		local catalog = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(run.SelectedJobId)
@@ -80,24 +80,21 @@ script UpgradeSkillStageLogic extends Logic
 		local canReplaceSold = inventory.PendingSoldSkillChoices > 0 and #inventory:GetDistinctOwnedSkillIds() < inventory.RunSkillBarSlotCount
 		for _, definition in ipairs(catalog.Skills) do
 			if canReplaceSold and definition.SkillTier == 1 and (definition.BaseSkillId or "") == "" and not inventory:HasOwnedSkillInFamily(definition.SkillId, catalog.Skills) then
+				definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(_SkillTreeServiceLogic:ResolveSkill(definition.SkillId, inventory.SkillTreeUnlockSnapshot))
 				local checked = _ContentValidatorLogic:ValidateSkillById(definition.SkillId)
 				if checked.Success then table.insert(newSkills, { Token = definition.SkillId .. "~NEW", Before = definition, After = definition, AugmentId = "", NewSkill = true }) end
 			end
 			local ownership = inventory:CanUseSkill(definition.SkillId)
 			if ownership.Success or ownership.Reason == "HEAL_CHARGES_EMPTY" then
-				local path = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(run.SelectedJobId, definition.SkillId)
-				if path.Success and definition.CostType ~= "HEAL_CHARGE" then
-					table.insert(normal, { Token = definition.SkillId, Before = definition, After = path.UpgradeDefinition, AugmentId = "" })
-				end
-				-- Only terminal tiers and skills without a tier path can offer normal or hidden augments.
-				if path.Reason == "NO_UPGRADE_PATH" then
+				-- Permanent inheritance belongs to the lobby; all owned tiers may augment.
+				do
 					local effects = _AugmentRuntimeLogic:GetEffectiveSkillBundle(playerEntity, definition.SkillId)
 					if effects.Success and #owner:GetSkillAugmentIds(definition.SkillId) < owner.MaxSkillAugmentStages then
 						local hidden = {}
 						for _, augment in ipairs(augments.Augments) do
 							local recharge = augment.Effects[1].ParamA == "HEAL_CHARGES"
 							if _AugmentRuntimeLogic:CanBindSkillAugment(effects.Data.Definition, effects.Data.EffectSteps, augment)
-								and (definition.CostType ~= "HEAL_CHARGE" or not inventory.HealUnlimited)
+								and (not inventory.HealUnlimited or (not recharge and augment.Effects[1].ParamA ~= "HEAL_UNLIMITED"))
 								and (not recharge or inventory:GetHealCharges() < 4) then
 								table.insert(augment.Effects[1].ParamC == "HIDDEN" and hidden or augmented, { Token = definition.SkillId .. "~" .. augment.Definition.AugmentId, Before = definition, After = definition, AugmentId = augment.Definition.AugmentId })
 							end
@@ -111,7 +108,7 @@ script UpgradeSkillStageLogic extends Logic
 			end
 		end
 		local allOffers = {}
-		-- A sold slot receives a dedicated basic-skill selection, never an upgraded skill.
+		-- A sold slot receives a new skill family at its captured permanent inheritance tier.
 		if #newSkills > 0 then
 			self:ShuffleOffers(newSkills)
 			local offers = {}
@@ -209,18 +206,17 @@ script UpgradeSkillStageLogic extends Logic
 			end
 		elseif selected.AugmentId ~= "" then
 			local owner = player:GetComponent("script.PlayerRunAugmentComponent")
-			if selected.Before.CostType == "HEAL_CHARGE" and selected.AugmentId == "skill_heal" then
-				applied = inventory:GrantHealChargeReward(2, state.RewardKey)
-			else
 			applied = owner:SetSkillAugment(selected.Before.SkillId, selected.AugmentId, state.RewardKey)
 			if applied.Success then
+				if selected.AugmentId == "skill_heal" then
+					inventory.HealCharges = math.min(5, inventory:GetHealCharges() + 2)
+					inventory.InventoryRevision = inventory.InventoryRevision + 1
+				end
 				inventory.AppliedRewardKeys = inventory:AppendDelimitedKey(inventory.AppliedRewardKeys, state.RewardKey)
 				if selected.AugmentId == "hidden_heal" then inventory.HealUnlimited = true; inventory.InventoryRevision = inventory.InventoryRevision + 1 end
 			end
-			end
 		else
-			applied = inventory:UpgradeSkill(selected.Before.SkillId, selected.After.SkillId, state.RewardKey)
-			if applied.Success and applied.ReplacedAmount ~= 1 then applied = { Success = false, Reason = "UPGRADE_ALREADY_APPLIED" } end
+			applied = { Success = false, Reason = "LOBBY_INHERITANCE_ONLY" }
 		end
 		self:ReceiveApplyResult(applied.Success, applied.Reason, selected.Before.SkillId, selected.After.SkillId, selected.After.SkillTier, applied.Success and nextMap or "", senderUserId)
 	end
@@ -337,7 +333,9 @@ script UpgradeSkillStageLogic extends Logic
 			if before == nil or after == nil then return { Success = false, Reason = "INVALID_SKILL_CONTENT" } end
 			if offer.Before.CostType == "HEAL_CHARGE" and not offer.NewSkill then
 				before.HealCharges = inventory:GetHealCharges()
-				if offer.AugmentId == "hidden_heal" then after.UnlimitedHeal = true else after.HealCharges = math.min(5, before.HealCharges + 2) end
+				before.UnlimitedHeal = inventory.HealUnlimited
+				after.UnlimitedHeal = inventory.HealUnlimited or offer.AugmentId == "hidden_heal"
+				after.HealCharges = offer.AugmentId == "skill_heal" and math.min(5, before.HealCharges + 2) or before.HealCharges
 			end
 			local name = offer.Before.DisplayName
 			local afterName = offer.After.DisplayName
@@ -351,13 +349,13 @@ script UpgradeSkillStageLogic extends Logic
 			}
 			if offer.NewSkill then
 				values[4] = "NEW"
-				values[5] = "상태: 판매한 스킬의 빈 자리\n선택: 새 기본 스킬"
+				values[5] = "상태: 판매한 스킬의 빈 자리\n선택: 새 스킬 · 출발 시 계승 적용"
 				values[9] = "NEW"
 			else
 				local owner = playerEntity:GetComponent("script.PlayerRunAugmentComponent")
 				local stage = #owner:GetSkillAugmentIds(offer.Before.SkillId)
-				values[5] = values[5] .. "\n강화 횟수: " .. stage .. "/" .. owner.MaxSkillAugmentStages
-				values[10] = values[10] .. "\n강화 횟수: " .. (stage + (offer.AugmentId ~= "" and 1 or 0)) .. "/" .. owner.MaxSkillAugmentStages
+				values[5] = values[5] .. "\n증강 횟수: " .. stage .. "/" .. owner.MaxSkillAugmentStages
+				values[10] = values[10] .. "\n증강 횟수: " .. (stage + (offer.AugmentId ~= "" and 1 or 0)) .. "/" .. owner.MaxSkillAugmentStages
 			end
 			for index, field in ipairs(fields) do table.insert(columns[field], values[index]) end
 		end

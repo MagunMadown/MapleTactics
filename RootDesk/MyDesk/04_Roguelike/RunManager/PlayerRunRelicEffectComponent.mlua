@@ -32,6 +32,7 @@ script PlayerRunRelicEffectComponent extends Component
 		if self.IsInitialized and self.ActiveRunSequence == runSequence then
 			return { Success = true, Reason = "RELIC_CATALOG_ALREADY_CAPTURED" }
 		end
+		self:ClearMagnetPetFollower()
 		self.ActiveRunSequence = runSequence
 		self.AttackBonus = 0
 		self.MaxHpBonus = 0
@@ -176,6 +177,7 @@ script PlayerRunRelicEffectComponent extends Component
 		self.MaxHpBonus = hp
 		self.DefenseBonus = defense
 		self.SpecialEffects = specialEffects
+		inventory:SetRelicConsumableSlotBonus(specialEffects["MAGNET_PET"] or 0)
 		local delta = hp - self.AppliedMaxHpBonus
 		if runState.RunHpInitialized and delta ~= 0 then
 			-- Removing a max-HP relic clamps current HP to the new maximum without dealing damage.
@@ -496,6 +498,8 @@ script PlayerRunRelicEffectComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void OnMapLeave(Entity nextMap)
 		-- The player component owns cleanup across maps, unlike a global Logic singleton.
+		self._T.MagnetPetChangingMap = true
+		self:ClearMagnetPetFollower()
 		self:EndBattleEffects()
 	end
 
@@ -517,6 +521,101 @@ script PlayerRunRelicEffectComponent extends Component
 		self:ApplyRelicHealing("VICTORY_HEAL")
 		self.LastVictoryKey = battleRecordKey
 		return { Success = true, Reason = "RELIC_VICTORY_APPLIED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		-- The server owns one replicated pet per relic owner; no client can grant a pet.
+		if self._T.MagnetPetChangingMap then return end
+		self._T.MagnetPetElapsed = (self._T.MagnetPetElapsed or 0) + math.max(0, delta)
+		if self._T.MagnetPetElapsed < 0.05 then return end
+		local elapsed = math.min(0.15, self._T.MagnetPetElapsed)
+		self._T.MagnetPetElapsed = 0
+		local map = self.Entity.CurrentMap
+		local run = self.Entity:GetComponent("script.PlayerRunStateComponent")
+		if not isvalid(map) or run == nil or run.RunState ~= "Active"
+			or not self.Entity.Enable or not self.Entity.Visible
+			or (run.RunHpInitialized and run.RunCurrentHp <= 0)
+			or self:GetSpecialEffectValue("MAGNET_PET") <= 0 then
+			self:ClearMagnetPetFollower()
+			return
+		end
+		local pet = self._T.MagnetPetFollower
+		if isvalid(pet) and pet.CurrentMap ~= map then
+			self:ClearMagnetPetFollower()
+			pet = nil
+		end
+		local ownerPosition = self.Entity.TransformComponent.WorldPosition
+		local direction = -1
+		local controller = self.Entity.PlayerControllerComponent
+		if controller ~= nil and controller.LookDirectionX > 0 then direction = 1 end
+		local targetX = ownerPosition.x - direction * 0.55
+		local targetY = ownerPosition.y
+		if not isvalid(pet) then
+			self._T.MagnetPetRetry = math.max(0, (self._T.MagnetPetRetry or 0) - elapsed)
+			if self._T.MagnetPetRetry > 0 then return end
+			self._T.MagnetPetRetry = 1
+			pet = _SpawnService:SpawnByModelId("cantabilemagnetpet", "MagnetPet_" .. tostring(self.Entity.Id), Vector3(0, 0, 0), map)
+			if not isvalid(pet) then
+				log_warning("[MagnetPetFollower] spawn failed player=" .. tostring(self.Entity.Id))
+				return
+			end
+			self._T.MagnetPetFollower = pet
+			pet.RigidbodyComponent.LayerSettingType = AutomaticLayerOption.None
+			pet.RigidbodyComponent:SetWorldPosition(Vector2(targetX, targetY))
+			log("[MagnetPetFollower] spawned player=" .. tostring(self.Entity.Id) .. " map=" .. map.Name)
+		end
+		local position = pet.TransformComponent.WorldPosition
+		local step = self:GetMagnetPetFollowStep(position.x, position.y, targetX, targetY, elapsed)
+		if step.Moving or step.Teleported then
+			pet.RigidbodyComponent:SetWorldPosition(Vector2(step.X, step.Y))
+		end
+		local renderer = pet.SpriteRendererComponent
+		local clip = step.Moving and "b92bd2899e9049e98dae65ae1d13ff50" or "98b1eb2cdc504339ac50673933ec45be"
+		if renderer.SpriteRUID ~= clip then renderer.SpriteRUID = clip end
+		local faceRight = direction > 0
+		if step.Moving and math.abs(targetX - position.x) > 0.02 then faceRight = targetX > position.x end
+		renderer.FlipX = faceRight
+		local avatar = self.Entity.AvatarRendererComponent
+		if avatar ~= nil then
+			renderer.SortingLayer = avatar.SortingLayer
+			renderer.OrderInLayer = avatar.OrderInLayer - 1
+		end
+	end
+
+	method table GetMagnetPetFollowStep(number x, number y, number targetX, number targetY, number delta)
+		-- Follow smoothly without overshoot; large teleports snap instead of crossing the map.
+		local dx, dy = targetX - x, targetY - y
+		local distance = math.sqrt(dx * dx + dy * dy)
+		if distance > 3.5 then return {X = targetX, Y = targetY, Moving = false, Teleported = true} end
+		if distance <= 0.025 then return {X = x, Y = y, Moving = false, Teleported = false} end
+		local travel = math.min(distance, math.max(0, delta) * math.max(2.5, distance * 8))
+		return {X = x + dx * travel / distance, Y = y + dy * travel / distance, Moving = travel > 0, Teleported = false}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearMagnetPetFollower()
+		-- Remove the old map's entity on relic loss, run end, transfer, or player disconnect.
+		local pet = self._T.MagnetPetFollower
+		self._T.MagnetPetFollower = nil
+		self._T.MagnetPetRetry = 0
+		if isvalid(pet) then
+			pet:Destroy()
+			log("[MagnetPetFollower] removed player=" .. tostring(self.Entity.Id))
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnMapEnter(Entity enteredMap)
+		-- Resume after transfer; OnUpdate spawns against the new CurrentMap once it is ready.
+		self._T.MagnetPetChangingMap = false
+		self._T.MagnetPetElapsed = 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Player removal must not leave a replicated pet in a shared map.
+		self:ClearMagnetPetFollower()
 	end
 
 end
