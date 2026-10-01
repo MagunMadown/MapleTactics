@@ -108,6 +108,15 @@
     ["CasterMotionPlayRate",0.000001,false,true],["CasterMotionDuration",0.000001,false,true],
     ["EnemyQueueTurns",0,true,true],["ProjectileCount",1,true,true],["ProjectileInterval",0,false,true],["ProjectileHeight",0,false,true]
   ];
+  function utilityPushModifiersOK(value) {
+    // Mirrors ContentValidatorLogic.IsValidUtilityPushParameterB's pipe-separated token set.
+    const tokens=String(value||"").match(/[^|]+/g)||[],seen=new Set();
+    for(const token of tokens){
+      if(!["CARRY_CASTER","CANCEL_QUEUE"].includes(token)||seen.has(token))return false;
+      seen.add(token);
+    }
+    return true;
+  }
   function effectReason(d,s) {
     if(s.ConditionId)return "UTILITY_CONDITION_UNSUPPORTED";
     const a=s.ParameterA||"",b=s.ParameterB||"",v=Number(s.Value);
@@ -121,7 +130,7 @@
     } else if(s.EffectType==="THROW_BEHIND"){
       if(d.TargetingType!=="SELF"&&s.TargetSelector==="PRIMARY_TARGET"&&Number.isInteger(v)&&v>=1&&b==="")return "";
     } else if(s.EffectType==="PUSH_DISTANCE"){
-      if(d.TargetingType!=="SELF"&&["PRIMARY_TARGET","ALL_SKILL_TARGETS"].includes(s.TargetSelector)&&["","CARRY_CASTER"].includes(b)){
+      if(d.TargetingType!=="SELF"&&["PRIMARY_TARGET","ALL_SKILL_TARGETS"].includes(s.TargetSelector)&&utilityPushModifiersOK(b)){
         if(a==="MAX"&&v===0)return "";
         if(a==="STOP_BEFORE_BLOCKED"&&Number.isInteger(v)&&v>=1)return "";
       }

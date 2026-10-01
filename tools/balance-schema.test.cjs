@@ -90,6 +90,21 @@ test("THROW_BEHIND utility effect follows ContentValidator.ValidateUtilityEffect
   assert.ok(S.validate(t).some(e=>e.code==="INVALID_UTILITY_EFFECT_PARAMETERS"));
 });
 
+for(const modifier of ["","CARRY_CASTER","CANCEL_QUEUE","CARRY_CASTER|CANCEL_QUEUE","CANCEL_QUEUE|CARRY_CASTER"]){
+  test("PUSH_DISTANCE accepts supported modifier set "+JSON.stringify(modifier),()=>{
+    const t=copy(),step=t.UtilitySkillEffectSteps.rows.find(r=>r.EffectType==="PUSH_DISTANCE");
+    assert.ok(step);step.ParameterB=modifier;
+    assert.deepEqual(S.validate(t),[]);
+  });
+}
+for(const modifier of ["CANCEL","CARRY_CASTER|CARRY_CASTER","CANCEL_QUEUE|CANCEL_QUEUE","CARRY_CASTER|CANCEL_QUEUE|CARRY_CASTER","CARRY_CASTER|UNKNOWN"," CANCEL_QUEUE"]){
+  test("PUSH_DISTANCE rejects unknown or repeated modifier "+JSON.stringify(modifier),()=>{
+    const t=copy(),step=t.UtilitySkillEffectSteps.rows.find(r=>r.EffectType==="PUSH_DISTANCE");
+    assert.ok(step);step.ParameterB=modifier;
+    assert.ok(S.validate(t).some(e=>e.code==="INVALID_UTILITY_EFFECT_PARAMETERS"));
+  });
+}
+
 test("UnionShopProducts is editable and current sale prices survive CSV round-trip",()=>{
   assert.equal(S.meta("UnionShopProducts").readonly,false);
   assert.deepEqual(S.meta("UnionShopProducts").key,["ProductId"]);

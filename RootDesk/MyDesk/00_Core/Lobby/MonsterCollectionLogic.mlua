@@ -39,7 +39,7 @@ script MonsterCollectionLogic extends Logic
 		if record ~= nil then return record end
 		local key = player.PlayerComponent.ProfileCode
 		if key == nil or key == "" then key = userId end
-		record = { Key = key, UserId = userId, Entries = {}, Pending = {}, Loaded = false, Loading = false, Saving = false, Raw = "", Exists = false, Timer = 0, RetryDelay = 3, NextLoadAt = 0, NextRequestAt = 0, Invalid = false }
+		record = { Key = key, UserId = userId, Entries = {}, Pending = {}, Loaded = false, Loading = false, Saving = false, Raw = "", Exists = false, Timer = 0, RetryDelay = 3, NextLoadAt = 0, NextRequestAt = 0, Invalid = false, FinalFlushRequested = false, FinalFlushInProgress = false }
 		self.Records[userId] = record
 		self:LoadRecord(record)
 		return record
@@ -117,14 +117,17 @@ script MonsterCollectionLogic extends Logic
 			if code == 2000000 then record.Loaded = false end
 			record.RetryDelay = code == 1000005 and 120 or math.min(120, math.max(10, record.RetryDelay * 2))
 			log_warning("[MonsterCollection] save pending code=" .. tostring(code))
-			self:ScheduleSave(record)
+			if record.FinalFlushRequested and not record.FinalFlushInProgress then self:FlushFinalRecord(record)
+			else self:ScheduleSave(record) end
 			return
 		end
 		record.Raw = raw
 		record.Exists = true
 		record.RetryDelay = 3
 		for id, state in pairs(pending) do if record.Pending[id] == state then record.Pending[id] = nil end end
-		if next(record.Pending) ~= nil then self:ScheduleSave(record) end
+		if record.FinalFlushRequested then
+			if not record.FinalFlushInProgress then self:FlushFinalRecord(record) end
+		elseif next(record.Pending) ~= nil then self:ScheduleSave(record) end
 		self:ReceiveSnapshot(self:EncodeRecords(record.Entries), true, "", record.UserId)
 		log("[MonsterCollection] saved bytes=" .. tostring(string.len(raw)))
 	end
@@ -178,14 +181,40 @@ script MonsterCollectionLogic extends Logic
 	end
 
 	@ExecSpace("ServerOnly")
-	method void WaitForActiveSave(table record)
-		-- Serializes the logout flush behind any live asynchronous write.
+	method boolean WaitForActiveSave(table record)
+		-- Waits within a bounded window; a late callback retains ownership of the requested final flush.
 		local remaining = 5
 		while record.Saving and remaining > 0 do
 			wait(0.05)
 			remaining = remaining - 0.05
 		end
-		if record.Saving then log_warning("[MonsterCollection] final save still in flight") end
+		if record.Saving then log_warning("[MonsterCollection] final save still in flight; dirty state retained") end
+		return not record.Saving
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean FlushFinalRecord(table record)
+		-- Drains the active save before a final synchronous write, retaining dirty state on timeout or failure.
+		record.FinalFlushRequested = true
+		if record.FinalFlushInProgress then return false end
+		record.FinalFlushInProgress = true
+		if record.Timer ~= 0 then _TimerService:ClearTimer(record.Timer) record.Timer = 0 end
+		if self:WaitForActiveSave(record) == false then
+			record.FinalFlushInProgress = false
+			return false
+		end
+		-- A setter during the final write can leave one more generation to flush.
+		for attempt = 1, 2 do
+			if next(record.Pending) == nil then break end
+			if self:FlushRecord(record, true) == false then break end
+		end
+		local saved = next(record.Pending) == nil and not record.Saving
+		if saved then record.FinalFlushRequested = false
+		else log_warning("[MonsterCollection] final flush incomplete; dirty state retained") end
+		record.FinalFlushInProgress = false
+		if (saved or self.Closing) and record.Timer ~= 0 then _TimerService:ClearTimer(record.Timer) record.Timer = 0 end
+		if not saved and not self.Closing then self:ScheduleSave(record) end
+		return saved
 	end
 
 	@ExecSpace("ServerOnly")
@@ -195,9 +224,8 @@ script MonsterCollectionLogic extends Logic
 		local record = self.Records[event.UserId]
 		if record == nil then return end
 		if record.Timer ~= 0 then _TimerService:ClearTimer(record.Timer) record.Timer = 0 end
-		self:WaitForActiveSave(record)
-		self:FlushRecord(record, true)
-		if next(record.Pending) == nil then self.Records[event.UserId] = nil end
+		local saved = self:FlushFinalRecord(record)
+		if saved then self.Records[event.UserId] = nil end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -206,7 +234,7 @@ script MonsterCollectionLogic extends Logic
 		self.Closing = true
 		for _, record in pairs(self.Records) do
 			if record.Timer ~= 0 then _TimerService:ClearTimer(record.Timer) record.Timer = 0 end
-			self:FlushRecord(record, true)
+			self:FlushFinalRecord(record)
 		end
 	end
 end
