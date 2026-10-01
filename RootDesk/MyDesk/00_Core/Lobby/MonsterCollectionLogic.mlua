@@ -8,6 +8,27 @@ script MonsterCollectionLogic extends Logic
 	property boolean Closing = false
 	property string LoadMessage = "수집 기록 불러오는 중"
 
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Start collection reads at login, before the first battle death needs this cache.
+		self.Closing = false
+		for _, player in ipairs(_UserService.UserEntities.Values) do
+			if isvalid(player) then self:GetRecord(player) end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Service", "UserService")
+	handler HandleUserEnter(UserEnterEvent event)
+		self:GetRecord(_UserService:GetUserEntityByUserId(event.UserId))
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Service", "UserService")
+	handler HandleUserReconnect(UserReconnectEvent event)
+		self:GetRecord(_UserService:GetUserEntityByUserId(event.UserId))
+	end
+
 	method table DecodeRecords(string raw)
 		-- Stores compact monotonic states: 1 is new, 2 is read; corrupt saves are never overwritten.
 		if raw == nil or raw == "" then return {} end
@@ -32,11 +53,14 @@ script MonsterCollectionLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method any GetRecord(Entity player)
-		-- Reads one dedicated collection key per player session and reuses the loaded cache.
+		-- Dispatches one dedicated collection read without suspending combat callers.
 		if isvalid(player) == false or player.PlayerComponent == nil then return nil end
 		local userId = player.PlayerComponent.UserId
 		local record = self.Records[userId]
-		if record ~= nil then return record end
+		if record ~= nil then
+			if not record.Loaded then self:LoadRecord(record) end
+			return record
+		end
 		local key = player.PlayerComponent.ProfileCode
 		if key == nil or key == "" then key = userId end
 		record = { Key = key, UserId = userId, Entries = {}, Pending = {}, Loaded = false, Loading = false, Saving = false, Raw = "", Exists = false, Timer = 0, RetryDelay = 3, NextLoadAt = 0, NextRequestAt = 0, Invalid = false, FinalFlushRequested = false, FinalFlushInProgress = false }
@@ -47,25 +71,56 @@ script MonsterCollectionLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method boolean LoadRecord(table record)
-		-- Retains pending discoveries when a read fails instead of replacing the saved catalog.
+		-- Async completion merges discoveries/read acknowledgments captured while the read was in flight.
+		if record.Loaded then return true end
 		if record.Loading or record.Invalid or _UtilLogic.ElapsedSeconds < record.NextLoadAt then return false end
 		record.NextLoadAt = _UtilLogic.ElapsedSeconds + 10
 		record.Loading = true
+		record.LoadStartedAt = _UtilLogic.ElapsedSeconds
+		local generation = {}
+		record.LoadGeneration = generation
 		local storage = _DataStorageService:GetUserDataStorage(record.Key)
-		local code, raw = storage:GetAndWait(self.StorageKey)
+		local dispatched = storage ~= nil and pcall(function()
+			storage:GetAsync(self.StorageKey, function(code, key, raw)
+				if key ~= self.StorageKey or self.Records[record.UserId] ~= record
+					or record.LoadGeneration ~= generation or not record.Loading then return end
+				record.LoadGeneration = nil
+				self:CompleteLoad(record, code, raw)
+			end)
+		end)
+		if not dispatched and record.LoadGeneration == generation then
+			record.LoadGeneration = nil
+			self:CompleteLoad(record, 1000001, "")
+		end
+		return record.Loaded
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompleteLoad(table record, integer code, string raw)
+		if self.Records[record.UserId] ~= record or not record.Loading then return end
 		record.Loading = false
+		log("[CollectionTiming] phase=LOAD elapsedMs=" .. tostring(math.floor((_UtilLogic.ElapsedSeconds - record.LoadStartedAt) * 1000)) .. " code=" .. tostring(code))
 		if code ~= 0 and code ~= 1000002 then
 			log_warning("[MonsterCollection] load failed code=" .. tostring(code))
-			return false
+			if next(record.Pending) ~= nil then self:ScheduleSave(record) end
+			self:ReceiveSnapshot(self:EncodeRecords(record.Entries), false, "", record.UserId)
+			return
 		end
 		local entries = self:DecodeRecords(code == 1000002 and "" or raw)
-		if entries == nil then record.Invalid = true log_error("[MonsterCollection] invalid saved record; write blocked") return false end
+		if entries == nil then record.Invalid = true log_error("[MonsterCollection] invalid saved record; write blocked") return end
+		local discoveredId = ""
+		for id, state in pairs(record.Pending) do
+			if (entries[id] or 0) == 0 then discoveredId = id end
+			entries[id] = math.max(entries[id] or 0, state)
+		end
 		record.Entries = entries
 		record.Raw = raw or ""
 		record.Exists = code == 0 and raw ~= nil and raw ~= ""
 		record.Loaded = true
-		for id, state in pairs(record.Pending) do record.Entries[id] = math.max(record.Entries[id] or 0, state) end
-		return true
+		self:ReceiveSnapshot(self:EncodeRecords(record.Entries), true, discoveredId, record.UserId)
+		if record.FinalFlushRequested then
+			if not record.FinalFlushInProgress then self:FlushFinalRecord(record) end
+		elseif next(record.Pending) ~= nil then self:ScheduleSave(record) end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -88,8 +143,10 @@ script MonsterCollectionLogic extends Logic
 			return false
 		end
 		record.Saving = true
+		record.SaveStartedAt = _UtilLogic.ElapsedSeconds
 		local pending = {}
 		for id, state in pairs(record.Pending) do pending[id] = state end
+		record.ActiveSavePending = pending
 		local raw = self:EncodeRecords(record.Entries)
 		if raw == record.Raw then self:CompleteSave(record, pending, raw, 0) return true end
 		local storage = _DataStorageService:GetUserDataStorage(record.Key)
@@ -112,7 +169,10 @@ script MonsterCollectionLogic extends Logic
 	@ExecSpace("ServerOnly")
 	method void CompleteSave(table record, table pending, string raw, integer code)
 		-- A failed write stays dirty and retries with backoff; corrupt saved data stays untouched.
+		if self.Records[record.UserId] ~= record or not record.Saving or record.ActiveSavePending ~= pending then return end
+		record.ActiveSavePending = nil
 		record.Saving = false
+		log("[CollectionTiming] phase=SAVE elapsedMs=" .. tostring(math.floor((_UtilLogic.ElapsedSeconds - record.SaveStartedAt) * 1000)) .. " code=" .. tostring(code))
 		if code ~= 0 then
 			if code == 2000000 then record.Loaded = false end
 			record.RetryDelay = code == 1000005 and 120 or math.min(120, math.max(10, record.RetryDelay * 2))
@@ -142,7 +202,8 @@ script MonsterCollectionLogic extends Logic
 		record.Entries[enemyId] = 1
 		record.Pending[enemyId] = 1
 		self:ScheduleSave(record)
-		self:ReceiveSnapshot(self:EncodeRecords(record.Entries), record.Loaded, enemyId, record.UserId)
+		-- A pending load may already contain this monster; announce only after that merge.
+		self:ReceiveSnapshot(self:EncodeRecords(record.Entries), record.Loaded, record.Loaded and enemyId or "", record.UserId)
 		log("[MonsterCollection] discovered enemy=" .. enemyId)
 	end
 
@@ -154,6 +215,7 @@ script MonsterCollectionLogic extends Logic
 		if record == nil or _UtilLogic.ElapsedSeconds < record.NextRequestAt then return end
 		record.NextRequestAt = _UtilLogic.ElapsedSeconds + 1
 		if record.Loaded == false then self:LoadRecord(record) end
+		if record.Loading then return end
 		self:ReceiveSnapshot(self:EncodeRecords(record.Entries), record.Loaded, "", senderUserId)
 	end
 
@@ -184,12 +246,12 @@ script MonsterCollectionLogic extends Logic
 	method boolean WaitForActiveSave(table record)
 		-- Waits within a bounded window; a late callback retains ownership of the requested final flush.
 		local remaining = 5
-		while record.Saving and remaining > 0 do
+		while (record.Saving or record.Loading) and remaining > 0 do
 			wait(0.05)
 			remaining = remaining - 0.05
 		end
-		if record.Saving then log_warning("[MonsterCollection] final save still in flight; dirty state retained") end
-		return not record.Saving
+		if record.Saving or record.Loading then log_warning("[MonsterCollection] final I/O still in flight; dirty state retained") end
+		return not record.Saving and not record.Loading
 	end
 
 	@ExecSpace("ServerOnly")
@@ -225,7 +287,7 @@ script MonsterCollectionLogic extends Logic
 		if record == nil then return end
 		if record.Timer ~= 0 then _TimerService:ClearTimer(record.Timer) record.Timer = 0 end
 		local saved = self:FlushFinalRecord(record)
-		if saved then self.Records[event.UserId] = nil end
+		if saved and self.Records[event.UserId] == record then self.Records[event.UserId] = nil end
 	end
 
 	@ExecSpace("ServerOnly")

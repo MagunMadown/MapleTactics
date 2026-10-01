@@ -164,9 +164,15 @@ script RunShopUIComponent extends Component
 				self.UnionRequestAge = self.UnionRequestAge + delta
 				if self.UnionRequestAge > 15 then
 					self.UnionPending = false
-					self.UnionSnapshot = {}
+					self._T.UnionRequestUncertain = true
 					self.UnionMessage = "응답이 지연되고 있습니다. 상점을 다시 열어 주세요."
-					self:RefreshUnionShop()
+					self:UpdateUnionRequestFeedback()
+				elseif self.UnionRequestAge >= 2 then
+					local seconds = math.floor(self.UnionRequestAge)
+					if self._T.UnionWaitSecond ~= seconds then
+						self._T.UnionWaitSecond = seconds
+						self:SetStatus("요청을 처리하고 있습니다. (" .. tostring(seconds) .. "초)")
+					end
 				end
 			end
 			return
@@ -945,6 +951,7 @@ script RunShopUIComponent extends Component
 		if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then return false end
 		self.UnionMode = true
 		self.UnionPending = false
+		self._T.UnionRequestUncertain = false
 		self.UnionSnapshot = {}
 		self.UnionOwnedOffers = {}
 		self.SelectedOfferIndex = 1
@@ -987,13 +994,19 @@ script RunShopUIComponent extends Component
 	method void SendUnionAction(string action, string productId)
 		-- One request in flight; expected revision rejects duplicate or delayed purchases.
 		if not self.UnionMode or self.UnionPending then return end
+		if action ~= "OPEN" and self._T.UnionRequestUncertain then return end
 		if action ~= "OPEN" and self.UnionSnapshot.Revision == nil then return end
 		self.UnionPending = true
 		self.UnionRequestAge = 0
 		self.UnionRequestId = self.UnionRequestId + 1
+		self._T.UnionRequestStarted = nil
+		self._T.UnionWaitSecond = nil
+		self._T.UnionRequestUncertain = false
 		self.UnionMessage = action == "OPEN" and "유니온 상점을 불러오는 중입니다." or "요청을 처리하고 있습니다."
-		self:RefreshUnionShop()
+		-- Purchase clicks only update feedback; rebuilding both lists delays sending the request.
+		if action == "OPEN" then self:RefreshUnionShop() else self:UpdateUnionRequestFeedback() end
 		_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 1)
+		self._T.UnionRequestStarted = _UtilLogic.ElapsedSeconds
 		_UnionShopServiceLogic:RequestShop(action, productId, self.UnionSnapshot.Revision or 0, self.UnionRequestId)
 	end
 
@@ -1002,11 +1015,30 @@ script RunShopUIComponent extends Component
 		-- Ignore replies from a previous opening of the shared popup.
 		if not self.UnionMode or requestId ~= self.UnionRequestId then return end
 		self.UnionPending = false
-		self.UnionSnapshot = snapshot
+		self._T.UnionRequestUncertain = snapshot == nil or snapshot.Revision == nil
+		if not self._T.UnionRequestUncertain then self.UnionSnapshot = snapshot end
+		local started = self._T.UnionRequestStarted
+		if started ~= nil then
+			log("[UnionShopLatency] request=" .. tostring(requestId) .. " roundTripMs=" .. tostring(math.floor(math.max(0, _UtilLogic.ElapsedSeconds - started) * 1000)) .. " success=" .. tostring(success))
+		end
+		self._T.UnionRequestStarted = nil
 		local messages = {OK="직업 해제 토큰은 캐릭터 선택창에서 사용합니다.", PURCHASED="구매했습니다. 오른쪽에서 보유 상품을 확인하세요.", FREE_TOKEN_CLAIMED="무료 직업 해제 토큰 1개를 받았습니다.", PRODUCT_SOLD_OUT="이미 무료 토큰을 받았습니다.", EQUIPPED="데미지 스타일을 장착했습니다.", SHOP_CHANGED="보유 상태가 갱신되었습니다. 다시 선택해 주세요.", ALREADY_OWNED="이미 보유한 스타일입니다.", SUPPLY_RESERVED="이미 다음 모험의 보급이 예약되어 있습니다.", INSUFFICIENT_UNION_COINS="유니온 코인이 부족합니다.", PRODUCT_UNAVAILABLE="현재 판매하지 않는 상품입니다.", LOBBY_ONLY="유니온 상점은 로비에서 이용할 수 있습니다."}
 		self.UnionMessage = messages[reason] or (success and "완료되었습니다." or "요청을 완료하지 못했습니다. 상점을 다시 열어 주세요.")
 		self:RefreshUnionShop()
 		log("[UnionShopUI] response success=" .. tostring(success) .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateUnionRequestFeedback()
+		-- Keep confirmed coins and ownership visible while a durable purchase is pending.
+		local buy = self:GetEntity("ShopPopup/BuybackButton")
+		if isvalid(buy) then
+			buy.TextGUIRendererComponent.Text = self._T.UnionRequestUncertain and "결과 확인 대기" or "처리 중"
+			buy.ButtonComponent.Enable = false
+		end
+		local equip = self:GetEntity("ShopPopup/SellButton")
+		if isvalid(equip) then equip.ButtonComponent.Enable = false end
+		self:SetStatus(self.UnionMessage)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1015,7 +1047,7 @@ script RunShopUIComponent extends Component
 		self:HideItemTooltip()
 		local service = _UnionShopServiceLogic
 		local state = self.UnionSnapshot
-		local ready = state.Revision ~= nil and not self.UnionPending
+		local ready = state.Revision ~= nil and not self.UnionPending and not self._T.UnionRequestUncertain
 		local tokenQuantity = self:GetUnionJobTokenQuantityText()
 		self.Offers = service:GetCatalog()
 		self.UnionOwnedOffers = {}
@@ -1072,7 +1104,7 @@ script RunShopUIComponent extends Component
 			local owned = selected ~= nil and selected.Kind == "SKIN" and service:OwnsSkin(state, selected.Id)
 			local free = selected ~= nil and service:IsFreeJobTokenProduct(selected)
 			local sold = selected ~= nil and service:IsProductSoldOut(state, selected)
-			buy.TextGUIRendererComponent.Text = self.UnionPending and "처리 중" or (sold and "품절" or (free and "무료 토큰 받기" or (owned and "선택 스타일 장착" or "선택 상품 구매")))
+			buy.TextGUIRendererComponent.Text = self.UnionPending and "처리 중" or (self._T.UnionRequestUncertain and "결과 확인 대기" or (sold and "품절" or (free and "무료 토큰 받기" or (owned and "선택 스타일 장착" or "선택 상품 구매"))))
 			buy.ButtonComponent.Enable = ready and selected ~= nil and not sold and selected.Kind ~= "FUTURE" and (selected.Kind ~= "SUPPLY" or state.PendingSupply == "") and (owned or (state.Coins or 0) >= selected.Price)
 		end
 		local equip = self:GetEntity("ShopPopup/SellButton")

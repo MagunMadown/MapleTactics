@@ -18,6 +18,9 @@ script BattleDropPresentationComponent extends Component
 	method void OnBeginPlay()
 		self.SpawnedDropEntities = {}
 		self.SpriteCenterOffsets = {}
+		self._T.SpriteCenterGeneration = {}
+		self._T.SpriteCenterLoads = {}
+		self._T.DropPreloadStarted = false
 		log("[BattleDropPresentation] ready model=" .. self.DropModelId)
 	end
 
@@ -26,6 +29,7 @@ script BattleDropPresentationComponent extends Component
 		self.CellStartX = cellStartX
 		self.CellSpacing = cellSpacing
 		self.UnitY = unitY
+		self:PreloadDropSprites()
 		log("[BattleDropPresentation] board configured startX=" .. cellStartX .. " spacing=" .. cellSpacing .. " unitY=" .. unitY)
 	end
 
@@ -218,6 +222,54 @@ script BattleDropPresentationComponent extends Component
 		if self.SpriteCenterOffsets == nil then self.SpriteCenterOffsets = {} end
 		local cached = self.SpriteCenterOffsets[spriteRuid]
 		if cached ~= nil then return cached end
+		self:QueueSpriteCenterLoad(spriteRuid)
+		return self.SpriteCenterOffsets[spriteRuid] or 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PreloadDropSprites()
+		-- Warm only an entered/configured battle map, not every empty published map.
+		if self._T.DropPreloadStarted then return end
+		self._T.DropPreloadStarted = true
+		self:QueueSpriteCenterLoad(self.CurrencySpriteRuid)
+		self:QueueSpriteCenterLoad(self.ConsumableSpriteRuid)
+		for _, id in ipairs({"red_potion", "orange_potion", "white_potion", "time_sand", "all_cure_potion"}) do
+			local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(id)
+			if definition.Success and definition.IconKey ~= nil and definition.IconKey ~= "" then self:QueueSpriteCenterLoad(definition.IconKey) end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void QueueSpriteCenterLoad(string spriteRuid)
+		-- Defer resource waits outside ShowDrop; a missing center never gates rewards or combat.
+		if spriteRuid == nil or spriteRuid == "" then return end
+		self.SpriteCenterOffsets = self.SpriteCenterOffsets or {}
+		self._T.SpriteCenterGeneration = self._T.SpriteCenterGeneration or {}
+		self._T.SpriteCenterLoads = self._T.SpriteCenterLoads or {}
+		if self.SpriteCenterOffsets[spriteRuid] ~= nil or self._T.SpriteCenterLoads[spriteRuid] ~= nil then return end
+		local generation = self._T.SpriteCenterGeneration
+		self._T.SpriteCenterLoads[spriteRuid] = _UtilLogic.ElapsedSeconds
+		local timerId = _TimerService:SetTimerOnce(function()
+			if self._T.SpriteCenterGeneration ~= generation or not isvalid(self.Entity) then return end
+			local dispatched = pcall(function()
+				_ResourceService:PreloadAsync({spriteRuid}, function()
+					if self._T.SpriteCenterGeneration == generation and isvalid(self.Entity) then self:LoadSpriteCenterOffsetX(spriteRuid, generation) end
+				end)
+			end)
+			if not dispatched then
+				self._T.SpriteCenterLoads[spriteRuid] = nil
+				log_warning("[BattleDropPresentation] center preload dispatch failed")
+			end
+		end, 0.01)
+		if timerId == 0 then
+			self._T.SpriteCenterLoads[spriteRuid] = nil
+			log_warning("[BattleDropPresentation] center preload timer unavailable")
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void LoadSpriteCenterOffsetX(string spriteRuid, table generation)
+		if self._T.SpriteCenterGeneration ~= generation or not isvalid(self.Entity) or self.SpriteCenterOffsets[spriteRuid] ~= nil then return end
 
 		local loaded, sprite = pcall(function()
 			local resourceType = _ResourceService:GetTypeAndWait(spriteRuid)
@@ -234,13 +286,33 @@ script BattleDropPresentationComponent extends Component
 			end
 			return nil
 		end)
+		if self._T.SpriteCenterGeneration ~= generation or not isvalid(self.Entity) or self.SpriteCenterOffsets[spriteRuid] ~= nil then return end
 		local offsetX = 0
+		local centerReady = false
 		if loaded and sprite ~= nil and sprite.IsLoadComplete and sprite.PixelPerUnit > 0 then
+			centerReady = true
 			-- Sprite pivots can lie outside the image; center its visible width on the logical cell.
 			offsetX = (sprite.PivotPixel.x - sprite.Width * 0.5) / sprite.PixelPerUnit
 		end
 		self.SpriteCenterOffsets[spriteRuid] = offsetX
-		return offsetX
+		local startedAt = self._T.SpriteCenterLoads[spriteRuid] or _UtilLogic.ElapsedSeconds
+		self._T.SpriteCenterLoads[spriteRuid] = nil
+		-- Recenter drops already shown with the zero-offset fallback, without disturbing magnet flights.
+		for key, drop in pairs(self.SpawnedDropEntities or {}) do
+			if isvalid(drop) and drop.SpriteRendererComponent ~= nil and drop.SpriteRendererComponent.SpriteRUID == spriteRuid
+				and (self._T.MagnetFlights == nil or self._T.MagnetFlights[key] == nil) and drop.TransformComponent ~= nil then
+				local position = drop.TransformComponent.WorldPosition
+				drop.TransformComponent.WorldPosition = Vector3(position.x + offsetX, position.y, position.z)
+			end
+		end
+		log("[DropResourceTiming] centerMs=" .. tostring(math.floor((_UtilLogic.ElapsedSeconds - startedAt) * 1000)) .. " success=" .. tostring(centerReady))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Ignore preloads completing after this map has been destroyed.
+		self._T.SpriteCenterGeneration = nil
+		self._T.SpriteCenterLoads = nil
 	end
 
 end

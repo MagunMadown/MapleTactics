@@ -22,6 +22,7 @@ script UnionProfileRepositoryLogic extends Logic
     @ExecSpace("ServerOnly")
     method void OnBeginPlay()
         -- Wires one server-side profile lifecycle and preloads users already present in the world instance.
+        self._T.ProfileDefinitionCache = {}
         self.UserEnterHandler = _UserService:ConnectEvent(UserEnterEvent, self.HandleUserEnterEvent)
         self.UserReconnectHandler = _UserService:ConnectEvent(UserReconnectEvent, self.HandleUserReconnectEvent)
         self.UserLeaveHandler = _UserService:ConnectEvent(UserLeaveEvent, self.HandleUserLeaveEvent)
@@ -53,6 +54,8 @@ script UnionProfileRepositoryLogic extends Logic
         self.LoadStateByStorageUserKey = {}
         self.MutationLocksByStorageUserKey = {}
         self.StorageUserKeyByUserId = {}
+        self._T.ProfileDefinitionCache = nil
+        self._T.ProfileLifetimeRank = nil
     end
 
     @ExecSpace("ServerOnly")
@@ -108,6 +111,18 @@ script UnionProfileRepositoryLogic extends Logic
             Profile = self:CloneProfile(self.ProfilesByStorageUserKey[loaded.StorageUserKey]),
             StorageUserKey = loaded.StorageUserKey
         }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetUnionShopSnapshot(Entity userEntity)
+        -- Shop responses copy only their own DTO, never the growing receipt/stat profile.
+        local loaded = self:EnsureProfileLoaded(userEntity)
+        if not loaded.Success then return loaded end
+        local profile = self.ProfilesByStorageUserKey[loaded.StorageUserKey]
+        if profile == nil then return {Success=false, Reason="PROFILE_CACHE_MISSING"} end
+        local snapshot = _UnionShopServiceLogic:CopyState(profile.UnionShop)
+        snapshot.Coins = profile.UnionPoints
+        return {Success=true, Reason="OK", Snapshot=snapshot}
     end
 
     @ExecSpace("ServerOnly")
@@ -1010,7 +1025,9 @@ script UnionProfileRepositoryLogic extends Logic
             self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
             return { Success = false, Reason = "USER_DATA_STORAGE_UNAVAILABLE", StorageUserKey = storageUserKey }
         end
+        local readStartedAt = _UtilLogic.ElapsedSeconds
         local errorCode, raw = storage:GetAndWait(self.StorageKey)
+        log("[ProfileTiming] phase=LOAD storageMs=" .. tostring(math.floor((_UtilLogic.ElapsedSeconds - readStartedAt) * 1000)) .. " code=" .. tostring(errorCode))
         if errorCode == 1000002 then
             return self:InitializeDefaultProfile(storageUserKey, storage)
         end
@@ -1030,7 +1047,9 @@ script UnionProfileRepositoryLogic extends Logic
             log_error("[UnionProfile] decode failed key=" .. storageUserKey)
             return { Success = false, Reason = "PROFILE_DECODE_FAILED", StorageUserKey = storageUserKey }
         end
+        local normalizeStartedAt = _UtilLogic.ElapsedSeconds
         local normalized = self:NormalizeProfile(decoded)
+        log("[ProfileTiming] phase=NORMALIZE verifyMs=" .. tostring(math.floor((_UtilLogic.ElapsedSeconds - normalizeStartedAt) * 1000)) .. " success=" .. tostring(normalized.Success))
         if normalized.Success == false then
             self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
             log_error("[UnionProfile] validation rejected key=" .. storageUserKey .. " reason=" .. (normalized.DetailReason or normalized.Reason or "UNKNOWN"))
@@ -1038,7 +1057,9 @@ script UnionProfileRepositoryLogic extends Logic
         end
         local normalizedRaw = _HttpService:JSONEncode(self:BuildJsonSafeProfile(normalized.Profile))
         if normalized.NeedsPersistence == true then
+            local migrateStartedAt = _UtilLogic.ElapsedSeconds
             local updateCode, updatedRaw = storage:UpdateAndWait(self.StorageKey, raw, normalizedRaw)
+            log("[ProfileTiming] phase=MIGRATE storageMs=" .. tostring(math.floor((_UtilLogic.ElapsedSeconds - migrateStartedAt) * 1000)) .. " code=" .. tostring(updateCode))
             if updateCode ~= 0 then
                 self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
                 log_error("[UnionProfile] normalized save failed key=" .. storageUserKey .. " error=" .. updateCode)
@@ -1083,9 +1104,11 @@ script UnionProfileRepositoryLogic extends Logic
             return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", StorageUserKey = storageUserKey }
         end
         self.LoadStateByStorageUserKey[storageUserKey] = "LOADING"
+        local createStartedAt = _UtilLogic.ElapsedSeconds
         local saveOk, saveCode = pcall(function()
             return storage:SetAndWait(self.StorageKey, newRaw)
         end)
+        log("[ProfileTiming] phase=CREATE storageMs=" .. tostring(math.floor((_UtilLogic.ElapsedSeconds - createStartedAt) * 1000)) .. " success=" .. tostring(saveOk and saveCode == 0))
         self:ReleaseMutationLock(storageUserKey)
         if saveOk == false or saveCode ~= 0 then
             self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
@@ -1103,6 +1126,7 @@ script UnionProfileRepositoryLogic extends Logic
     @ExecSpace("ServerOnly")
     method table PersistProfileCandidate(string storageUserKey, table candidate)
         -- Validates and durably writes one source-data candidate before replacing the in-memory cache.
+        local persistStartedAt = _UtilLogic.ElapsedSeconds
         if self.LoadStateByStorageUserKey[storageUserKey] ~= "LOADED" then
             return { Success = false, Reason = "PROFILE_NOT_LOADED" }
         end
@@ -1122,6 +1146,7 @@ script UnionProfileRepositoryLogic extends Logic
             self.ProfilesByStorageUserKey[storageUserKey] = self:CloneProfile(candidate)
             return { Success = true, Reason = "OK", WasWritten = false }
         end
+        local preparedAt = _UtilLogic.ElapsedSeconds
         local storage = _DataStorageService:GetUserDataStorage(storageUserKey)
         if storage == nil then
             return { Success = false, Reason = "USER_DATA_STORAGE_UNAVAILABLE" }
@@ -1133,6 +1158,7 @@ script UnionProfileRepositoryLogic extends Logic
         else
             errorCode = storage:SetAndWait(self.StorageKey, newRaw)
         end
+        log("[ProfileTiming] phase=SAVE verifyMs=" .. tostring(math.floor((preparedAt - persistStartedAt) * 1000)) .. " storageMs=" .. tostring(math.floor((_UtilLogic.ElapsedSeconds - preparedAt) * 1000)) .. " code=" .. tostring(errorCode) .. " bytes=" .. tostring(#newRaw))
         if errorCode ~= 0 then
             if errorCode == 2000000 then
                 self:EvictProfile(storageUserKey, "")
@@ -1695,7 +1721,7 @@ script UnionProfileRepositoryLogic extends Logic
 
     method table BuildZeroLevelMap()
         -- Builds an explicit zero entry for every server-validated Union upgrade definition.
-        local allDefinitions = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        local allDefinitions = self:GetProfileUpgradeDefinitions()
         if allDefinitions.Success == false then
             return { Success = false, Reason = allDefinitions.Reason, Levels = {} }
         end
@@ -1868,7 +1894,7 @@ script UnionProfileRepositoryLogic extends Logic
         elseif type(sourceLevels) ~= "table" then
             return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = "INVALID_PURCHASED_LEVEL_TABLE" }
         end
-        local allDefinitions = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        local allDefinitions = self:GetProfileUpgradeDefinitions()
         if allDefinitions.Success == false then
             return { Success = false, Reason = "PROFILE_MIGRATION_FAILED", DetailReason = allDefinitions.Reason }
         end
@@ -2093,7 +2119,7 @@ script UnionProfileRepositoryLogic extends Logic
             if statId == self.JsonEmptyMapMarker then
                 -- Ignore the serialization marker without scheduling an identical rewrite.
             else
-                local definition = _UnionStatDefinitionRepositoryLogic:GetStat(statId)
+                local definition = self:GetProfileStatDefinition(statId)
                 local level = tonumber(rawLevel)
                 if definition.Success == false then
                     return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "UNKNOWN_ALLOCATED_UNION_STAT_ID", StatId = tostring(statId) }
@@ -2127,16 +2153,16 @@ script UnionProfileRepositoryLogic extends Logic
 
     method table ValidateAllocatedUnionStatConsistency(table profile)
         -- Coin-purchased stat levels are permanent and no longer capped by derived job-grade points.
-        local currentRank = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(profile.LifetimeUnionPoints)
+        local currentRank = self:GetProfileLifetimeRank(profile.LifetimeUnionPoints)
         if currentRank.Success == false then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = currentRank.Reason or "INVALID_CURRENT_UNION_RANK" }
         end
         for statId, allocatedLevel in pairs(profile.AllocatedUnionStats) do
-            local definition = _UnionStatDefinitionRepositoryLogic:GetStat(statId)
+            local definition = self:GetProfileStatDefinition(statId)
             if definition.Success == false then
                 return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = definition.Reason or "UNKNOWN_ALLOCATED_UNION_STAT_ID", StatId = statId }
             end
-            local definitionRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(definition.RequiredUnionRank)
+            local definitionRank = self:GetProfileRankDefinition(definition.RequiredUnionRank)
             if definitionRank.Success == false then
                 return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_ALLOCATED_UNION_STAT_REQUIRED_RANK", StatId = statId }
             end
@@ -2144,17 +2170,72 @@ script UnionProfileRepositoryLogic extends Logic
                 return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "ALLOCATED_UNION_STAT_RANK_LOCKED", StatId = statId, RequiredUnionRank = definition.RequiredUnionRank }
             end
             for level = 1, allocatedLevel do
-                local levelDefinition = _UnionStatDefinitionRepositoryLogic:GetLevel(statId, level)
+                local levelDefinition = self:GetProfileStatLevelDefinition(statId, level)
                 if levelDefinition.Success == false then
                     return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = levelDefinition.Reason or "MISSING_ALLOCATED_UNION_STAT_LEVEL", StatId = statId, Level = level }
                 end
-                local levelRank = _UnionRankDefinitionRepositoryLogic:GetDefinition(levelDefinition.RequiredUnionRank)
+                local levelRank = self:GetProfileRankDefinition(levelDefinition.RequiredUnionRank)
                 if levelRank.Success == false or currentRank.SortOrder < levelRank.SortOrder then
                     return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "ALLOCATED_UNION_STAT_RANK_LOCKED", StatId = statId, Level = level, RequiredUnionRank = levelDefinition.RequiredUnionRank }
                 end
             end
         end
         return { Success = true, Reason = "OK" }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetProfileUpgradeDefinitions()
+        -- Definitions are immutable during play; cache successful reads, never failed lookups.
+        self._T.ProfileDefinitionCache = self._T.ProfileDefinitionCache or {}
+        local cache = self._T.ProfileDefinitionCache
+        if cache.Upgrades ~= nil then return cache.Upgrades end
+        local loaded = _UnionUpgradeDefinitionRepositoryLogic:GetAllDefinitions()
+        if loaded.Success then cache.Upgrades = loaded end
+        return loaded
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetProfileStatDefinition(string statId)
+        self._T.ProfileDefinitionCache = self._T.ProfileDefinitionCache or {}
+        local cache = self._T.ProfileDefinitionCache
+        cache.Stats = cache.Stats or {}
+        if cache.Stats[statId] ~= nil then return cache.Stats[statId] end
+        local loaded = _UnionStatDefinitionRepositoryLogic:GetStat(statId)
+        if loaded.Success then cache.Stats[statId] = loaded end
+        return loaded
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetProfileStatLevelDefinition(string statId, integer level)
+        self._T.ProfileDefinitionCache = self._T.ProfileDefinitionCache or {}
+        local cache = self._T.ProfileDefinitionCache
+        cache.StatLevels = cache.StatLevels or {}
+        local key = statId .. ":" .. tostring(level)
+        if cache.StatLevels[key] ~= nil then return cache.StatLevels[key] end
+        local loaded = _UnionStatDefinitionRepositoryLogic:GetLevel(statId, level)
+        if loaded.Success then cache.StatLevels[key] = loaded end
+        return loaded
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetProfileRankDefinition(string rankId)
+        self._T.ProfileDefinitionCache = self._T.ProfileDefinitionCache or {}
+        local cache = self._T.ProfileDefinitionCache
+        cache.Ranks = cache.Ranks or {}
+        if cache.Ranks[rankId] ~= nil then return cache.Ranks[rankId] end
+        local loaded = _UnionRankDefinitionRepositoryLogic:GetDefinition(rankId)
+        if loaded.Success then cache.Ranks[rankId] = loaded end
+        return loaded
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetProfileLifetimeRank(integer lifetimeUnionPoints)
+        -- Keep only the last threshold query, so changing balances cannot grow this cache.
+        local cached = self._T.ProfileLifetimeRank
+        if cached ~= nil and cached.Points == lifetimeUnionPoints then return cached.Rank end
+        local loaded = _UnionRankDefinitionRepositoryLogic:GetRankForLifetimePoints(lifetimeUnionPoints)
+        if loaded.Success then self._T.ProfileLifetimeRank = {Points=lifetimeUnionPoints, Rank=loaded} end
+        return loaded
     end
 
     method table CreateDefaultJobUnionProgress()
