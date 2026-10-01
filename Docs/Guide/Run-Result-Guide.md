@@ -143,7 +143,7 @@ local detail = _RunResultServiceLogic:GetLocalRunResultDetailSnapshot()
 
 - 로비 `Esc` 메뉴의 **플레이 기록** 항목에서 기록 화면을 연다. `GameMenuLogic`이 메뉴 진입점을 연결하고, `RunHistoryUIComponent`는 클라이언트 UI 어댑터로 화면 표시·탭·페이지·선택 상태를 담당한다.
 - 추가 진입점은 로비 2층의 `/maps/lobby/Lobby_2F/Facilities/RunHistoryNPC` NPC다. NPC의 `LobbyInteractionComponent.InteractionId`를 `RunHistory`로 지정하고 `LobbyInteractionFocusLogic.TargetPaths`에 이 경로를 등록해 기존 상호작용 라우팅을 재사용한다. NPC를 클릭하거나 가까이에서 현재 상호작용 키(기본 `E`)를 누르면 `/ui/RunHistoryUI/Controller`의 `RunHistoryUIComponent:SetOpen(true)`로 기록 화면을 연다. 기존 `Esc` 메뉴 진입은 그대로 유지하며, 원격 저장이나 기록 DTO는 변경하지 않는다.
-- NPC 명패는 **플레이 기록 · 사서 위즈**이며 유니온 상점 오른쪽 게시판 옆에 있다. 기본 로비 시작점에서 오른쪽 5칸 이동 후 `E`로 열 수 있다. 위치는 `map/lobby.map`의 Transform, 명패는 NameTag, 대기 모션은 SpriteRenderer의 `SpriteRUID=eb08d517056849509e291579b3cfaca9`로 조정한다. 상호작용 거리도 NPC의 `LobbyInteractionComponent` 설정으로 조정하며 별도 NPC 저장소/서비스는 추가하지 않는다.
+- NPC 명패는 **플레이 기록**이며 유니온 상점 오른쪽 게시판 옆에 있다. 기본 로비 시작점에서 오른쪽 5칸 이동 후 `E`로 열 수 있다. 위치는 `map/lobby.map`의 Transform, 명패는 NameTag, 대기 모션은 SpriteRenderer의 `SpriteRUID=eb08d517056849509e291579b3cfaca9`로 조정한다. 상호작용 거리도 NPC의 `LobbyInteractionComponent` 설정으로 조정하며 별도 NPC 저장소/서비스는 추가하지 않는다.
 - 최근 기록은 페이지당 5개를 보여 주며 페이지 수는 실제 목록 개수로 계산한다(기본 보관 수 10). 최고 완주 기록은 최근 목록과 별도로 선택할 수 있다.
 - 선택한 기록의 빌드는 **스킬 / 증강 / 유물** 세 탭으로 나누고, 각 탭은 페이지당 3개씩 표시한다. 스킬 상세에는 해당 스킬에 붙은 증강을 저장된 순서와 중복 그대로 보여 준다.
 - v1 기록은 빌드가 실제로 비어 있는 것이 아니라 미수집 상태다. `Build.Captured=false`이면 **빌드 정보 미수집**으로 표시한다. `Captured=true`이면서 해당 목록이 비었을 때만 그 종류에 **없음**을 표시한다.
