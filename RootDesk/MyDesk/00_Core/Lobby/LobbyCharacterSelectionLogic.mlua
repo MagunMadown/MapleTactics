@@ -284,9 +284,8 @@ script LobbyCharacterSelectionLogic extends Logic
 		self.IsApplyPending = false
 		self.JobAccess = snapshot.Revision ~= nil and snapshot or nil
 		self:RefreshView()
-		local tokens = self.JobAccess ~= nil and self.JobAccess.JobTokens or 0
 		local messages = {JOB_UNLOCKED="직업을 해금했습니다. 선택 버튼을 눌러 주세요.", NO_JOB_TOKEN="토큰이 부족합니다. 유니온 상점에서 구매할 수 있습니다.", SHOP_CHANGED="보유 상태가 바뀌었습니다. 다시 시도해 주세요.", JOB_ALREADY_UNLOCKED="이미 해금된 직업입니다."}
-		self:SetStatus((messages[reason] or (success and "첫 접속 시 토큰 1개 지급 · 직업 하나를 영구 해금할 수 있습니다." or "불러오기 실패: " .. tostring(reason))) .. "  보유 토큰: " .. tostring(tokens))
+		self:SetStatus(messages[reason] or (success and "" or "불러오기 실패: " .. tostring(reason)))
 	end
 
 	@ExecSpace("Server")
@@ -583,15 +582,24 @@ script LobbyCharacterSelectionLogic extends Logic
 		for _, binding in ipairs(self.JobCardBindings) do
 			local selected = binding.JobId == self.PendingClassId
 			local available = self:IsAvailableClass(binding.JobId)
+			local unlocked = _UnionShopServiceLogic:IsJobUnlocked(self.JobAccess, binding.JobId)
+			local brightness = unlocked and 1 or 0.5
 			binding.Button.Enable = available and self.IsApplyPending == false
+			-- Locked cards remain clickable for previews and token unlocks; hover must keep them dark.
+			binding.Button.Transition = unlocked and binding.Transition or TransitionType.None
 			binding.Card.SpriteGUIRendererComponent.Outline = true
 			binding.Card.SpriteGUIRendererComponent.OutlineWidth = 1
-			binding.Card.SpriteGUIRendererComponent.OutlineColor = selected and binding.Accent or Color(binding.Accent.r, binding.Accent.g, binding.Accent.b, 0.36)
+			binding.Card.SpriteGUIRendererComponent.OutlineColor = selected and binding.Accent or Color(binding.Accent.r * brightness, binding.Accent.g * brightness, binding.Accent.b * brightness, 0.36)
 			-- Native hover tint affects only the card fill; selection border and marker are independent.
 			local base = binding.BaseColor
 			local lift = selected and 0.13 or 0
-			binding.Card.SpriteGUIRendererComponent.Color = Color(base.r + lift, base.g + lift, base.b + lift, 1)
-			binding.Marker.Text = not _UnionShopServiceLogic:IsJobUnlocked(self.JobAccess, binding.JobId) and "잠김" or (selected and "선택 중" or (available and "" or "사용 불가"))
+			binding.Card.SpriteGUIRendererComponent.Color = Color((base.r + lift) * brightness, (base.g + lift) * brightness, (base.b + lift) * brightness, 1)
+			for _, tint in ipairs(binding.Tints) do
+				local color = tint.Color
+				local dimmed = Color(color.r * brightness, color.g * brightness, color.b * brightness, color.a)
+				if tint.IsText then tint.Renderer.FontColor = dimmed else tint.Renderer.Color = dimmed end
+			end
+			binding.Marker.Text = not unlocked and "잠김" or (selected and "선택 중" or (available and "" or "사용 불가"))
 			binding.Family:SetEnable(selected)
 			binding.Theme:SetEnable(selected)
 			if selected then self.JobNameText.FontColor = binding.TitleColor end
@@ -631,7 +639,19 @@ script LobbyCharacterSelectionLogic extends Logic
 			local theme = _EntityService:GetEntityByPath(root .. "CharacterPreviewArea/Theme_" .. jobId)
 			if isvalid(card) == false or isvalid(marker) == false or isvalid(family) == false or isvalid(theme) == false then return false end
 			if card.ButtonComponent == nil or card.SpriteGUIRendererComponent == nil or marker.TextGUIRendererComponent == nil then return false end
-			table.insert(bindings, { JobId = jobId, Card = card, Button = card.ButtonComponent, Marker = marker.TextGUIRendererComponent, Family = family, Theme = theme, Accent = accents[index], TitleColor = titles[index], BaseColor = backgrounds[index] })
+			-- Save original child colors once so repeated refreshes and unlocking restore the same tint.
+			local tints = {}
+			for _, suffix in ipairs({ "/Accent", "/Name", "/SelectedMark", "/Symbol/WeaponImage", "/InnerHighlight" }) do
+				local child = _EntityService:GetEntityByPath(root .. "JobCards/Card_" .. jobId .. suffix)
+				if isvalid(child) then
+					local textRenderer = child.TextGUIRendererComponent
+					local renderer = textRenderer or child.SpriteGUIRendererComponent
+					if renderer ~= nil then
+						table.insert(tints, { Renderer = renderer, IsText = textRenderer ~= nil, Color = textRenderer ~= nil and renderer.FontColor or renderer.Color })
+					end
+				end
+			end
+			table.insert(bindings, { JobId = jobId, Card = card, Button = card.ButtonComponent, Transition = card.ButtonComponent.Transition, Marker = marker.TextGUIRendererComponent, Family = family, Theme = theme, Accent = accents[index], TitleColor = titles[index], BaseColor = backgrounds[index], Tints = tints })
 		end
 		for _, binding in ipairs(bindings) do
 			local capturedJobId = binding.JobId
@@ -894,6 +914,9 @@ script LobbyCharacterSelectionLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void SetStatus(string message)
+		if (message == nil or message == "") and self.JobAccess ~= nil then
+			message = "보유 토큰: " .. tostring(self.JobAccess.JobTokens or 0)
+		end
 		if self.SelectionStatusText ~= nil then
 			self.SelectionStatusText.Text = message or ""
 		end

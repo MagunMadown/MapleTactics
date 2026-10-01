@@ -1,0 +1,123 @@
+@Logic
+script RunHistoryContractLogic extends Logic
+
+	@MinValue(1)
+	@MaxValue(50)
+	property integer RetentionLimit = 10
+	property integer MaxRetentionLimit = 50
+	property integer MaxIndexBytes = 4000
+	property integer MaxCleanupEntries = 100
+
+	method boolean IsRunId(any value)
+		-- Storage IDs are positive safe integers; string parsing and fractional IDs are never accepted.
+		return type(value) == "number" and value == value and value > 0 and value <= 9007199254740991 and value == math.floor(value)
+	end
+
+	method table EmptyIndex()
+		-- Empty Lua arrays are kept in the DTO and omitted only by the wire encoder.
+		return { SchemaVersion = 1, Revision = 0, BestPolicyVersion = _RunBestRecordPolicyLogic.PolicyVersion,
+			RecentRunIds = {}, BestRunId = 0, PrunedThroughRunId = 0, PendingDeleteRunIds = {} }
+	end
+
+	method table ValidateIndex(table index)
+		-- Rejects unknown/corrupt metadata before it can authorize overwrite or deletion.
+		if type(index) ~= "table" or index.SchemaVersion ~= 1 then return { Success = false, Reason = "RUN_HISTORY_SCHEMA_UNSUPPORTED" } end
+		if index.BestPolicyVersion ~= _RunBestRecordPolicyLogic.PolicyVersion then return { Success = false, Reason = "RUN_BEST_POLICY_UNSUPPORTED" } end
+		for _, field in ipairs({ "Revision", "BestRunId", "PrunedThroughRunId" }) do
+			local value = index[field]
+			if type(value) ~= "number" or value ~= value or value < 0 or value > 9007199254740991 or value ~= math.floor(value) then
+				return { Success = false, Reason = "RUN_HISTORY_INVALID_INDEX", Field = field }
+			end
+		end
+		local seen = {}
+		for _, field in ipairs({ "RecentRunIds", "PendingDeleteRunIds" }) do
+			local entries = index[field]
+			local maximum = field == "RecentRunIds" and self.MaxRetentionLimit or self.MaxCleanupEntries
+			if type(entries) ~= "table" or #entries > maximum then return { Success = false, Reason = "RUN_HISTORY_INVALID_INDEX", Field = field } end
+			local count = 0
+			for key, runId in pairs(entries) do
+				if type(key) ~= "number" or key < 1 or key ~= math.floor(key) or key > #entries or self:IsRunId(runId) == false or seen[runId] then
+					return { Success = false, Reason = "RUN_HISTORY_INVALID_INDEX", Field = field }
+				end
+				seen[runId] = true
+				count = count + 1
+			end
+			if count ~= #entries then return { Success = false, Reason = "RUN_HISTORY_INVALID_INDEX", Field = field } end
+		end
+		for position, runId in ipairs(index.RecentRunIds) do
+			if runId <= index.PrunedThroughRunId or (position > 1 and runId >= index.RecentRunIds[position - 1]) then
+				return { Success = false, Reason = "RUN_HISTORY_ORDER_INVALID" }
+			end
+		end
+		for _, runId in ipairs(index.PendingDeleteRunIds) do
+			if runId == index.BestRunId or runId > index.PrunedThroughRunId then return { Success = false, Reason = "RUN_HISTORY_DELETE_INVALID" } end
+		end
+		return { Success = true, Reason = "OK", Index = index }
+	end
+
+	method table EncodeIndex(table index)
+		-- The index contains IDs, not ten copied builds, and stays within a small independently versioned value.
+		local validation = self:ValidateIndex(index)
+		if not validation.Success then return validation end
+		local stored = {}
+		for key, value in pairs(index) do stored[key] = value end
+		if #index.RecentRunIds == 0 then stored.RecentRunIds = nil end
+		if #index.PendingDeleteRunIds == 0 then stored.PendingDeleteRunIds = nil end
+		local ok, encoded = pcall(function() return _HttpService:JSONEncode(stored) end)
+		if not ok or type(encoded) ~= "string" then return { Success = false, Reason = "RUN_HISTORY_ENCODE_FAILED" } end
+		if #encoded > self.MaxIndexBytes then return { Success = false, Reason = "RUN_HISTORY_INDEX_TOO_LARGE" } end
+		return { Success = true, Reason = "OK", Index = index, Json = encoded }
+	end
+
+	method table DecodeIndex(string encoded)
+		-- Missing arrays normalize only in the known schema; false/string values still fail validation.
+		if encoded == nil or encoded == "" then return { Success = true, Reason = "NO_RUN_HISTORY", HasIndex = false, Index = self:EmptyIndex(), Json = "" } end
+		if #encoded > self.MaxIndexBytes then return { Success = false, Reason = "RUN_HISTORY_INDEX_TOO_LARGE" } end
+		local ok, index = pcall(function() return _HttpService:JSONDecode(encoded) end)
+		if not ok or type(index) ~= "table" then return { Success = false, Reason = "RUN_HISTORY_DECODE_FAILED" } end
+		if index.SchemaVersion == 1 then
+			if index.RecentRunIds == nil then index.RecentRunIds = {} end
+			if index.PendingDeleteRunIds == nil then index.PendingDeleteRunIds = {} end
+		end
+		local validation = self:ValidateIndex(index)
+		validation.HasIndex = validation.Success
+		validation.Json = encoded
+		return validation
+	end
+
+	method table MakeSummary(table record)
+		-- Lists transfer lightweight summaries; full Build data is requested for the selected run only.
+		return { RecordId = record.RecordId, RunId = record.RunId, EndedAtUtc = record.EndedAtUtc,
+			EndReason = record.EndReason, JobId = record.JobId, CompletedStageNumber = record.CompletedStageNumber,
+			ConsumedTurns = record.ConsumedTurns, HitsTaken = record.HitsTaken, ElapsedSeconds = record.ElapsedSeconds,
+			RankEligible = record.RankEligible, BuildCaptured = record.Build.Captured }
+	end
+
+	method table EncodeSummary(table index, table records)
+		-- Provides a UI transport contract without exposing storage keys or doing client-side storage calls.
+		local summaries = {}
+		for _, runId in ipairs(index.RecentRunIds) do
+			local record = records[runId]
+			if record == nil then return { Success = false, Reason = "RUN_HISTORY_RECORD_MISSING" } end
+			table.insert(summaries, self:MakeSummary(record))
+		end
+		local dto = { SchemaVersion = 1, RetentionLimit = self.RetentionLimit, BestRunId = index.BestRunId,
+			BestPolicyVersion = index.BestPolicyVersion, CleanupPending = #index.PendingDeleteRunIds > 0 }
+		if #summaries > 0 then dto.Entries = summaries end
+		local ok, encoded = pcall(function() return _HttpService:JSONEncode(dto) end)
+		if not ok or type(encoded) ~= "string" then return { Success = false, Reason = "RUN_HISTORY_SUMMARY_ENCODE_FAILED" } end
+		return { Success = true, Reason = "OK", Json = encoded }
+	end
+
+	method table DecodeSummary(string encoded)
+		-- An unrequested history is distinct from a successfully loaded empty history.
+		if encoded == nil or encoded == "" then return { Success = true, Reason = "NOT_REQUESTED", Entries = {}, RetentionLimit = self.RetentionLimit, BestRunId = 0 } end
+		local ok, dto = pcall(function() return _HttpService:JSONDecode(encoded) end)
+		if not ok or type(dto) ~= "table" or dto.SchemaVersion ~= 1 then return { Success = false, Reason = "RUN_HISTORY_SUMMARY_INVALID", Entries = {} } end
+		if dto.Entries == nil then dto.Entries = {} end
+		if type(dto.Entries) ~= "table" or #dto.Entries > self.MaxRetentionLimit then return { Success = false, Reason = "RUN_HISTORY_SUMMARY_INVALID", Entries = {} } end
+		dto.Success = true
+		return dto
+	end
+
+end

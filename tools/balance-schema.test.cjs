@@ -4,6 +4,11 @@ const S=require("./balance-schema.js");
 const dataDir=path.join(__dirname,"../RootDesk/MyDesk/03_Data");
 const all=Object.fromEntries(fs.readdirSync(dataDir).filter(n=>n.endsWith(".csv")).map(n=>[n.slice(0,-4),S.parseCSV(fs.readFileSync(path.join(dataDir,n),"utf8"))]));
 const copy=()=>structuredClone(all);
+const unionProduct=(table,productId)=>{
+  const row=table.rows.find(r=>r.ProductId===productId);
+  assert.ok(row,"missing union product: "+productId);
+  return row;
+};
 test("all 48 current CSVs pass explicit schema; original bytes round-trip",()=>{
   assert.equal(Object.keys(all).length,48);assert.deepEqual(S.validate(all),[]);
   for(const t of Object.values(all))assert.equal(S.serializeCSV(t),t.raw);
@@ -109,9 +114,15 @@ test("UnionShopProducts is editable and current sale prices survive CSV round-tr
   assert.equal(S.meta("UnionShopProducts").readonly,false);
   assert.deepEqual(S.meta("UnionShopProducts").key,["ProductId"]);
   const rows=all.UnionShopProducts.rows;
-  assert.equal(rows.filter(r=>r.Enabled==="true").length,2);
+  assert.equal(rows.filter(r=>r.Enabled==="true").length,3);
   assert.equal(rows.find(r=>r.ProductId==="supply_potion").Price,"20");
   assert.equal(rows.find(r=>r.ProductId==="job_unlock").Price,"2000");
+  const free=unionProduct(all.UnionShopProducts,"job_unlock_free");
+  assert.equal(free.DisplayName,"직업 해제 토큰 (무료)");
+  assert.equal(free.Kind,"JOB_TOKEN");assert.equal(free.RefId,"job_unlock");assert.equal(free.Price,"0");
+  assert.equal(free.IconRUID,unionProduct(all.UnionShopProducts,"job_unlock").IconRUID);
+  assert.equal(free.SortOrder,"15");assert.equal(free.SchemaVersion,"1");
+  assert.equal(free.Description,"계정당 한 번 무료로 받을 수 있습니다. 캐릭터 선택창에서 잠긴 직업 1개를 영구 해금합니다.");
   const t=copy();t.UnionShopProducts.rows.find(r=>r.ProductId==="job_unlock").Price="2200";
   t.UnionShopProducts.dirty=true;
   assert.deepEqual(S.validate(t),[]);
@@ -119,37 +130,49 @@ test("UnionShopProducts is editable and current sale prices survive CSV round-tr
 });
 
 const unionCases=[
-  [0,"SchemaVersion","2","UNSUPPORTED_SCHEMA"],
-  [0,"ProductId","supply|bad","INVALID_PRODUCT_ID"],
-  [0,"DisplayName","   ","REQUIRED_FIELD_MISSING"],
-  [0,"Kind","PACKAGE","UNKNOWN_PRODUCT_KIND"],
-  [0,"Price","0","INVALID_PRODUCT_NUMBER"],
-  [0,"Price","-1","INVALID_PRODUCT_NUMBER"],
-  [0,"Price","1.5","INVALID_PRODUCT_NUMBER"],
-  [0,"Price","oops","INVALID_PRODUCT_NUMBER"],
-  [0,"Price","9007199254740991","INVALID_PRODUCT_NUMBER"],
-  [0,"SortOrder","1.5","INVALID_PRODUCT_NUMBER"],
-  [0,"SortOrder","0","INVALID_PRODUCT_NUMBER"],
-  [0,"Enabled","maybe","INVALID_PRODUCT_FLAGS"],
-  [0,"Retired","","INVALID_PRODUCT_FLAGS"],
-  [0,"Removed","maybe","INVALID_PRODUCT_FLAGS"],
-  [0,"Retired","true","RETIRED_PRODUCT_ENABLED"],
-  [0,"Removed","true","REMOVED_PRODUCT_NOT_RETIRED"],
-  [0,"IconRUID","not-an-icon","INVALID_PRODUCT_PRESENTATION"],
-  [0,"Description","  ","INVALID_PRODUCT_PRESENTATION"],
-  [0,"RefId","white_potion","UNSUPPORTED_SUPPLY_REF"],
-  [1,"RefId","warrior","UNSUPPORTED_JOB_TOKEN_REF"],
-  [2,"RefId","union_blade","INVALID_SKIN_REF"],
+  ["supply_potion","SchemaVersion","2","UNSUPPORTED_SCHEMA"],
+  ["supply_potion","ProductId","supply|bad","INVALID_PRODUCT_ID"],
+  ["supply_potion","DisplayName","   ","REQUIRED_FIELD_MISSING"],
+  ["supply_potion","Kind","PACKAGE","UNKNOWN_PRODUCT_KIND"],
+  ["supply_potion","Price","0","INVALID_PRODUCT_NUMBER"],
+  ["supply_potion","Price","-1","INVALID_PRODUCT_NUMBER"],
+  ["supply_potion","Price","1.5","INVALID_PRODUCT_NUMBER"],
+  ["supply_potion","Price","oops","INVALID_PRODUCT_NUMBER"],
+  ["supply_potion","Price","9007199254740991","INVALID_PRODUCT_NUMBER"],
+  ["supply_potion","SortOrder","1.5","INVALID_PRODUCT_NUMBER"],
+  ["supply_potion","SortOrder","0","INVALID_PRODUCT_NUMBER"],
+  ["supply_potion","Enabled","maybe","INVALID_PRODUCT_FLAGS"],
+  ["supply_potion","Retired","","INVALID_PRODUCT_FLAGS"],
+  ["supply_potion","Removed","maybe","INVALID_PRODUCT_FLAGS"],
+  ["supply_potion","Retired","true","RETIRED_PRODUCT_ENABLED"],
+  ["supply_potion","Removed","true","REMOVED_PRODUCT_NOT_RETIRED"],
+  ["supply_potion","IconRUID","not-an-icon","INVALID_PRODUCT_PRESENTATION"],
+  ["supply_potion","Description","  ","INVALID_PRODUCT_PRESENTATION"],
+  ["supply_potion","RefId","white_potion","UNSUPPORTED_SUPPLY_REF"],
+  ["job_unlock","RefId","warrior","UNSUPPORTED_JOB_TOKEN_REF"],
+  ["job_unlock","Price","0","INVALID_PRODUCT_NUMBER"],
+  ["job_unlock","Price","-1","INVALID_PRODUCT_NUMBER"],
+  ["job_unlock_free","Price","1","INVALID_PRODUCT_NUMBER"],
+  ["job_unlock_free","Price","-1","INVALID_PRODUCT_NUMBER"],
+  ["job_unlock_free","Price","0.5","INVALID_PRODUCT_NUMBER"],
+  ["job_unlock_free","Price","oops","INVALID_PRODUCT_NUMBER"],
+  ["job_unlock_free","Price","","INVALID_PRODUCT_NUMBER"],
+  ["job_unlock_free","Price","  ","INVALID_PRODUCT_NUMBER"],
+  ["job_unlock_free","Kind","SUPPLY","INVALID_FREE_JOB_TOKEN_PRODUCT"],
+  ["job_unlock_free","RefId","orange_potion","INVALID_FREE_JOB_TOKEN_PRODUCT"],
+  ["job_unlock_free","ProductId","job_unlock_bonus","INVALID_PRODUCT_NUMBER"],
+  ["union_forest","RefId","union_blade","INVALID_SKIN_REF"],
 ];
-for(const [row,column,value,code] of unionCases){
-  test("union shop rejects "+column+"="+JSON.stringify(value),()=>{
-    const t=copy();t.UnionShopProducts.rows[row][column]=value;
+for(const [productId,column,value,code] of unionCases){
+  test("union shop rejects "+productId+"."+column+"="+JSON.stringify(value),()=>{
+    const t=copy();unionProduct(t.UnionShopProducts,productId)[column]=value;
     assert.ok(S.validate(t).some(e=>e.table==="UnionShopProducts"&&e.code===code));
   });
 }
 test("union product IDs and numeric display order cannot collide",()=>{
-  const t=copy();t.UnionShopProducts.rows[1].ProductId=t.UnionShopProducts.rows[0].ProductId;
-  t.UnionShopProducts.rows[1].SortOrder="010";
+  const t=copy(),paid=unionProduct(t.UnionShopProducts,"job_unlock");
+  paid.ProductId=unionProduct(t.UnionShopProducts,"supply_potion").ProductId;
+  paid.SortOrder="010";
   const codes=S.validate(t).filter(e=>e.table==="UnionShopProducts").map(e=>e.code);
   assert.ok(codes.includes("DUPLICATE_PRIMARY_KEY"));
   assert.ok(codes.includes("DUPLICATE_SORT_ORDER"));
@@ -160,12 +183,12 @@ test("retired skins remain valid without native skin FK or active presentation",
     assert.ok(!t.DamageSkinDefinitions.rows.some(s=>s.SkinId===r.RefId));
   }
   assert.deepEqual(S.validate(t),[]);
-  t.UnionShopProducts.rows[2].Retired="false";
+  unionProduct(t.UnionShopProducts,"union_forest").Retired="false";
   assert.ok(S.validate(t).some(e=>e.code==="REMOVED_PRODUCT_NOT_RETIRED"));
 });
 test("union flags mirror accepted native boolean spellings",()=>{
-  const t=copy();t.UnionShopProducts.rows[0].Enabled="YES";
-  t.UnionShopProducts.rows[0].Retired="0";t.UnionShopProducts.rows[0].Removed="No";
+  const t=copy(),supply=unionProduct(t.UnionShopProducts,"supply_potion");supply.Enabled="YES";
+  supply.Retired="0";supply.Removed="No";
   assert.deepEqual(S.validate(t),[]);
 });
 
@@ -193,12 +216,13 @@ test("Balance Studio uses the union category and validates the same authored pro
   for(const script of html.matchAll(/<script>([\s\S]*?)<\/script>/g))new vm.Script(script[1]);
   const check=studioUnionValidator();
   assert.equal(check(all.UnionShopProducts).filter(e=>e.level==="error").length,0);
-  for(const [row,column,value,code] of unionCases){
-    const t=structuredClone(all.UnionShopProducts);t.rows[row][column]=value;
+  for(const [productId,column,value,code] of unionCases){
+    const t=structuredClone(all.UnionShopProducts);unionProduct(t,productId)[column]=value;
     assert.ok(check(t).some(e=>e.level==="error"&&e.msg.includes(code)),column+":"+code);
   }
   const duplicate=structuredClone(all.UnionShopProducts);
-  duplicate.rows[1].ProductId=duplicate.rows[0].ProductId;duplicate.rows[1].SortOrder="010";
+  const paid=unionProduct(duplicate,"job_unlock");
+  paid.ProductId=unionProduct(duplicate,"supply_potion").ProductId;paid.SortOrder="010";
   const errors=check(duplicate).filter(e=>e.level==="error");
   assert.ok(errors.some(e=>e.col==="ProductId"));
   assert.ok(errors.some(e=>e.msg.includes("DUPLICATE_SORT_ORDER")));
@@ -206,7 +230,7 @@ test("Balance Studio uses the union category and validates the same authored pro
 
 test("active union skins require native catalog references while retired aliases remain compatible",()=>{
   const t=copy(),skin=t.UnionShopProducts.rows.find(r=>r.ProductId==="union_blade");
-  skin.Enabled="true";skin.Retired="false";skin.IconRUID=t.UnionShopProducts.rows[0].IconRUID;
+  skin.Enabled="true";skin.Retired="false";skin.IconRUID=unionProduct(t.UnionShopProducts,"supply_potion").IconRUID;
   assert.deepEqual(S.validate(t),[]);
   const studio=studioUnionValidator();
   assert.equal(studio(t.UnionShopProducts).filter(e=>e.level==="error").length,0);

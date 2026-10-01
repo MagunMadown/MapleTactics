@@ -10,6 +10,11 @@ script GameSettingsLogic extends Logic
 	property table Volumes = {}
 	property table Bindings = {}
 	property boolean ShowKeyGuide = true
+	-- 0~100 percent; applied locally to every replicated magnet pet, never sent to other players.
+	property integer PetOpacity = 100
+	property number PetScanInterval = 0.5
+	property number PetScanRemaining = 0
+	property string PetNamePrefix = "MagnetPet_"
 	property boolean IsLoaded = false
 	property boolean IsWindowOpen = false
 	property boolean IsCapturingKey = false
@@ -115,6 +120,7 @@ script GameSettingsLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+		self:UpdatePetOpacity(delta)
 		-- Asks the server for the saved settings once the local player exists, retrying until an answer arrives.
 		if self.IsLoaded then return end
 		self.LoadRetryRemaining = self.LoadRetryRemaining - delta
@@ -264,6 +270,53 @@ script GameSettingsLogic extends Logic
 		self:MarkChanged()
 	end
 
+	-- ---------- effects ----------
+
+	method integer GetPetOpacity()
+		return self.PetOpacity
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetPetOpacity(number value)
+		local clamped = math.max(0, math.min(100, math.floor(value + 0.5)))
+		if self.PetOpacity == clamped then return end
+		self.PetOpacity = clamped
+		self.PetScanRemaining = 0
+		self:MarkChanged()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetEffectOptions()
+		self.PetOpacity = 100
+		self.PetScanRemaining = 0
+		log("[GameSettings] effect options reset")
+		self:MarkChanged()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdatePetOpacity(number delta)
+		-- Pets are server-spawned children of the map named MagnetPet_<owner>; only the local Color alpha is touched.
+		self.PetScanRemaining = self.PetScanRemaining - delta
+		if self.PetScanRemaining > 0 then return end
+		self.PetScanRemaining = self.PetScanInterval
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false then return end
+		local map = player.CurrentMap
+		if isvalid(map) == false then return end
+		local alpha = self.PetOpacity / 100
+		local prefix = self.PetNamePrefix
+		local prefixLength = string.len(prefix)
+		for _, child in ipairs(map.Children) do
+			if string.sub(child.Name, 1, prefixLength) == prefix then
+				local renderer = child.SpriteRendererComponent
+				if renderer ~= nil and math.abs(renderer.Color.a - alpha) > 0.001 then
+					local color = renderer.Color
+					renderer.Color = Color(color.r, color.g, color.b, alpha)
+				end
+			end
+		end
+	end
+
 	-- ---------- sound ----------
 
 	method integer GetVolume(string id)
@@ -312,7 +365,7 @@ script GameSettingsLogic extends Logic
 	-- ---------- persistence ----------
 
 	method string Encode()
-		return _HttpService:JSONEncode({ Version = 1, Game = { ShowKeyGuide = self.ShowKeyGuide }, Volumes = self.Volumes, Bindings = self.Bindings })
+		return _HttpService:JSONEncode({ Version = 1, Game = { ShowKeyGuide = self.ShowKeyGuide }, Effects = { PetOpacity = self.PetOpacity }, Volumes = self.Volumes, Bindings = self.Bindings })
 	end
 
 	method table Decode(string raw)
@@ -324,6 +377,12 @@ script GameSettingsLogic extends Logic
 		-- Saves written before the game tab existed have no Game block and keep the guide visible.
 		local showKeyGuide = true
 		if type(decoded.Game) == "table" and decoded.Game.ShowKeyGuide == false then showKeyGuide = false end
+		-- Saves written before the effects tab existed have no Effects block and keep pets fully opaque.
+		local petOpacity = 100
+		if type(decoded.Effects) == "table" then
+			local saved = tonumber(decoded.Effects.PetOpacity)
+			if saved ~= nil then petOpacity = math.max(0, math.min(100, math.floor(saved + 0.5))) end
+		end
 		local volumes = { Master = 100, Bgm = 100, Skill = 100, Monster = 100 }
 		if type(decoded.Volumes) == "table" then
 			for id, _ in pairs(volumes) do
@@ -351,7 +410,7 @@ script GameSettingsLogic extends Logic
 			end
 			bindings[action.Id] = pair
 		end
-		return { ShowKeyGuide = showKeyGuide, Volumes = volumes, Bindings = bindings }
+		return { ShowKeyGuide = showKeyGuide, PetOpacity = petOpacity, Volumes = volumes, Bindings = bindings }
 	end
 
 	@ExecSpace("ClientOnly")
@@ -381,10 +440,12 @@ script GameSettingsLogic extends Logic
 			return
 		end
 		self.ShowKeyGuide = decoded.ShowKeyGuide
+		self.PetOpacity = decoded.PetOpacity
+		self.PetScanRemaining = 0
 		self.Volumes = decoded.Volumes
 		self.Bindings = decoded.Bindings
 		self.Revision = self.Revision + 1
-		log("[GameSettings] load applied keyGuide=" .. tostring(self.ShowKeyGuide) .. " master=" .. tostring(self.Volumes.Master) .. " bgm=" .. tostring(self.Volumes.Bgm) .. " skill=" .. tostring(self.Volumes.Skill) .. " monster=" .. tostring(self.Volumes.Monster))
+		log("[GameSettings] load applied keyGuide=" .. tostring(self.ShowKeyGuide) .. " petOpacity=" .. tostring(self.PetOpacity) .. " master=" .. tostring(self.Volumes.Master) .. " bgm=" .. tostring(self.Volumes.Bgm) .. " skill=" .. tostring(self.Volumes.Skill) .. " monster=" .. tostring(self.Volumes.Monster))
 	end
 
 	@ExecSpace("ServerOnly")

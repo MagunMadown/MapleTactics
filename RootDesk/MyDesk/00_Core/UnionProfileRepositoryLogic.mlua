@@ -1012,17 +1012,7 @@ script UnionProfileRepositoryLogic extends Logic
         end
         local errorCode, raw = storage:GetAndWait(self.StorageKey)
         if errorCode == 1000002 then
-            local defaultResult = self:CreateDefaultProfile()
-            if defaultResult.Success == false then
-                self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
-                return defaultResult
-            end
-            self.ProfilesByStorageUserKey[storageUserKey] = defaultResult.Profile
-            self.RawByStorageUserKey[storageUserKey] = ""
-            self.StoredRecordExistsByStorageUserKey[storageUserKey] = false
-            self.LoadStateByStorageUserKey[storageUserKey] = "LOADED"
-            log("[UnionProfile] default initialized key=" .. storageUserKey .. " points=0")
-            return { Success = true, Reason = "OK", StorageUserKey = storageUserKey, IsNewProfile = true }
+            return self:InitializeDefaultProfile(storageUserKey, storage)
         end
         if errorCode ~= 0 then
             self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
@@ -1030,17 +1020,7 @@ script UnionProfileRepositoryLogic extends Logic
             return { Success = false, Reason = "PROFILE_LOAD_FAILED", ErrorCode = errorCode, StorageUserKey = storageUserKey }
         end
         if raw == nil or raw == "" then
-            local emptyResult = self:CreateDefaultProfile()
-            if emptyResult.Success == false then
-                self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
-                return emptyResult
-            end
-            self.ProfilesByStorageUserKey[storageUserKey] = emptyResult.Profile
-            self.RawByStorageUserKey[storageUserKey] = raw or ""
-            -- An empty payload has no CAS source value; the first real mutation must use SetAndWait.
-            self.StoredRecordExistsByStorageUserKey[storageUserKey] = false
-            self.LoadStateByStorageUserKey[storageUserKey] = "LOADED"
-            return { Success = true, Reason = "OK", StorageUserKey = storageUserKey, IsNewProfile = true }
+            return self:InitializeDefaultProfile(storageUserKey, storage)
         end
         local decodeOk, decoded = pcall(function()
             return _HttpService:JSONDecode(raw)
@@ -1072,6 +1052,52 @@ script UnionProfileRepositoryLogic extends Logic
         self.LoadStateByStorageUserKey[storageUserKey] = "LOADED"
         log("[UnionProfile] loaded key=" .. storageUserKey .. " schema=" .. normalized.Profile.SchemaVersion .. " points=" .. normalized.Profile.UnionPoints)
         return { Success = true, Reason = "OK", StorageUserKey = storageUserKey, WasMigrated = normalized.WasMigrated, WasSanitized = normalized.WasSanitized }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table InitializeDefaultProfile(string storageUserKey, any storage)
+        -- Keep the profile loading until its first durable record exists, including for cash-shop-only users.
+        if self.StoredRecordExistsByStorageUserKey[storageUserKey] == true and self.ProfilesByStorageUserKey[storageUserKey] ~= nil then
+            self.LoadStateByStorageUserKey[storageUserKey] = "LOADED"
+            return { Success = true, Reason = "OK", StorageUserKey = storageUserKey, WasCached = true }
+        end
+        local created = self:CreateDefaultProfile()
+        if created.Success == false then
+            self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+            return created
+        end
+        local validation = self:ValidateProfileData(created.Profile)
+        if validation.Success == false then
+            self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+            return validation
+        end
+        local encodeOk, newRaw = pcall(function()
+            return _HttpService:JSONEncode(self:BuildJsonSafeProfile(created.Profile))
+        end)
+        if encodeOk == false or newRaw == nil or newRaw == "" then
+            self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+            return { Success = false, Reason = "PROFILE_ENCODE_FAILED", StorageUserKey = storageUserKey }
+        end
+        -- Missing and empty records have no CAS source; establish it before exposing paid products.
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", StorageUserKey = storageUserKey }
+        end
+        self.LoadStateByStorageUserKey[storageUserKey] = "LOADING"
+        local saveOk, saveCode = pcall(function()
+            return storage:SetAndWait(self.StorageKey, newRaw)
+        end)
+        self:ReleaseMutationLock(storageUserKey)
+        if saveOk == false or saveCode ~= 0 then
+            self.LoadStateByStorageUserKey[storageUserKey] = "FAILED"
+            log_error("[UnionProfile] initial save failed key=" .. storageUserKey)
+            return { Success = false, Reason = "PROFILE_INITIALIZATION_SAVE_FAILED", ErrorCode = saveOk and saveCode or 0, StorageUserKey = storageUserKey }
+        end
+        self.ProfilesByStorageUserKey[storageUserKey] = created.Profile
+        self.RawByStorageUserKey[storageUserKey] = newRaw
+        self.StoredRecordExistsByStorageUserKey[storageUserKey] = true
+        self.LoadStateByStorageUserKey[storageUserKey] = "LOADED"
+        log("[UnionProfile] default persisted key=" .. storageUserKey .. " points=0")
+        return { Success = true, Reason = "OK", StorageUserKey = storageUserKey, IsNewProfile = true }
     end
 
     @ExecSpace("ServerOnly")
@@ -1291,6 +1317,7 @@ script UnionProfileRepositoryLogic extends Logic
         local wasSanitized = rewardReceiptResult.WasSanitized == true or source.UnionShop == nil or source.UnionShop.JobTokens == nil
         -- Optional Schema 5 extension: do not rerun the legacy refund/reset migration.
         wasSanitized = wasSanitized or source.RedeemedCouponCodes == nil
+        wasSanitized = wasSanitized or (source.UnionShop ~= nil and source.UnionShop.FreeJobTokenClaimed == nil)
         wasSanitized = wasSanitized or (source.UnionShop ~= nil and profile.UnionShop.EquippedSkin ~= source.UnionShop.EquippedSkin)
         local legacyUpgradeRefund = 0
         local legacyBlockRefund = 0
