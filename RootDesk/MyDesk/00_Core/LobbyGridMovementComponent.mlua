@@ -35,8 +35,11 @@ script LobbyGridMovementComponent extends Component
 			return
 		end
 
-		log("[LobbyGridMove] requested direction=" .. direction)
-		self:RequestMove(direction)
+		local current = player.TransformComponent.WorldPosition
+		local context = self._T.moveContext or 0
+		local target = Vector2(self:GetStepTargetX(current.x, direction), current.y)
+		local requestId = _PlayerGridMovementLogic:BeginLocalMove(player, self.Entity, 0, context, target, _PlayerGridMovementLogic:GetProfile(nil))
+		if requestId > 0 then self:RequestMove(direction, requestId, context) end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -44,6 +47,8 @@ script LobbyGridMovementComponent extends Component
 		-- Tracks each lobby player independently; no movement state lives in the shared Logic.
 		self._T.gridMoves = {}
 		self._T.gridPlayers = {}
+		self._T.gridMoveContexts = {}
+		self._T.lastMoveRequestIds = {}
 		self._T.playerScanRemaining = 0
 		log("[LobbyGridMove] begin map=" .. self.Entity.Name .. " cellSize=" .. self.CellSize)
 		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
@@ -67,6 +72,7 @@ script LobbyGridMovementComponent extends Component
 		-- Discard the old map's target before another map can take control of this player.
 		if isvalid(leftEntity) and leftEntity.PlayerComponent ~= nil and self._T.gridMoves ~= nil then
 			self._T.gridMoves[leftEntity.PlayerComponent.UserId] = nil
+			self._T.gridPlayers[leftEntity.PlayerComponent.UserId] = nil
 		end
 		self:SetGridControl(leftEntity, false)
 	end
@@ -102,12 +108,24 @@ script LobbyGridMovementComponent extends Component
 		if enabled and player:GetComponent("script.BattleUnitPresentationComponent") == nil then
 			player:AddComponent("BattleUnitPresentationComponent")
 		end
+		if enabled then
+			local userId = player.PlayerComponent.UserId
+			self._T.gridPlayers = self._T.gridPlayers or {}
+			self._T.gridMoveContexts = self._T.gridMoveContexts or {}
+			if self._T.gridPlayers[userId] ~= player then
+				self._T.gridPlayers[userId] = player
+				self._T.gridMoveContexts[userId] = (self._T.gridMoveContexts[userId] or 0) + 1
+				self._T.lastMoveRequestIds = self._T.lastMoveRequestIds or {}
+				self._T.lastMoveRequestIds[userId] = 0
+			end
+			self:ReceiveMoveContext(self._T.gridMoveContexts[userId], userId)
+		end
 
 		log("[LobbyGridMove] control player=" .. player.Name .. " grid=" .. tostring(enabled))
 	end
 
 	@ExecSpace("Server")
-	method void RequestMove(integer direction)
+	method void RequestMove(integer direction, integer requestId, integer context)
 		-- Validates ownership and accepts only one in-flight battle-style step per player.
 		if direction ~= -1 and direction ~= 1 then
 			log_warning("[LobbyGridMove] rejected reason=INVALID_DIRECTION")
@@ -119,27 +137,34 @@ script LobbyGridMovementComponent extends Component
 			log_warning("[LobbyGridMove] rejected reason=INVALID_SENDER")
 			return
 		end
+		if requestId <= 0 or requestId ~= math.floor(requestId) then return end
+		local current = player.TransformComponent ~= nil and player.TransformComponent.WorldPosition or Vector3.zero
+		if self._T.gridMoveContexts == nil or context ~= self._T.gridMoveContexts[senderUserId] then
+			self:ReceiveMoveResult(requestId, context, false, true, current.x, current.y, "LOBBY_CONTEXT_CHANGED", senderUserId)
+			return
+		end
+		self._T.lastMoveRequestIds = self._T.lastMoveRequestIds or {}
+		if requestId <= (self._T.lastMoveRequestIds[senderUserId] or 0) then return end
+		self._T.lastMoveRequestIds[senderUserId] = requestId
 
 		if player.TransformComponent == nil or player.MovementComponent == nil then
+			self:ReceiveMoveResult(requestId, context, false, true, current.x, current.y, "MOVEMENT_COMPONENT_MISSING", senderUserId)
 			log_warning("[LobbyGridMove] rejected reason=MOVEMENT_COMPONENT_MISSING")
 			return
 		end
 		if self._T.gridMoves == nil then self._T.gridMoves = {} end
 		if self._T.gridMoves[senderUserId] ~= nil then
+			self:ReceiveMoveResult(requestId, context, false, true, current.x, current.y, "MOVE_IN_PROGRESS", senderUserId)
 			log("[LobbyGridMove] blocked reason=MOVE_IN_PROGRESS")
 			return
 		end
 
-		local current = player.TransformComponent.WorldPosition
 		-- Snap to the spawn-anchored columns and clamp to the outermost column inside the map bounds, so a
 		-- boundary step never shifts the columns by a fraction of a cell.
-		local origin = self.GridOriginX
-		local targetX = origin + math.floor((current.x + self.CellSize * direction - origin) / self.CellSize + 0.5) * self.CellSize
-		local minColumn = origin + math.ceil((self.MinX - origin) / self.CellSize - 0.0001) * self.CellSize
-		local maxColumn = origin + math.floor((self.MaxX - origin) / self.CellSize + 0.0001) * self.CellSize
-		targetX = math.max(minColumn, math.min(maxColumn, targetX))
+		local targetX = self:GetStepTargetX(current.x, direction)
 
 		if math.abs(targetX - current.x) < 0.001 then
+			self:ReceiveMoveResult(requestId, context, false, true, current.x, current.y, "BOUNDARY", senderUserId)
 			log("[LobbyGridMove] blocked boundary x=" .. current.x)
 			return
 		end
@@ -149,10 +174,31 @@ script LobbyGridMovementComponent extends Component
 		self._T.gridMoves[senderUserId] = {
 			Entity = player, StartPosition = Vector2(current.x, current.y),
 			TargetPosition = Vector2(targetX, current.y), Elapsed = 0,
-			Duration = _PlayerGridMovementLogic:GetDuration(profile), Profile = profile
+			Duration = _PlayerGridMovementLogic:GetDuration(profile), Profile = profile,
+			RequestId = requestId, Context = context
 		}
-		_PlayerGridMovementLogic:PlayHop(player, senderUserId, profile)
+		_PlayerGridMovementLogic:PlayHop(player, senderUserId, profile, requestId)
+		self:ReceiveMoveResult(requestId, context, true, false, targetX, current.y, "MOVE_ACCEPTED", senderUserId)
 		log("[LobbyGridMove] started pipeline=PlayerGridMovementLogic user=" .. senderUserId .. " from=" .. current.x .. " to=" .. targetX .. " duration=" .. tostring(self._T.gridMoves[senderUserId].Duration))
+	end
+
+	method number GetStepTargetX(number currentX, integer direction)
+		local origin = self.GridOriginX
+		local targetX = origin + math.floor((currentX + self.CellSize * direction - origin) / self.CellSize + 0.5) * self.CellSize
+		local minColumn = origin + math.ceil((self.MinX - origin) / self.CellSize - 0.0001) * self.CellSize
+		local maxColumn = origin + math.floor((self.MaxX - origin) / self.CellSize + 0.0001) * self.CellSize
+		return math.max(minColumn, math.min(maxColumn, targetX))
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveMoveContext(integer context)
+		local player = _UserService.LocalPlayer
+		if isvalid(player) and player.CurrentMap == self.Entity and context >= (self._T.moveContext or 0) then self._T.moveContext = context end
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveMoveResult(integer requestId, integer context, boolean success, boolean completed, number targetX, number targetY, string reason)
+		_PlayerGridMovementLogic:ResolveLocalMove(self.Entity, requestId, 0, context, success, completed, targetX, targetY, reason)
 	end
 
 	@ExecSpace("Server")
@@ -180,9 +226,13 @@ script LobbyGridMovementComponent extends Component
 		if self:IsClient() then
 			local localPlayer = _UserService.LocalPlayer
 			if isvalid(localPlayer) and localPlayer.CurrentMap == self.Entity then
+				self._T.localPlayerOnMap = true
 				if localPlayer.PlayerControllerComponent ~= nil then
 					localPlayer.PlayerControllerComponent.Enable = false
 				end
+			elseif self._T.localPlayerOnMap then
+				self._T.localPlayerOnMap = false
+				self._T.moveContext = nil
 			end
 			return
 		end
@@ -195,7 +245,6 @@ script LobbyGridMovementComponent extends Component
 			for _, player in ipairs(users or {}) do
 				local userId = player.PlayerComponent.UserId
 				if self._T.gridPlayers[userId] ~= player then
-					self._T.gridPlayers[userId] = player
 					self:SetGridControl(player, true)
 				end
 			end
@@ -216,6 +265,7 @@ script LobbyGridMovementComponent extends Component
 				player.MovementComponent:SetWorldPosition(step.Position)
 				if step.Complete then
 					self._T.gridMoves[userId] = nil
+					self:ReceiveMoveResult(movement.RequestId, movement.Context, true, true, step.Position.x, step.Position.y, "MOVE_COMPLETE", userId)
 					log("[LobbyGridMove] completed user=" .. userId .. " snappedX=" .. tostring(step.Position.x))
 				end
 			end

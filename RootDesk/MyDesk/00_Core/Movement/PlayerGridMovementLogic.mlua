@@ -60,7 +60,7 @@ script PlayerGridMovementLogic extends Logic
 	end
 
 	@ExecSpace("ServerOnly")
-	method void PlayHop(Entity player, string unitId, table profile)
+	method void PlayHop(Entity player, string unitId, table profile, integer predictionRequestId)
 		-- Reuses the existing battle avatar presentation without attaching combat state to lobby players.
 		if profile.EnablePlayerHopVisual == false then return end
 		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
@@ -69,6 +69,156 @@ script PlayerGridMovementLogic extends Logic
 			profile.PlayerHopTakeoffSquashDuration, profile.PlayerHopLandingSquashDuration,
 			profile.PlayerHopSquashXScale, profile.PlayerHopSquashYScale,
 			profile.PlayerHopLandingXScale, profile.PlayerHopLandingYScale,
-			profile.PlayerHopPeakProgress, "", profile.PlayerHopAnimationPlayRate, true)
+			profile.PlayerHopPeakProgress, "", profile.PlayerHopAnimationPlayRate, true, predictionRequestId or 0)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasLocalMove(Entity map)
+		local move = self._T.localMove
+		return move ~= nil and move.Map == map
+	end
+
+	@ExecSpace("ClientOnly")
+	method integer BeginLocalMove(Entity player, Entity map, integer entry, integer context, Vector2 target, table profile)
+		-- Predict only the avatar child. Collision, cell occupancy and the player root remain authoritative.
+		if not isvalid(player) or player ~= _UserService.LocalPlayer or player.CurrentMap ~= map then return 0 end
+		if self._T.localMove ~= nil then return 0 end
+		self._T.nextMoveRequestId = (self._T.nextMoveRequestId or 0) + 1
+		local current = player.TransformComponent.WorldPosition
+		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
+		local move = {
+			Player = player, Map = map, Entry = entry, Context = context,
+			RequestId = self._T.nextMoveRequestId, Presentation = presentation, Profile = profile,
+			StartPosition = Vector2(current.x, current.y), TargetPosition = target,
+			Elapsed = 0, Age = 0, Duration = self:GetDuration(profile), Confirmed = false, Completed = false
+		}
+		-- A partially refreshed Maker script may return a component without its new methods.
+		-- Keep these local closures with the request so compatibility never needs another exported method.
+		move.WarnVisualUnavailable = function(reason)
+			if self._T.warnedMissingMoveHelpers then return end
+			self._T.warnedMissingMoveHelpers = true
+			log_warning("[GridMovePrediction] local visuals unavailable; server movement retained reason=" .. reason)
+		end
+		move.StopVisual = function()
+			local clear = move.ClearVisual
+			local shouldClear = move.VisualStarted
+			move.ClearVisual = nil
+			move.VisualStarted = false
+			move.VisualReady = false
+			-- Capture the original function once, before an old component loses its method table.
+			if shouldClear and type(clear) == "function" then
+				local restored = pcall(clear, move.Presentation)
+				if not restored then move.WarnVisualUnavailable("CLEAR_FAILED") end
+			end
+		end
+		move.BindPresentation = function(component)
+			move.Presentation = component
+			move.VisualFailed = false
+			move.PresentationProbeRemaining = 0.5
+			local ok, set, clear, begin = pcall(function()
+				if component == nil then return nil, nil, nil end
+				return component.SetLocalGridMoveOffset, component.ClearLocalGridMoveOffset, component.BeginLocalGridMoveHop
+			end)
+			move.VisualReady = ok and type(set) == "function" and type(clear) == "function" and type(begin) == "function"
+			move.ClearVisual = move.VisualReady and clear or nil
+			if not move.VisualReady then move.WarnVisualUnavailable("HELPERS_MISSING") end
+			return move.VisualReady and begin or nil
+		end
+		self._T.localMove = move
+		local beginHop = move.BindPresentation(presentation)
+		if beginHop ~= nil and profile.EnablePlayerHopVisual then
+			move.VisualStarted = true
+			local started = pcall(beginHop, presentation, player.PlayerComponent.UserId, self:GetDuration(profile), profile.PlayerHopHeight,
+				profile.PlayerHopTakeoffSquashDuration, profile.PlayerHopLandingSquashDuration,
+				profile.PlayerHopSquashXScale, profile.PlayerHopSquashYScale,
+				profile.PlayerHopLandingXScale, profile.PlayerHopLandingYScale,
+				profile.PlayerHopPeakProgress, "", profile.PlayerHopAnimationPlayRate, self._T.nextMoveRequestId)
+			if not started then move.StopVisual() move.VisualFailed = true move.WarnVisualUnavailable("HOP_FAILED") end
+		end
+		return self._T.nextMoveRequestId
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResolveLocalMove(Entity map, integer requestId, integer entry, integer context, boolean success, boolean completed, number targetX, number targetY, string reason)
+		local move = self._T.localMove
+		if move == nil or move.Map ~= map or move.RequestId ~= requestId or move.Entry ~= entry or move.Context ~= context then return end
+		if not success then self:CancelLocalMove(reason) return end
+		move.Confirmed = true
+		move.Completed = move.Completed or completed
+		-- Correct a different accepted endpoint without restarting a matching prediction.
+		if math.abs(move.TargetPosition.x - targetX) > 0.001 then
+			local progress = self:EvaluateCurve(math.min(1, move.Elapsed / move.Duration), move.Profile.MoveCurve)
+			move.StartPosition = Vector2(move.StartPosition.x + (move.TargetPosition.x - move.StartPosition.x) * progress, targetY)
+			move.Elapsed = 0
+			move.Duration = 0.10
+		end
+		move.TargetPosition = Vector2(targetX, targetY)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelLocalMove(string reason)
+		local move = self._T.localMove
+		if move == nil then return end
+		self._T.localMove = nil
+		if type(move.StopVisual) == "function" and type(move.BindPresentation) == "function" and type(move.WarnVisualUnavailable) == "function" then
+			move.StopVisual()
+		else
+			-- Live source refresh can retain an older request table without the local closures.
+			-- Clear only the current component once; never retry a stale cached component or RPC.
+			pcall(function()
+				if not isvalid(move.Player) then return end
+				local presentation = move.Player:GetComponent("script.BattleUnitPresentationComponent")
+				if presentation == nil then return end
+				local clear = presentation.ClearLocalGridMoveOffset
+				if type(clear) == "function" then clear(presentation) end
+			end)
+		end
+		_BattleHudPresenterLogic:ReleasePendingLocalCommand("MOVE", reason)
+		log("[GridMovePrediction] cleared request=" .. tostring(move.RequestId) .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		local move = self._T.localMove
+		if move == nil then return end
+		if type(move.StopVisual) ~= "function" or type(move.BindPresentation) ~= "function" or type(move.WarnVisualUnavailable) ~= "function" then
+			self:CancelLocalMove("SCRIPT_REFRESHED") return
+		end
+		local player = move.Player
+		if not isvalid(player) or player ~= _UserService.LocalPlayer or player.CurrentMap ~= move.Map then self:CancelLocalMove("MAP_CHANGED") return end
+		local session = move.Map:GetComponent("script.BattleSessionComponent")
+		if move.Entry > 0 and (session == nil or session.EntryRequestId ~= move.Entry or session.HudContextRevision ~= move.Context or session.BattleResult ~= "") then
+			self:CancelLocalMove("BATTLE_CONTEXT_CHANGED") return
+		end
+		move.Age = move.Age + math.max(0, delta)
+		if move.Age >= 2 then self:CancelLocalMove("MOVE_RESPONSE_TIMEOUT") return end
+		local step = self:Advance(move, delta, move.Profile.MoveCurve, move.Profile.MoveSnapThreshold)
+		local current = player.TransformComponent.WorldPosition
+		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= move.Presentation then
+			move.StopVisual()
+			move.BindPresentation(presentation)
+		elseif not move.VisualReady and not move.VisualFailed then
+			-- Retry missing metadata at most twice per second; normal movement checks only its setter.
+			move.PresentationProbeRemaining = move.PresentationProbeRemaining - math.max(0, delta)
+			if move.PresentationProbeRemaining <= 0 then move.BindPresentation(presentation) end
+		end
+		if move.VisualReady then
+			local offset = player.TransformComponent:ToLocalPoint(Vector3(step.Position.x, current.y, current.z))
+			local ok, applied = pcall(function()
+				local set = presentation.SetLocalGridMoveOffset
+				if type(set) ~= "function" then return false end
+				move.VisualStarted = true
+				set(presentation, offset.x)
+				return true
+			end)
+			if not ok or not applied then move.StopVisual() move.VisualFailed = true move.WarnVisualUnavailable("SET_FAILED") end
+		end
+		if step.Complete and move.Completed and math.abs(current.x - move.TargetPosition.x) <= 0.02 then self:CancelLocalMove("AUTHORITATIVE_POSITION_RECEIVED") end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		self:CancelLocalMove("WORLD_END")
 	end
 end

@@ -67,6 +67,8 @@ lua.globals().repo = load_methods(
         "CreateDefaultJobUnionProgress", "IsKnownUnionJobId", "NormalizeJobUnionProgress",
         "ValidateJobUnionProgress", "NormalizeAllocatedUnionStats", "ValidateAllocatedUnionStats",
         "ValidateAllocatedUnionStatConsistency", "NormalizePurchasedLevelsStrict",
+        "GetProfileUpgradeDefinitions", "GetProfileStatDefinition", "GetProfileStatLevelDefinition",
+        "GetProfileRankDefinition", "GetProfileLifetimeRank",
         "CountLegacyBlockEntries", "CopyLevelMap", "CopyRewardReceiptMap", "CountTableEntries",
         "NormalizeRewardReceiptMap", "PruneCommittedRewardKeys", "ReadNonNegativeInteger",
         "IsNonNegativeInteger", "ClampNonNegativeInteger", "ValidateCouponReceiptCodes",
@@ -128,6 +130,8 @@ _UnionRankDefinitionRepositoryLogic = {
     GetDefinition = function(self, id) return {Success=id=="rank1", SortOrder=1} end,
 }
 repo.CurrentSchemaVersion = 5
+repo._T = {}
+_UtilLogic = {ElapsedSeconds=0}
 repo.RewardReceiptRetention = 64
 repo.StorageKey = "UnionProfile"
 repo.JsonEmptyMapMarker = "__EMPTY_MAP__"
@@ -152,6 +156,7 @@ function seed(profile, raw)
     storage.Raw = repo.RawByStorageUserKey[KEY]
 end
 function fixture(balance)
+    repo._T = {}
     repo.ProfilesByStorageUserKey = {}
     repo.RawByStorageUserKey = {}
     repo.StoredRecordExistsByStorageUserKey = {}

@@ -225,6 +225,9 @@ script BattleUnitPresentationComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnMapEnter(Entity enteredMap)
 		-- Lobby entry restores the avatar even while the previous battle's dead flag is still synchronized.
+		self._T.confirmedDeathAwaitSync = false
+		local found, clear = pcall(function() return self.ClearLocalGridMoveOffset end)
+		if found and type(clear) == "function" then pcall(clear, self) end
 		if isvalid(enteredMap) and enteredMap.Name == "lobby" then
 			self:RestoreAvatarDeathMotion("LOBBY_ENTER")
 		end
@@ -485,6 +488,42 @@ script BattleUnitPresentationComponent extends Component
 		end
 	end
 
+	@ExecSpace("ClientOnly")
+	method void SetLocalGridMoveOffset(number offsetX)
+		-- Prediction moves only the avatar child; server Position and BoardState remain authoritative.
+		local visualEntity = self:GetMoveVisualEntity()
+		if isvalid(visualEntity) == false or visualEntity == self.Entity or visualEntity.TransformComponent == nil then return end
+		local state = self._T.localGridMoveVisual
+		if state == nil or state.Entity ~= visualEntity then
+			state = { Entity = visualEntity, BaseX = visualEntity.TransformComponent.Position.x, OffsetX = 0 }
+			self._T.localGridMoveVisual = state
+		end
+		state.OffsetX = offsetX
+		local position = visualEntity.TransformComponent.Position
+		visualEntity.TransformComponent.Position = Vector3(state.BaseX + offsetX, position.y, position.z)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearLocalGridMoveOffset()
+		local hop = self._T.moveHopVisual
+		if hop ~= nil and hop.LocalPrediction then self:StopMoveHopVisual("LOCAL_MOVE_FINISHED") end
+		local state = self._T.localGridMoveVisual
+		if state ~= nil and isvalid(state.Entity) and state.Entity.TransformComponent ~= nil then
+			local position = state.Entity.TransformComponent.Position
+			state.Entity.TransformComponent.Position = Vector3(state.BaseX, position.y, position.z)
+		end
+		self._T.localGridMoveVisual = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BeginLocalGridMoveHop(string unitId, number duration, number height, number takeoffDuration, number landingDuration, number squashXScale, number squashYScale, number landingXScale, number landingYScale, number peakProgress, string animationRuid, number animationPlayRate, integer predictionRequestId)
+		self._T.lastPredictedMoveHopRequestId = math.max(self._T.lastPredictedMoveHopRequestId or 0, predictionRequestId or 0)
+		self._T.startingPredictedMoveHop = true
+		self:PlayMoveHop(unitId, duration, height, takeoffDuration, landingDuration, squashXScale, squashYScale, landingXScale, landingYScale, peakProgress, animationRuid, animationPlayRate, true, predictionRequestId or 0)
+		self._T.startingPredictedMoveHop = false
+		if self._T.moveHopVisual ~= nil then self._T.moveHopVisual.LocalPrediction = true end
+	end
+
 	@ExecSpace("Client")
 	method void StopMoveHopVisual(string reason)
 		-- Cancels an overlapping cosmetic hop and restores the visual child's exact local transform.
@@ -506,7 +545,9 @@ script BattleUnitPresentationComponent extends Component
 					local currentPosition = visualEntity.TransformComponent.Position
 					visualEntity.TransformComponent.Position = Vector3(currentPosition.x, state.BasePosition.y, currentPosition.z)
 				else
-					visualEntity.TransformComponent.Position = state.BasePosition
+					local offset = self._T.localGridMoveVisual
+					local offsetX = offset ~= nil and offset.Entity == visualEntity and offset.OffsetX or 0
+					visualEntity.TransformComponent.Position = Vector3(state.BasePosition.x + offsetX, state.BasePosition.y, state.BasePosition.z)
 				end
 			end
 			visualEntity.TransformComponent.Scale = state.BaseScale
@@ -517,7 +558,9 @@ script BattleUnitPresentationComponent extends Component
 	end
 
 	@ExecSpace("Client")
-	method void PlayMoveHop(string unitId, number duration, number height, number takeoffDuration, number landingDuration, number squashXScale, number squashYScale, number landingXScale, number landingYScale, number peakProgress, string animationRuid, number animationPlayRate, boolean animatePosition)
+	method void PlayMoveHop(string unitId, number duration, number height, number takeoffDuration, number landingDuration, number squashXScale, number squashYScale, number landingXScale, number landingYScale, number peakProgress, string animationRuid, number animationPlayRate, boolean animatePosition, integer predictionRequestId)
+		if (predictionRequestId or 0) > 0 and self._T.startingPredictedMoveHop ~= true
+			and predictionRequestId <= (self._T.lastPredictedMoveHopRequestId or 0) then return end
 		-- Shared cosmetic path for avatar and sprite units. It never mutates BattleUnit CellIndex.
 		if self._T.fullMotion ~= nil then
 			-- Charge displacement may happen during an attack; keep that pose while the server moves the entity.
@@ -568,6 +611,10 @@ script BattleUnitPresentationComponent extends Component
 		local landingFraction = math.min(0.45, landing / totalDuration)
 		local transform = visualEntity.TransformComponent
 		local basePosition = transform.Position
+		local prediction = self._T.localGridMoveVisual
+		if prediction ~= nil and prediction.Entity == visualEntity then
+			basePosition = Vector3(basePosition.x - prediction.OffsetX, basePosition.y, basePosition.z)
+		end
 		local baseScale = transform.Scale
 		local baseRotation = transform.Rotation
 		local preserveHorizontalPosition = visualEntity == self.Entity and self.Entity.SpriteRendererComponent ~= nil
@@ -620,7 +667,9 @@ script BattleUnitPresentationComponent extends Component
 			local scaleX = baseScale.x * scaleXMultiplier
 			local scaleY = baseScale.y * scaleYMultiplier
 			local currentPosition = visualEntity.TransformComponent.Position
-			local visualX = preserveHorizontalPosition and currentPosition.x or basePosition.x
+			local offset = self._T.localGridMoveVisual
+			local offsetX = offset ~= nil and offset.Entity == visualEntity and offset.OffsetX or 0
+			local visualX = preserveHorizontalPosition and currentPosition.x or basePosition.x + offsetX
 			local visualZ = preserveHorizontalPosition and currentPosition.z or basePosition.z
 			if animatePosition then
 				visualEntity.TransformComponent.Position = Vector3(visualX, basePosition.y + yOffset, visualZ)
@@ -638,7 +687,9 @@ script BattleUnitPresentationComponent extends Component
 						local currentPosition = visualEntity.TransformComponent.Position
 						visualEntity.TransformComponent.Position = Vector3(currentPosition.x, basePosition.y, currentPosition.z)
 					else
-						visualEntity.TransformComponent.Position = basePosition
+						local offset = self._T.localGridMoveVisual
+						local offsetX = offset ~= nil and offset.Entity == visualEntity and offset.OffsetX or 0
+						visualEntity.TransformComponent.Position = Vector3(basePosition.x + offsetX, basePosition.y, basePosition.z)
 					end
 				end
 				visualEntity.TransformComponent.Scale = baseScale
@@ -670,8 +721,27 @@ script BattleUnitPresentationComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void ResetConfirmedDeathPresentation()
+		self._T.confirmedDeathAwaitSync = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayConfirmedDeathPresentation(string unitId, string team)
+		-- Start from the authoritative death RPC even when IsDead synchronization has not arrived yet.
+		self:RefreshDefeatedDisplay(unitId, team, true)
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		self._T.confirmedDeathAwaitSync = unit == nil or unit.IsDead ~= true
+	end
+
+	@ExecSpace("ClientOnly")
 	method void RefreshDefeatedDisplay(string unitId, string team, boolean isDead)
 		-- Airborne bosses use the same visibility boundary while remaining alive in the turn order.
+		if isDead then
+			self._T.confirmedDeathAwaitSync = false
+		elseif self._T.confirmedDeathAwaitSync then
+			-- HP/Team updates may arrive before IsDead; they must not cancel a death already dispatched.
+			isDead = true
+		end
 		if team ~= "Enemy" then
 			local currentMap = self.Entity.CurrentMap
 			if self.Entity.PlayerComponent ~= nil and isvalid(currentMap) and currentMap.Name == "lobby" then

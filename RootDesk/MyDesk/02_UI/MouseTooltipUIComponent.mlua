@@ -20,9 +20,14 @@ script MouseTooltipUIComponent extends Component
 	property integer SkillHoverRequestId = 0
 	property string HoverSkillId = ""
 	property Entity HoverMap = nil
+	property number SkillHoverRefreshInterval = 1
+	property number SkillHoverResponseTimeout = 3
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
+		self._T.SkillHoverCache = {}
+		self._T.SkillHoverCacheMap = nil
+		self._T.NextLiveSkillHover = 0
 		self:ForceHide()
 		log("[MouseTooltip] shared controller ready")
 	end
@@ -47,8 +52,11 @@ script MouseTooltipUIComponent extends Component
 			log_warning("[MouseTooltip] show rejected owner=" .. ownerKey .. " reason=BINDING_MISSING")
 			return
 		end
+		-- Live previews often return identical text. Keep its layout and scroll position.
+		if self.IsShowing and self.TooltipPanel.Enable and self.ActiveOwnerKey == ownerKey and self._T.DisplayText == text then return end
 		if ownerKey ~= "battle_skill" and ownerKey ~= "enemy_skill" and self.HoverSkillId ~= "" then self:ForceHide() end
 		self.ActiveOwnerKey = ownerKey
+		self._T.DisplayText = text
 		self.TooltipText.HorizontalAlignment = TextHorizontalAlignmentOption.Left
 		self.TooltipText.VerticalAlignment = TextVerticalAlignmentOption.Top
 		self.TooltipText.Text = text
@@ -87,6 +95,8 @@ script MouseTooltipUIComponent extends Component
 		self.HoverSkillId = ""
 		self.HoverMap = nil
 		self.SkillHoverRequestId = self.SkillHoverRequestId + 1
+		self._T.PendingSkillHover = nil
+		self._T.DisplayText = nil
 		self:ApplySkillRange(nil, {})
 		if isvalid(self.TooltipPanel) then self.TooltipPanel.Enable = false end
 		self.ActiveOwnerKey = ""
@@ -162,29 +172,62 @@ script MouseTooltipUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void RequestSkillHover(Entity map, string skillId, string signature)
-		-- Refresh the hovered skill periodically for server-only buffs, without hiding an existing tooltip.
+		-- One live preview in flight prevents a slow reply from being superseded every 0.3s.
+		if not isvalid(map) or skillId == "" then return end
 		local sameSkill = self.ActiveOwnerKey == "battle_skill" and self.HoverMap == map and self.HoverSkillId == skillId
 		local now = _UtilLogic.ElapsedSeconds
-		if sameSkill and self._T.SkillHoverSignature == signature and now < (self._T.NextLiveSkillHover or 0) then return end
-		self._T.NextLiveSkillHover = now + 0.3
 		local session = map:GetComponent("script.BattleSessionComponent")
 		if session == nil then return end
-		if not sameSkill then self:ApplySkillRange(nil, {}) end
+		if self._T.SkillHoverCacheMap ~= map then
+			self._T.SkillHoverCacheMap = map
+			self._T.SkillHoverCache = {}
+		end
+		local cache = self._T.SkillHoverCache or {}
+		self._T.SkillHoverCache = cache
+		local previousSignature = self._T.SkillHoverSignature
 		self.HoverMap = map
 		self.HoverSkillId = skillId
 		self._T.SkillHoverSignature = signature
-		self.SkillHoverRequestId = self.SkillHoverRequestId + 1
 		self.ActiveOwnerKey = "battle_skill"
 		if not sameSkill then
+			self:ApplySkillRange(nil, {})
+			self._T.PendingSkillHover = nil
 			self.IsShowing = false
 			if isvalid(self.TooltipPanel) then self.TooltipPanel.Enable = false end
 		end
+		local cached = cache[skillId]
+		if cached ~= nil and cached.Signature == signature and now < cached.Expires then
+			if not self.IsShowing then
+				self.TooltipText.IsRichText = true
+				self:Show("battle_skill", self:ColorizeSkillText(cached.Text))
+				self:ApplySkillRange(map, cached.Cells)
+			end
+			return
+		end
+		local pending = self._T.PendingSkillHover
+		if pending ~= nil and pending.Map == map and pending.SkillId == skillId
+			and now - pending.Started < math.max(0.5, self.SkillHoverResponseTimeout) then return end
+		if sameSkill and previousSignature == signature and now < (self._T.NextLiveSkillHover or 0) then return end
+		self.SkillHoverRequestId = self.SkillHoverRequestId + 1
+		self._T.PendingSkillHover = { Map = map, SkillId = skillId, Signature = signature, Started = now, RequestId = self.SkillHoverRequestId }
+		self._T.NextLiveSkillHover = now + math.max(0.2, self.SkillHoverRefreshInterval)
 		session:RequestSkillHover(skillId, self.SkillHoverRequestId)
 	end
 
 	@ExecSpace("ClientOnly")
 	method void ReceiveSkillHover(Entity map, string skillId, integer requestId, string text, table cells)
 		if self.ActiveOwnerKey ~= "battle_skill" or self.HoverMap ~= map or self.HoverSkillId ~= skillId or self.SkillHoverRequestId ~= requestId then return end
+		local pending = self._T.PendingSkillHover
+		if pending == nil or pending.RequestId ~= requestId then return end
+		self._T.PendingSkillHover = nil
+		if pending.Signature ~= self._T.SkillHoverSignature then
+			-- The actor changed while the response was travelling; fetch the latest state once.
+			self._T.NextLiveSkillHover = 0
+			self:RequestSkillHover(map, skillId, self._T.SkillHoverSignature)
+			return
+		end
+		self._T.SkillHoverCache = self._T.SkillHoverCache or {}
+		self._T.SkillHoverCache[skillId] = { Signature = pending.Signature, Text = text, Cells = cells, Expires = _UtilLogic.ElapsedSeconds + math.max(0.2, self.SkillHoverRefreshInterval) }
 		self.TooltipText.IsRichText = true
 		self:Show("battle_skill", self:ColorizeSkillText(text))
 		self:ApplySkillRange(map, cells)
@@ -201,6 +244,7 @@ script MouseTooltipUIComponent extends Component
 		if self.HoverMap == map and self.HoverSkillId == hoverKey and self._T.SkillHoverSignature == signature then return end
 		local session = map:GetComponent("script.BattleSessionComponent")
 		if session == nil then return end
+		self._T.PendingSkillHover = nil
 		self:ApplySkillRange(nil, {})
 		self.HoverMap = map
 		self.HoverSkillId = hoverKey
