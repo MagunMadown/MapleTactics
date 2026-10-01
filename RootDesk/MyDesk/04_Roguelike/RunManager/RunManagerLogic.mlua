@@ -8,6 +8,16 @@ script RunManagerLogic extends Logic
 	property string StartingPotionId = "orange_potion"
 
 	@ExecSpace("ServerOnly")
+	method table FinalizeRunResult(Entity playerEntity, string endReason, string detail, string terminalStageId)
+		-- Reports capture failures without replaying the separately committed combat or reward workflow.
+		local result = _RunResultServiceLogic:FinalizeRun(playerEntity, endReason, detail, terminalStageId)
+		if result.Success == false then
+			log_warning("[RunResult] capture failed reason=" .. tostring(result.Reason))
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
 		-- This Logic coordinates run state but never stores one user's mutable run as global data.
 		log("[RunManager] ready defaultSeed=" .. self.DefaultRunSeed .. " defaultJob=" .. self.DefaultJobId)
@@ -331,6 +341,10 @@ script RunManagerLogic extends Logic
 		if relics.Success == false then return relics end
 		local supply = _UnionShopServiceLogic:GrantDepartureSupply(playerEntity, inventory, unionState.RewardRunId)
 		if supply.Success == false then return supply end
+		local resultStart = _RunResultServiceLogic:BeginRun(playerEntity, true)
+		if resultStart.Success == false then
+			log_warning("[RunResult] start capture failed reason=" .. resultStart.Reason)
+		end
 		return { Success = true, Reason = "RUN_OWNED_STATE_INITIALIZED", UnionSnapshot = captured }
 	end
 
@@ -399,6 +413,7 @@ script RunManagerLogic extends Logic
 			end
 			log("[RunManager] reused player=" .. playerEntity.Name .. " sequence=" .. runState.RunSequence .. " seed=" .. runState.RunSeed .. " state=" .. runState.RunState)
 		end
+		_RunResultServiceLogic:BeginRun(playerEntity, false)
 		return runState
 	end
 
@@ -448,6 +463,8 @@ script RunManagerLogic extends Logic
 			return { Success = false, Reason = "RUN_UNION_STATE_UNAVAILABLE" }
 		end
 
+		-- Freeze before job, HP, statistics, and the persistent reward run ID are cleared.
+		self:FinalizeRunResult(playerEntity, "DEFEATED", reason or "DEFEAT_RESET", runState.LastCompletedStageId)
 		local resetResult = runState:ResetAfterDefeat(reason)
 		if resetResult.Success == false then
 			return resetResult
@@ -469,6 +486,11 @@ script RunManagerLogic extends Logic
 		local runState = self:GetOrCreateRunState(playerEntity)
 		if runState == nil then
 			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
+		end
+		if runState.RunState == "Active" then
+			self:FinalizeRunResult(playerEntity, "ABANDONED", reason or "PLAYER_ABANDONED", runState.LastCompletedStageId)
+		elseif runState.RunState == "Completed" then
+			self:FinalizeRunResult(playerEntity, "COMPLETED", "COMPLETED_RETURN_TO_LOBBY", runState.LastCompletedStageId)
 		end
 		runState.RunState = "Failed"
 		runState.LastBattleResult = "Defeat"
@@ -551,6 +573,10 @@ script RunManagerLogic extends Logic
 		end
 		if unionRewardResult.RunEnded == true and battleResult == "Victory" then
 			runState:MarkRunCompleted("UNION_REWARD_RUN_CLEAR")
+		end
+		if runState.RunState == "Completed" or runState.RunState == "Failed" then
+			self:FinalizeRunResult(playerEntity,
+				runState.RunState == "Completed" and "COMPLETED" or "DEFEATED", "BATTLE_RESULT", stageId)
 		end
 		return true
 	end
@@ -677,7 +703,11 @@ script RunManagerLogic extends Logic
 			local reward = _UnionRewardServiceLogic:ProcessTerminalContentCompletion(playerEntity, runState.RunSequence, runState.LastCompletedStageId)
 			if reward.Success == false then return reward end
 		end
-		return runState:ApplyContentCompletion(flowResult, completionKey)
+		local completed = runState:ApplyContentCompletion(flowResult, completionKey)
+		if completed.Success and runState.RunState == "Completed" then
+			self:FinalizeRunResult(playerEntity, "COMPLETED", "TERMINAL_CONTENT", runState.LastCompletedStageId)
+		end
+		return completed
 	end
 
 	@ExecSpace("ServerOnly")

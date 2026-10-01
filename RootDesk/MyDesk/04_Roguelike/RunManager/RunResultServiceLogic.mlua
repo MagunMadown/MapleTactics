@@ -1,0 +1,173 @@
+@Logic
+script RunResultServiceLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method any GetOrCreateResultState(Entity playerEntity)
+		-- One actor owns run metadata and pending writes; the singleton keeps no player's active run state.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then return nil end
+		local state = playerEntity:GetComponent("script.PlayerRunResultComponent")
+		if state == nil then state = playerEntity:AddComponent(PlayerRunResultComponent) end
+		return state
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BeginRun(Entity playerEntity, boolean observedStart)
+		-- Reuses the persistent reward-run allocation instead of creating another counter or GUID source.
+		local state = self:GetOrCreateResultState(playerEntity)
+		if state == nil then return { Success = false, Reason = "RUN_RESULT_STATE_UNAVAILABLE" } end
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local reward = playerEntity:GetComponent("script.PlayerRunUnionEffectComponent")
+		if run == nil or reward == nil or reward.ActiveRunSequence ~= run.RunSequence then
+			return { Success = false, Reason = "RUN_RESULT_SEQUENCE_MISMATCH" }
+		end
+		return state:BeginRun(run.RunSequence, reward.RewardRunId, observedStart)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ObserveTestMode(Entity playerEntity)
+		-- Captures the sticky test exclusion before MarkRunCompleted clears PrototypeTestMode.
+		if isvalid(playerEntity) == false then return end
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local state = playerEntity:GetComponent("script.PlayerRunResultComponent")
+		if run ~= nil and state ~= nil and run.PrototypeTestMode then state:ExcludeFromRanking("PROTOTYPE_TEST") end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table FinalizeRun(Entity playerEntity, string endReason, string detail, string terminalStageId)
+		-- Freezes a server-owned result before reset; persistence failure must not replay rewards or combat.
+		if endReason ~= "COMPLETED" and endReason ~= "DEFEATED" and endReason ~= "ABANDONED" then
+			return { Success = false, Reason = "RUN_RESULT_END_REASON_INVALID" }
+		end
+		local state = self:GetOrCreateResultState(playerEntity)
+		if state == nil then return { Success = false, Reason = "RUN_RESULT_STATE_UNAVAILABLE" } end
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local stats = playerEntity:GetComponent("script.PlayerRunCombatStatsComponent")
+		if run ~= nil and state.ActiveRunSequence == run.RunSequence and state.FrozenRecordJson ~= "" then
+			return { Success = true, Reason = "RUN_RESULT_ALREADY_FINALIZED", Json = state.FrozenRecordJson }
+		end
+		if run == nil or stats == nil or stats.ActiveRunSequence ~= run.RunSequence then
+			return { Success = false, Reason = "RUN_RESULT_STATS_UNAVAILABLE" }
+		end
+		if state.ActiveRunSequence ~= run.RunSequence or state.ActiveRunId <= 0 then
+			local begun = self:BeginRun(playerEntity, false)
+			if begun.Success == false then return begun end
+		end
+		if state.FrozenRecordJson ~= "" then
+			return { Success = true, Reason = "RUN_RESULT_ALREADY_FINALIZED", Json = state.FrozenRecordJson }
+		end
+		if (endReason == "COMPLETED" and run.RunState ~= "Completed")
+			or (endReason == "DEFEATED" and run.RunState ~= "Failed")
+			or (endReason == "ABANDONED" and run.RunState ~= "Active" and run.RunState ~= "Failed") then
+			return { Success = false, Reason = "RUN_RESULT_NOT_TERMINAL" }
+		end
+		self:ObserveTestMode(playerEntity)
+		local capturedBuild = _RunBuildSnapshotLogic:CaptureForPlayer(playerEntity, run.RunSequence)
+		if not capturedBuild.Success then return capturedBuild end
+		stats:FinishRun()
+		local snapshot = stats:GetSnapshot()
+		local excluded = state.RankExclusionReason
+		if excluded == "" and endReason ~= "COMPLETED" then excluded = "INCOMPLETE_RUN" end
+		if excluded == "" and run.SelectedJobId == "" then excluded = "JOB_MISSING" end
+		local record = {
+			SchemaVersion = _RunResultContractLogic.SchemaVersion,
+			RecordId = _RunResultContractLogic:MakeRecordId(state.ActiveRunId), RunId = state.ActiveRunId,
+			RunSequence = run.RunSequence, RunSeed = run.RunSeed,
+			RuleVersion = state.CapturedRuleVersion,
+			StartedAtUtc = state.StartedAtUtc,
+			EndedAtUtc = _RunResultContractLogic:FormatUtcTimestamp(),
+			EndReason = endReason, EndDetail = detail or "",
+			JobId = run.SelectedJobId or "", NodeGraphId = run.CurrentNodeGraphId or "",
+			LastNodeId = run.CurrentNodeId or "", LastStageId = terminalStageId or "",
+			RouteId = run.SelectedWorldMapBranch or "",
+			CompletedStageNumber = run.CompletedStageCount,
+			ConsumedTurns = snapshot.ConsumedTurns, HitsTaken = snapshot.HitsTaken,
+			ElapsedSeconds = snapshot.FinalElapsedSeconds,
+			CurrentHp = run.RunCurrentHp, MaxHp = run.RunMaxHp,
+			RankEligible = excluded == "", RankExclusionReason = excluded,
+			Build = capturedBuild.Build
+		}
+		local encoded = _RunResultContractLogic:EncodeRecord(record)
+		if encoded.Success == false then
+			log_error("[RunResult] finalization rejected reason=" .. encoded.Reason)
+			return encoded
+		end
+		local saved = state:QueueFinalResult(encoded.Json)
+		if state.FrozenRecordJson == "" then
+			log_error("[RunResult] result not queued reason=" .. tostring(saved.Reason))
+			return saved
+		end
+		local persisted = saved.Success and state.PendingResultCount == 0
+		return { Success = true, Reason = persisted and saved.Reason or "RUN_RESULT_PENDING", PersistenceSucceeded = persisted, Record = record, Json = encoded.Json }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetLatestRunResult(Entity playerEntity)
+		-- Server integrations query an authoritative record; client UI uses the owner-authenticated component RPC.
+		return _RunResultRepositoryLogic:GetLatestResult(playerEntity)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetRunHistory(Entity playerEntity)
+		-- Returns the authoritative retained history and best to trusted server integrations.
+		return _RunResultRepositoryLogic:GetHistory(playerEntity)
+	end
+
+	@ExecSpace("Server")
+	method void RequestMyRunHistory()
+		-- Client requests contain no identity or score; the server resolves the authenticated owning player.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local state = self:GetOrCreateResultState(playerEntity)
+		if state ~= nil then
+			state:LoadLatestResult()
+			_RunHistoryPresenterLogic:PublishCatalogForPlayer(playerEntity, state)
+		end
+	end
+
+	@ExecSpace("Server")
+	method void RequestMyRunResultDetail(integer runId)
+		-- RunId selects only the caller's already-authorized recent/best records and performs no storage read.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		if isvalid(playerEntity) == false then return end
+		local state = playerEntity:GetComponent("script.PlayerRunResultComponent")
+		if state ~= nil then state:SelectRetainedResult(runId) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalRunHistorySnapshot()
+		-- Screen implementers consume summaries and the best without sharing persistence implementation details.
+		local playerEntity = _UserService.LocalPlayer
+		if isvalid(playerEntity) == false then return { Success = false, Reason = "LOCAL_PLAYER_UNAVAILABLE", Entries = {}, HasBest = false, IsLoaded = false } end
+		local state = playerEntity:GetComponent("script.PlayerRunResultComponent")
+		if state == nil then return { Success = true, Reason = "NOT_REQUESTED", Entries = {}, HasBest = false, IsLoaded = false, RetentionLimit = _RunHistoryContractLogic.RetentionLimit } end
+		return state:GetHistorySnapshot()
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalRunResultDetailSnapshot()
+		-- Returns the selected immutable build using only owner-synchronized local data.
+		local playerEntity = _UserService.LocalPlayer
+		if isvalid(playerEntity) == false then return { Success = false, Reason = "LOCAL_PLAYER_UNAVAILABLE", HasRecord = false } end
+		local state = playerEntity:GetComponent("script.PlayerRunResultComponent")
+		if state == nil then return { Success = true, Reason = "NOT_REQUESTED", HasRecord = false } end
+		return state:GetSelectedResultSnapshot()
+	end
+
+	@ExecSpace("Server")
+	method void RequestMyLatestRunResult()
+		-- The lobby can read before the first run; the server resolves the authenticated caller itself.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local state = self:GetOrCreateResultState(playerEntity)
+		if state ~= nil then state:LoadLatestResult() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalLatestRunResultSnapshot()
+		-- UI polls only synchronized local data; requesting storage is an explicit separate command.
+		local playerEntity = _UserService.LocalPlayer
+		if isvalid(playerEntity) == false then return { Success = false, Reason = "LOCAL_PLAYER_UNAVAILABLE", HasRecord = false, PersistenceState = "NONE", IsStale = false, Revision = 0 } end
+		local state = playerEntity:GetComponent("script.PlayerRunResultComponent")
+		if state == nil then return { Success = true, Reason = "NOT_REQUESTED", HasRecord = false, PersistenceState = "NONE", IsStale = false, Revision = 0 } end
+		return state:GetLatestResultSnapshot()
+	end
+
+end

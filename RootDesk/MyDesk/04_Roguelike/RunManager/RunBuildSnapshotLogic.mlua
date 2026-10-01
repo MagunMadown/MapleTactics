@@ -1,0 +1,177 @@
+@Logic
+script RunBuildSnapshotLogic extends Logic
+
+	property integer MaxListEntries = 128
+
+	method table EmptySnapshot()
+		-- Old results have no captured build; an empty list must not imply an empty historical inventory.
+		return { Captured = false, Relics = {}, Augments = {}, Skills = {} }
+	end
+
+	method table ToStorageSnapshot(table build)
+		-- MSW JSONEncode rejects empty tables: omit empty lists on wire without mutating the public DTO.
+		local stored = { Captured = build.Captured }
+		if #build.Relics > 0 then stored.Relics = build.Relics end
+		if #build.Augments > 0 then stored.Augments = build.Augments end
+		if #build.Skills > 0 then
+			stored.Skills = {}
+			for _, skill in ipairs(build.Skills) do
+				local entry = { SkillId = skill.SkillId, Amount = skill.Amount, SkillTier = skill.SkillTier, SlotIndex = skill.SlotIndex }
+				if #skill.AugmentIds > 0 then entry.AugmentIds = skill.AugmentIds end
+				table.insert(stored.Skills, entry)
+			end
+		end
+		return stored
+	end
+
+	method table FromStorageSnapshot(table stored)
+		-- Missing list fields mean empty only in the known v2 wire schema; invalid non-table values remain invalid.
+		local build = { Captured = stored.Captured, Relics = stored.Relics,
+			Augments = stored.Augments, Skills = stored.Skills }
+		for _, field in ipairs({ "Relics", "Augments", "Skills" }) do
+			if build[field] == nil then build[field] = {} end
+		end
+		if self:IsDenseList(build.Skills) then
+			local skills = {}
+			for _, entry in ipairs(build.Skills) do
+				if type(entry) == "table" then
+					local skill = { SkillId = entry.SkillId, Amount = entry.Amount, SkillTier = entry.SkillTier,
+						SlotIndex = entry.SlotIndex, AugmentIds = entry.AugmentIds }
+					if skill.AugmentIds == nil then skill.AugmentIds = {} end
+					table.insert(skills, skill)
+				else
+					table.insert(skills, entry)
+				end
+			end
+			build.Skills = skills
+		end
+		return build
+	end
+
+	method boolean IsSafeInteger(any value, integer minimum)
+		-- Storage numbers must survive JSON without rounding, infinities, or fractional counts.
+		return type(value) == "number" and value == value and value >= minimum
+			and value <= 9007199254740991 and value == math.floor(value)
+	end
+
+	method boolean IsIdentifier(any value)
+		-- Retain historical IDs even if a later content catalog no longer contains the definition.
+		return type(value) == "string" and value ~= "" and string.len(value) <= 100
+	end
+
+	method boolean IsDenseList(any values)
+		-- Reject dictionaries and sparse arrays; the ceiling protects decoding, not gameplay inventory capacity.
+		if type(values) ~= "table" then return false end
+		local count = 0
+		for key, _ in pairs(values) do
+			if not self:IsSafeInteger(key, 1) then return false end
+			count = count + 1
+			if count > self.MaxListEntries then return false end
+		end
+		for index = 1, count do
+			if values[index] == nil then return false end
+		end
+		return true
+	end
+
+	method table ValidateSnapshot(table build)
+		-- Validates the small persisted build DTO without reinterpreting it using today's balance tables.
+		if build == nil or type(build.Captured) ~= "boolean" then
+			return { Success = false, Reason = "RUN_RESULT_BUILD_INVALID" }
+		end
+		for _, field in ipairs({ "Relics", "Augments", "Skills" }) do
+			local values = build[field]
+			if not self:IsDenseList(values) then
+				return { Success = false, Reason = "RUN_RESULT_BUILD_LIST_INVALID", Field = field }
+			end
+			if not build.Captured and #values > 0 then
+				return { Success = false, Reason = "RUN_RESULT_BUILD_CAPTURE_INVALID" }
+			end
+			local seen = {}
+			local slots = {}
+			for _, entry in ipairs(values) do
+				if type(entry) ~= "table" then return { Success = false, Reason = "RUN_RESULT_BUILD_ENTRY_INVALID", Field = field } end
+				local id = entry.RelicId
+				local amount = entry.Amount
+				if field == "Augments" then id = entry.AugmentId; amount = entry.Stacks end
+				if field == "Skills" then id = entry.SkillId end
+				if not self:IsIdentifier(id) or seen[id] or not self:IsSafeInteger(amount, 1) then
+					return { Success = false, Reason = "RUN_RESULT_BUILD_ENTRY_INVALID", Field = field }
+				end
+				seen[id] = true
+				if field == "Skills" then
+					if not self:IsSafeInteger(entry.SkillTier, 1) or not self:IsSafeInteger(entry.SlotIndex, 0)
+						or not self:IsDenseList(entry.AugmentIds) then
+						return { Success = false, Reason = "RUN_RESULT_BUILD_SKILL_INVALID" }
+					end
+					if entry.SlotIndex > 0 and slots[entry.SlotIndex] then
+						return { Success = false, Reason = "RUN_RESULT_BUILD_SLOT_DUPLICATE" }
+					end
+					slots[entry.SlotIndex] = entry.SlotIndex > 0 and true or nil
+					for _, augmentId in ipairs(entry.AugmentIds) do
+						-- Repeated skill augments are legal; their application order and repetition must survive.
+						if not self:IsIdentifier(augmentId) then return { Success = false, Reason = "RUN_RESULT_BUILD_AUGMENT_INVALID" } end
+					end
+				end
+			end
+		end
+		return { Success = true, Reason = "OK", Build = build }
+	end
+
+	method table ReadOwnership(string snapshot)
+		-- Copies the existing id~amount format; never calls a mutating inventory snapshot/normalizer.
+		local entries = {}
+		local seen = {}
+		for token in string.gmatch(snapshot or "", "([^|]+)") do
+			local separator, _ = string.find(token, "~", 1, true)
+			if separator == nil then return { Success = false, Reason = "RUN_RESULT_OWNERSHIP_INVALID" } end
+			local id = string.sub(token, 1, separator - 1)
+			local amount = tonumber(string.sub(token, separator + 1))
+			if not self:IsIdentifier(id) or seen[id] or not self:IsSafeInteger(amount, 1) then
+				return { Success = false, Reason = "RUN_RESULT_OWNERSHIP_INVALID" }
+			end
+			seen[id] = true
+			table.insert(entries, { Id = id, Amount = amount })
+		end
+		table.sort(entries, function(left, right) return left.Id < right.Id end)
+		return { Success = true, Reason = "OK", Entries = entries }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CaptureForPlayer(Entity playerEntity, integer runSequence)
+		-- Read-only adapter freezes the ending run's ownership before reset; it never grants or recalculates effects.
+		if not isvalid(playerEntity) then return { Success = false, Reason = "INVALID_PLAYER" } end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local augments = playerEntity:GetComponent("script.PlayerRunAugmentComponent")
+		if runSequence <= 0 or inventory == nil or augments == nil
+			or inventory.ActiveRunSequence ~= runSequence or augments.ActiveRunSequence ~= runSequence then
+			return { Success = false, Reason = "RUN_RESULT_BUILD_SEQUENCE_MISMATCH" }
+		end
+		local ownedRelics = self:ReadOwnership(inventory.RunItemSnapshot)
+		local ownedSkills = self:ReadOwnership(inventory:GetSkillSnapshot().SkillSnapshot)
+		if not ownedRelics.Success then return ownedRelics end
+		if not ownedSkills.Success then return ownedSkills end
+		local build = { Captured = true, Relics = {}, Augments = {}, Skills = {} }
+		for _, entry in ipairs(ownedRelics.Entries) do
+			table.insert(build.Relics, { RelicId = entry.Id, Amount = entry.Amount })
+		end
+		for _, entry in ipairs(augments:GetOwnedEntries()) do
+			table.insert(build.Augments, { AugmentId = entry.AugmentId, Stacks = entry.Stacks })
+		end
+		local slots = inventory:ParseRunSkillBarSlotPipe(inventory.RunSkillBarSlotIds)
+		for _, entry in ipairs(ownedSkills.Entries) do
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(entry.Id)
+			if not definition.Success then return { Success = false, Reason = "RUN_RESULT_SKILL_DEFINITION_MISSING", SkillId = entry.Id } end
+			local skillAugments = {}
+			for _, id in ipairs(augments:GetSkillAugmentIds(entry.Id)) do table.insert(skillAugments, id) end
+			local slotIndex = 0
+			for index, id in ipairs(slots) do
+				if id == entry.Id then slotIndex = index; break end
+			end
+			table.insert(build.Skills, { SkillId = entry.Id, Amount = entry.Amount,
+				SkillTier = definition.SkillTier, SlotIndex = slotIndex, AugmentIds = skillAugments })
+		end
+		return self:ValidateSnapshot(build)
+	end
+
+end
