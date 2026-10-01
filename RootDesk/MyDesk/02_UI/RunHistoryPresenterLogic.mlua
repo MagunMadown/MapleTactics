@@ -1,0 +1,109 @@
+@Logic
+script RunHistoryPresenterLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method any FindRow(string dataSetName, string column, string id)
+		local dataSet = _DataService:GetTable(dataSetName)
+		if dataSet == nil or id == "" then return nil end
+		return dataSet:FindRow(column, id)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table MakeDisplayEntry(string category, string id)
+		-- A display-only projection of today's catalog; no live inventory or balance state is read.
+		local row = nil
+		if category == "Jobs" then row = self:FindRow("JobDefinitions", "JobId", id)
+		elseif category == "Relics" then row = self:FindRow("RelicDefinitions", "RelicId", id)
+		elseif category == "Augments" then row = self:FindRow("AugmentDefinitions", "AugmentId", id)
+		elseif category == "Skills" then
+			for _, name in ipairs(_SkillDefinitionRepositoryLogic:GetSkillDataSetNames()) do
+				row = self:FindRow(name, "SkillId", id)
+				if row ~= nil then break end
+			end
+		end
+		if row == nil and category == "Relics" then
+			local premium = _PremiumBenefitsLogic:GetMagnetRelicDefinition()
+			if premium.RelicId == id then
+				return { Name = premium.DisplayName, Icon = premium.IconImageRUID, Description = premium.EffectDescription }
+			end
+		end
+		if row == nil then return { Name = id, Missing = true } end
+		if category == "Augments" then
+			return { NameKey = row:GetItem("NameKey") or id, DescriptionKey = row:GetItem("DescriptionKey") or "", Rarity = row:GetItem("Rarity") or "" }
+		elseif category == "Relics" then
+			return { Name = row:GetItem("DisplayName") or id, Icon = row:GetItem("IconImageRUID") or "", Description = row:GetItem("EffectDescription") or "" }
+		elseif category == "Skills" then
+			local icon = row:GetItem("HudIconRuid") or ""
+			if icon == "" then icon = row:GetItem("IconRuid") or "" end
+			return { Name = row:GetItem("DisplayName") or id, Icon = icon }
+		end
+		return { Name = row:GetItem("DisplayName") or id }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AddDisplayEntry(table catalog, string category, string id)
+		if id == nil or id == "" then return end
+		if catalog[category] == nil then catalog[category] = {} end
+		if catalog[category][id] == nil then catalog[category][id] = self:MakeDisplayEntry(category, id) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishCatalogForPlayer(Entity playerEntity, any state)
+		-- Only the authenticated player's retained records are projected and targeted back to that player.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil or state == nil then return end
+		if state.ReadInProgress then return end
+		local now = _UtilLogic.ServerElapsedSeconds
+		if now < (state._T.NextHistoryCatalogAt or 0) and state._T.HistoryCatalogSource == state.HistorySummaryJson then return end
+		state._T.NextHistoryCatalogAt = now + 10
+		state._T.HistoryCatalogSource = state.HistorySummaryJson
+		local catalog = { Version = 1 }
+		for _, record in pairs(state.CachedHistoryRecords or {}) do
+			self:AddDisplayEntry(catalog, "Jobs", record.JobId)
+			local build = record.Build or {}
+			for _, entry in ipairs(build.Relics or {}) do self:AddDisplayEntry(catalog, "Relics", entry.RelicId) end
+			for _, entry in ipairs(build.Augments or {}) do self:AddDisplayEntry(catalog, "Augments", entry.AugmentId) end
+			for _, entry in ipairs(build.Skills or {}) do
+				self:AddDisplayEntry(catalog, "Skills", entry.SkillId)
+				for _, id in ipairs(entry.AugmentIds or {}) do self:AddDisplayEntry(catalog, "Augments", id) end
+			end
+		end
+		local ok, encoded = pcall(function() return _HttpService:JSONEncode(catalog) end)
+		if ok and type(encoded) == "string" then
+			self:ReceiveCatalog(encoded, playerEntity.PlayerComponent.UserId)
+		end
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveCatalog(string encoded)
+		if encoded == nil or string.len(encoded) > 200000 then return end
+		local ok, decoded = pcall(function() return _HttpService:JSONDecode(encoded) end)
+		if not ok or type(decoded) ~= "table" or decoded.Version ~= 1 then return end
+		self._T.Catalog = decoded
+		self._T.Revision = (self._T.Revision or 0) + 1
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalCatalog()
+		return { Catalog = self._T.Catalog or {}, Revision = self._T.Revision or 0 }
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetDisplayEntry(string category, string id)
+		local catalog = self._T.Catalog or {}
+		local entry = (catalog[category] or {})[id] or {}
+		local name = entry.Name or ""
+		local description = entry.Description or ""
+		-- Localization is client-only. Missing keys keep readable catalog keys/IDs rather than disappearing.
+		if entry.NameKey ~= nil and entry.NameKey ~= "" then
+			name = _LocalizationService:GetText(entry.NameKey) or entry.NameKey
+			if name == entry.NameKey and string.sub(name, 1, 8) == "augment." then name = id end
+		end
+		if entry.DescriptionKey ~= nil and entry.DescriptionKey ~= "" then
+			description = _LocalizationService:GetText(entry.DescriptionKey) or entry.DescriptionKey
+			if description == entry.DescriptionKey and string.sub(description, 1, 8) == "augment." then description = "설명 번역이 등록되지 않았습니다." end
+		end
+		if name == "" then name = id end
+		return { Name = name, Description = description, Icon = entry.Icon or "", Rarity = entry.Rarity or "", Missing = entry.Missing == true }
+	end
+
+end

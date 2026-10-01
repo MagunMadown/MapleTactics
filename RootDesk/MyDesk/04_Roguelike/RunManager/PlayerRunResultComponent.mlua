@@ -1,0 +1,252 @@
+@Component
+script PlayerRunResultComponent extends Component
+
+	property integer ActiveRunSequence = 0
+	property integer ActiveRunId = 0
+	property string StartedAtUtc = ""
+	property string CapturedRuleVersion = ""
+	property string RankExclusionReason = ""
+	property string FrozenRecordJson = ""
+	property string PendingRecordJson = ""
+	property table PendingRecords = {}
+	property table CachedHistoryRecords = {}
+	property table CachedHistoryJsonById = {}
+	property string StorageUserKey = ""
+	property boolean SaveInProgress = false
+	property boolean ReadInProgress = false
+	property integer RetryTimerId = 0
+	property integer RetryAttempt = 0
+	property number NextReadAt = 0
+	@TargetUserSync property string LatestResultJson = ""
+	@TargetUserSync property string PersistenceState = "NONE"
+	@TargetUserSync property string LastResultReason = "NO_RUN_RESULT"
+	@TargetUserSync property boolean LastReadSucceeded = true
+	@TargetUserSync property integer ResultRevision = 0
+	@TargetUserSync property integer PendingResultCount = 0
+	@TargetUserSync property string HistorySummaryJson = ""
+	@TargetUserSync property string BestResultJson = ""
+	@TargetUserSync property string SelectedResultJson = ""
+	@TargetUserSync property string LastDetailReason = "NOT_REQUESTED"
+	@TargetUserSync property boolean HistoryReadSucceeded = true
+	property number NextDetailAt = 0
+
+	@ExecSpace("ServerOnly")
+	method table BeginRun(integer runSequence, integer runId, boolean observedStart)
+		-- Captures immutable run metadata; a previous unsaved latest result survives a new run.
+		if runSequence <= 0 or runId <= 0 then return { Success = false, Reason = "RUN_RESULT_CONTEXT_INVALID" } end
+		if self.ActiveRunId == runId then return { Success = true, Reason = "RUN_RESULT_START_ALREADY_CAPTURED" } end
+		local identity = _RunResultRepositoryLogic:ResolveIdentity(self.Entity)
+		if identity.Success == false then return identity end
+		self.StorageUserKey = identity.StorageUserKey
+		self.ActiveRunSequence = runSequence
+		self.ActiveRunId = runId
+		self.StartedAtUtc = _RunResultContractLogic:FormatUtcTimestamp()
+		self.CapturedRuleVersion = _RunResultContractLogic.RuleVersion
+		self.FrozenRecordJson = ""
+		self.RankExclusionReason = ""
+		if observedStart == false then self.RankExclusionReason = "RUN_START_UNOBSERVED" end
+		if Environment:IsMakerPlay() then self:ExcludeFromRanking("MAKER_TEST") end
+		return { Success = true, Reason = "RUN_RESULT_START_CAPTURED", RunId = runId }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ExcludeFromRanking(string reason)
+		-- Eligibility can only be revoked within a run; clearing prototype UI state never restores it.
+		if self.RankExclusionReason == "" then self.RankExclusionReason = reason end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table QueueFinalResult(string encoded)
+		-- Freezes each run once and retains earlier unsaved results in FIFO order across subsequent runs.
+		if self.FrozenRecordJson ~= "" then
+			return { Success = true, Reason = "RUN_RESULT_ALREADY_FINALIZED", Json = self.FrozenRecordJson }
+		end
+		local decoded = _RunResultContractLogic:DecodeRecord(encoded)
+		if decoded.Success == false then return decoded end
+		if decoded.HasRecord ~= true then return { Success = false, Reason = "RUN_RESULT_EMPTY_RECORD" } end
+		self.FrozenRecordJson = encoded
+		table.insert(self.PendingRecords, encoded)
+		self.PendingRecordJson = self.PendingRecords[1]
+		self.PendingResultCount = #self.PendingRecords
+		self.LatestResultJson = encoded
+		self.PersistenceState = "PENDING"
+		self.LastResultReason = "RUN_RESULT_PENDING"
+		self.LastReadSucceeded = true
+		self.ResultRevision = self.ResultRevision + 1
+		self.RetryAttempt = 0
+		return self:TryPersistPending()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryPersistPending()
+		-- Runs only at finalization, bounded retry timers, and logout; never from OnUpdate or a hit event.
+		if self.PendingRecordJson == "" then return { Success = true, Reason = "NO_PENDING_RUN_RESULT" } end
+		if self.SaveInProgress then return { Success = false, Reason = "RUN_RESULT_SAVE_IN_PROGRESS" } end
+		local captured = {}
+		for _, encoded in ipairs(self.PendingRecords) do table.insert(captured, encoded) end
+		if #captured == 0 then return { Success = false, Reason = "RUN_RESULT_PENDING_STATE_INVALID" } end
+		self.SaveInProgress = true
+		self.PersistenceState = "SAVING"
+		local saved = _RunResultRepositoryLogic:SaveResults(self.StorageUserKey, captured)
+		self.SaveInProgress = false
+		if saved.Success then
+			for _, encoded in ipairs(captured) do
+				if self.PendingRecords[1] == encoded then table.remove(self.PendingRecords, 1) end
+			end
+			self.PendingRecordJson = self.PendingRecords[1] or ""
+			self.PendingResultCount = #self.PendingRecords
+			self:ApplyHistorySnapshot(saved)
+			self.RetryAttempt = 0
+			if self.PendingRecordJson == "" then
+				self.LatestResultJson = saved.Json or captured[#captured]
+				self.PersistenceState = "SAVED"
+				self.LastResultReason = saved.Reason
+				self.LastReadSucceeded = true
+			else
+				self.LatestResultJson = self.PendingRecords[#self.PendingRecords]
+				self.PersistenceState = "PENDING"
+				self.LastResultReason = "RUN_RESULT_PENDING"
+				self:ScheduleRetry()
+			end
+			if saved.WasWritten then log("[RunResult] saved latest=" .. tostring(saved.Record.RunId) .. " pendingBatch=" .. tostring(#captured)) end
+		else
+			self.PersistenceState = "PENDING"
+			self.LastResultReason = saved.Reason or "RUN_RESULT_SAVE_FAILED"
+			log_warning("[RunResult] save pending reason=" .. self.LastResultReason .. " error=" .. tostring(saved.ErrorCode or 0))
+			self:ScheduleRetry()
+		end
+		self.ResultRevision = self.ResultRevision + 1
+		return saved
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ScheduleRetry()
+		-- Uses a capped exponential backoff; permanently invalid data remains visible without a write loop.
+		if self.RetryTimerId > 0 or self.PendingRecordJson == "" or self.RetryAttempt >= 5 then return end
+		if self.LastResultReason == "RUN_RESULT_FINALIZATION_CONFLICT" or self.LastResultReason == "RUN_RESULT_SCHEMA_UNSUPPORTED"
+			or self.LastResultReason == "RUN_HISTORY_SCHEMA_UNSUPPORTED" or self.LastResultReason == "RUN_BEST_POLICY_UNSUPPORTED" then return end
+		self.RetryAttempt = self.RetryAttempt + 1
+		local delay = math.min(60, 5 * (2 ^ (self.RetryAttempt - 1)))
+		if self.LastResultReason == "RUN_RESULT_CREDIT_EXHAUSTED" then delay = 60 end
+		self.RetryTimerId = _TimerService:SetTimerOnce(function()
+			self.RetryTimerId = 0
+			if isvalid(self.Entity) then self:TryPersistPending() end
+		end, delay)
+	end
+
+	@ExecSpace("Server")
+	method void RequestLatestResult()
+		-- Own-account read RPC only; scores and identities are never submitted by the client.
+		if self.Entity.PlayerComponent == nil or senderUserId ~= self.Entity.PlayerComponent.UserId then return end
+		self:LoadLatestResult()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void LoadLatestResult()
+		-- One throttled load fills latest, recent history, best, and the server-only detail cache together.
+		if self.ReadInProgress or _UtilLogic.ServerElapsedSeconds < self.NextReadAt then return end
+		self.NextReadAt = _UtilLogic.ServerElapsedSeconds + 10
+		if self.PendingRecordJson ~= "" or self.SaveInProgress then return end
+		local capturedRevision = self.ResultRevision
+		self.ReadInProgress = true
+		local loaded = _RunResultRepositoryLogic:GetHistory(self.Entity)
+		self.ReadInProgress = false
+		-- A read begun before finalization cannot replace the newer in-memory result after its wait.
+		if self.ResultRevision ~= capturedRevision then return end
+		self.LastReadSucceeded = loaded.Success == true
+		self.HistoryReadSucceeded = loaded.Success == true
+		self.LastResultReason = loaded.Reason or "RUN_RESULT_LOAD_FAILED"
+		if loaded.Success then
+			self:ApplyHistorySnapshot(loaded)
+			self.LatestResultJson = loaded.Json or ""
+			self.PersistenceState = loaded.HasRecord and "SAVED" or "NONE"
+		end
+		self.ResultRevision = self.ResultRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyHistorySnapshot(table snapshot)
+		-- Replaces only a positively loaded/committed generation; failed reads keep the previous cache.
+		if not snapshot.Success or snapshot.HistoryJson == nil then return end
+		self.HistorySummaryJson = snapshot.HistoryJson
+		self.BestResultJson = snapshot.BestJson or ""
+		self.CachedHistoryRecords = snapshot.Records or {}
+		self.CachedHistoryJsonById = snapshot.JsonById or {}
+		self.HistoryReadSucceeded = true
+		if self.SelectedResultJson ~= "" then
+			local selected = _RunResultContractLogic:DecodeRecord(self.SelectedResultJson)
+			if not selected.Success or not selected.HasRecord or self.CachedHistoryRecords[selected.Record.RunId] == nil then
+				self.SelectedResultJson = ""
+				self.LastDetailReason = "RUN_RESULT_NOT_RETAINED"
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SelectRetainedResult(integer runId)
+		-- Details are served from the authorized recent/best cache, not from arbitrary record keys.
+		if _UtilLogic.ServerElapsedSeconds < self.NextDetailAt then return end
+		self.NextDetailAt = _UtilLogic.ServerElapsedSeconds + 0.25
+		if not _RunHistoryContractLogic:IsRunId(runId) then
+			self.SelectedResultJson = ""
+			self.LastDetailReason = "RUN_RESULT_ID_INVALID"
+			self.ResultRevision = self.ResultRevision + 1
+			return
+		end
+		local encoded = self.CachedHistoryJsonById[runId]
+		self.SelectedResultJson = encoded or ""
+		self.LastDetailReason = encoded ~= nil and "RUN_RESULT_DETAIL_READY" or "RUN_RESULT_NOT_RETAINED"
+		self.ResultRevision = self.ResultRevision + 1
+	end
+
+	method table GetHistorySnapshot()
+		-- UI gets ten lightweight summaries plus a separately decoded best; builds use the detail endpoint.
+		local summary = _RunHistoryContractLogic:DecodeSummary(self.HistorySummaryJson)
+		local best = _RunResultContractLogic:DecodeRecord(self.BestResultJson)
+		return { Success = summary.Success and best.Success and self.HistoryReadSucceeded,
+			Reason = self.LastResultReason, IsStale = self.HistoryReadSucceeded == false or self.PendingResultCount > 0,
+			Entries = summary.Entries or {}, RetentionLimit = summary.RetentionLimit or _RunHistoryContractLogic.RetentionLimit,
+			HasBest = best.HasRecord == true, BestRecord = best.Record, BestPolicyVersion = summary.BestPolicyVersion,
+			CleanupPending = summary.CleanupPending == true, PendingResultCount = self.PendingResultCount,
+			PersistenceState = self.PersistenceState, Revision = self.ResultRevision, IsLoaded = self.HistorySummaryJson ~= "" }
+	end
+
+	method table GetSelectedResultSnapshot()
+		-- Selection metadata is cache-only; the read does not hit DataStorage every UI frame.
+		local decoded = _RunResultContractLogic:DecodeRecord(self.SelectedResultJson)
+		return { Success = decoded.Success and self.LastDetailReason == "RUN_RESULT_DETAIL_READY",
+			Reason = self.LastDetailReason, HasRecord = decoded.HasRecord == true, Record = decoded.Record,
+			IsStale = self.HistoryReadSucceeded == false, Revision = self.ResultRevision }
+	end
+
+	method table GetLatestResultSnapshot()
+		-- UI consumes this DTO without knowing storage keys or retaining Component references.
+		local decoded = _RunResultContractLogic:DecodeRecord(self.LatestResultJson)
+		return {
+			Success = decoded.Success and self.LastReadSucceeded,
+			IsStale = self.LastReadSucceeded == false,
+			Reason = self.LastResultReason,
+			HasRecord = decoded.HasRecord == true,
+			Record = decoded.Record,
+			PersistenceState = self.PersistenceState,
+			Revision = self.ResultRevision
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Service", "UserService")
+	handler HandleUserLeaveEvent(UserLeaveEvent event)
+		-- Flushes a pending result before the player session is removed, but does not invent a completed run.
+		if self.Entity.PlayerComponent == nil or event.UserId ~= self.Entity.PlayerComponent.UserId then return end
+		self:TryPersistPending()
+		if self.PendingResultCount > 0 then log_warning("[RunResult] logout retained pending count=" .. tostring(self.PendingResultCount)) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Cancels delayed work; a failed local save is not claimed durable after server shutdown.
+		if self.RetryTimerId > 0 then _TimerService:ClearTimer(self.RetryTimerId) end
+		self.RetryTimerId = 0
+	end
+
+end
