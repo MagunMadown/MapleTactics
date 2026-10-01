@@ -1,0 +1,107 @@
+@Logic
+script RunResultContractLogic extends Logic
+
+	property integer SchemaVersion = 2
+	property integer MaxRecordBytes = 4000
+	property string RuleVersion = "run_result_v1"
+
+	method string MakeRecordId(integer runId)
+		-- JSON may restore integer-valued numbers as floats; IDs never depend on tostring formatting.
+		return "run:" .. string.format("%.0f", runId)
+	end
+
+	method string FormatUtcTimestamp()
+		-- ISO T/Z strings are auto-converted to unsupported Date tokens by MSW JSONDecode.
+		return DateTime.UtcNow:ToFormattedString("yyyy-MM-dd HH:mm:ss.fff") .. " UTC"
+	end
+
+	method table ValidateRecord(table record)
+		-- Validates the persisted DTO, not a live Component or a client-supplied score.
+		if record == nil or (record.SchemaVersion ~= 1 and record.SchemaVersion ~= self.SchemaVersion) then
+			return { Success = false, Reason = "RUN_RESULT_SCHEMA_UNSUPPORTED" }
+		end
+		for _, field in ipairs({ "RunId", "RunSequence", "RunSeed", "ConsumedTurns", "HitsTaken", "CompletedStageNumber" }) do
+			local value = record[field]
+			if type(value) ~= "number" or value ~= value or value < 0 or value > 9007199254740991 or value ~= math.floor(value) then
+				return { Success = false, Reason = "RUN_RESULT_INVALID_INTEGER", Field = field }
+			end
+		end
+		if record.RunId <= 0 or record.RunSequence <= 0 or record.RecordId ~= self:MakeRecordId(record.RunId) then
+			return { Success = false, Reason = "RUN_RESULT_ID_INVALID" }
+		end
+		for _, field in ipairs({ "RecordId", "RuleVersion", "StartedAtUtc", "EndedAtUtc", "JobId", "NodeGraphId", "LastNodeId", "LastStageId", "RouteId", "EndReason", "RankExclusionReason" }) do
+			if type(record[field]) ~= "string" or string.len(record[field]) > 100 then
+				return { Success = false, Reason = "RUN_RESULT_INVALID_STRING", Field = field }
+			end
+		end
+		if type(record.EndDetail) ~= "string" or string.len(record.EndDetail) > 160 then
+			return { Success = false, Reason = "RUN_RESULT_INVALID_DETAIL" }
+		end
+		if record.RuleVersion == "" or record.StartedAtUtc == "" or record.EndedAtUtc == "" then
+			return { Success = false, Reason = "RUN_RESULT_METADATA_MISSING" }
+		end
+		if record.EndReason ~= "COMPLETED" and record.EndReason ~= "DEFEATED" and record.EndReason ~= "ABANDONED" then
+			return { Success = false, Reason = "RUN_RESULT_END_REASON_INVALID" }
+		end
+		for _, field in ipairs({ "ElapsedSeconds", "CurrentHp", "MaxHp" }) do
+			local value = record[field]
+			if type(value) ~= "number" or value ~= value or value < 0 or value >= math.huge then
+				return { Success = false, Reason = "RUN_RESULT_INVALID_NUMBER", Field = field }
+			end
+		end
+		if record.CurrentHp > record.MaxHp or type(record.RankEligible) ~= "boolean" then
+			return { Success = false, Reason = "RUN_RESULT_STATE_INVALID" }
+		end
+		if record.RankEligible and (record.EndReason ~= "COMPLETED" or record.RankExclusionReason ~= "" or record.JobId == "") then
+			return { Success = false, Reason = "RUN_RESULT_ELIGIBILITY_INVALID" }
+		end
+		if record.SchemaVersion == self.SchemaVersion then
+			if type(record.Build) ~= "table" or record.Build.Captured ~= true then
+				return { Success = false, Reason = "RUN_RESULT_BUILD_MISSING" }
+			end
+			local buildValidation = _RunBuildSnapshotLogic:ValidateSnapshot(record.Build)
+			if not buildValidation.Success then return buildValidation end
+		end
+		return { Success = true, Reason = "OK", Record = record }
+	end
+
+	method table EncodeRecord(table record)
+		-- Keeps the versioned JSON under one storage credit-sized value; rejects rather than truncating.
+		if record == nil or record.SchemaVersion ~= self.SchemaVersion then
+			return { Success = false, Reason = "RUN_RESULT_WRITE_SCHEMA_UNSUPPORTED" }
+		end
+		local validation = self:ValidateRecord(record)
+		if validation.Success == false then return validation end
+		local stored = {}
+		for key, value in pairs(record) do stored[key] = value end
+		stored.Build = _RunBuildSnapshotLogic:ToStorageSnapshot(record.Build)
+		local ok, encoded = pcall(function() return _HttpService:JSONEncode(stored) end)
+		if ok == false or type(encoded) ~= "string" then
+			return { Success = false, Reason = "RUN_RESULT_ENCODE_FAILED" }
+		end
+		if string.len(encoded) > self.MaxRecordBytes then
+			return { Success = false, Reason = "RUN_RESULT_TOO_LARGE", Bytes = string.len(encoded) }
+		end
+		return { Success = true, Reason = "OK", Record = record, Json = encoded, Bytes = string.len(encoded) }
+	end
+
+	method table DecodeRecord(string encoded)
+		-- Fails closed on corrupted or future schemas without replacing existing saved data.
+		if encoded == nil or encoded == "" then return { Success = true, Reason = "NO_RUN_RESULT", HasRecord = false } end
+		if string.len(encoded) > self.MaxRecordBytes then return { Success = false, Reason = "RUN_RESULT_TOO_LARGE" } end
+		local ok, decoded = pcall(function() return _HttpService:JSONDecode(encoded) end)
+		if ok == false or type(decoded) ~= "table" then return { Success = false, Reason = "RUN_RESULT_DECODE_FAILED" } end
+		if decoded.SchemaVersion == self.SchemaVersion and type(decoded.Build) == "table" then
+			decoded.Build = _RunBuildSnapshotLogic:FromStorageSnapshot(decoded.Build)
+		end
+		local validation = self:ValidateRecord(decoded)
+		if validation.Success and decoded.SchemaVersion == 1 then
+			-- Normalize the read DTO only; keep the original JSON for repository CAS/deduplication.
+			decoded.Build = _RunBuildSnapshotLogic:EmptySnapshot()
+		end
+		validation.HasRecord = validation.Success
+		validation.Json = encoded
+		return validation
+	end
+
+end

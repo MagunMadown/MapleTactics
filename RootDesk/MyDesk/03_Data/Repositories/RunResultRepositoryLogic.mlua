@@ -1,0 +1,359 @@
+@Logic
+script RunResultRepositoryLogic extends Logic
+
+	property string StorageKey = "RunResultLatestV1"
+	property string HistoryIndexKey = "RunResultHistoryIndexV1"
+	property string RecordKeyPrefix = "RunResultRecordV1:"
+	property table MutationLocks = {}
+
+	@ExecSpace("ServerOnly")
+	method table ResolveIdentity(Entity playerEntity)
+		-- Mirrors the existing Union profile identity without borrowing its storage key or save schema.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			return { Success = false, Reason = "INVALID_PLAYER" }
+		end
+		local key = playerEntity.PlayerComponent.ProfileCode or ""
+		if key == "" then key = playerEntity.PlayerComponent.UserId or "" end
+		if key == "" then return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING" } end
+		return { Success = true, Reason = "OK", StorageUserKey = key }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetLatestResult(Entity playerEntity)
+		-- Resolves the latest retained result; no public endpoint accepts another user's identity.
+		local identity = self:ResolveIdentity(playerEntity)
+		if identity.Success == false then return identity end
+		return self:LoadByIdentity(identity.StorageUserKey)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LoadByIdentity(string storageUserKey)
+		-- Preserves the latest-result API while the history index now owns which result is latest.
+		return self:LoadHistoryByIdentity(storageUserKey)
+	end
+
+	method string MakeRecordKey(integer runId)
+		-- Record keys are generated from validated numeric IDs, never a client-provided storage path.
+		return self.RecordKeyPrefix .. string.format("%.0f", runId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetHistory(Entity playerEntity)
+		-- Other server systems can query a player's history; the public facade authenticates its own caller.
+		local identity = self:ResolveIdentity(playerEntity)
+		if not identity.Success then return identity end
+		return self:LoadHistoryByIdentity(identity.StorageUserKey)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ReadBatch(string storageUserKey, table keys)
+		-- Drains every page and reports failures before a missing entry can be mistaken for an empty save.
+		local storage = _DataStorageService:GetUserDataStorage(storageUserKey)
+		if storage == nil then return { Success = false, Reason = "USER_DATA_STORAGE_UNAVAILABLE" } end
+		local code, pages = storage:BatchGetAndWait(keys)
+		if code ~= 0 then return self:StorageFailure(code, "RUN_RESULT_LOAD_FAILED") end
+		if pages == nil then return { Success = false, Reason = "RUN_HISTORY_PAGES_MISSING" } end
+		local values = {}
+		while true do
+			local entries = pages:GetCurrentPageDatas()
+			if entries ~= nil then
+				for _, entry in ipairs(entries) do values[entry.KeyInfo.Key] = entry.Value end
+			end
+			if pages.IsLastPage then break end
+			local pageCode = pages:LoadNextPageAndWait()
+			if pageCode ~= 0 then return self:StorageFailure(pageCode, "RUN_RESULT_LOAD_FAILED") end
+			pages:MoveToNextPageAndWait()
+		end
+		return { Success = true, Reason = "OK", Values = values }
+	end
+
+	method table StorageFailure(integer code, string fallbackReason)
+		-- Centralizes credit/conflict errors so the existing bounded retry policy remains compatible.
+		local reason = fallbackReason
+		if code == 1000005 then reason = "RUN_RESULT_CREDIT_EXHAUSTED" end
+		if code == 2000000 then reason = "RUN_RESULT_WRITE_CONFLICT" end
+		return { Success = false, Reason = reason, ErrorCode = code }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LoadMetadata(string storageUserKey)
+		-- Reads legacy data without changing its raw JSON; migration is performed only during a successful save.
+		if storageUserKey == "" then return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING" } end
+		local read = self:ReadBatch(storageUserKey, { self.HistoryIndexKey, self.StorageKey })
+		if not read.Success then return read end
+		local metadata = _RunHistoryContractLogic:DecodeIndex(read.Values[self.HistoryIndexKey] or "")
+		if not metadata.Success then return metadata end
+		metadata.LegacyJson = ""
+		if not metadata.HasIndex then
+			local legacy = _RunResultContractLogic:DecodeRecord(read.Values[self.StorageKey] or "")
+			if not legacy.Success then return legacy end
+			if legacy.HasRecord then
+				metadata.LegacyJson = legacy.Json
+				metadata.LegacyRecord = legacy.Record
+				table.insert(metadata.Index.RecentRunIds, legacy.Record.RunId)
+				if _RunBestRecordPolicyLogic:IsCandidate(legacy.Record) then metadata.Index.BestRunId = legacy.Record.RunId end
+			end
+		end
+		return metadata
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ReadRecords(string storageUserKey, table metadata, integer extraRunId)
+		-- Uses one batch for recent builds, the retained best, and an optional incoming idempotency check.
+		local extraIds = {}
+		if extraRunId > 0 then table.insert(extraIds, extraRunId) end
+		return self:ReadRecordBatch(storageUserKey, metadata, extraIds)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ReadRecordBatch(string storageUserKey, table metadata, table extraIds)
+		-- Multiple pending runs share the same batch instead of issuing a storage request per entry.
+		local ids = {}
+		local keys = {}
+		for _, runId in ipairs(metadata.Index.RecentRunIds) do ids[runId] = true end
+		if metadata.Index.BestRunId > 0 then ids[metadata.Index.BestRunId] = true end
+		for _, runId in ipairs(extraIds) do ids[runId] = true end
+		for runId, _ in pairs(ids) do table.insert(keys, self:MakeRecordKey(runId)) end
+		local values = {}
+		if #keys > 0 then
+			local read = self:ReadBatch(storageUserKey, keys)
+			if not read.Success then return read end
+			values = read.Values
+		end
+		local records = {}
+		local jsonById = {}
+		for runId, _ in pairs(ids) do
+			local raw = values[self:MakeRecordKey(runId)]
+			if raw == nil and metadata.LegacyRecord ~= nil and metadata.LegacyRecord.RunId == runId then raw = metadata.LegacyJson end
+			if raw ~= nil then
+				local decoded = _RunResultContractLogic:DecodeRecord(raw)
+				if not decoded.Success then return decoded end
+				if not decoded.HasRecord or decoded.Record.RunId ~= runId then return { Success = false, Reason = "RUN_HISTORY_RECORD_ID_MISMATCH" } end
+				records[runId] = decoded.Record
+				jsonById[runId] = raw
+			end
+		end
+		for _, runId in ipairs(metadata.Index.RecentRunIds) do
+			if records[runId] == nil then return { Success = false, Reason = "RUN_HISTORY_RECORD_MISSING" } end
+		end
+		if metadata.Index.BestRunId > 0 and (records[metadata.Index.BestRunId] == nil or not _RunBestRecordPolicyLogic:IsCandidate(records[metadata.Index.BestRunId])) then
+			return { Success = false, Reason = "RUN_BEST_RECORD_INVALID" }
+		end
+		return { Success = true, Reason = "OK", Records = records, JsonById = jsonById, StoredValues = values }
+	end
+
+	method table MakeSnapshot(table index, table records, table jsonById)
+		-- Latest, recent summaries, and best are derived from the same committed metadata generation.
+		local summary = _RunHistoryContractLogic:EncodeSummary(index, records)
+		if not summary.Success then return summary end
+		local latestId = index.RecentRunIds[1] or 0
+		local visibleRecords = {}
+		local visibleJson = {}
+		for _, runId in ipairs(index.RecentRunIds) do visibleRecords[runId] = records[runId]; visibleJson[runId] = jsonById[runId] end
+		if index.BestRunId > 0 then visibleRecords[index.BestRunId] = records[index.BestRunId]; visibleJson[index.BestRunId] = jsonById[index.BestRunId] end
+		return { Success = true, Reason = latestId > 0 and "RUN_HISTORY_LOADED" or "NO_RUN_RESULT",
+			HasRecord = latestId > 0, Record = records[latestId], Json = jsonById[latestId] or "",
+			HasBest = index.BestRunId > 0, BestRecord = records[index.BestRunId], BestJson = jsonById[index.BestRunId] or "",
+			Index = index, Records = visibleRecords, JsonById = visibleJson, HistoryJson = summary.Json,
+			CleanupPending = #index.PendingDeleteRunIds > 0 }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LoadHistoryByIdentity(string storageUserKey)
+		-- Read-only loading never silently repairs corrupted data or writes an empty first-time history.
+		local metadata = self:LoadMetadata(storageUserKey)
+		if not metadata.Success then return metadata end
+		local loaded = self:ReadRecords(storageUserKey, metadata, 0)
+		if not loaded.Success then return loaded end
+		local result = self:MakeSnapshot(metadata.Index, loaded.Records, loaded.JsonById)
+		result.StorageUserKey = storageUserKey
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SaveLatestResult(string storageUserKey, string recordJson)
+		-- Serializes local mutations and uses CAS for existing records; older retries cannot regress the latest result.
+		return self:SaveResults(storageUserKey, { recordJson })
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SaveResults(string storageUserKey, table recordJsons)
+		-- Validates the entire pending snapshot before one payload batch and one index commit.
+		if type(recordJsons) ~= "table" then return { Success = false, Reason = "RUN_RESULT_INVALID_BATCH" } end
+		local batchSize = #recordJsons
+		local entryCount = 0
+		for key, _ in pairs(recordJsons) do
+			if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > batchSize then
+				return { Success = false, Reason = "RUN_RESULT_INVALID_BATCH" }
+			end
+			entryCount = entryCount + 1
+		end
+		if entryCount ~= batchSize then return { Success = false, Reason = "RUN_RESULT_INVALID_BATCH" } end
+		if batchSize == 0 then return { Success = false, Reason = "RUN_RESULT_EMPTY_BATCH" } end
+		local records = {}
+		for _, recordJson in ipairs(recordJsons) do
+			if type(recordJson) ~= "string" then return { Success = false, Reason = "RUN_RESULT_INVALID_BATCH" } end
+			local decoded = _RunResultContractLogic:DecodeRecord(recordJson)
+			if not decoded.Success then return decoded end
+			if not decoded.HasRecord then return { Success = false, Reason = "RUN_RESULT_EMPTY_RECORD" } end
+			table.insert(records, { Record = decoded.Record, Json = recordJson })
+		end
+		if storageUserKey == "" then return { Success = false, Reason = "PERSISTENT_USER_ID_MISSING" } end
+		if self.MutationLocks[storageUserKey] then return { Success = false, Reason = "RUN_RESULT_SAVE_IN_PROGRESS" } end
+		self.MutationLocks[storageUserKey] = true
+		local ok, result = pcall(function() return self:CommitRecords(storageUserKey, records) end)
+		self.MutationLocks[storageUserKey] = nil
+		if ok == false then
+			log_warning("[RunResult] storage exception=" .. tostring(result))
+			return { Success = false, Reason = "RUN_RESULT_STORAGE_EXCEPTION" }
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CommitLatestResult(string storageUserKey, string recordJson, table record)
+		-- Persists immutable payloads before committing the index, then deletes only explicitly retired run keys.
+		return self:CommitRecords(storageUserKey, { { Record = record, Json = recordJson } })
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CommitRecords(string storageUserKey, table incoming)
+		-- A group of ended runs is merged atomically at the index, preserving FIFO backlog on logout.
+		local limit = _RunHistoryContractLogic.RetentionLimit
+		if limit < 1 or limit > _RunHistoryContractLogic.MaxRetentionLimit then return { Success = false, Reason = "RUN_HISTORY_RETENTION_INVALID" } end
+		local metadata = self:LoadMetadata(storageUserKey)
+		if not metadata.Success then return metadata end
+		local extraIds = {}
+		for _, entry in ipairs(incoming) do table.insert(extraIds, entry.Record.RunId) end
+		local previous = self:ReadRecordBatch(storageUserKey, metadata, extraIds)
+		if not previous.Success then return previous end
+		local index = metadata.Index
+		local ids = {}
+		for _, runId in ipairs(index.RecentRunIds) do ids[runId] = true end
+		local bestId = index.BestRunId
+		local newCount = 0
+		local foundDuplicate = false
+		table.sort(incoming, function(left, right) return left.Record.RunId < right.Record.RunId end)
+		for _, entry in ipairs(incoming) do
+			local record = entry.Record
+			if previous.JsonById[record.RunId] ~= nil and previous.JsonById[record.RunId] ~= entry.Json then
+				return { Success = false, Reason = "RUN_RESULT_FINALIZATION_CONFLICT" }
+			end
+			local isDuplicate = ids[record.RunId] == true or index.BestRunId == record.RunId
+			foundDuplicate = foundDuplicate or isDuplicate
+			if not isDuplicate and record.RunId > index.PrunedThroughRunId then
+				ids[record.RunId] = true
+				previous.Records[record.RunId] = record
+				previous.JsonById[record.RunId] = entry.Json
+				if _RunBestRecordPolicyLogic:IsBetter(record, previous.Records[bestId]) then bestId = record.RunId end
+				newCount = newCount + 1
+			end
+		end
+		if metadata.HasIndex and newCount == 0 then
+			local cleaned = self:CleanupRetiredRecords(storageUserKey, metadata.Json, index)
+			local snapshot = self:MakeSnapshot(cleaned.Index or index, previous.Records, previous.JsonById)
+			snapshot.Reason = foundDuplicate and "DUPLICATE_RUN_RESULT_IGNORED" or "OLDER_RUN_RESULT_IGNORED"
+			snapshot.WasWritten = false
+			return snapshot
+		end
+		local ordered = {}
+		for runId, _ in pairs(ids) do table.insert(ordered, runId) end
+		table.sort(ordered, function(left, right) return left > right end)
+		local nextIndex = _RunHistoryContractLogic:EmptyIndex()
+		nextIndex.Revision = index.Revision + 1
+		nextIndex.BestRunId = bestId
+		nextIndex.PrunedThroughRunId = index.PrunedThroughRunId
+		local retired = {}
+		for _, runId in ipairs(index.PendingDeleteRunIds) do retired[runId] = true end
+		for position, runId in ipairs(ordered) do
+			if position <= limit then
+				table.insert(nextIndex.RecentRunIds, runId)
+				retired[runId] = nil
+			else
+				nextIndex.PrunedThroughRunId = math.max(nextIndex.PrunedThroughRunId, runId)
+				if runId ~= bestId then retired[runId] = true end
+			end
+		end
+		-- A former best can be outside ordered; retire it only when it is no longer a recent record.
+		local retained = {}
+		for _, runId in ipairs(nextIndex.RecentRunIds) do retained[runId] = true end
+		if index.BestRunId > 0 and index.BestRunId ~= bestId and not retained[index.BestRunId] then retired[index.BestRunId] = true end
+		retired[bestId] = nil
+		for runId, _ in pairs(retired) do table.insert(nextIndex.PendingDeleteRunIds, runId) end
+		table.sort(nextIndex.PendingDeleteRunIds)
+		local encoded = _RunHistoryContractLogic:EncodeIndex(nextIndex)
+		if not encoded.Success then return encoded end
+		local storage = _DataStorageService:GetUserDataStorage(storageUserKey)
+		if storage == nil then return { Success = false, Reason = "USER_DATA_STORAGE_UNAVAILABLE" } end
+		local writes = {}
+		for _, runId in ipairs(nextIndex.RecentRunIds) do
+			local key = self:MakeRecordKey(runId)
+			if previous.StoredValues[key] == nil then writes[key] = previous.JsonById[runId] end
+		end
+		if bestId > 0 and previous.StoredValues[self:MakeRecordKey(bestId)] == nil then writes[self:MakeRecordKey(bestId)] = previous.JsonById[bestId] end
+		if next(writes) ~= nil then
+			local writeCode, successKeys = storage:BatchSetAndWait(writes)
+			if writeCode ~= 0 then return self:StorageFailure(writeCode, "RUN_RESULT_SAVE_FAILED") end
+			local confirmed = {}
+			for _, key in ipairs(successKeys) do confirmed[key] = true end
+			for key, _ in pairs(writes) do
+				if not confirmed[key] then return { Success = false, Reason = "RUN_HISTORY_PAYLOAD_NOT_CONFIRMED" } end
+			end
+		end
+		local code = 0
+		if metadata.HasIndex then
+			local updated = nil
+			code, updated = storage:UpdateAndWait(self.HistoryIndexKey, metadata.Json, encoded.Json)
+		else
+			code = storage:SetAndWait(self.HistoryIndexKey, encoded.Json)
+		end
+		if code ~= 0 then return self:StorageFailure(code, "RUN_RESULT_SAVE_FAILED") end
+		local cleaned = self:CleanupRetiredRecords(storageUserKey, encoded.Json, nextIndex)
+		local snapshot = self:MakeSnapshot(cleaned.Index or nextIndex, previous.Records, previous.JsonById)
+		snapshot.Reason = "RUN_RESULT_SAVED"
+		snapshot.WasWritten = true
+		return snapshot
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CleanupRetiredRecords(string storageUserKey, string expectedJson, table index)
+		-- Cleanup is post-commit and retryable; a partial delete never causes replay of the finalized run.
+		if #index.PendingDeleteRunIds == 0 then return { Success = true, Index = index } end
+		local validation = _RunHistoryContractLogic:ValidateIndex(index)
+		if not validation.Success then return { Success = false, Index = index } end
+		local keys = { self.HistoryIndexKey }
+		for _, runId in ipairs(index.PendingDeleteRunIds) do table.insert(keys, self:MakeRecordKey(runId)) end
+		local read = self:ReadBatch(storageUserKey, keys)
+		if not read.Success then return { Success = false, Index = index } end
+		if read.Values[self.HistoryIndexKey] ~= expectedJson then return { Success = false, Index = index } end
+		local present = {}
+		local remaining = {}
+		for _, runId in ipairs(index.PendingDeleteRunIds) do
+			local key = self:MakeRecordKey(runId)
+			if read.Values[key] ~= nil then table.insert(present, key); remaining[key] = true end
+		end
+		local storage = _DataStorageService:GetUserDataStorage(storageUserKey)
+		if #present > 0 then
+			local code, deleted = storage:BatchDeleteAndWait(present)
+			for _, key in ipairs(deleted or {}) do remaining[key] = nil end
+			if code ~= 0 then log_warning("[RunResult] retired cleanup pending error=" .. tostring(code)) end
+		end
+		local cleanIndex = {}
+		for key, value in pairs(index) do cleanIndex[key] = value end
+		cleanIndex.PendingDeleteRunIds = {}
+		for _, runId in ipairs(index.PendingDeleteRunIds) do
+			if remaining[self:MakeRecordKey(runId)] then table.insert(cleanIndex.PendingDeleteRunIds, runId) end
+		end
+		if #cleanIndex.PendingDeleteRunIds == #index.PendingDeleteRunIds then return { Success = false, Index = index } end
+		cleanIndex.Revision = index.Revision + 1
+		local encoded = _RunHistoryContractLogic:EncodeIndex(cleanIndex)
+		if not encoded.Success then return { Success = false, Index = index } end
+		local code, updated = storage:UpdateAndWait(self.HistoryIndexKey, expectedJson, encoded.Json)
+		if code ~= 0 then
+			log_warning("[RunResult] cleanup index pending error=" .. tostring(code))
+			return { Success = false, Index = index }
+		end
+		return { Success = #cleanIndex.PendingDeleteRunIds == 0, Index = cleanIndex }
+	end
+
+end
