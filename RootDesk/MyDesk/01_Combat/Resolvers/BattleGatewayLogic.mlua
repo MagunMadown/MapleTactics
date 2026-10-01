@@ -1,9 +1,53 @@
 @Logic
 script BattleGatewayLogic extends Logic
+	property number LobbyEntryTransferTimeout = 8
+	property table LobbyEntryTransfers = {}
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
+		-- Initializes the server-owned lobby arrival watchdog for this world session.
+		self.LobbyEntryTransfers = {}
 		log("[BattleGateway] ready")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Drops arrival watches so a later play session cannot inherit an old request.
+		self.LobbyEntryTransfers = {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnUpdate(number delta)
+		-- Releases only an unchanged prepared request that never left its lobby source map.
+		for userId, pending in pairs(self.LobbyEntryTransfers) do
+			local player = pending.PlayerEntity
+			local entry = isvalid(player) and player:GetComponent("script.BattleEntryStateComponent") or nil
+			if entry == nil or entry.RequestId ~= pending.RequestId or entry.EntryState ~= "PREPARED"
+				or player.CurrentMap ~= pending.SourceMap then
+				self.LobbyEntryTransfers[userId] = nil
+			else
+				pending.Elapsed = pending.Elapsed + math.max(0, delta)
+				if pending.Elapsed >= math.max(1, self.LobbyEntryTransferTimeout) then
+					self.LobbyEntryTransfers[userId] = nil
+					_MapTeleportManager:CancelPendingTransfer(player, "LOBBY_ENTRY_TRANSFER_TIMEOUT")
+					entry:Cancel("LOBBY_ENTRY_TRANSFER_TIMEOUT")
+					self:NotifyLobbyBattleEntryResult(false, "LOBBY_ENTRY_TRANSFER_TIMEOUT", pending.RequestedStageId, userId)
+					log_warning("[BattleGateway] lobby arrival timed out user=" .. userId .. " request=" .. tostring(pending.RequestId))
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void WatchLobbyEntryTransfer(Entity playerEntity, integer requestId, string requestedStageId)
+		-- Watches successful dispatch without trusting it as proof that the player arrived.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then return end
+		local sourceMap = playerEntity.CurrentMap
+		if isvalid(sourceMap) == false or sourceMap.Name ~= "lobby" then return end
+		self.LobbyEntryTransfers[playerEntity.PlayerComponent.UserId] = {
+			PlayerEntity = playerEntity, SourceMap = sourceMap, RequestId = requestId,
+			RequestedStageId = requestedStageId or "", Elapsed = 0
+		}
 	end
 
 	@ExecSpace("ServerOnly")
@@ -37,22 +81,33 @@ script BattleGatewayLogic extends Logic
 		return entryState:Prepare(stageId, characterId, jobId, loadoutId, runSeed, entryMode)
 	end
 
-	@ExecSpace("Server")
-	method void RequestPrepareBattleEntry(string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode)
-		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
-		local result = self:PrepareBattleEntry(playerEntity, stageId, characterId, jobId, loadoutId, runSeed, entryMode)
-		if result.Success == false then
-			log_warning("[BattleGateway] prepare rejected user=" .. senderUserId .. " reason=" .. result.Reason)
+	@ExecSpace("ServerOnly")
+	method table ValidateLobbyEntryRequest(Entity playerEntity)
+		-- Public lobby requests cannot restart an active battle or replace an in-flight preparation.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			return { Success = false, Reason = "INVALID_PLAYER", RequestId = 0 }
 		end
+		if isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= "lobby" then
+			return { Success = false, Reason = "NOT_IN_LOBBY", RequestId = 0 }
+		end
+		local entryState = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		if entryState ~= nil and (entryState.EntryState == "PREPARED" or entryState.EntryState == "INITIALIZING") then
+			return { Success = false, Reason = "ENTRY_REQUEST_IN_PROGRESS", RequestId = entryState.RequestId }
+		end
+		return { Success = true, Reason = "LOBBY_ENTRY_ALLOWED", RequestId = 0 }
 	end
 
 	@ExecSpace("ServerOnly")
 	method table PrepareLobbyBattleEntry(Entity playerEntity)
 		-- High-level lobby boundary: callers do not fabricate optional compatibility metadata.
+		local eligibility = self:ValidateLobbyEntryRequest(playerEntity)
+		if eligibility.Success == false then return eligibility end
 		local context = _RunManagerLogic:GetLobbyBattleEntryContext(playerEntity)
 		if context.Success == false then
 			return { Success = false, Reason = context.Reason, RequestId = 0 }
 		end
+		eligibility = self:ValidateLobbyEntryRequest(playerEntity)
+		if eligibility.Success == false then return eligibility end
 		context.RunSeed = self:SelectLobbyRunSeed(context.RunSeed, context.EntryMode)
 		return self:PrepareBattleEntry(
 			playerEntity,
@@ -68,6 +123,8 @@ script BattleGatewayLogic extends Logic
 	@ExecSpace("ServerOnly")
 	method table PrepareLobbyStageEntry(Entity playerEntity, string requestedStageId)
 		-- Validates a world-map stage selection against the authoritative lobby run context.
+		local eligibility = self:ValidateLobbyEntryRequest(playerEntity)
+		if eligibility.Success == false then return eligibility end
 		local context = _RunManagerLogic:GetLobbyBattleEntryContext(playerEntity)
 		if context.Success == false then
 			return { Success = false, Reason = context.Reason, RequestId = 0 }
@@ -79,6 +136,8 @@ script BattleGatewayLogic extends Logic
 			log_warning("[BattleGateway] world map stage rejected requested=" .. requestedStageId .. " expected=" .. context.StageId)
 			return { Success = false, Reason = "STAGE_NOT_AVAILABLE", RequestId = 0 }
 		end
+		eligibility = self:ValidateLobbyEntryRequest(playerEntity)
+		if eligibility.Success == false then return eligibility end
 		context.RunSeed = self:SelectLobbyRunSeed(context.RunSeed, context.EntryMode)
 		return self:PrepareBattleEntry(
 			playerEntity,
@@ -118,9 +177,11 @@ script BattleGatewayLogic extends Logic
 		local transferResult = self:TransferPreparedLobbyBattleEntry(playerEntity, result.RequestId)
 		if transferResult.Success == false then
 			log_warning("[BattleGateway] world map transfer rejected user=" .. senderUserId .. " stage=" .. requestedStageId .. " reason=" .. transferResult.Reason)
+			self:CancelBattleEntry(playerEntity, transferResult.Reason)
 			self:NotifyLobbyBattleEntryResult(false, transferResult.Reason, requestedStageId, senderUserId)
 			return
 		end
+		self:WatchLobbyEntryTransfer(playerEntity, result.RequestId, requestedStageId)
 		self:NotifyLobbyBattleEntryResult(true, transferResult.Reason, requestedStageId, senderUserId)
 	end
 
@@ -137,9 +198,11 @@ script BattleGatewayLogic extends Logic
 		local transferResult = self:TransferPreparedLobbyBattleEntry(playerEntity, result.RequestId)
 		if transferResult.Success == false then
 			log_warning("[BattleGateway] lobby transfer rejected user=" .. senderUserId .. " request=" .. result.RequestId .. " reason=" .. transferResult.Reason)
+			self:CancelBattleEntry(playerEntity, transferResult.Reason)
 			self:NotifyLobbyBattleEntryResult(false, transferResult.Reason, "", senderUserId)
 			return
 		end
+		self:WatchLobbyEntryTransfer(playerEntity, result.RequestId, "")
 		self:NotifyLobbyBattleEntryResult(true, transferResult.Reason, "", senderUserId)
 	end
 
@@ -312,16 +375,6 @@ script BattleGatewayLogic extends Logic
 		return self:StartPreparedBattle(playerEntity)
 	end
 
-	@ExecSpace("Server")
-	method void RequestBeginBattle(string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode)
-		-- Single-call Client facade for flows where the player is already inside a battle map.
-		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
-		local result = self:BeginBattle(playerEntity, stageId, characterId, jobId, loadoutId, runSeed, entryMode)
-		if result.Success == false then
-			log_warning("[BattleGateway] begin rejected user=" .. senderUserId .. " reason=" .. result.Reason)
-		end
-	end
-
 	@ExecSpace("ServerOnly")
 	method table ConsumePreparedBattle(Entity playerEntity, any battleSession)
 		-- Claims the player-owned request before run initialization can yield to another map-entry callback.
@@ -339,6 +392,11 @@ script BattleGatewayLogic extends Logic
 				Reason = "ENTRY_STATE_UNAVAILABLE",
 				RequestId = 0
 			}
+		end
+		local destination = self:ValidatePreparedBattleDestination(playerEntity, battleSession, entryState)
+		if destination.Success == false then
+			log_warning("[BattleGateway] consume blocked request=" .. tostring(entryState.RequestId) .. " reason=" .. destination.Reason)
+			return destination
 		end
 		local claimResult = entryState:BeginInitialization()
 		if claimResult.Success == false then
@@ -388,7 +446,29 @@ script BattleGatewayLogic extends Logic
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ValidatePreparedBattleDestination(Entity playerEntity, any battleSession, any entryState)
+		-- A server-prepared stage is consumed only by its authored destination map's session.
+		local requestId = entryState == nil and 0 or entryState.RequestId
+		local currentMap = playerEntity.CurrentMap
+		if isvalid(currentMap) == false or battleSession.Entity ~= currentMap then
+			return { Success = false, Reason = "BATTLE_SESSION_MAP_MISMATCH", RequestId = requestId }
+		end
+		local route = _StageMapRouteRepositoryLogic:GetMapRoute(entryState.StageId)
+		if route == nil or route.Success ~= true then
+			return { Success = false, Reason = route == nil and "STAGE_MAP_ROUTE_RESULT_MISSING" or route.Reason, RequestId = requestId }
+		end
+		if route.MapId ~= currentMap.Name then
+			return { Success = false, Reason = "BATTLE_STAGE_MAP_MISMATCH", RequestId = requestId }
+		end
+		return { Success = true, Reason = "BATTLE_DESTINATION_ALLOWED", RequestId = requestId }
+	end
+
+	@ExecSpace("ServerOnly")
 	method table CancelBattleEntry(Entity playerEntity, string reason)
+		-- Cancels both the prepared payload and any matching lobby-arrival watch.
+		if isvalid(playerEntity) and playerEntity.PlayerComponent ~= nil then
+			self.LobbyEntryTransfers[playerEntity.PlayerComponent.UserId] = nil
+		end
 		local entryState = self:GetOrCreateEntryState(playerEntity)
 		if entryState == nil then
 			return {

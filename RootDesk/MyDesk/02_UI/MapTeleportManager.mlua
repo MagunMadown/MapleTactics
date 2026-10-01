@@ -1,11 +1,61 @@
 @Logic
 script MapTeleportManager extends Logic
 	property number PreTransferUiDelay = 0.15
+	property table PendingTransfers = {}
 
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
 		-- Announces the single server-side boundary used by every map transfer flow.
+		self.PendingTransfers = {}
 		log("[MapNavigation] ready")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Releases all pre-transfer timers when the world session ends.
+		for _, pending in pairs(self.PendingTransfers) do
+			if pending.TimerId > 0 then _TimerService:ClearTimer(pending.TimerId) end
+		end
+		self.PendingTransfers = {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CancelPendingTransfer(Entity playerEntity, string reason)
+		-- Invalidates a delayed transfer before a newer destination or run reset is accepted.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then return end
+		local userId = playerEntity.PlayerComponent.UserId
+		local pending = self.PendingTransfers[userId]
+		if pending == nil then return end
+		self.PendingTransfers[userId] = nil
+		if pending.TimerId > 0 then _TimerService:ClearTimer(pending.TimerId) end
+		log("[MapNavigation] pending transfer cancelled user=" .. userId .. " reason=" .. (reason or "UNSPECIFIED"))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CapturePendingTransfer(Entity playerEntity, string source)
+		-- Makes each accepted request replace older stage and pre-transfer reservations for this player.
+		self:CancelPendingTransfer(playerEntity, source)
+		_StageTransitionManagerLogic:CancelPendingTransition(playerEntity, source)
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local pending = {
+			PlayerEntity = playerEntity, UserId = playerEntity.PlayerComponent.UserId,
+			SourceMap = playerEntity.CurrentMap, TimerId = 0,
+			RunSequence = runState ~= nil and runState.RunSequence or -1
+		}
+		self.PendingTransfers[pending.UserId] = pending
+		return pending
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean ConsumePendingTransfer(table pending)
+		-- Claims only the latest request while the same player remains in its original map and run.
+		if self.PendingTransfers[pending.UserId] ~= pending then return false end
+		self.PendingTransfers[pending.UserId] = nil
+		local playerEntity = pending.PlayerEntity
+		if isvalid(playerEntity) == false or isvalid(pending.SourceMap) == false or playerEntity.CurrentMap ~= pending.SourceMap then return false end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local runSequence = runState ~= nil and runState.RunSequence or -1
+		return runSequence == pending.RunSequence
 	end
 
 	@ExecSpace("ServerOnly")
@@ -28,21 +78,22 @@ script MapTeleportManager extends Logic
 			return result
 		end
 
+		local pending = self:CapturePendingTransfer(playerEntity, result.Source)
 		self:PrepareClientForMapTransfer(result.Source, playerEntity.PlayerComponent.UserId)
 		local targetPlayer = playerEntity
 		local targetMapName = destinationMapName
 		local targetMapPosition = targetPosition
 		local transferSource = result.Source
 		local requestTransfer = function()
-			if isvalid(targetPlayer) == false then
-				log_warning("[MapNavigation] delayed transfer cancelled map=" .. targetMapName .. " source=" .. transferSource .. " reason=PLAYER_INVALIDATED")
+			if self:ConsumePendingTransfer(pending) == false then
+				log_warning("[MapNavigation] delayed transfer cancelled map=" .. targetMapName .. " source=" .. transferSource .. " reason=STALE_REQUEST")
 				return
 			end
 			_TeleportService:TeleportToMapPosition(targetPlayer, targetMapPosition, targetMapName)
 			log("[MapNavigation] transfer requested player=" .. targetPlayer.Name .. " map=" .. targetMapName .. " pos=" .. tostring(targetMapPosition) .. " source=" .. transferSource)
 		end
-		local transferTimerId = _TimerService:SetTimerOnce(requestTransfer, math.max(0.05, self.PreTransferUiDelay))
-		if transferTimerId == 0 then
+		pending.TimerId = _TimerService:SetTimerOnce(requestTransfer, math.max(0.05, self.PreTransferUiDelay))
+		if pending.TimerId == 0 then
 			log_warning("[MapNavigation] pre-transfer delay unavailable map=" .. destinationMapName .. " source=" .. result.Source .. " fallback=IMMEDIATE")
 			requestTransfer()
 		end
@@ -77,20 +128,21 @@ script MapTeleportManager extends Logic
 			resolvedSpawnName = "SpawnLocation"
 		end
 		local destinationEntityPath = "/maps/" .. destinationMapName .. "/" .. resolvedSpawnName
+		local pending = self:CapturePendingTransfer(playerEntity, result.Source)
 		self:PrepareClientForMapTransfer(result.Source, playerEntity.PlayerComponent.UserId)
 		local targetPlayer = playerEntity
 		local targetPath = destinationEntityPath
 		local transferSource = result.Source
 		local requestTransfer = function()
-			if isvalid(targetPlayer) == false then
-				log_warning("[MapNavigation] delayed spawn transfer cancelled path=" .. targetPath .. " source=" .. transferSource .. " reason=PLAYER_INVALIDATED")
+			if self:ConsumePendingTransfer(pending) == false then
+				log_warning("[MapNavigation] delayed spawn transfer cancelled path=" .. targetPath .. " source=" .. transferSource .. " reason=STALE_REQUEST")
 				return
 			end
 			_TeleportService:TeleportToEntityPath(targetPlayer, targetPath)
 			log("[MapNavigation] spawn transfer requested player=" .. targetPlayer.Name .. " path=" .. targetPath .. " source=" .. transferSource)
 		end
-		local transferTimerId = _TimerService:SetTimerOnce(requestTransfer, math.max(0.05, self.PreTransferUiDelay))
-		if transferTimerId == 0 then
+		pending.TimerId = _TimerService:SetTimerOnce(requestTransfer, math.max(0.05, self.PreTransferUiDelay))
+		if pending.TimerId == 0 then
 			log_warning("[MapNavigation] pre-transfer delay unavailable path=" .. destinationEntityPath .. " source=" .. result.Source .. " fallback=IMMEDIATE")
 			requestTransfer()
 		end
