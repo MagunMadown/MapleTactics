@@ -1,6 +1,10 @@
 @Logic
 script PlayerGridMovementLogic extends Logic
 
+	property number BlockedMoveDistanceRatio = 0.18
+	property number BlockedMoveForwardDuration = 0.06
+	property number BlockedMoveReturnDuration = 0.14
+
 	method integer GetDirection(any key)
 		-- Shares the battle movement key mapping with noncombat maps; the keys come from the player's settings.
 		return _GameSettingsLogic:GetMoveDirection(key)
@@ -83,6 +87,7 @@ script PlayerGridMovementLogic extends Logic
 		-- Predict only the avatar child. Collision, cell occupancy and the player root remain authoritative.
 		if not isvalid(player) or player ~= _UserService.LocalPlayer or player.CurrentMap ~= map then return 0 end
 		if self._T.localMove ~= nil then return 0 end
+		self:CancelBlockedMove("NEW_MOVE")
 		self._T.nextMoveRequestId = (self._T.nextMoveRequestId or 0) + 1
 		local current = player.TransformComponent.WorldPosition
 		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
@@ -90,7 +95,7 @@ script PlayerGridMovementLogic extends Logic
 			Player = player, Map = map, Entry = entry, Context = context,
 			RequestId = self._T.nextMoveRequestId, Presentation = presentation, Profile = profile,
 			StartPosition = Vector2(current.x, current.y), TargetPosition = target,
-			Elapsed = 0, Age = 0, Duration = self:GetDuration(profile), Confirmed = false, Completed = false
+			Elapsed = 0, Age = 0, Duration = self:GetDuration(profile), Confirmed = false, Completed = false, LastVisualOffset = 0
 		}
 		-- A partially refreshed Maker script may return a component without its new methods.
 		-- Keep these local closures with the request so compatibility never needs another exported method.
@@ -126,7 +131,7 @@ script PlayerGridMovementLogic extends Logic
 		end
 		self._T.localMove = move
 		local beginHop = move.BindPresentation(presentation)
-		if beginHop ~= nil and profile.EnablePlayerHopVisual then
+		if beginHop ~= nil and profile.EnablePlayerHopVisual and not profile.ObstructionHint then
 			move.VisualStarted = true
 			local started = pcall(beginHop, presentation, player.PlayerComponent.UserId, self:GetDuration(profile), profile.PlayerHopHeight,
 				profile.PlayerHopTakeoffSquashDuration, profile.PlayerHopLandingSquashDuration,
@@ -140,9 +145,25 @@ script PlayerGridMovementLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void ResolveLocalMove(Entity map, integer requestId, integer entry, integer context, boolean success, boolean completed, number targetX, number targetY, string reason)
+		-- Match the authoritative receipt before accepting movement or presenting a physical rejection.
 		local move = self._T.localMove
 		if move == nil or move.Map ~= map or move.RequestId ~= requestId or move.Entry ~= entry or move.Context ~= context then return end
-		if not success then self:CancelLocalMove(reason) return end
+		if not success then
+			local direction = move.Profile.AttemptDirection or (move.TargetPosition.x >= move.StartPosition.x and 1 or -1)
+			local cellSize = move.Profile.AttemptCellSize or math.abs(move.TargetPosition.x - move.StartPosition.x)
+			local startOffset = move.LastVisualOffset or 0
+			self:CancelLocalMove(reason)
+			if self:IsBlockedMoveReason(reason) then
+				self:BeginBlockedMove(move.Player, map, entry, context, direction, cellSize, startOffset, reason)
+			end
+			return
+		end
+		if move.Profile.ObstructionHint then
+			local position = move.LastVisualPosition or move.StartPosition
+			move.StartPosition = Vector2(position.x, targetY)
+			move.Elapsed = 0
+			move.Profile.ObstructionHint = false
+		end
 		move.Confirmed = true
 		move.Completed = move.Completed or completed
 		-- Correct a different accepted endpoint without restarting a matching prediction.
@@ -157,6 +178,8 @@ script PlayerGridMovementLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void CancelLocalMove(string reason)
+		-- Clear cosmetic rejection feedback as well as any authoritative move prediction.
+		self:CancelBlockedMove(reason)
 		local move = self._T.localMove
 		if move == nil then return end
 		self._T.localMove = nil
@@ -179,6 +202,8 @@ script PlayerGridMovementLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
+		-- Advance cosmetic recoil separately from accepted movement and server state.
+		self:UpdateBlockedMove(delta)
 		local move = self._T.localMove
 		if move == nil then return end
 		if type(move.StopVisual) ~= "function" or type(move.BindPresentation) ~= "function" or type(move.WarnVisualUnavailable) ~= "function" then
@@ -192,7 +217,17 @@ script PlayerGridMovementLogic extends Logic
 		end
 		move.Age = move.Age + math.max(0, delta)
 		if move.Age >= 2 then self:CancelLocalMove("MOVE_RESPONSE_TIMEOUT") return end
-		local step = self:Advance(move, delta, move.Profile.MoveCurve, move.Profile.MoveSnapThreshold)
+		local step = nil
+		if move.Profile.ObstructionHint and not move.Confirmed then
+			-- This is a visual hint, never a client rejection: class pushes still reach the server.
+			move.Elapsed = move.Elapsed + math.max(0, delta)
+			local t = math.min(1, move.Elapsed / math.max(0.03, self.BlockedMoveForwardDuration))
+			local distance = move.Profile.AttemptCellSize * math.max(0.05, math.min(0.25, self.BlockedMoveDistanceRatio))
+			local x = move.StartPosition.x + move.Profile.AttemptDirection * distance * (1 - (1 - t) * (1 - t))
+			step = { Position = Vector2(x, move.StartPosition.y), Complete = false }
+		else
+			step = self:Advance(move, delta, move.Profile.MoveCurve, move.Profile.MoveSnapThreshold)
+		end
 		local current = player.TransformComponent.WorldPosition
 		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
 		if presentation ~= move.Presentation then
@@ -210,11 +245,91 @@ script PlayerGridMovementLogic extends Logic
 				if type(set) ~= "function" then return false end
 				move.VisualStarted = true
 				set(presentation, offset.x)
+				move.LastVisualOffset = offset.x
+				move.LastVisualPosition = step.Position
 				return true
 			end)
 			if not ok or not applied then move.StopVisual() move.VisualFailed = true move.WarnVisualUnavailable("SET_FAILED") end
 		end
 		if step.Complete and move.Completed and math.abs(current.x - move.TargetPosition.x) <= 0.02 then self:CancelLocalMove("AUTHORITATIVE_POSITION_RECEIVED") end
+	end
+
+
+	method boolean IsBlockedMoveReason(string reason)
+		-- Only physical obstructions get feedback; invalid input and stale sessions do not.
+		return reason == "BOUNDARY" or reason == "OUT_OF_BOUNDS" or reason == "CELL_OCCUPIED"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BeginBlockedMove(Entity player, Entity map, integer entry, integer context, integer direction, number cellSize, number startOffset, string reason)
+		-- Animate the avatar child only. Failed moves keep their root, cell, facing and turn unchanged.
+		self:CancelBlockedMove("REPLACED")
+		if not isvalid(player) or player ~= _UserService.LocalPlayer or player.CurrentMap ~= map then return end
+		if direction ~= -1 and direction ~= 1 then return end
+		---@type BattleUnitPresentationComponent
+		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
+		local unit = player:GetComponent("script.BattleUnitComponent")
+		if presentation == nil or presentation:IsFullMotionPending() or (unit ~= nil and (unit.IsDead or unit.CurrentHp <= 0)) then return end
+		local current = player.TransformComponent.WorldPosition
+		local distance = math.max(0, cellSize) * math.max(0.05, math.min(0.25, self.BlockedMoveDistanceRatio))
+		local peak = player.TransformComponent:ToLocalPoint(Vector3(current.x + direction * distance, current.y, current.z)).x
+		-- A late rejection eases from the actual predicted offset back through the short recoil peak.
+		local state = {
+			Player = player, Map = map, Entry = entry, Context = context, Presentation = presentation,
+			Origin = current, StartOffset = startOffset, PeakOffset = peak, Elapsed = 0,
+			ForwardDuration = math.max(0.03, math.min(0.10, self.BlockedMoveForwardDuration)),
+			ReturnDuration = math.max(0.08, math.min(0.25, self.BlockedMoveReturnDuration))
+		}
+		self._T.localBlockedMove = state
+		presentation:SetLocalGridMoveOffset(startOffset)
+		log("[GridMoveBlocked] started reason=" .. reason .. " direction=" .. tostring(direction) .. " peak=" .. tostring(peak))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelBlockedMove(string reason)
+		-- Restore the exact visual baseline on completion, a new action, death or map transfer.
+		local state = self._T.localBlockedMove
+		if state == nil then return end
+		self._T.localBlockedMove = nil
+		if isvalid(state.Player) then
+			pcall(function() state.Presentation:ClearLocalGridMoveOffset() end)
+		end
+		log("[GridMoveBlocked] restored reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateBlockedMove(number delta)
+		-- A short ease-out push followed by a slower smooth return makes the obstruction readable.
+		local state = self._T.localBlockedMove
+		if state == nil then return end
+		local player = state.Player
+		if not isvalid(player) or player ~= _UserService.LocalPlayer or player.CurrentMap ~= state.Map then
+			self:CancelBlockedMove("MAP_CHANGED") return
+		end
+		local session = state.Map:GetComponent("script.BattleSessionComponent")
+		if state.Entry > 0 and (session == nil or session.EntryRequestId ~= state.Entry or session.HudContextRevision ~= state.Context or session.BattleResult ~= "") then
+			self:CancelBlockedMove("BATTLE_CONTEXT_CHANGED") return
+		end
+		---@type BattleUnitPresentationComponent
+		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
+		local unit = player:GetComponent("script.BattleUnitComponent")
+		local current = player.TransformComponent.WorldPosition
+		if presentation ~= state.Presentation or presentation:IsFullMotionPending() or (unit ~= nil and (unit.IsDead or unit.CurrentHp <= 0))
+			or math.abs(current.x - state.Origin.x) > 0.02 or math.abs(current.y - state.Origin.y) > 0.02 then
+			self:CancelBlockedMove("ACTION_CHANGED") return
+		end
+		state.Elapsed = state.Elapsed + math.max(0, delta)
+		local offset = 0
+		if state.Elapsed < state.ForwardDuration then
+			local t = state.Elapsed / state.ForwardDuration
+			local eased = 1 - (1 - t) * (1 - t)
+			offset = state.StartOffset + (state.PeakOffset - state.StartOffset) * eased
+		else
+			local t = math.min(1, (state.Elapsed - state.ForwardDuration) / state.ReturnDuration)
+			offset = state.PeakOffset * (1 - t * t * (3 - 2 * t))
+		end
+		presentation:SetLocalGridMoveOffset(offset)
+		if state.Elapsed >= state.ForwardDuration + state.ReturnDuration then self:CancelBlockedMove("COMPLETE") end
 	end
 
 	@ExecSpace("ClientOnly")

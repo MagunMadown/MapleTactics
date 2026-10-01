@@ -515,9 +515,9 @@ script NewSkillSelectionUILogic extends Logic
 		if offer == nil or offer.PreviewRuid == nil or offer.PreviewRuid == "" then return end
 		local preview = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Cards/Choice" .. tostring(slotIndex) .. "/Surface/Artwork/SkillPreview")
 		if isvalid(preview) == false or preview.SpriteGUIRendererComponent == nil then return end
-		local renderer = preview.SpriteGUIRendererComponent
-		local ruid = playing and offer.PreviewRuid or ("thumbnail://" .. offer.PreviewRuid)
-		if renderer.ImageRUID.DataId == ruid and preview.Enable then return end
+		local state = self._T.PreviewFits ~= nil and self._T.PreviewFits[preview.Id] or nil
+		-- Static and animated previews share a RUID; compare their playback state explicitly.
+		if state ~= nil and state.ruid == offer.PreviewRuid and state.playing == playing then return end
 		if playing then
 			self:PlayFittedPreview(preview, offer.PreviewRuid)
 			self:SetText(self.GroupPath .. "/Screen/Cards/Choice" .. tostring(slotIndex) .. "/Surface/SelectHint", "선택")
@@ -714,7 +714,7 @@ script NewSkillSelectionUILogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void SetPreviewThumbnail(Entity preview, string ruid)
-		-- Restores the full preview box when leaving animation playback.
+		-- Uses a developed frame at the same scale as playback, avoiding enlarged startup flashes.
 		self:ReleasePreviewFit(preview)
 		local renderer = preview.SpriteGUIRendererComponent
 		renderer.Type = ImageType.Simple
@@ -723,7 +723,7 @@ script NewSkillSelectionUILogic extends Logic
 		renderer.LocalPosition = Vector2(0, 0)
 		renderer.LocalScale = Vector2(1, 1)
 		renderer.Color = Color(1, 1, 1, 1)
-		-- Show frame zero of the source clip while preview playback is inactive.
+		-- Frame zero is temporary until the representative frame metadata is ready.
 		renderer.StartFrameIndex = 0
 		renderer.EndFrameIndex = 0
 		renderer.AnimClipPlayType = SpriteAnimClipPlayType.Loop
@@ -731,7 +731,7 @@ script NewSkillSelectionUILogic extends Logic
 		renderer.ImageRUID = DataRef(ruid)
 		preview.Enable = true
 		self._T.PreviewFits = self._T.PreviewFits or {}
-		local state = { entity = preview, box = preview.UITransformComponent.RectSize }
+		local state = { entity = preview, box = preview.UITransformComponent.RectSize, ruid = ruid, playing = false }
 		self._T.PreviewFits[preview.Id] = state
 		_ResourceService:PreloadAsync({ruid}, function()
 			if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
@@ -740,15 +740,27 @@ script NewSkillSelectionUILogic extends Logic
 			local loaded, clip = pcall(function() return _ResourceService:LoadAnimationClipAndWait(ruid) end)
 			if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
 			if not loaded or clip == nil or not clip.IsLoadComplete then return end
+			local widest, tallest, largestArea = 0, 0, 0
+			local representative = nil
 			for _, frame in ipairs(clip.Frames:ToTable()) do
-				if frame.FrameIndex == 0 and frame.FrameSprite ~= nil then
-					local sprite = frame.FrameSprite
-					if sprite.Width > 0 and sprite.Height > 0 then
-						local scale = math.min(state.box.x / sprite.Width, state.box.y / sprite.Height)
-						preview.UITransformComponent.RectSize = Vector2(sprite.Width * scale, sprite.Height * scale)
+				local sprite = frame.FrameSprite
+				if sprite ~= nil and sprite.IsLoadComplete and sprite.Width > 0 and sprite.Height > 0 then
+					widest = math.max(widest, sprite.Width)
+					tallest = math.max(tallest, sprite.Height)
+					local area = sprite.Width * sprite.Height
+					if area > largestArea then
+						largestArea = area
+						representative = frame
 					end
-					break
 				end
+			end
+			if representative ~= nil then
+				local sprite = representative.FrameSprite
+				local scale = math.min(state.box.x / widest, state.box.y / tallest)
+				preview.UITransformComponent.RectSize = Vector2(sprite.Width * scale, sprite.Height * scale)
+				renderer.StartFrameIndex = representative.FrameIndex
+				renderer.EndFrameIndex = representative.FrameIndex
+				log("[SkillPreviewThumbnail] ruid=" .. ruid .. " frame=" .. tostring(representative.FrameIndex) .. " scale=" .. tostring(scale))
 			end
 		end)
 	end
@@ -759,7 +771,7 @@ script NewSkillSelectionUILogic extends Logic
 		self:ReleasePreviewFit(preview)
 		self._T.PreviewFits = self._T.PreviewFits or {}
 		self._T.PreviewSizes = self._T.PreviewSizes or {}
-		local state = { entity = preview, box = preview.UITransformComponent.RectSize }
+		local state = { entity = preview, box = preview.UITransformComponent.RectSize, ruid = ruid, playing = true }
 		self._T.PreviewFits[preview.Id] = state
 		preview.Enable = false
 		_ResourceService:PreloadAsync({ruid}, function()

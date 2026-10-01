@@ -11,10 +11,14 @@ script MapTransitionUIComponent extends Component
 	property number FadeSeconds = 0.18
 	property number TransferTimeoutSeconds = 8
 	property boolean HasWarnedTimeout = false
+	property number AnimationElapsed = 0
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
-		-- Keeps the cover hidden until the common navigation boundary requests a transfer.
+		-- Resets the cover each play session before the common navigation boundary requests a transfer.
+		self.IsTransferActive = false
+		if isvalid(self.CoverCanvas) then self.CoverCanvas.GroupAlpha = 0 end
+		log("[MapTransitionUI] initialized cover hidden")
 		if self.CoverEntity ~= nil then
 			self.CoverEntity.Enable = false
 		end
@@ -28,6 +32,9 @@ script MapTransitionUIComponent extends Component
 		if isvalid(player) and isvalid(player.CurrentMap) then
 			self.SourceMapName = player.CurrentMap.Name
 		end
+		self.AnimationElapsed = 0
+		self:SelectLoadingCharacter(math.random(1, 3))
+		self:SetLoadingChatHidden(true)
 		self.IsTransferActive = true
 		self.TransferElapsed = 0
 		self.ReadyElapsed = 0
@@ -46,6 +53,7 @@ script MapTransitionUIComponent extends Component
 	method void OnUpdate(number delta)
 		-- Reveals the destination after its HUD has accepted the new map and the view has settled.
 		if self.IsTransferActive == false then return end
+		self:AnimateLoading(delta)
 		self.TransferElapsed = self.TransferElapsed + delta
 		local player = _UserService.LocalPlayer
 		local currentMapName = ""
@@ -109,6 +117,7 @@ script MapTransitionUIComponent extends Component
 	method void FinishTransfer(string mapName, string reason)
 		-- Releases the input-blocking cover after readiness or a failed transfer, allowing a retry.
 		self.IsTransferActive = false
+		self:SetLoadingChatHidden(false)
 		self.ReadyElapsed = 0
 		self.FadeElapsed = 0
 		if isvalid(self.CoverCanvas) then
@@ -119,4 +128,101 @@ script MapTransitionUIComponent extends Component
 		end
 		log("[MapTransitionUI] revealed map=" .. mapName .. " reason=" .. reason)
 	end
+	@ExecSpace("ClientOnly")
+	method void AnimateLoading(number delta)
+		-- Limits visual catch-up after a stalled frame; transfer timers keep real elapsed time.
+		self.AnimationElapsed = self.AnimationElapsed + math.min(math.max(delta, 0), 0.05)
+		local slime = self.CoverEntity:GetChildByName("Walk", false):GetChildByName("Slime", false)
+		local slimeHeight = slime.UITransformComponent.RectSize.y
+		local phase = self.AnimationElapsed % 5
+		local step = math.floor(phase)
+		local t = math.min(1, (phase - step) / 0.4)
+		local x = -360 + math.min(4, step) * 180
+		local y = -22 + slimeHeight / 2
+		if step < 4 then
+			x = x + 180 * t
+			y = y + math.sin(math.pi * t) * 60
+		end
+		slime.UITransformComponent.anchoredPosition = Vector2(x, y)
+		local dots = math.floor(self.AnimationElapsed / 0.4) % 4
+		local label = self.CoverEntity:GetChildByName("LoadingText", false).TextGUIRendererComponent
+		local text = "NOW LOADING" .. string.rep(".", dots)
+		if label.Text ~= text then label.Text = text end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetLoadingChatHidden(boolean hidden)
+		-- Restores the exact prior chat state when loading or the preview map ends.
+		local chat = _EntityService:GetEntityByPath("/ui/DefaultGroup/UIChat")
+		if not isvalid(chat) then return end
+		if hidden then
+			if self._T.ChatEnabled == nil then self._T.ChatEnabled = chat.Enable end
+			chat.Enable = false
+		elseif self._T.ChatEnabled ~= nil then
+			chat.Enable = self._T.ChatEnabled
+			self._T.ChatEnabled = nil
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Releases session-local chat suppression and pending resource work on shutdown.
+		self._T.CharacterRequest = nil
+		local actor = self.CoverEntity:GetChildByName("Walk", false):GetChildByName("Slime", false)
+		if isvalid(actor) and self._T.CharacterHandler ~= nil then
+			actor:DisconnectEvent(SpriteGUIAnimPlayerChangeFrameEvent, self._T.CharacterHandler)
+		end
+		self._T.CharacterHandler = nil
+		self:SetLoadingChatHidden(false)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectLoadingCharacter(integer index)
+		-- Each loading entry chooses one of three equally weighted native move clips.
+		local clips = {"50faf654ee5d479cb2958edce9feaef0", "c745828d831b42739b9a58c07f334864", "aa7d5f03ff1d45df9c08faa147b64db1"}
+		local names = {"slime", "mushmom", "pinkbean"}
+		local ruid = clips[index]
+		if ruid == nil then return end
+		local actor = self.CoverEntity:GetChildByName("Walk", false):GetChildByName("Slime", false)
+		if self._T.CharacterHandler ~= nil then
+			actor:DisconnectEvent(SpriteGUIAnimPlayerChangeFrameEvent, self._T.CharacterHandler)
+			self._T.CharacterHandler = nil
+		end
+		local request = {}
+		self._T.CharacterRequest = request
+		actor.Enable = false
+		_ResourceService:PreloadAsync({ruid}, function()
+			if self._T.CharacterRequest ~= request or not isvalid(actor) then return end
+			local clip = _ResourceService:LoadAnimationClipAndWait(ruid)
+			if self._T.CharacterRequest ~= request or not isvalid(actor) or clip == nil or not clip.IsLoadComplete then return end
+			local frames = {}
+			local width, height = 0, 0
+			for _, frame in ipairs(clip.Frames:ToTable()) do
+				local sprite = frame.FrameSprite
+				if sprite ~= nil and sprite.Width > 0 and sprite.Height > 0 then
+					frames[frame.FrameIndex] = Vector2(sprite.Width, sprite.Height)
+					width = math.max(width, sprite.Width)
+					height = math.max(height, sprite.Height)
+				end
+			end
+			if width <= 0 or height <= 0 then return end
+			local scale = math.min(110 / width, 100 / height)
+			local fit = function(frameIndex)
+				if self._T.CharacterRequest ~= request or not isvalid(actor) then return end
+				local size = frames[frameIndex]
+				if size ~= nil then actor.UITransformComponent.RectSize = Vector2(size.x * scale, size.y * scale) end
+			end
+			self._T.CharacterHandler = actor:ConnectEvent(SpriteGUIAnimPlayerChangeFrameEvent, function(event) fit(event.FrameIndex) end)
+			local renderer = actor.SpriteGUIRendererComponent
+			renderer.PreserveSprite = PreserveSpriteType.None
+			renderer.StartFrameIndex = 0
+			renderer.EndFrameIndex = 2147483647
+			renderer.AnimClipPlayType = SpriteAnimClipPlayType.Loop
+			renderer.ImageRUID = DataRef(ruid)
+			fit(0)
+			actor.Enable = true
+			log("[LoadingCharacter] name=" .. names[index] .. " ruid=" .. ruid .. " scale=" .. tostring(scale))
+		end)
+	end
+
 end
