@@ -3,11 +3,73 @@ script StageTransitionManagerLogic extends Logic
 
 	property integer NewSkillChoiceCount = 2
 	property number CompletedRunLobbyDelay = 3.0
+	property table PendingTransitions = {}
 	
 	@ExecSpace("ServerOnly")
 	method void OnBeginPlay()
 		-- Initializes the reward-stage transition adapter.
+		self.PendingTransitions = {}
 		log("[StageTransition] ready")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Cancels every delayed transfer before this world session ends.
+		for _, pending in pairs(self.PendingTransitions) do
+			if pending.TimerId > 0 then _TimerService:ClearTimer(pending.TimerId) end
+		end
+		self.PendingTransitions = {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CancelPendingTransition(Entity playerEntity, string reason)
+		-- Invalidates a player's old reward or lobby timer before another flow takes ownership.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then return end
+		local userId = playerEntity.PlayerComponent.UserId
+		local pending = self.PendingTransitions[userId]
+		if pending == nil then return end
+		self.PendingTransitions[userId] = nil
+		if pending.TimerId > 0 then _TimerService:ClearTimer(pending.TimerId) end
+		log("[StageTransition] pending transfer cancelled user=" .. userId .. " reason=" .. (reason or "UNSPECIFIED"))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CapturePendingTransition(Entity playerEntity, string reason)
+		-- Captures the exact run, result, flow and map that authorize one delayed transition.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil or isvalid(playerEntity.CurrentMap) == false then
+			return { Success = false, Reason = "INVALID_TRANSITION_PLAYER" }
+		end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil then return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" } end
+		self:CancelPendingTransition(playerEntity, reason)
+		local entryState = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		local pending = {
+			Success = true, PlayerEntity = playerEntity, UserId = playerEntity.PlayerComponent.UserId,
+			SourceMap = playerEntity.CurrentMap, TimerId = 0,
+			RunSequence = runState.RunSequence, RunState = runState.RunState,
+			RunFlowState = runState.RunFlowState, RunFlowRevision = runState.RunFlowRevision,
+			LastBattleRecordKey = runState.LastBattleRecordKey, LastCompletedStageId = runState.LastCompletedStageId,
+			PendingNextStageMapName = runState.PendingNextStageMapName,
+			EntryRequestId = entryState ~= nil and entryState.RequestId or -1
+		}
+		self.PendingTransitions[pending.UserId] = pending
+		return pending
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsPendingTransitionCurrent(table pending)
+		-- Rejects cancelled timers and snapshots changed by abandoning, restarting or leaving the source map.
+		if self.PendingTransitions[pending.UserId] ~= pending then return false end
+		local playerEntity = pending.PlayerEntity
+		if isvalid(playerEntity) == false or isvalid(pending.SourceMap) == false or playerEntity.CurrentMap ~= pending.SourceMap then return false end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if runState == nil or runState.RunSequence ~= pending.RunSequence or runState.RunState ~= pending.RunState then return false end
+		if runState.RunFlowState ~= pending.RunFlowState or runState.RunFlowRevision ~= pending.RunFlowRevision then return false end
+		if runState.LastBattleRecordKey ~= pending.LastBattleRecordKey or runState.LastCompletedStageId ~= pending.LastCompletedStageId then return false end
+		if runState.PendingNextStageMapName ~= pending.PendingNextStageMapName then return false end
+		local entryState = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		local entryRequestId = entryState ~= nil and entryState.RequestId or -1
+		return entryRequestId == pending.EntryRequestId
 	end
 
 	@ExecSpace("ServerOnly")
@@ -17,6 +79,7 @@ script StageTransitionManagerLogic extends Logic
 			log_warning("[StageTransition] victory transition rejected reason=INVALID_PLAYER stage=" .. clearedStageId)
 			return
 		end
+		self:CancelPendingTransition(playerEntity, "VICTORY_TRANSITION")
 		local runFlow = _RunManagerLogic:GetRunFlowSnapshot(playerEntity)
 		if self:IsShopChoiceFlow(runFlow) then
 			log("[StageTransition] shop choice ready stage=" .. clearedStageId .. " nodes=" .. runFlow.AvailableNodeIds)
@@ -53,14 +116,21 @@ script StageTransitionManagerLogic extends Logic
 		end
 		self:StoreNextStageMapForPlayer(playerEntity, nextStageMap)
 		log("[StageTransition] victory current=" .. clearedStageId .. " rewardNode=" .. graphTransition.RewardNodeId .. " next=" .. graphTransition.NextBattleStageId .. " nextMap=" .. nextStageMap .. " rewardMap=" .. rewardMap)
-		local targetPlayer = playerEntity
+		local pending = self:CapturePendingTransition(playerEntity, "VICTORY_REWARD")
+		if pending.Success == false then return end
 		local targetMap = rewardMap
-		_TimerService:SetTimerOnce(function()
-			if isvalid(targetPlayer) then
-				log("[StageTransition] teleporting player=" .. targetPlayer.Name .. " rewardMap=" .. targetMap)
-				_MapTeleportManager:TeleportPlayer(targetPlayer, targetMap, Vector3(0, 0.5, 0), "VICTORY_REWARD")
+		local transferReward = function()
+			if self:IsPendingTransitionCurrent(pending) == false then
+				if self.PendingTransitions[pending.UserId] == pending then self.PendingTransitions[pending.UserId] = nil end
+				log("[StageTransition] stale reward transfer ignored user=" .. pending.UserId)
+				return
 			end
-		end, 1.5)
+			self.PendingTransitions[pending.UserId] = nil
+			log("[StageTransition] teleporting player=" .. playerEntity.Name .. " rewardMap=" .. targetMap)
+			_MapTeleportManager:TeleportPlayer(playerEntity, targetMap, Vector3(0, 0.5, 0), "VICTORY_REWARD")
+		end
+		pending.TimerId = _TimerService:SetTimerOnce(transferReward, 1.5)
+		if pending.TimerId == 0 then transferReward() end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -75,19 +145,22 @@ script StageTransitionManagerLogic extends Logic
 			log_warning("[StageTransition] completed run transition rejected reason=RUN_NOT_COMPLETED")
 			return
 		end
-		local targetPlayer = playerEntity
-		local completedRunSequence = runState.RunSequence
-		_TimerService:SetTimerOnce(function()
-			if isvalid(targetPlayer) == false then
+		local pending = self:CapturePendingTransition(playerEntity, "RUN_COMPLETED_RETURN")
+		if pending.Success == false then return end
+		local returnCompletedRun = function()
+			if self:IsPendingTransitionCurrent(pending) == false then
+				if self.PendingTransitions[pending.UserId] == pending then self.PendingTransitions[pending.UserId] = nil end
+				log("[StageTransition] stale completed-run transfer ignored user=" .. pending.UserId)
 				return
 			end
-			local entryState = _BattleGatewayLogic:GetOrCreateEntryState(targetPlayer)
-			if entryState ~= nil then
-				entryState:ResetToIdle("RUN_COMPLETED_RETURN")
-			end
-			_MapTeleportManager:TeleportPlayer(targetPlayer, "lobby", Vector3(-27.3686, -7.92, 0), "RUN_COMPLETED_RETURN")
-			log("[StageTransition] completed run returned player=" .. targetPlayer.Name .. " sequence=" .. completedRunSequence .. " destination=lobby")
-		end, math.max(1.5, self.CompletedRunLobbyDelay))
+			self.PendingTransitions[pending.UserId] = nil
+			local entryState = _BattleGatewayLogic:GetOrCreateEntryState(playerEntity)
+			if entryState ~= nil then entryState:ResetToIdle("RUN_COMPLETED_RETURN") end
+			_MapTeleportManager:TeleportPlayer(playerEntity, "lobby", Vector3(-27.3686, -7.92, 0), "RUN_COMPLETED_RETURN")
+			log("[StageTransition] completed run returned player=" .. playerEntity.Name .. " sequence=" .. pending.RunSequence .. " destination=lobby")
+		end
+		pending.TimerId = _TimerService:SetTimerOnce(returnCompletedRun, math.max(1.5, self.CompletedRunLobbyDelay))
+		if pending.TimerId == 0 then returnCompletedRun() end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -198,7 +271,7 @@ script StageTransitionManagerLogic extends Logic
 			local bundle = _ShopDefinitionRepositoryLogic:GetShopBundle(binding.ShopId)
 			if bundle.Success == false then return bundle end
 			return { Success = true, Reason = "REWARD_THEN_SHOP", NodeGraphId = currentBattle.NodeGraphId,
-				RewardNodeId = rewardNode.NodeId, NextBattleNodeId = "", NextBattleStageId = "", NextShopMapId = bundle.Definition.MapId }
+				RewardNodeId = rewardNode.NodeId, NextBattleNodeId = "", NextBattleStageId = "", NextShopMapId = _ShopDefinitionRepositoryLogic:GetMapIdForNode(bundle.Definition, nextBattle.NodeId) }
 		end
 		if nextBattle.NodeType ~= "BATTLE" and nextBattle.NodeType ~= "BOSS" then
 			return { Success = false, Reason = "NEXT_NODE_NOT_BATTLE", NextNodeId = nextBattle.NodeId }

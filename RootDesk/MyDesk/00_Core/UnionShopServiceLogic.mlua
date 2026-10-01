@@ -2,34 +2,54 @@
 script UnionShopServiceLogic extends Logic
 
     method table GetCatalog()
-        -- Server-owned prices; job unlocks are display-only until job locking is introduced.
-        return {
-            {Id="supply_potion", Name="출발 보급권", Kind="SUPPLY", Ref="orange_potion", Price=20, Icon="2debf574d6d04f7083e980dbc8f462d9", Description="다음 새 모험을 주황 포션 1개를 더 가진 상태로 시작합니다. 보급권 1장은 한 번의 출발에 사용됩니다."},
-            {Id="union_blade", Name="블레이드 데미지 스타일", Kind="SKIN", Ref="union_blade", Price=150, Icon="", Description="기본 숫자에 블레이드 표시 연출을 적용합니다. 영구 보유하며 전투 능력에는 영향을 주지 않습니다."},
-            {Id="union_volcano", Name="볼케이노 데미지 스타일", Kind="SKIN", Ref="union_volcano", Price=150, Icon="", Description="기본 숫자에 볼케이노 표시 연출을 적용합니다. 영구 보유하며 전투 능력에는 영향을 주지 않습니다."},
-            {Id="union_forest", Name="근성의 숲 데미지 스킨", Kind="SKIN", Ref="union_forest", Price=150, Icon="", Description="근성의 숲 데미지 스킨입니다. 구매 즉시 장착되며 영구 보유합니다."},
-            {Id="union_origami", Name="종이접기 데미지 스킨", Kind="SKIN", Ref="union_origami", Price=150, Icon="", Description="종이접기 데미지 스킨입니다. 구매 즉시 장착되며 영구 보유합니다."},
-            {Id="job_unlock", Name="직업 해제권 · 준비 중", Kind="FUTURE", Ref="", Price=0, Icon="d78b17a4e1d74c569781f31a60d5354c", Description="현재 모든 직업을 자유롭게 사용할 수 있습니다. 직업 잠금 도입 후 판매할 예정입니다."}
-        }
+        -- Read presentation and sale state from the shared CSV repository.
+        local catalog = _UnionShopProductRepositoryLogic:GetCatalog()
+        return catalog.Success and catalog.Products or {}
+    end
+
+    method boolean IsUnlockableJob(string jobId)
+        return jobId == "warrior" or jobId == "archer" or jobId == "mage" or jobId == "thief" or jobId == "pirate"
+    end
+
+    method boolean IsJobUnlocked(table state, string jobId)
+        return state ~= nil and self:IsUnlockableJob(jobId) and string.find("|" .. (state.UnlockedJobs or "") .. "|", "|" .. jobId .. "|", 1, true) ~= nil
+    end
+
+    @ExecSpace("ServerOnly")
+    method table CanSelectJob(Entity player, string jobId)
+        local loaded = _UnionProfileRepositoryLogic:GetUnionProfile(player)
+        if not loaded.Success then return loaded end
+        local unlocked = self:IsJobUnlocked(loaded.Profile.UnionShop, jobId)
+        return {Success=unlocked, Reason=unlocked and "OK" or "JOB_LOCKED"}
     end
 
     method any GetProduct(string productId)
-        -- Resolve only known catalog identifiers.
-        for _, product in ipairs(self:GetCatalog()) do if product.Id == productId then return product end end
-        return nil
+        -- Query all definitions, including records kept only for old ownership validation.
+        local product = _UnionShopProductRepositoryLogic:GetDefinition(productId)
+        return product.Success and product or nil
     end
 
     method table DefaultState()
         -- Fixed scalar fields serialize safely even for a new account.
-        return {Revision=0, OwnedSkins="", EquippedSkin="maple_default", PendingSupply="", LastSupplyRunId=0, LastSupplyItem=""}
+        return {Revision=0, OwnedSkins="", EquippedSkin="maple_default", PendingSupply="", LastSupplyRunId=0, LastSupplyItem="", JobTokens=1, UnlockedJobs="warrior"}
     end
 
     method table CopyState(table source)
         -- Never share mutable profile tables with callers.
         local copy = self:DefaultState()
         if source ~= nil then for key, _ in pairs(copy) do copy[key] = source[key] end end
+        if source ~= nil and source.JobTokens == nil and source.UnlockedJobs == nil then
+            -- Accounts created before job locking retain the five previously available jobs.
+            copy.JobTokens = 0
+            copy.UnlockedJobs = "warrior|archer|mage|thief|pirate"
+        end
         -- Preserve previously purchased reservations when replacing the initial supply catalog.
         if copy.PendingSupply == "red_potion" or copy.PendingSupply == "time_sand" then copy.PendingSupply = "orange_potion" end
+        -- Retain legacy ownership records, but removed skins can no longer remain equipped.
+        local equippedProduct = self:GetProduct(copy.EquippedSkin)
+        if equippedProduct ~= nil and equippedProduct.Removed then
+            copy.EquippedSkin = "maple_default"
+        end
         return copy
     end
 
@@ -46,6 +66,17 @@ script UnionShopServiceLogic extends Logic
             if type(value) ~= "number" or value < 0 or value ~= math.floor(value) or value > 9007199254740990 then return false end
         end
         if type(state.OwnedSkins) ~= "string" or #state.OwnedSkins > 128 then return false end
+        if state.JobTokens ~= nil or state.UnlockedJobs ~= nil then
+            if type(state.JobTokens) ~= "number" or state.JobTokens < 0 or state.JobTokens ~= math.floor(state.JobTokens) or state.JobTokens > 1000000 then return false end
+            if type(state.UnlockedJobs) ~= "string" or #state.UnlockedJobs > 128 then return false end
+            local jobs, seenJobs = {}, {}
+            for id in string.gmatch(state.UnlockedJobs, "[^|]+") do
+                if not self:IsUnlockableJob(id) or seenJobs[id] then return false end
+                seenJobs[id] = true
+                table.insert(jobs, id)
+            end
+            if not seenJobs.warrior or table.concat(jobs, "|") ~= state.UnlockedJobs then return false end
+        end
         local seen = {}
         for id in string.gmatch(state.OwnedSkins, "[^|]+") do
             local product = self:GetProduct(id)
@@ -78,20 +109,36 @@ script UnionShopServiceLogic extends Logic
             return {Success=true, Changed=true, Item=state.LastSupplyItem}
         end
         if expectedRevision ~= state.Revision then return {Success=false, Reason="SHOP_CHANGED"} end
+        if action == "UNLOCK_JOB" then
+            if not self:IsUnlockableJob(productId) then return {Success=false, Reason="JOB_UNAVAILABLE"} end
+            if self:IsJobUnlocked(state, productId) then return {Success=false, Reason="JOB_ALREADY_UNLOCKED"} end
+            if state.JobTokens < 1 then return {Success=false, Reason="NO_JOB_TOKEN"} end
+            state.JobTokens = state.JobTokens - 1
+            state.UnlockedJobs = state.UnlockedJobs .. "|" .. productId
+            state.Revision = state.Revision + 1
+            return {Success=true, Changed=true, Reason="JOB_UNLOCKED"}
+        end
         local product = self:GetProduct(productId)
-        if product == nil or product.Kind == "FUTURE" then return {Success=false, Reason="PRODUCT_UNAVAILABLE"} end
+        if product == nil or product.Removed or product.Kind == "FUTURE" then return {Success=false, Reason="PRODUCT_UNAVAILABLE"} end
         if action == "EQUIP" then
             if product.Kind ~= "SKIN" or not self:OwnsSkin(state, product.Id) then return {Success=false, Reason="NOT_OWNED"} end
             if state.EquippedSkin == product.Id then return {Success=true, Changed=false, Reason="EQUIPPED"} end
             state.EquippedSkin = product.Id
         elseif action == "BUY" then
+            -- A catalog error blocks new spending while record lookup still supports old ownership.
+            local catalog = _UnionShopProductRepositoryLogic:GetCatalog()
+            if not catalog.Success then return {Success=false, Reason="PRODUCT_UNAVAILABLE"} end
+            if not product.Enabled or product.Retired then return {Success=false, Reason="PRODUCT_UNAVAILABLE"} end
             if product.Kind == "SKIN" and self:OwnsSkin(state, product.Id) then return {Success=false, Reason="ALREADY_OWNED"} end
             if product.Kind == "SUPPLY" and state.PendingSupply ~= "" then return {Success=false, Reason="SUPPLY_RESERVED"} end
+            if product.Kind == "JOB_TOKEN" and state.JobTokens >= 1000000 then return {Success=false, Reason="TOKEN_LIMIT"} end
             if profile.UnionPoints < product.Price then return {Success=false, Reason="INSUFFICIENT_UNION_COINS"} end
             profile.UnionPoints = profile.UnionPoints - product.Price
             if product.Kind == "SKIN" then
                 state.OwnedSkins = state.OwnedSkins == "" and product.Id or state.OwnedSkins .. "|" .. product.Id
                 state.EquippedSkin = product.Id
+            elseif product.Kind == "JOB_TOKEN" then
+                state.JobTokens = state.JobTokens + 1
             else
                 state.PendingSupply = product.Ref
             end

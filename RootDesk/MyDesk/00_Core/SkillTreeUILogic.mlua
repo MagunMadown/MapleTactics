@@ -1,0 +1,240 @@
+@Logic
+script SkillTreeUILogic extends Logic
+    property string JobId = "warrior"
+    property integer SelectedIndex = 0
+    property integer RequestId = 0
+    property boolean Pending = false
+    property table Snapshot = {}
+    property table Handles = {}
+
+    @ExecSpace("ClientOnly")
+    method Entity Find(string path)
+        -- Resolve authored matrix controls without server-side UI references.
+        return _EntityService:GetEntityByPath("/ui/SkillTreeUI/Modal/Window/" .. path)
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsOpen()
+        -- The modal child controls both visibility and pointer input.
+        local root = _EntityService:GetEntityByPath("/ui/SkillTreeUI/Modal")
+        return isvalid(root) and root.Enable
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Bind(string path, any callback)
+        -- Store native event handles for deterministic cleanup.
+        local entity = self:Find(path)
+        if not isvalid(entity) then return end
+        table.insert(self.Handles, {Entity=entity, Handle=entity:ConnectEvent(ButtonClickEvent, callback)})
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnBeginPlay()
+        -- Bind the five job tabs, skill slots and purchase controls once.
+        self:Bind("Close", function() self:CloseWindow() end)
+        self:Bind("Buy", function() self:BuySelected() end)
+        for index = 1, 8 do
+            local slot = index
+            self:Bind("Grid/Viewport/Scroll/Slot" .. index, function() self.SelectedIndex=slot; self:Render(); self:UpdatePreviews() end)
+        end
+        log("[SkillTreeUI] ready bindings=" .. tostring(#self.Handles))
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OpenWindow()
+        -- NPC mouse and keyboard interactions share this entry point.
+        local root = _EntityService:GetEntityByPath("/ui/SkillTreeUI/Modal")
+        if not isvalid(root) then return end
+        local player = _UserService.LocalPlayer
+        if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then return end
+        self.JobId = _LobbyCharacterSelectionLogic:GetSelectedClassId() or ""
+        if self.JobId == "" then
+            _LobbyInteractionFocusLogic:ShowJobRequiredNotice()
+            return
+        end
+        root:SetEnable(true)
+        self.SelectedIndex = 0
+        local scroll = self:Find("Grid/Viewport/Scroll")
+        if isvalid(scroll) and scroll.ScrollLayoutGroupComponent ~= nil then scroll.ScrollLayoutGroupComponent:ResetScrollPosition(UITransformAxis.Horizontal) end
+        self.Snapshot = {}
+        self:Render()
+        self:UpdatePreviews()
+        self:RequestState("")
+        log("[SkillTreeUI] opened from lobby NPC")
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CloseWindow()
+        -- Invalidate delayed replies when the window closes.
+        local root = _EntityService:GetEntityByPath("/ui/SkillTreeUI/Modal")
+        if isvalid(root) then root:SetEnable(false) end
+        self.RequestId = self.RequestId + 1
+        self.Pending = false
+        self:ReleasePreviews()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Never leave the lobby service visible during a map transition.
+        if not self:IsOpen() then return end
+        local player = _UserService.LocalPlayer
+        if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then self:CloseWindow() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RequestState(string skillId)
+        -- Serialize UI requests; the server independently validates stale revisions.
+        self.RequestId = self.RequestId + 1
+        self.Pending = true
+        self:SetText("Status", "불러오는 중…")
+        self:Render()
+        _SkillTreeServiceLogic:RequestTree(self.JobId, skillId, self.Snapshot.Revision or 0, self.RequestId)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ReceiveState(integer requestId, boolean success, string reason, table snapshot)
+        -- Ignore responses from previously closed windows or older requests.
+        if requestId ~= self.RequestId or not self:IsOpen() then return end
+        self.Pending = false
+        if snapshot.Nodes ~= nil then self.Snapshot = snapshot end
+        local messages = {OK="계승 해금은 다음 모험부터 적용됩니다.", PURCHASED="영구 해금 완료! 다음 모험부터 계승 스킬로 획득합니다.", INSUFFICIENT_UNION_COINS="유니온 코인이 부족합니다.", ALREADY_OWNED="이미 해금한 스킬입니다.", TREE_CHANGED="정보가 변경되었습니다. 다시 확인해 주세요.", PROFILE_MUTATION_IN_PROGRESS="저장 중입니다. 잠시 후 다시 시도해 주세요."}
+        self:SetText("Status", messages[reason] or ("처리하지 못했습니다: " .. reason))
+        self:Render()
+        self:UpdatePreviews()
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetText(string path, string value)
+        -- Keep content updates separate from layout.
+        local entity = self:Find(path)
+        if isvalid(entity) and entity.TextGUIRendererComponent ~= nil then entity.TextGUIRendererComponent.Text = value end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetDescription(string side, string value)
+        -- Grow the text inside its clipped scroll area and reset only when content changes.
+        local path = "Detail/" .. side .. "Viewport/Scroll"
+        local text = self:Find(path .. "/Text")
+        local scroll = self:Find(path)
+        if not isvalid(text) or text.TextGUIRendererComponent == nil then return end
+        local renderer = text.TextGUIRendererComponent
+        local changed = renderer.Text ~= value
+        renderer.Text = value
+        if changed and isvalid(scroll) and scroll.ScrollLayoutGroupComponent ~= nil then
+            scroll.ScrollLayoutGroupComponent:ResetScrollPosition(UITransformAxis.Vertical)
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Render()
+        -- Only upgradeable families are listed; purchased slots display their inherited form.
+        local nodes = self.Snapshot.Nodes or {}
+        self:SetText("Coins", "유니온 코인  " .. tostring(self.Snapshot.Coins or 0))
+        for index = 1, 8 do
+            local slot = self:Find("Grid/Viewport/Scroll/Slot" .. index)
+            local node = nodes[index]
+            if isvalid(slot) then
+                slot:SetEnable(node ~= nil)
+                if node ~= nil then
+                    self:SetText("Grid/Viewport/Scroll/Slot" .. index .. "/Name", node.Owned and node.Name or node.BaseName)
+                    self:SetText("Grid/Viewport/Scroll/Slot" .. index .. "/State", node.Owned and "T2 · 완료" or "T1 → T2")
+                    local icon = self:Find("Grid/Viewport/Scroll/Slot" .. index .. "/Icon")
+                    icon.SpriteGUIRendererComponent.ImageRUID = DataRef(node.Owned and node.Icon or node.BaseIcon)
+                    slot.SpriteGUIRendererComponent.Color = index == self.SelectedIndex and Color(0.16,0.40,0.57,1) or Color(0.16,0.23,0.31,1)
+                end
+            end
+        end
+        local selected = nodes[self.SelectedIndex]
+        local buy = self:Find("Buy")
+        if isvalid(buy) then buy.ButtonComponent.Enable = not self.Pending and selected ~= nil and selected.CanUpgrade and not selected.Owned and (self.Snapshot.Coins or 0) >= selected.Price end
+        self:Find("Detail"):SetEnable(selected ~= nil)
+        if selected == nil then self:SetText("Buy", "하단에서 강화할 스킬을 선택하세요"); return end
+        self:SetText("Detail/BaseName", "T1 · " .. selected.BaseName)
+        self:SetText("Detail/TargetName", "T2 · " .. selected.Name)
+        self:Find("Detail/BaseIcon").SpriteGUIRendererComponent.ImageRUID = DataRef(selected.BaseIcon)
+        self:Find("Detail/TargetIcon").SpriteGUIRendererComponent.ImageRUID = DataRef(selected.Icon)
+        self:SetDescription("Before", selected.Before)
+        self:SetDescription("After", selected.After)
+        self:SetText("Buy", selected.CanUpgrade and (selected.Owned and "해금 완료" or tostring(selected.Price) .. " 코인 · 영구 해금") or "인게임에서 증강 가능")
+    end
+
+    @ExecSpace("ClientOnly")
+    method any GetPreviewPlayer()
+        -- Reuse the augmentation screen's frame fitting and cancellation pipeline.
+        local entity = _EntityService:GetEntityByPath("/ui/UpgradeSkillStageUI/Controller")
+        return isvalid(entity) and entity:GetComponent("script.UpgradeSkillStageUIComponent") or nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ReleasePreviews()
+        -- Release only matrix previews, leaving the augmentation screen's own views untouched.
+        local controller = self:GetPreviewPlayer()
+        for _, side in ipairs({"Base", "Target"}) do
+            local preview = self:Find("Preview/" .. side .. "/Animation")
+            if isvalid(preview) then
+                if controller ~= nil then controller:ReleasePreviewFit(preview) end
+                preview:SetEnable(false)
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePreviews()
+        -- Blank until a skill is selected; visual effect size is separate from actual target cells.
+        self:ReleasePreviews()
+        local node = (self.Snapshot.Nodes or {})[self.SelectedIndex]
+        local content = self:Find("Preview")
+        content:SetEnable(node ~= nil)
+        if node == nil then return end
+        local controller = self:GetPreviewPlayer()
+        for _, side in ipairs({"Base", "Target"}) do
+            local ruid = node[side .. "Preview"] or ""
+            local id = side == "Base" and node.BaseId or node.Id
+            local preview = self:Find("Preview/" .. side .. "/Animation")
+            if controller ~= nil and ruid ~= "" then controller:PlayFittedPreview(preview, ruid, id == "explosion") end
+            local name = side == "Base" and node.BaseName or node.Name
+            self:SetText("Preview/" .. side .. "/Label", (side == "Base" and "T1 · " or "T2 · ") .. name)
+            local targeting = node[side .. "Targeting"]
+            local offsets = node[side .. "Offsets"] or ""
+            local range = node[side .. "Range"] or 0
+            local count = 0
+            for cell = -4, 4 do
+                local hit = false
+                if targeting == "RANGE_OFFSETS" then
+                    hit = string.find("|" .. offsets .. "|", "|" .. tostring(cell) .. "|", 1, true) ~= nil
+                elseif targeting == "FRONT_CELL" then hit = cell == 1
+                elseif targeting == "FIRST_ENEMY_FORWARD" then hit = cell > 0 and cell <= range
+                elseif targeting == "SELF" then hit = cell == 0 end
+                if hit then count = count + 1 end
+                local entity = self:Find("Preview/" .. side .. "/Cell" .. tostring(cell + 5))
+                entity.SpriteGUIRendererComponent.Color = cell == 0 and Color(0.7,0.55,0.3,1) or (hit and Color(0.22,0.7,0.95,1) or Color(0.16,0.22,0.28,1))
+            end
+            self:SetText("Preview/" .. side .. "/Range", targeting == "FIRST_ENEMY_FORWARD" and ("전방 " .. range .. "칸 내 첫 적 1명") or ("적용 범위 " .. count .. "칸 · 노란 칸은 내 위치"))
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void BuySelected()
+        -- Request only the selected server-provided node identifier.
+        local node = (self.Snapshot.Nodes or {})[self.SelectedIndex]
+        if self.Pending or node == nil or not node.CanUpgrade or node.Owned then return end
+        self:RequestState(node.Id)
+    end
+
+    @ExecSpace("ClientOnly")
+    @EventSender("Service", "InputService")
+    handler HandleKeyDown(KeyDownEvent event)
+        -- Escape closes the matrix without spending currency.
+        if self:IsOpen() and event.key == KeyboardKey.Escape then self:CloseWindow() end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnEndPlay()
+        -- Release all native listeners at world-session shutdown.
+        for _, binding in ipairs(self.Handles) do
+            if isvalid(binding.Entity) then binding.Entity:DisconnectEvent(ButtonClickEvent, binding.Handle) end
+        end
+        self.Handles = {}
+        self:ReleasePreviews()
+    end
+end

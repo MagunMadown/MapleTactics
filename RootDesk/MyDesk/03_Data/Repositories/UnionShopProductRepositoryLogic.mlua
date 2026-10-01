@@ -1,0 +1,189 @@
+@Logic
+script UnionShopProductRepositoryLogic extends Logic
+
+    property string DataSetName = "UnionShopProducts"
+    property integer SupportedSchemaVersion = 1
+
+    method table LoadDefinitions()
+        -- Load one validated catalog per execution side; publish the cache only after all rows pass.
+        if self._T.definitions ~= nil then return self._T.definitions end
+        local result = {Success=false, Reason="UNION_SHOP_DATASET_MISSING", Products={}, Catalog={}, ProductsById={}}
+        local dataSet = _DataService:GetTable(self.DataSetName)
+        if dataSet == nil then return result end
+        if dataSet:GetRowCount() == 0 then return self:Reject(0, "", "NO_PRODUCT_ROWS") end
+        local seenOrders = {}
+        for rowIndex = 1, dataSet:GetRowCount() do
+            local product = self:ConvertRow(dataSet, rowIndex)
+            local validation = self:ValidateDefinition(product)
+            if not validation.Success then return validation end
+            local referenceValidation = self:ValidateRewardReference(product)
+            if not referenceValidation.Success then return referenceValidation end
+            if result.ProductsById[product.Id] ~= nil then return self:Reject(rowIndex, product.Id, "DUPLICATE_PRODUCT_ID") end
+            if seenOrders[product.SortOrder] then return self:Reject(rowIndex, product.Id, "DUPLICATE_SORT_ORDER") end
+            seenOrders[product.SortOrder] = true
+            result.ProductsById[product.Id] = product
+            table.insert(result.Products, product)
+        end
+        table.sort(result.Products, function(left, right)
+            if left.SortOrder == right.SortOrder then return left.Id < right.Id end
+            return left.SortOrder < right.SortOrder
+        end)
+        for _, product in ipairs(result.Products) do
+            if product.Enabled and not product.Retired and not product.Removed then
+                table.insert(result.Catalog, product)
+            end
+        end
+        result.Success = true
+        result.Reason = "OK"
+        result.Source = "DATASET"
+        self._T.definitions = result
+        self._T.lastFailure = nil
+        log("[UnionShopData] loaded products=" .. tostring(#result.Products) .. " catalog=" .. tostring(#result.Catalog))
+        return result
+    end
+
+    method table GetCatalog()
+        -- Return fresh sale DTOs for both the client UI and server services.
+        local loaded = self:LoadDefinitions()
+        local result = {Success=loaded.Success, Reason=loaded.Reason, Products={}, ProductCount=0, Source=loaded.Source or ""}
+        if not loaded.Success then return result end
+        for _, product in ipairs(loaded.Catalog) do table.insert(result.Products, self:CopyProduct(product)) end
+        result.ProductCount = #result.Products
+        return result
+    end
+
+    method table GetDefinition(string productId)
+        -- Validate only the requested record so a sale-row error cannot invalidate unrelated old ownership.
+        if not self:IsSafeToken(productId) then return {Success=false, Reason="INVALID_UNION_SHOP_PRODUCT_ID"} end
+        if self._T.definitions ~= nil then
+            local cached = self._T.definitions.ProductsById[productId]
+            return cached ~= nil and self:CopyProduct(cached) or {Success=false, Reason="UNION_SHOP_PRODUCT_NOT_FOUND"}
+        end
+        local dataSet = _DataService:GetTable(self.DataSetName)
+        if dataSet == nil then return {Success=false, Reason="UNION_SHOP_DATASET_MISSING"} end
+        local matched = nil
+        for rowIndex = 1, dataSet:GetRowCount() do
+            if dataSet:GetCell(rowIndex, "ProductId") == productId then
+                if matched ~= nil then return self:Reject(rowIndex, productId, "DUPLICATE_PRODUCT_ID") end
+                local product = self:ConvertRow(dataSet, rowIndex)
+                local validation = self:ValidateDefinition(product)
+                if not validation.Success then return validation end
+                matched = product
+            end
+        end
+        return matched or {Success=false, Reason="UNION_SHOP_PRODUCT_NOT_FOUND"}
+    end
+
+    method table ValidateDefinitions()
+        -- Revalidate authored data instead of reusing a previous successful cache.
+        self._T.definitions = nil
+        local loaded = self:LoadDefinitions()
+        return {
+            Success=loaded.Success, Reason=loaded.Reason,
+            DetailReason=loaded.DetailReason or "", RowIndex=loaded.RowIndex or 0,
+            ProductId=loaded.ProductId or "", ProductCount=#(loaded.Products or {}),
+            CatalogCount=#(loaded.Catalog or {})
+        }
+    end
+
+    method table ConvertRow(any dataSet, integer rowIndex)
+        -- Convert CSV strings without rounding malformed prices into valid currency amounts.
+        return {
+            Success=true, Reason="OK", Source="DATASET", RowIndex=rowIndex,
+            SchemaVersion=tonumber(dataSet:GetCell(rowIndex, "SchemaVersion")),
+            Id=dataSet:GetCell(rowIndex, "ProductId") or "",
+            Name=dataSet:GetCell(rowIndex, "DisplayName") or "",
+            Kind=dataSet:GetCell(rowIndex, "Kind") or "",
+            Ref=dataSet:GetCell(rowIndex, "RefId") or "",
+            Price=tonumber(dataSet:GetCell(rowIndex, "Price")),
+            Icon=dataSet:GetCell(rowIndex, "IconRUID") or "",
+            Description=dataSet:GetCell(rowIndex, "Description") or "",
+            SortOrder=tonumber(dataSet:GetCell(rowIndex, "SortOrder")),
+            Enabled=self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")),
+            Retired=self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Retired")),
+            Removed=self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Removed"))
+        }
+    end
+
+    method table ValidateDefinition(table product)
+        -- Reject invalid content before any product can reach purchase or profile validation.
+        if product.SchemaVersion ~= self.SupportedSchemaVersion then return self:Reject(product.RowIndex, product.Id, "UNSUPPORTED_SCHEMA") end
+        if not self:IsSafeToken(product.Id) then return self:Reject(product.RowIndex, product.Id, "INVALID_PRODUCT_ID") end
+        if product.Kind ~= "SUPPLY" and product.Kind ~= "JOB_TOKEN" and product.Kind ~= "SKIN" and product.Kind ~= "FUTURE" then
+            return self:Reject(product.RowIndex, product.Id, "UNKNOWN_PRODUCT_KIND")
+        end
+        if type(product.Enabled) ~= "boolean" or type(product.Retired) ~= "boolean" or type(product.Removed) ~= "boolean" then
+            return self:Reject(product.RowIndex, product.Id, "INVALID_PRODUCT_FLAGS")
+        end
+        if (product.Retired or product.Removed) and product.Enabled then return self:Reject(product.RowIndex, product.Id, "RETIRED_PRODUCT_ENABLED") end
+        if product.Removed and not product.Retired then return self:Reject(product.RowIndex, product.Id, "REMOVED_PRODUCT_NOT_RETIRED") end
+        if not self:IsSafeText(product.Name) or not self:IsSafeToken(product.Ref) then return self:Reject(product.RowIndex, product.Id, "REQUIRED_FIELD_MISSING") end
+        if not self:IsPositiveInteger(product.Price) or not self:IsPositiveInteger(product.SortOrder) then
+            return self:Reject(product.RowIndex, product.Id, "INVALID_PRODUCT_NUMBER")
+        end
+        if product.Enabled and (not self:IsSafeText(product.Description) or #product.Icon ~= 32 or string.match(product.Icon, "^%x+$") == nil) then
+            return self:Reject(product.RowIndex, product.Id, "INVALID_PRODUCT_PRESENTATION")
+        end
+        if product.Kind == "SUPPLY" and product.Ref ~= "orange_potion" and product.Ref ~= "red_potion" and product.Ref ~= "time_sand" then
+            return self:Reject(product.RowIndex, product.Id, "UNSUPPORTED_SUPPLY_REF")
+        end
+        if product.Kind == "JOB_TOKEN" and product.Ref ~= "job_unlock" then return self:Reject(product.RowIndex, product.Id, "UNSUPPORTED_JOB_TOKEN_REF") end
+        if product.Kind == "SKIN" and product.Ref ~= product.Id then return self:Reject(product.RowIndex, product.Id, "INVALID_SKIN_REF") end
+        return {Success=true, Reason="OK"}
+    end
+
+    method table ValidateRewardReference(table product)
+        -- Saleable skins must resolve to an actual skin definition; historical records remain loadable.
+        if product.Enabled and product.Kind == "SKIN" then
+            local skin = _DamageSkinDefinitionRepositoryLogic:GetDefinition(product.Ref)
+            if not skin.Success then return self:Reject(product.RowIndex, product.Id, "UNKNOWN_DAMAGE_SKIN_REF") end
+        end
+        return {Success=true, Reason="OK"}
+    end
+
+    method table CopyProduct(table product)
+        -- Prevent consumers from changing the cached prices or sale flags.
+        local copy = {}
+        for key, value in pairs(product) do copy[key] = value end
+        return copy
+    end
+
+    method any ParseBooleanCell(any value)
+        -- Distinguish malformed flags from valid false values.
+        local normalized = string.lower(tostring(value or ""))
+        if normalized == "true" or normalized == "1" or normalized == "yes" then return true end
+        if value == false or normalized == "false" or normalized == "0" or normalized == "no" then return false end
+        return nil
+    end
+
+    method boolean IsSafeToken(string value)
+        -- Stable IDs cannot contain the delimiter used by saved ownership lists.
+        return value ~= nil and value ~= "" and string.match(value, "^[%w_%-]+$") ~= nil
+    end
+
+    method boolean IsSafeText(string value)
+        -- Preserve descriptions as plain nonempty strings.
+        return value ~= nil and string.match(value, "%S") ~= nil
+    end
+
+    method boolean IsPositiveInteger(any value)
+        -- Currency amounts and ordering keys must be finite positive safe integers.
+        return type(value) == "number" and value > 0 and value <= 9007199254740990 and value == math.floor(value)
+    end
+
+    method table Reject(integer rowIndex, string productId, string detailReason)
+        -- Report each distinct malformed-content failure once without providing fallback sale data.
+        local failure = tostring(rowIndex) .. ":" .. (productId or "") .. ":" .. detailReason
+        if self._T.lastFailure ~= failure then
+            log_error("[UnionShopData] rejected row=" .. tostring(rowIndex) .. " product=" .. (productId or "") .. " reason=" .. detailReason)
+            self._T.lastFailure = failure
+        end
+        return {Success=false, Reason="CONTENT_VALIDATION_FAILED", DetailReason=detailReason, RowIndex=rowIndex, ProductId=productId or ""}
+    end
+
+    method void OnEndPlay()
+        -- Clear both execution-side caches when the world session ends.
+        self._T.definitions = nil
+        self._T.lastFailure = nil
+    end
+end

@@ -107,21 +107,34 @@ script UnionRewardServiceLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table CommitPendingRunReward(Entity userEntity, string reason)
+		-- Persists the captured reward receipt, then updates only the same live run snapshot.
+		local runContext = _RunManagerLogic:CaptureRunOperationContext(userEntity)
+		if runContext == nil then return { Success = false, Reason = "STALE_RUN_REWARD_CONTEXT" } end
 		local unionState = userEntity:GetComponent("script.PlayerRunUnionEffectComponent")
 		if unionState == nil or unionState.RewardRunId <= 0 then
 			return { Success = false, Reason = "UNION_REWARD_RUN_NOT_INITIALIZED" }
 		end
-		local commitKey = "union_run:" .. tostring(unionState.RewardRunId)
+		local rewardRunId = unionState.RewardRunId
+		local runSequence = unionState.ActiveRunSequence
+		local pendingUnionPoints = unionState.PendingUnionPoints
+		local commitKey = "union_run:" .. tostring(rewardRunId)
 		local commit = _UnionProfileRepositoryLogic:TryCommitUnionReward(
 			userEntity,
-			unionState.PendingUnionPoints,
+			pendingUnionPoints,
 			commitKey,
 			reason or "RUN_END"
 		)
+		if _RunManagerLogic:IsRunOperationContextCurrent(userEntity, runContext) == false
+			or isvalid(unionState) == false
+			or userEntity:GetComponent("script.PlayerRunUnionEffectComponent") ~= unionState
+			or unionState.ActiveRunSequence ~= runSequence or unionState.RewardRunId ~= rewardRunId then
+			log_warning("[UnionReward] stale reward continuation ignored key=" .. commitKey)
+			return { Success = false, Reason = "STALE_RUN_REWARD_CONTEXT", WasPersisted = commit.Success == true }
+		end
 		if commit.Success == false then
 			return commit
 		end
-		local applied = unionState:ApplyUnionRewardCommit(commitKey, commit.CommittedAmount or unionState.PendingUnionPoints, commit.WasDuplicate == true)
+		local applied = unionState:ApplyUnionRewardCommit(commitKey, commit.CommittedAmount or pendingUnionPoints, commit.WasDuplicate == true)
 		applied.ProfileSnapshot = commit.Snapshot
 		log("[UnionReward] committed runId=" .. unionState.RewardRunId
 			.. " base=" .. applied.BaseUnionPoints

@@ -30,10 +30,10 @@
 
 | 스킬 | 직업 | 효과 |
 |---|---|---|
-| royal_guard | warrior | 다음 플레이어 턴까지 가드 상태로 피해 무효화 |
+| royal_guard (새크로생티티) | warrior | 다음 플레이어 턴까지 가드 상태로 피해 무효화 |
 | teleport | mage | 전방의 빈 칸 중 가장 먼 칸으로 이동 |
-| fairy_turn | archer | 바로 앞 적을 최대 2칸 밀며 막히면 중단 |
-| rapid_evasion | thief | 전방에서 가장 먼 적의 1칸 뒤로 이동. 경계 밖·점유 시 실패 |
+| fairy_turn (드래곤 펄스) | archer | 앞 1~2칸(`RANGE_OFFSETS` 1|2, Range 2)의 적을 최대 2칸 밀며 막히면 중단. 투사체·피격 연출은 시각 전용 |
+| rapid_evasion (인투 다크니스) | thief | 전방에서 가장 먼 적의 1칸 뒤로 이동 후 그 적을 향해 돌아섬. 뒤 칸이 경계 밖·점유면 그 적의 앞 칸으로 이동(돌아서지 않음). 앞 칸도 불가하면 실패 |
 | somersault_kick | pirate | 바로 앞 적을 붙잡아 시전자 바로 뒤 칸으로 넘긴다. 대상 없음·HEAVY·뒤 칸이 막히거나 보드 밖이면 실패(쿨다운 미소모) |
 
 해적 유틸은 파도(`tidal_wave`, 밀기 + 장전 취소)에서 써머솔트 킥으로 교체됐다. 파도가 쓰던 `PUSH_DISTANCE`
@@ -66,7 +66,8 @@ PUSH_DISTANCE의 `ParameterB`는 `|`로 구분한 토큰 집합이며 중복은 
 밀기는 0칸이어도 취소가 하나라도 발생하면 결과는 `Success=true / UTILITY_QUEUE_CANCELLED`다.
 
 `ConditionId`는 실행 코드에서 평가하지 않으므로 비워야 한다.
-비용 차감·유틸리티 강화·투사체는 지원하지 않으므로 `CostType=""`, `CostValue=0`, `SkillTier=1`, `BaseSkillId=""`, `ProjectileRuid=""`을 유지한다. FreePlay는 false만 허용한다.
+비용 차감·유틸리티 강화는 지원하지 않으므로 `CostType=""`, `CostValue=0`, `SkillTier=1`, `BaseSkillId=""`을 유지한다.
+투사체(`ProjectileRuid`)는 `PUSH_DISTANCE` 유틸리티에서만 허용한다(`TargetingType=SELF` 불가, `ProjectileSpeed>0` 필요). 투사체는 시각 전용이며 밀기는 발사 즉시 해결되고, `HitEffectRuid`·`HitSoundRuid`는 투사체 도착 시점에 밀린 대상에게 재생된다. 다른 효과에 넣으면 `UTILITY_PROJECTILE_UNSUPPORTED`로 거부한다. FreePlay는 false만 허용한다.
 실행되지 않는 값을 채워 기능이 적용된 것처럼 보이는 저작을 검증에서 거부한다.
 
 이동 목적지 없음은 `Success=false / UTILITY_NO_EMPTY_DESTINATION`,
@@ -75,7 +76,7 @@ PUSH_DISTANCE의 `ParameterB`는 `|`로 구분한 토큰 집합이며 중복은 
 
 ## 연출과 검증 절차
 
-CastEffectRuid와 CastSoundRuid는 현재 데이터에 채워져 있다. 아이콘·피격 연출 등 선택 필드는 필요할 때 실제 리소스를 확인해 작성한다.
+CastEffectRuid와 CastSoundRuid는 현재 데이터에 채워져 있다. 리소스는 해당 스킬 리소스 팩(`effect`·`icon`·`ball`·`hit/0`·`audio/*`)에서 가져온다. 팩의 `repeat`·`audio/Loop`(지속 오라)는 아직 대응 열이 없어 사용하지 않는다.
 MotionProfileId는 현재 basic_slash / heavy_slash를 사용한다.
 
 1. 편집기에서 `RootDesk/MyDesk/03_Data` 폴더 전체를 연다.

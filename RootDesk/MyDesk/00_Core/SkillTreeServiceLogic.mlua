@@ -1,0 +1,123 @@
+@Logic
+script SkillTreeServiceLogic extends Logic
+
+    method integer GetUnlockCoinCost()
+        -- Share the fixed union coin price between purchase validation and UI snapshots.
+        return 200
+    end
+
+    method table DefaultState()
+        -- Scalar ownership is safe for both new and legacy profile JSON.
+        return {Revision=0, Unlocked=""}
+    end
+
+    method table CopyState(any source)
+        -- Keep snapshots independent from the repository cache.
+        if source == nil then return self:DefaultState() end
+        return {Revision=source.Revision, Unlocked=source.Unlocked}
+    end
+
+    method boolean Owns(string unlocked, string id)
+        -- Match complete identifiers only.
+        return string.find("|" .. unlocked .. "|", "|" .. id .. "|", 1, true) ~= nil
+    end
+
+    method boolean ValidateState(any state)
+        -- Retain unknown historical identifiers but reject malformed ownership.
+        if type(state) ~= "table" or type(state.Revision) ~= "number" or state.Revision < 0 or state.Revision ~= math.floor(state.Revision) or state.Revision > 9007199254740990 then return false end
+        if type(state.Unlocked) ~= "string" or #state.Unlocked > 8192 then return false end
+        local ids, seen = {}, {}
+        for id in string.gmatch(state.Unlocked, "[^|]+") do
+            if not string.match(id, "^[%w_]+$") or seen[id] then return false end
+            seen[id] = true
+            table.insert(ids, id)
+        end
+        return table.concat(ids, "|") == state.Unlocked
+    end
+
+    @ExecSpace("ServerOnly")
+    method string ResolveSkill(string skillId, string unlocked)
+        -- Apply only the immutable ownership captured at departure.
+        local current = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+        for index = 1, 8 do
+            if not current.Success or (current.RequiredJobTag or "") == "" then break end
+            local path = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(current.RequiredJobTag, current.SkillId)
+            if not path.Success or not self:Owns(unlocked, path.UpgradeSkillId) then break end
+            current = path.UpgradeDefinition
+            skillId = current.SkillId
+        end
+        return skillId
+    end
+
+    @ExecSpace("ServerOnly")
+    method table EvaluatePurchase(table profile, string skillId, integer revision)
+        -- Validate and mutate a candidate inside the repository lock and CAS write.
+        local state = profile.SkillTree
+        if not self:ValidateState(state) then return {Success=false, Reason="INVALID_TREE_SAVE"} end
+        if revision ~= state.Revision then return {Success=false, Reason="TREE_CHANGED"} end
+        local target = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+        if not target.Success or (target.BaseSkillId or "") == "" then return {Success=false, Reason="INVALID_NODE"} end
+        local path = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(target.RequiredJobTag, target.BaseSkillId)
+        if not path.Success or path.UpgradeSkillId ~= skillId then return {Success=false, Reason="INVALID_NODE"} end
+        if self:Owns(state.Unlocked, skillId) then return {Success=false, Reason="ALREADY_OWNED"} end
+        if path.BaseDefinition.SkillTier > 1 and not self:Owns(state.Unlocked, target.BaseSkillId) then return {Success=false, Reason="PREREQUISITE_REQUIRED"} end
+        local checked = _ContentValidatorLogic:ValidateSkillById(skillId)
+        if not checked.Success then return {Success=false, Reason="INVALID_NODE"} end
+        local price = self:GetUnlockCoinCost()
+        if profile.UnionPoints < price then return {Success=false, Reason="INSUFFICIENT_UNION_COINS"} end
+        profile.UnionPoints = profile.UnionPoints - price
+        state.Unlocked = state.Unlocked == "" and skillId or state.Unlocked .. "|" .. skillId
+        state.Revision = state.Revision + 1
+        return {Success=true, Changed=true, Reason="PURCHASED"}
+    end
+
+    @ExecSpace("Server")
+    method void RequestTree(string jobId, string skillId, integer revision, integer requestId)
+        -- Client prices and ownership are never accepted.
+        local player = _UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then
+            self:ReceiveTree(requestId, false, "LOBBY_ONLY", {}, senderUserId)
+            return
+        end
+        local selection = player:GetComponent("script.TemporaryClassSelectionStateComponent")
+        if selection == nil or selection.SelectedJobId == "" or selection.SelectedJobId ~= jobId then
+            self:ReceiveTree(requestId, false, "JOB_NOT_SELECTED", {}, senderUserId)
+            return
+        end
+        local catalog = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(jobId)
+        if not catalog.Success then self:ReceiveTree(requestId, false, "INVALID_JOB", {}, senderUserId); return end
+        local result = {Success=true, Reason="OK"}
+        if skillId ~= "" then result = _UnionProfileRepositoryLogic:TryCommitSkillTreePurchase(player, skillId, revision) end
+        local loaded = _UnionProfileRepositoryLogic:GetUnionProfile(player)
+        if not loaded.Success then self:ReceiveTree(requestId, false, loaded.Reason, {}, senderUserId); return end
+        local snapshot = self:CopyState(loaded.Profile.SkillTree)
+        snapshot.Coins = loaded.Profile.UnionPoints
+        snapshot.JobId = jobId
+        snapshot.Nodes = {}
+        for _, base in ipairs(catalog.Skills) do
+            if base.SkillTier == 1 and (base.BaseSkillId or "") == "" then
+                local path = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(jobId, base.SkillId)
+                if path.Success then
+                local target = path.UpgradeDefinition
+                table.insert(snapshot.Nodes, {Id=target.SkillId, BaseName=base.DisplayName, Name=target.DisplayName,
+                    Icon=_UpgradeSkillStageLogic:GetSkillIconRuid(target), BaseIcon=_UpgradeSkillStageLogic:GetSkillIconRuid(base),
+                    BasePreview=base.CastEffectRuid ~= "" and base.CastEffectRuid or base.HitEffectRuid,
+                    TargetPreview=target.CastEffectRuid ~= "" and target.CastEffectRuid or target.HitEffectRuid,
+                    BaseId=base.SkillId, BaseRange=base.Range, TargetRange=target.Range,
+                    BaseOffsets=base.TargetOffsets, TargetOffsets=target.TargetOffsets,
+                    BaseTargeting=base.TargetingType, TargetTargeting=target.TargetingType,
+                    Before=_SkillCodexProvider:BuildDescription(base), After=_SkillCodexProvider:BuildDescription(target),
+                    Price=path.Success and self:GetUnlockCoinCost() or 0, CanUpgrade=path.Success,
+                    Owned=self:Owns(snapshot.Unlocked, target.SkillId)})
+                end
+            end
+        end
+        self:ReceiveTree(requestId, result.Success, result.Reason or "OK", snapshot, senderUserId)
+    end
+
+    @ExecSpace("Client")
+    method void ReceiveTree(integer requestId, boolean success, string reason, table snapshot)
+        -- Deliver private state to the local matrix window.
+        _SkillTreeUILogic:ReceiveState(requestId, success, reason, snapshot)
+    end
+end

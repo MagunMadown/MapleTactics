@@ -1,0 +1,273 @@
+@Logic
+script CouponServiceLogic extends Logic
+
+	property string StorageName = "MapleTacticsCouponsV1"
+	property string AdminProfileCodes = "9NwJBE,M0b9H,tTYwI,nBjNPE,VMa5FD"
+	property table RedemptionBusyByUserId = {}
+	property table RedemptionNextAllowedByUserId = {}
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Resets request guards for this world session without reading coupon storage on every frame.
+		self.RedemptionBusyByUserId = {}
+		self.RedemptionNextAllowedByUserId = {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Releases non-persistent request guards when the world session ends.
+		self.RedemptionBusyByUserId = {}
+		self.RedemptionNextAllowedByUserId = {}
+	end
+
+	@ExecSpace("ServerOnly")
+	method string NormalizeProfileCode(string raw)
+		-- Removes the display-only # while preserving the native profile code's case-sensitive identity.
+		local value = string.match(raw or "", "^%s*(.-)%s*$") or ""
+		if string.sub(value, 1, 1) == "#" then value = string.sub(value, 2) end
+		return value
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Service", "UserService")
+	handler HandleUserLeave(UserLeaveEvent event)
+		-- Drops only transient request guards; persisted coupon receipts remain in the account profile.
+		self.RedemptionBusyByUserId[event.UserId] = nil
+		self.RedemptionNextAllowedByUserId[event.UserId] = nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsAdminUser(string userId)
+		-- Resolves the RPC sender on the server; no client-supplied identity is trusted.
+		local player = _UserService:GetUserEntityByUserId(userId)
+		if isvalid(player) == false or player.PlayerComponent == nil then return false end
+		local profileCode = self:NormalizeProfileCode(player.PlayerComponent.ProfileCode or "")
+		if profileCode == "" then return false end
+		for configured in string.gmatch(self.AdminProfileCodes or "", "[^,]+") do
+			if profileCode == self:NormalizeProfileCode(configured) then return true end
+		end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method string NormalizeCouponCode(string raw)
+		-- Canonical codes are case-insensitive and contain only safe key characters.
+		return string.upper(string.match(raw or "", "^%s*(.-)%s*$") or "")
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsValidCouponCode(string code)
+		-- Keeps storage keys predictable and rules out whitespace or control characters.
+		return string.len(code) >= 4 and string.len(code) <= 24 and string.match(code, "^[A-Z0-9%-]+$") ~= nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LoadCoupon(string code)
+		-- Reads one coupon record; NotFound is a normal missing-code result.
+		local storage = _DataStorageService:GetGlobalDataStorage(self.StorageName)
+		if storage == nil then return { Success = false, Reason = "STORAGE_UNAVAILABLE" } end
+		local key = "C:" .. code
+		local errorCode, raw = storage:GetAndWait(key)
+		-- Maker can report an absent key as OK + nil instead of NotFound.
+		if errorCode == 1000002 or (errorCode == 0 and (raw == nil or raw == "")) then
+			return { Success = true, Exists = false, Storage = storage, Key = key }
+		end
+		if errorCode ~= 0 then
+			log_error("[Coupon] read failed error=" .. tostring(errorCode))
+			return { Success = false, Reason = "STORAGE_READ_FAILED" }
+		end
+		local decodeOk, record = pcall(function() return _HttpService:JSONDecode(raw) end)
+		if decodeOk == false or type(record) ~= "table" or record.Code ~= code or (record.Kind ~= "COMMON" and record.Kind ~= "ONE_TIME") then
+			log_error("[Coupon] invalid stored record")
+			return { Success = false, Reason = "INVALID_RECORD" }
+		end
+		if record.SchemaVersion ~= 1 and record.SchemaVersion ~= 2 then return {Success = false, Reason = "INVALID_RECORD"} end
+		if type(record.Active) ~= "boolean" then return {Success = false, Reason = "INVALID_RECORD"} end
+		if record.SchemaVersion == 1 then
+			record.RewardType = "NONE"
+			record.RewardAmount = 0
+		elseif type(record.RewardType) ~= "string" or self:IsValidReward(record.RewardType, record.RewardAmount) == false then
+			return {Success = false, Reason = "INVALID_RECORD"}
+		end
+		return { Success = true, Exists = true, Storage = storage, Key = key, Raw = raw, Record = record }
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsValidReward(string rewardType, any amount)
+		-- Closed reward vocabulary keeps client requests and persisted definitions from inventing payouts.
+		if type(amount) ~= "number" or amount ~= math.floor(amount) then return false end
+		return (rewardType == "NONE" and amount == 0) or (rewardType == "JOB_TOKEN" and amount >= 1 and amount <= 1000000)
+	end
+
+	@ExecSpace("ServerOnly")
+	method string CreateCoupon(string code, string kind, string operatorUserId)
+		-- Retains the original registration command for reward-free definitions.
+		return self:CreateCouponWithReward(code, kind, "NONE", 0, operatorUserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method string CreateCouponWithReward(string code, string kind, string rewardType, integer amount, string operatorUserId)
+		-- Registers an immutable server-owned reward definition; existing codes cannot be repurposed.
+		if self:IsValidCouponCode(code) == false then return "코드는 영문·숫자·- 4~24자여야 합니다." end
+		if kind ~= "COMMON" and kind ~= "ONE_TIME" then return "종류는 COMMON 또는 ONE_TIME입니다." end
+		if self:IsValidReward(rewardType, amount) == false then return "보상은 JOB_TOKEN 1~1000000입니다." end
+		if kind == "ONE_TIME" and rewardType ~= "NONE" then return "일회용 보상 지급은 아직 준비 중입니다." end
+		local loaded = self:LoadCoupon(code)
+		if loaded.Success == false then return "저장소 조회 실패: " .. loaded.Reason end
+		if loaded.Exists then return "이미 등록된 코드입니다." end
+		local player = _UserService:GetUserEntityByUserId(operatorUserId)
+		local profileCode = isvalid(player) and self:NormalizeProfileCode(player.PlayerComponent.ProfileCode or "") or ""
+		local record = { SchemaVersion = 2, Code = code, Kind = kind, Active = true, CreatedBy = profileCode, RewardType = rewardType, RewardAmount = amount }
+		local encoded = _HttpService:JSONEncode(record)
+		local errorCode = loaded.Storage:SetAndWait(loaded.Key, encoded)
+		if errorCode ~= 0 then
+			log_error("[Coupon] create failed error=" .. tostring(errorCode))
+			return "저장 실패: " .. tostring(errorCode)
+		end
+		log("[Coupon] created kind=" .. kind .. " by=" .. profileCode)
+		return "등록 완료: " .. code .. " (" .. kind .. ")" .. (rewardType == "JOB_TOKEN" and " / 토큰 " .. tostring(amount) .. "개" or "")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string RevokeCoupon(string code, string operatorUserId)
+		-- Disables a coupon using compare-and-swap so concurrent changes are not overwritten.
+		if self:IsValidCouponCode(code) == false then return "올바른 코드를 입력해 주세요." end
+		local loaded = self:LoadCoupon(code)
+		if loaded.Success == false then return "저장소 조회 실패: " .. loaded.Reason end
+		if loaded.Exists == false then return "등록되지 않은 코드입니다." end
+		if loaded.Record.Active == false then return "이미 중지된 코드입니다." end
+		loaded.Record.Active = false
+		loaded.Record.SchemaVersion = 2
+		local encoded = _HttpService:JSONEncode(loaded.Record)
+		local errorCode = loaded.Storage:UpdateAndWait(loaded.Key, loaded.Raw, encoded)
+		if errorCode ~= 0 then
+			log_error("[Coupon] revoke failed error=" .. tostring(errorCode))
+			return errorCode == 2000000 and "동시 수정 충돌: 다시 시도해 주세요." or "중지 실패: " .. tostring(errorCode)
+		end
+		log("[Coupon] revoked by user=" .. tostring(operatorUserId))
+		return "중지 완료: " .. code
+	end
+
+	@ExecSpace("ServerOnly")
+	method string DescribeCoupon(string code)
+		-- Returns the minimal status needed for an operator to inspect one known code.
+		if self:IsValidCouponCode(code) == false then return "올바른 코드를 입력해 주세요." end
+		local loaded = self:LoadCoupon(code)
+		if loaded.Success == false then return "저장소 조회 실패: " .. loaded.Reason end
+		if loaded.Exists == false then return "등록되지 않은 코드입니다." end
+		local state = loaded.Record.Active == true and "사용 가능" or "중지됨"
+		local reward = loaded.Record.RewardType == "JOB_TOKEN" and " / 토큰 " .. tostring(loaded.Record.RewardAmount) .. "개" or " / 보상 없음"
+		return code .. " / " .. loaded.Record.Kind .. " / " .. state .. reward
+	end
+
+	@ExecSpace("Server")
+	method void RequestAdminAccess()
+		-- Only the server decides whether the requester may open the operator console.
+		if self:IsAdminUser(senderUserId) == false then
+			log_warning("[Coupon] admin access denied")
+			return
+		end
+		self:ReceiveAdminAccess(senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveAdminAccess()
+		-- Opens the existing coupon window in operator mode for the authorized client.
+		_GameMenuLogic:OpenAdminConsole()
+	end
+
+	@ExecSpace("Server")
+	method void RequestAdminCommand(string commandText)
+		-- Rechecks permission for every command, including calls that bypass the UI.
+		if self:IsAdminUser(senderUserId) == false then
+			log_warning("[Coupon] admin command denied")
+			return
+		end
+		if commandText == nil or string.len(commandText) > 96 then
+			self:ReceiveAdminResult("명령이 너무 깁니다.", senderUserId)
+			return
+		end
+		local args = {}
+		for word in string.gmatch(commandText, "%S+") do table.insert(args, word) end
+		local action = string.lower(args[1] or "")
+		local code = self:NormalizeCouponCode(args[2] or "")
+		local result = "create CODE COMMON JOB_TOKEN 1 / info CODE / revoke CODE"
+		if action == "create" and #args == 3 then
+			result = self:CreateCoupon(code, string.upper(args[3]), senderUserId)
+		elseif action == "create" and #args == 5 then
+			local amount = tonumber(args[5])
+			if self:IsValidReward(string.upper(args[4]), amount) then
+				result = self:CreateCouponWithReward(code, string.upper(args[3]), string.upper(args[4]), math.floor(amount), senderUserId)
+			else
+				result = "보상은 JOB_TOKEN 1~1000000입니다."
+			end
+		elseif action == "info" and #args == 2 then
+			result = self:DescribeCoupon(code)
+		elseif action == "revoke" and #args == 2 then
+			result = self:RevokeCoupon(code, senderUserId)
+		end
+		self:ReceiveAdminResult(result, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveAdminResult(string result)
+		-- Delivers only a short operator result to the requesting client's UI.
+		_GameMenuLogic:SetCouponStatus(result)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RedeemCommonCoupon(Entity player, string code)
+		-- Loads the authoritative definition before the repository atomically commits receipt and reward.
+		local loaded = self:LoadCoupon(code)
+		if not loaded.Success then return loaded end
+		if not loaded.Exists then return {Success = false, Reason = "COUPON_NOT_FOUND"} end
+		local record = loaded.Record
+		if not record.Active then return {Success = false, Reason = "COUPON_REVOKED"} end
+		if record.Kind ~= "COMMON" then return {Success = false, Reason = "ONE_TIME_NOT_READY"} end
+		if record.RewardType ~= "JOB_TOKEN" then return {Success = false, Reason = "COUPON_REWARD_NOT_SET"} end
+		return _UnionProfileRepositoryLogic:TryGrantJobTokenCoupon(player, code, record.RewardAmount)
+	end
+
+	@ExecSpace("Server")
+	method void RequestRedeemCoupon(string rawCode, integer requestId)
+		-- The requester may only redeem for their own server-resolved account, never an arbitrary player.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) then return end
+		if rawCode == nil or #rawCode > 64 then
+			self:ReceiveRedemptionResult(requestId, false, "쿠폰 코드를 확인해 주세요.", senderUserId)
+			return
+		end
+		local code = self:NormalizeCouponCode(rawCode)
+		if not self:IsValidCouponCode(code) then
+			self:ReceiveRedemptionResult(requestId, false, "쿠폰 코드를 확인해 주세요.", senderUserId)
+			return
+		end
+		local now = _UtilLogic.ServerElapsedSeconds
+		if self.RedemptionBusyByUserId[senderUserId] or now < (self.RedemptionNextAllowedByUserId[senderUserId] or 0) then
+			self:ReceiveRedemptionResult(requestId, false, "잠시 후 다시 시도해 주세요.", senderUserId)
+			return
+		end
+		self.RedemptionBusyByUserId[senderUserId] = true
+		self.RedemptionNextAllowedByUserId[senderUserId] = now + 1
+		local ok, result = pcall(function() return self:RedeemCommonCoupon(player, code) end)
+		self.RedemptionBusyByUserId[senderUserId] = nil
+		if not ok then
+			log_error("[Coupon] redemption exception")
+			result = {Success = false, Reason = "COUPON_REWARD_SAVE_EXCEPTION"}
+		end
+		local messages = {COUPON_ALREADY_REDEEMED = "이미 사용한 쿠폰입니다.", COUPON_NOT_FOUND = "등록되지 않은 쿠폰입니다.", COUPON_REVOKED = "사용이 중지된 쿠폰입니다.", COUPON_REWARD_NOT_SET = "보상이 설정되지 않은 쿠폰입니다.", ONE_TIME_NOT_READY = "일회용 쿠폰 사용은 아직 준비 중입니다.", TOKEN_LIMIT = "직업 해제 토큰 보유 한도에 도달했습니다.", COUPON_RECEIPT_LIMIT = "쿠폰 사용 기록 한도에 도달했습니다."}
+		local message = messages[result.Reason] or "저장 처리에 실패했습니다. 잠시 후 다시 시도해 주세요."
+		if result.Success then
+			message = "직업 해제 토큰 " .. tostring(result.Amount) .. "개 지급! 보유 " .. tostring(result.JobTokens) .. "개"
+			log("[Coupon] redeemed reward=JOB_TOKEN amount=" .. tostring(result.Amount))
+		end
+		self:ReceiveRedemptionResult(requestId, result.Success, message, senderUserId)
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveRedemptionResult(integer requestId, boolean success, string message)
+		-- Returns the persisted result to the player's coupon entry window.
+		_GameMenuLogic:ReceiveCouponRedemption(requestId, success, message)
+	end
+
+end

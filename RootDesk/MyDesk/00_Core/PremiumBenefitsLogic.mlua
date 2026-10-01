@@ -2,24 +2,58 @@
 script PremiumBenefitsLogic extends Logic
 
     -- Register as a one-time WorldShop Pass. Keep this ID permanently mapped to these benefits.
-    property string MagnetPetProductId = ""
-    property boolean SalesEnabled = false
+    property string MagnetPetProductId = "20L2F20NR"
+    property boolean SalesEnabled = true
     property string MagnetRelicId = "premium_magnet_pet"
+    property boolean MakerMagnetPetTestEnabled = false
 
     @ExecSpace("ServerOnly")
     method table GetBenefits(Entity player)
-        -- Fail closed on profile load errors; a purchased run must never silently lose its benefits.
+        -- Load ownership, then persist the single creator-authorized gift before applying it.
         local profile = _UnionProfileRepositoryLogic:GetUnionProfile(player)
         if profile.Success == false then return profile end
-        return {Success = true, MagnetPetOwned = (profile.Profile.MagnetPetPurchaseId or "") ~= ""}
+        local owned = (profile.Profile.MagnetPetPurchaseId or "") ~= "" or (profile.Profile.MagnetPetGiftId or "") ~= ""
+        if not owned and self:IsMagnetPetGiftRecipient(player) then
+            local granted = _UnionProfileRepositoryLogic:TryGrantMagnetPetGift(player)
+            if granted.Success == false then return granted end
+            profile = _UnionProfileRepositoryLogic:GetUnionProfile(player)
+            if profile.Success == false then return profile end
+            owned = (profile.Profile.MagnetPetPurchaseId or "") ~= "" or (profile.Profile.MagnetPetGiftId or "") ~= ""
+        end
+        return {Success = true, MagnetPetOwned = owned or self:IsMakerMagnetPetTester(player)}
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsMagnetPetGiftRecipient(Entity player)
+        -- Exact native profile-code allowlist for the three creator-authorized permanent gifts.
+        if not isvalid(player) or player.PlayerComponent == nil then return false end
+        local code = player.PlayerComponent.ProfileCode or ""
+        if string.sub(code, 1, 1) == "#" then code = string.sub(code, 2) end
+        return code == "tTYwI" or code == "VMa5FD" or code == "9NwJBE"
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsMakerMagnetPetTester(Entity player)
+        -- Session-only test entitlement; never writes a purchase receipt or applies in release.
+        if not self.MakerMagnetPetTestEnabled or not Environment:IsMakerPlay() or Environment:IsPublishedPlay() then return false end
+        if not isvalid(player) or player.PlayerComponent == nil then return false end
+        local userId = player.PlayerComponent.UserId
+        if userId == nil or userId == "" then return false end
+        if self._T.MagnetPetTestUserId == nil then
+            -- Bind one solo Maker tester; joining additional clients never receives the test pass.
+            if _UserService:GetUserCount() ~= 1 or _UserService:GetUserEntityByUserId(userId) ~= player then return false end
+            self._T.MagnetPetTestUserId = userId
+            log("[MagnetPet] Maker-only test entitlement enabled")
+        end
+        return self._T.MagnetPetTestUserId == userId
     end
 
     method table GetMagnetRelicDefinition()
         -- This reserved catalog entry is never included in random or ordinary shop acquisition.
         return {Success = true, Reason = "OK", RelicId = self.MagnetRelicId, Source = "PREMIUM",
-            DisplayName = "자석펫", IconImageRUID = "7208e25d3fb34c0598c586f1e4640d5c",
-            EffectDescription = "맵 전체 드랍 즉시 자동 획득 / 아이템 드랍 확률 10% 증가 / 메소 획득량 10% 증가 (영구 구매 혜택)",
-            AttackBonus = 0, MaxHpBonus = 0, DefenseBonus = 0, SpecialEffectType = "", SpecialEffectValue = 0,
+            DisplayName = "자석펫", IconImageRUID = "d6a6fae1f10f49fa904b9890445d4b73",
+            EffectDescription = "맵에 있는 아이템 즉시 자동 수집 / 인벤토리 슬롯 +1 (매 모험 시작 시 지급)",
+            AttackBonus = 0, MaxHpBonus = 0, DefenseBonus = 0, SpecialEffectType = "MAGNET_PET", SpecialEffectValue = 1,
             RequiredJobId = "", IsOpen = false, PremiumOnly = true}
     end
 
@@ -39,7 +73,7 @@ script PremiumBenefitsLogic extends Logic
             return {Success = false, Reason = "RUN_PREMIUM_RELIC_UNAVAILABLE"}
         end
         if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, self.MagnetRelicId) > 0 then
-            return {Success = true, Reason = "ALREADY_OWNED"}
+            return effects:Recalculate()
         end
         inventory.RunItemSnapshot = inventory:SetSnapshotAmount(inventory.RunItemSnapshot, self.MagnetRelicId, 1)
         inventory.InventoryRevision = inventory.InventoryRevision + 1
@@ -48,10 +82,4 @@ script PremiumBenefitsLogic extends Logic
         return result
     end
 
-    method number ApplyItemDropBonus(number chancePermille, boolean owned)
-        -- Relative increase, never +10 percentage points; preserve fractional permille precision.
-        local chance = math.max(0, math.min(1000, chancePermille))
-        if owned then chance = math.min(1000, chance * 1.1) end
-        return chance
-    end
 end

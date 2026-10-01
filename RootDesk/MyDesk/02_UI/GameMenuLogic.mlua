@@ -1,18 +1,28 @@
 @Logic
 script GameMenuLogic extends Logic
 
-	-- Esc menu with Settings, Return to Lobby and Quit. The window is cloned from the settings window so both share one look.
+	-- Esc menu with Settings, Coupon, Return to Lobby and Quit. The windows are cloned from the settings window so all share one look.
 	property boolean IsOpen = false
+	property boolean IsCouponOpen = false
+	property boolean IsAdminConsoleOpen = false
+	property integer CouponRequestId = 0
+	property integer CouponPendingRequestId = 0
 	property string PendingConfirm = ""
 	property number ConfirmRemaining = 0
 	property number RefreshRemaining = 0
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
+		-- Initializes menu and coupon windows for this client session.
 		self._T.Screen = nil
+		self._T.CouponScreen = nil
+		self._T.CouponInput = nil
 		self._T.Buttons = {}
 		self._T.Links = {}
 		self._T.OtherWindowOpen = false
+		self.IsAdminConsoleOpen = false
+		self.CouponRequestId = 0
+		self.CouponPendingRequestId = 0
 		_GameSettingsLogic.IsMenuOpen = false
 	end
 
@@ -59,14 +69,15 @@ script GameMenuLogic extends Logic
 		local prototype = window:GetChildByName("FooterCloseButton")
 		if isvalid(prototype) then
 			local layout = {
-				{ Id = "Settings", Y = 70, Label = "설정", OnClick = function() self:OnSettingsClicked() end },
-				{ Id = "Lobby", Y = -30, Label = "로비로 가기", OnClick = function() self:OnLobbyClicked() end },
-				{ Id = "Exit", Y = -130, Label = "게임 종료", OnClick = function() self:OnExitClicked() end }
+				{ Id = "Settings", Y = 100, Label = "설정", OnClick = function() self:OnSettingsClicked() end },
+				{ Id = "Coupon", Y = 10, Label = "쿠폰 입력", OnClick = function() self:OnCouponClicked() end },
+				{ Id = "Lobby", Y = -80, Label = "로비로 가기", OnClick = function() self:OnLobbyClicked() end },
+				{ Id = "Exit", Y = -170, Label = "게임 종료", OnClick = function() self:OnExitClicked() end }
 			}
 			for _, entry in ipairs(layout) do
 				local button = prototype:Clone(entry.Id .. "MenuButton")
 				button:AttachTo(window)
-				button.UITransformComponent.RectSize = Vector2(420, 74)
+				button.UITransformComponent.RectSize = Vector2(420, 70)
 				button.UITransformComponent.anchoredPosition = Vector2(0, entry.Y)
 				_GameUIPolishLogic:FitLabel(button.TextGUIRendererComponent, 26)
 				self._T.Buttons[entry.Id] = button
@@ -77,6 +88,101 @@ script GameMenuLogic extends Logic
 		self._T.Screen = screen
 		_GameUIPolishLogic:HideWindowImmediately(screen)
 		log("[GameMenu] window built")
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean EnsureCouponWindow()
+		-- Builds the coupon number window once, from the same settings-window pieces as the menu.
+		if isvalid(self._T.CouponScreen) then return true end
+		local root = _EntityService:GetEntityByPath("/ui/SettingsUI")
+		local source = _EntityService:GetEntityByPath("/ui/SettingsUI/Screen")
+		if isvalid(root) == false or isvalid(source) == false then
+			log_warning("[Coupon] settings window missing; coupon window unavailable")
+			return false
+		end
+		local screen = source:Clone("CouponScreen")
+		if isvalid(screen) == false then return false end
+		screen:AttachTo(root)
+		local window = screen:GetChildByName("Window")
+		if isvalid(window) == false then screen:Destroy() return false end
+		for _, child in ipairs(window.Children:ToTable()) do
+			local keep = child.Name == "Title" or child.Name == "HeaderLine" or child.Name == "CloseButton" or child.Name == "FooterCloseButton"
+			if keep == false then child:Destroy() end
+		end
+		window.UITransformComponent.RectSize = Vector2(560, 360)
+
+		local title = window:GetChildByName("Title")
+		local line = window:GetChildByName("HeaderLine")
+		local status = nil
+		local field = nil
+		if isvalid(line) then field = line:Clone("CouponInput") end
+		if isvalid(title) then status = title:Clone("CouponStatus") end
+		if isvalid(title) then
+			title.UITransformComponent.anchoredPosition = Vector2(0, 116)
+			title.TextGUIRendererComponent.Text = "쿠폰 입력"
+			title.TextGUIRendererComponent.HorizontalAlignment = TextHorizontalAlignmentOption.Center
+		end
+		if isvalid(line) then
+			line.UITransformComponent.anchoredPosition = Vector2(0, 72)
+			line.UITransformComponent.RectSize = Vector2(500, 2)
+		end
+		local close = window:GetChildByName("CloseButton")
+		if isvalid(close) then
+			close.UITransformComponent.anchoredPosition = Vector2(226, 116)
+			self:Connect(close, function() self:CloseCoupon() end)
+		end
+
+		if isvalid(field) then
+			field:AttachTo(window)
+			field.UITransformComponent.RectSize = Vector2(420, 64)
+			field.UITransformComponent.anchoredPosition = Vector2(0, 16)
+			field.SpriteGUIRendererComponent.Color = Color(0.1, 0.12, 0.19, 1)
+			local text = field:AddComponent("TextGUIRendererComponent")
+			local input = field:AddComponent("TextGUIRendererInputComponent")
+			if isvalid(title) then text.Font = title.TextGUIRendererComponent.Font end
+			-- The input component draws the typed text itself; the plain text component must not add its default.
+			text.Text = ""
+			text.FontSize = 26
+			text.FontColor = Color(0.95, 0.96, 0.98, 1)
+			text.HorizontalAlignment = TextHorizontalAlignmentOption.Center
+			text.VerticalAlignment = TextVerticalAlignmentOption.Middle
+			input.PlaceHolder = "쿠폰 번호를 입력하세요"
+			input.PlaceHolderColor = Color(0.6, 0.64, 0.72, 0.7)
+			input.CharacterLimit = 32
+			self._T.CouponInput = input
+		end
+		if isvalid(status) then
+			status:AttachTo(window)
+			status.UITransformComponent.RectSize = Vector2(420, 34)
+			status.UITransformComponent.anchoredPosition = Vector2(0, -42)
+			status.TextGUIRendererComponent.HorizontalAlignment = TextHorizontalAlignmentOption.Center
+			status.TextGUIRendererComponent.FontColor = Color(0.95, 0.72, 0.28, 1)
+			status.TextGUIRendererComponent.Text = ""
+			_GameUIPolishLogic:FitLabel(status.TextGUIRendererComponent, 20)
+			self._T.CouponStatus = status
+		end
+
+		local prototype = window:GetChildByName("FooterCloseButton")
+		if isvalid(prototype) then
+			local buttons = {
+				{ Id = "CouponConfirm", X = -110, Label = "확인", OnClick = function() self:OnCouponSubmit() end },
+				{ Id = "CouponCancel", X = 110, Label = "취소", OnClick = function() self:CloseCoupon() end }
+			}
+			for _, entry in ipairs(buttons) do
+				local button = prototype:Clone(entry.Id .. "Button")
+				button:AttachTo(window)
+				button.UITransformComponent.RectSize = Vector2(200, 64)
+				button.UITransformComponent.anchoredPosition = Vector2(entry.X, -114)
+				self._T.Buttons[entry.Id] = button
+				self:StyleButton(entry.Id, entry.Label, true, false)
+				self:Connect(button, entry.OnClick)
+			end
+			prototype:Destroy()
+		end
+		self._T.CouponScreen = screen
+		_GameUIPolishLogic:HideWindowImmediately(screen)
+		log("[Coupon] window built")
 		return true
 	end
 
@@ -123,6 +229,7 @@ script GameMenuLogic extends Logic
 	@ExecSpace("ClientOnly")
 	method void RefreshButtons()
 		self:StyleButton("Settings", "설정", true, false)
+		self:StyleButton("Coupon", "쿠폰 입력", true, false)
 		-- Returning to the lobby only makes sense while a run is in progress.
 		local lobbyLabel = self.PendingConfirm == "lobby" and "다시 누르면 로비로 이동합니다" or "로비로 가기"
 		self:StyleButton("Lobby", lobbyLabel, self:IsLocalPlayerInLobby() == false, self.PendingConfirm == "lobby")
@@ -146,6 +253,90 @@ script GameMenuLogic extends Logic
 	end
 
 	@ExecSpace("ClientOnly")
+	method void OpenCoupon()
+		-- Shows the shared input window in player or operator mode.
+		if self.IsCouponOpen or self:EnsureCouponWindow() == false then return end
+		self.IsCouponOpen = true
+		self.CouponPendingRequestId = 0
+		-- Gameplay keys stay paused while a number is typed.
+		_GameSettingsLogic.IsMenuOpen = true
+		if self._T.CouponInput ~= nil then self._T.CouponInput.Text = "" end
+		local window = self._T.CouponScreen:GetChildByName("Window")
+		local title = isvalid(window) and window:GetChildByName("Title") or nil
+		if isvalid(title) then
+			title.TextGUIRendererComponent.Text = self.IsAdminConsoleOpen and "쿠폰 관리" or "쿠폰 입력"
+		end
+		if self._T.CouponInput ~= nil then
+			self._T.CouponInput.PlaceHolder = self.IsAdminConsoleOpen and "create CODE COMMON JOB_TOKEN 1" or "쿠폰 번호를 입력하세요"
+			self._T.CouponInput.CharacterLimit = self.IsAdminConsoleOpen and 96 or 32
+		end
+		self:StyleButton("CouponConfirm", self.IsAdminConsoleOpen and "실행" or "확인", true, false)
+		self:SetCouponStatus(self.IsAdminConsoleOpen and "create / info / revoke 명령을 입력하세요" or "")
+		_GameUIPolishLogic:BringUIGroupToFront(_EntityService:GetEntityByPath("/ui/SettingsUI"))
+		_GameUIPolishLogic:SetWindowVisible(self._T.CouponScreen, true)
+		log("[Coupon] open")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OpenAdminConsole()
+		-- The server grants entry; the server separately authorizes every command.
+		if self.IsCouponOpen then self:CloseCoupon() end
+		if self.IsOpen then self:CloseMenu() end
+		self.IsAdminConsoleOpen = true
+		self:OpenCoupon()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseCoupon()
+		-- Hides either coupon mode and clears the operator state.
+		if self.IsCouponOpen == false then return end
+		self.IsCouponOpen = false
+		self.IsAdminConsoleOpen = false
+		self.CouponPendingRequestId = 0
+		_GameSettingsLogic.IsMenuOpen = false
+		_GameUIPolishLogic:SetWindowVisible(self._T.CouponScreen, false)
+		log("[Coupon] close")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetCouponStatus(string message)
+		local status = self._T.CouponStatus
+		if isvalid(status) then status.TextGUIRendererComponent.Text = message end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCouponSubmit()
+		-- Sends operator commands or one account-bound redemption request to the server.
+		if self.CouponPendingRequestId ~= 0 then return end
+		local raw = self._T.CouponInput ~= nil and self._T.CouponInput.Text or ""
+		local code = string.match(raw or "", "^%s*(.-)%s*$") or ""
+		if code == "" then
+			self:SetCouponStatus(self.IsAdminConsoleOpen and "명령을 입력해 주세요." or "쿠폰 번호를 입력해 주세요.")
+			return
+		end
+		if self.IsAdminConsoleOpen then
+			self:SetCouponStatus("처리 중...")
+			_CouponServiceLogic:RequestAdminCommand(code)
+			return
+		end
+		self.CouponRequestId = self.CouponRequestId + 1
+		self.CouponPendingRequestId = self.CouponRequestId
+		self:SetCouponStatus("보상 지급 중...")
+		self:StyleButton("CouponConfirm", "처리 중...", false, false)
+		_CouponServiceLogic:RequestRedeemCoupon(code, self.CouponRequestId)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReceiveCouponRedemption(integer requestId, boolean success, string message)
+		-- Ignores stale responses after closing/reopening and restores the submit button after persistence.
+		if requestId ~= self.CouponPendingRequestId then return end
+		self.CouponPendingRequestId = 0
+		if not self.IsCouponOpen or self.IsAdminConsoleOpen then return end
+		self:StyleButton("CouponConfirm", "확인", true, false)
+		self:SetCouponStatus(message)
+	end
+
+	@ExecSpace("ClientOnly")
 	method void CloseMenu()
 		if self.IsOpen == false then return end
 		self.IsOpen = false
@@ -163,6 +354,12 @@ script GameMenuLogic extends Logic
 		local controller = _EntityService:GetEntityByPath("/ui/SettingsUI/Controller")
 		local settings = isvalid(controller) and controller:GetComponent("script.SettingsUIComponent") or nil
 		if settings ~= nil then settings:SetOpen(true) end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnCouponClicked()
+		self:CloseMenu()
+		self:OpenCoupon()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -204,10 +401,11 @@ script GameMenuLogic extends Logic
 	@ExecSpace("ClientOnly")
 	method boolean IsEscWindowOpen()
 		-- Windows that close themselves on Esc; the same key press must not also open the menu.
-		if _GameSettingsLogic.IsWindowOpen or _GameSettingsLogic.IsCapturingKey then return true end
+		if _GameSettingsLogic.IsWindowOpen or _GameSettingsLogic.IsCapturingKey or self.IsCouponOpen then return true end
 		if _UnionCoinShopLogic.IsOpen or _LobbyCodexLogic:IsOpen() or _LobbyCharacterSelectionLogic:IsOpen() or _UnionSystemUILogic:IsOpen() or _RunRelicInventoryUILogic.IsOpen then
 			return true
 		end
+		if _SkillTreeUILogic:IsOpen() then return true end
 		if _SkillTestLogic ~= nil and _SkillTestLogic.KeyboardCaptured == true then return true end
 		local skillTest = _EntityService:GetEntityByPath("/ui/SkillTestUI/Controller")
 		local panel = isvalid(skillTest) and skillTest:GetComponent("script.SkillTestUIComponent") or nil
@@ -242,9 +440,19 @@ script GameMenuLogic extends Logic
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
 	handler HandleMenuKeyDown(KeyDownEvent event)
+		if event.key == KeyboardKey.Backslash then
+			if self.IsOpen == false and self.IsCouponOpen == false and self:IsEscWindowOpen() == false then
+				_CouponServiceLogic:RequestAdminAccess()
+			end
+			return
+		end
 		if event.key ~= KeyboardKey.Escape then return end
 		-- A key capture in the settings window uses Esc to cancel.
 		if _GameSettingsLogic.IsCapturingKey then return end
+		if self.IsCouponOpen then
+			self:CloseCoupon()
+			return
+		end
 		if self.IsOpen then
 			self:CloseMenu()
 			return
@@ -261,6 +469,9 @@ script GameMenuLogic extends Logic
 		end
 		self._T.Links = {}
 		self.IsOpen = false
+		self.IsCouponOpen = false
+		self.IsAdminConsoleOpen = false
+		self.CouponPendingRequestId = 0
 		_GameSettingsLogic.IsMenuOpen = false
 	end
 
