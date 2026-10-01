@@ -56,13 +56,44 @@ script MapTeleportManager extends Logic
 	@ExecSpace("ServerOnly")
 	method boolean ConsumePendingTransfer(table pending)
 		-- Claims only the latest request while the same player remains in its original map and run.
+		local current = self:IsPendingTransferCurrent(pending)
+		if self.PendingTransfers[pending.UserId] == pending then self.PendingTransfers[pending.UserId] = nil end
+		return current
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsPendingTransferCurrent(table pending)
 		if self.PendingTransfers[pending.UserId] ~= pending then return false end
-		self.PendingTransfers[pending.UserId] = nil
 		local playerEntity = pending.PlayerEntity
 		if isvalid(playerEntity) == false or isvalid(pending.SourceMap) == false or playerEntity.CurrentMap ~= pending.SourceMap then return false end
 		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
 		local runSequence = runState ~= nil and runState.RunSequence or -1
 		return runSequence == pending.RunSequence
+	end
+
+	@ExecSpace("ServerOnly")
+	method void WaitForDestination(table pending, string destination, Vector3 position, string source, integer attempts)
+		if not self:IsPendingTransferCurrent(pending) then
+			if self.PendingTransfers[pending.UserId] == pending then self.PendingTransfers[pending.UserId] = nil end
+			return
+		end
+		local map = _EntityService:GetEntityByPath("/maps/" .. destination)
+		if isvalid(map) and map.MapComponent ~= nil then
+			if self:ConsumePendingTransfer(pending) then self:TeleportPlayer(pending.PlayerEntity, destination, position, source) end
+			return
+		end
+		if attempts <= 0 then
+			self.PendingTransfers[pending.UserId] = nil
+			self:NotifyUnavailableDestination(destination, pending.UserId)
+			return
+		end
+		pending.TimerId = _TimerService:SetTimerOnce(function()
+			self:WaitForDestination(pending, destination, position, source, attempts - 1)
+		end, 0.5)
+		if pending.TimerId == 0 then
+			self.PendingTransfers[pending.UserId] = nil
+			self:NotifyUnavailableDestination(destination, pending.UserId)
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -85,6 +116,15 @@ script MapTeleportManager extends Logic
 			return result
 		end
 
+		-- Wait in the source map for up to ten seconds without replaying reward logic.
+		local destination = _EntityService:GetEntityByPath("/maps/" .. destinationMapName)
+		if not isvalid(destination) or destination.MapComponent == nil then
+			local waiting = self:CapturePendingTransfer(playerEntity, result.Source)
+			self:WaitForDestination(waiting, destinationMapName, targetPosition, result.Source, 20)
+			result.Success = self.PendingTransfers[waiting.UserId] == waiting
+			result.Reason = result.Success and "WAITING_FOR_DESTINATION" or "DESTINATION_MAP_UNAVAILABLE"
+			return result
+		end
 		local pending = self:CapturePendingTransfer(playerEntity, result.Source)
 		self:PrepareClientForMapTransfer(result.Source, playerEntity.PlayerComponent.UserId)
 		local targetPlayer = playerEntity
@@ -95,6 +135,16 @@ script MapTeleportManager extends Logic
 			if self:ConsumePendingTransfer(pending) == false then
 				log_warning("[MapNavigation] delayed transfer cancelled map=" .. targetMapName .. " source=" .. transferSource .. " reason=STALE_REQUEST")
 				return
+			end
+			-- Reward screens use this boundary directly, without the lobby gateway.
+			-- Record arrival eligibility only for the prepared battle's destination,
+			-- never for the intermediate reward map visited before it.
+			local entry = targetPlayer:GetComponent("script.BattleEntryStateComponent")
+			if entry ~= nil and entry.EntryState == "PREPARED" then
+				local route = _StageMapRouteRepositoryLogic:GetMapRoute(entry.StageId)
+				if route ~= nil and route.Success == true and route.MapId == targetMapName then
+					entry:TryMarkTransferRequested(entry.RequestId)
+				end
 			end
 			_TeleportService:TeleportToMapPosition(targetPlayer, targetMapPosition, targetMapName)
 			log("[MapNavigation] transfer requested player=" .. targetPlayer.Name .. " map=" .. targetMapName .. " pos=" .. tostring(targetMapPosition) .. " source=" .. transferSource)
@@ -159,6 +209,13 @@ script MapTeleportManager extends Logic
 		log("[MapNavigation] spawn transfer scheduled player=" .. playerEntity.Name .. " path=" .. destinationEntityPath .. " delay=" .. tostring(self.PreTransferUiDelay) .. " source=" .. result.Source)
 		return result
 	end
+
+
+	@ExecSpace("Client")
+	method void NotifyUnavailableDestination(string destination)
+		_GameUIPolishLogic:ShowToast("목적지 맵을 불러오지 못했습니다", "잠시 후 다시 시도해 주세요. 현재 맵에 머무릅니다.")
+	end
+
 
 	@ExecSpace("Client")
 	method void PrepareClientForMapTransfer(string source)

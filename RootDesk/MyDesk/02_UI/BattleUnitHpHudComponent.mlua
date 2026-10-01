@@ -137,6 +137,10 @@ script BattleUnitHpHudComponent extends Component
 		-- Tracks battle units every frame and refreshes pool assignment at a small fixed interval.
 		local player = _UserService.LocalPlayer
 		local session = self:GetBattleSession(player)
+		if isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap.Name == "lobby" then
+			self:UpdateLobbyName(player)
+			return
+		end
 		local state = self._T.HudState
 		if _RunRelicInventoryUILogic.IsOpen or _GameSettingsLogic.IsWindowOpen or _GameSettingsLogic.IsMenuOpen
 			or session == nil or session.BattleResult ~= "" or state == nil or state.Success ~= true or state.ContextVisible ~= true
@@ -200,10 +204,10 @@ script BattleUnitHpHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method any GetBattleSession(Entity player)
 		-- Reuses the existing map-scoped battle session as the visibility boundary.
-		if isvalid(player) == false or player.CurrentMap == nil then
-			return nil
-		end
-		return player.CurrentMap:GetComponent("script.BattleSessionComponent")
+		if not isvalid(player) then return nil end
+		local map = player.CurrentMap
+		if not isvalid(map) then return nil end
+		return map:GetComponent("script.BattleSessionComponent")
 	end
 
 	@ExecSpace("ClientOnly")
@@ -272,6 +276,7 @@ script BattleUnitHpHudComponent extends Component
 			return
 		end
 		local changed = view.UnitId ~= unit.UnitId or view.UnitEntity ~= unitEntity
+		if changed then self:ClearView(view) end
 		view.UnitEntity = unitEntity
 		view.UnitId = unit.UnitId
 		if changed then
@@ -292,6 +297,15 @@ script BattleUnitHpHudComponent extends Component
 		if view == nil then
 			return
 		end
+		for child, enabled in pairs(view.NameOnlyChildren or {}) do
+			if isvalid(child) then child.Enable = enabled end
+		end
+		view.NameOnlyChildren = nil
+		if view.NativeNameTag ~= nil and isvalid(view.NativeNameTag.Entity) then
+			view.NativeNameTag.Enable = view.NativeNameTagEnabled
+		end
+		view.NativeNameTag = nil
+		view.NativeNameTagEnabled = nil
 		if isvalid(view.Root) then
 			view.Root.Enable = false
 		end
@@ -300,6 +314,58 @@ script BattleUnitHpHudComponent extends Component
 		view.LastHpText = ""
 		view.LastNameText = ""
 		view.LastPipSignature = ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateLobbyName(Entity player)
+		-- Reuse the authored player name line without exposing battle HP in the lobby.
+		local view = self._T.PlayerView
+		if view == nil or not isvalid(view.Root) or not isvalid(view.NameText) then return end
+		if self._T.ContextMap ~= player.CurrentMap or view.UnitEntity ~= player then
+			self:HideAllBars("LOBBY_NAME")
+			self._T.ContextMap = player.CurrentMap
+			view.UnitEntity = player
+			view.NameOnlyChildren = {}
+			for _, key in ipairs({"Frame", "Shadow", "Empty", "Fill", "Highlight", "HpText", "PipLayer"}) do
+				local child = view[key]
+				if isvalid(child) then
+					view.NameOnlyChildren[child] = child.Enable
+					child.Enable = false
+				end
+			end
+		end
+		local transform = player.TransformComponent
+		if transform == nil or view.Root.UITransformComponent == nil then return end
+		local position = transform.WorldPosition
+		local renderer = player.AvatarRendererComponent
+		if renderer ~= nil then
+			local visual = renderer:GetAvatarRootEntity()
+			if isvalid(visual) and visual.TransformComponent ~= nil then position = visual.TransformComponent.WorldPosition end
+		end
+		local screen = _UILogic:WorldToScreenPosition(Vector2(position.x, position.y + self.PlayerHpBarOffsetY + self.HpPipOffsetY))
+		local ui = _UILogic:ScreenToUIPosition(screen)
+		view.Root.UITransformComponent.anchoredPosition = Vector2(ui.x, ui.y - 28)
+		view.Root.Enable = renderer == nil or renderer.Enable ~= false
+		self:UpdatePlayerName(view)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdatePlayerName(table view)
+		local nativeName = view.UnitEntity.NameTagComponent
+		if nativeName == nil or not isvalid(view.NameText) or view.NameText.TextGUIRendererComponent == nil then return end
+		if view.NativeNameTag == nil then
+			view.NativeNameTag = nativeName
+			view.NativeNameTagEnabled = nativeName.Enable
+		end
+		local name = nativeName.Name or ""
+		if name == "" and view.UnitEntity.PlayerComponent ~= nil then name = view.UnitEntity.PlayerComponent.Nickname or "" end
+		if view.LastNameText ~= name then
+			view.NameText.TextGUIRendererComponent.Text = name
+			view.LastNameText = name
+		end
+		view.NameText.Enable = view.NativeNameTagEnabled
+		view.NameText.TextGUIRendererComponent.Enable = view.NativeNameTagEnabled
+		nativeName.Enable = false
 	end
 
 	@ExecSpace("ClientOnly")
@@ -352,15 +418,18 @@ script BattleUnitHpHudComponent extends Component
 			return
 		end
 		local worldPosition = transform.WorldPosition
+		if view.UnitEntity.AvatarRendererComponent ~= nil then
+			local visual = view.UnitEntity.AvatarRendererComponent:GetAvatarRootEntity()
+			if isvalid(visual) and visual.TransformComponent ~= nil then
+				worldPosition = visual.TransformComponent.WorldPosition
+			end
+		end
 		local screenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y + offsetY))
 		local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
 		if view == self._T.PlayerView then
 			-- Reserve a readable name line between the feet and the player's HP pips.
 			uiPosition = Vector2(uiPosition.x, uiPosition.y - 28)
-			if isvalid(view.NameText) then
-				-- The native name tag already displays the player nickname.
-				view.NameText.Enable = false
-			end
+			self:UpdatePlayerName(view)
 		end
 		view.Root.UITransformComponent.anchoredPosition = uiPosition
 		self:RefreshViewVisual(view, unit, delta)

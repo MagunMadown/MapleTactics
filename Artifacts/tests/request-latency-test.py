@@ -40,6 +40,9 @@ lua.globals().tooltipMethods = methods(
 lua.globals().sessionMethods = methods(
     "RootDesk/MyDesk/01_Combat/Components/Shared/BattleSessionComponent.mlua", {"OnUpdate"},
 )
+lua.globals().navigationMethods = methods(
+    "RootDesk/MyDesk/02_UI/MapTeleportManager.mlua", {"TeleportPlayer"},
+)
 lua.globals().shopMethods = methods(
     "RootDesk/MyDesk/02_UI/RunShopUIComponent.mlua",
     {"SendUnionAction", "ReceiveUnionShop", "UpdateUnionRequestFeedback", "OnUpdate"},
@@ -162,7 +165,12 @@ active.HudRelicSnapshot="previous"
 refreshes=0
 active:OnUpdate(1/60)
 assert(refreshes==0 and active.HudRelicSnapshot=="")
-local incoming={CurrentMap=activeMap,GetComponent=function() return {EntryState="PREPARED",RequestId=2,StageId="stage_1"} end}
+local entry={EntryState="PREPARED",RequestId=2,LastTransferRequestId=2,StageId="stage_1"}
+local incoming={CurrentMap=activeMap,GetComponent=function() return entry end}
+_BattleGatewayLogic={}
+_BattleGatewayLogic.ValidatePreparedBattleDestination=function(_,player,session)
+    return {Success=player.CurrentMap==session.Entity and entry.StageId=="stage_1"}
+end
 active.PlayerExitObservedAfterBattle=true
 active.LastInitializedEntryRequestId=1
 active._T.EntryUserScanRemaining=0
@@ -170,6 +178,70 @@ _UserService.GetUsersByMapComponent=function() return {incoming} end
 active:OnUpdate(1/60)
 assert(active.PlayerEntity==incoming and refreshes==5, "re-entry must still resume")
 print("PASS session: 19 empty maps, active update, departed map, prepared re-entry")
+
+-- Re-entry must not depend on observing an empty map between two visits.
+local function pollEntry(phase, result, state, transferId, stage, expected)
+    local s,m=newSession()
+    s.EntryPolicyResolved=true
+    s.BattlePhase=phase
+    s.BattleResult=result
+    s.LastInitializedEntryRequestId=1
+    local calls=0
+    s.OnMapEnter=function() calls=calls+1 end
+    s.TryStartBattle=function() end
+    entry.EntryState=state
+    entry.LastTransferRequestId=transferId
+    entry.StageId=stage
+    incoming.CurrentMap=m
+    if phase=="Victory" then s.PlayerEntity=incoming end
+    _UserService.GetUsersByMapComponent=function() return {incoming} end
+    s:OnUpdate(0.16)
+    assert(calls==expected, phase.."/"..state.."/"..stage..": "..calls)
+end
+pollEntry("Victory","VICTORY","PREPARED",2,"stage_1",1)
+pollEntry("Setup","","PREPARED",2,"stage_1",1)
+pollEntry("Victory","VICTORY","PREPARED",1,"stage_1",0)
+pollEntry("Victory","VICTORY","PREPARED",2,"other_map_stage",0)
+pollEntry("Setup","","INITIALIZING",2,"stage_1",0)
+pollEntry("Setup","","STARTED",2,"stage_1",0)
+print("PASS entry: missed exit, idle setup, reward guard, destination guard, no duplicate initialization")
+
+-- Reward -> boss uses direct navigation, so it must also arm the entry poll.
+log_warning=function() end
+local marked,teleports=0,0
+local prepared={EntryState="PREPARED",StageId="henesys_stage_04",RequestId=3,
+    TryMarkTransferRequested=function(self,id) marked=marked+1; self.LastTransferRequestId=id end}
+local traveler={Name="tester",PlayerComponent={UserId="test"},GetComponent=function() return prepared end}
+local nav=attach({PreTransferUiDelay=0.15},navigationMethods)
+nav.CapturePendingTransfer=function() return {} end
+nav.PrepareClientForMapTransfer=function() end
+nav.WatchTransferArrival=function() end
+nav.ConsumePendingTransfer=function() return true end
+local delayed
+_EntityService={GetEntityByPath=function() return {MapComponent={}} end}
+_TimerService={SetTimerOnce=function(_,callback) delayed=callback; return 1 end}
+_TeleportService={TeleportToMapPosition=function() teleports=teleports+1 end}
+_StageMapRouteRepositoryLogic={GetMapRoute=function() return {Success=true,MapId="henesys_boss"} end}
+nav:TeleportPlayer(traveler,"new_skill_stage",{},"VICTORY_REWARD")
+delayed()
+assert(marked==0 and teleports==1,"reward transfer must not arm battle initialization")
+nav:TeleportPlayer(traveler,"henesys_boss",{},"NEW_SKILL_STAGE_COMPLETE")
+assert(marked==0,"do not arm a transfer before its stale-request check")
+delayed()
+assert(marked==1 and prepared.LastTransferRequestId==3 and teleports==2)
+nav.ConsumePendingTransfer=function() return false end
+nav:TeleportPlayer(traveler,"henesys_boss",{},"NEW_SKILL_STAGE_COMPLETE")
+delayed()
+assert(marked==1 and teleports==2,"stale transfer must not arm or teleport")
+local waiting=false
+nav.PendingTransfers={}
+nav.CapturePendingTransfer=function() local p={UserId='test'}; nav.PendingTransfers.test=p; return p end
+nav.WaitForDestination=function() waiting=true end
+_EntityService.GetEntityByPath=function() return nil end
+local rejectedResult=nav:TeleportPlayer(traveler,"new_upgrade_stage",{},"VICTORY_REWARD")
+assert(rejectedResult.Success and rejectedResult.Reason=="WAITING_FOR_DESTINATION" and waiting)
+assert(teleports==2,'unavailable map must never detach the player')
+print("PASS navigation: reward -> boss entry marker, intermediate reward guard, stale transfer guard")
 
 -- A durable purchase sends immediately without rebuilding/loading the product lists.
 local sent=0

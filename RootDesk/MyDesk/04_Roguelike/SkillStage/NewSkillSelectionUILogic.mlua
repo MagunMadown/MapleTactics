@@ -47,6 +47,10 @@ script NewSkillSelectionUILogic extends Logic
 		local playerEntity = _UserService.LocalPlayer
 		local mapName = ""
 		if isvalid(playerEntity) and isvalid(playerEntity.CurrentMap) then mapName = playerEntity.CurrentMap.Name end
+		if mapName == self.RewardMapName then
+			local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+			if run == nil or run.RewardSelectionContext ~= tostring(run.RunSequence) .. ":" .. run.LastBattleRecordKey .. "|NEW" then mapName = "" end
+		end
 		if mapName ~= self.ActiveMapName then
 			self.ActiveMapName = mapName
 			self.RequestRevision = self.RequestRevision + 1
@@ -217,7 +221,7 @@ script NewSkillSelectionUILogic extends Logic
 						if isvalid(preview) then
 							self:ReleasePreviewFit(preview)
 							preview.Enable = hasPreview
-							if hasPreview then self:SetPreviewThumbnail(preview, offer.PreviewRuid) end
+							if hasPreview then self:PlayFittedPreview(preview, offer.PreviewRuid) end
 						end
 						icon.UITransformComponent.RectSize = hasPreview and Vector2(48,48) or Vector2(160,160)
 						icon.UITransformComponent.anchoredPosition = hasPreview and Vector2(-140,100) or Vector2(0,0)
@@ -497,11 +501,7 @@ script NewSkillSelectionUILogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void SetCardHighlight(integer slotIndex, boolean highlighted)
-		-- Highlights the active card and plays only its authored skill effect.
-		if highlighted and self.HoveredSlot ~= 0 and self.HoveredSlot ~= slotIndex then
-			self:SetPreviewPlaying(self.HoveredSlot, false)
-		end
-		self:SetPreviewPlaying(slotIndex, highlighted)
+		-- Hover only changes selection feedback; both previews keep their playback position.
 		if highlighted then self.HoveredSlot = slotIndex
 		elseif self.HoveredSlot == slotIndex then self.HoveredSlot = 0 end
 		local frame = _EntityService:GetEntityByPath(self.GroupPath .. "/Screen/Cards/Choice" .. tostring(slotIndex) .. "/HoverFrame")
@@ -767,7 +767,7 @@ script NewSkillSelectionUILogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void PlayFittedPreview(Entity preview, string ruid)
-		-- Fits all animation frames at one scale; world pivots cannot push UI art into the mask.
+		-- Fit the complete clip once. Native playback preserves frame pivots without UI relayout.
 		self:ReleasePreviewFit(preview)
 		self._T.PreviewFits = self._T.PreviewFits or {}
 		self._T.PreviewSizes = self._T.PreviewSizes or {}
@@ -777,7 +777,7 @@ script NewSkillSelectionUILogic extends Logic
 		_ResourceService:PreloadAsync({ruid}, function()
 			if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
 			local sizes = self._T.PreviewSizes[ruid]
-			if sizes == nil then
+			if sizes == nil or sizes.minX == nil then
 				-- Sprite previews are valid UI resources, but cannot be loaded as AnimationClip.
 				local typeOk, resourceType = pcall(function() return _ResourceService:GetTypeAndWait(ruid) end)
 				if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
@@ -787,17 +787,24 @@ script NewSkillSelectionUILogic extends Logic
 				end
 				local ok, clip = pcall(function() return _ResourceService:LoadAnimationClipAndWait(ruid) end)
 				if ok and clip ~= nil and clip.IsLoadComplete then
-					sizes = { width = 0, height = 0, frames = {} }
+					sizes = { minX = math.huge, minY = math.huge, maxX = -math.huge, maxY = -math.huge, frames = {} }
 					for _, frame in ipairs(clip.Frames:ToTable()) do
 						local sprite = frame.FrameSprite
 						if sprite ~= nil and sprite.IsLoadComplete and sprite.Width > 0 and sprite.Height > 0 then
 							sizes.frames[frame.FrameIndex] = Vector2(sprite.Width, sprite.Height)
-							sizes.width = math.max(sizes.width, sprite.Width)
-							sizes.height = math.max(sizes.height, sprite.Height)
+							local pivot = sprite.PivotPixel
+							sizes.minX = math.min(sizes.minX, -pivot.x)
+							sizes.minY = math.min(sizes.minY, -pivot.y)
+							sizes.maxX = math.max(sizes.maxX, sprite.Width - pivot.x)
+							sizes.maxY = math.max(sizes.maxY, sprite.Height - pivot.y)
 						else
 							sizes = nil
 							break
 						end
+					end
+					if sizes ~= nil then
+						sizes.width = sizes.maxX - sizes.minX
+						sizes.height = sizes.maxY - sizes.minY
 					end
 					if sizes ~= nil and sizes.width > 0 and sizes.height > 0 then
 						self._T.PreviewSizes[ruid] = sizes
@@ -814,31 +821,19 @@ script NewSkillSelectionUILogic extends Logic
 				return
 			end
 			local scale = math.min(state.box.x / sizes.width, state.box.y / sizes.height)
-			local applyFrame = function(frameIndex)
-				if not isvalid(preview) or self._T.PreviewFits[preview.Id] ~= state then return end
-				local size = sizes.frames[frameIndex]
-				if size ~= nil then
-					preview.UITransformComponent.RectSize = Vector2(size.x * scale, size.y * scale)
-				end
-			end
 			local renderer = preview.SpriteGUIRendererComponent
 			renderer.Type = ImageType.Simple
-			-- None ignores sprite pivots; each frame's rect already preserves its native aspect.
-			renderer.PreserveSprite = PreserveSpriteType.None
-			renderer.LocalPosition = Vector2(0, 0)
-			renderer.LocalScale = Vector2(1, 1)
+			renderer.PreserveSprite = PreserveSpriteType.NativeSize
+			renderer.LocalPosition = Vector2(-(sizes.minX + sizes.maxX) * 0.5 * scale, -(sizes.minY + sizes.maxY) * 0.5 * scale)
+			renderer.LocalScale = Vector2(scale, scale)
 			renderer.Color = Color(1, 1, 1, 1)
 			renderer.StartFrameIndex = 0
 			renderer.EndFrameIndex = 2147483647
 			renderer.AnimClipPlayType = SpriteAnimClipPlayType.Loop
 			renderer.PlayRate = 1
-			state.eventHandler = preview:ConnectEvent(SpriteGUIAnimPlayerChangeFrameEvent, function(event)
-				applyFrame(event.FrameIndex)
-		end)
-		applyFrame(0)
-		renderer.ImageRUID = DataRef(ruid)
-		preview.Enable = true
-		log("[SkillPreviewFit] ruid=" .. ruid .. " bounds=" .. tostring(sizes.width) .. "x" .. tostring(sizes.height) .. " scale=" .. tostring(scale))
+			renderer.ImageRUID = DataRef(ruid)
+			preview.Enable = true
+			log("[SkillPreviewFit] ruid=" .. ruid .. " bounds=" .. tostring(sizes.width) .. "x" .. tostring(sizes.height) .. " scale=" .. tostring(scale))
 		end)
 	end
 
