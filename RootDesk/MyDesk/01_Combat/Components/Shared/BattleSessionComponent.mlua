@@ -1989,9 +1989,21 @@ script BattleSessionComponent extends Component
 		self.UtilityRemainingCooldown = runtime:GetRemainingCooldown(definition.SkillId)
 		self:PublishTurnStateSnapshot("UTILITY_EXECUTED")
 		local duration = math.max(0.1, definition.ActionDuration) / self:GetSkillSpeedMultiplier()
-		self.ActionTimerId = _TimerService:SetTimerOnce(function()
+		local expectedEntry = self.EntryRequestId
+		local expectedTurn = self.TurnState.TurnNumber
+		local expectedPlayer = self.PlayerEntity
+		local completeUtility = function()
+			if isvalid(self.Entity) == false or isvalid(expectedPlayer) == false
+				or self.PlayerEntity ~= expectedPlayer or expectedPlayer.CurrentMap ~= self.Entity
+				or self.EntryRequestId ~= expectedEntry or self.TurnState == nil
+				or self.TurnState.TurnNumber ~= expectedTurn then return end
 			self:CompleteQueuedAction("UTILITY", true, result.Reason)
-		end, duration)
+		end
+		self.ActionTimerId = _TimerService:SetTimerOnce(completeUtility, duration)
+		if self.ActionTimerId == 0 then
+			log_warning("[BattlePlayerActionBoundary] utility completion timer unavailable; resolving immediately")
+			completeUtility()
+		end
 		return result
 	end
 
@@ -2315,6 +2327,18 @@ script BattleSessionComponent extends Component
 		if self.BattleResult ~= "" then
 			return
 		end
+		local pending = actionType == "UTILITY" and self._T.PendingClear or nil
+		if pending ~= nil then
+			self._T.PendingClear = nil
+			if pending.Entry == self.EntryRequestId and self.BoardState ~= nil
+				and #self.BoardState:CollectLivingEnemies() == 0 then
+				-- The accepted utility still consumes its action when its impact leaves no enemy round to run.
+				self:AdvanceConsumedPlayerActionEffects("IMMEDIATE_ACTION_COMPLETED")
+				if self.BattleResult ~= "" then return end
+				self:FinishEmptyBattlefield(pending.UnitId, pending.Cause, "Enemy")
+				return
+			end
+		end
 
 		if success == true then
 			self:BeginEnemyTurnFromPlayerAction("IMMEDIATE_ACTION_COMPLETED")
@@ -2327,16 +2351,7 @@ script BattleSessionComponent extends Component
 	method void BeginEnemyTurnFromPlayerAction(string completionReason)
 		-- The authoritative action completion has already happened. Lock the enemy phase now,
 		-- then consume only the presentation handoff that this action still needs.
-		self:RecordRunConsumedPlayerTurn()
-		local playerUnit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
-		if playerUnit ~= nil then playerUnit:AdvanceNegativeStatusTurns() end
-		if self.BoardState ~= nil then
-			for _, enemyEntity in ipairs(self.BoardState:CollectLivingEnemies()) do
-				local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
-				if enemy ~= nil and enemy.BurnTurns > 0 then enemy:AdvanceNegativeStatusTurns() end
-			end
-		end
-		self:AdvancePoisonMists()
+		self:AdvanceConsumedPlayerActionEffects(completionReason)
 		if self.BattleResult ~= "" then return end
 		local handoffDelay = self.PlayerToEnemyBeatDuration
 		if completionReason == "IMMEDIATE_ACTION_COMPLETED" or completionReason == "SKILL_QUEUE_COMPLETED" then
@@ -2349,6 +2364,22 @@ script BattleSessionComponent extends Component
 		self.PendingPlayerToEnemyHandoffDelay = math.max(0.016, math.min(0.12, handoffDelay))
 		log("[BattlePlayerHandoff] player action completed reason=" .. completionReason .. " remainingBeat=" .. tostring(self.PendingPlayerToEnemyHandoffDelay))
 		self:BeginEnemyTurn()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceConsumedPlayerActionEffects(string completionReason)
+		-- Every consumed action spends status duration, including queues that clear a wave without an enemy round.
+		self:RecordRunConsumedPlayerTurn()
+		local playerUnit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
+		if playerUnit ~= nil then playerUnit:AdvanceNegativeStatusTurns() end
+		if self.BoardState ~= nil then
+			for _, enemyEntity in ipairs(self.BoardState:CollectLivingEnemies()) do
+				local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
+				if enemy ~= nil and enemy.BurnTurns > 0 then enemy:AdvanceNegativeStatusTurns() end
+			end
+		end
+		self:AdvancePoisonMists()
+		log("[BattlePlayerActionBoundary] effects advanced reason=" .. completionReason .. " result=" .. self.BattleResult)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4303,6 +4334,7 @@ script BattleSessionComponent extends Component
 			return result
 		end
 		self:ResetPlayerSkillChain("QUEUE_STARTED")
+		self._T.QueueExecutionConsumedAction = false
 		self.CurrentPlayerActionKillCount = 0
 		self:PublishTurnStateSnapshot("SKILL_QUEUE_FROZEN")
 		log("[BattleTileQueue] execution started count=" .. self:GetTileIdCount(self.ExecutingTileIds) .. " capacity=" .. self.TileQueueCapacity .. " turn=" .. self.TurnNumber)
@@ -4434,7 +4466,9 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CompleteTileQueueExecution(boolean success, string reason)
-		-- Clears execution state once, then hands control to the enemy only after the full queue succeeds.
+		-- A rejected first cast is free; once a cast starts applying effects or costs the action is consumed.
+		local consumedAction = success or self._T.QueueExecutionConsumedAction == true
+		self._T.QueueExecutionConsumedAction = nil
 		self._T.RelicRepeatIndex = nil
 		self._T.ReplayingRelicSkill = false
 		local relics = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent") or nil
@@ -4449,7 +4483,7 @@ script BattleSessionComponent extends Component
 		self:CompletePlayerCombatPresentationHandoff(reason)
 		self.TurnState:CompleteSkillQueue(reason)
 		self:PublishTurnStateSnapshot("SKILL_QUEUE_COMPLETED")
-		log("[BattleTileQueue] execution completed success=" .. tostring(success) .. " reason=" .. reason .. " count=" .. executedCount)
+		log("[BattleTileQueue] execution completed success=" .. tostring(success) .. " reason=" .. reason .. " count=" .. executedCount .. " consumedAction=" .. tostring(consumedAction))
 
 		if self.BattleResult ~= "" then
 			return
@@ -4458,12 +4492,13 @@ script BattleSessionComponent extends Component
 		if pending ~= nil then
 			self._T.PendingClear = nil
 			if pending.Entry == self.EntryRequestId and #self.BoardState:CollectLivingEnemies() == 0 then
-				self:RecordRunConsumedPlayerTurn()
+				if consumedAction then self:AdvanceConsumedPlayerActionEffects("SKILL_QUEUE_COMPLETED") end
+				if self.BattleResult ~= "" then return end
 				self:FinishEmptyBattlefield(pending.UnitId, pending.Cause, "Enemy")
 				return
 			end
 		end
-		if success then
+		if consumedAction then
 			self:BeginEnemyTurnFromPlayerAction("SKILL_QUEUE_COMPLETED")
 			return
 		end
@@ -6094,6 +6129,7 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method table RebuildBattleState(string reason)
 		self._T.PendingClear = nil
+		self._T.QueueExecutionConsumedAction = nil
 		self._T.BossDefeated = false
 		self._T.EnemyDeathSettlement = nil
 		-- Clears transient battle state, then rebuilds the selected Stage through the normal spawn path.
@@ -6524,6 +6560,10 @@ script BattleSessionComponent extends Component
 				return { Success = false, Reason = "HEAL_CHARGES_EMPTY" }
 			end
 			if sourceUnit.CurrentHp >= sourceUnit.MaxHp then return { Success = false, Reason = "HP_FULL" } end
+		end
+		if sourceUnitId == "player_01" and self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0 then
+			-- Acceptance precedes burn, charge spending and effects, which cannot be rolled back on a later failure.
+			self._T.QueueExecutionConsumedAction = true
 		end
 		if sourceUnit.BurnDamage > 0 then
 			self:ApplyStatusDamage(sourceUnitId, sourceUnit.BurnDamage, sourceUnit.BurnSourceUnitId, "BURN_CAST")
@@ -7955,11 +7995,14 @@ script BattleSessionComponent extends Component
 				return
 			end
 		end
-		if deathTeam == "Enemy" and not deathIsBoss and self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0 then
-			-- Keep the frozen queue alive so healing/buffs resolve before wave or victory settlement.
-			self:ClearForcedSpawnSchedule("QUEUE_CLEAR_PENDING")
+		local executingQueue = self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0
+		local executingUtility = self.TurnState ~= nil and self.TurnState.IsActionProcessing
+			and self.TurnState.QueuedActionType == "UTILITY"
+		if deathTeam == "Enemy" and ((not deathIsBoss and executingQueue) or executingUtility) then
+			-- Finish the accepted player action before its reserved state is cleared by wave or victory settlement.
+			self:ClearForcedSpawnSchedule(executingUtility and "UTILITY_CLEAR_PENDING" or "QUEUE_CLEAR_PENDING")
 			self._T.PendingClear = { UnitId = unitId, Cause = cause, Entry = self.EntryRequestId }
-			log("[BattleQueueBoundary] clear deferred until queue completion unit=" .. unitId)
+			log("[BattlePlayerActionBoundary] clear deferred action=" .. (executingUtility and "UTILITY" or "SKILL_QUEUE") .. " unit=" .. unitId)
 			return
 		end
 		self:FinishEmptyBattlefield(unitId, cause, deathTeam)
@@ -8053,7 +8096,12 @@ script BattleSessionComponent extends Component
 			elseif self.DropRuntime ~= nil then
 				self.DropRuntime:DiscardPending("BATTLE_DEFEAT")
 			end
+			local resultContext = self:CaptureBattleResultContext()
 			runResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
+			if self:IsBattleResultContextCurrent(resultContext) == false then
+				log_warning("[BattleResult] stale settlement continuation cancelled")
+				return
+			end
 			local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 			if relics ~= nil then relics:EndBattleEffects() end
 			if runResultRecorded == true then
@@ -8087,11 +8135,12 @@ script BattleSessionComponent extends Component
 		self.ResultRecorded = runResultRecorded
 		self.ResultElapsedSeconds = math.max(0, math.floor(_UtilLogic.ElapsedSeconds - self.ResultStartTime))
 		-- ResultGold records gross grants, including overflow conversion, independently of spending.
-		local expectedEntry = self.EntryRequestId
+		local readinessContext = self:CaptureBattleResultContext()
 		self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
+			if self:IsBattleResultContextCurrent(readinessContext) == false then return end
 			self.ResultTransitionTimerId = 0
 			self:WaitForMotionCompletion(function()
-				if self.EntryRequestId == expectedEntry and self.BattleResult ~= "" then
+				if self:IsBattleResultContextCurrent(readinessContext) and self.BattleResult ~= "" then
 					self.ResultReady = true
 					log("[BattleResult] ready for confirmation kills=" .. self.ResultKillCount)
 				end
@@ -8108,16 +8157,15 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void AdvanceWaveAfterMotion(integer clearedWave, integer nextWave)
 		-- Dead entities remain visible until their completed animation and hold have been acknowledged.
-		if self.BattleResult ~= "" or self.CurrentWave ~= clearedWave then
+		if self.BattleResult ~= "" or self.CurrentWave ~= clearedWave or self.TurnState == nil
+			or self.TurnState.BattlePhase ~= "WaveTransition" then
 			return
 		end
 		self.TurnState:OpenPlayerTurn(self.TurnNumber + 1, "NEXT_WAVE")
-		if isvalid(self.PlayerEntity) then
-			local unit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
-			if unit ~= nil then unit.UtilityGuardActive = false end
-		end
 		self:PublishTurnStateSnapshot("NEXT_WAVE")
 		self.StageTurnNumber = self.TurnNumber
+		-- A new wave opens a new player turn even when there were no surviving enemies to act.
+		self:AdvancePlayerSkillCooldowns("PLAYER_TURN_" .. self.TurnNumber)
 		self:SpawnWave(nextWave)
 		if self.CurrentWave == nextWave then
 			self.TurnState:SetPhase("PlayerTurn", "NEXT_WAVE_ACTIVE")
@@ -9510,6 +9558,36 @@ script BattleSessionComponent extends Component
 		combatStats:RecordConsumedTurn(consumptionKey)
 	end
 
+	@ExecSpace("ServerOnly")
+	method table CaptureBattleResultContext()
+		-- A result save may yield; retain only identity fields that normal settlement does not change.
+		local player = self.PlayerEntity
+		if isvalid(player) == false then return nil end
+		local run = player:GetComponent("script.PlayerRunStateComponent")
+		local entryState = player:GetComponent("script.BattleEntryStateComponent")
+		if (run ~= nil and isvalid(run) == false) or (entryState ~= nil and isvalid(entryState) == false) then return nil end
+		return { Player = player, Map = player.CurrentMap, Entry = self.EntryRequestId,
+			Stage = self.StageId, Result = self.BattleResult, Run = run,
+			EntryState = entryState, PlayerEntry = entryState ~= nil and entryState.RequestId or 0,
+			RunLifetime = run ~= nil and run.RunLifetimeRevision or 0,
+			RunSequence = run ~= nil and run.RunSequence or 0 }
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsBattleResultContextCurrent(table context)
+		-- Forfeit, logout, a new run and map transfer invalidate the old save's UI/reward continuation.
+		if context == nil or isvalid(self.Entity) == false or isvalid(context.Player) == false
+			or self.PlayerEntity ~= context.Player or context.Player.CurrentMap ~= context.Map
+			or context.Map ~= self.Entity or self.EntryRequestId ~= context.Entry
+			or self.StageId ~= context.Stage or self.BattleResult ~= context.Result then return false end
+		local run = context.Player:GetComponent("script.PlayerRunStateComponent")
+		local entryState = context.Player:GetComponent("script.BattleEntryStateComponent")
+		if entryState ~= context.EntryState or (entryState ~= nil and (isvalid(entryState) == false
+			or (context.AllowPlayerEntryAdvance ~= true and entryState.RequestId ~= context.PlayerEntry))) then return false end
+		return run == context.Run and (run == nil or (isvalid(run) and run.RunLifetimeRevision == context.RunLifetime
+			and run.RunSequence == context.RunSequence))
+	end
+
 	@ExecSpace("Server")
 	method void RequestContinueResult()
 		-- Only the registered player can advance an ended, presented battle once.
@@ -9517,7 +9595,13 @@ script BattleSessionComponent extends Component
 		if self.BattleResult ~= "Victory" and self.BattleResult ~= "Defeat" then return end
 		self.ResultReady = false
 		if self.ResultRecorded == false then
-			self.ResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
+			local resultContext = self:CaptureBattleResultContext()
+			local recorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
+			if self:IsBattleResultContextCurrent(resultContext) == false then
+				log_warning("[BattleResult] stale result retry cancelled")
+				return
+			end
+			self.ResultRecorded = recorded
 			if self.ResultRecorded then self:RefreshUnionRewardPresentation() end
 		end
 		if self.ResultRecorded == false then self.ResultReady = true return end
@@ -9527,15 +9611,21 @@ script BattleSessionComponent extends Component
 			self:PublishPlayerCommandResult("RETURN_TO_LOBBY", result)
 			return
 		end
+		local transitionContext = self:CaptureBattleResultContext()
+		if transitionContext == nil then return end
+		-- A normal victory transition prepares the next entry on the same player component before teleporting.
+		transitionContext.AllowPlayerEntryAdvance = true
 		if self.UnionRewardRunEnded and self.UnionRewardWasCommitted then
 			_StageTransitionManagerLogic:HandleCompletedRunTransition(self.PlayerEntity)
 		else
 			_StageTransitionManagerLogic:HandleVictoryTransition(self.PlayerEntity, self.StageId)
 		end
-		local expectedEntry = self.EntryRequestId
+		if self:IsBattleResultContextCurrent(transitionContext) == false then return end
+		local retryContext = self:CaptureBattleResultContext()
 		self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
+			if self:IsBattleResultContextCurrent(retryContext) == false then return end
 			self.ResultTransitionTimerId = 0
-			if isvalid(self.PlayerEntity) and self.PlayerEntity.CurrentMap == self.Entity and self.EntryRequestId == expectedEntry then self.ResultReady = true end
+			self.ResultReady = true
 		end, 8)
 	end
 

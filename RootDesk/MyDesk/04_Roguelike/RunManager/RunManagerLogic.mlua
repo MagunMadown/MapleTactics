@@ -358,6 +358,13 @@ script RunManagerLogic extends Logic
 	end
 
 	@ExecSpace("ServerOnly")
+	method void CancelPendingRunTransfers(Entity playerEntity, string reason)
+		-- Cancels both delayed transition layers before the run lifetime changes.
+		_StageTransitionManagerLogic:CancelPendingTransition(playerEntity, reason)
+		_MapTeleportManager:CancelPendingTransfer(playerEntity, reason)
+	end
+
+	@ExecSpace("ServerOnly")
 	method any EnsureRunState(Entity playerEntity, integer fallbackSeed)
 		-- Reuses an active run or initializes progression and inventory as one boundary.
 		local runState = self:GetOrCreateRunState(playerEntity)
@@ -366,6 +373,7 @@ script RunManagerLogic extends Logic
 		end
 
 		if runState.RunSequence <= 0 or runState.RunState == "Idle" then
+			self:CancelPendingRunTransfers(playerEntity, "NEW_RUN")
 			local seed = fallbackSeed
 			if seed < 0 then
 				seed = self.DefaultRunSeed
@@ -425,6 +433,7 @@ script RunManagerLogic extends Logic
 			return nil
 		end
 
+		self:CancelPendingRunTransfers(playerEntity, "NEW_RUN")
 		local resolvedEffects = _UnionEffectResolverLogic:GetEffectSnapshot(playerEntity)
 		if resolvedEffects.Success == false then
 			log_error("[UnionEffect] run start blocked reason=" .. (resolvedEffects.Reason or "UNKNOWN"))
@@ -450,6 +459,7 @@ script RunManagerLogic extends Logic
 		if runState.RunState ~= "Failed" or runState.LastBattleResult ~= "Defeat" then
 			return { Success = false, Reason = "RUN_NOT_FAILED" }
 		end
+		self:CancelPendingRunTransfers(playerEntity, reason)
 		local inventory = self:GetOrCreateRunInventory(playerEntity)
 		if inventory == nil then
 			return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" }
@@ -487,6 +497,7 @@ script RunManagerLogic extends Logic
 		if runState == nil then
 			return { Success = false, Reason = "RUN_STATE_UNAVAILABLE" }
 		end
+		runState:InvalidateRunLifetime("RUN_ABANDONED")
 		if runState.RunState == "Active" then
 			self:FinalizeRunResult(playerEntity, "ABANDONED", reason or "PLAYER_ABANDONED", runState.LastCompletedStageId)
 		elseif runState.RunState == "Completed" then
@@ -495,6 +506,42 @@ script RunManagerLogic extends Logic
 		runState.RunState = "Failed"
 		runState.LastBattleResult = "Defeat"
 		return self:ResetFailedRun(playerEntity, reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CaptureRunOperationContext(Entity playerEntity)
+		-- Captures the run and flow identity before any operation that may wait for storage.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then return nil end
+		local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if isvalid(runState) == false then return nil end
+		local entryState = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		if entryState ~= nil and isvalid(entryState) == false then return nil end
+		return {
+			RunState = runState, RunLifetimeRevision = runState.RunLifetimeRevision,
+			RunSequence = runState.RunSequence, StateName = runState.RunState,
+			SourceMap = playerEntity.CurrentMap, EntryState = entryState,
+			EntryRequestId = entryState ~= nil and entryState.RequestId or -1,
+			RunFlowState = runState.RunFlowState, RunFlowRevision = runState.RunFlowRevision,
+			ContentTransitionRevision = runState.ContentTransitionRevision,
+			CurrentNodeGraphId = runState.CurrentNodeGraphId, CurrentNodeId = runState.CurrentNodeId,
+			LastBattleRecordKey = runState.LastBattleRecordKey
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsRunOperationContextCurrent(Entity playerEntity, table context)
+		-- Rejects continuations after abandonment, replacement, deletion, entry changes or flow changes.
+		if context == nil or isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then return false end
+		local runState = context.RunState
+		if isvalid(runState) == false or playerEntity:GetComponent("script.PlayerRunStateComponent") ~= runState then return false end
+		if playerEntity.CurrentMap ~= context.SourceMap or (context.SourceMap ~= nil and isvalid(context.SourceMap) == false) then return false end
+		if runState.RunLifetimeRevision ~= context.RunLifetimeRevision or runState.RunSequence ~= context.RunSequence or runState.RunState ~= context.StateName then return false end
+		if runState.RunFlowRevision ~= context.RunFlowRevision or runState.RunFlowState ~= context.RunFlowState then return false end
+		if runState.ContentTransitionRevision ~= context.ContentTransitionRevision or runState.LastBattleRecordKey ~= context.LastBattleRecordKey then return false end
+		if runState.CurrentNodeGraphId ~= context.CurrentNodeGraphId or runState.CurrentNodeId ~= context.CurrentNodeId then return false end
+		local entryState = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		if entryState ~= context.EntryState or (entryState ~= nil and isvalid(entryState) == false) then return false end
+		return (entryState ~= nil and entryState.RequestId or -1) == context.EntryRequestId
 	end
 
 	@ExecSpace("ServerOnly")
@@ -509,6 +556,9 @@ script RunManagerLogic extends Logic
 			log_warning("[RunManager] duplicate result ignored key=" .. battleRecordKey)
 			return true
 		end
+		if runState.RunSequence <= 0 or runState.RunState ~= "Active" then return false end
+		local resultContext = self:CaptureRunOperationContext(playerEntity)
+		if resultContext == nil or (resultContext.EntryState ~= nil and resultContext.EntryRequestId ~= entryRequestId) then return false end
 		local flowResult = _NodeDefinitionRepositoryLogic:ResolveBattleOutcome(
 			runState.CurrentNodeGraphId,
 			runState.CurrentNodeId,
@@ -525,6 +575,10 @@ script RunManagerLogic extends Logic
 				log_error("[RunManager] stage reward failed stage=" .. stageId .. " reason=" .. rewardResult.Reason .. " detail=" .. (rewardResult.DetailReason or ""))
 				return false
 			end
+			if self:IsRunOperationContextCurrent(playerEntity, resultContext) == false then
+				log_warning("[RunManager] stale result ignored key=" .. battleRecordKey)
+				return false
+			end
 			local relics = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 			if relics ~= nil then
 				local relicResult = relics:ApplyVictory(battleRecordKey)
@@ -534,6 +588,10 @@ script RunManagerLogic extends Logic
 				end
 			end
 		end
+		if self:IsRunOperationContextCurrent(playerEntity, resultContext) == false then
+			log_warning("[RunManager] stale result ignored key=" .. battleRecordKey)
+			return false
+		end
 		local unionRewardResult = _UnionRewardServiceLogic:ProcessBattleResult(
 			playerEntity,
 			stageId,
@@ -542,6 +600,10 @@ script RunManagerLogic extends Logic
 			battleRecordKey,
 			flowResult
 		)
+		if self:IsRunOperationContextCurrent(playerEntity, resultContext) == false then
+			log_warning("[RunManager] stale result ignored key=" .. battleRecordKey)
+			return false
+		end
 		if unionRewardResult.Success == false then
 			log_error("[RunManager] Union reward failed stage=" .. stageId .. " reason=" .. unionRewardResult.Reason)
 			return false
@@ -557,6 +619,10 @@ script RunManagerLogic extends Logic
 				NodeGraphId = flowResult.NodeGraphId,
 				NodeId = flowResult.CompletedNodeId
 			})
+			if self:IsRunOperationContextCurrent(playerEntity, resultContext) == false then
+				log_warning("[RunManager] stale result ignored key=" .. battleRecordKey)
+				return false
+			end
 			if jobProgressionResult.Success == false then
 				log_error("[RunManager] Union Job milestone failed stage=" .. stageId .. " reason=" .. (jobProgressionResult.Reason or "UNKNOWN"))
 				return false
@@ -564,6 +630,10 @@ script RunManagerLogic extends Logic
 			if jobProgressionResult.WasImproved == true then
 				log("[RunManager] Union Job milestone committed job=" .. jobProgressionResult.AuthoritativeJobId .. " milestone=" .. jobProgressionResult.MilestoneId .. " progress=" .. tostring(jobProgressionResult.NewProgress))
 			end
+		end
+		if self:IsRunOperationContextCurrent(playerEntity, resultContext) == false then
+			log_warning("[RunManager] stale result ignored key=" .. battleRecordKey)
+			return false
 		end
 		if runState:RecordBattleResult(stageNumber, battleResult, battleRecordKey) == false then
 			return false
