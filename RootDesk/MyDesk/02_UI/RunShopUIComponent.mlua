@@ -90,7 +90,6 @@ script RunShopUIComponent extends Component
 			if isvalid(row) then
 				local capturedIndex = rowIndex
 				self.RowHandlers[rowIndex] = row:ConnectEvent(ButtonClickEvent, function() self:SelectOffer(capturedIndex) end)
-				self.HoverHandlers[rowIndex] = row:ConnectEvent(UITouchEnterEvent, self.OnAnyHover)
 			end
 		end
 		self:BindTooltipRows()
@@ -179,6 +178,9 @@ script RunShopUIComponent extends Component
 		end
 		self:UpdateTooltipHover(delta)
 		if not self.AvatarBound then self:BindPlayerAvatar() end
+		self._T.ShopPollRemaining = (self._T.ShopPollRemaining or 0) - delta
+		if self._T.ShopPollRemaining > 0 then return end
+		self._T.ShopPollRemaining = 0.1
 		local state = _RunShopLogic:GetLocalShopUiState()
 		if state.Success ~= true then
 			self:SetStatus(state.Reason or "SHOP_STATE_UNAVAILABLE")
@@ -204,6 +206,7 @@ script RunShopUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void RefreshFromState(table state)
+		self._T.RenderedShopState = state
 		-- Rebuilds the offer list with readable name, category, price, and sold-state labels.
 		self:HideItemTooltip()
 		local contextKey = (state.ShopId or "") .. ":" .. (state.NodeId or "") .. ":" .. tostring(state.VisitSequence or 0)
@@ -610,6 +613,11 @@ script RunShopUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void SetPopupVisible(boolean visible)
+		self._T.ShopPollRemaining = 0
+		if visible then
+			_RunRelicInventoryUILogic:SetOpen(false)
+			_GameUIPolishLogic:BringUIGroupToFront(self.Entity)
+		end
 		self:HideItemTooltip()
 		local popup = self:GetEntity("ShopPopup")
 		local dim = self:GetEntity("Dim")
@@ -692,7 +700,7 @@ script RunShopUIComponent extends Component
 				local rowIndex = index
 				local row = self:GetEntity(base .. (selling and "/SellRow" or "/OfferRow") .. tostring(index))
 				if isvalid(row) then
-					local enter = row:ConnectEvent(UITouchEnterEvent, function() self:ShowItemTooltip(isSelling, rowIndex) end)
+					local enter = row:ConnectEvent(UITouchEnterEvent, function() self:QueueItemTooltip(isSelling, rowIndex, row) end)
 					local leave = row:ConnectEvent(UITouchExitEvent, function() if self.TooltipSelling == isSelling and self.TooltipIndex == rowIndex then self.TooltipLeaveRemaining = 0.45 end end)
 					table.insert(self.TooltipHandlers, {Entity=row, Event=UITouchEnterEvent, Subscription=enter})
 					table.insert(self.TooltipHandlers, {Entity=row, Event=UITouchExitEvent, Subscription=leave})
@@ -719,8 +727,8 @@ script RunShopUIComponent extends Component
 			self.TooltipLeaveRemaining = 0.45
 			return
 		end
-		local state = _RunShopLogic:GetLocalShopUiState()
-		if not state.Success then return end
+		local state = self._T.RenderedShopState
+		if state == nil or not state.Success then return end
 		self.TooltipSelling = selling
 		self.TooltipIndex = index
 		self.TooltipSourceRow = self:GetEntity(selling and ("ShopPopup/SellFrame/ListScroll/SellRow" .. tostring(index)) or ("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(index)))
@@ -792,8 +800,14 @@ script RunShopUIComponent extends Component
 				if entity.ScrollLayoutGroupComponent ~= nil then entity.ScrollLayoutGroupComponent.UseScroll = true end
 				local text = entity:GetComponent("script.ScrollableTextComponent")
 				if text ~= nil then
+					-- Shop descriptions are explicitly refreshed when the hovered product changes.
+					text.AutoRefresh = false
 					text.WheelRequiresHover = true
 					text:RefreshText()
+					-- Short descriptions need no active scroll layout; retain wheel/drag only for overflow.
+					if entity.ScrollLayoutGroupComponent ~= nil then
+						entity.ScrollLayoutGroupComponent.UseScroll = text.ContentHeight > entity.UITransformComponent.RectSize.y
+					end
 				end
 				if entity.SpriteGUIRendererComponent ~= nil then entity.SpriteGUIRendererComponent.RaycastTarget = true end
 			end
@@ -811,14 +825,40 @@ script RunShopUIComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void QueueItemTooltip(boolean selling, integer index, Entity row)
+		-- Input callbacks only record intent; layout mutations can themselves emit hover events.
+		local pending = self._T.PendingTooltip
+		if pending ~= nil and pending.Selling == selling and pending.Index == index then return end
+		if self.TooltipSelling == selling and self.TooltipIndex == index then return end
+		self._T.PendingTooltip = { Selling = selling, Index = index, Row = row, Cursor = _InputService:GetCursorPosition() }
+	end
+
+	@ExecSpace("ClientOnly")
 	method void UpdateTooltipHover(number delta)
 		-- Allow crossing the gap from the row into a fixed, interactive description.
 		local tooltip = self:GetEntity("ShopPopup/ItemTooltip")
+		local pending = self._T.PendingTooltip
+		if pending ~= nil then
+			if self:IsPointerInside(tooltip) or not self:IsPointerInside(pending.Row) then
+				self._T.PendingTooltip = nil
+			else
+				self._T.PendingTooltip = nil
+				self._T.TooltipAnchorCursor = pending.Cursor
+				self._T.TooltipPointerEntered = false
+				self:ShowItemTooltip(pending.Selling, pending.Index)
+			end
+		end
 		if not isvalid(tooltip) or not tooltip.Enable then return end
-		if self:IsPointerInside(tooltip) or self:IsPointerInside(self.TooltipSourceRow) then
+		if self:IsPointerInside(tooltip) then
+			self._T.TooltipPointerEntered = true
 			self.TooltipLeaveRemaining = 0.45
 			return
 		end
+		if self:IsPointerInside(self.TooltipSourceRow) then
+			self.TooltipLeaveRemaining = 0.45
+			return
+		end
+		if self._T.TooltipPointerEntered then self:HideItemTooltip() return end
 		self.TooltipLeaveRemaining = math.max(0, self.TooltipLeaveRemaining - delta)
 		if self.TooltipLeaveRemaining == 0 then self:HideItemTooltip() end
 	end
@@ -830,18 +870,26 @@ script RunShopUIComponent extends Component
 		if not isvalid(tooltip) or not tooltip.Enable or not isvalid(tooltip.Parent) then return end
 		local parent = tooltip.Parent.UITransformComponent
 		local transform = tooltip.UITransformComponent
-		local pos = _UILogic:ScreenToLocalUIPosition(_InputService:GetCursorPosition(), parent)
+		local key = tostring(self.TooltipSelling) .. ":" .. tostring(self.TooltipIndex)
+		if self._T.TooltipPositionKey == key then return end
+		local cursor = self._T.TooltipAnchorCursor or _InputService:GetCursorPosition()
+		local anchor = _UILogic:ScreenToLocalUIPosition(cursor, parent)
 		local lower = _UILogic:ScreenToLocalUIPosition(Vector2(0, 0), parent)
 		local upper = _UILogic:ScreenToLocalUIPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight), parent)
 		local halfWidth, halfHeight = transform.RectSize.x * 0.5, transform.RectSize.y * 0.5
-		local x = pos.x + halfWidth + 24
-		if x + halfWidth > upper.x - 8 then x = pos.x - halfWidth - 24 end
-		local y = pos.y - halfHeight - 16
+		local x = anchor.x + halfWidth + 24
+		if x + halfWidth > upper.x - 8 then x = anchor.x - halfWidth - 24 end
+		local y = anchor.y - halfHeight - 16
 		transform.anchoredPosition = Vector2(math.max(lower.x + halfWidth + 8, math.min(upper.x - halfWidth - 8, x)), math.max(lower.y + halfHeight + 8, math.min(upper.y - halfHeight - 8, y)))
+		self._T.TooltipPositionKey = key
 	end
 
 	@ExecSpace("ClientOnly")
 	method void HideItemTooltip()
+		self._T.TooltipPointerEntered = false
+		self._T.TooltipPositionKey = nil
+		self._T.TooltipAnchorCursor = nil
+		self._T.PendingTooltip = nil
 		-- Remove hover content on leave, close, filter, or inventory change.
 		local tooltip = self:GetEntity("ShopPopup/ItemTooltip")
 		if isvalid(tooltip) then tooltip.Enable = false end
