@@ -14,6 +14,8 @@ script RunShopUIComponent extends Component
 	property table TooltipHandlers = {}
 	property boolean TooltipSelling = false
 	property integer TooltipIndex = 0
+	property any TooltipSourceRow = nil
+	property number TooltipLeaveRemaining = 0
 	property any CloseHandler = nil
 	property any BuyHandler = nil
 	property any SellHandler = nil
@@ -58,6 +60,7 @@ script RunShopUIComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Connect both trading panes once for the lifetime of this UI.
+		self:PrepareItemTooltip()
 		for _, filter in ipairs({ "ALL", "ITEM", "CONSUMABLE", "SKILL" }) do
 			local selectedFilter = filter
 			local tab = self:GetEntity("ShopPopup/SellTabs/" .. filter)
@@ -155,7 +158,7 @@ script RunShopUIComponent extends Component
 		if self.UnionMode then
 			local player = _UserService.LocalPlayer
 			if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then self:CloseUi() return end
-			self:UpdateTooltipPosition()
+			self:UpdateTooltipHover(delta)
 			if not self.AvatarBound then self:BindPlayerAvatar() end
 			if self.UnionPending then
 				self.UnionRequestAge = self.UnionRequestAge + delta
@@ -168,7 +171,7 @@ script RunShopUIComponent extends Component
 			end
 			return
 		end
-		self:UpdateTooltipPosition()
+		self:UpdateTooltipHover(delta)
 		if not self.AvatarBound then self:BindPlayerAvatar() end
 		local state = _RunShopLogic:GetLocalShopUiState()
 		if state.Success ~= true then
@@ -607,6 +610,7 @@ script RunShopUIComponent extends Component
 		if isvalid(popup) then
 			popup.Enable = visible
 			popup.Visible = visible
+			if visible then _GameUIPolishLogic:FitVerticalScrollLayouts(popup) end
 		end
 		if isvalid(dim) then
 			dim.Enable = visible
@@ -666,14 +670,16 @@ script RunShopUIComponent extends Component
 				local row = self:GetEntity(base .. (selling and "/SellRow" or "/OfferRow") .. tostring(index))
 				if isvalid(row) then
 					local enter = row:ConnectEvent(UITouchEnterEvent, function() self:ShowItemTooltip(isSelling, rowIndex) end)
-					local leave = row:ConnectEvent(UITouchExitEvent, function() if self.TooltipSelling == isSelling and self.TooltipIndex == rowIndex then self:HideItemTooltip() end end)
+					local leave = row:ConnectEvent(UITouchExitEvent, function() if self.TooltipSelling == isSelling and self.TooltipIndex == rowIndex then self.TooltipLeaveRemaining = 0.45 end end)
 					table.insert(self.TooltipHandlers, {Entity=row, Event=UITouchEnterEvent, Subscription=enter})
 					table.insert(self.TooltipHandlers, {Entity=row, Event=UITouchExitEvent, Subscription=leave})
 				end
 			end
 			local scroll = self:GetEntity(base)
 			if isvalid(scroll) then
-				local sub = scroll:ConnectEvent(ScrollPositionChangedEvent, function() self:HideItemTooltip() end)
+				local sub = scroll:ConnectEvent(ScrollPositionChangedEvent, function()
+					if not self:IsPointerInside(self:GetEntity("ShopPopup/ItemTooltip")) then self:HideItemTooltip() end
+				end)
 				table.insert(self.TooltipHandlers, {Entity=scroll, Event=ScrollPositionChangedEvent, Subscription=sub})
 			end
 		end
@@ -690,6 +696,8 @@ script RunShopUIComponent extends Component
 		if not state.Success then return end
 		self.TooltipSelling = selling
 		self.TooltipIndex = index
+		self.TooltipSourceRow = self:GetEntity(selling and ("ShopPopup/SellFrame/ListScroll/SellRow" .. tostring(index)) or ("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(index)))
+		self.TooltipLeaveRemaining = 0.45
 		local isConsumable = (selling and offer.ItemType == "CONSUMABLE") or (not selling and offer.RewardType == "CONSUMABLE")
 		local isSkill = selling and offer.ItemType == "SKILL"
 		local root = "ShopPopup/ItemTooltip/"
@@ -708,6 +716,7 @@ script RunShopUIComponent extends Component
 			local size = source.UITransformComponent.RectSize
 			icon.UITransformComponent.RectSize = Vector2(size.x * 1.75, size.y * 1.75)
 		end
+		self:PrepareItemTooltip()
 		self:BringTooltipToFront(tooltip)
 		tooltip.Enable = true
 		self:UpdateTooltipPosition()
@@ -729,15 +738,75 @@ script RunShopUIComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method void UpdateTooltipPosition()
-		-- Follow the pointer with a gap and keep the complete tooltip within the reference canvas.
+	method void PrepareItemTooltip()
+		-- Imported sprite pivots must not shift the image away from the frame's center.
+		local frame = self:GetEntity("ShopPopup/ItemTooltip/IconFrame")
+		local icon = self:GetEntity("ShopPopup/ItemTooltip/Icon")
+		if isvalid(frame) and isvalid(icon) and icon.SpriteGUIRendererComponent ~= nil then
+			local transform = icon.UITransformComponent
+			local size = transform.RectSize
+			local room = frame.UITransformComponent.RectSize
+			local scale = math.min(math.max(1, room.x - 32) / math.max(1, size.x), math.max(1, room.y - 32) / math.max(1, size.y))
+			transform.AnchorsMin = frame.UITransformComponent.AnchorsMin
+			transform.AnchorsMax = frame.UITransformComponent.AnchorsMax
+			transform.Pivot = Vector2(0.5, 0.5)
+			transform.anchoredPosition = frame.UITransformComponent.anchoredPosition
+			transform.RectSize = Vector2(size.x * scale, size.y * scale)
+			icon.SpriteGUIRendererComponent.PreserveSprite = PreserveSpriteType.None
+			icon.SpriteGUIRendererComponent.LocalPosition = Vector2(0, 0)
+		end
+		for _, name in ipairs({ "Description", "EffectHint" }) do
+			local entity = self:GetEntity("ShopPopup/ItemTooltip/" .. name)
+			if isvalid(entity) then
+				if entity.ScrollLayoutGroupComponent ~= nil then entity.ScrollLayoutGroupComponent.UseScroll = true end
+				local text = entity:GetComponent("script.ScrollableTextComponent")
+				if text ~= nil then
+					text.WheelRequiresHover = true
+					text:RefreshText()
+				end
+				if entity.SpriteGUIRendererComponent ~= nil then entity.SpriteGUIRendererComponent.RaycastTarget = true end
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsPointerInside(Entity entity)
+		if not isvalid(entity) or not entity.EnabledInHierarchy or not entity.VisibleInHierarchy or entity.UITransformComponent == nil then return false end
+		local transform = entity.UITransformComponent
+		local cursor = _UILogic:ScreenToLocalUIPosition(_InputService:GetCursorPosition(), transform)
+		local size, pivot = transform.RectSize, transform.Pivot
+		return cursor.x >= -size.x * pivot.x and cursor.x <= size.x * (1 - pivot.x)
+			and cursor.y >= -size.y * pivot.y and cursor.y <= size.y * (1 - pivot.y)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateTooltipHover(number delta)
+		-- Allow crossing the gap from the row into a fixed, interactive description.
 		local tooltip = self:GetEntity("ShopPopup/ItemTooltip")
 		if not isvalid(tooltip) or not tooltip.Enable then return end
-		local pos = _UILogic:ScreenToUIPosition(_InputService:GetCursorPosition())
-		local x = pos.x + 277
-		if x + 255 > 948 then x = pos.x - 277 end
-		local y = pos.y - 174
-		tooltip.UITransformComponent.anchoredPosition = Vector2(math.max(-693, math.min(693, x)), math.max(-376, math.min(376, y)) - 40)
+		if self:IsPointerInside(tooltip) or self:IsPointerInside(self.TooltipSourceRow) then
+			self.TooltipLeaveRemaining = 0.45
+			return
+		end
+		self.TooltipLeaveRemaining = math.max(0, self.TooltipLeaveRemaining - delta)
+		if self.TooltipLeaveRemaining == 0 then self:HideItemTooltip() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateTooltipPosition()
+		-- Position once on item entry; moving inside the tooltip never moves it away.
+		local tooltip = self:GetEntity("ShopPopup/ItemTooltip")
+		if not isvalid(tooltip) or not tooltip.Enable or not isvalid(tooltip.Parent) then return end
+		local parent = tooltip.Parent.UITransformComponent
+		local transform = tooltip.UITransformComponent
+		local pos = _UILogic:ScreenToLocalUIPosition(_InputService:GetCursorPosition(), parent)
+		local lower = _UILogic:ScreenToLocalUIPosition(Vector2(0, 0), parent)
+		local upper = _UILogic:ScreenToLocalUIPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight), parent)
+		local halfWidth, halfHeight = transform.RectSize.x * 0.5, transform.RectSize.y * 0.5
+		local x = pos.x + halfWidth + 24
+		if x + halfWidth > upper.x - 8 then x = pos.x - halfWidth - 24 end
+		local y = pos.y - halfHeight - 16
+		transform.anchoredPosition = Vector2(math.max(lower.x + halfWidth + 8, math.min(upper.x - halfWidth - 8, x)), math.max(lower.y + halfHeight + 8, math.min(upper.y - halfHeight - 8, y)))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -746,6 +815,8 @@ script RunShopUIComponent extends Component
 		local tooltip = self:GetEntity("ShopPopup/ItemTooltip")
 		if isvalid(tooltip) then tooltip.Enable = false end
 		self.TooltipIndex = 0
+		self.TooltipSourceRow = nil
+		self.TooltipLeaveRemaining = 0
 	end
 
 	@ExecSpace("ClientOnly")
@@ -907,7 +978,7 @@ script RunShopUIComponent extends Component
 		if not self.UnionMode or requestId ~= self.UnionRequestId then return end
 		self.UnionPending = false
 		self.UnionSnapshot = snapshot
-		local messages = {OK="직업 해제 토큰은 캐릭터 선택창에서 사용합니다.", PURCHASED="구매했습니다. 오른쪽에서 보유 상품을 확인하세요.", EQUIPPED="데미지 스타일을 장착했습니다.", SHOP_CHANGED="보유 상태가 갱신되었습니다. 다시 선택해 주세요.", ALREADY_OWNED="이미 보유한 스타일입니다.", SUPPLY_RESERVED="이미 다음 모험의 보급이 예약되어 있습니다.", INSUFFICIENT_UNION_COINS="유니온 코인이 부족합니다.", PRODUCT_UNAVAILABLE="현재 판매하지 않는 상품입니다.", LOBBY_ONLY="유니온 상점은 로비에서 이용할 수 있습니다."}
+		local messages = {OK="직업 해제 토큰은 캐릭터 선택창에서 사용합니다.", PURCHASED="구매했습니다. 오른쪽에서 보유 상품을 확인하세요.", FREE_TOKEN_CLAIMED="무료 직업 해제 토큰 1개를 받았습니다.", PRODUCT_SOLD_OUT="이미 무료 토큰을 받았습니다.", EQUIPPED="데미지 스타일을 장착했습니다.", SHOP_CHANGED="보유 상태가 갱신되었습니다. 다시 선택해 주세요.", ALREADY_OWNED="이미 보유한 스타일입니다.", SUPPLY_RESERVED="이미 다음 모험의 보급이 예약되어 있습니다.", INSUFFICIENT_UNION_COINS="유니온 코인이 부족합니다.", PRODUCT_UNAVAILABLE="현재 판매하지 않는 상품입니다.", LOBBY_ONLY="유니온 상점은 로비에서 이용할 수 있습니다."}
 		self.UnionMessage = messages[reason] or (success and "완료되었습니다." or "요청을 완료하지 못했습니다. 상점을 다시 열어 주세요.")
 		self:RefreshUnionShop()
 		log("[UnionShopUI] response success=" .. tostring(success) .. " reason=" .. reason)
@@ -915,7 +986,7 @@ script RunShopUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void RefreshUnionShop()
-		-- Left: catalog and purchase. Right: permanent styles and the one reserved supply.
+		-- Left: catalog and purchase. Right: aggregate token balance, permanent styles and reserved supply.
 		self:HideItemTooltip()
 		local service = _UnionShopServiceLogic
 		local state = self.UnionSnapshot
@@ -934,17 +1005,19 @@ script RunShopUIComponent extends Component
 				row.Visible = product ~= nil
 				if product ~= nil then
 					local owned = product.Kind == "SKIN" and service:OwnsSkin(state, product.Id)
+					local free = service:IsFreeJobTokenProduct(product)
+					local sold = service:IsProductSoldOut(state, product)
 					row.ButtonComponent.Enable = true
 					row.TextGUIRendererComponent.Text = product.Name
-					row.TextGUIRendererComponent.FontColor = Color(0.08, 0.10, 0.12, 1)
-					row.SpriteGUIRendererComponent.Color = index == self.SelectedOfferIndex and Color(0.77, 0.91, 0.94, 1) or Color(0.82, 0.84, 0.85, 1)
+					row.TextGUIRendererComponent.FontColor = sold and Color(0.42, 0.46, 0.49, 1) or Color(0.08, 0.10, 0.12, 1)
+					row.SpriteGUIRendererComponent.Color = sold and Color(0.74, 0.77, 0.79, 1) or (index == self.SelectedOfferIndex and Color(0.77, 0.91, 0.94, 1) or Color(0.82, 0.84, 0.85, 1))
 					self:SetText(path .. "/CategoryText", product.Kind == "SKIN" and "영구 꾸미기" or (product.Kind == "SUPPLY" and "다음 모험 보급" or "직업 영구 해금"))
-					self:SetText(path .. "/PriceText", owned and "보유 중" or (product.Kind == "FUTURE" and "준비 중" or tostring(product.Price) .. " 코인"))
-					self:SetText(path .. "/Stock/Label", product.Kind == "SUPPLY" and "1회 예약" or (product.Kind == "JOB_TOKEN" and tokenQuantity or "영구 보유"))
+					self:SetText(path .. "/PriceText", sold and "품절" or (free and "무료" or (owned and "보유 중" or (product.Kind == "FUTURE" and "준비 중" or tostring(product.Price) .. " 코인"))))
+					self:SetText(path .. "/Stock/Label", sold and "품절" or (free and "계정당 1회" or (product.Kind == "SUPPLY" and "1회 예약" or (product.Kind == "JOB_TOKEN" and tokenQuantity or "영구 보유"))))
 					self:SetSellImage(path .. "/Icon", product.Icon ~= "" and product.Icon or "95632823c5e44dab89b9859ff439165b")
 					local bar = self:GetEntity(path .. "/SelectedBar")
 					if isvalid(bar) then bar.Enable = index == self.SelectedOfferIndex end
-					if owned or (product.Kind == "JOB_TOKEN" and (state.JobTokens or 0) > 0) or (product.Kind == "SUPPLY" and state.PendingSupply == product.Ref) then table.insert(self.UnionOwnedOffers, product) end
+					if not free and (owned or (product.Kind == "JOB_TOKEN" and (state.JobTokens or 0) > 0) or (product.Kind == "SUPPLY" and state.PendingSupply == product.Ref)) then table.insert(self.UnionOwnedOffers, product) end
 				end
 			end
 		end
@@ -972,8 +1045,10 @@ script RunShopUIComponent extends Component
 		if isvalid(buy) then
 			buy.Enable = true
 			local owned = selected ~= nil and selected.Kind == "SKIN" and service:OwnsSkin(state, selected.Id)
-			buy.TextGUIRendererComponent.Text = self.UnionPending and "처리 중" or (owned and "선택 스타일 장착" or "선택 상품 구매")
-			buy.ButtonComponent.Enable = ready and selected ~= nil and selected.Kind ~= "FUTURE" and (selected.Kind ~= "SUPPLY" or state.PendingSupply == "") and (owned or (state.Coins or 0) >= selected.Price)
+			local free = selected ~= nil and service:IsFreeJobTokenProduct(selected)
+			local sold = selected ~= nil and service:IsProductSoldOut(state, selected)
+			buy.TextGUIRendererComponent.Text = self.UnionPending and "처리 중" or (sold and "품절" or (free and "무료 토큰 받기" or (owned and "선택 스타일 장착" or "선택 상품 구매")))
+			buy.ButtonComponent.Enable = ready and selected ~= nil and not sold and selected.Kind ~= "FUTURE" and (selected.Kind ~= "SUPPLY" or state.PendingSupply == "") and (owned or (state.Coins or 0) >= selected.Price)
 		end
 		local equip = self:GetEntity("ShopPopup/SellButton")
 		local owned = self.UnionOwnedOffers[self.SelectedSellIndex]
@@ -999,14 +1074,19 @@ script RunShopUIComponent extends Component
 		if product == nil or not isvalid(tooltip) then return end
 		self.TooltipSelling = owned
 		self.TooltipIndex = index
+		self.TooltipSourceRow = self:GetEntity(owned and ("ShopPopup/SellFrame/ListScroll/SellRow" .. tostring(index)) or ("ShopPopup/ListFrame/ListScroll/OfferRow" .. tostring(index)))
+		self.TooltipLeaveRemaining = 0.45
 		local path = "ShopPopup/ItemTooltip/"
+		local free = _UnionShopServiceLogic:IsFreeJobTokenProduct(product)
+		local sold = _UnionShopServiceLogic:IsProductSoldOut(self.UnionSnapshot, product)
 		self:SetText(path .. "Name", product.Name)
-		self:SetText(path .. "Category", product.Kind == "SKIN" and "영구 데미지 꾸미기" or "유니온 상품")
+		self:SetText(path .. "Category", free and "계정당 1회 무료 상품" or (product.Kind == "SKIN" and "영구 데미지 꾸미기" or "유니온 상품"))
 		self:SetText(path .. "Description", product.Description)
-		self:SetText(path .. "EffectHint", product.Kind == "SUPPLY" and "계속하기에는 지급되지 않습니다." or (product.Kind == "JOB_TOKEN" and "캐릭터 선택창에서 토큰 1개로 직업 1개 해금" or "영구 보유하는 데미지 스킨입니다."))
-		self:SetText(path .. "Price", product.Kind == "FUTURE" and "판매 준비 중" or tostring(product.Price) .. " 유니온 코인")
-		self:SetText(path .. "Quantity", product.Kind == "JOB_TOKEN" and self:GetUnionJobTokenQuantityText() or (owned and "보유 상품" or "목록에서 선택 후 구매 버튼을 눌러 주세요."))
-		self:SetImage(path .. "Icon", product.Icon ~= "" and product.Icon or "95632823c5e44dab89b9859ff439165b")
+		self:SetText(path .. "EffectHint", free and "계정당 1회 수령 · 캐릭터 선택창에서 직업 1개 해금" or (product.Kind == "SUPPLY" and "계속하기에는 지급되지 않습니다." or (product.Kind == "JOB_TOKEN" and "캐릭터 선택창에서 토큰 1개로 직업 1개 해금" or "영구 보유하는 데미지 스킨입니다.")))
+		self:SetText(path .. "Price", sold and "품절" or (free and "무료" or (product.Kind == "FUTURE" and "판매 준비 중" or tostring(product.Price) .. " 유니온 코인")))
+		self:SetText(path .. "Quantity", free and (sold and "무료 토큰을 이미 받았습니다. · " .. self:GetUnionJobTokenQuantityText() or "무료 토큰 1개 · 계정당 1회") or (product.Kind == "JOB_TOKEN" and self:GetUnionJobTokenQuantityText() or (owned and "보유 상품" or "목록에서 선택 후 구매 버튼을 눌러 주세요.")))
+		self:SetSellImage(path .. "Icon", product.Icon ~= "" and product.Icon or "95632823c5e44dab89b9859ff439165b")
+		self:PrepareItemTooltip()
 		self:BringTooltipToFront(tooltip)
 		tooltip.Enable = true
 		self:UpdateTooltipPosition()
