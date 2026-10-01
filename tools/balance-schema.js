@@ -46,7 +46,7 @@
     UnionShopProducts:{
       ProductId:{note:"저장 데이터가 참조하는 고유 상품 ID. 기존 구매 이력이 있으면 삭제하거나 변경하지 마세요."},
       RefId:{note:"SUPPLY: orange_potion / red_potion / time_sand. JOB_TOKEN: job_unlock. SKIN: ProductId와 동일. 은퇴·삭제 스킨은 호환 검증만 유지하며 native 데미지 스킨 참조를 요구하지 않음."},
-      Price:{label:"유니온 코인 가격",note:"1 이상의 안전한 정수. 서버가 이 값을 차감합니다."},
+      Price:{label:"유니온 코인 가격",note:"1 이상의 안전한 정수. job_unlock_free(JOB_TOKEN / job_unlock)만 반드시 0이며 계정당 한 번 수령할 수 있습니다. 서버가 이 값을 차감합니다."},
       SortOrder:{note:"중복 없는 1 이상의 안전한 정수. 표시 순서는 이 값을 따릅니다."}
     },
     UtilitySkillDefinitions:{
@@ -156,7 +156,11 @@
       if (removed && !retired) add(row, "Retired", "REMOVED_PRODUCT_NOT_RETIRED");
       if (!text(r.DisplayName)) add(row, "DisplayName", "REQUIRED_FIELD_MISSING");
       if (!token(r.RefId)) add(row, "RefId", "REQUIRED_FIELD_MISSING");
-      for (const field of ["Price", "SortOrder"]) if (!positive(r[field])) add(row, field, "INVALID_PRODUCT_NUMBER");
+      const freeJobToken = r.ProductId === "job_unlock_free";
+      if (freeJobToken && (r.Kind !== "JOB_TOKEN" || r.RefId !== "job_unlock")) add(row, "ProductId", "INVALID_FREE_JOB_TOKEN_PRODUCT");
+      const priceValid = freeJobToken ? text(r.Price) && Number(r.Price) === 0 : positive(r.Price);
+      if (!priceValid) add(row, "Price", "INVALID_PRODUCT_NUMBER");
+      if (!positive(r.SortOrder)) add(row, "SortOrder", "INVALID_PRODUCT_NUMBER");
       if (positive(r.SortOrder)) {
         const order = Number(r.SortOrder);
         if (orders.has(order)) add(row, "SortOrder", "DUPLICATE_SORT_ORDER");

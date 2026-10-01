@@ -29,15 +29,27 @@ script UnionShopServiceLogic extends Logic
         return product.Success and product or nil
     end
 
+    method boolean IsFreeJobTokenProduct(table product)
+        return product ~= nil and product.Id == "job_unlock_free" and product.Kind == "JOB_TOKEN" and product.Ref == "job_unlock" and product.Price == 0
+    end
+
+    method boolean IsProductSoldOut(table state, table product)
+        return self:IsFreeJobTokenProduct(product) and state ~= nil and state.FreeJobTokenClaimed == true
+    end
+
     method table DefaultState()
         -- Fixed scalar fields serialize safely even for a new account.
-        return {Revision=0, OwnedSkins="", EquippedSkin="maple_default", PendingSupply="", LastSupplyRunId=0, LastSupplyItem="", JobTokens=1, UnlockedJobs="warrior"}
+        return {Revision=0, OwnedSkins="", EquippedSkin="maple_default", PendingSupply="", LastSupplyRunId=0, LastSupplyItem="", JobTokens=0, UnlockedJobs="warrior", FreeJobTokenClaimed=false}
     end
 
     method table CopyState(table source)
         -- Never share mutable profile tables with callers.
         local copy = self:DefaultState()
-        if source ~= nil then for key, _ in pairs(copy) do copy[key] = source[key] end end
+        if source ~= nil then
+            for key, _ in pairs(copy) do
+                if source[key] ~= nil then copy[key] = source[key] end
+            end
+        end
         if source ~= nil and source.JobTokens == nil and source.UnlockedJobs == nil then
             -- Accounts created before job locking retain the five previously available jobs.
             copy.JobTokens = 0
@@ -61,6 +73,7 @@ script UnionShopServiceLogic extends Logic
     method boolean ValidateState(any state)
         -- Reject malformed saves rather than replacing purchased ownership with defaults.
         if type(state) ~= "table" then return false end
+        if state.FreeJobTokenClaimed ~= nil and type(state.FreeJobTokenClaimed) ~= "boolean" then return false end
         for _, key in ipairs({"Revision", "LastSupplyRunId"}) do
             local value = state[key]
             if type(value) ~= "number" or value < 0 or value ~= math.floor(value) or value > 9007199254740990 then return false end
@@ -129,6 +142,7 @@ script UnionShopServiceLogic extends Logic
             local catalog = _UnionShopProductRepositoryLogic:GetCatalog()
             if not catalog.Success then return {Success=false, Reason="PRODUCT_UNAVAILABLE"} end
             if not product.Enabled or product.Retired then return {Success=false, Reason="PRODUCT_UNAVAILABLE"} end
+            if self:IsProductSoldOut(state, product) then return {Success=false, Reason="PRODUCT_SOLD_OUT"} end
             if product.Kind == "SKIN" and self:OwnsSkin(state, product.Id) then return {Success=false, Reason="ALREADY_OWNED"} end
             if product.Kind == "SUPPLY" and state.PendingSupply ~= "" then return {Success=false, Reason="SUPPLY_RESERVED"} end
             if product.Kind == "JOB_TOKEN" and state.JobTokens >= 1000000 then return {Success=false, Reason="TOKEN_LIMIT"} end
@@ -139,6 +153,7 @@ script UnionShopServiceLogic extends Logic
                 state.EquippedSkin = product.Id
             elseif product.Kind == "JOB_TOKEN" then
                 state.JobTokens = state.JobTokens + 1
+                if self:IsFreeJobTokenProduct(product) then state.FreeJobTokenClaimed = true end
             else
                 state.PendingSupply = product.Ref
             end
@@ -146,7 +161,7 @@ script UnionShopServiceLogic extends Logic
             return {Success=false, Reason="INVALID_ACTION"}
         end
         state.Revision = state.Revision + 1
-        return {Success=true, Changed=true, Reason=action == "EQUIP" and "EQUIPPED" or "PURCHASED"}
+        return {Success=true, Changed=true, Reason=action == "EQUIP" and "EQUIPPED" or (self:IsFreeJobTokenProduct(product) and "FREE_TOKEN_CLAIMED" or "PURCHASED")}
     end
 
     @ExecSpace("Server")
