@@ -30,6 +30,7 @@ script BattleWaveComponent extends Component
 	property integer ForceSpawnTimerId = 0
 	@Sync property integer SpawnVariantIndex = 0
 	property integer SpawnVariantSeed = 0
+	property integer HardEnemyAttackBonus = 1
 
 	@ExecSpace("ServerOnly")
 	method void ResetWaveState(integer totalWaves, string reason)
@@ -245,6 +246,80 @@ script BattleWaveComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method integer GetHardEnemyHpBonus(table definition)
+		-- Explicit regional tuning: fragile/ranged +1~2, frontline +2~4, bosses separate.
+		local bonuses = {
+			early_mushroom = 1,
+			guard_mushroom = 2,
+			csv_retreat_mushroom = 1,
+			csv_telegraph_mushroom = 2,
+			region_01_spore_ranged = 1,
+			region_01_guardian_boss = 4,
+			ellinia_slime = 2,
+			ellinia_bubbling = 1,
+			ellinia_fairy = 1,
+			ellinia_royal_fairy = 1,
+			ellinia_evil_eye = 2,
+			ellinia_curse_eye = 2,
+			ellinia_surgeon_eye = 1,
+			ellinia_cold_eye = 2,
+			ellinia_lupin = 1,
+			ellinia_zombie_lupin = 2,
+			ellinia_malady = 1,
+			ellinia_faust = 4,
+			region_kerning_stirge = 1,
+			region_kerning_jr_wraith = 2,
+			region_kerning_wraith = 1,
+			region_kerning_ligator = 2,
+			region_kerning_jr_necki = 1,
+			region_kerning_croco = 2,
+			region_kerning_shade = 2,
+			region_kerning_swamp_mud = 1,
+			region_kerning_dyle = 6,
+			region_04_axe_stump = 2,
+			region_04_wild_boar = 2,
+			region_04_iron_hog = 2,
+			region_04_fire_boar = 2,
+			region_04_skeleton_soldier = 3,
+			region_04_skeleton_officer = 3,
+			region_04_mummydog = 3,
+			region_04_commander_skeleton = 8,
+			region_05_blue_ribbon_pig = 2,
+			region_05_yellow_starfish = 2,
+			region_05_jellyfish = 1,
+			region_05_angry_starfish = 2,
+			region_05_cool_jellyfish = 2,
+			region_05_clang = 2,
+			region_05_king_clang = 6,
+			region_06_horny_mushroom = 3,
+			region_06_zombie_mushroom = 3,
+			region_06_jr_boogie = 1,
+			region_06_food_cart = 10,
+			region_06_wild_kargo = 3,
+			region_06_taurospear = 2,
+			region_06_tauromacis = 4,
+			region_06_jr_balrog = 12,
+			region_06_drake = 2,
+			region_06_copper_drake = 3,
+			region_06_dark_drake = 1
+		}
+		local bonus = bonuses[definition.EnemyDefinitionId] or 1
+		-- Preserve deliberately fragile boss summons (e.g. commander mummy dogs).
+		if definition.IsBoss ~= true then bonus = math.min(bonus, math.max(1, definition.MaxHp)) end
+		return bonus
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveDifficultyStats(any session, table definition)
+		-- Resolve a copy at spawn time; repository data and later waves remain unmodified.
+		local run = isvalid(session.PlayerEntity) and session.PlayerEntity:GetComponent("script.PlayerRunStateComponent") or nil
+		local hard = not session.SkillTestMode and run ~= nil and run.RunDifficulty == "HARD"
+		local bonus = hard and self.HardEnemyAttackBonus or 0
+		return { MaxHp = hard and definition.MaxHp + self:GetHardEnemyHpBonus(definition) or definition.MaxHp,
+			BasicAttackDamage = definition.BasicAttackDamage + bonus, AttackBonus = bonus }
+	end
+
+	@ExecSpace("ServerOnly")
 	method Entity SpawnEnemy(any session, string side, integer startCell, string facing, integer spawnOrder, table spawnDefinition)
 		-- Spawns one enemy with a wave-unique name and UnitId, then registers its logical state.
 		if session.BattleResult ~= "" or self:GetAvailableSlots(session) < 1 or self:IsSpawnCellFree(session, startCell) == false then
@@ -272,7 +347,8 @@ script BattleWaveComponent extends Component
 		elseif spawnDefinition.InitialFacingPolicy == "FIXED_RIGHT" then
 			resolvedFacing = "Right"
 		end
-		local unitInitialization = session:InitializeUnitState(enemy, unitId, "Enemy", startCell, resolvedFacing, spawnDefinition.MaxHp, spawnOrder)
+		local stats = self:ResolveDifficultyStats(session, spawnDefinition)
+		local unitInitialization = session:InitializeUnitState(enemy, unitId, "Enemy", startCell, resolvedFacing, stats.MaxHp, spawnOrder)
 		if unitInitialization.Success == false then
 			log_error("[BattleWave] enemy initialization failed unit=" .. unitId .. " reason=" .. unitInitialization.Reason)
 			_EntityService:Destroy(enemy)
@@ -280,12 +356,13 @@ script BattleWaveComponent extends Component
 		end
 		local enemyUnit = enemy:GetComponent("script.BattleUnitComponent")
 		if enemyUnit ~= nil then
-			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, spawnDefinition.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.TraitIds or "", spawnDefinition.IsBoss == true, spawnDefinition.DisplayName or "")
+			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, stats.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.TraitIds or "", spawnDefinition.IsBoss == true, spawnDefinition.DisplayName or "")
 			if enemyConfiguration.Success == false then
 				log_error("[EnemyData] apply failed unit=" .. unitId .. " reason=" .. enemyConfiguration.Reason)
 				_EntityService:Destroy(enemy)
 				return nil
 			end
+			enemyUnit.DifficultyAttackBonus = stats.AttackBonus
 			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " traits=" .. enemyUnit.EnemyTraitIds .. " boss=" .. tostring(enemyUnit.IsBoss) .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
 		end
 		if spawnDefinition.EnemyDefinitionId == "ellinia_faust" then
