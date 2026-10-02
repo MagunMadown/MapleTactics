@@ -240,6 +240,47 @@ script UnionProfileRepositoryLogic extends Logic
     end
 
     @ExecSpace("ServerOnly")
+    method table TryAdvanceAscensionLevel(Entity userEntity, integer completedLevel)
+        -- Persists one monotonic account unlock through the existing lock and CAS writer.
+        if self:IsNonNegativeInteger(completedLevel) == false or completedLevel > _AscensionDifficultyLogic.MaxLevel then
+            return { Success = false, Reason = "INVALID_ASCENSION_LEVEL", UnlockedLevel = 0 }
+        end
+        local loaded = self:GetUnionProfile(userEntity)
+        if loaded.Success == false then return loaded end
+        local storageUserKey = loaded.StorageUserKey
+        if self:TryAcquireMutationLock(storageUserKey) == false then
+            return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", UnlockedLevel = loaded.Profile.AscensionUnlockedLevel }
+        end
+        local candidate = self:GetCachedSnapshot(storageUserKey)
+        if candidate == nil then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "PROFILE_CACHE_MISSING", UnlockedLevel = 0 }
+        end
+        local previous = candidate.AscensionUnlockedLevel
+        if completedLevel > previous then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = false, Reason = "ASCENSION_LOCKED", UnlockedLevel = previous }
+        end
+        local unlocked = math.min(_AscensionDifficultyLogic.MaxLevel, completedLevel + 1)
+        if unlocked <= previous then
+            self:ReleaseMutationLock(storageUserKey)
+            return { Success = true, Reason = "ASCENSION_ALREADY_UNLOCKED", UnlockedLevel = previous, WasWritten = false }
+        end
+        candidate.AscensionUnlockedLevel = unlocked
+        local ok, persisted = pcall(function() return self:PersistProfileCandidate(storageUserKey, candidate) end)
+        self:ReleaseMutationLock(storageUserKey)
+        if not ok then
+            log_warning("[Ascension] unlock storage exception=" .. tostring(persisted))
+            return { Success = false, Reason = "ASCENSION_SAVE_EXCEPTION", UnlockedLevel = previous }
+        end
+        if persisted.Success == false then
+            return { Success = false, Reason = persisted.Reason, ErrorCode = persisted.ErrorCode or 0, UnlockedLevel = previous }
+        end
+        log("[Ascension] account unlock previous=" .. tostring(previous) .. " new=" .. tostring(unlocked) .. " cleared=" .. tostring(completedLevel))
+        return { Success = true, Reason = "ASCENSION_UNLOCKED", UnlockedLevel = unlocked, WasWritten = persisted.WasWritten == true }
+    end
+
+    @ExecSpace("ServerOnly")
     method table GetAllocatedUnionStats(Entity userEntity)
         local profileResult = self:GetUnionProfile(userEntity)
         if profileResult.Success == false then
@@ -536,7 +577,22 @@ script UnionProfileRepositoryLogic extends Logic
 
     @ExecSpace("ServerOnly")
     method table TryCommitUnionReward(Entity userEntity, integer amount, string rewardKey, string reason)
-        -- Atomically records the idempotency receipt and both point balances in one DataStorage mutation.
+        -- Preserves the existing repeat-reward contract while sharing its atomic persistence path.
+        return self:TryCommitUnionRewardInternal(userEntity, amount, rewardKey, reason, -1)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryCommitAscensionUnionReward(Entity userEntity, integer amount, string rewardKey, string reason, integer completedLevel)
+        -- Adds the account's first-clear bonus to a completed unlocked Ascension run in the same reward CAS.
+        if self:IsNonNegativeInteger(completedLevel) == false or completedLevel > _AscensionDifficultyLogic.MaxLevel then
+            return { Success = false, Reason = "INVALID_ASCENSION_LEVEL" }
+        end
+        return self:TryCommitUnionRewardInternal(userEntity, amount, rewardKey, reason, completedLevel)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryCommitUnionRewardInternal(Entity userEntity, integer amount, string rewardKey, string reason, integer completedLevel)
+        -- Persists point balances, the run receipt, and an optional permanent Ascension claim as one profile mutation.
         if amount == nil or amount < 0 or amount ~= math.floor(amount) then
             return { Success = false, Reason = "INVALID_POINT_AMOUNT" }
         end
@@ -546,61 +602,112 @@ script UnionProfileRepositoryLogic extends Logic
         if reason == nil or reason == "" then
             return { Success = false, Reason = "INVALID_POINT_REASON" }
         end
+        local isAscensionReward = completedLevel >= 0
+        local rewardRunId = 0
+        local ascensionKey = ""
+        if isAscensionReward then
+            rewardRunId = tonumber(string.match(rewardKey, "^union_run:([1-9]%d*)$")) or 0
+            if self:IsNonNegativeInteger(rewardRunId) == false or rewardRunId < 1 then
+                return { Success = false, Reason = "INVALID_REWARD_KEY", RewardKey = rewardKey }
+            end
+            ascensionKey = string.format("%.0f", completedLevel)
+        end
         local profileResult = self:GetUnionProfile(userEntity)
         if profileResult.Success == false then
             return profileResult
         end
         local existingAmount = profileResult.Profile.CommittedRewardKeys[rewardKey]
-        if existingAmount ~= nil then
-            return {
-                Success = true,
-                Reason = "DUPLICATE_REWARD_IGNORED",
-                WasDuplicate = true,
-                RewardKey = rewardKey,
-                CommittedAmount = existingAmount,
-                Snapshot = profileResult.Profile
-            }
+        if isAscensionReward == false and existingAmount ~= nil then
+            return { Success = true, Reason = "DUPLICATE_REWARD_IGNORED", WasDuplicate = true, RewardKey = rewardKey, CommittedAmount = existingAmount, Snapshot = profileResult.Profile }
         end
         local storageUserKey = profileResult.StorageUserKey
         if self:TryAcquireMutationLock(storageUserKey) == false then
             return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS", RewardKey = rewardKey, Snapshot = profileResult.Profile }
         end
-        local candidate = self:GetCachedSnapshot(storageUserKey)
-        if candidate == nil then
-            self:ReleaseMutationLock(storageUserKey)
-            return { Success = false, Reason = "PROFILE_CACHE_MISSING", RewardKey = rewardKey }
-        end
-        existingAmount = candidate.CommittedRewardKeys[rewardKey]
-        if existingAmount ~= nil then
-            self:ReleaseMutationLock(storageUserKey)
-            return { Success = true, Reason = "DUPLICATE_REWARD_IGNORED", WasDuplicate = true, RewardKey = rewardKey, CommittedAmount = existingAmount, Snapshot = candidate }
-        end
-        local previousLifetimeUnionPoints = candidate.LifetimeUnionPoints
-        local newUnionPoints = candidate.UnionPoints + amount
-        local newLifetimeUnionPoints = candidate.LifetimeUnionPoints + amount
-        if newUnionPoints < candidate.UnionPoints or newLifetimeUnionPoints < candidate.LifetimeUnionPoints then
-            self:ReleaseMutationLock(storageUserKey)
-            return { Success = false, Reason = "POINT_AMOUNT_OVERFLOW", RewardKey = rewardKey, Snapshot = candidate }
-        end
-        candidate.UnionPoints = newUnionPoints
-        candidate.LifetimeUnionPoints = newLifetimeUnionPoints
-        candidate.CommittedRewardKeys[rewardKey] = amount
-        self:PruneCommittedRewardKeys(candidate.CommittedRewardKeys, candidate.NextRewardRunId)
-        local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+        local previousLifetimeUnionPoints = 0
+        -- Every locked branch, including storage exceptions, returns through the same release point.
+        local mutationOk, result = pcall(function()
+            local candidate = self:GetCachedSnapshot(storageUserKey)
+            if candidate == nil then
+                return { Success = false, Reason = "PROFILE_CACHE_MISSING", RewardKey = rewardKey }
+            end
+            if isAscensionReward then
+                if rewardRunId > candidate.NextRewardRunId then
+                    return { Success = false, Reason = "REWARD_RUN_NOT_ALLOCATED", RewardKey = rewardKey, Snapshot = candidate }
+                end
+                if completedLevel > candidate.AscensionUnlockedLevel then
+                    return { Success = false, Reason = "ASCENSION_LOCKED", RewardKey = rewardKey, Snapshot = candidate }
+                end
+            end
+            existingAmount = candidate.CommittedRewardKeys[rewardKey]
+            local firstClearBonus = 0
+            if existingAmount ~= nil then
+                if isAscensionReward and completedLevel > 0 and candidate.AscensionFirstClearRewardRuns[ascensionKey] == rewardRunId then
+                    firstClearBonus = _AscensionDifficultyLogic:GetFirstClearCoinBonus(completedLevel)
+                end
+                local duplicate = { Success = true, Reason = "DUPLICATE_REWARD_IGNORED", WasDuplicate = true, RewardKey = rewardKey, CommittedAmount = existingAmount, Snapshot = candidate }
+                if isAscensionReward then
+                    duplicate.AscensionLevel = completedLevel
+                    duplicate.FirstClearBonus = firstClearBonus
+                end
+                return duplicate
+            end
+            if isAscensionReward then
+                local minimumRunId = math.max(1, candidate.NextRewardRunId - self.RewardReceiptRetention + 1)
+                if rewardRunId < minimumRunId then
+                    return { Success = false, Reason = "REWARD_RUN_EXPIRED", RewardKey = rewardKey, Snapshot = candidate }
+                end
+                if completedLevel > 0 and candidate.AscensionFirstClearRewardRuns[ascensionKey] == nil then
+                    firstClearBonus = _AscensionDifficultyLogic:GetFirstClearCoinBonus(completedLevel)
+                    if self:IsNonNegativeInteger(firstClearBonus) == false then
+                        return { Success = false, Reason = "INVALID_ASCENSION_FIRST_CLEAR_BONUS", RewardKey = rewardKey, Snapshot = candidate }
+                    end
+                end
+            end
+            local committedAmount = amount + firstClearBonus
+            previousLifetimeUnionPoints = candidate.LifetimeUnionPoints
+            local newUnionPoints = candidate.UnionPoints + committedAmount
+            local newLifetimeUnionPoints = candidate.LifetimeUnionPoints + committedAmount
+            if self:IsNonNegativeInteger(committedAmount) == false or committedAmount < amount or newUnionPoints < candidate.UnionPoints or newLifetimeUnionPoints < candidate.LifetimeUnionPoints then
+                return { Success = false, Reason = "POINT_AMOUNT_OVERFLOW", RewardKey = rewardKey, Snapshot = candidate }
+            end
+            candidate.UnionPoints = newUnionPoints
+            candidate.LifetimeUnionPoints = newLifetimeUnionPoints
+            candidate.CommittedRewardKeys[rewardKey] = committedAmount
+            if isAscensionReward and completedLevel > 0 and candidate.AscensionFirstClearRewardRuns[ascensionKey] == nil then
+                candidate.AscensionFirstClearRewardRuns[ascensionKey] = rewardRunId
+            end
+            self:PruneCommittedRewardKeys(candidate.CommittedRewardKeys, candidate.NextRewardRunId)
+            local persisted = self:PersistProfileCandidate(storageUserKey, candidate)
+            if persisted.Success == false then
+                return { Success = false, Reason = persisted.Reason, DetailReason = persisted.DetailReason or "", ErrorCode = persisted.ErrorCode or 0, RewardKey = rewardKey, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+            end
+            local committed = { Success = true, Reason = "OK", WasDuplicate = false, RewardKey = rewardKey, CommittedAmount = committedAmount, Snapshot = self:CloneProfile(candidate) }
+            if isAscensionReward then
+                committed.AscensionLevel = completedLevel
+                committed.FirstClearBonus = firstClearBonus
+            end
+            return committed
+        end)
         self:ReleaseMutationLock(storageUserKey)
-        if persisted.Success == false then
-            return { Success = false, Reason = persisted.Reason, DetailReason = persisted.DetailReason or "", ErrorCode = persisted.ErrorCode or 0, RewardKey = rewardKey, Snapshot = self:GetCachedSnapshot(storageUserKey) }
+        if mutationOk == false then
+            -- The write may have committed before its response was lost; reload its receipt before retrying.
+            self:EvictProfile(storageUserKey, "")
+            log_error("[UnionProfile] reward save exception key=" .. rewardKey .. " detail=" .. tostring(result))
+            return { Success = false, Reason = "PROFILE_SAVE_EXCEPTION", RewardKey = rewardKey, Snapshot = nil }
         end
-        _UnionRankProgressionLogic:NotifyRankTransition(userEntity, previousLifetimeUnionPoints, candidate.LifetimeUnionPoints)
-        log("[UnionProfile] reward committed key=" .. rewardKey .. " amount=" .. amount .. " balance=" .. candidate.UnionPoints .. " reason=" .. reason)
-        return {
-            Success = true,
-            Reason = "OK",
-            WasDuplicate = false,
-            RewardKey = rewardKey,
-            CommittedAmount = amount,
-            Snapshot = self:CloneProfile(candidate)
-        }
+        if result.Success == false then
+            if result.ErrorCode == 1000004 then
+                self:EvictProfile(storageUserKey, "")
+                result.Snapshot = nil
+            end
+            return result
+        end
+        if result.WasDuplicate == false then
+            log("[UnionProfile] reward committed key=" .. rewardKey .. " amount=" .. tostring(result.CommittedAmount) .. " firstClearBonus=" .. tostring(result.FirstClearBonus or 0) .. " ascension=" .. tostring(completedLevel) .. " balance=" .. tostring(result.Snapshot.UnionPoints) .. " reason=" .. reason)
+            _UnionRankProgressionLogic:NotifyRankTransition(userEntity, previousLifetimeUnionPoints, result.Snapshot.LifetimeUnionPoints)
+        end
+        return result
     end
 
     @ExecSpace("ServerOnly")
@@ -1248,6 +1355,8 @@ script UnionProfileRepositoryLogic extends Logic
                 UnionPoints = 0,
                 LifetimeUnionPoints = 0,
                 NextRewardRunId = 0,
+                AscensionUnlockedLevel = 0,
+                AscensionFirstClearRewardRuns = {},
                 UnionShop = _UnionShopServiceLogic:DefaultState(),
                 SkillTree = _SkillTreeServiceLogic:DefaultState(),
                 CommittedRewardKeys = {},
@@ -1294,6 +1403,12 @@ script UnionProfileRepositoryLogic extends Logic
             if not _SkillTreeServiceLogic:ValidateState(source.SkillTree) then return {Success=false, Reason="INVALID_TREE_SAVE"} end
             profile.SkillTree = _SkillTreeServiceLogic:CopyState(source.SkillTree)
         end
+        local ascensionLevel = source.AscensionUnlockedLevel
+        if ascensionLevel == nil then ascensionLevel = 0 end
+        if self:IsNonNegativeInteger(ascensionLevel) == false or ascensionLevel > _AscensionDifficultyLogic.MaxLevel then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_ASCENSION_UNLOCKED_LEVEL" }
+        end
+        profile.AscensionUnlockedLevel = ascensionLevel
         local unionPointsResult = self:ReadNonNegativeInteger(source.UnionPoints, "INVALID_UNION_POINTS")
         if unionPointsResult.Success == false then
             return unionPointsResult
@@ -1309,6 +1424,9 @@ script UnionProfileRepositoryLogic extends Logic
         profile.UnionPoints = unionPointsResult.Value
         profile.LifetimeUnionPoints = lifetimeResult.Value
         profile.NextRewardRunId = rewardRunResult.Value
+        local firstClearResult = self:NormalizeAscensionFirstClearRewardRuns(source.AscensionFirstClearRewardRuns, profile.NextRewardRunId, profile.AscensionUnlockedLevel)
+        if firstClearResult.Success == false then return firstClearResult end
+        profile.AscensionFirstClearRewardRuns = firstClearResult.RewardRuns
 
         local rewardReceiptResult = self:NormalizeRewardReceiptMap(source.CommittedRewardKeys, profile.NextRewardRunId)
         if rewardReceiptResult.Success == false then
@@ -1342,7 +1460,7 @@ script UnionProfileRepositoryLogic extends Logic
         local wasMigrated = sourceSchemaVersion < self.CurrentSchemaVersion
         local wasSanitized = rewardReceiptResult.WasSanitized == true or source.UnionShop == nil or source.UnionShop.JobTokens == nil
         -- Optional Schema 5 extension: do not rerun the legacy refund/reset migration.
-        wasSanitized = wasSanitized or source.RedeemedCouponCodes == nil
+        wasSanitized = wasSanitized or source.RedeemedCouponCodes == nil or source.AscensionUnlockedLevel == nil or firstClearResult.WasSanitized == true
         wasSanitized = wasSanitized or (source.UnionShop ~= nil and source.UnionShop.FreeJobTokenClaimed == nil)
         wasSanitized = wasSanitized or (source.UnionShop ~= nil and profile.UnionShop.EquippedSkin ~= source.UnionShop.EquippedSkin)
         local legacyUpgradeRefund = 0
@@ -1557,6 +1675,9 @@ script UnionProfileRepositoryLogic extends Logic
         if not self:ValidateCouponReceiptCodes(profile.RedeemedCouponCodes) then
             return {Success = false, Reason = "INVALID_COUPON_RECEIPTS"}
         end
+        if self:IsNonNegativeInteger(profile.AscensionUnlockedLevel) == false or profile.AscensionUnlockedLevel > _AscensionDifficultyLogic.MaxLevel then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_ASCENSION_UNLOCKED_LEVEL" }
+        end
         if self:IsNonNegativeInteger(profile.UnionPoints) == false then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_POINTS" }
         end
@@ -1565,6 +1686,11 @@ script UnionProfileRepositoryLogic extends Logic
         end
         if self:IsNonNegativeInteger(profile.NextRewardRunId) == false then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_NEXT_REWARD_RUN_ID" }
+        end
+        local firstClearValidation = self:NormalizeAscensionFirstClearRewardRuns(profile.AscensionFirstClearRewardRuns, profile.NextRewardRunId, profile.AscensionUnlockedLevel)
+        if firstClearValidation.Success == false then return firstClearValidation end
+        if type(profile.AscensionFirstClearRewardRuns) ~= "table" or profile.AscensionFirstClearRewardRuns[self.JsonEmptyMapMarker] ~= nil then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "ASCENSION_FIRST_CLEAR_REWARD_RUNS_MISSING_OR_NON_CANONICAL" }
         end
         if type(profile.CommittedRewardKeys) ~= "table" then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "COMMITTED_REWARD_KEYS_MISSING" }
@@ -1739,6 +1865,8 @@ script UnionProfileRepositoryLogic extends Logic
             UnionPoints = source.UnionPoints,
             LifetimeUnionPoints = source.LifetimeUnionPoints,
             NextRewardRunId = source.NextRewardRunId,
+            AscensionUnlockedLevel = source.AscensionUnlockedLevel or 0,
+            AscensionFirstClearRewardRuns = self:CopyLevelMap(source.AscensionFirstClearRewardRuns),
             UnionShop = _UnionShopServiceLogic:CopyState(source.UnionShop),
             SkillTree = _SkillTreeServiceLogic:CopyState(source.SkillTree),
             CommittedRewardKeys = self:CopyRewardReceiptMap(source.CommittedRewardKeys),
@@ -1756,6 +1884,9 @@ script UnionProfileRepositoryLogic extends Logic
         -- MSW's JSON encoder cannot infer the object type of a newly-created empty Lua table.
         -- A reserved marker is added only to the serialized clone and stripped during normalization.
         local result = self:CloneProfile(source)
+        if self:CountTableEntries(result.AscensionFirstClearRewardRuns) == 0 then
+            result.AscensionFirstClearRewardRuns[self.JsonEmptyMapMarker] = 0
+        end
         if self:CountTableEntries(result.PaidPurchaseReceipts) == 0 then
             result.PaidPurchaseReceipts[self.JsonEmptyMapMarker] = 0
         end
@@ -1858,6 +1989,32 @@ script UnionProfileRepositoryLogic extends Logic
         self:ReleaseMutationLock(key)
         log("[SkillTree] purchase skill=" .. skillId .. " success=" .. tostring(result.Success))
         return result
+    end
+
+    method table NormalizeAscensionFirstClearRewardRuns(any source, integer nextRewardRunId, integer unlockedLevel)
+        -- Normalizes at most seven permanent account-wide first-clear run IDs without pruning their claims.
+        local rewardRuns = {}
+        if source == nil then
+            return { Success = true, Reason = "OK", RewardRuns = rewardRuns, WasSanitized = true }
+        end
+        if type(source) ~= "table" then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_ASCENSION_FIRST_CLEAR_REWARD_RUNS" }
+        end
+        for levelKey, rewardRunId in pairs(source) do
+            if levelKey == self.JsonEmptyMapMarker then
+                -- Ignore the empty-object marker without scheduling an identical rewrite.
+            else
+                local level = type(levelKey) == "string" and tonumber(string.match(levelKey, "^[1-7]$")) or nil
+                if level == nil or level > _AscensionDifficultyLogic.MaxLevel or level > unlockedLevel or type(rewardRunId) ~= "number" or self:IsNonNegativeInteger(rewardRunId) == false or rewardRunId < 1 or rewardRunId > nextRewardRunId then
+                    return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_ASCENSION_FIRST_CLEAR_REWARD_RUN", AscensionKey = tostring(levelKey or "") }
+                end
+                rewardRuns[levelKey] = math.floor(rewardRunId)
+            end
+        end
+        if self:CountTableEntries(rewardRuns) > _AscensionDifficultyLogic.MaxLevel then
+            return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "ASCENSION_FIRST_CLEAR_REWARD_RUN_LIMIT_EXCEEDED" }
+        end
+        return { Success = true, Reason = "OK", RewardRuns = rewardRuns, WasSanitized = false }
     end
 
     method table NormalizeRewardReceiptMap(any source, integer nextRewardRunId)

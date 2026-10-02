@@ -106,6 +106,21 @@ script UnionRewardServiceLogic extends Logic
 	end
 
 	@ExecSpace("ServerOnly")
+	method integer ResolveCompletedAscensionRewardLevel(Entity userEntity, any unionState)
+		-- Uses the observed server run identity and sticky test exclusions before a completion is finalized.
+		if unionState.UnionRewardRunEnded == false or unionState.UnionRewardRunEndReason ~= "RUN_CLEAR" then return 0 end
+		local run = userEntity:GetComponent("script.PlayerRunStateComponent")
+		local result = userEntity:GetComponent("script.PlayerRunResultComponent")
+		if run == nil or result == nil or run.RunSequence ~= unionState.ActiveRunSequence
+			or result.ActiveRunSequence ~= run.RunSequence or result.ActiveRunId ~= unionState.RewardRunId then return 0 end
+		_RunResultServiceLogic:ObserveTestMode(userEntity)
+		if result.AscensionExcluded == true or result.RankExclusionReason == "RUN_START_UNOBSERVED"
+			or run.SelectedJobId == "" then return 0 end
+		local level = _AscensionDifficultyLogic:ResolveLevel(run.RunDifficulty)
+		return math.max(0, level)
+	end
+
+	@ExecSpace("ServerOnly")
 	method table CommitPendingRunReward(Entity userEntity, string reason)
 		-- Persists the captured reward receipt, then updates only the same live run snapshot.
 		local runContext = _RunManagerLogic:CaptureRunOperationContext(userEntity)
@@ -116,13 +131,17 @@ script UnionRewardServiceLogic extends Logic
 		end
 		local rewardRunId = unionState.RewardRunId
 		local runSequence = unionState.ActiveRunSequence
+		local rewardLevel = self:ResolveCompletedAscensionRewardLevel(userEntity, unionState)
+		local configured = unionState:ConfigureAscensionReward(rewardLevel)
+		if configured.Success == false then return configured end
 		local pendingUnionPoints = unionState.PendingUnionPoints
 		local commitKey = "union_run:" .. tostring(rewardRunId)
-		local commit = _UnionProfileRepositoryLogic:TryCommitUnionReward(
+		local commit = _UnionProfileRepositoryLogic:TryCommitAscensionUnionReward(
 			userEntity,
 			pendingUnionPoints,
 			commitKey,
-			reason or "RUN_END"
+			reason or "RUN_END",
+			rewardLevel
 		)
 		if _RunManagerLogic:IsRunOperationContextCurrent(userEntity, runContext) == false
 			or isvalid(unionState) == false
@@ -134,12 +153,15 @@ script UnionRewardServiceLogic extends Logic
 		if commit.Success == false then
 			return commit
 		end
-		local applied = unionState:ApplyUnionRewardCommit(commitKey, commit.CommittedAmount or pendingUnionPoints, commit.WasDuplicate == true)
+		local applied = unionState:ApplyAscensionRewardCommit(commitKey, commit.CommittedAmount or pendingUnionPoints, commit.WasDuplicate == true, commit.FirstClearBonus or 0)
 		applied.ProfileSnapshot = commit.Snapshot
 		log("[UnionReward] committed runId=" .. unionState.RewardRunId
 			.. " base=" .. applied.BaseUnionPoints
 			.. " bonus=" .. applied.BonusUnionPoints
 			.. " final=" .. applied.FinalUnionPoints
+			.. " ascension=" .. tostring(applied.AscensionLevel)
+			.. " multiplier=" .. tostring(applied.AscensionCoinMultiplier)
+			.. " firstClear=" .. tostring(applied.FirstClearCoinBonus)
 			.. " duplicate=" .. tostring(applied.WasDuplicate))
 		return applied
 	end

@@ -17,6 +17,9 @@ script PlayerRunUnionEffectComponent extends Component
 	@TargetUserSync property integer RewardRunId = 0
 	@TargetUserSync property integer PendingBaseUnionPoints = 0
 	@TargetUserSync property integer PendingUnionPoints = 0
+	@TargetUserSync property integer RewardAscensionLevel = 0
+	@TargetUserSync property number RewardAscensionCoinMultiplier = 1
+	@TargetUserSync property integer LastCommittedFirstClearCoinBonus = 0
 	@TargetUserSync property integer LastCommittedBaseUnionPoints = 0
 	@TargetUserSync property integer LastCommittedUnionPoints = 0
 	@TargetUserSync property integer LastCommittedBonusUnionPoints = 0
@@ -89,6 +92,9 @@ script PlayerRunUnionEffectComponent extends Component
 		self.RewardRunId = 0
 		self.PendingBaseUnionPoints = 0
 		self.PendingUnionPoints = 0
+		self.RewardAscensionLevel = 0
+		self.RewardAscensionCoinMultiplier = 1
+		self.LastCommittedFirstClearCoinBonus = 0
 		self.LastCommittedBaseUnionPoints = 0
 		self.LastCommittedUnionPoints = 0
 		self.LastCommittedBonusUnionPoints = 0
@@ -119,6 +125,9 @@ script PlayerRunUnionEffectComponent extends Component
 		self.RewardRunId = rewardRunId
 		self.PendingBaseUnionPoints = 0
 		self.PendingUnionPoints = 0
+		self.RewardAscensionLevel = 0
+		self.RewardAscensionCoinMultiplier = 1
+		self.LastCommittedFirstClearCoinBonus = 0
 		self.LastCommittedBaseUnionPoints = 0
 		self.LastCommittedUnionPoints = 0
 		self.LastCommittedBonusUnionPoints = 0
@@ -170,6 +179,30 @@ script PlayerRunUnionEffectComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method table ConfigureAscensionReward(integer completedLevel)
+		-- Applies a completion-only multiplier before the existing idempotent account settlement.
+		if completedLevel < 0 or completedLevel > _AscensionDifficultyLogic.MaxLevel
+			or completedLevel ~= math.floor(completedLevel) then
+			return { Success = false, Reason = "INVALID_ASCENSION_LEVEL" }
+		end
+		if completedLevel > 0 and (self.UnionRewardRunEnded == false or self.UnionRewardRunEndReason ~= "RUN_CLEAR") then
+			return { Success = false, Reason = "ASCENSION_REWARD_RUN_NOT_COMPLETED" }
+		end
+		self.RewardAscensionLevel = completedLevel
+		self.RewardAscensionCoinMultiplier = _AscensionDifficultyLogic:GetCoinMultiplier(completedLevel)
+		self.PendingUnionPoints = self:CalculateUnionPointReward(self.PendingBaseUnionPoints)
+		self.UnionRewardRevision = self.UnionRewardRevision + 1
+		return self:GetRewardSnapshot()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyAscensionRewardCommit(string commitKey, integer committedAmount, boolean wasDuplicate, integer firstClearBonus)
+		-- Exposes the first-clear amount only after the wallet and its permanent claim were saved together.
+		self.LastCommittedFirstClearCoinBonus = math.max(0, math.floor(firstClearBonus or 0))
+		return self:ApplyUnionRewardCommit(commitKey, committedAmount, wasDuplicate)
+	end
+
+	@ExecSpace("ServerOnly")
 	method table ApplyUnionRewardCommit(string commitKey, integer committedAmount, boolean wasDuplicate)
 		if commitKey == nil or commitKey == "" then
 			return { Success = false, Reason = "INVALID_REWARD_COMMIT_KEY" }
@@ -192,6 +225,11 @@ script PlayerRunUnionEffectComponent extends Component
 			RunSequence = self.ActiveRunSequence,
 			RewardRunId = self.RewardRunId,
 			UnionPointGainRate = self.UnionPointGainRate,
+			AscensionLevel = self.RewardAscensionLevel,
+			AscensionCoinMultiplier = self.RewardAscensionCoinMultiplier,
+			FirstClearCoinBonus = self.LastRewardWasCommitted and self.LastCommittedFirstClearCoinBonus or 0,
+			UnionBonusUnionPoints = math.max(0, self:CalculateOrdinaryUnionPointReward(self.PendingBaseUnionPoints) - self:CalculateBaseUnionPointReward(self.PendingBaseUnionPoints)),
+			AscensionBonusUnionPoints = math.max(0, self.PendingUnionPoints - self:CalculateOrdinaryUnionPointReward(self.PendingBaseUnionPoints)),
 			PendingBaseUnionPoints = self.PendingBaseUnionPoints,
 			PendingUnionPoints = self.PendingUnionPoints,
 			BaseUnionPoints = self.LastRewardWasCommitted and self.LastCommittedBaseUnionPoints or self:CalculateBaseUnionPointReward(self.PendingBaseUnionPoints),
@@ -253,12 +291,18 @@ script PlayerRunUnionEffectComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method integer CalculateOrdinaryUnionPointReward(integer baseUnionPoints)
+		-- Retains the ordinary reward for failed runs and the separate permanent Union bonus breakdown.
+		if baseUnionPoints == nil or baseUnionPoints <= 0 then return 0 end
+		return math.max(0, math.floor(baseUnionPoints * 0.95 * (1 + self.UnionPointGainRate) + 0.000001))
+	end
+
+	@ExecSpace("ServerOnly")
 	method integer CalculateUnionPointReward(integer baseUnionPoints)
-		-- Apply the 5% dungeon reward reduction before the captured bonus, rounding only the total.
-		if baseUnionPoints == nil or baseUnionPoints <= 0 then
-			return 0
-		end
-		return math.max(0, math.floor((baseUnionPoints * 0.95 * (1 + self.UnionPointGainRate)) + 0.000001))
+		-- Rounds once after the existing reduction, captured Union bonus and completion-only Ascension multiplier.
+		if baseUnionPoints == nil or baseUnionPoints <= 0 then return 0 end
+		return math.max(0, math.floor(baseUnionPoints * 0.95 * (1 + self.UnionPointGainRate)
+			* self.RewardAscensionCoinMultiplier + 0.000001))
 	end
 
 end
