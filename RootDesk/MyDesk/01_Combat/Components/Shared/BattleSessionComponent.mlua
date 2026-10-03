@@ -1,6 +1,10 @@
 @Component
 script BattleSessionComponent extends Component
 
+	@Sync property boolean TutorialActive = false
+	@Sync property integer TutorialStep = 0
+	@Sync property string TutorialUserId = ""
+
 	@Sync property string PoisonMistCellSnapshot = ""
 
 	@Sync property string BattlePhase = "Setup"
@@ -394,7 +398,21 @@ script BattleSessionComponent extends Component
 	handler HandleUnitMovedEvent(UnitMovedEvent event)
 		-- Confirms that subscribers can observe a completed logical move, then ticks venom poison on the mover.
 		log("[BattleEvent] UnitMovedEvent received unit=" .. event.UnitId .. " from=" .. event.FromCell .. " to=" .. event.ToCell)
-		if event.FromCell ~= event.ToCell then self:ApplyPoisonOnMove(event.UnitId) end
+		if event.FromCell ~= event.ToCell then
+			if self.TutorialActive and event.UnitId == "player_01" then
+				if self.TutorialStep == 1 then
+					self.TutorialStep = 2
+					log("[Tutorial] step=2 movement completed")
+				elseif self.TutorialStep == 3 and event.ToCell < event.FromCell then
+					self.TutorialStep = 4
+					log("[Tutorial] step=4 dodged left")
+				elseif self.TutorialStep == 4 and event.ToCell > event.FromCell then
+					self.TutorialStep = 5
+					log("[Tutorial] step=5 stepped back in")
+				end
+			end
+			self:ApplyPoisonOnMove(event.UnitId)
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1125,6 +1143,7 @@ script BattleSessionComponent extends Component
 	method table TryPrototypeForceStageClear()
 		-- Skips remaining waves, then kills one retained enemy through the normal damage/death/victory pipeline.
 		local result = { Success = false, Reason = "UNKNOWN" }
+		if self.TutorialActive then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
 		if self.BattleResult ~= "" then
 			result.Reason = "BATTLE_ALREADY_ENDED"
 			return result
@@ -1334,7 +1353,7 @@ script BattleSessionComponent extends Component
 		end
 		self.TurnState:ConfigureQueueCapacity(baseQueueCapacity, self.MinQueueCapacity, self.MaxQueueCapacity, "JOB_AND_STAGE_DEFINITION")
 		self:PublishTurnStateSnapshot("STAGE_DEFINITION")
-		self.WaveRuntime:SetTotalWaves(validation.TotalWaves, "STAGE_DEFINITION")
+		self.WaveRuntime:SetTotalWaves(self.TutorialActive and 1 or validation.TotalWaves, "STAGE_DEFINITION")
 		self:PublishWaveStateSnapshot("STAGE_DEFINITION")
 		log("[BattleSession] stage definition applied stage=" .. self.StageId .. " region=" .. self.RegionId .. " index=" .. self.StageIndex .. " type=" .. self.StageType .. " display=" .. self.StageDisplayName .. " cells=" .. self.CellCount .. " startX=" .. self.CellStartX .. " spacing=" .. self.CellSpacing .. " playerCell=" .. self.PlayerStartCell .. " queue=" .. self.TileQueueCapacity)
 		return validation
@@ -2238,6 +2257,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryUseUtilitySkill()
+		-- Keep the introductory lesson on movement and the starting attack.
+		if self.TutorialActive then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		-- Seal leaves movement, facing, queue cleanup and consumables available.
 		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Reserves the existing immediate-action lock without consuming or rewriting queued skills.
@@ -2525,10 +2546,37 @@ script BattleSessionComponent extends Component
 		end
 	end
 
+	-- Shared by client input gating and server validation; reads only synced session state.
+	method boolean IsTutorialCommandAllowed(string commandType, string tileId, integer direction)
+		-- The tutorial accepts only the one command its current step teaches; every other input is ignored.
+		-- Steps: 1 move right, 2 queue Brandish, 3 dodge left, 4 step back in, 5 execute Brandish,
+		-- 6 automatic enemy round, 7 Divine Swing finish.
+		if not self.TutorialActive then return true end
+		local step = self.TutorialStep
+		local queued = self.QueuedTileCount
+		if commandType == "MOVE" then
+			if step == 1 or step == 4 then return direction == 1 end
+			if step == 3 then return direction == -1 end
+			return false
+		end
+		if commandType == "QUEUE_TILE" then
+			if step == 2 then return tileId == "brandish" and queued == 0 end
+			if step == 7 then return tileId == "divine_swing" and queued == 0 end
+			return false
+		end
+		if commandType == "EXECUTE_QUEUE" then
+			return (step == 5 or step == 7) and queued > 0
+		end
+		return false
+	end
+
 	@ExecSpace("ServerOnly")
 	method table TryQueuePlayerAction(string actionType, integer direction)
 		-- Accepts at most one player action and keeps the slot occupied until presentation time ends.
 		local result = { Success = false, Reason = "UNKNOWN" }
+		if self.TutorialActive and not self:IsTutorialCommandAllowed(actionType, "", direction) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
 
 		if actionType ~= "MOVE" and actionType ~= "TURN" then
 			result.Reason = "INVALID_ACTION"
@@ -2778,6 +2826,13 @@ script BattleSessionComponent extends Component
 			end
 			executeDelay = math.max(0.02, math.min(0.05, executeDelay))
 			log("[BattleEnemyHandoff] from=" .. enemyHandoffSourceId .. " action=" .. enemyHandoffActionType .. " to=" .. preparedIntent.EnemyId .. " delay=" .. tostring(executeDelay))
+		end
+		if self.TutorialActive and isQueueingAttack then
+			executeDelay = 0.8
+			log("[Tutorial] enemy queueing attack delay=" .. tostring(executeDelay) .. " enemy=" .. preparedIntent.EnemyId)
+		elseif self.TutorialActive and self.TutorialStep >= 4 and self.TutorialStep <= 6 then
+			executeDelay = 0.5
+			log("[Tutorial] step=" .. tostring(self.TutorialStep) .. " enemy action delay=" .. tostring(executeDelay) .. " enemy=" .. preparedIntent.EnemyId)
 		end
 		self.ActionTimerId = _TimerService:SetTimerOnce(execute, executeDelay)
 	end
@@ -3086,6 +3141,11 @@ script BattleSessionComponent extends Component
 			end
 			if preparedEnemyUnit == nil or actionPlan == nil then
 				return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING" }
+			end
+			if self.TutorialActive and self.TutorialStep == 1 then
+				return actionPlan:ReplacePlan(enemyUnitId, {
+					{ ActionType = "WAIT", TileId = "", Direction = 0, Reason = "TUTORIAL_STEP1_WAIT" }
+				}, self.TurnNumber, preparedEnemyUnit.EnemyTraitIds, "TUTORIAL_STEP1_WAIT", 0)
 			end
 			if actionPlan.PlanState ~= "EMPTY" then
 				actionPlan:ResetPlan("REPLAN")
@@ -4007,6 +4067,13 @@ script BattleSessionComponent extends Component
 		end
 
 		local beatDuration = math.max(0.02, math.min(0.06, self.EnemyToPlayerBeatDuration))
+		if self.TutorialActive and actionType == "QUEUE_TILE" then
+			beatDuration = 2.0
+			log("[Tutorial] enemy QUEUE_TILE hold beatDuration=" .. tostring(beatDuration))
+		elseif self.TutorialActive and self.TutorialStep >= 4 and self.TutorialStep <= 6 then
+			beatDuration = 0.4
+			log("[Tutorial] step=" .. tostring(self.TutorialStep) .. " enemy-to-player hold beatDuration=" .. tostring(beatDuration))
+		end
 		local expectedEntry = self.EntryRequestId
 		local expectedTurn = self.TurnState.TurnNumber
 		local finishTransition = function()
@@ -4038,6 +4105,13 @@ script BattleSessionComponent extends Component
 
 		self.TurnState:CompleteEnemyTurn("ENEMY_ROUND_COMPLETED")
 		self:PublishTurnStateSnapshot("PLAYER_TURN_REOPENED")
+		if self.TutorialActive and self.TutorialStep == 2 and self.QueuedTileCount > 0 then
+			self.TutorialStep = 3
+			log("[Tutorial] step=3 enemy loaded a skill; dodge left")
+		elseif self.TutorialActive and self.TutorialStep == 6 then
+			self.TutorialStep = 7
+			log("[Tutorial] step=7 automatic enemy turn completed")
+		end
 		self.StageTurnNumber = self.TurnNumber
 		self:AdvancePlayerSkillCooldowns("PLAYER_TURN_" .. self.TurnNumber)
 		self:ProcessAugmentTrigger("TURN_START", "TURN:" .. tostring(self.TurnNumber), 0)
@@ -4267,6 +4341,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryReorderBattleSkillSlot(integer sourceIndex, integer targetIndex, integer expectedRevision)
+		if self.TutorialActive then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		local result = {
 			Success = false,
 			Reason = "UNKNOWN",
@@ -4563,6 +4638,10 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryQueueTile(string tileId)
+		-- Guide the first hit without changing normal queue or automatic turn behavior.
+		if self.TutorialActive and not self:IsTutorialCommandAllowed("QUEUE_TILE", tileId, 0) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
 		-- Seal leaves movement, facing, queue cleanup and consumables available.
 		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Appends one supported tile up to the configurable queue capacity.
@@ -4627,6 +4706,9 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryExecuteQueuedTile()
+		if self.TutorialActive and not self:IsTutorialCommandAllowed("EXECUTE_QUEUE", "", 0) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
 		-- Seal leaves movement, facing, queue cleanup and consumables available.
 		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Freezes the registered queue and starts an arbitrary-length sequential execution pass.
@@ -4890,6 +4972,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryClearQueuedTile()
+		if self.TutorialActive then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		-- Clears every registered tile only while the player still owns an idle input phase.
 		local clearedCount = self.TurnState.QueuedTileCount
 		local result = self.TurnState:TryClearQueuedSkills()
@@ -4905,6 +4988,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryRemoveQueuedTileAt(integer queueIndex)
+		if self.TutorialActive then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		-- Removes one queued tile without advancing the turn or starting the enemy round.
 		local result = self.TurnState:TryRemoveQueuedSkillAt(queueIndex)
 		if result.Success == false then
@@ -4919,6 +5003,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryReorderQueuedTile(integer fromIndex, integer toIndex, integer expectedQueueOrderRevision)
+		if self.TutorialActive then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		local currentRevision = self.TurnState ~= nil and self.TurnState.QueueOrderRevision or 0
 		local currentQueue = self.TurnState ~= nil and self.TurnState.QueuedTileIds or ""
 		local result = {
@@ -4976,6 +5061,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryMoveQueuedTile(integer fromIndex, integer toIndex)
+		if self.TutorialActive then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		-- Reorders the queued tiles without advancing the turn or starting the enemy round.
 		local result = self.TurnState:TryMoveQueuedSkill(fromIndex, toIndex)
 		if result.Success == false then
@@ -5054,7 +5140,9 @@ script BattleSessionComponent extends Component
 		end
 		self.ResultDefeatReset = resetResult
 		log("[BattleForfeit] run abandoned stage=" .. tostring(self.StageId) .. " turn=" .. tostring(self.TurnNumber))
-		return self:ReturnToLobbyAfterDefeat()
+		local returned = self:ReturnToLobbyAfterDefeat()
+		if returned.Success and self.TutorialActive then _NewPlayerTutorialLogic:ReleasePlayer(self.PlayerEntity) end
+		return returned
 	end
 
 	@ExecSpace("ServerOnly")
@@ -5258,7 +5346,9 @@ script BattleSessionComponent extends Component
 		local slotIds = {}
 		local slotNames = {}
 		local slotCooldownTurns = {}
-		if runOrderAvailable == true then
+		if self.TutorialActive then
+			slotIds = { "brandish", "divine_swing" }
+		elseif runOrderAvailable == true then
 			slotIds = self:ParseSkillSlotPipe(runSlotIds)
 		else
 			-- Compatibility fallback only; valid runs initialize and persist their random default in the run owner.
@@ -5535,6 +5625,9 @@ script BattleSessionComponent extends Component
 			result.Reason = "INVALID_DIFFICULTY"
 			return result
 		end
+		self.TutorialActive = _NewPlayerTutorialLogic:IsEntry(playerEntity, requestId)
+		self.TutorialStep = self.TutorialActive and 1 or 0
+		self.TutorialUserId = self.TutorialActive and playerEntity.PlayerComponent.UserId or ""
 		local runState = nil
 		if entryMode == "NEW_RUN" then
 			runState = _RunManagerLogic:StartNewRun(playerEntity, runSeed)
@@ -6148,6 +6241,7 @@ script BattleSessionComponent extends Component
 	method table TryDiscardRunConsumable(Entity playerEntity, string consumableId, integer requestId, integer entryId, integer inventoryRevision)
 		-- Disposal bypasses effect usability, but retains ownership, turn and revision checks.
 		local result = { Success = false, Reason = "INVALID_PLAYER", ConsumesTurn = false, ConsumedAmount = 0 }
+		if self.TutorialActive then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
 		if not isvalid(playerEntity) or playerEntity ~= self.PlayerEntity or playerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then return result end
 		if requestId <= 0 then result.Reason = "INVALID_REQUEST_ID"; return result end
 		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or self.TurnState.IsActionProcessing then
@@ -6205,6 +6299,7 @@ script BattleSessionComponent extends Component
 	method table TryUseRunConsumable(Entity playerEntity, string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Validates timing and inventory, executes the registered effect, then commits consumption exactly once.
 		local result = { Success = false, Reason = "UNKNOWN", ConsumableId = consumableId or "", AppliedAmount = 0, ConsumedAmount = 0, ConsumesTurn = false }
+		if self.TutorialActive then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
 		if isvalid(playerEntity) == false or playerEntity ~= self.PlayerEntity or playerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then
 			result.Reason = "INVALID_PLAYER"
 			return result
@@ -8005,6 +8100,10 @@ script BattleSessionComponent extends Component
 		if not ignoresBuffs and defenderEffects ~= nil then
 			amount = math.max(0, amount - defenderEffects:GetFrontDamageReduction(sourceUnit, targetUnit))
 		end
+		if self.TutorialActive and (targetUnit.Team == "Player" or self.TutorialStep < 7) then
+			-- Training cannot kill the learner or skip observing the first enemy round.
+			amount = math.min(amount, math.max(0, targetUnit.CurrentHp - 1))
+		end
 		local damageResult
 		if amount == 0 then
 			damageResult = { Success = true, Reason = "RELIC_FRONT_GUARDED", AppliedAmount = 0,
@@ -8017,6 +8116,10 @@ script BattleSessionComponent extends Component
 		if damageResult.Success == false then
 			result.Reason = damageResult.Reason
 			return result
+		end
+		if self.TutorialActive and self.TutorialStep == 5 and sourceUnit.Team == "Player" and targetUnit.Team == "Enemy" and damageResult.AppliedAmount > 0 then
+			self.TutorialStep = 6
+			log("[Tutorial] step=6 attack hit; awaiting automatic enemy turn")
 		end
 		if self.SkillTestMode == true and targetUnit.Team == "Enemy" then
 			-- The dummy's pips cap at its small max HP, so report the full post-buff hit separately.
@@ -8222,7 +8325,7 @@ script BattleSessionComponent extends Component
 		end
 		if unit.Team == "Enemy" and isvalid(self.PlayerEntity) then
 			self.ResultKillCount = self.ResultKillCount + 1
-			_MonsterCollectionLogic:RecordDefeat(self.PlayerEntity, unit.EnemyDefinitionId)
+			if not self.TutorialActive then _MonsterCollectionLogic:RecordDefeat(self.PlayerEntity, unit.EnemyDefinitionId) end
 			local sourceEntity = self:FindUnitEntity(sourceUnitId)
 			if sourceEntity == self.PlayerEntity then
 				local relics = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
@@ -8247,7 +8350,7 @@ script BattleSessionComponent extends Component
 			self:ResetEnemyIntentCursor("UNIT_DIED")
 		end
 		self:PublishEnemyPlanSnapshot("UNIT_DIED")
-		if unit.Team == "Enemy" and self.DropRuntime ~= nil then
+		if unit.Team == "Enemy" and self.DropRuntime ~= nil and not self.TutorialActive then
 			local sourceEntity = self:FindUnitEntity(sourceUnitId)
 			local sourceUnit = nil
 			if isvalid(sourceEntity) then
@@ -8386,8 +8489,8 @@ script BattleSessionComponent extends Component
 			self.BattleResult = "Defeat"
 		end
 
-		local runResultRecorded = false
-		if isvalid(self.PlayerEntity) then
+		local runResultRecorded = self.TutorialActive
+		if isvalid(self.PlayerEntity) and not self.TutorialActive then
 			local playerUnit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
 			if playerUnit ~= nil then playerUnit:ClearAttackBuffs() end
 			if self.BattleResult == "Victory" and self.DropRuntime ~= nil then
@@ -9950,6 +10053,12 @@ script BattleSessionComponent extends Component
 		if self:IsValidPlayerRequest(senderUserId) == false or self.ResultReady == false then return end
 		if self.BattleResult ~= "Victory" and self.BattleResult ~= "Defeat" then return end
 		self.ResultReady = false
+		if self.TutorialActive then
+			local result = _NewPlayerTutorialLogic:Finish(self)
+			if not result.Success then self.ResultReady = true end
+			self:PublishPlayerCommandResult("TUTORIAL_FINISH", result)
+			return
+		end
 		if self.ResultRecorded == false then
 			local resultContext = self:CaptureBattleResultContext()
 			local recorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)

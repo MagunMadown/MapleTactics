@@ -66,6 +66,52 @@ script EnemyIntentHudComponent extends Component
 
 		self:UpdateViewPositions(session)
 		self:RefreshEnemySkillHover(player, session, delta)
+		local showTutorialHighlight = session.TutorialActive and session.TutorialStep < 4
+		if showTutorialHighlight then
+			self._T.WasTutorialHighlight = true
+			local t = (_UtilLogic.ElapsedSeconds or 0) * 5
+			local pulse = 0.5 + 0.5 * math.sin(t)
+			for _, record in pairs(self._T.EnemyViews or {}) do
+				local view = record.View
+				if isvalid(view) and view.EnabledInHierarchy then
+					local slot = view:GetChildByName("QueueSlot01")
+					if isvalid(slot) and slot.EnabledInHierarchy then
+						local highlight = slot:GetChildByName("TutorialHighlight")
+						if isvalid(highlight) and highlight.Enable then
+							local scale = 1.0 + 0.08 * pulse
+							highlight.UITransformComponent.UIScale = Vector3(scale, scale, 1)
+							if highlight.SpriteGUIRendererComponent ~= nil then
+								highlight.SpriteGUIRendererComponent.Color = Color(1, 0.85 + 0.15 * pulse, 0.25, 0.9 + 0.1 * pulse)
+							end
+						end
+						local tag = slot:GetChildByName("SpecialTag")
+						if isvalid(tag) and tag.Enable then
+							local tagScale = 1.0 + 0.05 * pulse
+							tag.UITransformComponent.UIScale = Vector3(tagScale, tagScale, 1)
+						end
+					end
+				end
+			end
+		elseif self._T.WasTutorialHighlight == true then
+			self._T.WasTutorialHighlight = false
+			for _, record in pairs(self._T.EnemyViews or {}) do
+				local view = record.View
+				if isvalid(view) then
+					local slot = view:GetChildByName("QueueSlot01")
+					if isvalid(slot) then
+						local highlight = slot:GetChildByName("TutorialHighlight")
+						if isvalid(highlight) then
+							highlight.Enable = false
+							highlight.UITransformComponent.UIScale = Vector3(1, 1, 1)
+						end
+						local tag = slot:GetChildByName("SpecialTag")
+						if isvalid(tag) then
+							tag.UITransformComponent.UIScale = Vector3(1, 1, 1)
+						end
+					end
+				end
+			end
+		end
 		self.RefreshElapsed = self.RefreshElapsed + delta
 		if self.RefreshElapsed < self.RefreshInterval then
 			return
@@ -184,6 +230,7 @@ script EnemyIntentHudComponent extends Component
 		end
 		local view = self.EnemyIntentTemplate:Clone("EnemyIntent_" .. unitId)
 		view.Enable = true
+		self:EnsureSpecialMarkers(view)
 		self._T.EnemyViews[unitId] = {
 			View = view,
 			Enemy = enemyEntity,
@@ -221,33 +268,62 @@ script EnemyIntentHudComponent extends Component
 		local queuedIconBackgroundColors = self:SplitTokens(intent.QueuedIconBackgroundColors or "")
 		local queuedSpecialFlags = self:SplitTokens(intent.QueuedSpecialFlags or "")
 		self._T.ViewQueues[intent.UnitId] = queuedIds
+		local player = _UserService.LocalPlayer
+		local session = self:GetBattleSession(player)
+		local isTutorial = session ~= nil and session.TutorialActive and session.TutorialStep < 4
 		for slotIndex = 1, 3 do
 			local slot = view:GetChildByName("QueueSlot0" .. tostring(slotIndex))
 			local tileId = queuedIds[slotIndex] or ""
 			if isvalid(slot) then
-				slot.Enable = tileId ~= ""
+				local hasSkill = tileId ~= ""
+				local isTutorialSlot = isTutorial and slotIndex == 1 and hasSkill
+				slot.Enable = hasSkill
 				slot.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, queueBaseY + (slotIndex - 1) * self.QueueSlotSpacing)
 				self:ApplyQueueSlotColor(slot, intent.State)
 				-- Special attacks (telegraph/status/control) get a gold frame and a corner tag.
-				local special = tileId ~= "" and queuedSpecialFlags[slotIndex] == "1"
+				local special = (hasSkill and queuedSpecialFlags[slotIndex] == "1") or isTutorialSlot
 				local specialFrame = slot:GetChildByName("SpecialFrame")
-				if isvalid(specialFrame) then specialFrame.Enable = special end
+				if isvalid(specialFrame) then specialFrame.Enable = special and not isTutorialSlot end
 				local specialTag = slot:GetChildByName("SpecialTag")
-				if isvalid(specialTag) then specialTag.Enable = special end
+				if isvalid(specialTag) then
+					specialTag.Enable = special
+					if isTutorialSlot and specialTag.TextGUIRendererComponent ~= nil then
+						specialTag.TextGUIRendererComponent.Text = "스킬 장전!"
+						specialTag.TextGUIRendererComponent.FontSize = 13
+						specialTag.TextGUIRendererComponent.FontColor = Color(0.16, 0.09, 0, 1)
+					elseif not isTutorialSlot and specialTag.TextGUIRendererComponent ~= nil then
+						specialTag.TextGUIRendererComponent.Text = "특수"
+					end
+					if not isTutorialSlot then
+						specialTag.UITransformComponent.UIScale = Vector3(1, 1, 1)
+					end
+				end
+				local tutorialHighlight = slot:GetChildByName("TutorialHighlight")
+				if isvalid(tutorialHighlight) then
+					tutorialHighlight.Enable = isTutorialSlot
+					if not isTutorialSlot then
+						tutorialHighlight.UITransformComponent.UIScale = Vector3(1, 1, 1)
+					end
+				end
 				local icon = slot:GetChildByName("SkillIcon")
-				if isvalid(icon) and icon.SpriteGUIRendererComponent ~= nil and tileId ~= "" then
-					local iconRuid = queuedIconRuids[slotIndex] or ""
-					if iconRuid == "" or iconRuid == "-" then
-						iconRuid = self:GetEnemySkillFallbackIconRuid(tileId)
+				if isvalid(icon) and icon.SpriteGUIRendererComponent ~= nil then
+					if hasSkill then
+						local iconRuid = queuedIconRuids[slotIndex] or ""
+						if iconRuid == "" or iconRuid == "-" then
+							iconRuid = self:GetEnemySkillFallbackIconRuid(tileId)
+						end
+						local innerBackground = slot:GetChildByName("InnerBackground")
+						if isvalid(innerBackground) and innerBackground.SpriteGUIRendererComponent ~= nil then
+							-- Restore the default too, because these slots are reused across skills.
+							innerBackground.SpriteGUIRendererComponent.Color = self:GetQueueIconBackgroundColor(queuedIconBackgroundColors[slotIndex] or "")
+						end
+						icon.Enable = true
+						icon.UITransformComponent.anchoredPosition = Vector2(self.SkillIconOffsetX, self.SkillIconOffsetY)
+						icon.UITransformComponent.RectSize = Vector2(self.SkillIconSize, self.SkillIconSize)
+						icon.SpriteGUIRendererComponent.ImageRUID = DataRef(self:NormalizeHudIconRuid(iconRuid))
+					else
+						icon.Enable = false
 					end
-					local innerBackground = slot:GetChildByName("InnerBackground")
-					if isvalid(innerBackground) and innerBackground.SpriteGUIRendererComponent ~= nil then
-						-- Restore the default too, because these slots are reused across skills.
-						innerBackground.SpriteGUIRendererComponent.Color = self:GetQueueIconBackgroundColor(queuedIconBackgroundColors[slotIndex] or "")
-					end
-					icon.UITransformComponent.anchoredPosition = Vector2(self.SkillIconOffsetX, self.SkillIconOffsetY)
-					icon.UITransformComponent.RectSize = Vector2(self.SkillIconSize, self.SkillIconSize)
-					icon.SpriteGUIRendererComponent.ImageRUID = DataRef(self:NormalizeHudIconRuid(iconRuid))
 				end
 			end
 		end
@@ -305,6 +381,19 @@ script EnemyIntentHudComponent extends Component
 					frame.SpriteGUIRendererComponent.Color = Color(1, 0.76, 0.29, 1)
 					_UILogic:SetSiblingIndex(frame.UITransformComponent, 1)
 					frame.Enable = false
+				end
+			end
+			if isvalid(background) and not isvalid(slot:GetChildByName("TutorialHighlight")) then
+				local highlight = background:Clone("TutorialHighlight")
+				if isvalid(highlight) then
+					highlight.UITransformComponent.RectSize = Vector2(92, 92)
+					local hr = highlight.SpriteGUIRendererComponent
+					hr.ImageRUID = DataRef("99804bfbea32478b8186bb1fc769fa09")
+					hr.Type = ImageType.Sliced
+					hr.Color = Color(1, 0.85, 0.25, 1)
+					hr.RaycastTarget = false
+					_UILogic:SetSiblingIndex(highlight.UITransformComponent, 1)
+					highlight.Enable = false
 				end
 			end
 			if isvalid(slot) and isvalid(readyLabel) and not isvalid(slot:GetChildByName("SpecialTag")) then
