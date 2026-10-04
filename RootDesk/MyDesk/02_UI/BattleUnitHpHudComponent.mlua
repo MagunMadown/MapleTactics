@@ -306,6 +306,7 @@ script BattleUnitHpHudComponent extends Component
 		end
 		view.NativeNameTag = nil
 		view.NativeNameTagEnabled = nil
+		if view == self._T.PlayerView then self:DestroyLobbyNameFollower() end
 		if isvalid(view.Root) then
 			view.Root.Enable = false
 		end
@@ -318,35 +319,93 @@ script BattleUnitHpHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void UpdateLobbyName(Entity player)
-		-- Reuse the authored player name line without exposing battle HP in the lobby.
+		-- The lobby name is a world-space name tag. A screen-space line is placed through WorldToScreenPosition,
+		-- which trails the rendered camera while it follows a grid step, so it slid off the avatar on every move.
+		-- A copy of the native tag sits under the avatar root, so the hierarchy carries it through the step and
+		-- the hop height like the battle name. Without a template the native tag on the root is shown instead.
 		local view = self._T.PlayerView
-		if view == nil or not isvalid(view.Root) or not isvalid(view.NameText) then return end
+		if view == nil or not isvalid(view.Root) then return end
 		if self._T.ContextMap ~= player.CurrentMap or view.UnitEntity ~= player then
 			self:HideAllBars("LOBBY_NAME")
 			self._T.ContextMap = player.CurrentMap
 			view.UnitEntity = player
-			view.NameOnlyChildren = {}
-			for _, key in ipairs({"Frame", "Shadow", "Empty", "Fill", "Highlight", "HpText", "PipLayer"}) do
-				local child = view[key]
-				if isvalid(child) then
-					view.NameOnlyChildren[child] = child.Enable
-					child.Enable = false
-				end
+		end
+		view.Root.Enable = false
+		local nativeName = player.NameTagComponent
+		if nativeName == nil then return end
+		if view.NativeNameTag == nil then
+			view.NativeNameTag = nativeName
+			view.NativeNameTagEnabled = nativeName.Enable
+		end
+		local follower = self:EnsureLobbyNameFollower(player, nativeName)
+		nativeName.Enable = view.NativeNameTagEnabled and follower == nil
+		if follower ~= nil then
+			local tag = follower.NameTagComponent
+			if tag.Name ~= nativeName.Name then tag.Name = nativeName.Name end
+			tag.Enable = view.NativeNameTagEnabled
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity EnsureLobbyNameFollower(Entity player, any nativeName)
+		-- Spawns one client-only copy of a lobby name label under the avatar root and styles it like the player tag.
+		local renderer = player.AvatarRendererComponent
+		local avatarRoot = renderer ~= nil and renderer:GetAvatarRootEntity() or nil
+		if not isvalid(avatarRoot) then return nil end
+		local follower = self._T.LobbyNameFollower
+		if isvalid(follower) and follower.Parent == avatarRoot then return follower end
+		-- The avatar root is rebuilt when the avatar reloads; start over under the new one.
+		self:DestroyLobbyNameFollower()
+		local template = self:FindLobbyNameTemplate(player.CurrentMap)
+		if template == nil then return nil end
+		follower = _SpawnService:SpawnByEntity(template, "LobbyNameFollower", Vector3(0, 0, 0), avatarRoot, false)
+		if not isvalid(follower) or follower.NameTagComponent == nil then
+			if isvalid(follower) then follower:Destroy() end
+			return nil
+		end
+		-- The avatar root is mirrored with Scale.x for facing; name tags still read left to right under it.
+		follower.TransformComponent.Position = Vector3(0, 0, 0)
+		local tag = follower.NameTagComponent
+		tag.NameTagRUID = nativeName.NameTagRUID
+		tag.FontColor = nativeName.FontColor
+		tag.FontSize = nativeName.FontSize
+		tag.FontOffset = nativeName.FontOffset
+		tag.Bold = nativeName.Bold
+		tag.OffsetY = nativeName.OffsetY
+		tag.Name = nativeName.Name
+		self._T.LobbyNameFollower = follower
+		log("[BattleUnitHpHUD] lobby name follows avatar root template=" .. tostring(template.Name))
+		return follower
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity FindLobbyNameTemplate(Entity map)
+		-- Lobby facility labels are plain NameLabel entities; any one of them is a ready-made name tag to copy.
+		if not isvalid(map) then return nil end
+		-- Search each map once; a map without labels keeps the native tag instead of rescanning every frame.
+		if self._T.LobbyNameTemplateMap == map then
+			return isvalid(self._T.LobbyNameTemplate) and self._T.LobbyNameTemplate or nil
+		end
+		local found = nil
+		local pending = { map }
+		while found == nil and #pending > 0 do
+			local entity = table.remove(pending)
+			if entity ~= map and entity.Name == "NameLabel" and entity.NameTagComponent ~= nil then
+				found = entity
+			else
+				for _, child in ipairs(entity.Children or {}) do table.insert(pending, child) end
 			end
 		end
-		local transform = player.TransformComponent
-		if transform == nil or view.Root.UITransformComponent == nil then return end
-		local position = transform.WorldPosition
-		local renderer = player.AvatarRendererComponent
-		if renderer ~= nil then
-			local visual = renderer:GetAvatarRootEntity()
-			if isvalid(visual) and visual.TransformComponent ~= nil then position = visual.TransformComponent.WorldPosition end
-		end
-		local screen = _UILogic:WorldToScreenPosition(Vector2(position.x, position.y + self.PlayerHpBarOffsetY + self.HpPipOffsetY))
-		local ui = _UILogic:ScreenToUIPosition(screen)
-		view.Root.UITransformComponent.anchoredPosition = Vector2(ui.x, ui.y - 28)
-		view.Root.Enable = renderer == nil or renderer.Enable ~= false
-		self:UpdatePlayerName(view)
+		self._T.LobbyNameTemplateMap = map
+		self._T.LobbyNameTemplate = found
+		return found
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DestroyLobbyNameFollower()
+		local follower = self._T.LobbyNameFollower
+		self._T.LobbyNameFollower = nil
+		if isvalid(follower) then follower:Destroy() end
 	end
 
 	@ExecSpace("ClientOnly")

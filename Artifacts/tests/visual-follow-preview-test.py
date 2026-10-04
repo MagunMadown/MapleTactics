@@ -25,7 +25,8 @@ def load(path, names):
 
 
 lua.globals().hp = load("RootDesk/MyDesk/02_UI/BattleUnitHpHudComponent.mlua", {
-    "UpdateWorldBar", "UpdateLobbyName", "UpdatePlayerName", "ClearView", "AssignView", "GetHpRatio"})
+    "UpdateWorldBar", "UpdateLobbyName", "UpdatePlayerName", "ClearView", "AssignView", "GetHpRatio",
+    "EnsureLobbyNameFollower", "FindLobbyNameTemplate", "DestroyLobbyNameFollower"})
 lua.globals().queue = load("RootDesk/MyDesk/02_UI/PlayerOverheadQueueHudComponent.mlua", {"UpdatePlayerTracking"})
 lua.globals().preview = load("RootDesk/MyDesk/04_Roguelike/SkillStage/NewSkillSelectionUILogic.mlua", {
     "PlayFittedPreview", "SetPreviewThumbnail", "ReleasePreviewFit", "ClearPreviewFits", "SetCardHighlight"})
@@ -77,27 +78,56 @@ assert(view.Root.UITransformComponent.anchoredPosition.x==1 and queue.Reservatio
 unit.IsDead=true; hp:UpdateWorldBar(view,0.016,-1); assert(player.NameTagComponent.Enable)
 print('PASS missing avatar fallback and death restore native nickname')
 
--- Lobby names follow the predicted visual every frame, without requiring a battle unit.
+-- Lobby names use the world-space native tag: the screen-space line is placed through WorldToScreenPosition,
+-- which trails the camera while it follows a lobby step. No battle unit is required.
 local lobby={Name='lobby'}
 player.CurrentMap=lobby
 player.GetComponent=function() error('lobby name must not query a battle unit') end
 player.AvatarRendererComponent.GetAvatarRootEntity=function() return visual end
 view.Frame={Enable=true}; view.Fill={Enable=false}; view.PipLayer={Enable=true}
-hp.PlayerHpBarOffsetY=0.2; hp.HpPipOffsetY=-0.48
+local anchored=view.Root.UITransformComponent.anchoredPosition
 local clears=0
 hp.HideAllBars=function(self) clears=clears+1; self:ClearView(view) end
 hp:UpdateLobbyName(player)
-assert(clears==1 and view.Root.Enable and view.NameText.Enable)
-assert(not view.Frame.Enable and not view.Fill.Enable and not view.PipLayer.Enable)
-assert(view.Root.UITransformComponent.anchoredPosition.x==9 and not player.NameTagComponent.Enable)
+assert(clears==1 and not view.Root.Enable and player.NameTagComponent.Enable)
+assert(view.Root.UITransformComponent.anchoredPosition==anchored)
 visual.TransformComponent.WorldPosition=Vector2(12,4)
 hp:UpdateLobbyName(player)
-assert(clears==1 and view.Root.UITransformComponent.anchoredPosition.x==12)
+assert(clears==1 and not view.Root.Enable and player.NameTagComponent.Enable)
 assert(player.TransformComponent.WorldPosition.x==1)
 hp:ClearView(view)
 assert(player.NameTagComponent.Enable and not view.Root.Enable)
 assert(view.Frame.Enable and not view.Fill.Enable and view.PipLayer.Enable)
-print('PASS lobby prediction, no battle dependency, no HP, per-frame follow and exact restoration')
+print('PASS lobby native tag, no battle dependency, no HP, no screen-space line and exact restoration')
+
+-- With a lobby NameLabel to copy, the name lives under the avatar root so the hierarchy carries the hop height.
+local spawned={}
+Vector3=Vector3 or function(x,y,z) return {x=x,y=y,z=z} end
+_SpawnService={SpawnByEntity=function(_,template,name,position,parent,includeChild)
+    local copy={Name=name,Parent=parent,TransformComponent={},NameTagComponent={Enable=true,Name=template.NameTagComponent.Name,OffsetY=-0.98},
+        Destroy=function(self) self.destroyed=true end}
+    spawned[#spawned+1]=copy; return copy
+end}
+local label={Name='NameLabel',NameTagComponent={Name='Codex'}}
+local lobby2={Name='lobby',Children={{Name='Zone',Children={label}}}}
+player.CurrentMap=lobby2
+player.NameTagComponent.Name='Haze'; player.NameTagComponent.OffsetY=0; player.NameTagComponent.NameTagRUID='tag'
+player.NameTagComponent.FontColor='white'; player.NameTagComponent.FontSize=1; player.NameTagComponent.FontOffset='fo'; player.NameTagComponent.Bold=false
+hp:UpdateLobbyName(player)
+local follower=spawned[1]
+assert(#spawned==1 and follower.Parent==visual and not view.Root.Enable)
+assert(follower.NameTagComponent.Name=='Haze' and follower.NameTagComponent.OffsetY==0 and follower.NameTagComponent.NameTagRUID=='tag')
+assert(follower.NameTagComponent.Enable and not player.NameTagComponent.Enable)
+hp:UpdateLobbyName(player); assert(#spawned==1)
+-- A rebuilt avatar root gets a fresh follower; the old one is destroyed.
+local rebuilt={TransformComponent={WorldPosition=Vector2(8,3)}}
+player.AvatarRendererComponent.GetAvatarRootEntity=function() return rebuilt end
+hp:UpdateLobbyName(player)
+assert(#spawned==2 and follower.destroyed and spawned[2].Parent==rebuilt)
+hp:ClearView(view)
+assert(spawned[2].destroyed and player.NameTagComponent.Enable and hp._T.LobbyNameFollower==nil)
+player.AvatarRendererComponent.GetAvatarRootEntity=function() return visual end
+print('PASS lobby name follows the avatar root through the hierarchy and is cleaned up with the view')
 
 ImageType={Simple=1}; PreserveSpriteType={None=0,NativeSize=1}
 SpriteAnimClipPlayType={Loop=1}; ResourceType={AnimationClip=1}

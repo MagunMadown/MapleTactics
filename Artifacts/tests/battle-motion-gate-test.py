@@ -350,6 +350,8 @@ function _TweenLogic:PlayTween(a,b,duration,ease,callback)
 end
 actor:SetLocalGridMoveOffset(.5)
 actor:BeginLocalGridMoveHop("owner",.13,.09,.02,.04,1.03,.97,1.05,.95,.5,"",3,7)
+-- The hop reads the frame clock, not the tween value, so advance the clock into the arc.
+_UtilLogic.ElapsedSeconds=_UtilLogic.ElapsedSeconds+.08
 _TweenLogic.LastCallback(.5)
 assert(math.abs(visual.TransformComponent.Position.x-.75)<.000001)
 assert(visual.TransformComponent.Position.y>2)
