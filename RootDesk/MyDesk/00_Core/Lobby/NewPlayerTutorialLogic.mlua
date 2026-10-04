@@ -1,0 +1,180 @@
+@Logic
+script NewPlayerTutorialLogic extends Logic
+
+    property table ActivePlayers = {}
+    property boolean CheckedLogin = false
+
+    @ExecSpace("ServerOnly")
+    method boolean IsActive(Entity playerEntity)
+        -- Tutorial ownership is server-created and tied to this exact player entity.
+        if not isvalid(playerEntity) or playerEntity.PlayerComponent == nil then return false end
+        local active = self.ActivePlayers[playerEntity.PlayerComponent.UserId]
+        return active ~= nil and active.Player == playerEntity
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean IsEntry(Entity playerEntity, integer requestId)
+        -- A later normal entry must never inherit an earlier tutorial flag.
+        if not self:IsActive(playerEntity) then return false end
+        return self.ActivePlayers[playerEntity.PlayerComponent.UserId].RequestId == requestId
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ReleasePlayer(Entity playerEntity)
+        -- Releases the tutorial only after run cleanup has excluded its result.
+        if self:IsActive(playerEntity) then
+            self.ActivePlayers[playerEntity.PlayerComponent.UserId] = nil
+            self:ShowEntryStatus("", false, playerEntity.PlayerComponent.UserId)
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    @EventSender("Service", "UserService")
+    handler HandleUserLeaveEvent(UserLeaveEvent event)
+        -- Rejoining an unfinished tutorial starts it again from its saved completion flag.
+        self.ActivePlayers[event.UserId] = nil
+    end
+
+    @ExecSpace("Server")
+    method void RequestStart()
+        -- Resolve the caller on the server; never accept another player's identity or completion.
+        self:BeginEntry(senderUserId, false)
+    end
+
+    @ExecSpace("Server")
+    method void RequestReplay()
+        -- Esc-menu replay: same flow as the first entry, but a saved completion does not block it.
+        self:BeginEntry(senderUserId, true)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void BeginEntry(string userId, boolean force)
+        -- Prepare the existing lobby entry after loading the saved tutorial completion flag.
+        local senderUserId = userId
+        local player = _UserService:GetUserEntityByUserId(senderUserId)
+        if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then return end
+        if self:IsActive(player) then return end
+        local allowed = _BattleGatewayLogic:ValidateLobbyEntryRequest(player)
+        if not allowed.Success then return end
+        local active = { Player = player, RequestId = 0 }
+        self.ActivePlayers[senderUserId] = active
+        local loaded = _UnionProfileRepositoryLogic:GetUnionProfile(player)
+        if self.ActivePlayers[senderUserId] ~= active or not isvalid(player) then return end
+        if not loaded.Success then
+            self:ReleasePlayer(player)
+            self:ShowEntryStatus("접속 정보를 불러오지 못했습니다. 다시 시도해 주세요.", true, senderUserId)
+            return
+        end
+        if loaded.Profile.TutorialCompleted and not force then
+            self:ReleasePlayer(player)
+            self:ShowEntryStatus("", false, senderUserId)
+            return
+        end
+        if not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then self:ReleasePlayer(player) return end
+        local prepared = _BattleGatewayLogic:PrepareBattleEntry(player, "henesys_stage_01", "", "warrior", "", 1001, "NEW_RUN")
+        if not prepared.Success then
+            self:ReleasePlayer(player)
+            self:ShowEntryStatus("튜토리얼을 준비하지 못했습니다. 다시 시도해 주세요.", true, senderUserId)
+            return
+        end
+        active.RequestId = prepared.RequestId
+        _BattleGatewayLogic:WatchLobbyEntryTransfer(player, prepared.RequestId, "henesys_stage_01")
+        local transferred = _BattleGatewayLogic:TransferPreparedLobbyBattleEntry(player, prepared.RequestId)
+        if not transferred.Success then
+            local entry = player:GetComponent("script.BattleEntryStateComponent")
+            if entry ~= nil then entry:Cancel("TUTORIAL_TRANSFER_FAILED") end
+            self:ReleasePlayer(player)
+            self:ShowEntryStatus("연습장으로 이동하지 못했습니다. 다시 시도해 주세요.", true, senderUserId)
+            return
+        end
+        log("[Tutorial] entry prepared request=" .. prepared.RequestId)
+        self:ShowEntryStatus("", false, senderUserId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table Finish(any session)
+        -- Persist a genuine completed lesson before allowing the result button to leave.
+        local player = session.PlayerEntity
+        if not self:IsEntry(player, session.EntryRequestId) then return { Success = false, Reason = "TUTORIAL_ENTRY_MISMATCH" } end
+        if session.BattleResult == "Victory" then
+            if not _TutorialRulesLogic:IsCompletionValid(session) then
+                return { Success = false, Reason = "TUTORIAL_INCOMPLETE" }
+            end
+            local saved = _UnionProfileRepositoryLogic:CompleteTutorial(player)
+            if not saved.Success then
+                self:ShowEntryStatus("완료 기록을 저장하지 못했습니다. 전투 결과의 확인 버튼으로 다시 시도해 주세요.", false, player.PlayerComponent.UserId)
+                return saved
+            end
+            log("[Tutorial] completion saved")
+        end
+        local defeated = session.BattleResult == "Defeat"
+        local returned = session:ForfeitToLobby()
+        if returned.Success and defeated then
+            self:ShowEntryStatus("아쉽게 쓰러졌지만 다시 도전할 수 있어요!\n아래 재도전 버튼을 눌러 튜토리얼을 다시 플레이하세요.", true, player.PlayerComponent.UserId)
+            log("[Tutorial] defeat returned to lobby; replay offered")
+        end
+        return returned
+    end
+
+    @ExecSpace("Client")
+    method void ShowEntryStatus(string message, boolean retry)
+        -- This targeted RPC updates only the receiving client presentation.
+        _TutorialPresentationLogic:SetEntryStatus(message, retry)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void OnUpdate(number delta)
+        -- Preserve the original global update checkpoint.
+        _TutorialPresentationLogic:Update(delta)
+    end
+    method void OnEndPlay()
+        -- Clear entry ownership after releasing local presentation resources.
+        if self:IsClient() then _TutorialPresentationLogic:Reset() end
+        self.ActivePlayers = {}
+        self.CheckedLogin = false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CheckFirstLogin(Entity player)
+        -- Request the first lesson once after the guide has resolved its UI bindings.
+        if not self.CheckedLogin and player.CurrentMap.Name == "lobby" then
+            self.CheckedLogin = true
+            self:RequestStart()
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HandleTransferFailure(Entity player, integer requestId)
+        -- Release a timed-out preparation at the existing gateway cleanup checkpoint.
+        if not self:IsEntry(player, requestId) then return end
+        self:ReleasePlayer(player)
+        self:ShowEntryStatus("연습장으로 이동하지 못했습니다. 다시 시도해 주세요.", true, player.PlayerComponent.UserId)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void HandleInitializationFailure(Entity player, any session, integer requestId)
+        -- Clean the run before releasing ownership when battle initialization fails.
+        if not self:IsEntry(player, requestId) then return end
+        _RunManagerLogic:AbandonRun(player, "TUTORIAL_INITIALIZATION_FAILED")
+        session.TutorialActive = false
+        self:ReleasePlayer(player)
+        self:ShowEntryStatus("튜토리얼을 시작하지 못했습니다. 로비에서 다시 시도해 주세요.", true, player.PlayerComponent.UserId)
+        _MapTeleportManager:TeleportPlayer(player, "lobby", Vector3(-27.3686, -7.92, 0), "TUTORIAL_INITIALIZATION_FAILED")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ReleaseAfterReturn(any session, table returned)
+        -- Release ownership only after the normal forfeit cleanup and lobby return succeed.
+        if returned.Success and session.TutorialActive then self:ReleasePlayer(session.PlayerEntity) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryFinishSession(any session)
+        -- Return nil for normal results; tutorial completion keeps its existing save and retry behavior.
+        if not session.TutorialActive then return nil end
+        local result = self:Finish(session)
+        if not result.Success then session.ResultReady = true end
+        session:PublishPlayerCommandResult("TUTORIAL_FINISH", result)
+        return result
+    end
+end
