@@ -3,20 +3,6 @@ script NewPlayerTutorialLogic extends Logic
 
     property table ActivePlayers = {}
     property boolean CheckedLogin = false
-    property string EntryMessage = ""
-    property boolean CanRetry = false
-    property number RefreshDelay = 0
-    property Entity GuidePanel = "51cc5d98-7fda-49e8-861d-4e59c1ac4323"
-    property Entity RetryButton = "7b10d474-17c5-4def-8455-44123edf4d09"
-    property TextGUIRendererComponent GuideText = "2822a7b3-2580-449e-abda-84d065745914"
-    property Entity Dimmer = "1936db7c-f1be-49e2-af4b-a8d9e7cf3ee5"
-    property Entity CellHighlight = "1f180bfd-2087-46a0-bb31-387749f9b50b"
-    property any RetryHandler = nil
-    property Entity WorldDimmer = ""
-    property table HighlightedRenderers = {}
-    property table TutorialUnits = {}
-    property number UnitRefreshDelay = 0
-    property boolean ActionHighlighted = false
 
     @ExecSpace("ServerOnly")
     method boolean IsActive(Entity playerEntity)
@@ -63,6 +49,7 @@ script NewPlayerTutorialLogic extends Logic
 
     @ExecSpace("ServerOnly")
     method void BeginEntry(string userId, boolean force)
+        -- Prepare the existing lobby entry after loading the saved tutorial completion flag.
         local senderUserId = userId
         local player = _UserService:GetUserEntityByUserId(senderUserId)
         if not isvalid(player) or not isvalid(player.CurrentMap) or player.CurrentMap.Name ~= "lobby" then return end
@@ -110,9 +97,7 @@ script NewPlayerTutorialLogic extends Logic
         local player = session.PlayerEntity
         if not self:IsEntry(player, session.EntryRequestId) then return { Success = false, Reason = "TUTORIAL_ENTRY_MISMATCH" } end
         if session.BattleResult == "Victory" then
-            if session.TutorialStep < 10 or session.CurrentWave ~= 3 or session.WaveRuntime == nil
-                or session.WaveRuntime.PendingSpawnCount > 0 or session.BoardState == nil
-                or #session.BoardState:CollectLivingEnemies() > 0 or session.ResultKillCount < 4 then
+            if not _TutorialRulesLogic:IsCompletionValid(session) then
                 return { Success = false, Reason = "TUTORIAL_INCOMPLETE" }
             end
             local saved = _UnionProfileRepositoryLogic:CompleteTutorial(player)
@@ -133,239 +118,63 @@ script NewPlayerTutorialLogic extends Logic
 
     @ExecSpace("Client")
     method void ShowEntryStatus(string message, boolean retry)
-        -- This targeted RPC only updates the receiving client's guide.
-        self.EntryMessage = message
-        self.CanRetry = retry
+        -- This targeted RPC updates only the receiving client presentation.
+        _TutorialPresentationLogic:SetEntryStatus(message, retry)
     end
 
     @ExecSpace("ClientOnly")
     method void OnUpdate(number delta)
-        -- Poll only local UI/map state; login triggers one server request, never a storage poll.
-        local player = _UserService.LocalPlayer
-        local map = isvalid(player) and player.CurrentMap or nil
-        local session = isvalid(map) and map:GetComponent("script.BattleSessionComponent") or nil
-        local inTutorialBattle = session ~= nil and session.TutorialActive and session.TutorialUserId == player.PlayerComponent.UserId
-        local guidedBattle = inTutorialBattle and session.TutorialStep < 10 and session.BattleResult == ""
-        self:UpdateWorldDimmer(map, session, guidedBattle, delta)
-        self.RefreshDelay = self.RefreshDelay - delta
-        if self.RefreshDelay > 0 then return end
-        self.RefreshDelay = 0.1
-        if not isvalid(player) or not isvalid(player.CurrentMap) then return end
-        if not isvalid(self.GuidePanel) then self.GuidePanel = _EntityService:GetEntityByPath("/ui/TutorialGuide/Panel") end
-        if not isvalid(self.GuidePanel) then return end
-        local textEntity = self.GuidePanel:GetChildByName("Message")
-        local retryEntity = self.GuidePanel:GetChildByName("Retry")
-        if not isvalid(textEntity) or not isvalid(retryEntity) then return end
-        self.GuideText = textEntity.TextGUIRendererComponent
-        if self.RetryHandler == nil then
-            self.RetryButton = retryEntity
-            self.RetryHandler = retryEntity:ConnectEvent(ButtonClickEvent, function()
-                self.EntryMessage = "첫 전투를 준비하고 있습니다…"
-                self.CanRetry = false
-                self:RequestReplay()
-            end)
-        end
+        -- Preserve the original global update checkpoint.
+        _TutorialPresentationLogic:Update(delta)
+    end
+    method void OnEndPlay()
+        -- Clear entry ownership after releasing local presentation resources.
+        if self:IsClient() then _TutorialPresentationLogic:Reset() end
+        self.ActivePlayers = {}
+        self.CheckedLogin = false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void CheckFirstLogin(Entity player)
+        -- Request the first lesson once after the guide has resolved its UI bindings.
         if not self.CheckedLogin and player.CurrentMap.Name == "lobby" then
             self.CheckedLogin = true
             self:RequestStart()
         end
-        local message = ""
-        if inTutorialBattle then
-            message = self:GetGuideMessage(session.TutorialStep, session.QueuedTileCount, session.BattleResult)
-            if session.TutorialStep == 3 and session.BattleResult == "" and session.BattlePhase ~= "PlayerTurn" then
-                message = "3 / 10  공격 회피\n한 칸 물러났습니다! 몬스터의 공격이 빗나가는 모습을 잠시 확인해 보세요."
-            end
-            if (session.TutorialStep == 6 or session.TutorialStep == 9) and session.BattleResult == "" and
-                (self.ActionHighlighted or session.BattlePhase ~= "PlayerTurn") then
-                message = tostring(session.TutorialStep) .. " / 10  몬스터 처치\n공격이 진행 중입니다. 행동이 끝날 때까지 잠시 기다려 주세요."
-            end
-            if session.TutorialStep == 8 and session.BattleResult == "" then
-                if session.TutorialGuardUsed then
-                    message = "8 / 10  전사 특수 스킬 · 가드\n가드가 적용되었습니다. 몬스터의 공격을 막는 동안 잠시 기다려 주세요."
-                elseif session.QueuedTileCount > 0 and (session.BattlePhase ~= "PlayerTurn" or session.IsActionProcessing) then
-                    message = "8 / 10  가드 준비\n몬스터가 공격을 장전하고 있습니다. 장전이 끝나면 S 또는 아래 방향키(↓)로 가드를 사용하세요."
-                end
-            end
-            if self.EntryMessage ~= "" and session.BattleResult ~= "" then message = self.EntryMessage end
-        elseif player.CurrentMap.Name == "lobby" then
-            message = self.EntryMessage
-        end
-        self.GuidePanel.Enable = message ~= ""
-        self.GuideText.Text = message
-        retryEntity.Enable = self.CanRetry and player.CurrentMap.Name == "lobby"
-        if not isvalid(self.Dimmer) then self.Dimmer = _EntityService:GetEntityByPath("/ui/TutorialGuide/Dimmer") end
-        if isvalid(self.Dimmer) then
-            -- Screen UI always covers world actors; use the world overlay when it is available.
-            local showDimmer = guidedBattle and not isvalid(self.WorldDimmer)
-            if showDimmer and not self.Dimmer.Enable then
-                -- Maker's runtime sibling order can differ from the saved displayOrder.
-                _UILogic:SetSiblingIndex(self.Dimmer.UITransformComponent, 1)
-                _UILogic:SetSiblingIndex(self.GuidePanel.UITransformComponent, 1000000)
-                log("[Tutorial] guide shown above dimmer")
-            end
-            self.Dimmer.Enable = showDimmer
-        end
-        if not isvalid(self.CellHighlight) then self.CellHighlight = _EntityService:GetEntityByPath("/ui/TutorialGuide/CellHighlight") end
-        if isvalid(self.CellHighlight) then
-            local showCell = inTutorialBattle and (session.TutorialStep == 1 or session.TutorialStep == 3 or session.TutorialStep == 4) and session.BattleResult == ""
-                and (session.TutorialStep ~= 3 or (session.BattlePhase == "PlayerTurn" and not session.IsActionProcessing))
-            self.CellHighlight.Enable = showCell
-            if showCell then
-                local playerUnit = isvalid(player) and player:GetComponent("script.BattleUnitComponent") or nil
-                local currentCell = playerUnit ~= nil and playerUnit.CellIndex or session.PlayerStartCell
-                local targetCell = currentCell + 1
-                if session.TutorialStep == 3 then
-                    targetCell = currentCell - 1
-                end
-                local originX = session.CellStartX
-                local spacing = session.CellSpacing
-                local worldX = originX + targetCell * spacing
-                local worldY = -0.1
-                local worldPlatforms = player.CurrentMap:GetChildByName("BattlePlatforms")
-                if isvalid(worldPlatforms) then
-                    local cellEntity = worldPlatforms:GetChildByName("BattleCell" .. tostring(targetCell + 1))
-                    if isvalid(cellEntity) and cellEntity.TransformComponent ~= nil then
-                        worldY = cellEntity.TransformComponent.Position.y
-                    end
-                end
-                local screenPos = _UILogic:WorldToScreenPosition(Vector2(worldX, worldY))
-                local root = _EntityService:GetEntityByPath("/ui/TutorialGuide")
-                local localPos = isvalid(root) and _UILogic:ScreenToLocalUIPosition(screenPos, root.UITransformComponent) or _UILogic:ScreenToUIPosition(screenPos)
-                local t = (_UtilLogic.ElapsedSeconds or 0) * 5
-                local pulse = 0.5 + 0.5 * math.sin(t)
-                local scale = 1.0 + 0.06 * pulse
-                self.CellHighlight.UITransformComponent.anchoredPosition = localPos
-                self.CellHighlight.UITransformComponent.UIScale = Vector3(scale, scale, 1)
-                local renderer = self.CellHighlight.SpriteGUIRendererComponent
-                if renderer ~= nil then
-                    renderer.Color = Color(1, 0.85 + 0.15 * pulse, 0.25, 0.9 + 0.1 * pulse)
-                end
-            end
-        end
     end
 
-    @ExecSpace("ClientOnly")
-    method void UpdateWorldDimmer(Entity map, any session, boolean enabled, number delta)
-        -- A local world overlay lets real actors and effects render above it while the guide stays in screen UI.
-        if not enabled and not isvalid(self.WorldDimmer) and not self.ActionHighlighted and #self.TutorialUnits == 0 then return end
-        if not enabled or not isvalid(map) or (isvalid(self.WorldDimmer) and self.WorldDimmer.CurrentMap ~= map) then
-            self:RestoreActionHighlight()
-            self.TutorialUnits = {}
-            self.UnitRefreshDelay = 0
-            if isvalid(self.WorldDimmer) then self.WorldDimmer:Destroy() end
-            self.WorldDimmer = nil
-            if not enabled or not isvalid(map) then return end
-        end
-        if not isvalid(self.WorldDimmer) then
-            self.WorldDimmer = _SpawnService:SpawnByModelId("tutorialdimmer", "TutorialDimmer", Vector3.zero, map)
-            if not isvalid(self.WorldDimmer) then return end
-            local polygon = self.WorldDimmer.PolygonRendererComponent
-            polygon.Color = Color(0, 0, 0, 0.42)
-            polygon.Points:Add(Vector2(-0.5, -0.5))
-            polygon.Points:Add(Vector2(0.5, -0.5))
-            polygon.Points:Add(Vector2(0.5, 0.5))
-            polygon.Points:Add(Vector2(-0.5, 0.5))
-            log("[Tutorial] world dimmer created drawable=" .. tostring(polygon:IsDrawable()))
-        end
-        -- Follow the camera, zoom and viewport rather than assuming fixed world dimensions.
-        local bottomLeft = _UILogic:ScreenToWorldPosition(Vector2(0, 0))
-        local topRight = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
-        self.WorldDimmer.TransformComponent.WorldPosition = Vector3((bottomLeft.x + topRight.x) * 0.5, (bottomLeft.y + topRight.y) * 0.5, 0)
-        self.WorldDimmer.TransformComponent.Scale = Vector3(math.abs(topRight.x - bottomLeft.x), math.abs(topRight.y - bottomLeft.y), 1)
-        self.UnitRefreshDelay = self.UnitRefreshDelay - delta
-        if self.UnitRefreshDelay <= 0 then
-            self.UnitRefreshDelay = 0.1
-            self.TutorialUnits = map:GetChildComponentsByTypeName("script.BattleUnitPresentationComponent", true)
-        end
-        local acting = session ~= nil and session.IsActionProcessing
-        for _, presentation in ipairs(self.TutorialUnits) do
-            if isvalid(presentation) and (presentation:IsFullMotionPending() or presentation._T.moveHopVisual ~= nil) then
-                acting = true
-            end
-        end
-        if not acting then self:RestoreActionHighlight() return end
-        for _, presentation in ipairs(self.TutorialUnits) do
-            if isvalid(presentation) and isvalid(presentation.Entity) then
-                local actor = presentation.Entity
-                local renderer = actor.AvatarRendererComponent or actor.SpriteRendererComponent
-                if renderer ~= nil then
-                    if self.HighlightedRenderers[actor.Id] == nil then
-                        self.HighlightedRenderers[actor.Id] = { Renderer = renderer, Layer = renderer.SortingLayer, Order = renderer.OrderInLayer }
-                    end
-                    renderer.SortingLayer = self.WorldDimmer.PolygonRendererComponent.SortingLayer
-                    renderer.OrderInLayer = self.WorldDimmer.PolygonRendererComponent.OrderInLayer + 10
-                end
-            end
-        end
-        if not self.ActionHighlighted then
-            self.ActionHighlighted = true
-            log("[Tutorial] actors highlighted above dimmer")
-        end
+    @ExecSpace("ServerOnly")
+    method void HandleTransferFailure(Entity player, integer requestId)
+        -- Release a timed-out preparation at the existing gateway cleanup checkpoint.
+        if not self:IsEntry(player, requestId) then return end
+        self:ReleasePlayer(player)
+        self:ShowEntryStatus("연습장으로 이동하지 못했습니다. 다시 시도해 주세요.", true, player.PlayerComponent.UserId)
     end
 
-    @ExecSpace("ClientOnly")
-    method void RestoreActionHighlight()
-        -- Restore exact renderer settings on idle, map transition, defeat and Maker stop.
-        for _, original in pairs(self.HighlightedRenderers) do
-            if isvalid(original.Renderer) then
-                original.Renderer.SortingLayer = original.Layer
-                original.Renderer.OrderInLayer = original.Order
-            end
-        end
-        self.HighlightedRenderers = {}
-        if self.ActionHighlighted then log("[Tutorial] actor render order restored") end
-        self.ActionHighlighted = false
+    @ExecSpace("ServerOnly")
+    method void HandleInitializationFailure(Entity player, any session, integer requestId)
+        -- Clean the run before releasing ownership when battle initialization fails.
+        if not self:IsEntry(player, requestId) then return end
+        _RunManagerLogic:AbandonRun(player, "TUTORIAL_INITIALIZATION_FAILED")
+        session.TutorialActive = false
+        self:ReleasePlayer(player)
+        self:ShowEntryStatus("튜토리얼을 시작하지 못했습니다. 로비에서 다시 시도해 주세요.", true, player.PlayerComponent.UserId)
+        _MapTeleportManager:TeleportPlayer(player, "lobby", Vector3(-27.3686, -7.92, 0), "TUTORIAL_INITIALIZATION_FAILED")
     end
 
-    @ExecSpace("ClientOnly")
-    method void ApplyEffectHighlight(table options)
-        -- Keep existing cast and hit effects visible above the tutorial's world overlay.
-        if not isvalid(self.WorldDimmer) then return end
-        options["SortingLayer"] = self.WorldDimmer.PolygonRendererComponent.SortingLayer
-        options["OrderInLayer"] = self.WorldDimmer.PolygonRendererComponent.OrderInLayer + 20
+    @ExecSpace("ServerOnly")
+    method void ReleaseAfterReturn(any session, table returned)
+        -- Release ownership only after the normal forfeit cleanup and lobby return succeed.
+        if returned.Success and session.TutorialActive then self:ReleasePlayer(session.PlayerEntity) end
     end
 
-    method string GetGuideMessage(integer step, integer queued, string battleResult)
-        -- Prompts follow successful server actions, including the automatic enemy round.
-        if battleResult == "Victory" then return "튜토리얼 완료!\n주황버섯 2마리와의 자유전투까지 클리어했습니다. 완료 버튼을 눌러 저장하고 로비로 돌아가세요." end
-        if battleResult == "Defeat" then return "아쉽게 쓰러졌지만 다시 도전할 수 있어요!\n전투 결과에서 로비로 돌아간 뒤 재도전 버튼을 눌러 다시 플레이하세요." end
-        if step == 10 then return "10 / 10  자유전투\n배운 조작을 자유롭게 사용해 주황버섯 2마리를 모두 처치하세요. 쓰러지면 다시 도전할 수 있습니다!" end
-        if step == 1 then return "1 / 10  이동\n오른쪽 이동(D 또는 →)으로 몬스터에게 한 칸 다가가세요." end
-        if step == 2 then return "2 / 10  스킬 장전\n브랜디쉬를 눌러 공격을 등록하세요. 몬스터도 스킬을 장전합니다." end
-        if step == 3 then return "3 / 10  공격 회피\n몬스터가 공격을 준비 중입니다! 왼쪽 이동(A 또는 ←)으로 한 칸 물러나 공격을 피하세요." end
-        if step == 4 then return "4 / 10  재접근\n공격을 회피했습니다! 다시 오른쪽 이동(D 또는 →)으로 다가가세요." end
-        if step == 5 then return "5 / 10  공격 실행\n실행 버튼(Space)을 눌러 등록해 둔 브랜디쉬로 몬스터를 공격하세요!" end
-        if step == 6 and queued == 0 then return "6 / 10  첫 몬스터 처치\n디바인 스윙을 장전해 마무리 공격을 준비하세요." end
-        if step == 6 then return "6 / 10  첫 몬스터 처치\n실행 버튼(Space)을 눌러 첫 몬스터를 처치하세요. 이어서 몬스터 한 마리가 더 등장합니다." end
-        if step == 7 then return "7 / 10  포션 사용\n두 번째 몬스터가 등장했습니다! 주황 포션을 눌러 줄어든 HP를 회복하세요. 포션은 턴을 소모하지 않습니다." end
-        if step == 8 and queued == 0 then return "8 / 10  가드 준비\n브랜디쉬를 장전하세요. 새 몬스터도 공격을 장전합니다. 이번에는 가드로 막아 봅시다." end
-        if step == 8 then return "8 / 10  전사 특수 스킬 · 가드\nS 또는 아래 방향키(↓)로 새크로생티티(가드)를 사용하세요. 몬스터의 공격 피해를 막으며 장전한 스킬은 유지됩니다." end
-        if queued == 0 then return "9 / 10  두 번째 몬스터 처치\n브랜디쉬를 먼저 장전하세요. 이어서 디바인 스윙을 추가해 두 공격을 함께 실행합니다." end
-        if queued == 1 then return "9 / 10  두 번째 몬스터 처치\n가드로 공격을 막았습니다! 스킬 큐에 디바인 스윙도 장전해 브랜디쉬와 함께 한 번에 처치하세요." end
-        return "9 / 10  두 번째 몬스터 처치\n브랜디쉬와 디바인 스윙이 모두 장전되었습니다! 실행 버튼(Space)을 한 번 눌러 처치하세요. 다음은 주황버섯 2마리와의 자유전투입니다."
-    end
-
-    method void OnEndPlay()
-        -- Clear both lifetimes and disconnect the local button before a Maker restart.
-        if self:IsClient() then
-            self:RestoreActionHighlight()
-            if isvalid(self.WorldDimmer) then self.WorldDimmer:Destroy() end
-            self.WorldDimmer = nil
-            self.TutorialUnits = {}
-        end
-        if self:IsClient() and isvalid(self.RetryButton) and self.RetryHandler ~= nil then
-            self.RetryButton:DisconnectEvent(ButtonClickEvent, self.RetryHandler)
-        end
-        if self:IsClient() and isvalid(self.Dimmer) then
-            self.Dimmer.Enable = false
-        end
-        if self:IsClient() and isvalid(self.CellHighlight) then
-            self.CellHighlight.Enable = false
-        end
-        self.RetryHandler = nil
-        self.ActivePlayers = {}
-        self.CheckedLogin = false
-        self.EntryMessage = ""
-        self.CanRetry = false
+    @ExecSpace("ServerOnly")
+    method table TryFinishSession(any session)
+        -- Return nil for normal results; tutorial completion keeps its existing save and retry behavior.
+        if not session.TutorialActive then return nil end
+        local result = self:Finish(session)
+        if not result.Success then session.ResultReady = true end
+        session:PublishPlayerCommandResult("TUTORIAL_FINISH", result)
+        return result
     end
 end
