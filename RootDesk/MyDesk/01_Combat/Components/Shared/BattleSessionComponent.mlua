@@ -3,6 +3,7 @@ script BattleSessionComponent extends Component
 
 	@Sync property boolean TutorialActive = false
 	@Sync property integer TutorialStep = 0
+	@Sync property boolean TutorialGuardUsed = false
 	@Sync property string TutorialUserId = ""
 
 	@Sync property string PoisonMistCellSnapshot = ""
@@ -1353,7 +1354,7 @@ script BattleSessionComponent extends Component
 		end
 		self.TurnState:ConfigureQueueCapacity(baseQueueCapacity, self.MinQueueCapacity, self.MaxQueueCapacity, "JOB_AND_STAGE_DEFINITION")
 		self:PublishTurnStateSnapshot("STAGE_DEFINITION")
-		self.WaveRuntime:SetTotalWaves(self.TutorialActive and 1 or validation.TotalWaves, "STAGE_DEFINITION")
+		self.WaveRuntime:SetTotalWaves(self.TutorialActive and 2 or validation.TotalWaves, "STAGE_DEFINITION")
 		self:PublishWaveStateSnapshot("STAGE_DEFINITION")
 		log("[BattleSession] stage definition applied stage=" .. self.StageId .. " region=" .. self.RegionId .. " index=" .. self.StageIndex .. " type=" .. self.StageType .. " display=" .. self.StageDisplayName .. " cells=" .. self.CellCount .. " startX=" .. self.CellStartX .. " spacing=" .. self.CellSpacing .. " playerCell=" .. self.PlayerStartCell .. " queue=" .. self.TileQueueCapacity)
 		return validation
@@ -2257,8 +2258,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryUseUtilitySkill()
-		-- Keep the introductory lesson on movement and the starting attack.
-		if self.TutorialActive then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
+		-- Allow the tutorial guard only after recovery and the next attack has been queued.
+		if not self:IsTutorialCommandAllowed("UTILITY", "", 0) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		-- Seal leaves movement, facing, queue cleanup and consumables available.
 		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Reserves the existing immediate-action lock without consuming or rewriting queued skills.
@@ -2279,6 +2280,9 @@ script BattleSessionComponent extends Component
 			return { Success = false, Reason = "PLAYER_FROSTBITTEN" }
 		end
 		local definition = bundle.Definition
+		if self.TutorialActive and (definition.SkillId ~= "royal_guard" or bundle.Step.EffectType ~= "GUARD") then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
 		local runtime = self:GetSkillRuntimeState("player_01")
 		if runtime == nil then return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" } end
 		local cooldown = runtime:CanUseSkill(definition.SkillId)
@@ -2307,6 +2311,10 @@ script BattleSessionComponent extends Component
 		local relicEffects = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		if relicEffects ~= nil then relicEffects:OnSkillCompleted(definition.SkillId) end
 		self.UtilityRemainingCooldown = runtime:GetRemainingCooldown(definition.SkillId)
+		if self.TutorialActive and result.Reason == "UTILITY_GUARD_ACTIVE" then
+			self.TutorialGuardUsed = true
+			log("[Tutorial] step=8 guard active; waiting for enemy attack")
+		end
 		self:PublishTurnStateSnapshot("UTILITY_EXECUTED")
 		local duration = math.max(0.1, definition.ActionDuration) / self:GetSkillSpeedMultiplier()
 		local expectedEntry = self.EntryRequestId
@@ -2550,7 +2558,8 @@ script BattleSessionComponent extends Component
 	method boolean IsTutorialCommandAllowed(string commandType, string tileId, integer direction)
 		-- The tutorial accepts only the one command its current step teaches; every other input is ignored.
 		-- Steps: 1 move right, 2 queue Brandish, 3 dodge left, 4 step back in, 5 execute Brandish,
-		-- 6 Divine Swing finish.
+		-- 6 finish the first enemy, 7 recover, 8 queue Brandish and guard the second enemy,
+		-- 9 finish the second enemy with Brandish and Divine Swing.
 		if not self.TutorialActive then return true end
 		local step = self.TutorialStep
 		local queued = self.QueuedTileCount
@@ -2562,11 +2571,18 @@ script BattleSessionComponent extends Component
 		if commandType == "QUEUE_TILE" then
 			if step == 2 then return tileId == "brandish" and queued == 0 end
 			if step == 6 then return tileId == "divine_swing" and queued == 0 end
+			if step == 9 then
+				return (tileId == "brandish" and queued == 0) or (tileId == "divine_swing" and queued == 1)
+			end
+			if step == 8 then return tileId == "brandish" and queued == 0 and not self.TutorialGuardUsed end
 			return false
 		end
 		if commandType == "EXECUTE_QUEUE" then
+			if step == 9 then return queued == 2 end
 			return (step == 5 or step == 6) and queued > 0
 		end
+		if commandType == "USE_CONSUMABLE" then return step == 7 and tileId == "orange_potion" end
+		if commandType == "UTILITY" then return step == 8 and queued > 0 and not self.TutorialGuardUsed end
 		return false
 	end
 
@@ -4104,7 +4120,10 @@ script BattleSessionComponent extends Component
 			log("[Tutorial] step=3 enemy loaded a skill; dodge left")
 		elseif self.TutorialActive and self.TutorialStep == 5 then
 			self.TutorialStep = 6
-			log("[Tutorial] step=6 enemy round completed; ready for final attack")
+			log("[Tutorial] step=6 enemy round completed; finish the first enemy")
+		elseif self.TutorialActive and self.TutorialStep == 8 and self.TutorialGuardUsed then
+			self.TutorialStep = 9
+			log("[Tutorial] step=9 guard round completed; finish the second enemy")
 		end
 		self.StageTurnNumber = self.TurnNumber
 		self:AdvancePlayerSkillCooldowns("PLAYER_TURN_" .. self.TurnNumber)
@@ -5621,6 +5640,7 @@ script BattleSessionComponent extends Component
 		end
 		self.TutorialActive = _NewPlayerTutorialLogic:IsEntry(playerEntity, requestId)
 		self.TutorialStep = self.TutorialActive and 1 or 0
+		self.TutorialGuardUsed = false
 		self.TutorialUserId = self.TutorialActive and playerEntity.PlayerComponent.UserId or ""
 		local runState = nil
 		if entryMode == "NEW_RUN" then
@@ -5653,6 +5673,10 @@ script BattleSessionComponent extends Component
 		self.EntryMode = entryMode
 		self.SelectedCharacterId = characterId or ""
 		self.SelectedLoadoutId = loadoutId or ""
+		if self.TutorialActive and entryMode == "NEW_RUN" then
+			-- Seed reduced HP once; later registration and rebuilds restore the same run-owned value.
+			runState:SetRunHp(math.max(1, math.floor(runState.RunMaxHp * 0.5)), runState.RunMaxHp, "TUTORIAL_START")
+		end
 		self:RegisterPlayer(playerEntity)
 
 		local rebuildResult = self:RebuildBattleState("BATTLE_ENTRY")
@@ -6293,7 +6317,7 @@ script BattleSessionComponent extends Component
 	method table TryUseRunConsumable(Entity playerEntity, string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Validates timing and inventory, executes the registered effect, then commits consumption exactly once.
 		local result = { Success = false, Reason = "UNKNOWN", ConsumableId = consumableId or "", AppliedAmount = 0, ConsumedAmount = 0, ConsumesTurn = false }
-		if self.TutorialActive then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
+		if not self:IsTutorialCommandAllowed("USE_CONSUMABLE", consumableId, 0) then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
 		if isvalid(playerEntity) == false or playerEntity ~= self.PlayerEntity or playerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then
 			result.Reason = "INVALID_PLAYER"
 			return result
@@ -6370,6 +6394,10 @@ script BattleSessionComponent extends Component
 		result.CooldownBefore = effectResult.CooldownBefore or 0
 		result.CooldownAfter = effectResult.CooldownAfter or 0
 		log("[BattleConsumable] used ref=" .. consumableId .. " effect=" .. definition.EffectType .. " applied=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter .. " consumesTurn=" .. tostring(result.ConsumesTurn) .. " key=" .. useKey)
+		if self.TutorialActive and self.TutorialStep == 7 and result.AppliedAmount > 0 and result.ConsumedAmount > 0 then
+			self.TutorialStep = 8
+			log("[Tutorial] step=8 potion recovery completed; prepare the guard lesson")
+		end
 		return result
 	end
 
@@ -6451,6 +6479,7 @@ script BattleSessionComponent extends Component
 				-- Cleanse is available while a real hostile status is active.
 				if definition.EffectType == "CLEANSE" and unit.SealTurns <= 0 and unit.FrostbiteTurns <= 0 and unit.ConfuseTurns <= 0
 					and unit.BurnDamage <= 0 then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
+				if not self:IsTutorialCommandAllowed("USE_CONSUMABLE", itemId, 0) then usable = false; reason = "TUTORIAL_FOLLOW_GUIDE" end
 				table.insert(result.Items, { ConsumableId = itemId, DisplayOrder = definition.RowIndex, DisplayName = definition.DisplayName, Count = tonumber(count), EffectType = definition.EffectType, EffectValue = definition.EffectValue, IconKey = definition.IconKey, Description = definition.Description, Usable = usable, Reason = reason })
 			end
 		end
@@ -8094,8 +8123,8 @@ script BattleSessionComponent extends Component
 		if not ignoresBuffs and defenderEffects ~= nil then
 			amount = math.max(0, amount - defenderEffects:GetFrontDamageReduction(sourceUnit, targetUnit))
 		end
-		if self.TutorialActive and (targetUnit.Team == "Player" or self.TutorialStep < 6) then
-			-- Training cannot kill the learner or skip observing the first enemy round.
+		if self.TutorialActive and (targetUnit.Team == "Player" or self.TutorialStep < 6 or self.TutorialStep == 7 or self.TutorialStep == 8) then
+			-- Keep the learner alive and allow each enemy to die only after its lesson.
 			amount = math.min(amount, math.max(0, targetUnit.CurrentHp - 1))
 		end
 		local damageResult
@@ -8574,6 +8603,13 @@ script BattleSessionComponent extends Component
 		self:AdvancePlayerSkillCooldowns("PLAYER_TURN_" .. self.TurnNumber)
 		self:SpawnWave(nextWave)
 		if self.CurrentWave == nextWave then
+			if self.TutorialActive and nextWave == 2 then
+				-- Start the second lesson with usable attacks instead of the first kill's cooldowns.
+				local runtime = self:GetSkillRuntimeState("player_01")
+				if runtime ~= nil then runtime:ResetSkillRuntimeState("TUTORIAL_SECOND_ENEMY") end
+				self.TutorialStep = 7
+				log("[Tutorial] step=7 second enemy spawned; recover with a potion")
+			end
 			self.TurnState:SetPhase("PlayerTurn", "NEXT_WAVE_ACTIVE")
 			self:PublishTurnStateSnapshot("NEXT_WAVE_ACTIVE")
 			self.WaveRuntime:MarkWaveActive("NEXT_WAVE_ACTIVE")
