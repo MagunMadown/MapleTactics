@@ -4,6 +4,9 @@ script PlayerGridMovementLogic extends Logic
 	property number BlockedMoveDistanceRatio = 0.18
 	property number BlockedMoveForwardDuration = 0.06
 	property number BlockedMoveReturnDuration = 0.14
+	-- After the authoritative position lands, a late server write can still lift the root for a frame;
+	-- keep the avatar on its ground line this long. Input is already released on arrival.
+	property number LandingSettleDuration = 0.1
 
 	method integer GetDirection(any key)
 		-- Shares the battle movement key mapping with noncombat maps; the keys come from the player's settings.
@@ -12,11 +15,12 @@ script PlayerGridMovementLogic extends Logic
 
 	method table GetProfile(any session)
 		-- Battle inspector overrides are preserved; the lobby uses the same default movement profile.
+		-- A step reads as a jump: linear horizontal travel under a visible arc, both on one duration.
 		local profile = {
-			MoveActionDuration = 0.12, MoveCurve = "QUAD_EASE_OUT", MoveSnapThreshold = 0.01,
-			EnablePlayerHopVisual = true, PlayerHopDuration = 0.13, PlayerHopHeight = 0.09,
-			PlayerHopTakeoffSquashDuration = 0.02, PlayerHopLandingSquashDuration = 0.04,
-			PlayerHopSquashXScale = 1.03, PlayerHopSquashYScale = 0.97,
+			MoveActionDuration = 0.24, PlayerMoveCurve = "LINEAR", MoveSnapThreshold = 0.01,
+			EnablePlayerHopVisual = true, PlayerHopDuration = 0.24, PlayerHopHeight = 0.30,
+			PlayerHopTakeoffSquashDuration = 0.03, PlayerHopLandingSquashDuration = 0.07,
+			PlayerHopSquashXScale = 1.0, PlayerHopSquashYScale = 1.0,
 			PlayerHopLandingXScale = 1.04, PlayerHopLandingYScale = 0.96,
 			PlayerHopPeakProgress = 0.50, PlayerHopAnimationPlayRate = 1.0
 		}
@@ -27,10 +31,10 @@ script PlayerGridMovementLogic extends Logic
 	end
 
 	method number GetDuration(table profile)
-		-- Keeps the horizontal movement and cosmetic hop on the original battle timing.
-		local duration = math.max(0.10, math.min(0.16, profile.MoveActionDuration))
+		-- Keeps the horizontal movement and cosmetic hop on one timing; the cap stops a step from stalling the turn.
+		local duration = math.max(0.10, math.min(0.35, profile.MoveActionDuration))
 		if profile.EnablePlayerHopVisual then
-			duration = math.max(duration, math.max(0.12, math.min(0.16, profile.PlayerHopDuration)))
+			duration = math.max(duration, math.max(0.12, math.min(0.35, profile.PlayerHopDuration)))
 		end
 		return duration
 	end
@@ -79,14 +83,19 @@ script PlayerGridMovementLogic extends Logic
 	@ExecSpace("ClientOnly")
 	method boolean HasLocalMove(Entity map)
 		local move = self._T.localMove
-		return move ~= nil and move.Map == map
+		-- A settling move has already landed; it never blocks the next command.
+		return move ~= nil and move.Map == map and not move.Arrived
 	end
 
 	@ExecSpace("ClientOnly")
 	method integer BeginLocalMove(Entity player, Entity map, integer entry, integer context, Vector2 target, table profile)
 		-- Predict only the avatar child. Collision, cell occupancy and the player root remain authoritative.
 		if not isvalid(player) or player ~= _UserService.LocalPlayer or player.CurrentMap ~= map then return 0 end
-		if self._T.localMove ~= nil then return 0 end
+		local previous = self._T.localMove
+		if previous ~= nil and not previous.Arrived then return 0 end
+		-- Reuse the settled ground line: the root may still sit on a rounded y from the last server write.
+		local settledGroundY = previous ~= nil and previous.Player == player and previous.GroundY or nil
+		if previous ~= nil then self:CancelLocalMove("NEXT_MOVE") end
 		self:CancelBlockedMove("NEW_MOVE")
 		self._T.nextMoveRequestId = (self._T.nextMoveRequestId or 0) + 1
 		local current = player.TransformComponent.WorldPosition
@@ -95,8 +104,23 @@ script PlayerGridMovementLogic extends Logic
 			Player = player, Map = map, Entry = entry, Context = context,
 			RequestId = self._T.nextMoveRequestId, Presentation = presentation, Profile = profile,
 			StartPosition = Vector2(current.x, current.y), TargetPosition = target,
-			Elapsed = 0, Age = 0, Duration = self:GetDuration(profile), Confirmed = false, Completed = false, LastVisualOffset = 0
+			Elapsed = 0, Age = 0, Duration = self:GetDuration(profile), Confirmed = false, Completed = false, LastVisualOffset = 0,
+			-- The hop reads the same clock, so the arc and the horizontal step leave and land on the same frame.
+			StartTime = _UtilLogic.ElapsedSeconds,
+			-- Server position writes nudge the root's y off the foothold; the avatar stays on this ground line.
+			GroundY = (settledGroundY ~= nil and math.abs(settledGroundY - current.y) <= 0.02) and settledGroundY or current.y
 		}
+		move.RootOrigin = Vector2(current.x, move.GroundY)
+		-- A client-driven step moves the root here (see OnUpdate). A damped follow camera would trail it and keep
+		-- sliding after the avatar lands, which reads as a bounce back; track it rigidly for the step instead.
+		-- WorldToScreenPosition does not see this runtime damping, so nothing on such a map may place UI with it
+		-- (the lobby name uses the world-space native tag for that reason).
+		local camera = profile.ClientRoot and player.CameraComponent or nil
+		if camera ~= nil then
+			move.Camera = camera
+			move.CameraBaseDamping = camera.Damping
+			camera.Damping = Vector2(0, camera.Damping.y)
+		end
 		-- A partially refreshed Maker script may return a component without its new methods.
 		-- Keep these local closures with the request so compatibility never needs another exported method.
 		move.WarnVisualUnavailable = function(reason)
@@ -162,15 +186,17 @@ script PlayerGridMovementLogic extends Logic
 			local position = move.LastVisualPosition or move.StartPosition
 			move.StartPosition = Vector2(position.x, targetY)
 			move.Elapsed = 0
+			move.StartTime = _UtilLogic.ElapsedSeconds
 			move.Profile.ObstructionHint = false
 		end
 		move.Confirmed = true
 		move.Completed = move.Completed or completed
 		-- Correct a different accepted endpoint without restarting a matching prediction.
 		if math.abs(move.TargetPosition.x - targetX) > 0.001 then
-			local progress = self:EvaluateCurve(math.min(1, move.Elapsed / move.Duration), move.Profile.MoveCurve)
+			local progress = self:EvaluateCurve(math.min(1, move.Elapsed / move.Duration), move.Profile.PlayerMoveCurve)
 			move.StartPosition = Vector2(move.StartPosition.x + (move.TargetPosition.x - move.StartPosition.x) * progress, targetY)
 			move.Elapsed = 0
+			move.StartTime = _UtilLogic.ElapsedSeconds
 			move.Duration = 0.10
 		end
 		move.TargetPosition = Vector2(targetX, targetY)
@@ -183,6 +209,14 @@ script PlayerGridMovementLogic extends Logic
 		local move = self._T.localMove
 		if move == nil then return end
 		self._T.localMove = nil
+		if isvalid(move.Player) then
+			if move.Camera ~= nil then move.Camera.Damping = move.CameraBaseDamping end
+			-- A client-driven step that never completed puts the root back where it began.
+			if move.Profile ~= nil and move.Profile.ClientRoot and not move.Arrived and move.RootOrigin ~= nil
+				and move.Player.CurrentMap == move.Map and move.Player.MovementComponent ~= nil then
+				move.Player.MovementComponent:SetWorldPosition(move.RootOrigin)
+			end
+		end
 		if type(move.StopVisual) == "function" and type(move.BindPresentation) == "function" and type(move.WarnVisualUnavailable) == "function" then
 			move.StopVisual()
 		else
@@ -196,7 +230,8 @@ script PlayerGridMovementLogic extends Logic
 				if type(clear) == "function" then clear(presentation) end
 			end)
 		end
-		_BattleHudPresenterLogic:ReleasePendingLocalCommand("MOVE", reason)
+		-- A settling move released its command on arrival; releasing again could unlock the next command.
+		if not move.Arrived then _BattleHudPresenterLogic:ReleasePendingLocalCommand("MOVE", reason) end
 		log("[GridMovePrediction] cleared request=" .. tostring(move.RequestId) .. " reason=" .. reason)
 	end
 
@@ -218,15 +253,22 @@ script PlayerGridMovementLogic extends Logic
 		move.Age = move.Age + math.max(0, delta)
 		if move.Age >= 2 then self:CancelLocalMove("MOVE_RESPONSE_TIMEOUT") return end
 		local step = nil
+		-- Wall-clock elapsed instead of summed deltas: the frame that started the move adds nothing yet.
+		local elapsed = math.max(move.Elapsed, _UtilLogic.ElapsedSeconds - (move.StartTime or _UtilLogic.ElapsedSeconds))
 		if move.Profile.ObstructionHint and not move.Confirmed then
 			-- This is a visual hint, never a client rejection: class pushes still reach the server.
-			move.Elapsed = move.Elapsed + math.max(0, delta)
+			move.Elapsed = elapsed
 			local t = math.min(1, move.Elapsed / math.max(0.03, self.BlockedMoveForwardDuration))
 			local distance = move.Profile.AttemptCellSize * math.max(0.05, math.min(0.25, self.BlockedMoveDistanceRatio))
 			local x = move.StartPosition.x + move.Profile.AttemptDirection * distance * (1 - (1 - t) * (1 - t))
 			step = { Position = Vector2(x, move.StartPosition.y), Complete = false }
 		else
-			step = self:Advance(move, delta, move.Profile.MoveCurve, move.Profile.MoveSnapThreshold)
+			step = self:Advance(move, elapsed - move.Elapsed, move.Profile.PlayerMoveCurve, move.Profile.MoveSnapThreshold)
+		end
+		if move.Profile.ClientRoot and not move.Profile.ObstructionHint and player.MovementComponent ~= nil then
+			-- Lobby steps carry no combat authority, so the local root walks the step itself: camera, name tag and
+			-- avatar share one smooth path. The server only times the step and corrects a wrong landing.
+			player.MovementComponent:SetWorldPosition(Vector2(step.Position.x, move.GroundY))
 		end
 		local current = player.TransformComponent.WorldPosition
 		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
@@ -239,19 +281,36 @@ script PlayerGridMovementLogic extends Logic
 			if move.PresentationProbeRemaining <= 0 then move.BindPresentation(presentation) end
 		end
 		if move.VisualReady then
-			local offset = player.TransformComponent:ToLocalPoint(Vector3(step.Position.x, current.y, current.z))
+			local offset = player.TransformComponent:ToLocalPoint(Vector3(step.Position.x, move.GroundY or current.y, current.z))
 			local ok, applied = pcall(function()
 				local set = presentation.SetLocalGridMoveOffset
 				if type(set) ~= "function" then return false end
 				move.VisualStarted = true
-				set(presentation, offset.x)
+				set(presentation, offset.x, offset.y)
 				move.LastVisualOffset = offset.x
 				move.LastVisualPosition = step.Position
 				return true
 			end)
 			if not ok or not applied then move.StopVisual() move.VisualFailed = true move.WarnVisualUnavailable("SET_FAILED") end
 		end
-		if step.Complete and move.Completed and math.abs(current.x - move.TargetPosition.x) <= 0.02 then self:CancelLocalMove("AUTHORITATIVE_POSITION_RECEIVED") end
+		if step.Complete and move.Completed and math.abs(current.x - move.TargetPosition.x) <= 0.02 then
+			if not move.Arrived then
+				move.Arrived = true
+				move.SettleRemaining = math.max(0, self.LandingSettleDuration)
+				_BattleHudPresenterLogic:ReleasePendingLocalCommand("MOVE", "AUTHORITATIVE_POSITION_RECEIVED")
+				log("[GridMovePrediction] arrived request=" .. tostring(move.RequestId))
+			end
+			move.SettleRemaining = move.SettleRemaining - math.max(0, delta)
+			-- Attack and hit motions own the avatar child; stop holding it the moment one starts.
+			local motionStarted = false
+			if presentation ~= nil then
+				local ok, pending = pcall(function() return presentation:IsFullMotionPending() end)
+				motionStarted = ok and pending == true
+			end
+			if move.SettleRemaining <= 0 or motionStarted then
+				self:CancelLocalMove(motionStarted and "SETTLE_INTERRUPTED" or "AUTHORITATIVE_POSITION_RECEIVED")
+			end
+		end
 	end
 
 
@@ -281,7 +340,7 @@ script PlayerGridMovementLogic extends Logic
 			ReturnDuration = math.max(0.08, math.min(0.25, self.BlockedMoveReturnDuration))
 		}
 		self._T.localBlockedMove = state
-		presentation:SetLocalGridMoveOffset(startOffset)
+		presentation:SetLocalGridMoveOffset(startOffset, 0)
 		log("[GridMoveBlocked] started reason=" .. reason .. " direction=" .. tostring(direction) .. " peak=" .. tostring(peak))
 	end
 
@@ -328,7 +387,7 @@ script PlayerGridMovementLogic extends Logic
 			local t = math.min(1, (state.Elapsed - state.ForwardDuration) / state.ReturnDuration)
 			offset = state.PeakOffset * (1 - t * t * (3 - 2 * t))
 		end
-		presentation:SetLocalGridMoveOffset(offset)
+		presentation:SetLocalGridMoveOffset(offset, 0)
 		if state.Elapsed >= state.ForwardDuration + state.ReturnDuration then self:CancelBlockedMove("COMPLETE") end
 	end
 

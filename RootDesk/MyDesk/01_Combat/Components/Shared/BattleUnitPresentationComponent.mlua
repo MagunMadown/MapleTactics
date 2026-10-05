@@ -567,28 +567,32 @@ script BattleUnitPresentationComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method void SetLocalGridMoveOffset(number offsetX)
+	method void SetLocalGridMoveOffset(number offsetX, number offsetY)
 		-- Prediction moves only the avatar child; server Position and BoardState remain authoritative.
+		-- offsetY cancels the root's y jitter from server position writes; the hop arc is layered on top of it.
 		local visualEntity = self:GetMoveVisualEntity()
 		if isvalid(visualEntity) == false or visualEntity == self.Entity or visualEntity.TransformComponent == nil then return end
 		local state = self._T.localGridMoveVisual
 		if state == nil or state.Entity ~= visualEntity then
-			state = { Entity = visualEntity, BaseX = visualEntity.TransformComponent.Position.x, OffsetX = 0 }
+			state = { Entity = visualEntity, BaseX = visualEntity.TransformComponent.Position.x, OffsetX = 0, OffsetY = 0 }
 			self._T.localGridMoveVisual = state
 		end
-		state.OffsetX = offsetX
 		local position = visualEntity.TransformComponent.Position
-		visualEntity.TransformComponent.Position = Vector3(state.BaseX + offsetX, position.y, position.z)
+		local nextOffsetY = offsetY or 0
+		visualEntity.TransformComponent.Position = Vector3(state.BaseX + offsetX, position.y - state.OffsetY + nextOffsetY, position.z)
+		state.OffsetX = offsetX
+		state.OffsetY = nextOffsetY
 	end
 
 	@ExecSpace("ClientOnly")
 	method void ClearLocalGridMoveOffset()
 		local hop = self._T.moveHopVisual
-		if hop ~= nil and hop.LocalPrediction then self:StopMoveHopVisual("LOCAL_MOVE_FINISHED") end
+		-- A landed hop only has its ground squash left; let it finish instead of popping the scale back.
+		if hop ~= nil and hop.LocalPrediction and not hop.Landed then self:StopMoveHopVisual("LOCAL_MOVE_FINISHED") end
 		local state = self._T.localGridMoveVisual
 		if state ~= nil and isvalid(state.Entity) and state.Entity.TransformComponent ~= nil then
 			local position = state.Entity.TransformComponent.Position
-			state.Entity.TransformComponent.Position = Vector3(state.BaseX, position.y, position.z)
+			state.Entity.TransformComponent.Position = Vector3(state.BaseX, position.y - (state.OffsetY or 0), position.z)
 		end
 		self._T.localGridMoveVisual = nil
 	end
@@ -625,7 +629,8 @@ script BattleUnitPresentationComponent extends Component
 				else
 					local offset = self._T.localGridMoveVisual
 					local offsetX = offset ~= nil and offset.Entity == visualEntity and offset.OffsetX or 0
-					visualEntity.TransformComponent.Position = Vector3(state.BasePosition.x + offsetX, state.BasePosition.y, state.BasePosition.z)
+					local offsetY = offset ~= nil and offset.Entity == visualEntity and offset.OffsetY or 0
+					visualEntity.TransformComponent.Position = Vector3(state.BasePosition.x + offsetX, state.BasePosition.y + offsetY, state.BasePosition.z)
 				end
 			end
 			visualEntity.TransformComponent.Scale = state.BaseScale
@@ -677,21 +682,23 @@ script BattleUnitPresentationComponent extends Component
 			return
 		end
 
-		local totalDuration = math.max(0.12, math.min(0.16, duration))
+		local totalDuration = math.max(0.12, math.min(0.35, duration))
 		if animatePosition == false then
 			totalDuration = math.max(0.05, duration)
 		end
 		local hopHeight = math.max(0, height)
 		local hopPeakProgress = math.max(0.45, math.min(0.55, peakProgress))
 		local takeoff = math.max(0.02, math.min(0.04, takeoffDuration))
-		local landing = math.max(0.03, math.min(0.05, landingDuration))
+		local landing = math.max(0.03, math.min(0.08, landingDuration))
+		-- The arc owns totalDuration; the landing squash runs after touchdown so the body never deforms mid-air.
+		local tweenDuration = totalDuration + landing
+		local airFraction = totalDuration / tweenDuration
 		local takeoffFraction = math.min(0.45, takeoff / totalDuration)
-		local landingFraction = math.min(0.45, landing / totalDuration)
 		local transform = visualEntity.TransformComponent
 		local basePosition = transform.Position
 		local prediction = self._T.localGridMoveVisual
 		if prediction ~= nil and prediction.Entity == visualEntity then
-			basePosition = Vector3(basePosition.x - prediction.OffsetX, basePosition.y, basePosition.z)
+			basePosition = Vector3(basePosition.x - prediction.OffsetX, basePosition.y - (prediction.OffsetY or 0), basePosition.z)
 		end
 		local baseScale = transform.Scale
 		local baseRotation = transform.Rotation
@@ -709,8 +716,11 @@ script BattleUnitPresentationComponent extends Component
 		}
 		self._T.moveHopVisual = state
 		self:StartMoveHopAnimation(state, animationRuid, animationPlayRate)
+		-- The tween only paces the callbacks. Progress comes from the frame clock that the local grid
+		-- prediction also reads, so the arc and the horizontal step never drift a frame apart.
+		local startTime = _UtilLogic.ElapsedSeconds
 
-		local tweener = _TweenLogic:PlayTween(0, 1, totalDuration, EaseType.Linear, function(progress)
+		local tweener = _TweenLogic:PlayTween(0, 1, tweenDuration, EaseType.Linear, function(progress)
 			if state.Cancelled then
 				return
 			end
@@ -719,24 +729,33 @@ script BattleUnitPresentationComponent extends Component
 				return
 			end
 
-			local clampedProgress = math.max(0, math.min(1, progress))
+			local clampedProgress = math.max(0, math.min(1, (_UtilLogic.ElapsedSeconds - startTime) / tweenDuration))
+			local airProgress = math.min(1, clampedProgress / math.max(0.001, airFraction))
 			-- Two half-sine segments keep the peak configurable while reacting on the first tween frame.
 			local yOffset = 0
-			if clampedProgress <= hopPeakProgress then
-				local riseProgress = clampedProgress / math.max(0.001, hopPeakProgress)
+			if airProgress >= 1 then
+				yOffset = 0
+			elseif airProgress <= hopPeakProgress then
+				local riseProgress = airProgress / math.max(0.001, hopPeakProgress)
 				yOffset = math.sin(riseProgress * math.pi * 0.5) * hopHeight
 			else
-				local fallProgress = (clampedProgress - hopPeakProgress) / math.max(0.001, 1 - hopPeakProgress)
+				local fallProgress = (airProgress - hopPeakProgress) / math.max(0.001, 1 - hopPeakProgress)
 				yOffset = math.cos(fallProgress * math.pi * 0.5) * hopHeight
 			end
 
 			local takeoffWeight = 0
 			local landingWeight = 0
-			if clampedProgress < takeoffFraction then
-				local takeoffProgress = clampedProgress / math.max(0.001, takeoffFraction)
+			if airProgress < takeoffFraction then
+				local takeoffProgress = airProgress / math.max(0.001, takeoffFraction)
 				takeoffWeight = math.sin(math.pi * takeoffProgress)
-			elseif clampedProgress > 1 - landingFraction then
-				local landingProgress = (clampedProgress - (1 - landingFraction)) / math.max(0.001, landingFraction)
+			elseif airProgress >= 1 then
+				if not state.Landed then
+					-- Touchdown: switch back to the standing pose before the ground squash plays.
+					state.Landed = true
+					self:RestoreMoveHopAnimation(state, "LANDED")
+					state.AnimationKind = "NONE"
+				end
+				local landingProgress = (clampedProgress - airFraction) / math.max(0.001, 1 - airFraction)
 				landingWeight = math.sin(math.pi * landingProgress)
 			end
 
@@ -747,10 +766,11 @@ script BattleUnitPresentationComponent extends Component
 			local currentPosition = visualEntity.TransformComponent.Position
 			local offset = self._T.localGridMoveVisual
 			local offsetX = offset ~= nil and offset.Entity == visualEntity and offset.OffsetX or 0
+			local offsetY = offset ~= nil and offset.Entity == visualEntity and offset.OffsetY or 0
 			local visualX = preserveHorizontalPosition and currentPosition.x or basePosition.x + offsetX
 			local visualZ = preserveHorizontalPosition and currentPosition.z or basePosition.z
 			if animatePosition then
-				visualEntity.TransformComponent.Position = Vector3(visualX, basePosition.y + yOffset, visualZ)
+				visualEntity.TransformComponent.Position = Vector3(visualX, basePosition.y + offsetY + yOffset, visualZ)
 			end
 			visualEntity.TransformComponent.Scale = Vector3(scaleX, scaleY, baseScale.z)
 		end)
@@ -767,7 +787,8 @@ script BattleUnitPresentationComponent extends Component
 					else
 						local offset = self._T.localGridMoveVisual
 						local offsetX = offset ~= nil and offset.Entity == visualEntity and offset.OffsetX or 0
-						visualEntity.TransformComponent.Position = Vector3(basePosition.x + offsetX, basePosition.y, basePosition.z)
+						local offsetY = offset ~= nil and offset.Entity == visualEntity and offset.OffsetY or 0
+						visualEntity.TransformComponent.Position = Vector3(basePosition.x + offsetX, basePosition.y + offsetY, basePosition.z)
 					end
 				end
 				visualEntity.TransformComponent.Scale = baseScale
