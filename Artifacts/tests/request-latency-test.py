@@ -56,7 +56,7 @@ TextHorizontalAlignmentOption = {Left=1}
 TextVerticalAlignmentOption = {Top=1}
 _UtilLogic = {ElapsedSeconds=0}
 _InputService = {GetCursorPosition=function() return Vector2(0,0) end}
-_GameUIPolishLogic = {BringUIGroupToFront=function() end}
+_GameUIPolishLogic = {BringUIGroupToFront=function() end,FitVerticalScrollLayouts=function() end}
 
 -- Native proxies throw on both unknown reads and writes, including existing fields.
 function strict(values)

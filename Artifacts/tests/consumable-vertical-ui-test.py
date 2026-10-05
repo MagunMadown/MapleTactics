@@ -50,12 +50,12 @@ assert(slotCount()==2 and not hud.Slots[3].children.Icon.Enable)
 assert(hud.Slots[1].children.Icon.SpriteGUIRendererComponent.ImageRUID==hud.Slots[2].children.Icon.SpriteGUIRendererComponent.ImageRUID)
 ''',
     'D: fourth slot expands right without moving first three': '''
-inv.ConsumableCapacity=4; refreshHud()
+inv.BaseConsumableCapacity=4; inv.ConsumableCapacity=4; refreshHud()
 assert(#hud.Slots==4 and hud.Panel.UITransformComponent.RectSize.x==312)
 for i=1,4 do assert(hud.Slots[i].UITransformComponent.anchoredPosition.y==0 and hud.Slots[i].UITransformComponent.anchoredPosition.x==(i-1)*80) end
 ''',
     'E: fifth slot expands right and locks disappear on reset': '''
-inv.ConsumableCapacity=5; refreshHud()
+inv.BaseConsumableCapacity=5; inv.ConsumableCapacity=5; refreshHud()
 assert(#hud.Slots==5 and hud.Panel.UITransformComponent.RectSize.x==392)
 for i=1,5 do assert(hud.Slots[i].UITransformComponent.anchoredPosition.y==0 and hud.Slots[i].UITransformComponent.anchoredPosition.x==(i-1)*80) end
 inv:ResetForRun(2,0); refreshHud()

@@ -4,6 +4,9 @@ script BattleQueueHudComponent extends Component
 	property TextGUIRendererComponent TurnText = "9131478e-61b4-4407-aa83-e7a6713b52e1"
 
 	property Entity QueuePanelEntity = "a51334db-adb4-47a6-8e35-f2753dd6b18c"
+	property Entity UtilitySlot = "fd8c3e55-9fa5-46e1-9d7e-241d2a68a53a"
+	property SpriteGUIRendererComponent UtilityIcon = "c015d218-7eb1-44ef-9bf3-5ef476ea5d4a"
+	property TextGUIRendererComponent UtilityCooldownText = "13f08b96-9b8d-4f4e-a81d-8b4b6f3b329b"
 
 	property Entity ResultPanelEntity = "6f0764a9-6582-48bb-8163-cb30159fcf81"
 
@@ -336,6 +339,7 @@ script BattleQueueHudComponent extends Component
 		self._T.SkillHoverElapsed = (self._T.SkillHoverElapsed or 0) + delta
 		if self._T.SkillHoverElapsed < 0.15 then return end
 		self._T.SkillHoverElapsed = 0
+		self:RefreshUtilitySlot()
 		if self:RefreshShopSkillBar() == false and self._T.ShopSkillPreview then
 			self._T.ShopSkillPreview = false
 			self:RefreshHud(true)
@@ -346,6 +350,13 @@ script BattleQueueHudComponent extends Component
 		local session = player.CurrentMap:GetComponent("script.BattleSessionComponent")
 		if (session == nil and not self._T.ShopSkillPreview) or (session ~= nil and session.BattleResult ~= "") then self:HideSkillHover() return end
 		local cursor = _InputService:GetCursorPosition()
+		if isvalid(self.UtilitySlot) and self.UtilitySlot.EnabledInHierarchy
+			and self:IsScreenPointInsideSkillSlot(cursor, self.UtilitySlot.UITransformComponent) then
+			local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
+			local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
+			if tooltip ~= nil then tooltip:Show("battle_utility", self._T.UtilityDescription or "고유 능력") end
+			return
+		end
 		local skillId = ""
 		for index = 1, 6 do
 			local button = self:GetSkillSlotButton(index)
@@ -373,6 +384,34 @@ script BattleQueueHudComponent extends Component
 			.. ":" .. tostring(unit ~= nil and unit.CurrentHp or 0) .. ":" .. tostring(unit ~= nil and unit.MaxHp or 0)
 			.. ":" .. tostring(inventory ~= nil and inventory.InventoryRevision or 0)
 		tooltip:RequestSkillHover(player.CurrentMap, skillId, signature)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshUtilitySlot()
+		-- Render server-owned turn cooldowns only when the combat skill bar is available.
+		if not isvalid(self.UtilitySlot) or not isvalid(self.UtilityIcon) or not isvalid(self.UtilityCooldownText) then return end
+		local player = _UserService.LocalPlayer
+		local session = isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap:GetComponent("script.BattleSessionComponent") or nil
+		local shown = self.IsHudContextVisible and not self.IsMapTransferPending and session ~= nil
+			and session.BattleResult == "" and (session.UtilitySkillId or "") ~= "" and (session.UtilitySkillIconRuid or "") ~= ""
+		if self.UtilitySlot.Enable ~= shown then self.UtilitySlot.Enable = shown end
+		if not shown then
+			self._T.UtilitySignature = nil
+			return
+		end
+		local turns = math.max(0, math.floor(session.UtilityRemainingCooldown or 0))
+		local signature = session.SelectedJobId .. ":" .. session.UtilitySkillId .. ":" .. session.UtilitySkillIconRuid .. ":" .. tostring(turns)
+			.. ":" .. _LobbyJobSelectionProvider.UtilitySnapshot
+		if self._T.UtilitySignature == signature then return end
+		self.UtilityIcon.ImageRUID = DataRef(session.UtilitySkillIconRuid)
+		self.UtilityIcon.Color = turns > 0 and Color(0.42, 0.42, 0.42, 1) or Color.white
+		self.UtilityCooldownText.Text = turns > 0 and tostring(turns) or ""
+		self.UtilityCooldownText.Entity.Enable = turns > 0
+		local presentation = _LobbyCharacterSelectionLogic:GetJobPassivePresentation(session.SelectedJobId)
+		self._T.UtilityDescription = presentation.Text .. "\n사용 키: S"
+		if turns > 0 then self._T.UtilityDescription = self._T.UtilityDescription .. "\n남은 대기시간: " .. tostring(turns) .. "턴" end
+		self._T.UtilitySignature = signature
+		log("[BattleUtilityHUD] skill=" .. session.UtilitySkillId .. " cooldown=" .. tostring(turns))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -443,7 +482,9 @@ script BattleQueueHudComponent extends Component
 	method void HideSkillHover()
 		local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
 		local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
-		if tooltip ~= nil and tooltip.ActiveOwnerKey == "battle_skill" then tooltip:Hide("battle_skill") end
+		if tooltip ~= nil and (tooltip.ActiveOwnerKey == "battle_skill" or tooltip.ActiveOwnerKey == "battle_utility") then
+			tooltip:Hide(tooltip.ActiveOwnerKey)
+		end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -1796,9 +1837,6 @@ script BattleQueueHudComponent extends Component
 		end
 		local snapshot = ""
 		local medalBonus = 0
-		local utilityId = ""
-		local utilityIcon = ""
-		local utilityTurns = 0
 		local player = _UserService.LocalPlayer
 		if self.IsHudContextVisible and isvalid(player) then
 			local unit = player:GetComponent("script.BattleUnitComponent")
@@ -1806,16 +1844,9 @@ script BattleQueueHudComponent extends Component
 				snapshot = unit.ActiveBuffSnapshot or ""
 				local relics = player:GetComponent("script.PlayerRunRelicEffectComponent")
 				if relics ~= nil then medalBonus = relics.BattleKillAttackBonus end
-				local session = isvalid(player.CurrentMap) and player.CurrentMap:GetComponent("script.BattleSessionComponent") or nil
-				if session ~= nil and session.BattleResult == "" and self.IsMapTransferPending == false then
-					utilityId = session.UtilitySkillId or ""
-					utilityIcon = session.UtilitySkillIconRuid or ""
-					utilityTurns = math.max(0, session.UtilityRemainingCooldown or 0)
-				end
 			end
 		end
 		local signature = snapshot .. ":" .. self.IconSnapshot .. ":medal:" .. tostring(medalBonus)
-			.. ":utility:" .. utilityId .. ":" .. utilityIcon .. ":" .. tostring(utilityTurns)
 		if signature == self._T.BuffBarSignature then
 			return
 		end
@@ -1842,10 +1873,6 @@ script BattleQueueHudComponent extends Component
 				if turns > 0 then remaining = remaining .. (hits > 0 and "\n" or "") .. "지속 " .. tostring(math.floor(turns)) .. "턴" end
 				table.insert(buffs, { SkillId = skillId, Remaining = remaining, IconRuid = iconRuid })
 			end
-		end
-		-- Read the authoritative cooldown without advancing it; ready skills have no buff entry.
-		if utilityId ~= "" and utilityIcon ~= "" and utilityTurns > 0 then
-			table.insert(buffs, { SkillId = utilityId, Remaining = "쿨타임\n" .. tostring(math.floor(utilityTurns)) .. "턴", IconRuid = utilityIcon })
 		end
 		for index = #views + 1, #buffs do
 			local view = template:Clone("BuffIcon" .. tostring(index))
