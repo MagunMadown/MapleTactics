@@ -1245,6 +1245,7 @@ script UnionProfileRepositoryLogic extends Logic
             Reason = "OK",
             Profile = {
                 SchemaVersion = self.CurrentSchemaVersion,
+                TutorialCompleted = false,
                 UnionPoints = 0,
                 LifetimeUnionPoints = 0,
                 NextRewardRunId = 0,
@@ -1280,6 +1281,11 @@ script UnionProfileRepositoryLogic extends Logic
             return defaultResult
         end
         local profile = defaultResult.Profile
+        -- Missing only on accounts created before the tutorial was introduced.
+        if source.TutorialCompleted ~= nil and type(source.TutorialCompleted) ~= "boolean" then
+            return { Success = false, Reason = "INVALID_TUTORIAL_COMPLETION" }
+        end
+        profile.TutorialCompleted = source.TutorialCompleted ~= false
         if source.UnionShop ~= nil then
             if not _UnionShopServiceLogic:ValidateState(source.UnionShop) then
                 return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_UNION_SHOP" }
@@ -1340,7 +1346,7 @@ script UnionProfileRepositoryLogic extends Logic
         profile.PurchasedLevels = purchasedResult.Levels
 
         local wasMigrated = sourceSchemaVersion < self.CurrentSchemaVersion
-        local wasSanitized = rewardReceiptResult.WasSanitized == true or source.UnionShop == nil or source.UnionShop.JobTokens == nil
+        local wasSanitized = source.TutorialCompleted == nil or rewardReceiptResult.WasSanitized == true or source.UnionShop == nil or source.UnionShop.JobTokens == nil
         -- Optional Schema 5 extension: do not rerun the legacy refund/reset migration.
         wasSanitized = wasSanitized or source.RedeemedCouponCodes == nil
         wasSanitized = wasSanitized or (source.UnionShop ~= nil and source.UnionShop.FreeJobTokenClaimed == nil)
@@ -1547,6 +1553,9 @@ script UnionProfileRepositoryLogic extends Logic
         if profile == nil or type(profile) ~= "table" then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "PROFILE_TABLE_MISSING" }
         end
+        if type(profile.TutorialCompleted) ~= "boolean" then
+            return { Success = false, Reason = "INVALID_TUTORIAL_COMPLETION" }
+        end
         if profile.SchemaVersion ~= self.CurrentSchemaVersion then
             return { Success = false, Reason = "PROFILE_VALIDATION_FAILED", DetailReason = "INVALID_SCHEMA_VERSION" }
         end
@@ -1736,6 +1745,7 @@ script UnionProfileRepositoryLogic extends Logic
         -- Deep-copies only the persisted source fields and excludes all storage/cache metadata.
         return {
             SchemaVersion = source.SchemaVersion,
+            TutorialCompleted = source.TutorialCompleted ~= false,
             UnionPoints = source.UnionPoints,
             LifetimeUnionPoints = source.LifetimeUnionPoints,
             NextRewardRunId = source.NextRewardRunId,
@@ -2563,4 +2573,25 @@ script UnionProfileRepositoryLogic extends Logic
         return result
     end
 
+    @ExecSpace("ServerOnly")
+    method table CompleteTutorial(Entity playerEntity)
+        -- Commits completion with the existing locked compare-and-swap profile writer.
+        local loaded = self:EnsureProfileLoaded(playerEntity)
+        if not loaded.Success then return loaded end
+        local key = loaded.StorageUserKey
+        if not self:TryAcquireMutationLock(key) then return { Success = false, Reason = "PROFILE_MUTATION_IN_PROGRESS" } end
+        local ok, result = pcall(function()
+            local candidate = self:GetCachedSnapshot(key)
+            if candidate == nil then return { Success = false, Reason = "PROFILE_CACHE_MISSING" } end
+            if candidate.TutorialCompleted then return { Success = true, Reason = "ALREADY_COMPLETED" } end
+            candidate.TutorialCompleted = true
+            return self:PersistProfileCandidate(key, candidate)
+        end)
+        self:ReleaseMutationLock(key)
+        if not ok then
+            self:EvictProfile(key, "")
+            return { Success = false, Reason = "TUTORIAL_SAVE_FAILED" }
+        end
+        return result
+    end
 end

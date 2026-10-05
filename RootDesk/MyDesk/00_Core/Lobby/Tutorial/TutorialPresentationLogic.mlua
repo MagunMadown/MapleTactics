@@ -1,0 +1,743 @@
+@Logic
+script TutorialPresentationLogic extends Logic
+
+    property string EntryMessage = ""
+    property boolean CanRetry = false
+    property number RefreshDelay = 0
+    property Entity GuidePanel = "51cc5d98-7fda-49e8-861d-4e59c1ac4323"
+    property Entity RetryButton = "7b10d474-17c5-4def-8455-44123edf4d09"
+    property TextGUIRendererComponent GuideText = "2822a7b3-2580-449e-abda-84d065745914"
+    property Entity Dimmer = "1936db7c-f1be-49e2-af4b-a8d9e7cf3ee5"
+    property Entity CellHighlight = "1f180bfd-2087-46a0-bb31-387749f9b50b"
+    property any RetryHandler = nil
+    property Entity WorldDimmer = ""
+    property table HighlightedRenderers = {}
+    property table TutorialUnits = {}
+    property number UnitRefreshDelay = 0
+    property boolean ActionHighlighted = false
+
+    @ExecSpace("ClientOnly")
+    method void TrackDecoration(any hud, Entity decoration, boolean active)
+        -- Keep original values with the calling HUD and restore them when its lesson ends.
+        if not isvalid(decoration) then return end
+        local originals = hud._T.TutorialDecorations
+        if originals == nil then
+            if not active then return end
+            originals = {}
+            hud._T.TutorialDecorations = originals
+        end
+        local original = originals[decoration.Id]
+        local transform = decoration.UITransformComponent
+        local sprite = decoration.SpriteGUIRendererComponent
+        local text = decoration.TextGUIRendererComponent
+        if active then
+            if original == nil then
+                originals[decoration.Id] = {
+                    Entity = decoration, Scale = transform.UIScale, Size = transform.RectSize,
+                    Position = transform.anchoredPosition, Color = sprite ~= nil and sprite.Color or nil,
+                    FontSize = text ~= nil and text.FontSize or nil, FontColor = text ~= nil and text.FontColor or nil
+                }
+            end
+        elseif original ~= nil then
+            transform.UIScale = original.Scale
+            transform.RectSize = original.Size
+            transform.anchoredPosition = original.Position
+            if sprite ~= nil then sprite.Color = original.Color end
+            if text ~= nil then text.FontSize = original.FontSize; text.FontColor = original.FontColor end
+            originals[decoration.Id] = nil
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ResetHudHighlights(any hud)
+        -- Hidden or unloaded HUDs must not retain a pulse, tint or changed label size.
+        for _, original in pairs(hud._T.TutorialDecorations or {}) do
+            self:TrackDecoration(hud, original.Entity, false)
+        end
+        hud._T.TutorialDecorations = nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Update(number delta)
+        -- Called at the existing entry Logic update checkpoint; all presentation is local.
+        -- Poll only local UI/map state; login triggers one server request, never a storage poll.
+        local player = _UserService.LocalPlayer
+        local map = isvalid(player) and player.CurrentMap or nil
+        if self.RetryHandler ~= nil and (not isvalid(map) or map.Name ~= "lobby") then
+            if isvalid(self.RetryButton) then self.RetryButton:DisconnectEvent(ButtonClickEvent, self.RetryHandler) end
+            self.RetryHandler = nil
+        end
+        local session = isvalid(map) and map:GetComponent("script.BattleSessionComponent") or nil
+        local inTutorialBattle = session ~= nil and session.TutorialActive and session.TutorialUserId == player.PlayerComponent.UserId
+        local guidedBattle = inTutorialBattle and session.TutorialStep < 10 and session.BattleResult == ""
+        self:UpdateWorldDimmer(map, session, guidedBattle, delta)
+        self.RefreshDelay = self.RefreshDelay - delta
+        if self.RefreshDelay > 0 then return end
+        self.RefreshDelay = 0.1
+        if not isvalid(player) or not isvalid(player.CurrentMap) then return end
+        if not isvalid(self.GuidePanel) then self.GuidePanel = _EntityService:GetEntityByPath("/ui/TutorialGuide/Panel") end
+        if not isvalid(self.GuidePanel) then return end
+        local textEntity = self.GuidePanel:GetChildByName("Message")
+        local retryEntity = self.GuidePanel:GetChildByName("Retry")
+        if not isvalid(textEntity) or not isvalid(retryEntity) then return end
+        self.GuideText = textEntity.TextGUIRendererComponent
+        if self.RetryHandler == nil and player.CurrentMap.Name == "lobby" then
+            self.RetryButton = retryEntity
+            self.RetryHandler = retryEntity:ConnectEvent(ButtonClickEvent, function()
+                self.EntryMessage = "첫 전투를 준비하고 있습니다…"
+                self.CanRetry = false
+                _NewPlayerTutorialLogic:RequestReplay()
+            end)
+        end
+        _NewPlayerTutorialLogic:CheckFirstLogin(player)
+        local message = ""
+        if inTutorialBattle then
+            message = self:GetGuideMessage(session.TutorialStep, session.QueuedTileCount, session.BattleResult)
+            if session.TutorialStep == 3 and session.BattleResult == "" and session.BattlePhase ~= "PlayerTurn" then
+                message = "3 / 10  공격 회피\n한 칸 물러났습니다! 몬스터의 공격이 빗나가는 모습을 잠시 확인해 보세요."
+            end
+            if (session.TutorialStep == 6 or session.TutorialStep == 9) and session.BattleResult == "" and
+                (self.ActionHighlighted or session.BattlePhase ~= "PlayerTurn") then
+                message = tostring(session.TutorialStep) .. " / 10  몬스터 처치\n공격이 진행 중입니다. 행동이 끝날 때까지 잠시 기다려 주세요."
+            end
+            if session.TutorialStep == 8 and session.BattleResult == "" then
+                if session.TutorialGuardUsed then
+                    message = "8 / 10  전사 특수 스킬 · 가드\n가드가 적용되었습니다. 몬스터의 공격을 막는 동안 잠시 기다려 주세요."
+                elseif session.QueuedTileCount > 0 and (session.BattlePhase ~= "PlayerTurn" or session.IsActionProcessing) then
+                    message = "8 / 10  가드 준비\n몬스터가 공격을 장전하고 있습니다. 장전이 끝나면 S 또는 아래 방향키(↓)로 가드를 사용하세요."
+                end
+            end
+            if self.EntryMessage ~= "" and session.BattleResult ~= "" then message = self.EntryMessage end
+        elseif player.CurrentMap.Name == "lobby" then
+            message = self.EntryMessage
+        end
+        self.GuidePanel.Enable = message ~= ""
+        self.GuideText.Text = message
+        retryEntity.Enable = self.CanRetry and player.CurrentMap.Name == "lobby"
+        if not isvalid(self.Dimmer) then self.Dimmer = _EntityService:GetEntityByPath("/ui/TutorialGuide/Dimmer") end
+        if isvalid(self.Dimmer) then
+            -- Screen UI always covers world actors; use the world overlay when it is available.
+            local showDimmer = guidedBattle and not isvalid(self.WorldDimmer)
+            if showDimmer and not self.Dimmer.Enable then
+                -- Maker's runtime sibling order can differ from the saved displayOrder.
+                _UILogic:SetSiblingIndex(self.Dimmer.UITransformComponent, 1)
+                _UILogic:SetSiblingIndex(self.GuidePanel.UITransformComponent, 1000000)
+                log("[Tutorial] guide shown above dimmer")
+            end
+            self.Dimmer.Enable = showDimmer
+        end
+        if not isvalid(self.CellHighlight) then self.CellHighlight = _EntityService:GetEntityByPath("/ui/TutorialGuide/CellHighlight") end
+        if isvalid(self.CellHighlight) then
+            local showCell = inTutorialBattle and (session.TutorialStep == 1 or session.TutorialStep == 3 or session.TutorialStep == 4) and session.BattleResult == ""
+                and (session.TutorialStep ~= 3 or (session.BattlePhase == "PlayerTurn" and not session.IsActionProcessing))
+            self:TrackDecoration(self, self.CellHighlight, showCell)
+            self.CellHighlight.Enable = showCell
+            if showCell then
+                local playerUnit = isvalid(player) and player:GetComponent("script.BattleUnitComponent") or nil
+                local currentCell = playerUnit ~= nil and playerUnit.CellIndex or session.PlayerStartCell
+                local targetCell = currentCell + 1
+                if session.TutorialStep == 3 then
+                    targetCell = currentCell - 1
+                end
+                local originX = session.CellStartX
+                local spacing = session.CellSpacing
+                local worldX = originX + targetCell * spacing
+                local worldY = -0.1
+                local worldPlatforms = player.CurrentMap:GetChildByName("BattlePlatforms")
+                if isvalid(worldPlatforms) then
+                    local cellEntity = worldPlatforms:GetChildByName("BattleCell" .. tostring(targetCell + 1))
+                    if isvalid(cellEntity) and cellEntity.TransformComponent ~= nil then
+                        worldY = cellEntity.TransformComponent.Position.y
+                    end
+                end
+                local screenPos = _UILogic:WorldToScreenPosition(Vector2(worldX, worldY))
+                local root = _EntityService:GetEntityByPath("/ui/TutorialGuide")
+                local localPos = isvalid(root) and _UILogic:ScreenToLocalUIPosition(screenPos, root.UITransformComponent) or _UILogic:ScreenToUIPosition(screenPos)
+                local t = (_UtilLogic.ElapsedSeconds or 0) * 5
+                local pulse = 0.5 + 0.5 * math.sin(t)
+                local scale = 1.0 + 0.06 * pulse
+                self.CellHighlight.UITransformComponent.anchoredPosition = localPos
+                self.CellHighlight.UITransformComponent.UIScale = Vector3(scale, scale, 1)
+                local renderer = self.CellHighlight.SpriteGUIRendererComponent
+                if renderer ~= nil then
+                    renderer.Color = Color(1, 0.85 + 0.15 * pulse, 0.25, 0.9 + 0.1 * pulse)
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateWorldDimmer(Entity map, any session, boolean enabled, number delta)
+        -- A local world overlay lets real actors and effects render above it while the guide stays in screen UI.
+        if not enabled and not isvalid(self.WorldDimmer) and not self.ActionHighlighted and #self.TutorialUnits == 0 then return end
+        if not enabled or not isvalid(map) or (isvalid(self.WorldDimmer) and self.WorldDimmer.CurrentMap ~= map) then
+            self:RestoreActionHighlight()
+            self.TutorialUnits = {}
+            self.UnitRefreshDelay = 0
+            if isvalid(self.WorldDimmer) then self.WorldDimmer:Destroy() end
+            self.WorldDimmer = nil
+            if not enabled or not isvalid(map) then return end
+        end
+        if not isvalid(self.WorldDimmer) then
+            self.WorldDimmer = _SpawnService:SpawnByModelId("tutorialdimmer", "TutorialDimmer", Vector3.zero, map)
+            if not isvalid(self.WorldDimmer) then return end
+            local polygon = self.WorldDimmer.PolygonRendererComponent
+            polygon.Color = Color(0, 0, 0, 0.42)
+            polygon.Points:Add(Vector2(-0.5, -0.5))
+            polygon.Points:Add(Vector2(0.5, -0.5))
+            polygon.Points:Add(Vector2(0.5, 0.5))
+            polygon.Points:Add(Vector2(-0.5, 0.5))
+            log("[Tutorial] world dimmer created drawable=" .. tostring(polygon:IsDrawable()))
+        end
+        -- Follow the camera, zoom and viewport rather than assuming fixed world dimensions.
+        local bottomLeft = _UILogic:ScreenToWorldPosition(Vector2(0, 0))
+        local topRight = _UILogic:ScreenToWorldPosition(Vector2(_UILogic.ScreenWidth, _UILogic.ScreenHeight))
+        self.WorldDimmer.TransformComponent.WorldPosition = Vector3((bottomLeft.x + topRight.x) * 0.5, (bottomLeft.y + topRight.y) * 0.5, 0)
+        self.WorldDimmer.TransformComponent.Scale = Vector3(math.abs(topRight.x - bottomLeft.x), math.abs(topRight.y - bottomLeft.y), 1)
+        self.UnitRefreshDelay = self.UnitRefreshDelay - delta
+        if self.UnitRefreshDelay <= 0 then
+            self.UnitRefreshDelay = 0.1
+            self.TutorialUnits = map:GetChildComponentsByTypeName("script.BattleUnitPresentationComponent", true)
+        end
+        local acting = session ~= nil and session.IsActionProcessing
+        for _, presentation in ipairs(self.TutorialUnits) do
+            if isvalid(presentation) and (presentation:IsFullMotionPending() or presentation._T.moveHopVisual ~= nil) then
+                acting = true
+            end
+        end
+        if not acting then self:RestoreActionHighlight() return end
+        for _, presentation in ipairs(self.TutorialUnits) do
+            if isvalid(presentation) and isvalid(presentation.Entity) then
+                local actor = presentation.Entity
+                local renderer = actor.AvatarRendererComponent or actor.SpriteRendererComponent
+                if renderer ~= nil then
+                    if self.HighlightedRenderers[actor.Id] == nil then
+                        self.HighlightedRenderers[actor.Id] = { Renderer = renderer, Layer = renderer.SortingLayer, Order = renderer.OrderInLayer }
+                    end
+                    renderer.SortingLayer = self.WorldDimmer.PolygonRendererComponent.SortingLayer
+                    renderer.OrderInLayer = self.WorldDimmer.PolygonRendererComponent.OrderInLayer + 10
+                end
+            end
+        end
+        if not self.ActionHighlighted then
+            self.ActionHighlighted = true
+            log("[Tutorial] actors highlighted above dimmer")
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void RestoreActionHighlight()
+        -- Restore exact renderer settings on idle, map transition, defeat and Maker stop.
+        for _, original in pairs(self.HighlightedRenderers) do
+            if isvalid(original.Renderer) then
+                original.Renderer.SortingLayer = original.Layer
+                original.Renderer.OrderInLayer = original.Order
+            end
+        end
+        self.HighlightedRenderers = {}
+        if self.ActionHighlighted then log("[Tutorial] actor render order restored") end
+        self.ActionHighlighted = false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void ApplyEffectHighlight(table options)
+        -- Keep existing cast and hit effects visible above the tutorial's world overlay.
+        if not isvalid(self.WorldDimmer) then return end
+        options["SortingLayer"] = self.WorldDimmer.PolygonRendererComponent.SortingLayer
+        options["OrderInLayer"] = self.WorldDimmer.PolygonRendererComponent.OrderInLayer + 20
+    end
+    method string GetGuideMessage(integer step, integer queued, string battleResult)
+        -- Prompts follow successful server actions, including the automatic enemy round.
+        if battleResult == "Victory" then return "튜토리얼 완료!\n주황버섯 2마리와의 자유전투까지 클리어했습니다. 완료 버튼을 눌러 저장하고 로비로 돌아가세요." end
+        if battleResult == "Defeat" then return "아쉽게 쓰러졌지만 다시 도전할 수 있어요!\n전투 결과에서 로비로 돌아간 뒤 재도전 버튼을 눌러 다시 플레이하세요." end
+        if step == 10 then return "10 / 10  자유전투\n배운 조작을 자유롭게 사용해 주황버섯 2마리를 모두 처치하세요. 쓰러지면 다시 도전할 수 있습니다!" end
+        if step == 1 then return "1 / 10  이동\n오른쪽 이동(D 또는 →)으로 몬스터에게 한 칸 다가가세요." end
+        if step == 2 then return "2 / 10  스킬 장전\n브랜디쉬를 눌러 공격을 등록하세요. 몬스터도 스킬을 장전합니다." end
+        if step == 3 then return "3 / 10  공격 회피\n몬스터가 공격을 준비 중입니다! 왼쪽 이동(A 또는 ←)으로 한 칸 물러나 공격을 피하세요." end
+        if step == 4 then return "4 / 10  재접근\n공격을 회피했습니다! 다시 오른쪽 이동(D 또는 →)으로 다가가세요." end
+        if step == 5 then return "5 / 10  공격 실행\n실행 버튼(Space)을 눌러 등록해 둔 브랜디쉬로 몬스터를 공격하세요!" end
+        if step == 6 and queued == 0 then return "6 / 10  첫 몬스터 처치\n디바인 스윙을 장전해 마무리 공격을 준비하세요." end
+        if step == 6 then return "6 / 10  첫 몬스터 처치\n실행 버튼(Space)을 눌러 첫 몬스터를 처치하세요. 이어서 몬스터 한 마리가 더 등장합니다." end
+        if step == 7 then return "7 / 10  포션 사용\n두 번째 몬스터가 등장했습니다! 주황 포션을 눌러 줄어든 HP를 회복하세요. 포션은 턴을 소모하지 않습니다." end
+        if step == 8 and queued == 0 then return "8 / 10  가드 준비\n브랜디쉬를 장전하세요. 새 몬스터도 공격을 장전합니다. 이번에는 가드로 막아 봅시다." end
+        if step == 8 then return "8 / 10  전사 특수 스킬 · 가드\nS 또는 아래 방향키(↓)로 새크로생티티(가드)를 사용하세요. 몬스터의 공격 피해를 막으며 장전한 스킬은 유지됩니다." end
+        if queued == 0 then return "9 / 10  두 번째 몬스터 처치\n브랜디쉬를 먼저 장전하세요. 이어서 디바인 스윙을 추가해 두 공격을 함께 실행합니다." end
+        if queued == 1 then return "9 / 10  두 번째 몬스터 처치\n가드로 공격을 막았습니다! 스킬 큐에 디바인 스윙도 장전해 브랜디쉬와 함께 한 번에 처치하세요." end
+        return "9 / 10  두 번째 몬스터 처치\n브랜디쉬와 디바인 스윙이 모두 장전되었습니다! 실행 버튼(Space)을 한 번 눌러 처치하세요. 다음은 주황버섯 2마리와의 자유전투입니다."
+    end
+
+    @ExecSpace("ClientOnly")
+    method void Reset()
+        -- Restore actor layers, remove local overlays and disconnect the retry button.
+        self:ResetHudHighlights(self)
+        -- Clear both lifetimes and disconnect the local button before a Maker restart.
+        if self:IsClient() then
+            self:RestoreActionHighlight()
+            if isvalid(self.WorldDimmer) then self.WorldDimmer:Destroy() end
+            self.WorldDimmer = nil
+            self.TutorialUnits = {}
+        end
+        if self:IsClient() and isvalid(self.RetryButton) and self.RetryHandler ~= nil then
+            self.RetryButton:DisconnectEvent(ButtonClickEvent, self.RetryHandler)
+        end
+        if self:IsClient() and isvalid(self.Dimmer) then
+            self.Dimmer.Enable = false
+        end
+        if self:IsClient() and isvalid(self.CellHighlight) then
+            self.CellHighlight.Enable = false
+        end
+        self.RetryHandler = nil
+        self.EntryMessage = ""
+        self.CanRetry = false
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetEntryStatus(string message, boolean retry)
+        -- Accept the coordinator notification on the receiving client.
+        self.EntryMessage = message
+        self.CanRetry = retry
+    end
+
+    @ExecSpace("ClientOnly")
+    method boolean IsActorHighlighted(Entity actor)
+        -- Let normal actor layout respect an active tutorial render override.
+        return self.HighlightedRenderers[actor.Id] ~= nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateQueueHighlight(any hud, number delta)
+        -- Apply the original tutorial HUD decoration at its existing refresh checkpoint.
+        local player = _UserService.LocalPlayer
+        if not isvalid(player) or not isvalid(player.CurrentMap) then
+            self:SetQueueHighlightTarget(hud, 0)
+            return
+        end
+        local session = player.CurrentMap:GetComponent("script.BattleSessionComponent")
+        if session == nil or not session.TutorialActive or session.BattleResult == "Defeat" then
+            self:SetQueueHighlightTarget(hud, 0)
+            return
+        end
+
+        local slotSource = (hud.SlotSkillIds ~= "") and hud.SlotSkillIds or session.SkillSlotIds
+        local function FindSlot(id)
+            for slotIndex = 1, 6 do
+                if hud:GetFixedSkillSlotToken(slotSource, slotIndex) == id then
+                    return slotIndex
+                end
+            end
+            return 0
+        end
+        local brandishSlot = FindSlot("brandish")
+        if brandishSlot <= 0 then brandishSlot = 1 end
+        local divineSlot = FindSlot("divine_swing")
+        if divineSlot <= 0 then divineSlot = 2 end
+
+        local highlightTarget = 0
+        -- 0: None, 1: Slot 1, 2: Slot 2, 3: Execute, 4: ResultReset
+        if session.BattleResult == "Victory" then
+            highlightTarget = 4
+        elseif session.TutorialStep == 2 then
+            if session.QueuedTileCount == 0 then
+                highlightTarget = brandishSlot
+            end
+        elseif session.TutorialStep == 5 then
+            highlightTarget = 3
+        elseif session.TutorialStep == 6 then
+            if session.QueuedTileCount == 0 then
+                highlightTarget = divineSlot
+            else
+                highlightTarget = 3
+            end
+        elseif session.TutorialStep == 9 then
+            if session.QueuedTileCount == 0 then
+                highlightTarget = brandishSlot
+            elseif session.QueuedTileCount == 1 then
+                highlightTarget = divineSlot
+            else
+                highlightTarget = 3
+            end
+        elseif session.TutorialStep == 8 then
+            if session.QueuedTileCount == 0 then
+                highlightTarget = brandishSlot
+            end
+        end
+
+        self:SetQueueHighlightTarget(hud, highlightTarget)
+    end
+
+    @ExecSpace("ClientOnly")
+    method void SetQueueHighlightTarget(any hud, integer target)
+        -- Apply the original tutorial HUD decoration at its existing refresh checkpoint.
+        local highlights = {
+            hud.SkillSlot1TutorialHighlight,
+            hud.SkillSlot2TutorialHighlight,
+            hud.ExecuteTutorialHighlight,
+            hud.ResultResetTutorialHighlight
+        }
+        for index, hl in ipairs(highlights) do
+            if isvalid(hl) and isvalid(hl.Entity) then
+                local isActive = (index == target)
+                self:TrackDecoration(hud, hl.Entity, isActive)
+                hl.Entity.Enable = isActive
+                hl.Enable = isActive
+                if isActive then
+                    local t = (_UtilLogic.ElapsedSeconds or 0) * 5
+                    local pulse = 0.5 + 0.5 * math.sin(t)
+                    local scale = 1.0 + 0.07 * pulse
+                    local alpha = 0.75 + 0.25 * pulse
+                    hl.Entity.UITransformComponent.UIScale = Vector3(scale, scale, 1)
+                    hl.Color = Color(1, 0.80 + 0.15 * pulse, 0.22, alpha)
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateKeyHighlight(any hud, number delta)
+        -- Match keyboard hints to the guided queue, including both finishing skills.
+        local player = _UserService.LocalPlayer
+        local session = isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap:GetComponent("script.BattleSessionComponent") or nil
+        local isTutorial = session ~= nil and session.TutorialActive and hud.CurrentContext == "BATTLE"
+
+        local targetAction = ""
+        if isTutorial and session.BattleResult == "" then
+            local function FindSlot(snapshot, targetSkillId)
+                local serialized = snapshot or ""
+                local startIndex = 1
+                for slotIndex = 1, 6 do
+                    local sep, _ = string.find(serialized, "|", startIndex, true)
+                    local token = ""
+                    if sep ~= nil then
+                        token = string.sub(serialized, startIndex, sep - 1)
+                        startIndex = sep + 1
+                    else
+                        token = string.sub(serialized, startIndex)
+                        startIndex = #serialized + 1
+                    end
+                    if token == targetSkillId then
+                        return slotIndex
+                    end
+                end
+                return 0
+            end
+
+            local brandishSlot = FindSlot(session.SkillSlotIds, "brandish")
+            if brandishSlot <= 0 then brandishSlot = 1 end
+            local divineSlot = FindSlot(session.SkillSlotIds, "divine_swing")
+            if divineSlot <= 0 then divineSlot = 2 end
+
+            if session.TutorialStep == 1 then
+                targetAction = "MOVE_RIGHT"
+            elseif session.TutorialStep == 2 then
+                if session.QueuedTileCount == 0 then
+                    targetAction = "SLOT_" .. tostring(brandishSlot)
+                end
+            elseif session.TutorialStep == 3 then
+                if session.BattlePhase == "PlayerTurn" and not session.IsActionProcessing then
+                    targetAction = "MOVE_LEFT"
+                end
+            elseif session.TutorialStep == 4 then
+                targetAction = "MOVE_RIGHT"
+            elseif session.TutorialStep == 5 then
+                targetAction = "EXECUTE"
+            elseif session.TutorialStep == 6 then
+                if session.QueuedTileCount == 0 then
+                    targetAction = "SLOT_" .. tostring(divineSlot)
+                else
+                    targetAction = "EXECUTE"
+                end
+            elseif session.TutorialStep == 9 then
+                if session.QueuedTileCount == 0 then
+                    targetAction = "SLOT_" .. tostring(brandishSlot)
+                elseif session.QueuedTileCount == 1 then
+                    targetAction = "SLOT_" .. tostring(divineSlot)
+                else
+                    targetAction = "EXECUTE"
+                end
+            elseif session.TutorialStep == 8 and not session.TutorialGuardUsed then
+                if session.QueuedTileCount == 0 then
+                    targetAction = "SLOT_" .. tostring(brandishSlot)
+                else
+                    targetAction = "UTILITY"
+                end
+            end
+        end
+
+        local t = (_UtilLogic.ElapsedSeconds or 0) * 5
+        local pulse = 0.5 + 0.5 * math.sin(t)
+        local highlightColor = Color(1, 0.85 + 0.15 * pulse, 0.25, 1)
+        local normalColor = Color(0.97, 0.94, 0.86, 1)
+
+        local function SetCapHighlight(capEntity, isTarget)
+            if not isvalid(capEntity) then return end
+            local hl = capEntity:GetChildByName("Highlight")
+            if isvalid(hl) then
+                self:TrackDecoration(hud, hl, isTarget)
+                hl.Enable = isTarget
+                if isTarget then
+                    local scale = 1.0 + 0.08 * pulse
+                    hl.UITransformComponent.UIScale = Vector3(scale, scale, 1)
+                    local hr = hl.SpriteGUIRendererComponent
+                    if hr ~= nil then
+                        hr.Color = Color(1, 0.85 + 0.15 * pulse, 0.25, 0.85 + 0.15 * pulse)
+                    end
+                end
+            end
+            local fill = capEntity:GetChildByName("Fill")
+            if isvalid(fill) and fill.SpriteGUIRendererComponent ~= nil then
+                self:TrackDecoration(hud, fill, isTarget)
+                fill.SpriteGUIRendererComponent.Color = isTarget and highlightColor or normalColor
+            end
+        end
+
+        -- Row 1: Move Left (A: cap 1, LeftArrow: cap 3), Move Right (D: cap 2, RightArrow: cap 4)
+        local row1Caps = hud._T.RowCaps and hud._T.RowCaps["BattlePanel/Row1"]
+        if row1Caps ~= nil then
+            SetCapHighlight(row1Caps[1], targetAction == "MOVE_LEFT")
+            SetCapHighlight(row1Caps[2], targetAction == "MOVE_RIGHT")
+            SetCapHighlight(row1Caps[3], targetAction == "MOVE_LEFT")
+            SetCapHighlight(row1Caps[4], targetAction == "MOVE_RIGHT")
+        end
+
+        -- Row 3: The currently configured special skill keys.
+        local row3Caps = hud._T.RowCaps and hud._T.RowCaps["BattlePanel/Row3"]
+        for _, cap in ipairs(row3Caps or {}) do
+            SetCapHighlight(cap, targetAction == "UTILITY")
+        end
+
+        -- Row 4: Execute key
+        local row4Caps = hud._T.RowCaps and hud._T.RowCaps["BattlePanel/Row4"]
+        if row4Caps ~= nil then
+            SetCapHighlight(row4Caps[1], targetAction == "EXECUTE")
+        end
+
+        -- Row 5: Slots 1 and 2
+        local row5Caps = hud._T.RowCaps and hud._T.RowCaps["BattlePanel/Row5"]
+        if row5Caps ~= nil then
+            SetCapHighlight(row5Caps[1], targetAction == "SLOT_1")
+            SetCapHighlight(row5Caps[2], targetAction == "SLOT_2")
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateConsumableHighlight(any hud, any session)
+        -- Reuses the existing tutorial frame around the potion the player must use.
+        for index, slot in ipairs(hud.Slots) do
+            local item = (hud._T.SlotItems or {})[index]
+            local show = session.TutorialActive and session.TutorialStep == 7 and session.BattleResult == "" and item ~= nil and item.ConsumableId == "orange_potion"
+            local highlight = slot:GetChildByName("TutorialHighlight")
+            if show and not isvalid(highlight) then
+                local template = _EntityService:GetEntityByPath("/ui/TutorialGuide/CellHighlight")
+                if isvalid(template) then
+                    highlight = template:Clone("TutorialHighlight")
+                    if isvalid(highlight) and not highlight:AttachTo(slot) then highlight:Destroy(); highlight = nil end
+                end
+            end
+            if isvalid(highlight) then
+                self:TrackDecoration(hud, highlight, show)
+                highlight.Enable = show
+                if show then
+                    local transform = highlight.UITransformComponent
+                    local pulse = 0.5 + 0.5 * math.sin((_UtilLogic.ElapsedSeconds or 0) * 5)
+                    transform.AnchorsMin = Vector2(0.5, 0.5)
+                    transform.AnchorsMax = Vector2(0.5, 0.5)
+                    transform.Pivot = Vector2(0.5, 0.5)
+                    transform.anchoredPosition = Vector2(0, 0)
+                    transform.RectSize = Vector2(80, 80)
+                    transform.UIScale = Vector3(1 + 0.06 * pulse, 1 + 0.06 * pulse, 1)
+                    highlight.SpriteGUIRendererComponent.RaycastTarget = false
+                    highlight.SpriteGUIRendererComponent.Color = Color(1, 0.85 + 0.15 * pulse, 0.25, 0.9 + 0.1 * pulse)
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method string GetResultButtonText(any session, string battleResult, string defaultValue)
+        -- Override the result label only for a tutorial battle.
+        if session ~= nil and session.TutorialActive then
+            return battleResult == "Defeat" and "로비로 돌아가 재도전" or "튜토리얼 완료 · 로비로"
+        end
+        return defaultValue
+    end
+
+    @ExecSpace("ClientOnly")
+    method string GetRevisionToken(any session)
+        -- Keep consumable availability queries invalidated by the original lesson step.
+        return tostring(session.TutorialStep)
+    end
+
+    @ExecSpace("ClientOnly")
+    method Color GetPlatformColor(any hud, integer cell, Color base)
+        -- Return nil when normal range-warning colors should apply.
+        -- Tutorial target cell glows with bright pulsing gold, and non-target cells are dimmed
+        if hud._T.TutorialCell ~= nil and hud._T.TutorialCell >= 0 then
+            if cell == hud._T.TutorialCell then
+                local pulse = 0.5 + 0.5 * math.sin((_UtilLogic.ElapsedSeconds or 0) * 5)
+                return Color(1, 0.85 + 0.15 * pulse, 0.22, 1)
+            else
+                return Color(base.r * 0.35, base.g * 0.35, base.b * 0.35, base.a * 0.35)
+            end
+        end
+        return nil
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdatePlatformTarget(any hud, Entity player, any session)
+        -- Keep the target cell in the platform HUD instead of sharing it between maps.
+        if session.TutorialActive then
+            local playerUnit = isvalid(player) and player:GetComponent("script.BattleUnitComponent") or nil
+            local currentCell = playerUnit ~= nil and playerUnit.CellIndex or session.PlayerStartCell
+            if session.TutorialStep == 1 or session.TutorialStep == 4 then
+                hud._T.TutorialCell = currentCell + 1
+            elseif session.TutorialStep == 3 and session.BattlePhase == "PlayerTurn" and not session.IsActionProcessing then
+                hud._T.TutorialCell = currentCell - 1
+            else
+                hud._T.TutorialCell = -1
+            end
+        else
+            hud._T.TutorialCell = -1
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateEnemyQueueHighlight(any hud, any session)
+        -- Animate and restore enemy queue decorations using this HUD view cache.
+        local showTutorialHighlight = session.TutorialActive and (session.TutorialStep == 3 or session.TutorialStep == 8)
+        if showTutorialHighlight then
+            hud._T.WasTutorialHighlight = true
+            local t = (_UtilLogic.ElapsedSeconds or 0) * 5
+            local pulse = 0.5 + 0.5 * math.sin(t)
+            for _, record in pairs(hud._T.EnemyViews or {}) do
+                local view = record.View
+                if isvalid(view) and view.EnabledInHierarchy then
+                    local slot = view:GetChildByName("QueueSlot01")
+                    if isvalid(slot) and slot.EnabledInHierarchy then
+                        local highlight = slot:GetChildByName("TutorialHighlight")
+                        if isvalid(highlight) and highlight.Enable then
+                            local scale = 1.0 + 0.08 * pulse
+                            highlight.UITransformComponent.UIScale = Vector3(scale, scale, 1)
+                            if highlight.SpriteGUIRendererComponent ~= nil then
+                                highlight.SpriteGUIRendererComponent.Color = Color(1, 0.85 + 0.15 * pulse, 0.25, 0.9 + 0.1 * pulse)
+                            end
+                        end
+                        local tag = slot:GetChildByName("SpecialTag")
+                        if isvalid(tag) and tag.Enable then
+                            local tagScale = 1.0 + 0.05 * pulse
+                            tag.UITransformComponent.UIScale = Vector3(tagScale, tagScale, 1)
+                        end
+                    end
+                end
+            end
+        elseif hud._T.WasTutorialHighlight == true then
+            hud._T.WasTutorialHighlight = false
+            for _, record in pairs(hud._T.EnemyViews or {}) do
+                local view = record.View
+                if isvalid(view) then
+                    local slot = view:GetChildByName("QueueSlot01")
+                    if isvalid(slot) then
+                        local highlight = slot:GetChildByName("TutorialHighlight")
+                        if isvalid(highlight) then
+                            highlight.Enable = false
+                            highlight.UITransformComponent.UIScale = Vector3(1, 1, 1)
+                        end
+                        local tag = slot:GetChildByName("SpecialTag")
+                        if isvalid(tag) then
+                            tag.UITransformComponent.UIScale = Vector3(1, 1, 1)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method Entity CreateMonsterHighlight(Entity view)
+        -- Clone the existing tutorial frame for the attacker view.
+        local slot = view:GetChildByName("QueueSlot01")
+        local template = isvalid(slot) and slot:GetChildByName("TutorialHighlight") or nil
+        local monsterHighlight = isvalid(template) and template:Clone("MonsterHighlight") or nil
+        if isvalid(monsterHighlight) then
+            if monsterHighlight:AttachTo(view) then
+                _UILogic:SetSiblingIndex(monsterHighlight.UITransformComponent, 1)
+                monsterHighlight.Enable = false
+            else
+                monsterHighlight:Destroy()
+                monsterHighlight = nil
+            end
+        end
+        return monsterHighlight
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateEnemyQueueMarkers(any hud, Entity slot, any session, integer slotIndex, boolean hasSkill, boolean specialFlag)
+        -- Compose the tutorial decoration with the normal special-attack marker.
+        local isTutorial = session ~= nil and session.TutorialActive and (session.TutorialStep < 4 or session.TutorialStep == 8)
+        local isTutorialSlot = isTutorial and slotIndex == 1 and hasSkill
+        -- Special attacks (telegraph/status/control) get a gold frame and a corner tag.
+        local special = (hasSkill and specialFlag) or isTutorialSlot
+        local specialFrame = slot:GetChildByName("SpecialFrame")
+        if isvalid(specialFrame) then specialFrame.Enable = special and not isTutorialSlot end
+        local specialTag = slot:GetChildByName("SpecialTag")
+        if isvalid(specialTag) then
+            self:TrackDecoration(hud, specialTag, isTutorialSlot)
+            specialTag.Enable = special
+            if isTutorialSlot and specialTag.TextGUIRendererComponent ~= nil then
+                specialTag.TextGUIRendererComponent.Text = "스킬 장전!"
+                specialTag.TextGUIRendererComponent.FontSize = 13
+                specialTag.TextGUIRendererComponent.FontColor = Color(0.16, 0.09, 0, 1)
+            elseif not isTutorialSlot and specialTag.TextGUIRendererComponent ~= nil then
+                specialTag.TextGUIRendererComponent.Text = "특수"
+            end
+            if not isTutorialSlot then specialTag.UITransformComponent.UIScale = Vector3(1, 1, 1) end
+        end
+        local tutorialHighlight = slot:GetChildByName("TutorialHighlight")
+        if isvalid(tutorialHighlight) then
+            self:TrackDecoration(hud, tutorialHighlight, isTutorialSlot)
+            tutorialHighlight.Enable = isTutorialSlot
+            if not isTutorialSlot then tutorialHighlight.UITransformComponent.UIScale = Vector3(1, 1, 1) end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void EnsureEnemyQueueHighlight(Entity slot, Entity background)
+        -- Prepare the tutorial frame on the existing enemy intent template.
+        if isvalid(background) and not isvalid(slot:GetChildByName("TutorialHighlight")) then
+            local highlight = background:Clone("TutorialHighlight")
+            if isvalid(highlight) then
+                highlight.UITransformComponent.RectSize = Vector2(92, 92)
+                local hr = highlight.SpriteGUIRendererComponent
+                hr.ImageRUID = DataRef("99804bfbea32478b8186bb1fc769fa09")
+                hr.Type = ImageType.Sliced
+                hr.Color = Color(1, 0.85, 0.25, 1)
+                hr.RaycastTarget = false
+                _UILogic:SetSiblingIndex(highlight.UITransformComponent, 1)
+                highlight.Enable = false
+            end
+        end
+    end
+
+    @ExecSpace("ClientOnly")
+    method void UpdateMonsterHighlight(any hud, any session, string unitId, table record, Vector3 worldPosition, Vector2 uiPosition, number headOffsetUiY)
+        -- Frame the attacker only during the dodge and guard lessons.
+        local highlight = record.MonsterHighlight
+        if not isvalid(highlight) then return end
+        local guardTarget = session.TutorialStep == 8 and #(hud._T.ViewQueues[unitId] or {}) > 0
+        local show = session.TutorialActive and session.BattleResult == "" and (session.TutorialStep == 3 or guardTarget)
+        self:TrackDecoration(hud, highlight, show)
+        if highlight.Enable ~= show then
+            log("[Tutorial] monster highlight=" .. tostring(show) .. " step=" .. tostring(session.TutorialStep))
+        end
+        highlight.Enable = show
+        if show then
+            local edgeScreen = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x + session.CellSpacing * 0.5, worldPosition.y))
+            local edgeUi = _UILogic:ScreenToUIPosition(edgeScreen)
+            local pulse = 0.5 + 0.5 * math.sin((_UtilLogic.ElapsedSeconds or 0) * 5)
+            local scale = 1 + 0.06 * pulse
+            highlight.UITransformComponent.anchoredPosition = Vector2(0, headOffsetUiY * 0.5)
+            highlight.UITransformComponent.RectSize = Vector2(math.max(48, math.abs(edgeUi.x - uiPosition.x) * 2), math.max(48, headOffsetUiY + 24))
+            highlight.UITransformComponent.UIScale = Vector3(scale, scale, 1)
+            highlight.SpriteGUIRendererComponent.Color = Color(1, 0.85 + 0.15 * pulse, 0.25, 0.9 + 0.1 * pulse)
+        end
+    end
+end
