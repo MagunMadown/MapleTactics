@@ -84,9 +84,11 @@ script BattleUnitPresentationComponent extends Component
 	property string OriginalSpriteRuid = ""
 	property number OriginalSpritePlayRate = 1
 
-	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Presentation settings are local-only and never mutate logical battle state.
+		self:DisablePlayerAutomaticRenderLayer()
+		if self:IsServer() then return end
+		self:EnsurePlayerRenderOrder()
 		log("[BattlePresentation] ready entity=" .. self.Entity.Name .. " tuningSource=BattleSessionComponent")
 		_DamageSkinDefinitionRepositoryLogic:PreloadSkin(self.OutgoingDamageSkinId)
 		_DamageSkinDefinitionRepositoryLogic:PreloadSkin(self.IncomingDamageSkinId)
@@ -94,6 +96,77 @@ script BattleUnitPresentationComponent extends Component
 		if unit ~= nil then
 			self:ApplySpriteFacing(unit.UnitId, unit.Facing)
 		end
+	end
+
+	method void DisablePlayerAutomaticRenderLayer()
+		-- Keep footholds, ladders and ropes from moving player visuals behind scenery on either side.
+		if self.Entity.PlayerComponent == nil then return end
+		local body = self.Entity.RigidbodyComponent
+		if body ~= nil and body.LayerSettingType ~= AutomaticLayerOption.None then
+			body.LayerSettingType = AutomaticLayerOption.None
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Maintain the foreground rule for local and remote avatars across every map.
+		self:EnsurePlayerRenderOrder()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnsurePlayerRenderOrder()
+		-- Use the frontmost registered map layer; its internal ID need not match LayerSortOrder.
+		if self.Entity.PlayerComponent == nil then return end
+		local avatar = self.Entity.AvatarRendererComponent
+		local map = self.Entity.CurrentMap
+		if avatar == nil or not isvalid(map) then return end
+		self:DisablePlayerAutomaticRenderLayer()
+		local mapChanged = self._T.playerRenderMap ~= map
+		if mapChanged or self._T.playerRenderLayer == nil then
+			local frontLayer = nil
+			for _, candidate in ipairs(map:GetChildComponentsByTypeName("MapLayerComponent", true)) do
+				---@type MapLayerComponent
+				local layer = candidate
+				if isvalid(layer) and layer.IsVisible and layer.MapLayerName ~= "" then
+					if frontLayer == nil or layer.LayerSortOrder > frontLayer.LayerSortOrder then
+						frontLayer = layer
+					end
+				end
+			end
+			if frontLayer == nil then return end
+			self._T.playerRenderMap = map
+			self._T.playerRenderLayer = frontLayer.MapLayerName
+		end
+		-- The guided battle temporarily raises actors above its dimmer and restores this baseline.
+		if _TutorialPresentationLogic:IsActorHighlighted(self.Entity) then return end
+		if avatar.IgnoreMapLayerCheck then avatar.IgnoreMapLayerCheck = false end
+		if avatar.SortingLayer ~= self._T.playerRenderLayer then
+			avatar.SortingLayer = self._T.playerRenderLayer
+			-- Cache the effective internal ID after the engine resolves the map's display name.
+			self._T.playerRenderLayer = avatar.SortingLayer
+		end
+		if avatar.OrderInLayer ~= 200 then avatar.OrderInLayer = 200 end
+		if mapChanged then
+			log("[PlayerRender] foreground entity=" .. self.Entity.Name .. " map=" .. map.Name .. " layer=" .. avatar.SortingLayer .. " order=" .. tostring(avatar.OrderInLayer))
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetPlayerRenderLayer()
+		-- Expose the ordinary foreground layer even while the tutorial owns the actor's order.
+		self:EnsurePlayerRenderOrder()
+		return self._T.playerRenderLayer or "Default"
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyPlayerEffectRenderOrder(table options, integer orderOffset)
+		-- Keep attached skill effects and status markers above a foreground player avatar.
+		if self.Entity.PlayerComponent == nil then return end
+		local avatar = self.Entity.AvatarRendererComponent
+		if avatar == nil then return end
+		self:EnsurePlayerRenderOrder()
+		options["SortingLayer"] = avatar.SortingLayer
+		options["OrderInLayer"] = avatar.OrderInLayer + math.max(1, orderOffset)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -212,6 +285,9 @@ script BattleUnitPresentationComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnMapLeave(Entity previousMap)
+		-- Clear map-local render settings before the next map resolves its own foreground layer.
+		self._T.playerRenderMap = nil
+		self._T.playerRenderLayer = nil
 		self:ClearStatusMarkers()
 		-- A transferred avatar must not retain event handlers, queued poses or death state from the old board.
 		self:CancelCombatMotionHandoff(self.Entity.Name, "MAP_LEAVE", false)
@@ -222,9 +298,11 @@ script BattleUnitPresentationComponent extends Component
 		self.DeathMotionCompleted = false
 	end
 
-	@ExecSpace("ClientOnly")
 	method void OnMapEnter(Entity enteredMap)
 		-- Lobby entry restores the avatar even while the previous battle's dead flag is still synchronized.
+		self:DisablePlayerAutomaticRenderLayer()
+		if self:IsServer() then return end
+		self:EnsurePlayerRenderOrder()
 		self._T.confirmedDeathAwaitSync = false
 		local found, clear = pcall(function() return self.ClearLocalGridMoveOffset end)
 		if found and type(clear) == "function" then pcall(clear, self) end
@@ -1194,6 +1272,7 @@ script BattleUnitPresentationComponent extends Component
 		options["FlipX"] = flipX
 		options["SortingLayer"] = self.SkillEffectSortingLayer
 		options["OrderInLayer"] = self.SkillEffectOrderInLayer
+		self:ApplyPlayerEffectRenderOrder(options, self.SkillEffectOrderInLayer)
 		_TutorialPresentationLogic:ApplyEffectHighlight(options)
 		-- Matches the clip to the skill speed so the effect finishes with the swing, not after it.
 		options["PlayRate"] = safePlayRate
@@ -1231,6 +1310,7 @@ script BattleUnitPresentationComponent extends Component
 		options["FlipX"] = flipX
 		options["SortingLayer"] = self.SkillEffectSortingLayer
 		options["OrderInLayer"] = self.SkillEffectOrderInLayer
+		self:ApplyPlayerEffectRenderOrder(options, self.SkillEffectOrderInLayer)
 		_TutorialPresentationLogic:ApplyEffectHighlight(options)
 		for index, ruid in ipairs(frames) do
 			local frameRuid = ruid
@@ -1307,6 +1387,7 @@ script BattleUnitPresentationComponent extends Component
 		-- Status markers sit above actors (MapLayer2 / 100), below screen-space equipment UI.
 		options["SortingLayer"] = "MapLayer2"
 		options["OrderInLayer"] = 101
+		self:ApplyPlayerEffectRenderOrder(options, 1)
 		local scale = math.max(0.05, self.StatusMarkerScale)
 		local offsetY = self:GetStatusMarkerOffsetY()
 		for index, ruid in ipairs(markers) do
