@@ -1,0 +1,280 @@
+@Logic
+script UILayerLogic extends Logic
+
+	-- Owns the draw order of every /ui group and which open window owns input and Esc.
+	-- Fixed layers keep their listed order; the Window layer stacks windows in the order they were opened.
+	property number MapCheckRemaining = 0
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		self:EnsureState()
+		self:ApplyOrder()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void EnsureState()
+		-- Other Logics may push a window from their own OnBeginPlay before this one runs.
+		if self._T.Layers ~= nil then return end
+		self._T.Stack = {}
+		self._T.MapId = ""
+		self._T.EscapeTarget = nil
+		self:BuildLayers()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BuildLayers()
+		-- Bottom to top. Order inside a fixed layer is the draw order; new groups must be listed here.
+		self._T.Layers = {
+			{Name = "World", Base = 100, Groups = {"BattlePlatformHUD", "BattleUnitHpHUD"}},
+			{Name = "Tutorial", Base = 150, Groups = {"TutorialGuide"}},
+			{Name = "HUD", Base = 200, Groups = {"LobbyUnionCoinHUD", "PersistentAudio", "ShopDepartureUI", "KeyGuideHUD", "BattleQueueHUD", "TacticsPlayerOverheadHUD", "DefaultGroup", "BattleConsumableHUD", "EnemyIntentHUD"}},
+			-- Groups that still carry a HUD button come first so closed windows never cover other windows.
+			{Name = "Window", Base = 300, Groups = {"SettingsUI", "RunRelicInventoryUI", "RunShopUI", "SkillTestUI", "RunHistoryUI", "CollectionUI", "CharacterSelectionUI", "UpgradeSkillStageUI", "UnionSystemUI", "BattleTestHubUI", "NewSkillSelectionUI", "PopupGroup", "SkillReplacementUI", "UnionCoinShopUI", "SkillTreeUI"}},
+			{Name = "Toast", Base = 500, Groups = {"ToastGroup"}},
+			{Name = "Cursor", Base = 600, Groups = {"MouseTooltipGroup"}},
+			{Name = "System", Base = 900, Groups = {"MapTransitionUI"}},
+		}
+		self._T.LayerOf = {}
+		for _, layer in ipairs(self._T.Layers) do
+			for _, name in ipairs(layer.Groups) do self._T.LayerOf[name] = layer.Name end
+		end
+		-- Behavior of each pushed window. Input: pauses gameplay input. Esc: Esc closes it, so the menu stays shut.
+		-- HideWorld: battle HP bars hide while it is open. New windows must be listed here.
+		-- Each window keeps its own full-screen Dimmer as its first child with RaycastTarget on; dimmers are not shared.
+		self._T.Windows = {
+			["/ui/SettingsUI/Screen"] = {Input = true, Esc = true, HideWorld = true},
+			["/ui/SettingsUI/MenuScreen"] = {Input = true, Esc = true, HideWorld = true},
+			["/ui/SettingsUI/CouponScreen"] = {Input = true, Esc = true, HideWorld = true},
+			["/ui/RunShopUI/ShopPopup"] = {Input = true, Esc = true},
+			["/ui/UnionCoinShopUI/Screen"] = {Input = true, Esc = true},
+			["/ui/SkillTreeUI/Modal"] = {Input = true, Esc = true},
+			["/ui/CollectionUI/CollectionWindow"] = {Input = true, Esc = true},
+			["/ui/CharacterSelectionUI/JobSelectionScreen"] = {Input = true, Esc = true},
+			["/ui/UnionSystemUI/UnionWindow"] = {Input = true, Esc = true},
+			["/ui/RunHistoryUI/Modal"] = {Input = true, Esc = true, HideWorld = true},
+			["/ui/PopupGroup/MapTeleportPopup"] = {Input = true, Esc = true},
+			-- The relic and skill-test panels are used mid-combat and own their keys themselves.
+			["/ui/RunRelicInventoryUI/Modal"] = {Esc = true, HideWorld = true},
+			["/ui/SkillTestUI/Panel"] = {Esc = true},
+			-- Reward screens must be finished, so Esc opens the menu over them instead.
+			["/ui/NewSkillSelectionUI"] = {},
+			["/ui/SkillReplacementUI"] = {},
+			["/ui/UpgradeSkillStageUI/Panel"] = {},
+		}
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetLayer(Entity group)
+		if isvalid(group) == false or self._T.LayerOf == nil then return "" end
+		return self._T.LayerOf[group.Name] or ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetGroup(Entity entity)
+		-- Walks up to the direct child of /ui that owns the entity.
+		local current = entity
+		while isvalid(current) and isvalid(current.Parent) do
+			if current.Parent.Path == "/ui" then return current end
+			current = current.Parent
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void MoveToCursorLayer(Entity entity)
+		-- Drag visuals dropped onto another group are reparented into the Cursor layer so no HUD,
+		-- window or toast covers them. Cursor groups are full-screen, so anchored positions are unchanged.
+		self:EnsureState()
+		local cursorName = nil
+		for _, layer in ipairs(self._T.Layers) do
+			if layer.Name == "Cursor" then cursorName = layer.Groups[1] end
+		end
+		local cursor = _EntityService:GetEntityByPath("/ui/" .. tostring(cursorName))
+		if isvalid(entity) == false or isvalid(cursor) == false then
+			log_warning("[UILayer] cursor layer move skipped")
+			return
+		end
+		if entity.Parent == cursor then return end
+		local from = entity.Path
+		if entity:AttachTo(cursor) then
+			log("[UILayer] moved to cursor layer from=" .. from .. " to=" .. entity.Path)
+		else
+			log_warning("[UILayer] cursor layer move failed entity=" .. from)
+		end
+	end
+
+	-- ---------- window stack ----------
+
+	@ExecSpace("ClientOnly")
+	method void PushWindow(Entity window)
+		-- Call after the window is enabled. Raises it to the top of the Window layer;
+		-- entities in other layers keep their fixed slot.
+		self:EnsureState()
+		local group = self:GetGroup(window)
+		if group == nil or self:GetLayer(group) ~= "Window" then return end
+		local options = self._T.Windows[window.Path]
+		if options == nil then
+			log_warning("[UILayer] unlisted window " .. window.Path .. " pushed without input or Esc ownership")
+			options = {}
+		end
+		self:RemoveFromStack(window)
+		table.insert(self._T.Stack, {Entity = window, Options = options})
+		if window ~= group and window.UITransformComponent ~= nil then
+			_UILogic:SetSiblingIndex(window.UITransformComponent, 1000000)
+		end
+		_GameUIPolishLogic:FitVerticalScrollLayouts(window)
+		self:ApplyOrder()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PopWindow(Entity window)
+		-- Returns the window's group to its fixed slot unless another of its windows is still open.
+		self:EnsureState()
+		if self:RemoveFromStack(window) then self:ApplyOrder() end
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean RemoveFromStack(Entity window)
+		local stack = self._T.Stack or {}
+		for i = #stack, 1, -1 do
+			if stack[i].Entity == window then
+				table.remove(stack, i)
+				return true
+			end
+		end
+		return false
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean PruneStack()
+		-- Drops windows that were destroyed or hidden without a PopWindow call.
+		local stack = self._T.Stack or {}
+		local pruned = false
+		for i = #stack, 1, -1 do
+			local window = stack[i].Entity
+			if isvalid(window) == false or window.Enable == false then
+				table.remove(stack, i)
+				pruned = true
+			end
+		end
+		return pruned
+	end
+
+	@ExecSpace("ClientOnly")
+	method Entity GetTopWindow(string option)
+		-- Topmost open window whose registered behavior has the option set; nil when none.
+		self:EnsureState()
+		if self:PruneStack() then self:ApplyOrder() end
+		local stack = self._T.Stack
+		for i = #stack, 1, -1 do
+			if stack[i].Options[option] == true then return stack[i].Entity end
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasOpenWindow(string option)
+		return self:GetTopWindow(option) ~= nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasBlockingWindow()
+		-- Gameplay input (lobby movement, battle commands, NPC shortcuts) pauses while this is true.
+		return self:HasOpenWindow("Input")
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsEscapeTarget(Entity window)
+		-- Every Esc handler sees the same owner: the top Esc window as of the frame start,
+		-- so one press never closes two stacked windows.
+		return isvalid(window) and self._T.EscapeTarget == window
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean HasEscapeTarget()
+		return isvalid(self._T.EscapeTarget)
+	end
+
+	-- ---------- ordering ----------
+
+	@ExecSpace("ClientOnly")
+	method void ApplyOrder()
+		-- Rewrites GroupOrder and sibling index together: groups draw in sibling order,
+		-- and a runtime GroupOrder change alone does not re-sort the hierarchy.
+		self:EnsureState()
+		local ui = _EntityService:GetEntityByPath("/ui")
+		if isvalid(ui) == false then return end
+		self:PruneStack()
+		local present = {}
+		local unlisted = {}
+		for _, child in ipairs(ui.Children:ToTable()) do
+			if child.UIGroupComponent ~= nil and child.UITransformComponent ~= nil then
+				present[child.Name] = child
+				if self._T.LayerOf[child.Name] == nil then table.insert(unlisted, child) end
+			end
+		end
+		-- The stack decides the upper part of the Window layer; each group sits at its newest window.
+		local stacked = {}
+		local stackOrder = {}
+		for i = #self._T.Stack, 1, -1 do
+			local group = self:GetGroup(self._T.Stack[i].Entity)
+			if group ~= nil and stacked[group.Name] == nil then
+				stacked[group.Name] = true
+				table.insert(stackOrder, 1, group.Name)
+			end
+		end
+		local ordered = {}
+		local layout = {}
+		for _, layer in ipairs(self._T.Layers) do
+			local names = {}
+			for _, name in ipairs(layer.Groups) do
+				if layer.Name ~= "Window" or stacked[name] == nil then table.insert(names, name) end
+			end
+			if layer.Name == "Window" then
+				for _, name in ipairs(stackOrder) do table.insert(names, name) end
+			end
+			local slot = 0
+			for _, name in ipairs(names) do
+				local group = present[name]
+				if group ~= nil then
+					table.insert(ordered, {Entity = group, Order = layer.Base + slot})
+					slot = slot + 1
+				end
+			end
+			if layer.Name == "HUD" then
+				-- Unlisted groups stay visible above the HUD until they are registered.
+				for _, group in ipairs(unlisted) do
+					log_warning("[UILayer] unlisted group " .. group.Name .. " placed in HUD")
+					table.insert(ordered, {Entity = group, Order = layer.Base + slot})
+					slot = slot + 1
+				end
+			end
+			table.insert(layout, layer.Name .. ":" .. tostring(slot))
+		end
+		-- Sibling indices are 1-based; placing in ascending order leaves earlier slots untouched.
+		for index, entry in ipairs(ordered) do
+			entry.Entity.UIGroupComponent.GroupOrder = entry.Order
+			_UILogic:SetSiblingIndex(entry.Entity.UITransformComponent, index)
+		end
+		local top = #self._T.Stack > 0 and self._T.Stack[#self._T.Stack].Entity.Path or "-"
+		log("[UILayer] applied groups=" .. tostring(#ordered) .. " " .. table.concat(layout, " ") .. " top=" .. top)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- Snapshot the Esc owner once per frame, before this frame's key handlers can close it.
+		self:EnsureState()
+		self._T.EscapeTarget = self:GetTopWindow("Esc")
+		-- Map loads can rebuild the hierarchy, so the order is re-applied once per map change.
+		self.MapCheckRemaining = self.MapCheckRemaining - delta
+		if self.MapCheckRemaining > 0 then return end
+		self.MapCheckRemaining = 0.5
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or isvalid(player.CurrentMap) == false then return end
+		local mapId = player.CurrentMap.Id
+		if mapId == self._T.MapId then return end
+		self._T.MapId = mapId
+		self:ApplyOrder()
+	end
+
+end

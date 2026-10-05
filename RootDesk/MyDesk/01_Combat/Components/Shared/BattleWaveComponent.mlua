@@ -245,6 +245,92 @@ script BattleWaveComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
+	method integer GetBaseAscensionHpBonus(table definition)
+		-- Explicit regional tuning: fragile/ranged +1~2, frontline +2~4, bosses separate.
+		local bonuses = {
+			early_mushroom = 1,
+			guard_mushroom = 2,
+			csv_retreat_mushroom = 1,
+			csv_telegraph_mushroom = 2,
+			region_01_spore_ranged = 1,
+			region_01_guardian_boss = 4,
+			ellinia_slime = 2,
+			ellinia_bubbling = 1,
+			ellinia_fairy = 1,
+			ellinia_royal_fairy = 1,
+			ellinia_evil_eye = 2,
+			ellinia_curse_eye = 2,
+			ellinia_surgeon_eye = 1,
+			ellinia_cold_eye = 2,
+			ellinia_lupin = 1,
+			ellinia_zombie_lupin = 2,
+			ellinia_malady = 1,
+			ellinia_faust = 4,
+			region_kerning_stirge = 1,
+			region_kerning_jr_wraith = 2,
+			region_kerning_wraith = 1,
+			region_kerning_ligator = 2,
+			region_kerning_jr_necki = 1,
+			region_kerning_croco = 2,
+			region_kerning_shade = 2,
+			region_kerning_swamp_mud = 1,
+			region_kerning_dyle = 6,
+			region_04_axe_stump = 2,
+			region_04_wild_boar = 2,
+			region_04_iron_hog = 2,
+			region_04_fire_boar = 2,
+			region_04_skeleton_soldier = 3,
+			region_04_skeleton_officer = 3,
+			region_04_mummydog = 3,
+			region_04_commander_skeleton = 8,
+			region_05_blue_ribbon_pig = 2,
+			region_05_yellow_starfish = 2,
+			region_05_jellyfish = 1,
+			region_05_angry_starfish = 2,
+			region_05_cool_jellyfish = 2,
+			region_05_clang = 2,
+			region_05_king_clang = 6,
+			region_06_horny_mushroom = 3,
+			region_06_zombie_mushroom = 3,
+			region_06_jr_boogie = 1,
+			region_06_food_cart = 10,
+			region_06_wild_kargo = 3,
+			region_06_taurospear = 2,
+			region_06_tauromacis = 4,
+			region_06_jr_balrog = 12,
+			region_06_drake = 2,
+			region_06_copper_drake = 3,
+			region_06_dark_drake = 1
+		}
+		local bonus = bonuses[definition.EnemyDefinitionId] or 1
+		-- Preserve deliberately fragile boss summons (e.g. commander mummy dogs).
+		if definition.IsBoss ~= true then bonus = math.min(bonus, math.max(1, definition.MaxHp)) end
+		return bonus
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer GetAscensionLevel(any session)
+		-- Reads the rank frozen on the authoritative run and keeps skill-test dummies unscaled.
+		if session.SkillTestMode then return 0 end
+		local run = isvalid(session.PlayerEntity) and session.PlayerEntity:GetComponent("script.PlayerRunStateComponent") or nil
+		return run ~= nil and math.max(0, _AscensionDifficultyLogic:ResolveLevel(run.RunDifficulty)) or 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveDifficultyStats(any session, table definition)
+		-- Scales a spawn-time copy, preserving repository values and deliberately fragile summons.
+		local level = self:GetAscensionLevel(session)
+		local rules = _AscensionDifficultyLogic:GetRules(level)
+		local hpScale = definition.IsBoss == true and rules.BossHpScale or rules.EnemyHpScale
+		local hpBonus = self:GetBaseAscensionHpBonus(definition) * hpScale
+		if definition.IsBoss ~= true then hpBonus = math.min(hpBonus, math.max(1, definition.MaxHp)) end
+		local stats = { MaxHp = definition.MaxHp + hpBonus,
+			BasicAttackDamage = definition.BasicAttackDamage + rules.AttackBonus, AttackBonus = rules.AttackBonus }
+		log("[AscensionStats] level=" .. tostring(level) .. " enemy=" .. definition.EnemyDefinitionId .. " hp=" .. tostring(stats.MaxHp) .. " attack=" .. tostring(stats.BasicAttackDamage))
+		return stats
+	end
+
+	@ExecSpace("ServerOnly")
 	method Entity SpawnEnemy(any session, string side, integer startCell, string facing, integer spawnOrder, table spawnDefinition)
 		-- Spawns one enemy with a wave-unique name and UnitId, then registers its logical state.
 		if session.BattleResult ~= "" or self:GetAvailableSlots(session) < 1 or self:IsSpawnCellFree(session, startCell) == false then
@@ -272,7 +358,8 @@ script BattleWaveComponent extends Component
 		elseif spawnDefinition.InitialFacingPolicy == "FIXED_RIGHT" then
 			resolvedFacing = "Right"
 		end
-		local unitInitialization = session:InitializeUnitState(enemy, unitId, "Enemy", startCell, resolvedFacing, spawnDefinition.MaxHp, spawnOrder)
+		local stats = self:ResolveDifficultyStats(session, spawnDefinition)
+		local unitInitialization = session:InitializeUnitState(enemy, unitId, "Enemy", startCell, resolvedFacing, stats.MaxHp, spawnOrder)
 		if unitInitialization.Success == false then
 			log_error("[BattleWave] enemy initialization failed unit=" .. unitId .. " reason=" .. unitInitialization.Reason)
 			_EntityService:Destroy(enemy)
@@ -280,12 +367,13 @@ script BattleWaveComponent extends Component
 		end
 		local enemyUnit = enemy:GetComponent("script.BattleUnitComponent")
 		if enemyUnit ~= nil then
-			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, spawnDefinition.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.TraitIds or "", spawnDefinition.IsBoss == true, spawnDefinition.DisplayName or "")
+			local enemyConfiguration = enemyUnit:ConfigureEnemyDefinition(spawnDefinition.EnemyDefinitionId, stats.BasicAttackDamage, spawnDefinition.PatternId, spawnDefinition.MovementPolicy, spawnDefinition.TraitIds or "", spawnDefinition.IsBoss == true, spawnDefinition.DisplayName or "")
 			if enemyConfiguration.Success == false then
 				log_error("[EnemyData] apply failed unit=" .. unitId .. " reason=" .. enemyConfiguration.Reason)
 				_EntityService:Destroy(enemy)
 				return nil
 			end
+			enemyUnit.DifficultyAttackBonus = stats.AttackBonus
 			log("[EnemyData] applied unit=" .. unitId .. " definition=" .. enemyUnit.EnemyDefinitionId .. " hp=" .. enemyUnit.MaxHp .. " attack=" .. enemyUnit.BasicAttackDamage .. " pattern=" .. enemyUnit.EnemyPatternId .. " movement=" .. enemyUnit.EnemyMovementPolicy .. " traits=" .. enemyUnit.EnemyTraitIds .. " boss=" .. tostring(enemyUnit.IsBoss) .. " roll=" .. spawnDefinition.SelectionRoll .. "/" .. spawnDefinition.TotalWeight)
 		end
 		if spawnDefinition.EnemyDefinitionId == "ellinia_faust" then
@@ -307,6 +395,7 @@ script BattleWaveComponent extends Component
 			_EntityService:Destroy(enemy)
 			return nil
 		end
+		_TutorialRulesLogic:OnEnemyRegistered(session, enemy)
 		return enemy
 	end
 
@@ -405,7 +494,7 @@ script BattleWaveComponent extends Component
 			return
 		end
 		if waveNumber ~= self.CurrentWave + 1 then return end
-		local useVariant = session.StageType ~= "BOSS" and not session.SkillTestMode
+		local useVariant = _TutorialRulesLogic:UseSpawnVariant(session, session.StageType ~= "BOSS" and not session.SkillTestMode)
 		if waveNumber == 1 then
 			self.SpawnVariantIndex = 0
 			self.SpawnVariantSeed = 0
@@ -421,7 +510,12 @@ script BattleWaveComponent extends Component
 			session:PublishWaveStateSnapshot("WAVE_DEFINITION_ERROR")
 			return
 		end
-		local count = session.SkillTestMode and 1 or definition.SpawnCount
+		local rules = _AscensionDifficultyLogic:GetRules(self:GetAscensionLevel(session))
+		local count = session.SkillTestMode and 1 or (definition.SpawnCount + (useVariant and rules.SpawnCountBonus or 0))
+		count = _TutorialRulesLogic:GetSpawnCount(session, waveNumber, count)
+		local forceTurns = definition.ForceAfterTurns
+		if useVariant and forceTurns > 0 then forceTurns = math.max(1, forceTurns - rules.ForceTurnReduction) end
+		local concurrent = definition.MaxConcurrent + (useVariant and rules.ConcurrentBonus or 0)
 		local roster = {}
 		for index = 1, count do
 			local enemy = nil
@@ -438,7 +532,11 @@ script BattleWaveComponent extends Component
 			if session.SkillTestMode then enemy.MaxHp = math.max(1, session.SkillTestDummyMaxHp) end
 			table.insert(roster, enemy)
 		end
-		self:BeginWave(waveNumber, definition.SpawnTriggerMode, definition.ForceAfterTurns, definition.ForceAfterSeconds, count, definition.MaxConcurrent, definition.ClearSpawnDelaySeconds, math.max(1, session.StageTurnNumber))
+		-- Resolve lesson overrides before beginning the normal wave lifecycle.
+		local spawnMode = _TutorialRulesLogic:GetSpawnMode(session, definition.SpawnTriggerMode)
+		local maxConcurrent = _TutorialRulesLogic:GetMaxConcurrent(session, count, concurrent)
+		self:BeginWave(waveNumber, spawnMode, forceTurns, definition.ForceAfterSeconds, count, maxConcurrent, definition.ClearSpawnDelaySeconds, math.max(1, session.StageTurnNumber))
+		log("[AscensionWave] level=" .. tostring(rules.Level) .. " stage=" .. session.StageId .. " wave=" .. tostring(waveNumber) .. " count=" .. tostring(count) .. " forceTurns=" .. tostring(forceTurns) .. " concurrent=" .. tostring(concurrent))
 		self:SetWaveTriggerPhaseIndex(definition.TriggerPhaseIndex or 0, "WAVE_BEGIN")
 		self.SpawnProfile = session.StageType == "BOSS" and "BOSS" or (definition.SpawnTriggerMode == "LONE_ENEMY" and "NORMAL" or "PRESSURE")
 		self.PendingSpawnDefinitions = roster
@@ -476,6 +574,7 @@ script BattleWaveComponent extends Component
 			local index = self.PendingSpawnCursor
 			local cell = self:SelectSpawnCell(session, self.PendingSidePolicy, index)
 			if session.SkillTestMode then cell = session.SkillTestDummyCell end
+			cell = _TutorialRulesLogic:GetSpawnCell(session, self.CurrentWave, cell)
 			if cell < 0 then break end
 			local playerEntity = session:FindUnitEntity("player_01")
 			local player = isvalid(playerEntity) and playerEntity:GetComponent("script.BattleUnitComponent") or nil

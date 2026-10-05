@@ -8,12 +8,15 @@ script LobbyGridMovementComponent extends Component
 	-- Every step lands on GridOriginX + n * CellSize (the lobby spawn column), so fixed props such as the
 	-- start portal can sit exactly on a reachable column even after the player touches a map edge.
 	property number GridOriginX = -27.3686
+	-- The owning client walks its own root through a step; this long after the step ends the server checks
+	-- where the root landed and corrects it only when the client never arrived.
+	property number LandingCheckDelay = 0.5
 
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
 	handler HandleMoveKeyDown(KeyDownEvent event)
 		-- Lobby modal services own keyboard focus while open; normal grid input resumes on close.
-		if _SkillTreeUILogic:IsOpen() or _LobbyCharacterSelectionLogic:IsOpen() or _LobbyCodexLogic:IsOpen() or _UnionSystemUILogic:IsOpen() or _GameSettingsLogic:IsInputBlocked() then
+		if _GameSettingsLogic:IsInputBlocked() then
 			return
 		end
 
@@ -55,6 +58,7 @@ script LobbyGridMovementComponent extends Component
 		profile.AttemptDirection = direction
 		profile.AttemptCellSize = self.CellSize
 		profile.ObstructionHint = math.abs(target.x - current.x) < 0.001
+		profile.ClientRoot = true
 		local requestId = _PlayerGridMovementLogic:BeginLocalMove(player, self.Entity, 0, context, target, profile)
 		if requestId > 0 then self:RequestMove(direction, requestId, context) end
 	end
@@ -90,6 +94,7 @@ script LobbyGridMovementComponent extends Component
 		if isvalid(leftEntity) and leftEntity.PlayerComponent ~= nil and self._T.gridMoves ~= nil then
 			self._T.gridMoves[leftEntity.PlayerComponent.UserId] = nil
 			self._T.gridPlayers[leftEntity.PlayerComponent.UserId] = nil
+			if self._T.gridLandingChecks ~= nil then self._T.gridLandingChecks[leftEntity.PlayerComponent.UserId] = nil end
 		end
 		self:SetGridControl(leftEntity, false)
 	end
@@ -98,6 +103,7 @@ script LobbyGridMovementComponent extends Component
 	method void OnEndPlay()
 		-- Release map-owned movement state at shutdown.
 		self._T.gridMoves = {}
+		self._T.gridLandingChecks = {}
 		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
 		if users == nil then
 			return
@@ -187,6 +193,7 @@ script LobbyGridMovementComponent extends Component
 		end
 
 		player.MovementComponent:Stop()
+		if self._T.gridLandingChecks ~= nil then self._T.gridLandingChecks[senderUserId] = nil end
 		local profile = _PlayerGridMovementLogic:GetProfile(nil)
 		self._T.gridMoves[senderUserId] = {
 			Entity = player, StartPosition = Vector2(current.x, current.y),
@@ -242,7 +249,7 @@ script LobbyGridMovementComponent extends Component
 	method void UpdateBufferedMove(Entity player, number delta)
 		if self._T.BufferedDirection == nil then return end
 		self._T.BufferedMoveRemaining = (self._T.BufferedMoveRemaining or 0) - delta
-		if self._T.BufferedMoveRemaining <= 0 or _SkillTreeUILogic:IsOpen() or _LobbyCharacterSelectionLogic:IsOpen() or _LobbyCodexLogic:IsOpen() or _UnionSystemUILogic:IsOpen() or _GameSettingsLogic:IsInputBlocked() then
+		if self._T.BufferedMoveRemaining <= 0 or _GameSettingsLogic:IsInputBlocked() then
 			self._T.BufferedDirection = nil
 			return
 		end
@@ -253,7 +260,7 @@ script LobbyGridMovementComponent extends Component
 	end
 
 	method void OnUpdate(number delta)
-		-- Advances lobby steps through the same easing and exact endpoint snap used by battle.
+		-- Times lobby steps on the battle duration; the owning client moves the root itself.
 		if self:IsClient() then
 			local localPlayer = _UserService.LocalPlayer
 			if isvalid(localPlayer) and localPlayer.CurrentMap == self.Entity then
@@ -287,19 +294,43 @@ script LobbyGridMovementComponent extends Component
 				end
 			end
 		end
+		self:UpdateLandingChecks(delta)
 		if self._T.gridMoves == nil then return end
 		for userId, movement in pairs(self._T.gridMoves) do
 			local player = movement.Entity
 			if isvalid(player) == false or player.CurrentMap ~= self.Entity or player.MovementComponent == nil then
 				self._T.gridMoves[userId] = nil
 			else
+				-- Player transforms sync from the owning client, which walks the step itself. Writing positions
+				-- here would fight that path with lagging copies and make the root, camera and name tag stutter.
 				local profile = movement.Profile
-				local step = _PlayerGridMovementLogic:Advance(movement, delta, profile.MoveCurve, profile.MoveSnapThreshold)
-				player.MovementComponent:SetWorldPosition(step.Position)
+				local step = _PlayerGridMovementLogic:Advance(movement, delta, profile.PlayerMoveCurve, profile.MoveSnapThreshold)
 				if step.Complete then
 					self._T.gridMoves[userId] = nil
+					self._T.gridLandingChecks = self._T.gridLandingChecks or {}
+					self._T.gridLandingChecks[userId] = { Entity = player, Position = step.Position, Remaining = math.max(0, self.LandingCheckDelay) }
 					self:ReceiveMoveResult(movement.RequestId, movement.Context, true, true, step.Position.x, step.Position.y, "MOVE_COMPLETE", userId)
 					log("[LobbyGridMove] completed user=" .. userId .. " snappedX=" .. tostring(step.Position.x))
+				end
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateLandingChecks(number delta)
+		-- Keeps the grid authoritative: a root that never reached its column is put there once the client had time.
+		if self._T.gridLandingChecks == nil then return end
+		for userId, check in pairs(self._T.gridLandingChecks) do
+			local player = check.Entity
+			check.Remaining = check.Remaining - delta
+			if isvalid(player) == false or player.CurrentMap ~= self.Entity or player.MovementComponent == nil then
+				self._T.gridLandingChecks[userId] = nil
+			elseif check.Remaining <= 0 then
+				self._T.gridLandingChecks[userId] = nil
+				local landedX = player.TransformComponent.WorldPosition.x
+				if math.abs(landedX - check.Position.x) > 0.05 then
+					player.MovementComponent:SetWorldPosition(check.Position)
+					log_warning("[LobbyGridMove] corrected landing user=" .. userId .. " from=" .. tostring(landedX) .. " to=" .. tostring(check.Position.x))
 				end
 			end
 		end

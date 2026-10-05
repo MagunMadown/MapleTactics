@@ -31,6 +31,7 @@ script BattleGatewayLogic extends Logic
 					self.LobbyEntryTransfers[userId] = nil
 					_MapTeleportManager:CancelPendingTransfer(player, "LOBBY_ENTRY_TRANSFER_TIMEOUT")
 					entry:Cancel("LOBBY_ENTRY_TRANSFER_TIMEOUT")
+					_NewPlayerTutorialLogic:HandleTransferFailure(player, pending.RequestId)
 					self:NotifyLobbyBattleEntryResult(false, "LOBBY_ENTRY_TRANSFER_TIMEOUT", pending.RequestedStageId, userId)
 					log_warning("[BattleGateway] lobby arrival timed out user=" .. userId .. " request=" .. tostring(pending.RequestId))
 				end
@@ -90,6 +91,9 @@ script BattleGatewayLogic extends Logic
 		if isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= "lobby" then
 			return { Success = false, Reason = "NOT_IN_LOBBY", RequestId = 0 }
 		end
+		if _NewPlayerTutorialLogic:IsActive(playerEntity) then
+			return { Success = false, Reason = "ENTRY_REQUEST_IN_PROGRESS", RequestId = 0 }
+		end
 		local entryState = playerEntity:GetComponent("script.BattleEntryStateComponent")
 		if entryState ~= nil and (entryState.EntryState == "PREPARED" or entryState.EntryState == "INITIALIZING") then
 			return { Success = false, Reason = "ENTRY_REQUEST_IN_PROGRESS", RequestId = entryState.RequestId }
@@ -99,30 +103,22 @@ script BattleGatewayLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table PrepareLobbyBattleEntry(Entity playerEntity)
-		-- High-level lobby boundary: callers do not fabricate optional compatibility metadata.
+		-- Routes the default lobby button through the same validated rank boundary as the world map.
 		local eligibility = self:ValidateLobbyEntryRequest(playerEntity)
 		if eligibility.Success == false then return eligibility end
 		local context = _RunManagerLogic:GetLobbyBattleEntryContext(playerEntity)
-		if context.Success == false then
-			return { Success = false, Reason = context.Reason, RequestId = 0 }
-		end
-		eligibility = self:ValidateLobbyEntryRequest(playerEntity)
-		if eligibility.Success == false then return eligibility end
-		context.RunSeed = self:SelectLobbyRunSeed(context.RunSeed, context.EntryMode)
-		return self:PrepareBattleEntry(
-			playerEntity,
-			context.StageId,
-			context.CharacterId,
-			context.JobId,
-			context.LoadoutId,
-			context.RunSeed,
-			context.EntryMode
-		)
+		if context.Success == false then return { Success = false, Reason = context.Reason, RequestId = 0 } end
+		return self:PrepareLobbyStageEntry(playerEntity, context.StageId, "NORMAL")
 	end
 
 	@ExecSpace("ServerOnly")
-	method table PrepareLobbyStageEntry(Entity playerEntity, string requestedStageId)
-		-- Validates a world-map stage selection against the authoritative lobby run context.
+	method table PrepareLobbyStageEntry(Entity playerEntity, string requestedStageId, string difficulty)
+		-- Validate rank syntax and account unlocks before preparing a new run; continued runs keep their rank.
+		difficulty = difficulty or "NORMAL"
+		local level = _AscensionDifficultyLogic:ResolveLevel(difficulty)
+		if level < 0 then
+			return { Success = false, Reason = "INVALID_DIFFICULTY", RequestId = 0 }
+		end
 		local eligibility = self:ValidateLobbyEntryRequest(playerEntity)
 		if eligibility.Success == false then return eligibility end
 		local context = _RunManagerLogic:GetLobbyBattleEntryContext(playerEntity)
@@ -136,10 +132,19 @@ script BattleGatewayLogic extends Logic
 			log_warning("[BattleGateway] world map stage rejected requested=" .. requestedStageId .. " expected=" .. context.StageId)
 			return { Success = false, Reason = "STAGE_NOT_AVAILABLE", RequestId = 0 }
 		end
+		if context.EntryMode == "CONTINUE_RUN" then
+			local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+			level = run ~= nil and _AscensionDifficultyLogic:ResolveLevel(run.RunDifficulty) or -1
+			if level < 0 then return { Success = false, Reason = "INVALID_DIFFICULTY", RequestId = 0 } end
+		else
+			local unlocked = _AscensionProgressionLogic:ValidateSelection(playerEntity, level)
+			if unlocked.Success == false then return { Success = false, Reason = unlocked.Reason, RequestId = 0 } end
+		end
+		difficulty = _AscensionDifficultyLogic:ToDifficulty(level)
 		eligibility = self:ValidateLobbyEntryRequest(playerEntity)
 		if eligibility.Success == false then return eligibility end
 		context.RunSeed = self:SelectLobbyRunSeed(context.RunSeed, context.EntryMode)
-		return self:PrepareBattleEntry(
+		local result = self:PrepareBattleEntry(
 			playerEntity,
 			context.StageId,
 			context.CharacterId,
@@ -148,6 +153,12 @@ script BattleGatewayLogic extends Logic
 			context.RunSeed,
 			context.EntryMode
 		)
+		if result.Success then
+			local entry = self:GetOrCreateEntryState(playerEntity)
+			entry.Difficulty = difficulty
+			log("[BattleDifficulty] prepared difficulty=" .. entry.Difficulty .. " mode=" .. context.EntryMode)
+		end
+		return result
 	end
 
 	@ExecSpace("ServerOnly")
@@ -165,10 +176,10 @@ script BattleGatewayLogic extends Logic
 	end
 
 	@ExecSpace("Server")
-	method void RequestPrepareLobbyStageEntry(string requestedStageId)
+	method void RequestPrepareLobbyStageEntry(string requestedStageId, string difficulty)
 		-- Prepares and transfers the stage selected from the lobby world map.
 		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
-		local result = self:PrepareLobbyStageEntry(playerEntity, requestedStageId)
+		local result = self:PrepareLobbyStageEntry(playerEntity, requestedStageId, difficulty)
 		if result.Success == false then
 			log_warning("[BattleGateway] world map prepare rejected user=" .. senderUserId .. " stage=" .. requestedStageId .. " reason=" .. result.Reason)
 			self:NotifyLobbyBattleEntryResult(false, result.Reason, requestedStageId, senderUserId)
@@ -413,11 +424,13 @@ script BattleGatewayLogic extends Logic
 			entryState.LoadoutId,
 			entryState.RunSeed,
 			entryState.EntryMode,
-			entryState.RequestId
+			entryState.RequestId,
+			entryState.Difficulty
 		)
 		if startResult.Success == false then
 			-- A failed initialization must not remain eligible for the map re-entry poll.
 			entryState:Cancel(startResult.Reason)
+			_NewPlayerTutorialLogic:HandleInitializationFailure(playerEntity, battleSession, entryState.RequestId)
 			log_warning("[BattleGateway] consume rejected request=" .. entryState.RequestId .. " reason=" .. startResult.Reason)
 			return startResult
 		end

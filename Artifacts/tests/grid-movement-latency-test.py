@@ -28,12 +28,15 @@ def load(path, names):
 lua.globals().movement = load("RootDesk/MyDesk/00_Core/Movement/PlayerGridMovementLogic.mlua", {
     "GetProfile", "GetDuration", "EvaluateCurve", "Advance", "HasLocalMove", "BeginLocalMove",
     "ResolveLocalMove", "CancelLocalMove", "OnUpdate", "OnEndPlay", "PlayHop",
+    "CancelBlockedMove", "UpdateBlockedMove", "BeginBlockedMove", "IsBlockedMoveReason",
 })
 lua.globals().battle = load("RootDesk/MyDesk/01_Combat/Components/Shared/BattleSessionComponent.mlua", {
     "RequestMove", "ReceivePlayerMoveResult", "StartPlayerGridMovePresentation", "UpdatePlayerGridMove", "FinishPlayerGridMovePresentation", "PlayUnitMoveHop",
+    "GetPlayerFloorPosition",
 })
 lua.globals().lobby = load("RootDesk/MyDesk/00_Core/LobbyGridMovementComponent.mlua", {
     "GetStepTargetX", "RequestMove", "ReceiveMoveContext", "ReceiveMoveResult", "OnUpdate", "SetGridControl",
+    "UpdateLandingChecks",
 })
 lua.globals().presenter = load("RootDesk/MyDesk/02_UI/BattleHudPresenterLogic.mlua", {"DispatchLocalCommand"})
 lua.execute(r'''
@@ -60,9 +63,14 @@ _UtilLogic={ElapsedSeconds=0}
 _BattleHudPresenterLogic={ReleasePendingLocalCommand=function(_,_,reason) released=released+1; releaseReason=reason end}
 _PlayerGridMovementLogic=movement
 realPlayHop=movement.PlayHop; realPlayUnitMoveHop=battle.PlayUnitMoveHop
+-- Prediction reads the frame clock like the hop does; the engine advances it by each frame's delta.
+realMoveUpdate=movement.OnUpdate
+movement.OnUpdate=function(self,d) _UtilLogic.ElapsedSeconds=_UtilLogic.ElapsedSeconds+d; return realMoveUpdate(self,d) end
 function fixture()
     released=0; releaseReason=''; offsets={}; hops=0; clears=0; timersCleared=0; placements={}; receipts={}; requests=0; serverHops={}; warnings=0
     movement._T={}
+    movement.BlockedMoveDistanceRatio=0.18; movement.BlockedMoveForwardDuration=0.06
+    movement.BlockedMoveReturnDuration=0.14; movement.LandingSettleDuration=0.1
     movement.PlayHop=realPlayHop
     map={}; other={}; cell={CellIndex=2,Team='Player',UnitId='player_01'}
     presentation={BeginLocalGridMoveHop=function(_,...) hops=hops+1; localHopArgs={...} end,
@@ -78,11 +86,13 @@ function fixture()
             if name=='script.BattleUnitPresentationComponent' then return presentation end
             if name=='script.BattleUnitComponent' then return cell end
         end,
-        PlayerControllerComponent=native({Enable=true})})
+        PlayerControllerComponent=native({Enable=true}),
+        CameraComponent=native({CameraOffset=Vector2(0,0),Damping=Vector2(2.5,5)})})
     _UserService={LocalPlayer=player,GetUserEntityByUserId=function(_,id) if id=='owner' then return player end end,
         GetUsersByMapComponent=function() return {player} end}
     session={EntryRequestId=7,HudContextRevision=3,BattleResult=''}
     map.GetComponent=function(_,name) if name=='script.BattleSessionComponent' then return session end end
+    map.GetChildComponentsByTypeName=function() return {} end
     profile=movement:GetProfile(nil)
     for key,value in pairs(profile) do session[key]=value end
     battle._T={}; battle.Entity=map; battle.PlayerEntity=player; battle.EntryRequestId=7; battle.HudContextRevision=3
@@ -137,11 +147,13 @@ cases = {
     ''',
     "matching accept waits for complete and authoritative position": r'''
         fixture(); movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile)
-        movement:ResolveLocalMove(map,1,7,3,true,false,3,0,'OK'); movement:OnUpdate(0.2)
+        movement:ResolveLocalMove(map,1,7,3,true,false,3,0,'OK'); movement:OnUpdate(0.3)
         assert(movement:HasLocalMove(map) and offsets[#offsets]==1)
         movement:ResolveLocalMove(map,1,7,3,true,true,3,0,'DONE'); movement:OnUpdate(0.01)
         assert(movement:HasLocalMove(map)); transform.WorldPosition=Vector3(3,0,0)
-        movement:OnUpdate(0.01); assert(not movement:HasLocalMove(map) and clears==1)
+        movement:OnUpdate(0.01); assert(not movement:HasLocalMove(map) and clears==0 and released==1)
+        -- Landed: input is free, the avatar holds its ground line until the settle window ends.
+        movement:OnUpdate(0.1); assert(movement._T.localMove==nil and clears==1 and released==1)
     ''',
     "stale request/context/map responses cannot clear newer prediction": r'''
         fixture(); movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile)
@@ -197,7 +209,13 @@ cases = {
         lobby:RequestMove(1,2,4); assert(#receipts==2)
         assert(lobby:GetStepTargetX(0,-1)==0 and lobby:GetStepTargetX(4,1)==4)
         lobby.IsClient=function() return false end; lobby._T.gridPlayers={owner=player}; lobby._T.playerScanRemaining=1
-        lobby:OnUpdate(0.2); assert(lobby._T.gridMoves.owner==nil and receipts[#receipts][4]==true)
+        lobby.LandingCheckDelay=0.5
+        -- The client walks its own root; the server only times the step and leaves the transform alone.
+        local before=transform.WorldPosition.x
+        lobby:OnUpdate(0.3); assert(lobby._T.gridMoves.owner==nil and receipts[#receipts][4]==true)
+        assert(transform.WorldPosition.x==before and lobby._T.gridLandingChecks.owner~=nil)
+        -- A root that never arrived is corrected once the landing check expires.
+        lobby:OnUpdate(0.6); assert(lobby._T.gridLandingChecks.owner==nil and transform.WorldPosition.x==3)
         lobby:ReceiveMoveContext(4); lobby:ReceiveMoveContext(3); assert(lobby._T.moveContext==4)
     ''',
     "reservation success without an actual move rejects prediction": r'''
@@ -283,10 +301,12 @@ cases = {
         assert(#offsets==1 and hops==0 and movement:HasLocalMove(map))
         movement:ResolveLocalMove(map,id,7,3,true,true,3,0,'DONE')
         transform.WorldPosition=Vector3(3,0,0); movement:OnUpdate(0.01)
-        assert(not movement:HasLocalMove(map) and clears==1)
+        assert(not movement:HasLocalMove(map) and clears==0); movement:OnUpdate(0.1)
+        assert(clears==1)
         local nextId=movement:BeginLocalMove(player,map,7,3,Vector2(4,0),profile)
         assert(nextId==2 and hops==1 and warnings==1); movement:OnUpdate(0.03)
-        assert(#offsets==3); movement:CancelLocalMove('DONE'); assert(clears==2)
+        -- One extra offset comes from the landing settle frame before the first move cleared.
+        assert(#offsets==4); movement:CancelLocalMove('DONE'); assert(clears==2)
     ''',
     "normal frames probe only the current setter": r'''
         fixture(); local reads={}; presentation=scriptProxy(presentation,reads)

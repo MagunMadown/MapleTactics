@@ -12,8 +12,9 @@
 
 | Inspector 속성 | 기본값 | 동작 |
 |---|---:|---|
-| `MoveActionDuration` | `0.12` | 플레이어 이동 표현과 기존 MOVE 액션 잠금 시간. 런타임 적용값은 `0.10~0.16`초로 제한한다. |
-| `MoveCurve` | `QUAD_EASE_OUT` | 빠르게 반응하고 목적지 직전에 감속한다. `LINEAR`, `SMOOTH_STEP`, `QUAD_EASE_IN_OUT`도 선택할 수 있다. 알 수 없는 값은 기본 Ease Out으로 처리한다. |
+| `MoveActionDuration` | `0.24` | 플레이어 이동(점프) 표현과 기존 MOVE 액션 잠금 시간. 런타임 적용값은 `0.10~0.35`초로 제한한다. |
+| `MoveCurve` | `QUAD_EASE_OUT` | 적 이동 보간 Curve. 빠르게 반응하고 목적지 직전에 감속한다. `LINEAR`, `SMOOTH_STEP`, `QUAD_EASE_IN_OUT`도 선택할 수 있다. 알 수 없는 값은 기본 Ease Out으로 처리한다. |
+| `PlayerMoveCurve` | `LINEAR` | 플레이어 이동 보간 Curve. 점프 포물선 아래에서 일정한 속도로 가로 이동해야 점프처럼 보인다. 선택지는 `MoveCurve`와 같다. |
 | `MoveSnapThreshold` | `0.01` | 목적지까지 남은 X/Y 거리가 모두 임계값 이하면 셀 중앙으로 즉시 스냅한다. |
 
 ## 기존 규칙 보존 근거
@@ -22,7 +23,7 @@
 2. `BattleUnitComponent.ApplyCellChange(result.ToCell)`의 위치와 실행 시점을 변경하지 않았다.
 3. Drop 수집과 `UnitMovedEvent`는 기존처럼 논리 이동 성공 직후 실행한다.
 4. `CompleteQueuedAction`에서 `BeginEnemyTurn`으로 넘어가는 기존 턴 소비 지점을 변경하지 않았다.
-5. MOVE 액션의 기본 타이머는 기존과 같은 `0.12`초다.
+5. MOVE 액션의 기본 타이머는 `0.24`초다(점프 높이 `PlayerHopHeight = 0.30`).
 6. `BattleTurnComponent.TryReserveImmediateAction`의 `IsActionProcessing` 잠금을 변경하지 않아 연타 중 두 번째 입력은 계속 `ACTION_PROCESSING`으로 거절된다.
 7. 적 AI와 적 이동 코드는 수정하지 않았다.
 
