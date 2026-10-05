@@ -5,24 +5,14 @@ script BattleUnitHpHudComponent extends Component
 	property boolean ShowBossHpText = true
 	property boolean ShowHpPercent = false
 	property boolean ShowSegments = true
-	property boolean ShowPips = true
 	property string ShowHpTextMode = "SelectedOnly"
 	property string SelectedUnitId = ""
 	property string HoveredUnitId = ""
-	property number HpBarOffsetY = -0.48
-	property number HpPipOffsetY = -0.48
-	property number EnemyHpBarOffsetY = 0.06
-	property number PipWidth = 20
-	property number PipHeight = 12
-	property number PipSpacing = 4
-	property integer TargetPipCount = 8
-	property integer MaxVisiblePips = 10
-	property number HpBarWidth = 128
-	property number HpBarHeight = 16
+	property integer EnemyPipColumns = 10
+	property Color EnemyPipColor = Color(1.00, 0.34, 0.18, 1)
 	property number BossHpBarWidth = 480
 	property number BossHpBarHeight = 22
 	property number SmoothDuration = 0.18
-	property number DangerRatio = 0.30
 	property number RefreshInterval = 0.05
 	property integer SegmentCount = 10
 	property string BossNameOverride = ""
@@ -33,12 +23,8 @@ script BattleUnitHpHudComponent extends Component
 		-- Caches the authored tactical HUD pool without changing any battle-owned component.
 		self._T.RefreshElapsed = 0
 		self._T.LastContextVisible = false
-		self._T.EnemyViews = {}
-		for index = 1, 5 do
-			local barName = "EnemyHpBar0" .. tostring(index)
-			table.insert(self._T.EnemyViews, self:BuildBarView(self.Entity.Parent:GetChildByName(barName, false), false))
-		end
-		self._T.BossView = self:BuildBarView(self.Entity.Parent:GetChildByName("BossHpBar", false), true)
+		self._T.EnemyLabels = {}
+		self._T.BossView = self:BuildBossView(self.Entity.Parent:GetChildByName("BossHpBar", false))
 		self._T.GoldPanel = self.Entity.Parent:GetChildByName("LeftRunInfo", false)
 		self._T.StagePanel = self.Entity.Parent:GetChildByName("TopStage", false)
 		self._T.GoldText = self._T.GoldPanel:GetChildByName("GoldRow", false)
@@ -64,17 +50,16 @@ script BattleUnitHpHudComponent extends Component
 		self._T.PresenterHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudStateChangedEvent, self.OnPresenterStateChanged)
 		self._T.HudState = _BattleHudPresenterLogic:GetCurrentState()
 		self._T.TopDirty = true
-		self:ApplyAuthoredDimensions()
+		self:ApplyBossDimensions(self._T.BossView)
 		self:HideAllBars("INITIALIZE")
-		log("[BattleUnitHpHUD] ready enemyPool=5 targetPips=" .. tostring(self.TargetPipCount) .. " maxPips=" .. tostring(self.MaxVisiblePips) .. " bossSegments=" .. tostring(self.SegmentCount))
+		log("[BattleUnitHpHUD] ready bossSegments=" .. tostring(self.SegmentCount))
 	end
 
 	@ExecSpace("ClientOnly")
-	method table BuildBarView(Entity root, boolean isBoss)
-		-- Resolves one reusable bar's renderers and animation state from its authored child names.
+	method table BuildBossView(Entity root)
+		-- Resolves the top-screen boss bar's renderers and animation state from its authored child names.
 		local view = {
 			Root = root,
-			IsBoss = isBoss,
 			UnitEntity = nil,
 			UnitId = "",
 			DisplayRatio = 1,
@@ -82,8 +67,6 @@ script BattleUnitHpHudComponent extends Component
 			TargetRatio = 1,
 			SmoothElapsed = 0,
 			LastHpText = "",
-			LastPipSignature = "",
-			Pips = {},
 			Segments = {}
 		}
 		if isvalid(root) == false then
@@ -96,32 +79,11 @@ script BattleUnitHpHudComponent extends Component
 		view.Highlight = root:GetChildByName("Highlight", false)
 		view.HpText = root:GetChildByName("HpText", false)
 		view.NameText = root:GetChildByName("NameText", false)
-		if isBoss == false then
-			view.PipLayer = root:GetChildByName("Pips", false)
-			if isvalid(view.PipLayer) then
-				for index = 1, math.max(1, self.MaxVisiblePips) do
-					local pipName = "Pip"
-					if index < 10 then
-						pipName = pipName .. "0"
-					end
-					pipName = pipName .. tostring(index)
-					local pip = view.PipLayer:GetChildByName(pipName, false)
-					if isvalid(pip) then
-						table.insert(view.Pips, pip)
-					end
-				end
-			end
-		end
 		local segmentLayer = root:GetChildByName("Segments", false)
-		if isBoss and isvalid(segmentLayer) then
+		if isvalid(segmentLayer) then
 			-- The authored overlay contains nine dividers, producing ten equal visual cells.
 			for index = 1, 9 do
-				local segmentName = "Segment"
-				if index < 10 then
-					segmentName = segmentName .. "0"
-				end
-				segmentName = segmentName .. tostring(index)
-				local segment = segmentLayer:GetChildByName(segmentName, false)
+				local segment = segmentLayer:GetChildByName("Segment0" .. tostring(index), false)
 				if isvalid(segment) then
 					table.insert(view.Segments, segment)
 				end
@@ -171,9 +133,7 @@ script BattleUnitHpHudComponent extends Component
 		end
 
 		self:UpdatePlayerLabel(player, session)
-		for _, view in ipairs(self._T.EnemyViews or {}) do
-			self:UpdateWorldBar(view, delta, self.EnemyHpBarOffsetY + self.HpPipOffsetY)
-		end
+		self:UpdateEnemyLabels()
 		self:UpdateBossBar(self._T.BossView, delta)
 		if self._T.TopDirty == true then
 			self._T.TopDirty = false
@@ -192,7 +152,6 @@ script BattleUnitHpHudComponent extends Component
 		self:HideAllBars("END_PLAY")
 		self:DestroyPlayerLabel()
 		self._T.HudState = nil
-		self._T.EnemyViews = nil
 		self._T.BossView = nil
 		self._T.RelicSlots = nil
 		self._T.RelicRow = nil
@@ -215,7 +174,7 @@ script BattleUnitHpHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void RefreshAssignments(Entity player)
-		-- Assigns every synchronized enemy to the fixed reusable HUD pool; the player uses its world label.
+		-- Gives regular enemies world labels and the boss the top-screen bar; the player has its own label.
 		local enemies = {}
 		local map = player.CurrentMap
 		local enemyComponents = map:GetChildComponentsByTypeName("script.BattleUnitComponent", true)
@@ -234,22 +193,16 @@ script BattleUnitHpHudComponent extends Component
 			return left.UnitId < right.UnitId
 		end)
 
-		local regularIndex = 0
+		local regular = {}
 		local bossUnit = nil
 		for _, unit in ipairs(enemies) do
 			if unit.IsBoss == true and bossUnit == nil then
 				bossUnit = unit
 			else
-				regularIndex = regularIndex + 1
-				local view = self._T.EnemyViews[regularIndex]
-				if view ~= nil then
-					self:AssignView(view, unit.Entity, unit)
-				end
+				table.insert(regular, unit)
 			end
 		end
-		for index = regularIndex + 1, #self._T.EnemyViews do
-			self:ClearView(self._T.EnemyViews[index])
-		end
+		self:SyncEnemyLabels(regular)
 		if bossUnit ~= nil then
 			self:AssignView(self._T.BossView, bossUnit.Entity, bossUnit)
 		else
@@ -279,7 +232,6 @@ script BattleUnitHpHudComponent extends Component
 			view.TargetRatio = ratio
 			view.SmoothElapsed = self.SmoothDuration
 			view.LastHpText = ""
-			view.LastPipSignature = ""
 		end
 		view.Root.Enable = unit.IsDead == false
 	end
@@ -297,14 +249,13 @@ script BattleUnitHpHudComponent extends Component
 		view.UnitId = ""
 		view.LastHpText = ""
 		view.LastNameText = ""
-		view.LastPipSignature = ""
 	end
 
 	@ExecSpace("ClientOnly")
 	method void UpdatePlayerLabel(Entity player, any session)
-		-- The local player's name, and in battle its HP, is a world-space label that follows the avatar root.
+		-- The local player's name, and in battle its HP, is a world-space label attached to the player.
 		-- Screen-space UI placed through WorldToScreenPosition trails the camera while it follows a grid step,
-		-- while a world entity on the avatar root's position rides the step and the hop height.
+		-- while a child of the player rides the step and copies the avatar root's hop height.
 		if not isvalid(player) then return end
 		local nativeName = player.NameTagComponent
 		if nativeName ~= nil and self._T.NativeNameTagEnabled == nil then
@@ -341,34 +292,30 @@ script BattleUnitHpHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method any EnsurePlayerLabel(Entity player)
-		-- Spawns one client-only PlayerWorldLabel per map and points it at the current avatar root,
+		-- Attaches one client-only label to the player and points its hop offset at the current avatar root,
 		-- which is rebuilt whenever the avatar reloads.
-		local renderer = player.AvatarRendererComponent
-		local avatarRoot = renderer ~= nil and renderer:GetAvatarRootEntity() or nil
+		local avatarRoot = self:GetHopSource(player)
 		local map = player.CurrentMap
-		if not isvalid(avatarRoot) or not isvalid(map) then return nil end
+		if avatarRoot == nil or not isvalid(map) then return nil end
 		local label = self._T.PlayerLabel
-		if label ~= nil and isvalid(label.Entity) and label.Entity.Parent == map then
+		if label ~= nil and isvalid(label.Entity) and label.Entity.Parent == player then
 			if self._T.PlayerLabelTarget ~= avatarRoot then
 				self._T.PlayerLabelTarget = avatarRoot
-				label:Follow(avatarRoot)
+				label:SetOffsetSource(avatarRoot)
 			end
 			return label
 		end
 		self:DestroyPlayerLabel()
 		-- Try each map once so a failing spawn does not repeat every frame.
 		if self._T.PlayerLabelFailedMap == map then return nil end
-		local entity = _SpawnService:SpawnByModelId("playerworldlabel", "PlayerWorldLabel", Vector3(0, 0, 0), map)
-		label = isvalid(entity) and entity:GetComponent("script.PlayerWorldLabelComponent") or nil
+		label = self:SpawnUnitLabel(player, "PlayerWorldLabel")
 		if label == nil then
-			if isvalid(entity) then entity:Destroy() end
 			self._T.PlayerLabelFailedMap = map
 			log_warning("[BattleUnitHpHUD] player world label spawn failed; keeping the native name tag")
 			return nil
 		end
 		self._T.PlayerLabel = label
 		self._T.PlayerLabelTarget = avatarRoot
-		label:Follow(avatarRoot)
 		log("[BattleUnitHpHUD] player world label spawned map=" .. map.Name)
 		return label
 	end
@@ -379,7 +326,7 @@ script BattleUnitHpHudComponent extends Component
 		local label = self._T.PlayerLabel
 		self._T.PlayerLabel = nil
 		self._T.PlayerLabelTarget = nil
-		if label ~= nil and isvalid(label.Entity) then label.Entity:Destroy() end
+		self:DestroyLabel(label)
 		local nativeName = self._T.NativeNameTag
 		if nativeName ~= nil and isvalid(nativeName.Entity) and self._T.NativeNameTagEnabled ~= nil then
 			nativeName.Enable = self._T.NativeNameTagEnabled
@@ -387,13 +334,109 @@ script BattleUnitHpHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void SyncEnemyLabels(table units)
+		-- Gives every living regular enemy its own world label and drops labels of units that left the board.
+		local labels = self._T.EnemyLabels
+		local map = self._T.ContextMap
+		local seen = {}
+		for _, unit in ipairs(units) do
+			local key = unit.Entity.Id
+			seen[key] = true
+			local entry = labels[key]
+			if entry ~= nil and not isvalid(entry.Label.Entity) then
+				labels[key] = nil
+				entry = nil
+			end
+			-- Try each map once so a failing spawn does not repeat at every refresh.
+			if entry == nil and isvalid(map) and self._T.EnemyLabelFailedMap ~= map then
+				local label = self:SpawnUnitLabel(unit.Entity, "EnemyWorldLabel_" .. unit.UnitId)
+				if label == nil then
+					self._T.EnemyLabelFailedMap = map
+					log_warning("[BattleUnitHpHUD] enemy world label spawn failed map=" .. map.Name)
+				else
+					label.PipColumns = self.EnemyPipColumns
+					label.PipFilledColor = self.EnemyPipColor
+					label:SetName("")
+					label:SetHpVisible(true)
+					labels[key] = { Label = label, Unit = unit, Source = self:GetHopSource(unit.Entity) }
+					log("[BattleUnitHpHUD] enemy world label spawned unit=" .. unit.UnitId)
+				end
+			end
+		end
+		for key, entry in pairs(labels) do
+			if seen[key] ~= true then
+				self:DestroyLabel(entry.Label)
+				labels[key] = nil
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateEnemyLabels()
+		-- Pushes synchronized HP into each enemy label every frame; the label rebuilds pips only when HP changes.
+		local labels = self._T.EnemyLabels or {}
+		for key, entry in pairs(labels) do
+			local unit = entry.Unit
+			if not isvalid(entry.Label.Entity) or not isvalid(unit) or not isvalid(unit.Entity) or unit.IsDead == true then
+				self:DestroyLabel(entry.Label)
+				labels[key] = nil
+			else
+				local source = self:GetHopSource(unit.Entity)
+				if entry.Source ~= source then
+					entry.Source = source
+					entry.Label:SetOffsetSource(source)
+				end
+				entry.Label:SetHp(unit.CurrentHp, unit.MaxHp)
+				entry.Label:SetHpTextVisible(self:ShouldShowEnemyHpText(unit.UnitId))
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DestroyEnemyLabels()
+		-- Removes every enemy label, for example when the battle context is hidden.
+		for _, entry in pairs(self._T.EnemyLabels or {}) do
+			self:DestroyLabel(entry.Label)
+		end
+		self._T.EnemyLabels = {}
+	end
+
+	@ExecSpace("ClientOnly")
+	method any GetHopSource(Entity unitEntity)
+		-- Avatar units hop by moving their avatar root; sprite units hop on their own entity and need no source.
+		local renderer = unitEntity.AvatarRendererComponent
+		if renderer ~= nil then
+			local avatarRoot = renderer:GetAvatarRootEntity()
+			if isvalid(avatarRoot) then return avatarRoot end
+		end
+		return nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method any SpawnUnitLabel(Entity unitEntity, string name)
+		-- Spawns a client-only UnitWorldLabel on the unit's map and attaches it to the unit entity.
+		local entity = _SpawnService:SpawnByModelId("unitworldlabel", name, Vector3(0, 0, 0), unitEntity.CurrentMap)
+		local label = isvalid(entity) and entity:GetComponent("script.UnitWorldLabelComponent") or nil
+		if label == nil or not entity:AttachTo(unitEntity) then
+			if isvalid(entity) then entity:Destroy() end
+			return nil
+		end
+		label:SetOffsetSource(self:GetHopSource(unitEntity))
+		return label
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DestroyLabel(any label)
+		-- Destroys a label entity if it still exists.
+		if label ~= nil and isvalid(label.Entity) then label.Entity:Destroy() end
+	end
+
+	@ExecSpace("ClientOnly")
 	method void HideAllBars(string reason)
 		-- Hides this HUD group while leaving all other battle UI groups untouched.
 		self:RefreshRunStats(nil, false)
 		self:ClearRelicDisplay()
-		for _, view in ipairs(self._T.EnemyViews or {}) do
-			self:ClearView(view)
-		end
+		self:DestroyEnemyLabels()
 		self:ClearView(self._T.BossView)
 		if self._T.LastContextVisible == true then
 			log("[BattleUnitHpHUD] battle context hidden reason=" .. reason)
@@ -417,34 +460,6 @@ script BattleUnitHpHudComponent extends Component
 			slot.Root.Enable = false
 			self:SetTopText(slot.Label, "")
 		end
-	end
-
-	@ExecSpace("ClientOnly")
-	method void UpdateWorldBar(table view, number delta, number offsetY)
-		-- Moves a non-boss bar under its unit and renders synchronized HP through a short visual tween.
-		if view == nil or isvalid(view.Root) == false or isvalid(view.UnitEntity) == false then
-			return
-		end
-		local unit = view.UnitEntity:GetComponent("script.BattleUnitComponent")
-		if unit == nil or unit.IsDead == true or unit.IsBoss == true or view.UnitEntity.CurrentMap ~= self._T.ContextMap then
-			self:ClearView(view)
-			return
-		end
-		local transform = view.UnitEntity.TransformComponent
-		if transform == nil or view.Root.UITransformComponent == nil then
-			return
-		end
-		local worldPosition = transform.WorldPosition
-		if view.UnitEntity.AvatarRendererComponent ~= nil then
-			local visual = view.UnitEntity.AvatarRendererComponent:GetAvatarRootEntity()
-			if isvalid(visual) and visual.TransformComponent ~= nil then
-				worldPosition = visual.TransformComponent.WorldPosition
-			end
-		end
-		local screenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y + offsetY))
-		local uiPosition = _UILogic:ScreenToUIPosition(screenPosition)
-		view.Root.UITransformComponent.anchoredPosition = uiPosition
-		self:RefreshViewVisual(view, unit, delta)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -473,7 +488,7 @@ script BattleUnitHpHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void RefreshViewVisual(table view, any unit, number delta)
-		-- Normal units use discrete pips; the boss keeps its smoothed fill bar.
+		-- Smooths the boss fill toward synchronized HP.
 		local currentHp = unit.CurrentHp
 		local maxHp = unit.MaxHp
 		local targetRatio = self:GetHpRatio(currentHp, maxHp)
@@ -483,86 +498,16 @@ script BattleUnitHpHudComponent extends Component
 			view.SmoothElapsed = 0
 			log("[BattleUnitHpHUD] hp target unit=" .. unit.UnitId .. " hp=" .. tostring(currentHp) .. "/" .. tostring(maxHp) .. " ratio=" .. tostring(targetRatio))
 		end
-		if view.IsBoss then
-			local duration = math.max(0.01, self.SmoothDuration)
-			view.SmoothElapsed = math.min(duration, view.SmoothElapsed + delta)
-			local progress = view.SmoothElapsed / duration
-			view.DisplayRatio = view.StartRatio + (view.TargetRatio - view.StartRatio) * progress
-			if view.SmoothElapsed >= duration then
-				view.DisplayRatio = view.TargetRatio
-			end
-			self:ApplyFillWidth(view, view.DisplayRatio)
-			self:ApplyUnitColor(view, unit.Team, targetRatio)
-		else
-			view.DisplayRatio = targetRatio
-			view.TargetRatio = targetRatio
-			self:RefreshPips(view, currentHp, maxHp, unit.Team)
+		local duration = math.max(0.01, self.SmoothDuration)
+		view.SmoothElapsed = math.min(duration, view.SmoothElapsed + delta)
+		local progress = view.SmoothElapsed / duration
+		view.DisplayRatio = view.StartRatio + (view.TargetRatio - view.StartRatio) * progress
+		if view.SmoothElapsed >= duration then
+			view.DisplayRatio = view.TargetRatio
 		end
+		self:ApplyFillWidth(view, view.DisplayRatio)
+		self:ApplyBossColor(view)
 		self:RefreshHpText(view, currentHp, maxHp)
-	end
-
-	@ExecSpace("ClientOnly")
-	method void RefreshPips(table view, number currentHp, number maxHp, string team)
-		-- Each non-boss HP point owns one pip; grow the reusable pool for max-HP bonuses.
-		if view == nil or view.IsBoss or isvalid(view.PipLayer) == false then
-			return
-		end
-		local normalizedMaxHp = math.max(1, maxHp)
-		local maxPips = math.max(1, math.ceil(normalizedMaxHp))
-		local template = view.Pips[1]
-		if not isvalid(template) then
-			return
-		end
-		for index = #view.Pips + 1, maxPips do
-			local pip = template:Clone("HpPip" .. tostring(index))
-			if not isvalid(pip) then return end
-			pip.Enable = false
-			table.insert(view.Pips, pip)
-		end
-		local filledPips = math.max(0, math.min(maxPips, math.ceil(currentHp)))
-		local gridColumns = math.min(math.max(1, self.MaxVisiblePips), maxPips)
-		local gridRows = math.max(1, math.ceil(maxPips / gridColumns))
-		local rowWidth = gridColumns * self.PipWidth + math.max(0, gridColumns - 1) * self.PipSpacing
-		local gridHeight = gridRows * self.PipHeight + math.max(0, gridRows - 1) * self.PipSpacing
-		-- Keep the first row fixed and extend bonus rows downward, away from the name.
-		local baseHeight = self.PipHeight
-		local gridOffsetY = (baseHeight - gridHeight) * 0.5
-		view.PipLayer.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight)
-		view.PipLayer.UITransformComponent.anchoredPosition = Vector2(0, gridOffsetY)
-		if isvalid(view.Root) and view.Root.UITransformComponent ~= nil then
-			view.Root.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight + 44)
-		end
-		if isvalid(view.HpText) and view.HpText.UITransformComponent ~= nil then
-			view.HpText.UITransformComponent.anchoredPosition = Vector2(0, gridOffsetY - gridHeight * 0.5 - 12)
-		end
-		local filledColor = Color(1.00, 0.34, 0.18, 1)
-		-- Depleted HP stays visible as a neutral gray slot instead of disappearing.
-		local emptyColor = Color(0.27, 0.27, 0.27, 1)
-		for index, pip in ipairs(view.Pips) do
-			local visible = self.ShowPips and index <= maxPips
-			pip.Enable = visible
-			if pip.UITransformComponent ~= nil then
-				local columnIndex = (index - 1) % gridColumns
-				local rowIndex = math.floor((index - 1) / gridColumns)
-				local x = -rowWidth * 0.5 + self.PipWidth * 0.5 + columnIndex * (self.PipWidth + self.PipSpacing)
-				local y = gridHeight * 0.5 - self.PipHeight * 0.5 - rowIndex * (self.PipHeight + self.PipSpacing)
-				pip.UITransformComponent.anchoredPosition = Vector2(x, y)
-				pip.UITransformComponent.RectSize = Vector2(self.PipWidth, self.PipHeight)
-			end
-			if pip.SpriteGUIRendererComponent ~= nil then
-				pip.SpriteGUIRendererComponent.Enable = visible
-				if index <= filledPips then
-					pip.SpriteGUIRendererComponent.Color = filledColor
-				else
-					pip.SpriteGUIRendererComponent.Color = emptyColor
-				end
-			end
-		end
-		local signature = tostring(math.floor(normalizedMaxHp)) .. ":" .. tostring(maxPips) .. ":" .. tostring(filledPips)
-		if signature ~= view.LastPipSignature then
-			view.LastPipSignature = signature
-			log("[BattleUnitHpHUD] pips unit=" .. view.UnitId .. " hp=" .. tostring(currentHp) .. "/" .. tostring(maxHp) .. " filled=" .. tostring(filledPips) .. "/" .. tostring(maxPips))
-		end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -580,8 +525,8 @@ script BattleUnitHpHudComponent extends Component
 		if isvalid(view.Fill) == false or view.Fill.UITransformComponent == nil then
 			return
 		end
-		local fullWidth = view.IsBoss and math.max(1, self.BossHpBarWidth - 14) or math.max(1, self.HpBarWidth - 10)
-		local fillHeight = view.IsBoss and self.BossHpBarHeight or self.HpBarHeight
+		local fullWidth = math.max(1, self.BossHpBarWidth - 14)
+		local fillHeight = self.BossHpBarHeight
 		local width = fullWidth * math.max(0, math.min(1, ratio))
 		view.Fill.UITransformComponent.RectSize = Vector2(math.max(0.1, width), fillHeight)
 		view.Fill.Enable = ratio > 0
@@ -592,36 +537,24 @@ script BattleUnitHpHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method void ApplyUnitColor(table view, string team, number targetRatio)
-		-- Applies the reference image's saturated two-tone unit colors and player danger override.
+	method void ApplyBossColor(table view)
+		-- Applies the reference image's saturated boss fill and warm highlight.
 		if isvalid(view.Fill) == false or view.Fill.SpriteGUIRendererComponent == nil then
 			return
 		end
-		local fillColor = Color(0.95, 0.30, 0.16, 1)
-		if team == "Player" then
-			fillColor = Color(0.22, 0.78, 0.76, 1)
-			if targetRatio <= self.DangerRatio then
-				fillColor = Color(0.96, 0.23, 0.17, 1)
-			end
-		elseif view.IsBoss then
-			fillColor = Color(0.92, 0.20, 0.10, 1)
-		end
-		view.Fill.SpriteGUIRendererComponent.Color = fillColor
+		view.Fill.SpriteGUIRendererComponent.Color = Color(0.92, 0.20, 0.10, 1)
 		if isvalid(view.Highlight) and view.Highlight.SpriteGUIRendererComponent ~= nil then
-			view.Highlight.SpriteGUIRendererComponent.Color = Color(1, 0.82, 0.58, team == "Player" and 0.34 or 0.52)
+			view.Highlight.SpriteGUIRendererComponent.Color = Color(1, 0.82, 0.58, 0.52)
 		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void RefreshHpText(table view, number currentHp, number maxHp)
-		-- Shows compact exact values only when the matching Inspector option is enabled.
+		-- Shows the boss's exact values only when the matching Inspector option is enabled.
 		if isvalid(view.HpText) == false or view.HpText.TextGUIRendererComponent == nil then
 			return
 		end
-		local showExactValue = self:ShouldShowGeneralHpText(view)
-		if view.IsBoss then
-			showExactValue = self.ShowBossHpText
-		end
+		local showExactValue = self.ShowBossHpText
 		local visible = showExactValue
 		view.HpText.Enable = visible
 		view.HpText.TextGUIRendererComponent.Enable = visible
@@ -647,9 +580,9 @@ script BattleUnitHpHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
-	method boolean ShouldShowGeneralHpText(table view)
-		-- Keeps normal bars number-free unless an existing target snapshot or UI-owned state selects the unit.
-		if view == nil or view.IsBoss == true or view.UnitId == "" then
+	method boolean ShouldShowEnemyHpText(string unitId)
+		-- Keeps enemy labels number-free unless an existing target snapshot or UI-owned state selects the unit.
+		if unitId == nil or unitId == "" then
 			return false
 		end
 		if self.ShowHpText then
@@ -659,14 +592,14 @@ script BattleUnitHpHudComponent extends Component
 		if mode == "ALWAYS" then
 			return true
 		elseif mode == "HOVERONLY" then
-			return self.HoveredUnitId ~= "" and self.HoveredUnitId == view.UnitId
+			return self.HoveredUnitId ~= "" and self.HoveredUnitId == unitId
 		elseif mode == "SELECTEDONLY" then
-			if self.SelectedUnitId ~= "" and self.SelectedUnitId == view.UnitId then
+			if self.SelectedUnitId ~= "" and self.SelectedUnitId == unitId then
 				return true
 			end
 			local session = self._T.BattleSession
 			if session ~= nil then
-				return self:ContainsSerializedUnitId(session.LastSkillTargetUnitIds, view.UnitId)
+				return self:ContainsSerializedUnitId(session.LastSkillTargetUnitIds, unitId)
 			end
 		end
 		return false
@@ -691,68 +624,16 @@ script BattleUnitHpHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void SetHpTextHoveredUnit(string unitId)
-		-- Accepts hover state from another UI owner without adding input capture to the world bar itself.
+		-- Accepts hover state from another UI owner without adding input capture to the world label itself.
 		self.HoveredUnitId = unitId or ""
 	end
 
 	@ExecSpace("ClientOnly")
-	method void ApplyAuthoredDimensions()
-		-- Applies Inspector width and height values to every pooled bar and its ten visual segments.
-		for _, view in ipairs(self._T.EnemyViews or {}) do
-			self:ApplyViewDimensions(view)
-		end
-		self:ApplyViewDimensions(self._T.BossView)
-	end
-
-	@ExecSpace("ClientOnly")
-	method void ApplyViewDimensions(table view)
-		-- Configures discrete world pips separately from the retained top-screen boss fill bar.
+	method void ApplyBossDimensions(table view)
+		-- Applies Inspector width and height values to the boss bar and its ten visual segments.
 		if view == nil or isvalid(view.Root) == false then
 			return
 		end
-		if view.IsBoss == false then
-			local pipCount = math.max(1, math.min(#view.Pips, math.min(self.MaxVisiblePips, 10)))
-			local gridColumns = math.min(5, pipCount)
-			local gridRows = math.max(1, math.ceil(pipCount / gridColumns))
-			local rowWidth = gridColumns * self.PipWidth + math.max(0, gridColumns - 1) * self.PipSpacing
-			local gridHeight = gridRows * self.PipHeight + math.max(0, gridRows - 1) * self.PipSpacing
-			view.Root.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight + 44)
-			if isvalid(view.Frame) then
-				view.Frame.Enable = false
-			end
-			if isvalid(view.Shadow) then
-				view.Shadow.Enable = false
-			end
-			if isvalid(view.Empty) then
-				view.Empty.Enable = false
-			end
-			if isvalid(view.Fill) then
-				view.Fill.Enable = false
-			end
-			if isvalid(view.Highlight) then
-				view.Highlight.Enable = false
-			end
-			if isvalid(view.PipLayer) and view.PipLayer.UITransformComponent ~= nil then
-				view.PipLayer.Enable = true
-				view.PipLayer.UITransformComponent.RectSize = Vector2(rowWidth, gridHeight)
-			end
-			for index, pip in ipairs(view.Pips) do
-				pip.Enable = false
-				if pip.UITransformComponent ~= nil then
-					local columnIndex = (index - 1) % gridColumns
-					local rowIndex = math.floor((index - 1) / gridColumns)
-					local x = -rowWidth * 0.5 + self.PipWidth * 0.5 + columnIndex * (self.PipWidth + self.PipSpacing)
-					local y = gridHeight * 0.5 - self.PipHeight * 0.5 - rowIndex * (self.PipHeight + self.PipSpacing)
-					pip.UITransformComponent.anchoredPosition = Vector2(x, y)
-					pip.UITransformComponent.RectSize = Vector2(self.PipWidth, self.PipHeight)
-				end
-			end
-			if isvalid(view.HpText) and view.HpText.UITransformComponent ~= nil then
-				view.HpText.UITransformComponent.anchoredPosition = Vector2(0, -gridHeight * 0.5 - 12)
-			end
-			return
-		end
-
 		local width = self.BossHpBarWidth
 		local height = self.BossHpBarHeight
 		local frameHeight = height + 10
