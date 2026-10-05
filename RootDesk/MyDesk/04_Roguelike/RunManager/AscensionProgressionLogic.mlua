@@ -1,0 +1,88 @@
+@Logic
+script AscensionProgressionLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Initializes the authenticated lobby progress request throttle for this world session.
+		self._T.nextProgressRequestByUserId = {}
+		self._T.lastProgressByUserId = {}
+		log("[Ascension] progression ready maxLevel=" .. tostring(_AscensionDifficultyLogic.MaxLevel))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Releases session-only request data while durable unlocks remain in the Union profile.
+		self._T.nextProgressRequestByUserId = nil
+		self._T.lastProgressByUserId = nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetProgress(Entity playerEntity)
+		-- Reads the account-wide unlock from the existing cached permanent profile.
+		local loaded = _UnionProfileRepositoryLogic:GetUnionProfile(playerEntity)
+		if loaded.Success == false then return { Success = false, Reason = loaded.Reason, UnlockedLevel = 0 } end
+		return { Success = true, Reason = "OK", UnlockedLevel = loaded.Profile.AscensionUnlockedLevel }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateSelection(Entity playerEntity, integer selectedLevel)
+		-- Rejects forged, fractional, and locked levels before any new run is prepared.
+		if selectedLevel < 0 or selectedLevel > _AscensionDifficultyLogic.MaxLevel or selectedLevel ~= math.floor(selectedLevel) then
+			return { Success = false, Reason = "INVALID_ASCENSION_LEVEL", UnlockedLevel = 0 }
+		end
+		local progress = self:GetProgress(playerEntity)
+		if progress.Success == false then return progress end
+		if selectedLevel > progress.UnlockedLevel then
+			return { Success = false, Reason = "ASCENSION_LOCKED", UnlockedLevel = progress.UnlockedLevel }
+		end
+		return progress
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CommitCompletion(Entity playerEntity, integer completedLevel)
+		-- Trusted frozen completed records advance at most one step and repeated commits cost no write.
+		local result = _UnionProfileRepositoryLogic:TryAdvanceAscensionLevel(playerEntity, completedLevel)
+		if result.Success then self:PublishProgress(playerEntity, result) end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishProgress(Entity playerEntity, table progress)
+		-- Sends only the owning client's account unlock and immutable active-run difficulty.
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then return end
+		self._T.lastProgressByUserId = self._T.lastProgressByUserId or {}
+		self._T.lastProgressByUserId[playerEntity.PlayerComponent.UserId] = progress
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local active = run ~= nil and run.RunState == "Active"
+		local runLevel = run ~= nil and _AscensionDifficultyLogic:ResolveLevel(run.RunDifficulty) or 0
+		self:NotifyProgress(progress.Success == true, progress.UnlockedLevel or 0, math.max(0, runLevel), active, progress.Reason or "UNKNOWN", playerEntity.PlayerComponent.UserId)
+	end
+
+	@ExecSpace("Server")
+	method void RequestProgress()
+		-- Resolves identity from the RPC sender so clients cannot query or mutate another account.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		if isvalid(playerEntity) == false then return end
+		local requests = self._T.nextProgressRequestByUserId or {}
+		self._T.nextProgressRequestByUserId = requests
+		local now = _UtilLogic.ServerElapsedSeconds
+		if now < (requests[senderUserId] or 0) then
+			-- Reopening the map must receive an acknowledgement even during the storage-read throttle.
+			local cached = (self._T.lastProgressByUserId or {})[senderUserId]
+			if cached ~= nil then self:PublishProgress(playerEntity, cached) end
+			return
+		end
+		requests[senderUserId] = now + 1
+		self:PublishProgress(playerEntity, self:GetProgress(playerEntity))
+	end
+
+	@ExecSpace("Client")
+	method void NotifyProgress(boolean success, integer unlocked, integer runLevel, boolean runActive, string reason)
+		-- Applies the authenticated account snapshot to the local world-map controls.
+		local uiRoot = _EntityService:GetEntityByPath("/ui/DefaultGroup")
+		if isvalid(uiRoot) == false then return end
+		local minimap = uiRoot:GetComponent("script.MinimapUI")
+		if minimap ~= nil then minimap:ApplyAscensionProgress(success, unlocked, runLevel, runActive, reason) end
+	end
+
+end

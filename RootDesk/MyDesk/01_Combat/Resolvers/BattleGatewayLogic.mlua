@@ -103,32 +103,20 @@ script BattleGatewayLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table PrepareLobbyBattleEntry(Entity playerEntity)
-		-- High-level lobby boundary: callers do not fabricate optional compatibility metadata.
+		-- Routes the default lobby button through the same validated rank boundary as the world map.
 		local eligibility = self:ValidateLobbyEntryRequest(playerEntity)
 		if eligibility.Success == false then return eligibility end
 		local context = _RunManagerLogic:GetLobbyBattleEntryContext(playerEntity)
-		if context.Success == false then
-			return { Success = false, Reason = context.Reason, RequestId = 0 }
-		end
-		eligibility = self:ValidateLobbyEntryRequest(playerEntity)
-		if eligibility.Success == false then return eligibility end
-		context.RunSeed = self:SelectLobbyRunSeed(context.RunSeed, context.EntryMode)
-		return self:PrepareBattleEntry(
-			playerEntity,
-			context.StageId,
-			context.CharacterId,
-			context.JobId,
-			context.LoadoutId,
-			context.RunSeed,
-			context.EntryMode
-		)
+		if context.Success == false then return { Success = false, Reason = context.Reason, RequestId = 0 } end
+		return self:PrepareLobbyStageEntry(playerEntity, context.StageId, "NORMAL")
 	end
 
 	@ExecSpace("ServerOnly")
 	method table PrepareLobbyStageEntry(Entity playerEntity, string requestedStageId, string difficulty)
-		-- Validate the closed difficulty set before preparing any entry state.
+		-- Validate rank syntax and account unlocks before preparing a new run; continued runs keep their rank.
 		difficulty = difficulty or "NORMAL"
-		if difficulty ~= "NORMAL" and difficulty ~= "HARD" then
+		local level = _AscensionDifficultyLogic:ResolveLevel(difficulty)
+		if level < 0 then
 			return { Success = false, Reason = "INVALID_DIFFICULTY", RequestId = 0 }
 		end
 		local eligibility = self:ValidateLobbyEntryRequest(playerEntity)
@@ -144,6 +132,15 @@ script BattleGatewayLogic extends Logic
 			log_warning("[BattleGateway] world map stage rejected requested=" .. requestedStageId .. " expected=" .. context.StageId)
 			return { Success = false, Reason = "STAGE_NOT_AVAILABLE", RequestId = 0 }
 		end
+		if context.EntryMode == "CONTINUE_RUN" then
+			local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+			level = run ~= nil and _AscensionDifficultyLogic:ResolveLevel(run.RunDifficulty) or -1
+			if level < 0 then return { Success = false, Reason = "INVALID_DIFFICULTY", RequestId = 0 } end
+		else
+			local unlocked = _AscensionProgressionLogic:ValidateSelection(playerEntity, level)
+			if unlocked.Success == false then return { Success = false, Reason = unlocked.Reason, RequestId = 0 } end
+		end
+		difficulty = _AscensionDifficultyLogic:ToDifficulty(level)
 		eligibility = self:ValidateLobbyEntryRequest(playerEntity)
 		if eligibility.Success == false then return eligibility end
 		context.RunSeed = self:SelectLobbyRunSeed(context.RunSeed, context.EntryMode)
@@ -158,8 +155,7 @@ script BattleGatewayLogic extends Logic
 		)
 		if result.Success then
 			local entry = self:GetOrCreateEntryState(playerEntity)
-			local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
-			entry.Difficulty = context.EntryMode == "CONTINUE_RUN" and run ~= nil and run.RunDifficulty or difficulty
+			entry.Difficulty = difficulty
 			log("[BattleDifficulty] prepared difficulty=" .. entry.Difficulty .. " mode=" .. context.EntryMode)
 		end
 		return result

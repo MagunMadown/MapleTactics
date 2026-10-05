@@ -36,14 +36,24 @@ script MinimapUI extends Component
 	property any ShopCloseHandler = nil
 
 	property any WorldMapCloseHandler = nil
-	property any NormalDifficultyHandler = nil
-	property any HardDifficultyHandler = nil
+	property any AscensionDifficultyHandler = nil
+	property table AscensionLevelHandlers = {}
+	property table AscensionHoverHandlers = {}
 	property string SelectedDifficulty = "NORMAL"
+	property boolean AscensionSelectorOpen = false
+	property boolean AscensionProgressReady = false
+	property boolean AscensionRunActive = false
+	property integer UnlockedAscensionLevel = 0
+	property integer LockedRunAscensionLevel = 0
+	property string AscensionProgressReason = ""
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Initializes the persistent world-map controller through its stable UI path.
 		self.IsWorldMapOpenState = false
+		self.AscensionProgressReady = false
+		self.AscensionRunActive = false
+		self:CloseAscensionSelector()
 		local travelAvatar = self:GetTravelAvatar()
 		if isvalid(travelAvatar) and isvalid(travelAvatar.UITransformComponent) then
 			self.TravelStartPosition = travelAvatar.UITransformComponent.anchoredPosition
@@ -83,6 +93,9 @@ script MinimapUI extends Component
 		-- Reuses one world map for lobby entry, shop choice, and the locked post-shop route.
 		self.CurrentMode = mode or "LOBBY_STAGE"
 		self.SelectedRouteId = selectedRouteId or ""
+		self:CloseAscensionSelector()
+		self.AscensionProgressReady = false
+		self.AscensionProgressReason = "LOADING"
 		-- Refresh/Hot Reload can keep entities alive while invalidating component event handles.
 		self:DisconnectProgressEventHandler()
 		self:EnsureProgressEventHandler("OPEN_WORLD_MAP")
@@ -99,6 +112,8 @@ script MinimapUI extends Component
 			self:ResetStageButtonsForLobby(source)
 		end
 		self:ConfigureWorldMapMode()
+		self:RefreshDifficultyButtons()
+		_AscensionProgressionLogic:RequestProgress()
 		if self.CurrentMode == "POST_SHOP_ROUTE" then
 			self:ShowTravelAvatarAtRoute(self.SelectedRouteId)
 		elseif self.CurrentMode == "SHOP_CHOICE" then
@@ -286,10 +301,9 @@ script MinimapUI extends Component
 		if isvalid(worldMapCloseButton) and self.WorldMapCloseHandler == nil then
 			self.WorldMapCloseHandler = worldMapCloseButton:ConnectEvent(ButtonClickEvent, self.OnWorldMapCloseClicked)
 		end
-		local normal = self:GetWorldMapEntity("NormalDifficultyBtn")
-		local hard = self:GetWorldMapEntity("HardDifficultyBtn")
-		if isvalid(normal) and self.NormalDifficultyHandler == nil then self.NormalDifficultyHandler = normal:ConnectEvent(ButtonClickEvent, self.OnNormalDifficultyClicked) end
-		if isvalid(hard) and self.HardDifficultyHandler == nil then self.HardDifficultyHandler = hard:ConnectEvent(ButtonClickEvent, self.OnHardDifficultyClicked) end
+		local ascension = self:GetWorldMapEntity("AscensionDifficultyBtn")
+		if isvalid(ascension) and self.AscensionDifficultyHandler == nil then self.AscensionDifficultyHandler = ascension:ConnectEvent(ButtonClickEvent, self.OnAscensionDifficultyClicked) end
+		self:ConnectAscensionButtons()
 		self:RefreshDifficultyButtons()
 		log("[WorldMap] central close handlers connected")
 	end
@@ -306,12 +320,10 @@ script MinimapUI extends Component
 		end
 		self.ShopCloseHandler = nil
 		self.WorldMapCloseHandler = nil
-		local normal = self:GetWorldMapEntity("NormalDifficultyBtn")
-		local hard = self:GetWorldMapEntity("HardDifficultyBtn")
-		if isvalid(normal) and self.NormalDifficultyHandler ~= nil then normal:DisconnectEvent(ButtonClickEvent, self.NormalDifficultyHandler) end
-		if isvalid(hard) and self.HardDifficultyHandler ~= nil then hard:DisconnectEvent(ButtonClickEvent, self.HardDifficultyHandler) end
-		self.NormalDifficultyHandler = nil
-		self.HardDifficultyHandler = nil
+		local ascension = self:GetWorldMapEntity("AscensionDifficultyBtn")
+		if isvalid(ascension) and self.AscensionDifficultyHandler ~= nil then ascension:DisconnectEvent(ButtonClickEvent, self.AscensionDifficultyHandler) end
+		self.AscensionDifficultyHandler = nil
+		self:DisconnectAscensionButtons()
 	end
 
 	@ExecSpace("ClientOnly")
@@ -523,6 +535,7 @@ script MinimapUI extends Component
 	handler HandleWorldMapEscape(KeyDownEvent event)
 		-- Esc closes the world map through the same path as its close button.
 		if event.key == KeyboardKey.Escape and self.IsWorldMapOpenState and _UILayerLogic:IsEscapeTarget(self:GetWorldMapPopup()) then
+			if self.AscensionSelectorOpen then self:CloseAscensionSelector() return end
 			self:CloseWorldMap("escape")
 		end
 	end
@@ -577,6 +590,8 @@ script MinimapUI extends Component
 		if visible then _UILayerLogic:PushWindow(popup) end
 		self.IsWorldMapOpenState = visible
 		if visible == false then
+			self:CloseAscensionSelector()
+			self:HideAscensionTooltip("")
 			self:StopTravelAnimation(true)
 			local shopPanel = self:GetWorldMapEntity("ShopVisitPanel")
 			if isvalid(shopPanel) then
@@ -807,48 +822,284 @@ script MinimapUI extends Component
 
 	@ExecSpace("ClientOnly")
 	method boolean IsDifficultyLocked()
-		local player = _UserService.LocalPlayer
-		local run = isvalid(player) and player:GetComponent("script.PlayerRunStateComponent") or nil
-		if run ~= nil and run.RunSequence > 0 and run.RunState == "Active" then
-			self.SelectedDifficulty = run.RunDifficulty
-			return true
+		-- The server snapshot owns the run lock even when the run component is server-only.
+		return not self.AscensionProgressReady or self.AscensionRunActive
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyAscensionProgress(boolean success, integer unlocked, integer runLevel, boolean runActive, string reason)
+		-- Receives only this player's persisted unlock and active-run state from the server.
+		self.AscensionProgressReady = success
+		self.AscensionProgressReason = reason or "UNKNOWN"
+		if success then
+			self.UnlockedAscensionLevel = math.max(0, math.min(_AscensionDifficultyLogic.MaxLevel, unlocked))
+			self.LockedRunAscensionLevel = math.max(0, math.min(_AscensionDifficultyLogic.MaxLevel, runLevel))
+			self.AscensionRunActive = runActive
+			local selected = _AscensionDifficultyLogic:ResolveLevel(self.SelectedDifficulty)
+			if runActive then
+				self.SelectedDifficulty = _AscensionDifficultyLogic:ToDifficulty(self.LockedRunAscensionLevel)
+			elseif selected < 0 or selected > self.UnlockedAscensionLevel then
+				self.SelectedDifficulty = "NORMAL"
+			end
 		end
-		return false
+		self:RefreshDifficultyButtons()
+		log("[AscensionUI] progress applied success=" .. tostring(success) .. " unlocked=" .. tostring(self.UnlockedAscensionLevel) .. " run=" .. tostring(self.LockedRunAscensionLevel) .. " active=" .. tostring(self.AscensionRunActive) .. " reason=" .. self.AscensionProgressReason)
 	end
 
 	@ExecSpace("ClientOnly")
-	method void OnNormalDifficultyClicked(ButtonClickEvent event)
-		-- Difficulty selection is available only before departure.
-		if self.CurrentMode ~= "LOBBY_STAGE" or self:IsDifficultyLocked() then return end
-		self.SelectedDifficulty = "NORMAL"
-		self:RefreshDifficultyButtons()
+	method boolean CanRequestStageEntry()
+		-- Prevents departure while the unlock snapshot is pending; the gateway also validates it.
+		local level = _AscensionDifficultyLogic:ResolveLevel(self.SelectedDifficulty)
+		local allowed = self.AscensionProgressReady and self.CurrentMode == "LOBBY_STAGE" and level >= 0
+		if allowed then
+			allowed = self.AscensionRunActive and level == self.LockedRunAscensionLevel or not self.AscensionRunActive and level <= self.UnlockedAscensionLevel
+		end
+		if not allowed then
+			_AscensionProgressionLogic:RequestProgress()
+			log_warning("[AscensionUI] departure blocked selected=" .. self.SelectedDifficulty .. " ready=" .. tostring(self.AscensionProgressReady))
+		end
+		return allowed
+	end
+
+@ExecSpace("ClientOnly")
+	method void OnAscensionDifficultyClicked(ButtonClickEvent event)
+		-- Toggles the compact numeric list beneath the current ascension button.
+		if not self.IsWorldMapOpenState or self.CurrentMode ~= "LOBBY_STAGE" or not self.AscensionProgressReady then return end
+		if self.AscensionSelectorOpen then
+			self:CloseAscensionSelector()
+		else
+			local selector = self:GetWorldMapEntity("AscensionDifficultyBtn/Dropdown")
+			local button = self:GetWorldMapEntity("AscensionDifficultyBtn")
+			if not isvalid(selector) or not isvalid(button) then return end
+			self.AscensionSelectorOpen = true
+			selector.Enable = true
+			selector.Visible = true
+			_UILogic:SetSiblingIndex(button.UITransformComponent, 1000000)
+			self:DisconnectAscensionButtons()
+			self:ConnectAscensionButtons()
+			self:RefreshAscensionSelector()
+			self:RefreshAscensionTooltip()
+			log("[AscensionUI] dropdown opened selected=" .. self.SelectedDifficulty)
+		end
+		_GameSettingsLogic:PlayUISound("972843e759204d3e9ad84e7d3fa94f83", 1)
 	end
 
 	@ExecSpace("ClientOnly")
-	method void OnHardDifficultyClicked(ButtonClickEvent event)
-		-- The selected difficulty is captured when a stage entry starts.
-		if self.CurrentMode ~= "LOBBY_STAGE" or self:IsDifficultyLocked() then return end
-		self.SelectedDifficulty = "HARD"
+	method void CloseAscensionSelector()
+		-- Closes the numeric list on selection, outside input, escape, or map transfer.
+		local wasOpen = self.AscensionSelectorOpen
+		self.AscensionSelectorOpen = false
+		local selector = self:GetWorldMapEntity("AscensionDifficultyBtn/Dropdown")
+		if isvalid(selector) then selector.Enable = false selector.Visible = false end
+		if (self._T.AscensionHoverLevel or -1) >= 0 then self:HideAscensionTooltip("") end
+		if wasOpen then log("[AscensionUI] dropdown closed") end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SelectAscensionLevel(integer level)
+		-- Commits an unlocked number, with zero retaining the ordinary run rules.
+		if not self.IsWorldMapOpenState or self.CurrentMode ~= "LOBBY_STAGE" then return end
+		local difficulty = _AscensionDifficultyLogic:ToDifficulty(level)
+		if difficulty == "" then return end
+		if self:IsDifficultyLocked() or level > self.UnlockedAscensionLevel then
+			log("[AscensionUI] selection blocked level=" .. tostring(level) .. " unlocked=" .. tostring(self.UnlockedAscensionLevel) .. " active=" .. tostring(self.AscensionRunActive))
+			return
+		end
+		self.SelectedDifficulty = difficulty
+		self:CloseAscensionSelector()
+		_GameSettingsLogic:PlayUISound("972843e759204d3e9ad84e7d3fa94f83", 1)
 		self:RefreshDifficultyButtons()
+		log("[AscensionUI] selected=" .. self.SelectedDifficulty)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsAscensionPointInside(Entity entity, Vector2 screenPoint)
+		-- Uses the native local UI coordinates so hit bounds follow resolution and anchors.
+		if not isvalid(entity) or not entity.EnabledInHierarchy or not entity.VisibleInHierarchy then return false end
+		local transform = entity.UITransformComponent
+		if not isvalid(transform) then return false end
+		local point = _UILogic:ScreenToLocalUIPosition(screenPoint, transform)
+		local size, pivot = transform.RectSize, transform.Pivot
+		return point.x >= -size.x * pivot.x and point.x <= size.x * (1 - pivot.x)
+			and point.y >= -size.y * pivot.y and point.y <= size.y * (1 - pivot.y)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ScrollAscensionLevel(number scrollDelta, Vector2 screenPoint)
+		-- A wheel input over this button changes one level within the server-owned unlock cap.
+		if not self.IsWorldMapOpenState or self.CurrentMode ~= "LOBBY_STAGE" or self:IsDifficultyLocked() or scrollDelta == 0 then return end
+		local button = self:GetWorldMapEntity("AscensionDifficultyBtn")
+		if not self:IsAscensionPointInside(button, screenPoint) then return end
+		local selected = math.max(0, _AscensionDifficultyLogic:ResolveLevel(self.SelectedDifficulty))
+		local direction = scrollDelta > 0 and 1 or -1
+		local limit = math.min(_AscensionDifficultyLogic.MaxLevel, self.UnlockedAscensionLevel)
+		local level = math.max(0, math.min(limit, selected + direction))
+		if level == selected then return end
+		self:SelectAscensionLevel(level)
+		log("[AscensionUI] wheel level=" .. string.format("%.0f", level))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseAscensionOnOutsidePoint(Vector2 screenPoint)
+		-- Ignores this button and the list so native input order cannot immediately re-close it.
+		if not self.IsWorldMapOpenState or not self.AscensionSelectorOpen then return end
+		local button = self:GetWorldMapEntity("AscensionDifficultyBtn")
+		local selector = self:GetWorldMapEntity("AscensionDifficultyBtn/Dropdown")
+		if self:IsAscensionPointInside(button, screenPoint) or self:IsAscensionPointInside(selector, screenPoint) then return end
+		self:CloseAscensionSelector()
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleAscensionScroll(MouseScrollEvent event)
+		-- Routes native mouse wheel input to the visible difficulty button only.
+		self:ScrollAscensionLevel(event.ScrollDelta, _InputService:GetCursorPosition())
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("Service", "InputService")
+	handler HandleAscensionOutsideClick(ScreenTouchEvent event)
+		-- Collapses the list for mouse or touch input outside its current UI bounds.
+		self:CloseAscensionOnOutsidePoint(event.TouchPoint)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConnectAscensionButtons()
+		-- Captures each numeric choice and retains native event links for teardown.
+		self:ConnectAscensionHoverHandlers()
+		if #self.AscensionLevelHandlers > 0 then return end
+		for level = 0, _AscensionDifficultyLogic.MaxLevel do
+			local button = self:GetWorldMapEntity("AscensionDifficultyBtn/Dropdown/Level" .. string.format("%.0f", level))
+			if isvalid(button) then
+				local capturedLevel = level
+				local clickLink = button:ConnectEvent(ButtonClickEvent, function() self:SelectAscensionLevel(capturedLevel) end)
+				table.insert(self.AscensionLevelHandlers, { Entity = button, EventLink = clickLink })
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DisconnectAscensionButtons()
+		-- Releases number handlers before rebinding the persistent map popup.
+		for _, link in ipairs(self.AscensionLevelHandlers) do
+			if isvalid(link.Entity) then link.Entity:DisconnectEvent(ButtonClickEvent, link.EventLink) end
+		end
+		self.AscensionLevelHandlers = {}
+		for _, link in ipairs(self.AscensionHoverHandlers) do
+			if isvalid(link.Entity) then
+				link.Entity:DisconnectEvent(UITouchEnterEvent, link.EnterLink)
+				link.Entity:DisconnectEvent(UITouchExitEvent, link.ExitLink)
+			end
+		end
+		self.AscensionHoverHandlers = {}
+		self:HideAscensionTooltip("")
 	end
 
 	@ExecSpace("ClientOnly")
 	method void RefreshDifficultyButtons()
-		-- Hide selection during shop and route maps; keep the initial choice.
-		local selectable = self.CurrentMode == "LOBBY_STAGE"
-		local locked = self:IsDifficultyLocked()
-		for _, entry in ipairs({ {"NormalDifficultyBtn", "NORMAL", "노말"}, {"HardDifficultyBtn", "HARD", "하드"} }) do
-			local button = self:GetWorldMapEntity(entry[1])
+		-- Shows one compact ascension label and hides it outside lobby stage selection.
+		local lobby = self.CurrentMode == "LOBBY_STAGE"
+		local level = math.max(0, _AscensionDifficultyLogic:ResolveLevel(self.SelectedDifficulty))
+		local ascension = self:GetWorldMapEntity("AscensionDifficultyBtn")
+		if isvalid(ascension) then
+			self:SetNodeVisible(ascension, lobby)
+			ascension.ButtonComponent.Enable = lobby and self.AscensionProgressReady
+			ascension.TextGUIRendererComponent.Text = "승천 " .. string.format("%.0f", level)
+			ascension.TextGUIRendererComponent.FontColor = Color(0.25, 0.16, 0.08, 1)
+			ascension.SpriteGUIRendererComponent.Color = self:IsDifficultyLocked() and Color(0.8, 0.8, 0.8, 1) or Color(1, 0.88, 0.58, 1)
+		end
+		if not lobby or not self.AscensionProgressReady then self:CloseAscensionSelector() end
+		self:RefreshAscensionSelector()
+		self:RefreshAscensionTooltip()
+		log("[AscensionUI] refreshed selected=" .. self.SelectedDifficulty .. " mode=" .. self.CurrentMode .. " ready=" .. tostring(self.AscensionProgressReady))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshAscensionSelector()
+		-- Displays numbers only; locked levels are muted and cannot be selected.
+		local selected = _AscensionDifficultyLogic:ResolveLevel(self.SelectedDifficulty)
+		for level = 0, _AscensionDifficultyLogic.MaxLevel do
+			local button = self:GetWorldMapEntity("AscensionDifficultyBtn/Dropdown/Level" .. string.format("%.0f", level))
 			if isvalid(button) then
-				self:SetNodeVisible(button, selectable)
-				local selected = self.SelectedDifficulty == entry[2]
-				button.ButtonComponent.Enable = selectable and not locked
-				button.TextGUIRendererComponent.Text = entry[3]
-				button.SpriteGUIRendererComponent.Color = selected and Color(1, 0.82, 0.42, 1) or Color(1, 1, 1, 1)
-				button.TextGUIRendererComponent.FontColor = Color(0.286, 0.188, 0, 1)
+				local unlocked = self.AscensionProgressReady and level <= self.UnlockedAscensionLevel
+				button.TextGUIRendererComponent.Text = string.format("%.0f", level)
+				button.ButtonComponent.Enable = unlocked and not self:IsDifficultyLocked()
+				button.SpriteGUIRendererComponent.Color = selected == level and Color(1, 0.8, 0.4, 1) or (unlocked and Color(1, 1, 1, 1) or Color(0.62, 0.62, 0.62, 1))
+				button.TextGUIRendererComponent.FontColor = unlocked and Color(0.25, 0.16, 0.08, 1) or Color(0.47, 0.43, 0.38, 1)
 			end
 		end
-		log("[WorldMapDifficulty] selected=" .. self.SelectedDifficulty .. " mode=" .. self.CurrentMode .. " visible=" .. tostring(selectable))
+	end
+
+
+	@ExecSpace("ClientOnly")
+	method void ConnectAscensionHoverHandlers()
+		-- Keeps locked choices hoverable through their independent touch receivers.
+		if #self.AscensionHoverHandlers > 0 then return end
+		for level = -1, _AscensionDifficultyLogic.MaxLevel do
+			local capturedLevel = level
+			local key = level < 0 and "current" or "level" .. string.format("%.0f", level)
+			local path = level < 0 and "AscensionDifficultyBtn" or "AscensionDifficultyBtn/Dropdown/Level" .. string.format("%.0f", level)
+			local button = self:GetWorldMapEntity(path)
+			if isvalid(button) then
+				local enterLink = button:ConnectEvent(UITouchEnterEvent, function() self:ShowAscensionTooltip(capturedLevel, key) end)
+				local exitLink = button:ConnectEvent(UITouchExitEvent, function() self:HideAscensionTooltip(key) end)
+				table.insert(self.AscensionHoverHandlers, { Entity = button, EnterLink = enterLink, ExitLink = exitLink })
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ShowAscensionTooltip(integer hoverLevel, string ownerKey)
+		-- Builds the preview from the same rules and rewards used by the server.
+		if not self.IsWorldMapOpenState or self.CurrentMode ~= "LOBBY_STAGE" then return end
+		if hoverLevel >= 0 and not self.AscensionSelectorOpen then return end
+		local level = hoverLevel < 0 and math.max(0, _AscensionDifficultyLogic:ResolveLevel(self.SelectedDifficulty)) or hoverLevel
+		if level < 0 or level > _AscensionDifficultyLogic.MaxLevel then return end
+		local tooltip = self:GetTooltipUI()
+		if tooltip == nil then return end
+		local text = _AscensionDifficultyLogic:GetTooltipText(level)
+		if not self.AscensionProgressReady then
+			text = text .. "\n\n해금 정보를 불러오는 중입니다."
+		elseif level > self.UnlockedAscensionLevel then
+			local requirement = level == 1 and "일반 난이도" or "승천 " .. string.format("%.0f", level - 1)
+			text = text .. "\n\n잠김 · " .. requirement .. " 완주 시 해금"
+		elseif self.AscensionRunActive then
+			text = text .. "\n\n도전 중에는 단계를 변경할 수 없습니다."
+		elseif hoverLevel < 0 then
+			text = text .. "\n\n휠: 단계 변경 · 클릭: 단계 펼치기"
+		else
+			text = text .. "\n\n클릭하여 이 단계 선택"
+		end
+		self._T.AscensionHoverLevel = hoverLevel
+		self._T.AscensionHoverOwner = ownerKey
+		tooltip.TooltipText.IsRichText = true
+		tooltip:Show("ascension:" .. ownerKey, text)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void HideAscensionTooltip(string ownerKey)
+		-- A late exit from another choice cannot dismiss the newly hovered choice.
+		local currentOwner = self._T.AscensionHoverOwner
+		if currentOwner == nil or (ownerKey ~= "" and ownerKey ~= currentOwner) then return end
+		local tooltip = self:GetTooltipUI()
+		if tooltip ~= nil then tooltip:Hide("ascension:" .. currentOwner) end
+		self._T.AscensionHoverOwner = nil
+		self._T.AscensionHoverLevel = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshAscensionTooltip()
+		-- Refreshes wheel changes and late unlock replies without requiring another hover.
+		if not self.IsWorldMapOpenState or self.CurrentMode ~= "LOBBY_STAGE" then
+			self:HideAscensionTooltip("")
+			return
+		end
+		local ownerKey = self._T.AscensionHoverOwner
+		if ownerKey ~= nil then
+			self:ShowAscensionTooltip(self._T.AscensionHoverLevel or -1, ownerKey)
+		elseif self:IsAscensionPointInside(self:GetWorldMapEntity("AscensionDifficultyBtn"), _InputService:GetCursorPosition()) then
+			self:ShowAscensionTooltip(-1, "current")
+		end
 	end
 
 end

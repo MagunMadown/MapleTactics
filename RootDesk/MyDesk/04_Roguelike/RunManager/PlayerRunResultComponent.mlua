@@ -6,6 +6,7 @@ script PlayerRunResultComponent extends Component
 	property string StartedAtUtc = ""
 	property string CapturedRuleVersion = ""
 	property string RankExclusionReason = ""
+	property boolean AscensionExcluded = false
 	property string FrozenRecordJson = ""
 	property string PendingRecordJson = ""
 	property table PendingRecords = {}
@@ -44,6 +45,7 @@ script PlayerRunResultComponent extends Component
 		self.CapturedRuleVersion = _RunResultContractLogic.RuleVersion
 		self.FrozenRecordJson = ""
 		self.RankExclusionReason = ""
+		self.AscensionExcluded = false
 		if observedStart == false then self.RankExclusionReason = "RUN_START_UNOBSERVED" end
 		if Environment:IsMakerPlay() then self:ExcludeFromRanking("MAKER_TEST") end
 		return { Success = true, Reason = "RUN_RESULT_START_CAPTURED", RunId = runId }
@@ -87,7 +89,15 @@ script PlayerRunResultComponent extends Component
 		if #captured == 0 then return { Success = false, Reason = "RUN_RESULT_PENDING_STATE_INVALID" } end
 		self.SaveInProgress = true
 		self.PersistenceState = "SAVING"
-		local saved = _RunResultRepositoryLogic:SaveResults(self.StorageUserKey, captured)
+		local commitOk, completion = pcall(function() return self:CommitCapturedAscension(captured) end)
+		local saved = nil
+		if commitOk == false then
+			saved = { Success = false, Reason = "ASCENSION_COMMIT_EXCEPTION" }
+		elseif completion.Success == false then
+			saved = completion
+		else
+			saved = _RunResultRepositoryLogic:SaveResults(self.StorageUserKey, captured)
+		end
 		self.SaveInProgress = false
 		if saved.Success then
 			for _, encoded in ipairs(captured) do
@@ -117,6 +127,21 @@ script PlayerRunResultComponent extends Component
 		end
 		self.ResultRevision = self.ResultRevision + 1
 		return saved
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CommitCapturedAscension(table captured)
+		-- One highest trusted completion commits at most one profile write for the whole pending batch.
+		local highest = -1
+		for _, encoded in ipairs(captured) do
+			local decoded = _RunResultContractLogic:DecodeRecord(encoded)
+			if decoded.Success == false then return decoded end
+			if decoded.HasRecord and decoded.Record.EndReason == "COMPLETED" and decoded.Record.AscensionEligible == true then
+				highest = math.max(highest, decoded.Record.AscensionLevel)
+			end
+		end
+		if highest < 0 then return { Success = true, Reason = "NO_ASCENSION_COMPLETION" } end
+		return _AscensionProgressionLogic:CommitCompletion(self.Entity, highest)
 	end
 
 	@ExecSpace("ServerOnly")

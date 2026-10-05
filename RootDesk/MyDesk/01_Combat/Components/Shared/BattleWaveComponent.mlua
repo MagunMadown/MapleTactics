@@ -30,7 +30,6 @@ script BattleWaveComponent extends Component
 	property integer ForceSpawnTimerId = 0
 	@Sync property integer SpawnVariantIndex = 0
 	property integer SpawnVariantSeed = 0
-	property integer HardEnemyAttackBonus = 1
 
 	@ExecSpace("ServerOnly")
 	method void ResetWaveState(integer totalWaves, string reason)
@@ -246,7 +245,7 @@ script BattleWaveComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method integer GetHardEnemyHpBonus(table definition)
+	method integer GetBaseAscensionHpBonus(table definition)
 		-- Explicit regional tuning: fragile/ranged +1~2, frontline +2~4, bosses separate.
 		local bonuses = {
 			early_mushroom = 1,
@@ -310,13 +309,25 @@ script BattleWaveComponent extends Component
 	end
 
 	@ExecSpace("ServerOnly")
-	method table ResolveDifficultyStats(any session, table definition)
-		-- Resolve a copy at spawn time; repository data and later waves remain unmodified.
+	method integer GetAscensionLevel(any session)
+		-- Reads the rank frozen on the authoritative run and keeps skill-test dummies unscaled.
+		if session.SkillTestMode then return 0 end
 		local run = isvalid(session.PlayerEntity) and session.PlayerEntity:GetComponent("script.PlayerRunStateComponent") or nil
-		local hard = not session.SkillTestMode and run ~= nil and run.RunDifficulty == "HARD"
-		local bonus = hard and self.HardEnemyAttackBonus or 0
-		return { MaxHp = hard and definition.MaxHp + self:GetHardEnemyHpBonus(definition) or definition.MaxHp,
-			BasicAttackDamage = definition.BasicAttackDamage + bonus, AttackBonus = bonus }
+		return run ~= nil and math.max(0, _AscensionDifficultyLogic:ResolveLevel(run.RunDifficulty)) or 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveDifficultyStats(any session, table definition)
+		-- Scales a spawn-time copy, preserving repository values and deliberately fragile summons.
+		local level = self:GetAscensionLevel(session)
+		local rules = _AscensionDifficultyLogic:GetRules(level)
+		local hpScale = definition.IsBoss == true and rules.BossHpScale or rules.EnemyHpScale
+		local hpBonus = self:GetBaseAscensionHpBonus(definition) * hpScale
+		if definition.IsBoss ~= true then hpBonus = math.min(hpBonus, math.max(1, definition.MaxHp)) end
+		local stats = { MaxHp = definition.MaxHp + hpBonus,
+			BasicAttackDamage = definition.BasicAttackDamage + rules.AttackBonus, AttackBonus = rules.AttackBonus }
+		log("[AscensionStats] level=" .. tostring(level) .. " enemy=" .. definition.EnemyDefinitionId .. " hp=" .. tostring(stats.MaxHp) .. " attack=" .. tostring(stats.BasicAttackDamage))
+		return stats
 	end
 
 	@ExecSpace("ServerOnly")
@@ -499,8 +510,12 @@ script BattleWaveComponent extends Component
 			session:PublishWaveStateSnapshot("WAVE_DEFINITION_ERROR")
 			return
 		end
-		local count = session.SkillTestMode and 1 or definition.SpawnCount
+		local rules = _AscensionDifficultyLogic:GetRules(self:GetAscensionLevel(session))
+		local count = session.SkillTestMode and 1 or (definition.SpawnCount + (useVariant and rules.SpawnCountBonus or 0))
 		count = _TutorialRulesLogic:GetSpawnCount(session, waveNumber, count)
+		local forceTurns = definition.ForceAfterTurns
+		if useVariant and forceTurns > 0 then forceTurns = math.max(1, forceTurns - rules.ForceTurnReduction) end
+		local concurrent = definition.MaxConcurrent + (useVariant and rules.ConcurrentBonus or 0)
 		local roster = {}
 		for index = 1, count do
 			local enemy = nil
@@ -519,8 +534,9 @@ script BattleWaveComponent extends Component
 		end
 		-- Resolve lesson overrides before beginning the normal wave lifecycle.
 		local spawnMode = _TutorialRulesLogic:GetSpawnMode(session, definition.SpawnTriggerMode)
-		local maxConcurrent = _TutorialRulesLogic:GetMaxConcurrent(session, count, definition.MaxConcurrent)
-		self:BeginWave(waveNumber, spawnMode, definition.ForceAfterTurns, definition.ForceAfterSeconds, count, maxConcurrent, definition.ClearSpawnDelaySeconds, math.max(1, session.StageTurnNumber))
+		local maxConcurrent = _TutorialRulesLogic:GetMaxConcurrent(session, count, concurrent)
+		self:BeginWave(waveNumber, spawnMode, forceTurns, definition.ForceAfterSeconds, count, maxConcurrent, definition.ClearSpawnDelaySeconds, math.max(1, session.StageTurnNumber))
+		log("[AscensionWave] level=" .. tostring(rules.Level) .. " stage=" .. session.StageId .. " wave=" .. tostring(waveNumber) .. " count=" .. tostring(count) .. " forceTurns=" .. tostring(forceTurns) .. " concurrent=" .. tostring(concurrent))
 		self:SetWaveTriggerPhaseIndex(definition.TriggerPhaseIndex or 0, "WAVE_BEGIN")
 		self.SpawnProfile = session.StageType == "BOSS" and "BOSS" or (definition.SpawnTriggerMode == "LONE_ENEMY" and "NORMAL" or "PRESSURE")
 		self.PendingSpawnDefinitions = roster
