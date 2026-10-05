@@ -336,11 +336,15 @@ script BattleQueueHudComponent extends Component
 		self._T.SkillHoverElapsed = (self._T.SkillHoverElapsed or 0) + delta
 		if self._T.SkillHoverElapsed < 0.15 then return end
 		self._T.SkillHoverElapsed = 0
+		if self:RefreshShopSkillBar() == false and self._T.ShopSkillPreview then
+			self._T.ShopSkillPreview = false
+			self:RefreshHud(true)
+		end
 		if not self.IsHudContextVisible or self._T.SkillSlotDragActive or self.IsMapTransferPending then self:HideSkillHover() return end
 		local player = _UserService.LocalPlayer
 		if not isvalid(player) or not isvalid(player.CurrentMap) then self:HideSkillHover() return end
 		local session = player.CurrentMap:GetComponent("script.BattleSessionComponent")
-		if session == nil or session.BattleResult ~= "" then self:HideSkillHover() return end
+		if (session == nil and not self._T.ShopSkillPreview) or (session ~= nil and session.BattleResult ~= "") then self:HideSkillHover() return end
 		local cursor = _InputService:GetCursorPosition()
 		local skillId = ""
 		for index = 1, 6 do
@@ -357,6 +361,10 @@ script BattleQueueHudComponent extends Component
 		local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
 		local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
 		if tooltip == nil then return end
+		if self._T.ShopSkillPreview then
+			tooltip:Show("battle_skill", self._T.ShopSkillDescriptions[skillId] or skillId)
+			return
+		end
 		local unit = player:GetComponent("script.BattleUnitComponent")
 		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
 		local signature = tostring(session.EntryRequestId) .. ":" .. tostring(session.TurnNumber) .. ":" .. tostring(session.EnemyPlanRevision) .. ":" .. tostring(session.SkillSlotRevision)
@@ -365,6 +373,45 @@ script BattleQueueHudComponent extends Component
 			.. ":" .. tostring(unit ~= nil and unit.CurrentHp or 0) .. ":" .. tostring(unit ~= nil and unit.MaxHp or 0)
 			.. ":" .. tostring(inventory ~= nil and inventory.InventoryRevision or 0)
 		tooltip:RequestSkillHover(player.CurrentMap, skillId, signature)
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean RefreshShopSkillBar()
+		-- Show the current run's owner-synced skills on shop nodes without enabling combat commands.
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if not state.Success or not state.Commands.CanOpenUi then return false end
+		local player = _UserService.LocalPlayer
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.ActiveRunSequence ~= state.RunSequence then return false end
+		local signature = "SHOP:" .. tostring(state.RunSequence) .. ":" .. inventory.RunSkillBarSlotIds .. ":" .. state.SkillSnapshot .. ":" .. state.SellCatalogSnapshot
+		self._T.ShopSkillPreview = true
+		self:SetHudContextVisible(true, "SHOP_SKILL_PREVIEW")
+		if self.LastSignature == signature then return true end
+		self:SetUnavailableState("보유 스킬 · 상점")
+		self.LastSignature = signature
+		self.SlotSkillIds = inventory.RunSkillBarSlotIds
+		self.SlotSkillCooldownTurns = ""
+		self._T.IconMap = {}
+		self._T.ShopSkillDescriptions = {}
+		local names = {}
+		local nameMap = {}
+		for raw in string.gmatch(state.SellCatalogSnapshot or "", "([^|]+)") do
+			local fields = {}
+			for field in string.gmatch(raw .. "~", "([^~]*)~") do table.insert(fields, field) end
+			if fields[6] == "SKILL" then
+				nameMap[fields[1]] = fields[2]
+				self._T.IconMap[fields[1]] = fields[3]
+				self._T.ShopSkillDescriptions[fields[1]] = fields[2] .. "\n" .. fields[5]
+			end
+		end
+		for index = 1, 6 do names[index] = nameMap[self:GetSlotSkillId(index)] or "" end
+		self.SlotSkillNames = table.concat(names, "|")
+		self:RefreshSkillSlots(false, state.SkillSnapshot, "", "")
+		self:HideAllSkillCooldownPips()
+		self.TurnText.Text = ""
+		self.ExecuteButton.Entity.Enable = false
+		log("[BattleQueueHUD] shop skills=" .. self.SlotSkillIds)
+		return true
 	end
 
 	@ExecSpace("ClientOnly")
@@ -431,6 +478,7 @@ script BattleQueueHudComponent extends Component
 			log("[BattleQueueHUD] map transfer lock released map=" .. currentMapName)
 		end
 		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
+			if self:RefreshShopSkillBar() then return end
 			local reason = presenterState == nil and "PRESENTER_STATE_MISSING" or presenterState.ContextReason
 			self.HasQueueFeedbackSnapshot = false
 			self.LastQueuedTileIds = ""
@@ -443,6 +491,8 @@ script BattleQueueHudComponent extends Component
 		local waveState = presenterState.Wave
 		local uiState = presenterState.UiState
 		self:ConsumeSkillSlotReorderReceipt(session)
+		self._T.ShopSkillPreview = false
+		self.ExecuteButton.Entity.Enable = true
 		self:SetHudContextVisible(true, "BATTLE_CONTEXT_READY")
 		local queueState = uiState.PlayerQueue
 		local runFlowUi = presenterState.RunFlowUi
@@ -1041,6 +1091,7 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method boolean CanBeginSkillSlotDrag(integer slotIndex)
+		if self._T.ShopSkillPreview then return false end
 		if self.PendingSkillSlotReorderRequestId > 0
 			or self._T.SkillSlotDragCancelling == true
 			or (_UtilLogic.ElapsedSeconds or 0) < self.SuppressSkillDragUntil
@@ -1051,7 +1102,7 @@ script BattleQueueHudComponent extends Component
 		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
 			return false
 		end
-		if _TutorialRulesLogic:IsGuided(presenterState.Session) then
+		if not _TutorialRulesLogic:CanEditSkillQueue(presenterState.Session) then
 			return false
 		end
 		local uiState = presenterState.UiState
@@ -1962,6 +2013,8 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void RefreshSkillSlot(integer slotIndex, ButtonComponent button, TextGUIRendererComponent label, SpriteGUIRendererComponent icon, SpriteGUIRendererComponent queuedHighlight, TextGUIRendererComponent queueOrderBadge, TextGUIRendererComponent cooldownText, boolean canChooseTile, string ownedSkills, string cooldownSnapshot, string queuedTileIds)
 		-- Renders one slot from its server-assigned skill: empty slots stay labelled and disabled.
+		self._T.SkillSlotCanQueue = self._T.SkillSlotCanQueue or {}
+		self._T.SkillSlotCanQueue[slotIndex] = false
 		local skillId = self:GetSlotSkillId(slotIndex)
 		if skillId == "" then
 			-- Keep all six positions legible even when the later prototype slots have no skill data.
@@ -2028,10 +2081,13 @@ script BattleQueueHudComponent extends Component
 			queueOrderBadge.Enable = false
 			queueOrderBadge.Entity.Enable = false
 		end
-		button.Enable = canChooseTile
+		local canQueue = canChooseTile
 			and self:IsSkillOwned(ownedSkills, skillId)
 			and remainingCooldown <= 0
 			and queueOrder <= 0
+		self._T.SkillSlotCanQueue[slotIndex] = canQueue
+		-- Keep pointer input alive for rearranging reserved or cooling-down skills.
+		button.Enable = canQueue or self:CanBeginSkillSlotDrag(slotIndex)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -2048,6 +2104,9 @@ script BattleQueueHudComponent extends Component
 			log_warning("[BattleQueueHUD] register click ignored slot=" .. slotIndex .. " reason=SLOT_EMPTY")
 			return
 		end
+
+		-- A drag-enabled button is not necessarily available for queue registration.
+		if self._T.SkillSlotCanQueue ~= nil and self._T.SkillSlotCanQueue[slotIndex] == false then return end
 
 		self.SuppressSkillDragUntil = (_UtilLogic.ElapsedSeconds or 0) + self.SkillSlotDragClickSuppressionSeconds
 		self:PlaySkillIconPunch(slotIndex)
@@ -2420,12 +2479,20 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
 	handler HandleQuickbarCancelKey(KeyDownEvent event)
-		-- Keyboard slots follow the current quickbar order and reuse the click/server validation path.
-		if not self.IsHudContextVisible or self.IsMapTransferPending or _GameSettingsLogic:IsInputBlocked() then return end
+		-- Hotkeys toggle the current skill in the pending queue; execution and input locks stay authoritative.
+		if self._T.ShopSkillPreview or not self.IsHudContextVisible or self.IsMapTransferPending or _GameSettingsLogic:IsInputBlocked() then return end
 		for slotIndex = 1, 6 do
 			if _GameSettingsLogic:IsActionKey("SLOT_" .. tostring(slotIndex), event.key) then
-				log("[BattleQueueHUD] keyboard register requested slot=" .. tostring(slotIndex))
-				self:RequestSlotSkill(slotIndex, false)
+				local skillId = self:GetSlotSkillId(slotIndex)
+				local session = _BattleHudPresenterLogic:GetBattleSession()
+				local queueIndex = session ~= nil and skillId ~= "" and self:GetQueueOrder(session.QueuedTileIds, skillId) or 0
+				if queueIndex > 0 then
+					log("[BattleQueueHUD] keyboard cancel requested slot=" .. tostring(slotIndex) .. " tile=" .. skillId .. " index=" .. tostring(queueIndex))
+					_BattleHudPresenterLogic:RequestRemoveQueueItem(queueIndex)
+				else
+					log("[BattleQueueHUD] keyboard register requested slot=" .. tostring(slotIndex))
+					self:RequestSlotSkill(slotIndex, false)
+				end
 				return
 			end
 		end
