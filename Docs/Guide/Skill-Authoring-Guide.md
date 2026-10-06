@@ -80,6 +80,7 @@ TryQueueTile
 | `FreePlay` | boolean | `false` | `false`면 등록 자체가 턴을 소비하고, `true`면 등록 후 플레이어 턴 유지 |
 | `CastEffectRuid` | string | 32자리 hex | 시전자에게 붙는 이펙트. 비우면 생략. `a|b|c`처럼 `|`로 여러 개를 적으면 정지 sprite를 차례로 보여 주는 플립북(한 장당 0.12초)이 되고, 도감·미리보기는 첫 RUID를 쓴다(도적 `venom`) |
 | `HitEffectRuid` | string | 32자리 hex | 피격 대상에게 붙는 이펙트. 비우면 생략 |
+| `CellEffectRuid` | string | 32자리 hex | 시전 시 스킬이 떨어지는 모든 칸에 1회씩 재생하는 이펙트(예: 주니어 발록 메테오). 비우면 생략. CSV 마지막 열 |
 | `EffectScale` | number | `0.9` | 이펙트 배율. 0.05 미만은 0.05로 보정 |
 | `WeaponType` | string | `ONE_HANDED_SWORD` | `WeaponDefinitions.WeaponType` 참조. 비우면 현재 장착 무기 유지 |
 | `ProjectileRuid` | string | 32자리 hex | 날아가는 투사체 animationclip. 비우면 비행 단계 없음 |

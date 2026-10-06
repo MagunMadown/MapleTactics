@@ -111,6 +111,7 @@
 | FreePlay | boolean | O | 큐 등록 시 턴 미소비 여부 |
 | CastEffectRuid | string | - | 시전자에게 재생할 animationclip RUID. 비우면 시전 이펙트 없음 |
 | HitEffectRuid | string | - | 피격 대상에게 재생할 animationclip RUID. 비우면 피격 이펙트 없음 |
+| CellEffectRuid | string | - | 시전 시 스킬 대상 칸 전체(TargetResolver의 경고 칸, 비어 있어도 포함)에 1회씩 재생할 animationclip RUID. 시전/피격 이펙트와 함께 나오며 `EffectScale`을 따른다. 비우면 없음 (CSV 마지막 열) |
 | EffectScale | number | - | 두 이펙트에 공통 적용할 배율. 비우면 `1` |
 | WeaponType | string | - | §4.4 `WeaponDefinitions.WeaponType` 참조. 비우면 현재 장착 무기를 유지 |
 | ProjectileRuid | string | - | 날아가는 투사체 animationclip RUID. 비우면 비행 단계 없음 |
@@ -831,6 +832,7 @@ Facing을 이전 값으로 복구한다.
 | ReinforcementPoolId | string | - | 페이즈별 보충 적 Pool. 빈 칸이면 보충 비활성화 |
 | ReinforcementIntervalTurns | integer | - | 보충 활성화 시 1 이상. 성공한 보충 사이의 최소 턴 간격 |
 | ReinforcementMaxAlive | integer | - | 보충 활성화 시 1~4. 최초 잡몹을 포함한 살아 있는 일반 적 상한 |
+| ReinforcementSpawnRange | integer | - | 0 이상 정수. 빈 칸/0이면 플레이어에서 가장 먼 빈 칸, N≥1이면 플레이어 기준 N칸 이내 빈 칸 중 시드 기반 선택. 범위 안이 가득 차면 이번 보충은 건너뛰고 다음 턴 재시도 |
 
 첫 Phase는 `HpRatioLE=1.0`이고 `EnemyDefinitions.PatternId`와 같아야 한다.
 Phase 전환은 이미 고정된 적 Queue를 바꾸지 않으며, 다음 라운드 계획부터 새 Pattern을 사용한다.

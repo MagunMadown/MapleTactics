@@ -185,6 +185,8 @@ script BattleSessionComponent extends Component
 	property number PushMotionDuration = 0.40
 	property number PushImpactDelay = 0.18
 	property string ActiveEffectSkillId = ""
+	property string CellEffectSortingLayer = "MapLayer0"
+	property integer CellEffectOrderInLayer = 30
 	property string ActiveHitEffectRuid = ""
 	property string ActiveHitSoundRuid = ""
 	property number ActiveEffectScale = 1
@@ -5296,6 +5298,7 @@ script BattleSessionComponent extends Component
 				end
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CastEffectRuid)
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.HitEffectRuid)
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CellEffectRuid)
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.ProjectileRuid)
 				-- Audio clips warm the same way: an unloaded cast sound lands after its own swing, which
 				-- reads as a mistimed hit rather than a slow load.
@@ -5310,6 +5313,7 @@ script BattleSessionComponent extends Component
 		if utility.Success == true then
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastEffectRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitEffectRuid)
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CellEffectRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.ProjectileRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastSoundRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitSoundRuid)
@@ -5421,7 +5425,7 @@ script BattleSessionComponent extends Component
 		-- Warm the new utility's clips and sounds so its first cast looks like every later one.
 		local ruids = {}
 		local seen = {}
-		for _, ruid in ipairs({ definition.CastEffectRuid, definition.HitEffectRuid, definition.ProjectileRuid, definition.CastSoundRuid, definition.HitSoundRuid }) do
+		for _, ruid in ipairs({ definition.CastEffectRuid, definition.HitEffectRuid, definition.CellEffectRuid, definition.ProjectileRuid, definition.CastSoundRuid, definition.HitSoundRuid }) do
 			self:CollectPresentationRuid(ruids, seen, ruid)
 		end
 		if #ruids > 0 and isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
@@ -7464,6 +7468,20 @@ script BattleSessionComponent extends Component
 			self.ActiveEffectFlipX = sourceUnit.Facing == "Right"
 		end
 
+		-- The cell clip is tied to the struck cells, not the caster, so impact overrides below never mute it.
+		local cellEffectRuid = definition.CellEffectRuid or ""
+		if cellEffectRuid ~= "" then
+			local resolved = _SkillTargetResolverLogic:Resolve(self, sourceUnitId, definition)
+			local xs = {}
+			for _, cell in ipairs(resolved.TargetCellIndices or {}) do
+				table.insert(xs, self:GetCellPosition(cell).x)
+			end
+			if #xs > 0 then
+				self:PlayCellEffects(cellEffectRuid, xs, self.UnitY, self.ActiveEffectScale, self:GetSkillSpeedMultiplier())
+			end
+			log("[BattleEffect] cell effects requested skill=" .. self.ActiveEffectSkillId .. " ruid=" .. cellEffectRuid .. " cells=" .. table.concat(resolved.TargetCellIndices or {}, "|"))
+		end
+
 		local castEffectRuid = definition.CastEffectRuid or ""
 		if sourceUnit ~= nil and sourceUnit.Team == "Enemy" then
 			-- Only accepted damage emits enemy hit audio; PUSH/HEAL cannot replay it.
@@ -7494,6 +7512,27 @@ script BattleSessionComponent extends Component
 			sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
 		end
 		sourcePresentation:PlaySkillSound(sourceUnitId, "CAST", castSoundRuid, self:GetSkillSoundVolume())
+	end
+
+	@ExecSpace("Client")
+	method void PlayCellEffects(string effectRuid, table xs, number y, number scale, number playRate)
+		-- Plays one non-looping clip at each given board x. Purely presentational.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= self.Entity then return end
+		local safeScale = math.max(0.05, scale)
+		local options = {}
+		options["SortingLayer"] = self.CellEffectSortingLayer
+		options["OrderInLayer"] = self.CellEffectOrderInLayer
+		options["PlayRate"] = math.max(0.1, playRate)
+		local played = 0
+		for _, x in ipairs(xs) do
+			local serial = _EffectService:PlayEffect(effectRuid, self.Entity, Vector3(x, y, 0), 0, Vector3(safeScale, safeScale, 1), false, options)
+			if serial ~= 0 then played = played + 1 end
+		end
+		if played < #xs then
+			log_warning("[BattleEffect] cell effects partial ruid=" .. effectRuid .. " played=" .. played .. "/" .. #xs)
+		end
+		log("[BattleEffect] cell effects played ruid=" .. effectRuid .. " count=" .. played .. " y=" .. y .. " scale=" .. safeScale)
 	end
 
 	@ExecSpace("ServerOnly")
