@@ -34,7 +34,7 @@
 | teleport | mage | 전방의 빈 칸 중 가장 먼 칸으로 이동 |
 | fairy_turn (드래곤 펄스) | archer | 앞 1~2칸(`RANGE_OFFSETS` 1|2, Range 2)의 적을 최대 2칸 밀며 막히면 중단. 투사체·피격 연출은 시각 전용 |
 | rapid_evasion (인투 다크니스) | thief | 전방에서 가장 먼 적의 1칸 뒤로 이동 후 그 적을 향해 돌아섬. 뒤 칸이 경계 밖·점유면 그 적의 앞 칸으로 이동(돌아서지 않음). 앞 칸도 불가하면 실패 |
-| somersault_kick | pirate | 바로 앞 적을 붙잡아 시전자 바로 뒤 칸으로 넘긴다. 대상 없음·HEAVY·뒤 칸이 막히거나 보드 밖이면 실패(쿨다운 미소모) |
+| somersault_kick | pirate | 바로 앞 적을 바라보는 방향의 가장 먼 빈 칸으로 날린다(`THROW_FORWARD` / `FARTHEST_EMPTY`). 사이 유닛은 넘어간다. 대상 없음·HEAVY·그 너머에 빈 칸이 없으면 실패(쿨다운 미소모) |
 
 해적 유틸은 파도(`tidal_wave`, 밀기 + 장전 취소)에서 써머솔트 킥으로 교체됐다. 파도가 쓰던 `PUSH_DISTANCE`
 토큰(`CARRY_CASTER`, `CANCEL_QUEUE`)은 코드와 계약에 그대로 남아 있어 다른 유틸에서 다시 쓸 수 있다.
@@ -52,6 +52,9 @@
 | PUSH_DISTANCE | PRIMARY_TARGET 또는 ALL_SKILL_TARGETS / SELF 제외 | 양의 정수 | STOP_BEFORE_BLOCKED | 비움 또는 아래 토큰 조합 |
 | PUSH_DISTANCE | PRIMARY_TARGET 또는 ALL_SKILL_TARGETS / SELF 제외 | 0 | MAX | 비움 또는 아래 토큰 조합 |
 | THROW_BEHIND | PRIMARY_TARGET / SELF 제외 | 양의 정수(시전자 뒤 몇 번째 칸) | 비움 | 비움 |
+| THROW_FORWARD | PRIMARY_TARGET / SELF 제외 | 0 | FARTHEST_EMPTY(대상 너머 전방의 가장 먼 빈 칸, 사이 유닛 무시) | 비움 |
+
+`THROW_BEHIND`는 현재 데이터에서 쓰지 않지만 코드와 계약에 남아 있다.
 
 PUSH_DISTANCE의 `ParameterB`는 `|`로 구분한 토큰 집합이며 중복은 거부한다.
 
