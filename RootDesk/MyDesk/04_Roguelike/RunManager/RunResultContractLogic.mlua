@@ -1,9 +1,39 @@
 @Logic
 script RunResultContractLogic extends Logic
 
-	property integer SchemaVersion = 2
+	property integer SchemaVersion = 3
 	property integer MaxRecordBytes = 4000
 	property string RuleVersion = "run_result_v1"
+	property string BalanceVersion = "balance_2026_10_06"
+	property string SeasonId = "all_time"
+	property string RankingRuleVersion = "completion_turns_hits_v1"
+	property string AccountProgressionMode = "ACCOUNT_APPLIED"
+
+	method table CaptureConditions(string difficulty, boolean observedStart)
+		-- Captures server policy at run start; unversioned data is not a public leaderboard release.
+		return { Captured = true, ObservedStart = observedStart, DifficultyId = difficulty,
+			BalanceVersion = self.BalanceVersion, SeasonId = self.SeasonId,
+			RankingRuleVersion = self.RankingRuleVersion, AccountProgressionMode = self.AccountProgressionMode }
+	end
+
+	method table EmptyConditions()
+		-- Legacy records cannot be assigned today's balance, difficulty, or season retrospectively.
+		return { Captured = false, ObservedStart = false, DifficultyId = "", BalanceVersion = "",
+			SeasonId = "", RankingRuleVersion = "", AccountProgressionMode = "" }
+	end
+
+	method table ValidateConditions(table conditions)
+		-- Validates bounded server-captured grouping fields without changing private best-record policy.
+		if type(conditions) ~= "table" or conditions.Captured ~= true or type(conditions.ObservedStart) ~= "boolean" then
+			return { Success = false, Reason = "RUN_RESULT_CONDITIONS_MISSING" }
+		end
+		for _, field in ipairs({ "DifficultyId", "BalanceVersion", "SeasonId", "RankingRuleVersion", "AccountProgressionMode" }) do
+			if type(conditions[field]) ~= "string" or conditions[field] == "" or #conditions[field] > 64 then
+				return { Success = false, Reason = "RUN_RESULT_CONDITION_INVALID", Field = field }
+			end
+		end
+		return { Success = true, Reason = "OK" }
+	end
 
 	method string MakeRecordId(integer runId)
 		-- JSON may restore integer-valued numbers as floats; IDs never depend on tostring formatting.
@@ -17,7 +47,7 @@ script RunResultContractLogic extends Logic
 
 	method table ValidateRecord(table record)
 		-- Validates the persisted DTO, not a live Component or a client-supplied score.
-		if record == nil or (record.SchemaVersion ~= 1 and record.SchemaVersion ~= self.SchemaVersion) then
+		if type(record) ~= "table" or (record.SchemaVersion ~= 1 and record.SchemaVersion ~= 2 and record.SchemaVersion ~= self.SchemaVersion) then
 			return { Success = false, Reason = "RUN_RESULT_SCHEMA_UNSUPPORTED" }
 		end
 		for _, field in ipairs({ "RunId", "RunSequence", "RunSeed", "ConsumedTurns", "HitsTaken", "CompletedStageNumber" }) do
@@ -55,12 +85,26 @@ script RunResultContractLogic extends Logic
 		if record.RankEligible and (record.EndReason ~= "COMPLETED" or record.RankExclusionReason ~= "" or record.JobId == "") then
 			return { Success = false, Reason = "RUN_RESULT_ELIGIBILITY_INVALID" }
 		end
-		if record.SchemaVersion == self.SchemaVersion then
+		if record.SchemaVersion >= 2 then
 			if type(record.Build) ~= "table" or record.Build.Captured ~= true then
 				return { Success = false, Reason = "RUN_RESULT_BUILD_MISSING" }
 			end
 			local buildValidation = _RunBuildSnapshotLogic:ValidateSnapshot(record.Build)
 			if not buildValidation.Success then return buildValidation end
+		end
+		if record.SchemaVersion == self.SchemaVersion then
+			local conditions = self:ValidateConditions(record.Conditions)
+			if not conditions.Success then return conditions end
+			local regions = _RunRegionHistoryContractLogic:ValidateSnapshot(record.RegionHistory)
+			if not regions.Success then return regions end
+			if record.RegionHistory.Captured ~= true or not _RunRegionHistoryContractLogic:IsCounter(record.ClearedBattleCount)
+				or record.ClearedBattleCount ~= regions.ClearedBattleCount
+				or regions.ConsumedTurns > record.ConsumedTurns or regions.HitsTaken > record.HitsTaken then
+				return { Success = false, Reason = "RUN_RESULT_REGION_TOTAL_MISMATCH" }
+			end
+			if record.RankEligible and (not record.Conditions.ObservedStart or not record.RegionHistory.Complete or #record.RegionHistory.Visits == 0) then
+				return { Success = false, Reason = "RUN_RESULT_ELIGIBILITY_INVALID" }
+			end
 		end
 		return { Success = true, Reason = "OK", Record = record }
 	end
@@ -75,6 +119,7 @@ script RunResultContractLogic extends Logic
 		local stored = {}
 		for key, value in pairs(record) do stored[key] = value end
 		stored.Build = _RunBuildSnapshotLogic:ToStorageSnapshot(record.Build)
+		stored.RegionHistory = _RunRegionHistoryContractLogic:ToStorageSnapshot(record.RegionHistory)
 		local ok, encoded = pcall(function() return _HttpService:JSONEncode(stored) end)
 		if ok == false or type(encoded) ~= "string" then
 			return { Success = false, Reason = "RUN_RESULT_ENCODE_FAILED" }
@@ -91,13 +136,22 @@ script RunResultContractLogic extends Logic
 		if string.len(encoded) > self.MaxRecordBytes then return { Success = false, Reason = "RUN_RESULT_TOO_LARGE" } end
 		local ok, decoded = pcall(function() return _HttpService:JSONDecode(encoded) end)
 		if ok == false or type(decoded) ~= "table" then return { Success = false, Reason = "RUN_RESULT_DECODE_FAILED" } end
-		if decoded.SchemaVersion == self.SchemaVersion and type(decoded.Build) == "table" then
+		if (decoded.SchemaVersion == 2 or decoded.SchemaVersion == self.SchemaVersion) and type(decoded.Build) == "table" then
 			decoded.Build = _RunBuildSnapshotLogic:FromStorageSnapshot(decoded.Build)
+		end
+		if decoded.SchemaVersion == self.SchemaVersion and type(decoded.RegionHistory) == "table" then
+			decoded.RegionHistory = _RunRegionHistoryContractLogic:FromStorageSnapshot(decoded.RegionHistory)
 		end
 		local validation = self:ValidateRecord(decoded)
 		if validation.Success and decoded.SchemaVersion == 1 then
 			-- Normalize the read DTO only; keep the original JSON for repository CAS/deduplication.
 			decoded.Build = _RunBuildSnapshotLogic:EmptySnapshot()
+		end
+		if validation.Success and decoded.SchemaVersion < self.SchemaVersion then
+			decoded.Conditions = self:EmptyConditions()
+			decoded.RegionHistory = _RunRegionHistoryContractLogic:EmptySnapshot()
+			-- Unknown is deliberately nil, not zero: old maximum stage numbers are not clear counts.
+			decoded.ClearedBattleCount = nil
 		end
 		validation.HasRecord = validation.Success
 		validation.Json = encoded

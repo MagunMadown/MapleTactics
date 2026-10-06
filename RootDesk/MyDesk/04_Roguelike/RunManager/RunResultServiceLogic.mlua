@@ -20,7 +20,84 @@ script RunResultServiceLogic extends Logic
 		if run == nil or reward == nil or reward.ActiveRunSequence ~= run.RunSequence then
 			return { Success = false, Reason = "RUN_RESULT_SEQUENCE_MISMATCH" }
 		end
-		return state:BeginRun(run.RunSequence, reward.RewardRunId, observedStart)
+		local begun = state:BeginRun(run.RunSequence, reward.RewardRunId, observedStart)
+		if begun.Success then
+			local regions = playerEntity:GetComponent("script.PlayerRunRegionHistoryComponent")
+			if regions == nil then regions = playerEntity:AddComponent(PlayerRunRegionHistoryComponent) end
+			if regions ~= nil then regions:BeginRun(run.RunSequence, observedStart) end
+		end
+		return begun
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveRegionBoundary(string stageId)
+		-- Follows non-battle nodes to the next battle frontier; IDs are references, never naming rules.
+		local stage = _StageDefinitionRepositoryLogic:GetStageDefinition(stageId)
+		if not stage.Success or stage.RegionId == "" then return { Success = false, Reason = "RUN_REGION_STAGE_MISSING" } end
+		local current = _NodeDefinitionRepositoryLogic:FindNodeByStageId(stageId)
+		if not current.Success then return current end
+		local pending = {}
+		for id in string.gmatch(current.NextNodeIds or "", "([^|]+)") do table.insert(pending, id) end
+		if #pending == 0 then return { Success = true, RegionId = stage.RegionId, EndsRegion = true } end
+		local visited = {}
+		local frontiers = 0
+		local cursor = 1
+		while cursor <= #pending do
+			if cursor > 128 or #pending > 128 then return { Success = false, Reason = "RUN_REGION_GRAPH_LIMIT" } end
+			local id = pending[cursor]
+			cursor = cursor + 1
+			if not visited[id] then
+				visited[id] = true
+				local node = _NodeDefinitionRepositoryLogic:GetNodeDefinition(current.NodeGraphId, id)
+				if not node.Success then return node end
+				if node.NodeType == "BATTLE" or node.NodeType == "BOSS" then
+					local nextStage = _StageDefinitionRepositoryLogic:GetStageDefinition(node.StageId)
+					if not nextStage.Success or nextStage.RegionId == "" then return { Success = false, Reason = "RUN_REGION_STAGE_MISSING" } end
+					if nextStage.RegionId == stage.RegionId then return { Success = true, RegionId = stage.RegionId, EndsRegion = false } end
+					frontiers = frontiers + 1
+				elseif node.NextNodeIds == nil or node.NextNodeIds == "" then
+					frontiers = frontiers + 1
+				else
+					for nextId in string.gmatch(node.NextNodeIds, "([^|]+)") do table.insert(pending, nextId) end
+				end
+			end
+		end
+		if frontiers == 0 then return { Success = false, Reason = "RUN_REGION_GRAPH_NO_EXIT" } end
+		return { Success = true, RegionId = stage.RegionId, EndsRegion = true }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ObserveBattleStarted(Entity playerEntity, string stageId, integer requestId)
+		-- The gateway calls this after initialization and entry commit, never on map-selection previews.
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local state = playerEntity:GetComponent("script.PlayerRunResultComponent")
+		local regions = playerEntity:GetComponent("script.PlayerRunRegionHistoryComponent")
+		local stats = playerEntity:GetComponent("script.PlayerRunCombatStatsComponent")
+		if run == nil or state == nil or regions == nil or stats == nil then return end
+		if state.ActiveRunSequence ~= run.RunSequence or state.FrozenRecordJson ~= "" then return end
+		state:ObserveCommittedBattleStart(run.RunSequence, run.RunDifficulty)
+		local boundary = self:ResolveRegionBoundary(stageId)
+		local key = tostring(run.RunSequence) .. ":" .. stageId .. ":" .. tostring(requestId)
+		if not boundary.Success or not regions:EnterBattle(run.RunSequence, boundary.RegionId or "", key, boundary.EndsRegion == true, stats:GetSnapshot()) then
+			regions:MarkIncomplete()
+			state:ExcludeFromRanking("REGION_HISTORY_INCOMPLETE")
+			log_warning("[RunResult] region observation rejected stage=" .. stageId .. " reason=" .. tostring(boundary.Reason or "CONTEXT_MISMATCH"))
+		end
+		self:ObserveTestMode(playerEntity)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ObserveBattleResult(Entity playerEntity, string battleKey, string battleResult)
+		-- Called only after RunManager commits flow; failures cannot replay rewards or block gameplay.
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		local state = playerEntity:GetComponent("script.PlayerRunResultComponent")
+		local regions = playerEntity:GetComponent("script.PlayerRunRegionHistoryComponent")
+		local stats = playerEntity:GetComponent("script.PlayerRunCombatStatsComponent")
+		if run == nil or state == nil or regions == nil or stats == nil then return end
+		if state.ActiveRunSequence ~= run.RunSequence or state.FrozenRecordJson ~= "" then return end
+		if not regions:RecordBattleResult(run.RunSequence, battleKey, battleResult, stats:GetSnapshot()) then
+			state:ExcludeFromRanking("REGION_HISTORY_INCOMPLETE")
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -65,6 +142,12 @@ script RunResultServiceLogic extends Logic
 		if not capturedBuild.Success then return capturedBuild end
 		stats:FinishRun()
 		local snapshot = stats:GetSnapshot()
+		local regionState = playerEntity:GetComponent("script.PlayerRunRegionHistoryComponent")
+		local regionHistory = regionState ~= nil and regionState:GetFinalSnapshot(run.RunSequence, snapshot)
+			or { Captured = true, Complete = false, Visits = {} }
+		local regionValidation = _RunRegionHistoryContractLogic:ValidateSnapshot(regionHistory)
+		if not regionValidation.Success then return regionValidation end
+		if not regionHistory.Complete then state:ExcludeFromRanking("REGION_HISTORY_INCOMPLETE") end
 		local excluded = state.RankExclusionReason
 		if excluded == "" and endReason ~= "COMPLETED" then excluded = "INCOMPLETE_RUN" end
 		if excluded == "" and run.SelectedJobId == "" then excluded = "JOB_MISSING" end
@@ -84,7 +167,9 @@ script RunResultServiceLogic extends Logic
 			ElapsedSeconds = snapshot.FinalElapsedSeconds,
 			CurrentHp = run.RunCurrentHp, MaxHp = run.RunMaxHp,
 			RankEligible = excluded == "", RankExclusionReason = excluded,
-			Build = capturedBuild.Build
+			Build = capturedBuild.Build,
+			Conditions = state.CapturedConditions,
+			RegionHistory = regionHistory, ClearedBattleCount = regionValidation.ClearedBattleCount
 		}
 		local encoded = _RunResultContractLogic:EncodeRecord(record)
 		if encoded.Success == false then

@@ -15,6 +15,7 @@ script RunHistoryPresenterLogic extends Logic
 		if category == "Jobs" then row = self:FindRow("JobDefinitions", "JobId", id)
 		elseif category == "Relics" then row = self:FindRow("RelicDefinitions", "RelicId", id)
 		elseif category == "Augments" then row = self:FindRow("AugmentDefinitions", "AugmentId", id)
+		elseif category == "Regions" then row = self:FindRow("RegionDefinitions", "RegionId", id)
 		elseif category == "Skills" then
 			for _, name in ipairs(_SkillDefinitionRepositoryLogic:GetSkillDataSetNames()) do
 				row = self:FindRow(name, "SkillId", id)
@@ -42,9 +43,36 @@ script RunHistoryPresenterLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method void AddDisplayEntry(table catalog, string category, string id)
+		-- Catalog entries are display metadata, never serialized inventory or account state.
 		if id == nil or id == "" then return end
 		if catalog[category] == nil then catalog[category] = {} end
 		if catalog[category][id] == nil then catalog[category][id] = self:MakeDisplayEntry(category, id) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AddRecordToCatalog(table catalog, table record)
+		-- The same display adapter handles a private owned record or an already consented public projection.
+		self:AddDisplayEntry(catalog, "Jobs", record.JobId)
+		for _, visit in ipairs((record.RegionHistory or {}).Visits or {}) do self:AddDisplayEntry(catalog, "Regions", visit.RegionId) end
+		local build = record.Build or {}
+		for _, entry in ipairs(build.Relics or {}) do self:AddDisplayEntry(catalog, "Relics", entry.RelicId) end
+		for _, entry in ipairs(build.Augments or {}) do self:AddDisplayEntry(catalog, "Augments", entry.AugmentId) end
+		for _, entry in ipairs(build.Skills or {}) do
+			self:AddDisplayEntry(catalog, "Skills", entry.SkillId)
+			for _, id in ipairs(entry.AugmentIds or {}) do self:AddDisplayEntry(catalog, "Augments", id) end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishPublicCatalogForPlayer(Entity playerEntity, table records)
+		-- Names/icons for public builds come from definitions only, not the other player's private save.
+		if not isvalid(playerEntity) or playerEntity.PlayerComponent == nil or #records == 0 then return end
+		local catalog = { Version = 1 }
+		for _, record in ipairs(records) do self:AddRecordToCatalog(catalog, record) end
+		local ok, encoded = pcall(function() return _HttpService:JSONEncode(catalog) end)
+		if ok and type(encoded) == "string" and #encoded <= 200000 then
+			self:ReceiveCatalog(encoded, playerEntity.PlayerComponent.UserId)
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -58,14 +86,7 @@ script RunHistoryPresenterLogic extends Logic
 		state._T.HistoryCatalogSource = state.HistorySummaryJson
 		local catalog = { Version = 1 }
 		for _, record in pairs(state.CachedHistoryRecords or {}) do
-			self:AddDisplayEntry(catalog, "Jobs", record.JobId)
-			local build = record.Build or {}
-			for _, entry in ipairs(build.Relics or {}) do self:AddDisplayEntry(catalog, "Relics", entry.RelicId) end
-			for _, entry in ipairs(build.Augments or {}) do self:AddDisplayEntry(catalog, "Augments", entry.AugmentId) end
-			for _, entry in ipairs(build.Skills or {}) do
-				self:AddDisplayEntry(catalog, "Skills", entry.SkillId)
-				for _, id in ipairs(entry.AugmentIds or {}) do self:AddDisplayEntry(catalog, "Augments", id) end
-			end
+			self:AddRecordToCatalog(catalog, record)
 		end
 		local ok, encoded = pcall(function() return _HttpService:JSONEncode(catalog) end)
 		if ok and type(encoded) == "string" then
@@ -75,10 +96,18 @@ script RunHistoryPresenterLogic extends Logic
 
 	@ExecSpace("Client")
 	method void ReceiveCatalog(string encoded)
+		-- Merge separate private/public definition catalogs so switching tabs cannot erase display names.
 		if encoded == nil or string.len(encoded) > 200000 then return end
 		local ok, decoded = pcall(function() return _HttpService:JSONDecode(encoded) end)
 		if not ok or type(decoded) ~= "table" or decoded.Version ~= 1 then return end
-		self._T.Catalog = decoded
+		local catalog = self._T.Catalog or { Version = 1 }
+		for category, entries in pairs(decoded) do
+			if type(entries) == "table" then
+				catalog[category] = catalog[category] or {}
+				for id, entry in pairs(entries) do catalog[category][id] = entry end
+			end
+		end
+		self._T.Catalog = catalog
 		self._T.Revision = (self._T.Revision or 0) + 1
 	end
 
