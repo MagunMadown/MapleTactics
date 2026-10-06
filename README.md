@@ -24,6 +24,22 @@
 - **콘텐츠 무결성 게이트** — 시작 시 전체 데이터를 검증해 잘못된 참조나 값을 행 단위로 보고
 
 
+## 📸 스크린샷
+
+직업마다 고유한 스킬과 연출로 같은 1차원 전장을 다르게 풀어 갑니다. 머리 위 아이콘은 행동 큐에 등록된 스킬, 적 위 아이콘은 적의 다음 행동 예고(Intent)입니다.
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="Docs/Images/battle-thief.webp" alt="도적 전투 화면"><br><b>도적</b></td>
+    <td align="center" width="50%"><img src="Docs/Images/battle-pirate.webp" alt="해적 전투 화면"><br><b>해적</b></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="Docs/Images/battle-mage.webp" alt="마법사 전투 화면"><br><b>마법사</b></td>
+    <td align="center" width="50%"><img src="Docs/Images/battle-archer.webp" alt="궁수 전투 화면"><br><b>궁수</b></td>
+  </tr>
+</table>
+
+
 ## 👥 개발자
 
 | 이름 | GitHub | 주요 기여 영역 (v1.0.1까지의 커밋 기준) |
@@ -152,55 +168,6 @@ MapleTactics/
 - UI는 서버가 만든 상태 DTO(`GetBattleUiState()` 등)만 표시하며 가격·피해·보상을 직접 계산하지 않습니다.
 
 
-## 🚀 실행 방법
-
-1. 저장소를 클론하고 `v1.0.1` 태그를 체크아웃합니다.
-
-   ```bash
-   git clone git@github.com:MagunMadown/MapleTactics.git
-   ```
-
-   ```bash
-   git checkout v1.0.1
-   ```
-
-2. (선택) AI 개발 환경을 복구합니다. `.claude/`, `.agents/` 등 AI 스킬 생성물은 저장소에서 제외되어 있습니다.
-
-   ```bash
-   npm i -g @maplestoryworlds/ai-cli
-   ```
-
-   ```bash
-   mswai init
-   ```
-
-3. MapleStory Worlds Maker에서 프로젝트 폴더를 열고 **Refresh** 후 **Play**로 실행합니다.
-4. 전투만 빠르게 확인하려면 `battle_test_hub` 맵에서 스테이지·직업·Seed를 선택해 시작합니다.
-
-<!-- TODO: 퍼블리시된 월드 링크(있다면) 추가 -->
-
-
-## 🧪 테스트
-
-| 대상 | 방법 |
-|---|---|
-| 밸런스 도구 CSV 스키마 | `node --test tools/balance-schema.test.cjs` |
-| 밸런스 어휘 카탈로그 누락 검사 | `node tools/check-balance-vocab.cjs` (누락 시 exit 1) |
-| 회귀 테스트 스크립트 | `Artifacts/tests/` 의 Python / Node 스크립트 |
-| 콘텐츠 무결성 | Maker 실행 후 `_ContentValidatorLogic:ValidateAllContent()` 결과가 `VALID`인지 확인 |
-| 런타임 | Maker Play 후 Build / Runtime 로그의 Error 0 확인 |
-
-
-## 🧮 밸런스 도구
-
-`tools/` 폴더의 웹 도구는 별도 설치 없이 브라우저에서 `RootDesk/MyDesk/03_Data` 폴더를 열어 사용합니다.
-
-- **Balance Studio** (`tools/balance-studio.html`) — 스킬·증강·몬스터·아이템·스테이지를 카드로 보고 수정하며, 경제·드롭·처치 계산·노드맵 분석과 스킬 테스트 맵 결과 가져오기를 지원합니다.
-- **Balance Workbench** (`tools/balance-editor.html`) — 테이블 단위 CSV 편집과 참조 검사를 제공합니다.
-
-자세한 사용법은 [`tools/README.md`](tools/README.md)를 참고하세요.
-
-
 ## 📚 개발 문서
 
 - [M1 GDD](Docs/MapleTactics-M1-GDD.md)
@@ -217,14 +184,3 @@ MapleTactics/
 - `.codeblock`, `.directory`, `Environment/`, `Global/`(신규 파일 생성)은 직접 수정하지 않습니다.
 - `.model`, `.map`, `.ui`는 전용 Builder 또는 Maker를 통해 편집합니다.
 - 새 스킬 효과·적 패턴 값을 추가하면 `tools/balance-studio.html`의 `#vocabCatalog`도 함께 갱신합니다.
-
-
-## 📄 라이선스
-
-<!-- TODO: 라이선스 정보 추가 -->
-
-
-## 🙏 감사의 말
-
-- [MapleStory Worlds](https://maplestoryworlds.nexon.com/) — 게임 엔진 및 리소스
-- [MSW AI Coding Plugins](https://github.com/MSW-Git/msw-ai-coding-plugins-official) — AI 개발 스킬 세트
