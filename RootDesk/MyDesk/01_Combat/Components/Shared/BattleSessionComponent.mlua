@@ -1797,6 +1797,12 @@ script BattleSessionComponent extends Component
 					local telegraphKind = ""
 					local landingCell = -1
 					if actionType == "BOSS_JUMP_TELEGRAPH" or actionType == "BOSS_LAND_OPPOSITE" then
+						-- Immediate boss commands still publish their authored icon for the intent preview.
+						local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(tileId)
+						if definition.Success then
+							queuedTileNames = definition.DisplayName
+							queuedIconRuids = definition.HudIconRuid or ""
+						end
 						local telegraph = self:BuildBossLandingTelegraph(unit, tileId)
 						if telegraph.Success == true then
 							targetCellSnapshot = telegraph.TargetCells
@@ -1961,7 +1967,7 @@ script BattleSessionComponent extends Component
 			end
 			local tileId = fields[3] or ""
 			if tileId ~= "" and tileId ~= "-" then
-				table.insert(flags, self:IsEnemySpecialSkill(tileId) and "1" or "0")
+				table.insert(flags, self:GetEnemyActionOverlayKind(tileId, fields[2] or "") ~= "" and "1" or "0")
 			end
 		end
 		return table.concat(flags, "|")
@@ -1978,11 +1984,23 @@ script BattleSessionComponent extends Component
 			end
 			local skillId = fields[3] or ""
 			if skillId ~= "" and skillId ~= "-" then
-				local kind = self:GetEnemySkillOverlayKind(skillId)
+				local kind = self:GetEnemyActionOverlayKind(skillId, fields[2] or "")
 				table.insert(kinds, kind ~= "" and kind or "-")
 			end
 		end
 		return table.concat(kinds, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyActionOverlayKind(string skillId, string actionType)
+		-- Pattern commands may be special even when they reuse a plain damage skill.
+		if actionType == "BOSS_JUMP_TELEGRAPH" then return "JUMP_UP" end
+		if actionType == "BOSS_LAND_OPPOSITE" then return "JUMP_DOWN" end
+		local kind = self:GetEnemySkillOverlayKind(skillId)
+		if kind ~= "" then return kind end
+		if actionType == "TELEGRAPH_TILE" or actionType == "CAST_INTERRUPTIBLE"
+			or actionType == "CHARGE_FORWARD" or actionType == "SUMMON_ENEMIES" then return "WARNING" end
+		return ""
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2006,25 +2024,24 @@ script BattleSessionComponent extends Component
 		if found.PUSH or found.PULL or found.SEAL or found.BOSS_SWAP then return "WARNING" end
 		local tags = "|" .. string.lower(definition.SkillTags or "") .. "|"
 		if string.find(tags, "|cast|", 1, true) ~= nil then return "WARNING" end
-		if string.find(tags, "|telegraph|", 1, true) ~= nil then
-			if string.find(tags, "|area|", 1, true) ~= nil then return "IMPACT" end
-			return "WARNING"
+		if string.find(tags, "|area|", 1, true) ~= nil
+			or (definition.TargetingType == "RANGE_OFFSETS" and string.find(definition.TargetOffsets or "", "|", 1, true) ~= nil) then
+			return "IMPACT"
+		end
+		for _, tag in ipairs({ "telegraph", "charge", "control", "status", "support", "buff" }) do
+			if string.find(tags, "|" .. tag .. "|", 1, true) ~= nil then return "WARNING" end
+		end
+		-- Newly authored non-damage effects remain visible even before receiving dedicated artwork.
+		for effectType, _ in pairs(found) do
+			if effectType ~= "DAMAGE" then return "WARNING" end
 		end
 		return ""
 	end
 
 	@ExecSpace("ServerOnly")
 	method boolean IsEnemySpecialSkill(string skillId)
-		-- Special = telegraphed/cast attacks or anything beyond plain damage (status, push, mist, buffs).
-		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
-		if definition.Success ~= true then return false end
-		local tags = "|" .. string.lower(definition.SkillTags or "") .. "|"
-		if string.find(tags, "|telegraph|", 1, true) ~= nil or string.find(tags, "|cast|", 1, true) ~= nil then return true end
-		local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId or "")
-		for _, step in ipairs(effects.Success and effects.Steps or {}) do
-			if step.EffectType ~= "DAMAGE" then return true end
-		end
-		return false
+		-- Keep tooltip classification and the shared HUD badge rules in agreement.
+		return self:GetEnemySkillOverlayKind(skillId) ~= ""
 	end
 
 	@ExecSpace("ServerOnly")
@@ -5898,6 +5915,16 @@ script BattleSessionComponent extends Component
 					queuedTileIds = "boss_summon"
 					queuedTileNames = #fields >= 25 and self:DecodeEnemyPlanField(fields[25]) or "몬스터 소환"
 					queuedIconRuids = #fields >= 26 and self:DecodeEnemyPlanField(fields[26]) or ""
+					queuedSpecialFlags = "1"
+					queuedOverlayKinds = "WARNING"
+				elseif (actionType == "BOSS_JUMP_TELEGRAPH" or actionType == "BOSS_LAND_OPPOSITE")
+					and (fields[3] == "PREPARED" or fields[3] == "EXECUTING") and tileId ~= "" then
+					-- This read-only command preview does not register a combat queue entry.
+					queuedTileIds = tileId
+					queuedTileNames = #fields >= 25 and self:DecodeEnemyPlanField(fields[25]) or ""
+					queuedIconRuids = #fields >= 26 and self:DecodeEnemyPlanField(fields[26]) or ""
+					queuedSpecialFlags = "1"
+					queuedOverlayKinds = actionType == "BOSS_JUMP_TELEGRAPH" and "JUMP_UP" or "JUMP_DOWN"
 				end
 				table.insert(plans, {
 					UnitId = unitId,
@@ -8438,6 +8465,11 @@ script BattleSessionComponent extends Component
 		local preparedIntent = self:GetPreparedEnemyIntent()
 		if preparedIntent.EnemyId == unitId then
 			self:ResetEnemyIntentCursor("UNIT_DIED")
+			-- Hand the cursor to another enemy still holding a frozen plan so the next enemy turn starts from it.
+			-- During the enemy round CompletePreparedEnemyIntent advances the cursor itself.
+			if self.TurnState ~= nil and self.TurnState.BattlePhase == "PlayerTurn" then
+				self:PrepareNextEnemyIntent()
+			end
 		end
 		self:PublishEnemyPlanSnapshot("UNIT_DIED")
 		if unit.Team == "Enemy" and self.DropRuntime ~= nil and _TutorialRulesLogic:ShouldRecordProgress(self) then

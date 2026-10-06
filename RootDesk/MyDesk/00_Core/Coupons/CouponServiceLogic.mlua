@@ -96,7 +96,13 @@ script CouponServiceLogic extends Logic
 	method boolean IsValidReward(string rewardType, any amount)
 		-- Closed reward vocabulary keeps client requests and persisted definitions from inventing payouts.
 		if type(amount) ~= "number" or amount ~= math.floor(amount) then return false end
-		return (rewardType == "NONE" and amount == 0) or (rewardType == "JOB_TOKEN" and amount >= 1 and amount <= 1000000)
+		return (rewardType == "NONE" and amount == 0) or ((rewardType == "JOB_TOKEN" or rewardType == "UNION_COIN") and amount >= 1 and amount <= 1000000)
+	end
+
+	method string DescribeReward(string rewardType, integer amount)
+		if rewardType == "UNION_COIN" then return " / 유니온 코인 " .. tostring(amount) .. "개" end
+		if rewardType == "JOB_TOKEN" then return " / 토큰 " .. tostring(amount) .. "개" end
+		return " / 보상 없음"
 	end
 
 	@ExecSpace("ServerOnly")
@@ -110,7 +116,7 @@ script CouponServiceLogic extends Logic
 		-- Registers an immutable server-owned reward definition; existing codes cannot be repurposed.
 		if self:IsValidCouponCode(code) == false then return "코드는 영문·숫자·- 4~24자여야 합니다." end
 		if kind ~= "COMMON" and kind ~= "ONE_TIME" then return "종류는 COMMON 또는 ONE_TIME입니다." end
-		if self:IsValidReward(rewardType, amount) == false then return "보상은 JOB_TOKEN 1~1000000입니다." end
+		if self:IsValidReward(rewardType, amount) == false then return "보상은 JOB_TOKEN 또는 UNION_COIN, 수량은 1~1000000입니다." end
 		if kind == "ONE_TIME" and rewardType ~= "NONE" then return "일회용 보상 지급은 아직 준비 중입니다." end
 		local loaded = self:LoadCoupon(code)
 		if loaded.Success == false then return "저장소 조회 실패: " .. loaded.Reason end
@@ -125,7 +131,7 @@ script CouponServiceLogic extends Logic
 			return "저장 실패: " .. tostring(errorCode)
 		end
 		log("[Coupon] created kind=" .. kind .. " by=" .. profileCode)
-		return "등록 완료: " .. code .. " (" .. kind .. ")" .. (rewardType == "JOB_TOKEN" and " / 토큰 " .. tostring(amount) .. "개" or "")
+		return "등록 완료: " .. code .. " (" .. kind .. ")" .. self:DescribeReward(rewardType, amount)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -156,7 +162,7 @@ script CouponServiceLogic extends Logic
 		if loaded.Success == false then return "저장소 조회 실패: " .. loaded.Reason end
 		if loaded.Exists == false then return "등록되지 않은 코드입니다." end
 		local state = loaded.Record.Active == true and "사용 가능" or "중지됨"
-		local reward = loaded.Record.RewardType == "JOB_TOKEN" and " / 토큰 " .. tostring(loaded.Record.RewardAmount) .. "개" or " / 보상 없음"
+		local reward = self:DescribeReward(loaded.Record.RewardType, loaded.Record.RewardAmount)
 		return code .. " / " .. loaded.Record.Kind .. " / " .. state .. reward
 	end
 
@@ -191,7 +197,7 @@ script CouponServiceLogic extends Logic
 		for word in string.gmatch(commandText, "%S+") do table.insert(args, word) end
 		local action = string.lower(args[1] or "")
 		local code = self:NormalizeCouponCode(args[2] or "")
-		local result = "create CODE COMMON JOB_TOKEN 1 / info CODE / revoke CODE"
+		local result = "create CODE COMMON UNION_COIN 1000 (또는 JOB_TOKEN 1) / info CODE / revoke CODE"
 		if action == "create" and #args == 3 then
 			result = self:CreateCoupon(code, string.upper(args[3]), senderUserId)
 		elseif action == "create" and #args == 5 then
@@ -199,7 +205,7 @@ script CouponServiceLogic extends Logic
 			if self:IsValidReward(string.upper(args[4]), amount) then
 				result = self:CreateCouponWithReward(code, string.upper(args[3]), string.upper(args[4]), math.floor(amount), senderUserId)
 			else
-				result = "보상은 JOB_TOKEN 1~1000000입니다."
+				result = "보상은 JOB_TOKEN 또는 UNION_COIN, 수량은 1~1000000입니다."
 			end
 		elseif action == "info" and #args == 2 then
 			result = self:DescribeCoupon(code)
@@ -224,8 +230,8 @@ script CouponServiceLogic extends Logic
 		local record = loaded.Record
 		if not record.Active then return {Success = false, Reason = "COUPON_REVOKED"} end
 		if record.Kind ~= "COMMON" then return {Success = false, Reason = "ONE_TIME_NOT_READY"} end
-		if record.RewardType ~= "JOB_TOKEN" then return {Success = false, Reason = "COUPON_REWARD_NOT_SET"} end
-		return _UnionProfileRepositoryLogic:TryGrantJobTokenCoupon(player, code, record.RewardAmount)
+		if record.RewardType ~= "JOB_TOKEN" and record.RewardType ~= "UNION_COIN" then return {Success = false, Reason = "COUPON_REWARD_NOT_SET"} end
+		return _UnionProfileRepositoryLogic:TryGrantCouponReward(player, code, record.RewardType, record.RewardAmount)
 	end
 
 	@ExecSpace("Server")
@@ -257,9 +263,14 @@ script CouponServiceLogic extends Logic
 		end
 		local messages = {COUPON_ALREADY_REDEEMED = "이미 사용한 쿠폰입니다.", COUPON_NOT_FOUND = "등록되지 않은 쿠폰입니다.", COUPON_REVOKED = "사용이 중지된 쿠폰입니다.", COUPON_REWARD_NOT_SET = "보상이 설정되지 않은 쿠폰입니다.", ONE_TIME_NOT_READY = "일회용 쿠폰 사용은 아직 준비 중입니다.", TOKEN_LIMIT = "직업 해제 토큰 보유 한도에 도달했습니다.", COUPON_RECEIPT_LIMIT = "쿠폰 사용 기록 한도에 도달했습니다."}
 		local message = messages[result.Reason] or "저장 처리에 실패했습니다. 잠시 후 다시 시도해 주세요."
+		if result.Reason == "BALANCE_OVERFLOW" then message = "유니온 코인 보유 한도에 도달했습니다." end
 		if result.Success then
 			message = "직업 해제 토큰 " .. tostring(result.Amount) .. "개 지급! 보유 " .. tostring(result.JobTokens) .. "개"
-			log("[Coupon] redeemed reward=JOB_TOKEN amount=" .. tostring(result.Amount))
+			if result.RewardType == "UNION_COIN" then
+				message = "유니온 코인 " .. tostring(result.Amount) .. "개 지급! 보유 " .. tostring(result.UnionCoins) .. "개"
+				_UnionRankProgressionLogic:NotifyRankTransition(player, result.PreviousLifetimeUnionPoints, result.LifetimeUnionPoints)
+			end
+			log("[Coupon] redeemed reward=" .. tostring(result.RewardType) .. " amount=" .. tostring(result.Amount))
 		end
 		self:ReceiveRedemptionResult(requestId, result.Success, message, senderUserId)
 	end
