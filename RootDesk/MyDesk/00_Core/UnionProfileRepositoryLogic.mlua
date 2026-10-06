@@ -1946,11 +1946,18 @@ script UnionProfileRepositoryLogic extends Logic
 
     @ExecSpace("ServerOnly")
     method table TryGrantJobTokenCoupon(Entity userEntity, string couponCode, integer amount)
-        -- Commits the receipt, token balance and shop revision in the same existing profile CAS write.
+        return self:TryGrantCouponReward(userEntity, couponCode, "JOB_TOKEN", amount)
+    end
+
+    @ExecSpace("ServerOnly")
+    method table TryGrantCouponReward(Entity userEntity, string couponCode, string rewardType, integer amount)
+        -- Receipt and reward share one profile CAS write; retries cannot grant either reward twice.
         if not self:ValidateCouponReceiptCodes(couponCode) or couponCode == "" or string.find(couponCode, "|", 1, true) ~= nil then
             return {Success = false, Reason = "INVALID_COUPON_CODE"}
         end
-        if amount < 1 or amount > 1000000 then return {Success = false, Reason = "INVALID_COUPON_REWARD"} end
+        if (rewardType ~= "JOB_TOKEN" and rewardType ~= "UNION_COIN") or amount < 1 or amount > 1000000 or amount ~= math.floor(amount) then
+            return {Success = false, Reason = "INVALID_COUPON_REWARD"}
+        end
         local loaded = self:GetUnionProfile(userEntity)
         if not loaded.Success then return loaded end
         local key = loaded.StorageUserKey
@@ -1964,14 +1971,28 @@ script UnionProfileRepositoryLogic extends Logic
             end
             local nextReceipts = receipts == "" and couponCode or receipts .. "|" .. couponCode
             if not self:ValidateCouponReceiptCodes(nextReceipts) then return {Success = false, Reason = "COUPON_RECEIPT_LIMIT"} end
-            local nextTokens = candidate.UnionShop.JobTokens + amount
-            if nextTokens > 1000000 then return {Success = false, Reason = "TOKEN_LIMIT"} end
+            if rewardType == "JOB_TOKEN" then
+                local nextTokens = candidate.UnionShop.JobTokens + amount
+                if nextTokens > 1000000 then return {Success = false, Reason = "TOKEN_LIMIT"} end
+                candidate.UnionShop.JobTokens = nextTokens
+                candidate.UnionShop.Revision = candidate.UnionShop.Revision + 1
+            else
+                -- Promotional grants follow ordinary coin grants, including lifetime progression, without bonuses.
+                local balance = candidate.UnionPoints + amount
+                local lifetime = candidate.LifetimeUnionPoints + amount
+                if balance > 9007199254740991 or lifetime > 9007199254740991 then
+                    return {Success = false, Reason = "BALANCE_OVERFLOW"}
+                end
+                candidate.UnionPoints = balance
+                candidate.LifetimeUnionPoints = lifetime
+            end
             candidate.RedeemedCouponCodes = nextReceipts
-            candidate.UnionShop.JobTokens = nextTokens
-            candidate.UnionShop.Revision = candidate.UnionShop.Revision + 1
             local saved = self:PersistProfileCandidate(key, candidate)
             if not saved.Success then return saved end
-            return {Success = true, Reason = "COUPON_REDEEMED", Amount = amount, JobTokens = nextTokens}
+            return {Success = true, Reason = "COUPON_REDEEMED", RewardType = rewardType, Amount = amount,
+                JobTokens = candidate.UnionShop.JobTokens, UnionCoins = candidate.UnionPoints,
+                PreviousLifetimeUnionPoints = candidate.LifetimeUnionPoints - (rewardType == "UNION_COIN" and amount or 0),
+                LifetimeUnionPoints = candidate.LifetimeUnionPoints}
         end)
         self:ReleaseMutationLock(key)
         if not ok then
