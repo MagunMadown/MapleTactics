@@ -75,7 +75,7 @@ function fixture()
     map={}; other={}; cell={CellIndex=2,Team='Player',UnitId='player_01'}
     presentation={BeginLocalGridMoveHop=function(_,...) hops=hops+1; localHopArgs={...} end,
         PlayMoveHop=function(_,...) serverHops[#serverHops+1]={...} end, PlaySkillSound=function() end,
-        SetLocalGridMoveOffset=function(_,x) offsets[#offsets+1]=x end,
+        SetLocalGridMoveOffset2D=function(_,x) offsets[#offsets+1]=x end,
         ClearLocalGridMoveOffset=function() clears=clears+1 end}
     transform=native({WorldPosition=Vector3(2,0,0), ToLocalPoint=function(self,p)
         return Vector3(p.x-self.WorldPosition.x,p.y-self.WorldPosition.y,p.z-self.WorldPosition.z)
@@ -246,7 +246,7 @@ cases = {
         lobby:RequestMove(1,1,5); assert(lobby._T.gridMoves.owner.RequestId==1)
     ''',
     "missing setter falls back for nil and strict unknown script members": r'''
-        verifyMissingHelper('SetLocalGridMoveOffset')
+        verifyMissingHelper('SetLocalGridMoveOffset2D')
     ''',
     "missing begin helper falls back for nil and strict unknown script members": r'''
         verifyMissingHelper('BeginLocalGridMoveHop')
@@ -256,7 +256,7 @@ cases = {
     ''',
     "legacy component preserves presenter request and acknowledgement lock": r'''
         fixture(); local values=presentation
-        values.SetLocalGridMoveOffset=nil; values.ClearLocalGridMoveOffset=nil; values.BeginLocalGridMoveHop=nil
+        values.SetLocalGridMoveOffset2D=nil; values.ClearLocalGridMoveOffset=nil; values.BeginLocalGridMoveHop=nil
         presentation=scriptProxy(values,{})
         session.Entity=map; session.CellCount=7; session.GetCellPosition=function(_,n) return Vector2(n,0) end
         session.RequestMove=function(_,direction,id,entry,context)
@@ -274,10 +274,10 @@ cases = {
     "component swap restores old visual once and uses the new setter": r'''
         fixture(); movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile); movement:OnUpdate(0.03)
         local old=presentation; old.ClearLocalGridMoveOffset=nil
-        old.SetLocalGridMoveOffset=function() error('stale setter called') end
+        old.SetLocalGridMoveOffset2D=function() error('stale setter called') end
         local nextOffsets=0; local nextClears=0
         presentation={BeginLocalGridMoveHop=function() error('hop must not restart') end,
-            SetLocalGridMoveOffset=function() nextOffsets=nextOffsets+1 end,
+            SetLocalGridMoveOffset2D=function() nextOffsets=nextOffsets+1 end,
             ClearLocalGridMoveOffset=function() nextClears=nextClears+1 end}
         for n=1,5 do movement:OnUpdate(0.03) end
         assert(clears==1 and nextOffsets==5 and warnings==0)
@@ -286,18 +286,18 @@ cases = {
     "removed setter restores through captured clear and avoids repeat errors": r'''
         fixture(); local values=presentation; presentation=scriptProxy(values,{})
         movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile); movement:OnUpdate(0.03)
-        values.SetLocalGridMoveOffset=nil; values.ClearLocalGridMoveOffset=nil
+        values.SetLocalGridMoveOffset2D=nil; values.ClearLocalGridMoveOffset=nil
         movement:OnUpdate(0.03); assert(clears==1 and warnings==1)
         for n=1,20 do movement:OnUpdate(0.03) end
         assert(clears==1 and #offsets==1 and movement:HasLocalMove(map))
         movement:CancelLocalMove('DONE'); assert(clears==1 and released==1)
     ''',
     "refresh restores missing helpers and the next normal move": r'''
-        fixture(); local values=presentation; local set=values.SetLocalGridMoveOffset
-        values.SetLocalGridMoveOffset=nil; presentation=scriptProxy(values,{})
+        fixture(); local values=presentation; local set=values.SetLocalGridMoveOffset2D
+        values.SetLocalGridMoveOffset2D=nil; presentation=scriptProxy(values,{})
         local id=movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile); movement:OnUpdate(0.1)
         assert(hops==0 and #offsets==0 and warnings==1)
-        values.SetLocalGridMoveOffset=set; movement:OnUpdate(0.5)
+        values.SetLocalGridMoveOffset2D=set; movement:OnUpdate(0.5)
         assert(#offsets==1 and hops==0 and movement:HasLocalMove(map))
         movement:ResolveLocalMove(map,id,7,3,true,true,3,0,'DONE')
         transform.WorldPosition=Vector3(3,0,0); movement:OnUpdate(0.01)
@@ -312,14 +312,14 @@ cases = {
         fixture(); local reads={}; presentation=scriptProxy(presentation,reads)
         movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile)
         for n=1,10 do movement:OnUpdate(0.01) end
-        assert(reads.SetLocalGridMoveOffset==11 and reads.ClearLocalGridMoveOffset==1 and reads.BeginLocalGridMoveHop==1)
+        assert(reads.SetLocalGridMoveOffset2D==11 and reads.ClearLocalGridMoveOffset==1 and reads.BeginLocalGridMoveHop==1)
         movement:CancelLocalMove('DONE'); assert(reads.ClearLocalGridMoveOffset==1 and clears==1)
     ''',
     "throwing helpers cannot abort the request or retry stale functions": r'''
         for mode=1,3 do
             fixture(); local attempts=0
             if mode==1 then presentation.BeginLocalGridMoveHop=function() attempts=attempts+1; error('stale begin') end
-            elseif mode==2 then presentation.SetLocalGridMoveOffset=function() attempts=attempts+1; error('stale setter') end
+            elseif mode==2 then presentation.SetLocalGridMoveOffset2D=function() attempts=attempts+1; error('stale setter') end
             else presentation.ClearLocalGridMoveOffset=function() attempts=attempts+1; error('stale clear') end end
             local id=movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile)
             assert(id==1 and movement:HasLocalMove(map))
@@ -339,7 +339,7 @@ cases = {
         for mode=1,3 do
             for strict=1,2 do
                 fixture(); local values=presentation
-                if mode~=2 then values.SetLocalGridMoveOffset=nil end
+                if mode~=2 then values.SetLocalGridMoveOffset2D=nil end
                 if mode~=1 then values.ClearLocalGridMoveOffset=nil end
                 if strict==2 then presentation=scriptProxy(values,{}) end
                 oldMoveRecord(); movement:OnUpdate(0.03)
@@ -359,7 +359,7 @@ cases = {
     "old record map departure world shutdown and rejection end safely": r'''
         for mode=1,3 do
             for missingClear=1,2 do
-                fixture(); local values=presentation; values.SetLocalGridMoveOffset=nil
+                fixture(); local values=presentation; values.SetLocalGridMoveOffset2D=nil
                 if missingClear==2 then values.ClearLocalGridMoveOffset=nil end
                 presentation=scriptProxy(values,{}); oldMoveRecord()
                 if mode==1 then player.CurrentMap=other; movement:OnUpdate(0.03)

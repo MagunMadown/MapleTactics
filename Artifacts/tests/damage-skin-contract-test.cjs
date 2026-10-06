@@ -63,7 +63,7 @@ assert.match(attack, /self:PresentDamageNumber\(sourceEntity, targetEntity, dama
 assert.ok(attack.lastIndexOf('self:FlushDamageNumberBatch(batch)') < attack.indexOf('self:HandleUnitDiedFromSource('), 'Flush lethal batch before death handling');
 assert.match(attack, /if sourcePresentation ~= nil and playImpact then/);
 assert.match(attack, /if targetPresentation ~= nil and playImpact then/);
-assert.match(attack, /self\.HitFlashDuration, batch ~= nil\)/);
+assert.match(attack, /Flash = self\.HitFlashDuration, SkipMotion = batch ~= nil/);
 assert.match(session, /if batch == nil or batch\.HitCount <= 1 then self:PlayActiveHitEffect\(targetUnitId\) end/);
 assert.match(status, /if result.Success and result.AppliedAmount > 0 then\s+self:PresentDamageNumber/);
 assert.ok(status.indexOf('self:PresentDamageNumber(') < status.indexOf('self:HandleUnitDiedFromSource('), 'Status number before death handling');
