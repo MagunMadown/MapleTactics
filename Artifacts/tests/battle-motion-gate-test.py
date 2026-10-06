@@ -331,6 +331,25 @@ advance(125.1); assert(released==1)
 ''')
 
 # Actual presentation helpers, native visual root/tween boundaries mocked.
+scenario("avatar offset writes push the same position to world-label followers", r'''
+visual={Valid=true,TransformComponent={Position=Vector3(.25,2,0),Scale=Vector3(1,1,1),Rotation=0}}
+entity={Valid=true,AvatarRendererComponent={},CurrentMap=map}
+function entity.AvatarRendererComponent:GetAvatarRootEntity() return visual end
+actor=setmetatable({_T={},Entity=entity,UseCustomMoveHopProfile=false,DeathMotionActive=false,DeathMotionCompleted=false}, {__index=P})
+local label={Valid=true,TransformComponent={Position=Vector3(0,0,0)}}
+-- Registration copies the current offset at once; every later write pushes the new one in the same call.
+actor:AddMoveVisualFollower(label)
+assert(label.TransformComponent.Position.x==.25 and label.TransformComponent.Position.y==2)
+actor:SetLocalGridMoveOffset2D(.5,.1)
+assert(math.abs(label.TransformComponent.Position.x-.75)<1e-6 and math.abs(label.TransformComponent.Position.y-2.1)<1e-6)
+actor:ClearLocalGridMoveOffset()
+assert(math.abs(label.TransformComponent.Position.x-.25)<1e-6 and math.abs(label.TransformComponent.Position.y-2)<1e-6)
+-- Destroyed followers are dropped on the next push; removed ones are never written again.
+local other={Valid=true,TransformComponent={Position=Vector3(9,9,0)}}
+actor:AddMoveVisualFollower(other); actor:RemoveMoveVisualFollower(other); other.TransformComponent.Position=Vector3(9,9,0)
+label.Valid=false; actor:SetLocalGridMoveOffset2D(.3,0)
+assert(next(actor._T.moveVisualFollowers)==nil and other.TransformComponent.Position.x==9)
+''')
 scenario("prediction offsets preserve hop baseline and late server-hop dedup", r'''
 visual={Valid=true,TransformComponent={Position=Vector3(.25,2,0),Scale=Vector3(1,1,1),Rotation=0}}
 entity={Valid=true,AvatarRendererComponent={},CurrentMap=map}

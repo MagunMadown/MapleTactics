@@ -193,8 +193,12 @@ cases = {
         fixture(); battle:RequestMove(1,11,7,3)
         assert(battle._T.playerGridMove.RequestId==11 and receipts[1][9]=='owner')
         assert(serverHops[1][14]==11)
+        -- The requesting client walks its own root, so the server writes it only once, on completion.
+        assert(battle._T.playerGridMove.ClientDriven==true and #placements==0)
+        battle:UpdatePlayerGridMove(0.05); assert(#placements==0)
         battle:UpdatePlayerGridMove(0.2)
         assert(battle._T.playerGridMove==nil and completedActions==1 and receipts[#receipts][5]==true)
+        assert(#placements==1 and placements[1].x==3)
         fixture(); battle:RequestMove(1,12,7,3); local before=#placements
         player.CurrentMap=other; battle.ActionTimerId=42; battle:UpdatePlayerGridMove(0.1)
         assert(battle._T.playerGridMove==nil and #placements==before and completedActions==0 and timersCleared==1)
