@@ -21,8 +21,8 @@ def load(path, names=None):
     text = (ROOT / path).read_text(encoding='utf-8-sig')
     obj = lua.table()
     found = set()
-    for m in re.finditer(r'^\tmethod\s+\w+\s+(\w+)\((.*?)\)\n(.*?)^\tend', text, re.M | re.S):
-        name, params, body = m.groups()
+    for m in re.finditer(r'^([ \t]+)method\s+\w+\s+(\w+)\((.*?)\)\n(.*?)^\1end', text, re.M | re.S):
+        _, name, params, body = m.groups()
         if names is not None and name not in names:
             continue
         args = ','.join(p.strip().split()[-1] for p in params.split(',') if p.strip())
@@ -30,6 +30,9 @@ def load(path, names=None):
         found.add(name)
     if names is not None:
         assert set(names) <= found, (path, set(names) - found)
+    # Component defaults are supplied by Maker; reproduce scalar defaults in isolated fixtures.
+    for name, value in re.findall(r'^\s*(?:@Sync\s+)?property\s+(?:integer|number|boolean|string)\s+(\w+)\s*=\s*(.+)$', text, re.M):
+        obj[name] = lua.eval(value.strip())
     return obj
 
 base = 'RootDesk/MyDesk/'
@@ -41,11 +44,12 @@ assert len(rows) == 5
 lua.globals().rows = lua.table_from([lua.table_from(row) for row in rows])
 lua.execute('_DataService={GetTable=function() return {GetRowCount=function() return #rows end,GetCell=function(self,i,k) return rows[i][k] end} end}')
 lua.globals()._ConsumableDefinitionRepositoryLogic = repo
+lua.globals()._TutorialRulesLogic = load(base + '00_Core/Lobby/Tutorial/TutorialRulesLogic.mlua', {'IsGuided','IsCommandAllowed','OnConsumableUsed'})
 lua.globals().InventoryMethods = load(base + '04_Roguelike/RunManager/PlayerRunInventoryComponent.mlua')
 lua.globals().CooldownMethods = load(base + '01_Combat/Components/Shared/SkillRuntimeStateComponent.mlua')
 lua.globals().UnitMethods = load(base + '01_Combat/Components/Shared/BattleUnitComponent.mlua', {'ApplyHealing', 'SyncRunHp', 'RemoveNegativeStatusEffects'})
 lua.globals().SessionMethods = load(base + '01_Combat/Components/Shared/BattleSessionComponent.mlua', {
-    'TryUseRunConsumable', 'BuildConsumableHudState', 'SubmitConsumableUse', 'RequestUseConsumable',
+    'IsTutorialCommandAllowed', 'TryUseRunConsumable', 'BuildConsumableHudState', 'SubmitConsumableUse', 'RequestUseConsumable',
     'ReceiveConsumableUseResult', 'RequestConsumableHudState', 'ReceiveConsumableHudState'})
 lua.globals().HudMethods = load(base + '02_UI/BattleConsumableHudComponent.mlua')
 lua.globals()._ConsumableHealEffectLogic = load(base + '01_Combat/Resolvers/ConsumableHealEffectLogic.mlua')
@@ -55,13 +59,14 @@ lua.globals()._RunManagerLogic = load(base + '04_Roguelike/RunManager/RunManager
 lua.execute('''
 function object(methods, values)
     values = values or {}
-    for k,v in pairs(methods) do values[k]=v end
+    values._T = values._T or {}
+    for k,v in pairs(methods) do if values[k]==nil then values[k]=v end end
     return values
 end
 function fixture()
     map={Id="map-id"}
     player={Name="player", PlayerComponent={UserId="owner"}, CurrentMap=map}
-    inv=object(InventoryMethods, {Entity=player, ActiveRunSequence=1, ConsumableCapacity=3, BaseConsumableCapacity=3,
+    inv=object(InventoryMethods, {Entity=player, ActiveRunSequence=1, ConsumableCapacity=3, BaseConsumableCapacity=3, RelicConsumableSlotBonus=0,
         RunConsumableSnapshot="", RunCurrencySnapshot="", RunSkillSnapshot="brandish~1|slash~1", RunItemSnapshot="",
         AppliedUseKeys="", AppliedRewardKeys="", AppliedPurchaseKeys="", InventoryRevision=1,
         SkillInventoryRevision=1, RunSkillBarRevision=0, RunSkillBarSlotIds="", OverflowCurrencyPerItem=1, OverflowCurrencyId="gold"})
@@ -102,6 +107,8 @@ function uiEntity(withChildren)
         entity.children.Icon=uiEntity(false)
         entity.children.SlotSkin=uiEntity(false)
         entity.children.Count=uiEntity(false)
+        entity.children.Hotkey=uiEntity(false)
+        entity.children.Discard=uiEntity(false)
     end
     entity.GetChildByName=function(self,key) return self.children[key] end
     entity.Clone=function() return uiEntity(withChildren) end
@@ -111,6 +118,8 @@ function uiEntity(withChildren)
     return entity
 end
 function uiFixture()
+    _GameSettingsLogic={PlayUISound=function() end,IsInputBlocked=function() return false end}
+    _TutorialPresentationLogic={ResetHudHighlights=function() end,GetRevisionToken=function() return "" end,UpdateConsumableHighlight=function() end}
     ImageType={Simple=0}; PreserveSpriteType={None=0}
     Vector3=function(x,y,z) return {x=x,y=y,z=z} end
     _UILogic={SetSiblingIndex=function(self,t,i) t.sibling=i end,GetSiblingIndex=function(self,t) return t.sibling end}
@@ -136,7 +145,7 @@ end
 
 cases = {
     'Potion Heal + consume + turn + run HP': '''fixture(); grant("red_potion",2); local r=use("red_potion"); assert(r.Success and unit.CurrentHp==7 and r.ConsumedAmount==1); assert(inv:GetSnapshotAmount(inv.RunConsumableSnapshot,"red_potion")==1); assert(run.CurrentHp==7); unchangedTurn()''',
-    'Orange data value': '''fixture(); grant("orange_potion",1); assert(use("orange_potion").Success and unit.CurrentHp==9); unchangedTurn()''',
+    'Orange data value': '''fixture(); grant("orange_potion",1); assert(use("orange_potion").Success and unit.CurrentHp==8); unchangedTurn()''',
     'White MaxHP clamp': '''fixture(); grant("white_potion",1); unit.CurrentHp=8; local r=use("white_potion"); assert(r.Success and unit.CurrentHp==10 and r.AppliedAmount==2); unchangedTurn()''',
     'Full HP / dead rejects without consume': '''fixture(); grant("white_potion",2); unit.CurrentHp=10; local before=inv.RunConsumableSnapshot; assert(not use("white_potion").Success); assert(inv.RunConsumableSnapshot==before); unit.IsDead=true; unit.CurrentHp=0; assert(not use("white_potion").Success and inv.RunConsumableSnapshot==before)''',
     'Time Sand 3 -> 1 + untouched other cooldown': '''fixture(); grant("time_sand",2); cd:StartCooldown("brandish",3); cd:StartCooldown("slash",4); local rev=cd.CooldownRevision; local r=use("time_sand","brandish"); assert(r.Success and cd:GetRemainingCooldown("brandish")==1 and cd:GetRemainingCooldown("slash")==4); assert(cd.CooldownRevision==rev+1 and r.ConsumedAmount==1); unchangedTurn()''',
@@ -151,8 +160,8 @@ cases = {
     'Enemy turn / executing / battle over reject': '''fixture(); grant("red_potion",2); local before=inv.RunConsumableSnapshot; session.TurnState.BattlePhase="EnemyTurn"; assert(not use("red_potion").Success); session.TurnState.BattlePhase="PlayerTurn"; session.TurnState.IsActionProcessing=true; assert(not use("red_potion").Success); session.TurnState.IsActionProcessing=false; session.BattleResult="DEFEAT"; assert(not use("red_potion").Success); assert(unit.CurrentHp==5 and inv.RunConsumableSnapshot==before)''',
     'Three slots / total quantity / overflow / freed slot': '''fixture(); grant("red_potion",2); assert(grant("orange_potion",2).AcceptedAmount==1); assert(grant("time_sand",1).AcceptedAmount==0); assert(inv:GetSnapshotTotal(inv.RunConsumableSnapshot)==3); assert(inv.RunCurrencySnapshot=="gold~2"); inv:Consume("red_potion",1,"clear"); assert(grant("white_potion",1).AcceptedAmount==1)''',
     'Union configurable slot expansion': '''fixture(); inv:ResetForRun(2,2); assert(inv.ConsumableCapacity==5); for _,id in ipairs({"red_potion","orange_potion","white_potion","time_sand","all_cure_potion"}) do assert(grant(id,1).AcceptedAmount==1) end''',
-    'Shop uses stack capacity and validates before charging': '''fixture(); inv.RunCurrencySnapshot="gold~20"; grant("red_potion",2); local r=inv:ApplyShopPurchase("gold",5,"CONSUMABLE","red_potion",2,"buy1"); assert(r.Success and r.AcceptedAmount==1 and r.OverflowAmount==1 and r.BalanceAfter==16); local money=inv.RunCurrencySnapshot; local bad=inv:ApplyShopPurchase("gold",5,"CONSUMABLE","missing",1,"bad"); assert(not bad.Success and inv.RunCurrencySnapshot==money)''',
-    'Legacy potion alias migrates without quantity loss': '''fixture(); inv.RunConsumableSnapshot="orange_potion~1|potion_hp_small~2"; inv:NormalizeLegacyConsumables(); assert(inv.RunConsumableSnapshot=="orange_potion~3"); local def=_ConsumableDefinitionRepositoryLogic:GetDefinition("potion_hp_small"); assert(def.ConsumableId=="orange_potion" and def.EffectValue==4); assert(use("potion_hp_small").Success and unit.CurrentHp==9)''',
+    'Shop rejects overflow before charging and accepts an exact fit': '''fixture(); inv.RunCurrencySnapshot="gold~20"; grant("red_potion",2); local r=inv:ApplyShopPurchase("gold",5,"CONSUMABLE","red_potion",2,"buy1"); assert(not r.Success and r.Reason=="CONSUMABLE_CAPACITY_FULL" and r.BalanceAfter==20); assert(inv.RunCurrencySnapshot=="gold~20" and inv:GetSnapshotAmount(inv.RunConsumableSnapshot,"red_potion")==2); local fit=inv:ApplyShopPurchase("gold",5,"CONSUMABLE","red_potion",1,"buy1"); assert(fit.Success and fit.AcceptedAmount==1 and fit.OverflowAmount==0 and fit.BalanceAfter==15); local money=inv.RunCurrencySnapshot; local bad=inv:ApplyShopPurchase("gold",5,"CONSUMABLE","missing",1,"bad"); assert(not bad.Success and inv.RunCurrencySnapshot==money)''',
+    'Legacy potion alias migrates without quantity loss': '''fixture(); inv.RunConsumableSnapshot="orange_potion~1|potion_hp_small~2"; inv:NormalizeLegacyConsumables(); assert(inv.RunConsumableSnapshot=="orange_potion~3"); local def=_ConsumableDefinitionRepositoryLogic:GetDefinition("potion_hp_small"); assert(def.ConsumableId=="orange_potion" and def.EffectValue==3); assert(use("potion_hp_small").Success and unit.CurrentHp==8)''',
     'All five catalog rows validated / turn cost guarded': '''fixture(); for _,row in ipairs(rows) do local def=_ConsumableDefinitionRepositoryLogic:GetDefinition(row.ConsumableId); assert(def.Success); def.TurnCost=1; assert(not _ConsumableDefinitionRepositoryLogic:ValidateDefinition(def).Success) end''',
     'UI cancel / no-target selection never consumes': '''fixture(); grant("time_sand",1); local hud=object(HudMethods,{Selector={},SelectedConsumableId="time_sand",_T={Data={Skills={}}}}); hud:CloseSelection(); assert(hud.SelectedConsumableId=="" and not hud.Selector.Enable); hud.SelectedConsumableId="time_sand"; hud:RenderSkills(); assert(hud.SelectedConsumableId==""); assert(inv:GetSnapshotAmount(inv.RunConsumableSnapshot,"time_sand")==1)''',
     'UI/RPC pending guard / stale read receipts': '''fixture(); local calls=0; session.RequestUseConsumable=function() calls=calls+1 end; assert(session:SubmitConsumableUse("time_sand","brandish")); assert(not session:SubmitConsumableUse("time_sand","brandish")); assert(calls==1); session:ReceiveConsumableUseResult({Success=false,RequestId=1},6); assert(session._T.ConsumablePending); session:ReceiveConsumableUseResult({Success=false,RequestId=1},7); assert(not session._T.ConsumablePending); session:ReceiveConsumableHudState({mark=2},2,7); session:ReceiveConsumableHudState({mark=1},1,7); assert(session._T.ConsumableHudState.mark==2)''',

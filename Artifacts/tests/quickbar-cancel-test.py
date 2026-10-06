@@ -17,7 +17,9 @@ _UnionCoinShopLogic={IsOpen=false}
 _GameSettingsLogic={_T={KeyEnums={}},Bindings={}}
 for code=1,400 do _GameSettingsLogic._T.KeyEnums[code]=code end
 function _GameSettingsLogic:EnsureCatalogCache() end
-hud={OnClearClicked=function() calls=calls+1 end,
+_UILayerLogic={HasBlockingWindow=function() return _GameSettingsLogic.IsWindowOpen or _GameSettingsLogic.IsMenuOpen or _UnionCoinShopLogic.IsOpen end}
+_BattleHudPresenterLogic={GetBattleSession=function() return nil end}
+hud={_T={},GetSlotSkillId=function(_,slot) return tostring(slot) end,OnClearClicked=function() calls=calls+1 end,
      RequestSlotSkill=function(_,slot,execute)
          assert(execute==false); slotCalls[#slotCalls+1]=slot
      end}

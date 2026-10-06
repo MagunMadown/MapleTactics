@@ -1,0 +1,265 @@
+@Logic
+script TutorialRulesLogic extends Logic
+
+    method boolean IsGuided(any session)
+        -- Guided lessons end when the final free-combat wave opens.
+        return session ~= nil and session.TutorialActive and session.TutorialStep < 10
+    end
+
+    method boolean CanEditSkillQueue(any session)
+        -- Lesson nine introduces cancellation and quickbar dragging; earlier lessons keep their guardrails.
+        return not self:IsGuided(session) or session.TutorialStep == 9
+    end
+
+    method boolean ShouldRecordProgress(any session)
+        -- Tutorial battles never contribute drops, collection entries or normal run results.
+        return not session.TutorialActive
+    end
+
+    @ExecSpace("ServerOnly")
+    method boolean ShouldRecordRunProgress(Entity player)
+        -- Entry ownership is authoritative even before the battle session is initialized.
+        return not _NewPlayerTutorialLogic:IsActive(player)
+    end
+
+    @ExecSpace("ServerOnly")
+    method void InitializeSession(any session, Entity player, integer requestId)
+        -- Reset every synchronized field so a normal entry cannot inherit an earlier lesson.
+        session.TutorialActive = _NewPlayerTutorialLogic:IsEntry(player, requestId)
+        session.TutorialStep = session.TutorialActive and 1 or 0
+        session.TutorialGuardUsed = false
+        session.TutorialUserId = session.TutorialActive and player.PlayerComponent.UserId or ""
+        if session.TutorialActive then log("[Tutorial] rules initialized request=" .. tostring(requestId)) end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void ApplyStartingHp(any session, any runState, string entryMode)
+        -- Seed reduced HP once before the normal player registration restores run-owned HP.
+        if session.TutorialActive and entryMode == "NEW_RUN" then
+            runState:SetRunHp(math.max(1, math.floor(runState.RunMaxHp * 0.5)), runState.RunMaxHp, "TUTORIAL_START")
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetInitialSkillIds(Entity player)
+        -- Return nil for the normal persistent/random skill-bar initialization path.
+        if self:ShouldRecordRunProgress(player) then return nil end
+        return { "brandish", "divine_swing" }
+    end
+
+    method table GetSessionSkillIds(any session)
+        -- Session rebuilding keeps the same two teaching skills without changing normal candidates.
+        if not session.TutorialActive then return nil end
+        return { "brandish", "divine_swing" }
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GrantStartingPotion(any inventory, any runState, boolean recordProgress)
+        -- Grant exactly one potion using the existing run sequence receipt.
+        if recordProgress then return nil end
+        local granted = inventory:GrantRunReward("CONSUMABLE", "orange_potion", 1, "tutorial:start:" .. tostring(runState.RunSequence))
+        if not granted.Success then
+            return { Success = false, Reason = "TUTORIAL_POTION_GRANT_FAILED", DetailReason = granted.Reason }
+        end
+        log("[Tutorial] starting potion granted count=1")
+        return granted
+    end
+
+    @ExecSpace("ServerOnly")
+    method table GetRunInitializationResult(boolean recordProgress, table captured)
+        -- Tutorial startup stops before premium relics, departure supplies and result capture.
+        if recordProgress then return nil end
+        return { Success = true, Reason = "TUTORIAL_INITIALIZED", UnionSnapshot = captured }
+    end
+
+    method boolean IsCommandAllowed(any session, string commandType, string tileId, integer direction)
+        -- Shared by client input gating and authoritative server validation.
+        if not self:IsGuided(session) then return true end
+        local step = session.TutorialStep
+        local queued = session.QueuedTileCount
+        if commandType == "MOVE" then
+            if step == 1 or step == 4 then return direction == 1 end
+            if step == 3 then return direction == -1 end
+            return false
+        end
+        if commandType == "QUEUE_TILE" then
+            if step == 2 then return tileId == "brandish" and queued == 0 end
+            if step == 6 then return tileId == "divine_swing" and queued == 0 end
+            if step == 9 then
+                return (tileId == "brandish" or tileId == "divine_swing")
+                    and string.find("|" .. session.QueuedTileIds .. "|", "|" .. tileId .. "|", 1, true) == nil
+            end
+            if step == 8 then return tileId == "brandish" and queued == 0 and not session.TutorialGuardUsed end
+            return false
+        end
+        if commandType == "EXECUTE_QUEUE" then
+            if step == 9 then return queued == 2 end
+            return (step == 5 or step == 6) and queued > 0
+        end
+        if commandType == "USE_CONSUMABLE" then return step == 7 and tileId == "orange_potion" end
+        if commandType == "UTILITY" then return step == 8 and queued > 0 and not session.TutorialGuardUsed end
+        return false
+    end
+
+    method boolean IsUtilityAllowed(any session, string skillId, string effectType)
+        -- The guided utility lesson requires the warrior guard rather than another utility effect.
+        return not self:IsGuided(session) or (skillId == "royal_guard" and effectType == "GUARD")
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnUnitMoved(any session, string unitId, integer fromCell, integer toCell)
+        -- Run at the original movement-event checkpoint, before poison-on-move processing.
+        if not session.TutorialActive or unitId ~= "player_01" then return end
+        if session.TutorialStep == 1 then
+            session.TutorialStep = 2
+            log("[Tutorial] step=2 movement completed")
+        elseif session.TutorialStep == 3 and toCell < fromCell then
+            log("[Tutorial] step=3 dodged left; observing enemy attack")
+        elseif session.TutorialStep == 4 and toCell > fromCell then
+            session.TutorialStep = 5
+            log("[Tutorial] step=5 stepped back in")
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnUtilityUsed(any session, table result)
+        -- Guard succeeds before the enemy round; keep the lesson visible until that round completes.
+        if session.TutorialActive and session.TutorialStep == 8 and result.Reason == "UTILITY_GUARD_ACTIVE" then
+            session.TutorialGuardUsed = true
+            log("[Tutorial] step=8 guard active; waiting for enemy attack")
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnConsumableUsed(any session, table result)
+        -- Recovery advances only after both its effect and consumption have committed.
+        if session.TutorialActive and session.TutorialStep == 7 and result.AppliedAmount > 0 and result.ConsumedAmount > 0 then
+            session.TutorialStep = 8
+            log("[Tutorial] step=8 potion recovery completed; prepare the guard lesson")
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEnemyRoundCompleted(any session)
+        -- Preserve transitions after the normal turn snapshot has been published.
+        if not session.TutorialActive then return end
+        if session.TutorialStep == 2 and session.QueuedTileCount > 0 then
+            session.TutorialStep = 3
+            log("[Tutorial] step=3 enemy loaded a skill; dodge left")
+        elseif session.TutorialStep == 3 then
+            session.TutorialStep = 4
+            log("[Tutorial] step=4 dodge observation completed; step back in")
+        elseif session.TutorialStep == 5 and session.QueuedTileCount == 0 then
+            session.TutorialStep = 6
+            log("[Tutorial] step=6 enemy round completed; finish the first enemy")
+        elseif session.TutorialStep == 8 and session.TutorialGuardUsed then
+            session.TutorialStep = 9
+            log("[Tutorial] step=9 guard round completed; finish the second enemy")
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnWaveStarted(any session, integer wave)
+        -- Reset skill cooldowns at the same checkpoint before the new wave becomes active.
+        if not session.TutorialActive then return end
+        if wave == 2 then
+            local runtime = session:GetSkillRuntimeState("player_01")
+            if runtime ~= nil then runtime:ResetSkillRuntimeState("TUTORIAL_SECOND_ENEMY") end
+            session.TutorialStep = 7
+            log("[Tutorial] step=7 second enemy spawned; recover with a potion")
+        elseif wave == 3 then
+            local runtime = session:GetSkillRuntimeState("player_01")
+            if runtime ~= nil then runtime:ResetSkillRuntimeState("TUTORIAL_FREE_COMBAT") end
+            session.TutorialStep = 10
+            log("[Tutorial] step=10 free combat started enemies=" .. tostring(#session.BoardState:CollectLivingEnemies()))
+        end
+    end
+
+    method integer GetTotalWaves(any session, integer defaultValue)
+        -- Tutorial reuses the stage definition with three fixed waves.
+        return session.TutorialActive and 3 or defaultValue
+    end
+
+    method boolean UseSpawnVariant(any session, boolean defaultValue)
+        -- Keep normal stage variants while tutorial lessons use the authored roster.
+        return defaultValue and not session.TutorialActive
+    end
+
+    method integer GetSpawnCount(any session, integer wave, integer defaultValue)
+        -- The final wave contains two simultaneous enemies; earlier waves contain one.
+        if session.TutorialActive then return wave == 3 and 2 or 1 end
+        return defaultValue
+    end
+
+    method string GetSpawnMode(any session, string defaultValue)
+        -- Lessons wait for the current enemy to be cleared.
+        return session.TutorialActive and "CLEAR_ONLY" or defaultValue
+    end
+
+    method integer GetMaxConcurrent(any session, integer count, integer defaultValue)
+        -- Each tutorial wave spawns its full roster at once.
+        return session.TutorialActive and count or defaultValue
+    end
+
+    method integer GetSpawnCell(any session, integer wave, integer defaultValue)
+        -- Place the first two opponents two cells ahead of the starting cell.
+        if session.TutorialActive and wave < 3 then return math.min(session.CellCount - 1, session.PlayerStartCell + 2) end
+        return defaultValue
+    end
+
+    @ExecSpace("ServerOnly")
+    method void OnEnemyRegistered(any session, Entity enemy)
+        -- The potion break already pauses wave two, so its first enemy round loads the guard target.
+        if session.TutorialActive and session.CurrentWave == 2 then
+            local actionPlan = enemy:GetComponent("script.EnemyActionPlanComponent")
+            if actionPlan ~= nil then actionPlan.SpawnWaitPending = false end
+        end
+    end
+
+    @ExecSpace("ServerOnly")
+    method table PrepareEnemyPlan(any session, string unitId, any unit, any actionPlan)
+        -- Return nil to continue normal planning; the first lesson replaces it with one wait.
+        if session.TutorialActive and session.TutorialStep == 1 then
+            return actionPlan:ReplacePlan(unitId, {
+                { ActionType = "WAIT", TileId = "", Direction = 0, Reason = "TUTORIAL_STEP1_WAIT" }
+            }, session.TurnNumber, unit.EnemyTraitIds, "TUTORIAL_STEP1_WAIT", 0)
+        end
+        return nil
+    end
+
+    method number GetEnemyExecuteDelay(any session, boolean isQueueingAttack, string enemyId, number defaultValue)
+        -- Slow the loaded attack announcement only during guided lessons.
+        if self:IsGuided(session) and isQueueingAttack then
+            log("[Tutorial] enemy queueing attack delay=0.8 enemy=" .. enemyId)
+            return 0.8
+        end
+        return defaultValue
+    end
+
+    method number GetEnemyBeatDuration(any session, string actionType, number defaultValue)
+        -- Allow time to observe skill loading and the missed attack before reopening player input.
+        if self:IsGuided(session) and actionType == "QUEUE_TILE" then
+            log("[Tutorial] enemy QUEUE_TILE hold beatDuration=2.0")
+            return 2.0
+        elseif session.TutorialActive and session.TutorialStep == 3 then
+            log("[Tutorial] dodge observation hold beatDuration=2.0")
+            return 2.0
+        end
+        return defaultValue
+    end
+
+    method number GetDamageAmount(any session, any targetUnit, number amount)
+        -- Keep the learner alive and allow each opponent to die only after its lesson.
+        if self:IsGuided(session) and (targetUnit.Team == "Player" or session.TutorialStep < 6 or session.TutorialStep == 7 or session.TutorialStep == 8) then
+            return math.min(amount, math.max(0, targetUnit.CurrentHp - 1))
+        end
+        return amount
+    end
+
+    method boolean IsCompletionValid(any session)
+        -- A saved completion requires the final wave, no remaining spawns and four genuine kills.
+        return session.TutorialStep >= 10 and session.CurrentWave == 3 and session.WaveRuntime ~= nil
+            and session.WaveRuntime.PendingSpawnCount <= 0 and session.BoardState ~= nil
+            and #session.BoardState:CollectLivingEnemies() <= 0 and session.ResultKillCount >= 4
+    end
+end

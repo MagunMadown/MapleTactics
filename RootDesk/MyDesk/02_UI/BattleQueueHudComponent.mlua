@@ -4,6 +4,9 @@ script BattleQueueHudComponent extends Component
 	property TextGUIRendererComponent TurnText = "9131478e-61b4-4407-aa83-e7a6713b52e1"
 
 	property Entity QueuePanelEntity = "a51334db-adb4-47a6-8e35-f2753dd6b18c"
+	property Entity UtilitySlot = "fd8c3e55-9fa5-46e1-9d7e-241d2a68a53a"
+	property SpriteGUIRendererComponent UtilityIcon = "c015d218-7eb1-44ef-9bf3-5ef476ea5d4a"
+	property TextGUIRendererComponent UtilityCooldownText = "13f08b96-9b8d-4f4e-a81d-8b4b6f3b329b"
 
 	property Entity ResultPanelEntity = "6f0764a9-6582-48bb-8163-cb30159fcf81"
 
@@ -62,6 +65,14 @@ script BattleQueueHudComponent extends Component
 	property SpriteGUIRendererComponent SkillSlot5QueuedHighlight = "2c500d1c-4078-4b10-8edf-08a7cc3486d3"
 
 	property SpriteGUIRendererComponent SkillSlot6QueuedHighlight = "2bdb1532-5cc8-4e51-a0fa-48b55fe0488b"
+
+	property SpriteGUIRendererComponent SkillSlot1TutorialHighlight = "a2158857-f461-4b57-9e8e-8c0e4b483362"
+
+	property SpriteGUIRendererComponent SkillSlot2TutorialHighlight = "d46dd6d6-bb71-4139-8209-42ee2d5a0ff6"
+
+	property SpriteGUIRendererComponent ExecuteTutorialHighlight = "513ccc6b-c0d9-4e8d-9a8e-9d321274782a"
+
+	property SpriteGUIRendererComponent ResultResetTutorialHighlight = "252dbbe1-5419-4ddc-960d-3318345dffb8"
 
 	property TextGUIRendererComponent SkillSlot1QueueOrderBadge = "7008050a-98bc-4e6f-86d6-20be285692a0"
 
@@ -317,21 +328,35 @@ script BattleQueueHudComponent extends Component
 			self.ResetButton.Entity:DisconnectEvent(ButtonClickEvent, self.ResetClickHandler)
 			self.ResetClickHandler = nil
 		end
+		self:SetTutorialHighlightTarget(0)
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
 		-- Keep buff and hover refresh under one client lifecycle callback.
 		self:RefreshBuffBar()
+		self:UpdateTutorialHighlight(delta)
 		self._T.SkillHoverElapsed = (self._T.SkillHoverElapsed or 0) + delta
 		if self._T.SkillHoverElapsed < 0.15 then return end
 		self._T.SkillHoverElapsed = 0
+		self:RefreshUtilitySlot()
+		if self:RefreshShopSkillBar() == false and self._T.ShopSkillPreview then
+			self._T.ShopSkillPreview = false
+			self:RefreshHud(true)
+		end
 		if not self.IsHudContextVisible or self._T.SkillSlotDragActive or self.IsMapTransferPending then self:HideSkillHover() return end
 		local player = _UserService.LocalPlayer
 		if not isvalid(player) or not isvalid(player.CurrentMap) then self:HideSkillHover() return end
 		local session = player.CurrentMap:GetComponent("script.BattleSessionComponent")
-		if session == nil or session.BattleResult ~= "" then self:HideSkillHover() return end
+		if (session == nil and not self._T.ShopSkillPreview) or (session ~= nil and session.BattleResult ~= "") then self:HideSkillHover() return end
 		local cursor = _InputService:GetCursorPosition()
+		if isvalid(self.UtilitySlot) and self.UtilitySlot.EnabledInHierarchy
+			and self:IsScreenPointInsideSkillSlot(cursor, self.UtilitySlot.UITransformComponent) then
+			local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
+			local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
+			if tooltip ~= nil then tooltip:Show("battle_utility", self._T.UtilityDescription or "고유 능력") end
+			return
+		end
 		local skillId = ""
 		for index = 1, 6 do
 			local button = self:GetSkillSlotButton(index)
@@ -347,6 +372,10 @@ script BattleQueueHudComponent extends Component
 		local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
 		local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
 		if tooltip == nil then return end
+		if self._T.ShopSkillPreview then
+			tooltip:Show("battle_skill", self._T.ShopSkillDescriptions[skillId] or skillId)
+			return
+		end
 		local unit = player:GetComponent("script.BattleUnitComponent")
 		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
 		local signature = tostring(session.EntryRequestId) .. ":" .. tostring(session.TurnNumber) .. ":" .. tostring(session.EnemyPlanRevision) .. ":" .. tostring(session.SkillSlotRevision)
@@ -355,6 +384,85 @@ script BattleQueueHudComponent extends Component
 			.. ":" .. tostring(unit ~= nil and unit.CurrentHp or 0) .. ":" .. tostring(unit ~= nil and unit.MaxHp or 0)
 			.. ":" .. tostring(inventory ~= nil and inventory.InventoryRevision or 0)
 		tooltip:RequestSkillHover(player.CurrentMap, skillId, signature)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshUtilitySlot()
+		-- Render server-owned turn cooldowns only when the combat skill bar is available.
+		if not isvalid(self.UtilitySlot) or not isvalid(self.UtilityIcon) or not isvalid(self.UtilityCooldownText) then return end
+		local player = _UserService.LocalPlayer
+		local session = isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap:GetComponent("script.BattleSessionComponent") or nil
+		local shown = self.IsHudContextVisible and not self.IsMapTransferPending and session ~= nil
+			and session.BattleResult == "" and (session.UtilitySkillId or "") ~= "" and (session.UtilitySkillIconRuid or "") ~= ""
+		if self.UtilitySlot.Enable ~= shown then self.UtilitySlot.Enable = shown end
+		if not shown then
+			self._T.UtilitySignature = nil
+			return
+		end
+		local turns = math.max(0, math.floor(session.UtilityRemainingCooldown or 0))
+		local signature = session.SelectedJobId .. ":" .. session.UtilitySkillId .. ":" .. session.UtilitySkillIconRuid .. ":" .. tostring(turns)
+			.. ":" .. _LobbyJobSelectionProvider.UtilitySnapshot
+		if self._T.UtilitySignature == signature then return end
+		self.UtilityIcon.ImageRUID = DataRef(session.UtilitySkillIconRuid)
+		self.UtilityIcon.Color = turns > 0 and Color(0.42, 0.42, 0.42, 1) or Color.white
+		self.UtilityCooldownText.Text = turns > 0 and tostring(turns) or ""
+		self.UtilityCooldownText.Entity.Enable = turns > 0
+		local presentation = _LobbyCharacterSelectionLogic:GetJobPassivePresentation(session.SelectedJobId)
+		self._T.UtilityDescription = presentation.Text .. "\n사용 키: S"
+		if turns > 0 then self._T.UtilityDescription = self._T.UtilityDescription .. "\n남은 대기시간: " .. tostring(turns) .. "턴" end
+		self._T.UtilitySignature = signature
+		log("[BattleUtilityHUD] skill=" .. session.UtilitySkillId .. " cooldown=" .. tostring(turns))
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean RefreshShopSkillBar()
+		-- Show the current run's owner-synced skills on shop nodes without enabling combat commands.
+		local state = _RunShopLogic:GetLocalShopUiState()
+		if not state.Success or not state.Commands.CanOpenUi then return false end
+		local player = _UserService.LocalPlayer
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.ActiveRunSequence ~= state.RunSequence then return false end
+		local signature = "SHOP:" .. tostring(state.RunSequence) .. ":" .. inventory.RunSkillBarSlotIds .. ":" .. state.SkillSnapshot .. ":" .. state.SellCatalogSnapshot
+		self._T.ShopSkillPreview = true
+		self:SetHudContextVisible(true, "SHOP_SKILL_PREVIEW")
+		if self.LastSignature == signature then return true end
+		self:SetUnavailableState("보유 스킬 · 상점")
+		self.LastSignature = signature
+		self.SlotSkillIds = inventory.RunSkillBarSlotIds
+		self.SlotSkillCooldownTurns = ""
+		self._T.IconMap = {}
+		self._T.ShopSkillDescriptions = {}
+		local names = {}
+		local nameMap = {}
+		for raw in string.gmatch(state.SellCatalogSnapshot or "", "([^|]+)") do
+			local fields = {}
+			for field in string.gmatch(raw .. "~", "([^~]*)~") do table.insert(fields, field) end
+			if fields[6] == "SKILL" then
+				nameMap[fields[1]] = fields[2]
+				self._T.IconMap[fields[1]] = fields[3]
+				self._T.ShopSkillDescriptions[fields[1]] = fields[2] .. "\n" .. fields[5]
+			end
+		end
+		for index = 1, 6 do names[index] = nameMap[self:GetSlotSkillId(index)] or "" end
+		self.SlotSkillNames = table.concat(names, "|")
+		self:RefreshSkillSlots(false, state.SkillSnapshot, "", "")
+		self:HideAllSkillCooldownPips()
+		self.TurnText.Text = ""
+		self.ExecuteButton.Entity.Enable = false
+		log("[BattleQueueHUD] shop skills=" .. self.SlotSkillIds)
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateTutorialHighlight(number delta)
+		-- Delegate tutorial presentation while retaining the HUD-owned bindings and state.
+		_TutorialPresentationLogic:UpdateQueueHighlight(self, delta)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetTutorialHighlightTarget(integer target)
+		-- Delegate tutorial presentation while retaining the HUD-owned bindings and state.
+		_TutorialPresentationLogic:SetQueueHighlightTarget(self, target)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -374,7 +482,9 @@ script BattleQueueHudComponent extends Component
 	method void HideSkillHover()
 		local root = _EntityService:GetEntityByPath("/ui/MouseTooltipGroup")
 		local tooltip = isvalid(root) and root:GetComponent("script.MouseTooltipUIComponent") or nil
-		if tooltip ~= nil and tooltip.ActiveOwnerKey == "battle_skill" then tooltip:Hide("battle_skill") end
+		if tooltip ~= nil and (tooltip.ActiveOwnerKey == "battle_skill" or tooltip.ActiveOwnerKey == "battle_utility") then
+			tooltip:Hide(tooltip.ActiveOwnerKey)
+		end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -409,6 +519,7 @@ script BattleQueueHudComponent extends Component
 			log("[BattleQueueHUD] map transfer lock released map=" .. currentMapName)
 		end
 		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
+			if self:RefreshShopSkillBar() then return end
 			local reason = presenterState == nil and "PRESENTER_STATE_MISSING" or presenterState.ContextReason
 			self.HasQueueFeedbackSnapshot = false
 			self.LastQueuedTileIds = ""
@@ -421,6 +532,8 @@ script BattleQueueHudComponent extends Component
 		local waveState = presenterState.Wave
 		local uiState = presenterState.UiState
 		self:ConsumeSkillSlotReorderReceipt(session)
+		self._T.ShopSkillPreview = false
+		self.ExecuteButton.Entity.Enable = true
 		self:SetHudContextVisible(true, "BATTLE_CONTEXT_READY")
 		local queueState = uiState.PlayerQueue
 		local runFlowUi = presenterState.RunFlowUi
@@ -525,7 +638,7 @@ script BattleQueueHudComponent extends Component
 		else
 			self.QueueSlotSprite.Color = Color(0.38, 0.30, 0.12, 1)
 		end
-		self:SetResultVisibility(uiState.BattleResult, session.StageId, uiState.UnionReward)
+		self:SetResultVisibility(uiState.BattleResult, session.StageId, presenterState.UnionReward or uiState.UnionReward)
 
 	end
 
@@ -618,6 +731,7 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void SetHudContextVisible(boolean visible, string reason)
 		-- Keeps the UIGroup and controller alive while hiding only battle-specific content outside battle maps.
+		if not visible then self:SetTutorialHighlightTarget(0) end
 		if self.QueuePanelEntity ~= nil then
 			self.QueuePanelEntity.Enable = visible
 		end
@@ -721,10 +835,26 @@ script BattleQueueHudComponent extends Component
 			self.ResultText.Text = battleResult == "Victory" and "전투 승리" or "전투 종료"
 			if rewardVisible then
 				self.UnionRewardText.Text = "이번 런 정산 · 유니온 코인 +" .. tostring(unionReward.FinalUnionPoints or 0)
-				self.UnionRewardBreakdownText.Text = "기본 +" .. tostring(unionReward.BaseUnionPoints or 0) .. "    유니온 보너스 +" .. tostring(unionReward.BonusUnionPoints or 0)
+				if (unionReward.AscensionLevel or 0) > 0 then
+					local rewardParts = { "기본 +" .. string.format("%.0f", unionReward.BaseUnionPoints or 0) }
+					if (unionReward.UnionBonusUnionPoints or 0) > 0 then
+						table.insert(rewardParts, "유니온 +" .. string.format("%.0f", unionReward.UnionBonusUnionPoints))
+					end
+					if (unionReward.AscensionBonusUnionPoints or 0) > 0 then
+						table.insert(rewardParts, "승천 +" .. string.format("%.0f", unionReward.AscensionBonusUnionPoints))
+					end
+					if (unionReward.FirstClearCoinBonus or 0) > 0 then
+						table.insert(rewardParts, "첫 완주 +" .. string.format("%.0f", unionReward.FirstClearCoinBonus))
+					end
+					self.UnionRewardBreakdownText.Text = table.concat(rewardParts, " · ")
+				else
+					self.UnionRewardBreakdownText.Text = "기본 +" .. tostring(unionReward.BaseUnionPoints or 0) .. "    유니온 보너스 +" .. tostring(unionReward.BonusUnionPoints or 0)
+				end
 			end
 			if lobbyReturnVisible then
-				self.ResetButtonText.Text = session ~= nil and session.ResultReady and ((battleResult == "Defeat" or hasCommittedReward) and "로비로 돌아가기" or "보상 확인 · 다음으로") or "처리 중..."
+				local buttonText = (battleResult == "Defeat" or hasCommittedReward) and "로비로 돌아가기" or "보상 확인 · 다음으로"
+				buttonText = _TutorialPresentationLogic:GetResultButtonText(session, battleResult, buttonText)
+				self.ResetButtonText.Text = session ~= nil and session.ResultReady and buttonText or "처리 중..."
 			end
 		end
 		if battleResult ~= "" then
@@ -1002,6 +1132,7 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method boolean CanBeginSkillSlotDrag(integer slotIndex)
+		if self._T.ShopSkillPreview then return false end
 		if self.PendingSkillSlotReorderRequestId > 0
 			or self._T.SkillSlotDragCancelling == true
 			or (_UtilLogic.ElapsedSeconds or 0) < self.SuppressSkillDragUntil
@@ -1010,6 +1141,9 @@ script BattleQueueHudComponent extends Component
 		end
 		local presenterState = _BattleHudPresenterLogic:GetCurrentState()
 		if presenterState == nil or presenterState.Success == false or presenterState.ContextVisible == false then
+			return false
+		end
+		if not _TutorialRulesLogic:CanEditSkillQueue(presenterState.Session) then
 			return false
 		end
 		local uiState = presenterState.UiState
@@ -1196,28 +1330,11 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method integer ResolveSkillSlotAtTouchPoint(Vector2 touchPoint)
-		local uiPosition = _UILogic:ScreenToUIPosition(touchPoint)
-		local queueTransform = nil
-		if isvalid(self.QueuePanelEntity) then
-			queueTransform = self.QueuePanelEntity.UITransformComponent
-		end
-		if queueTransform == nil then
-			return 0
-		end
-		-- The queue and its six slots are BottomCenter anchored. Compare in the same
-		-- top-level UI coordinate space as ScreenToUIPosition; GetWorldCorners uses
-		-- Maker viewport coordinates and cannot be mixed with simulated screen input.
-		local queueBottom = -(_UILogic.ScreenHeight * 0.5) + queueTransform.anchoredPosition.y
-		local queueCenterX = queueTransform.anchoredPosition.x
+		-- Use each rendered slot's local coordinates; screen pixels are not reference UI units.
 		for slotIndex = 1, 6 do
 			local button = self:GetSkillSlotButton(slotIndex)
-			if button ~= nil and isvalid(button.Entity) and button.Entity.UITransformComponent ~= nil then
-				local slotTransform = button.Entity.UITransformComponent
-				local minX = queueCenterX + slotTransform.anchoredPosition.x - (slotTransform.RectSize.x * slotTransform.Pivot.x)
-				local maxX = minX + slotTransform.RectSize.x
-				local minY = queueBottom + slotTransform.anchoredPosition.y - (slotTransform.RectSize.y * slotTransform.Pivot.y)
-				local maxY = minY + slotTransform.RectSize.y
-				if uiPosition.x >= minX and uiPosition.x <= maxX and uiPosition.y >= minY and uiPosition.y <= maxY then
+			if button ~= nil and isvalid(button.Entity) and button.Entity.EnabledInHierarchy then
+				if self:IsScreenPointInsideSkillSlot(touchPoint, button.Entity.UITransformComponent) then
 					return slotIndex
 				end
 			end
@@ -1703,9 +1820,6 @@ script BattleQueueHudComponent extends Component
 		end
 		local snapshot = ""
 		local medalBonus = 0
-		local utilityId = ""
-		local utilityIcon = ""
-		local utilityTurns = 0
 		local player = _UserService.LocalPlayer
 		if self.IsHudContextVisible and isvalid(player) then
 			local unit = player:GetComponent("script.BattleUnitComponent")
@@ -1713,16 +1827,9 @@ script BattleQueueHudComponent extends Component
 				snapshot = unit.ActiveBuffSnapshot or ""
 				local relics = player:GetComponent("script.PlayerRunRelicEffectComponent")
 				if relics ~= nil then medalBonus = relics.BattleKillAttackBonus end
-				local session = isvalid(player.CurrentMap) and player.CurrentMap:GetComponent("script.BattleSessionComponent") or nil
-				if session ~= nil and session.BattleResult == "" and self.IsMapTransferPending == false then
-					utilityId = session.UtilitySkillId or ""
-					utilityIcon = session.UtilitySkillIconRuid or ""
-					utilityTurns = math.max(0, session.UtilityRemainingCooldown or 0)
-				end
 			end
 		end
 		local signature = snapshot .. ":" .. self.IconSnapshot .. ":medal:" .. tostring(medalBonus)
-			.. ":utility:" .. utilityId .. ":" .. utilityIcon .. ":" .. tostring(utilityTurns)
 		if signature == self._T.BuffBarSignature then
 			return
 		end
@@ -1749,10 +1856,6 @@ script BattleQueueHudComponent extends Component
 				if turns > 0 then remaining = remaining .. (hits > 0 and "\n" or "") .. "지속 " .. tostring(math.floor(turns)) .. "턴" end
 				table.insert(buffs, { SkillId = skillId, Remaining = remaining, IconRuid = iconRuid })
 			end
-		end
-		-- Read the authoritative cooldown without advancing it; ready skills have no buff entry.
-		if utilityId ~= "" and utilityIcon ~= "" and utilityTurns > 0 then
-			table.insert(buffs, { SkillId = utilityId, Remaining = "쿨타임\n" .. tostring(math.floor(utilityTurns)) .. "턴", IconRuid = utilityIcon })
 		end
 		for index = #views + 1, #buffs do
 			local view = template:Clone("BuffIcon" .. tostring(index))
@@ -1920,6 +2023,8 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void RefreshSkillSlot(integer slotIndex, ButtonComponent button, TextGUIRendererComponent label, SpriteGUIRendererComponent icon, SpriteGUIRendererComponent queuedHighlight, TextGUIRendererComponent queueOrderBadge, TextGUIRendererComponent cooldownText, boolean canChooseTile, string ownedSkills, string cooldownSnapshot, string queuedTileIds)
 		-- Renders one slot from its server-assigned skill: empty slots stay labelled and disabled.
+		self._T.SkillSlotCanQueue = self._T.SkillSlotCanQueue or {}
+		self._T.SkillSlotCanQueue[slotIndex] = false
 		local skillId = self:GetSlotSkillId(slotIndex)
 		if skillId == "" then
 			-- Keep all six positions legible even when the later prototype slots have no skill data.
@@ -1986,10 +2091,13 @@ script BattleQueueHudComponent extends Component
 			queueOrderBadge.Enable = false
 			queueOrderBadge.Entity.Enable = false
 		end
-		button.Enable = canChooseTile
+		local canQueue = canChooseTile
 			and self:IsSkillOwned(ownedSkills, skillId)
 			and remainingCooldown <= 0
 			and queueOrder <= 0
+		self._T.SkillSlotCanQueue[slotIndex] = canQueue
+		-- Keep pointer input alive for rearranging reserved or cooling-down skills.
+		button.Enable = canQueue or self:CanBeginSkillSlotDrag(slotIndex)
 	end
 
 	@ExecSpace("ClientOnly")
@@ -2006,6 +2114,9 @@ script BattleQueueHudComponent extends Component
 			log_warning("[BattleQueueHUD] register click ignored slot=" .. slotIndex .. " reason=SLOT_EMPTY")
 			return
 		end
+
+		-- A drag-enabled button is not necessarily available for queue registration.
+		if self._T.SkillSlotCanQueue ~= nil and self._T.SkillSlotCanQueue[slotIndex] == false then return end
 
 		self.SuppressSkillDragUntil = (_UtilLogic.ElapsedSeconds or 0) + self.SkillSlotDragClickSuppressionSeconds
 		self:PlaySkillIconPunch(slotIndex)
@@ -2378,12 +2489,20 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
 	handler HandleQuickbarCancelKey(KeyDownEvent event)
-		-- Keyboard slots follow the current quickbar order and reuse the click/server validation path.
-		if not self.IsHudContextVisible or self.IsMapTransferPending or _GameSettingsLogic:IsInputBlocked() then return end
+		-- Hotkeys toggle the current skill in the pending queue; execution and input locks stay authoritative.
+		if self._T.ShopSkillPreview or not self.IsHudContextVisible or self.IsMapTransferPending or _GameSettingsLogic:IsInputBlocked() then return end
 		for slotIndex = 1, 6 do
 			if _GameSettingsLogic:IsActionKey("SLOT_" .. tostring(slotIndex), event.key) then
-				log("[BattleQueueHUD] keyboard register requested slot=" .. tostring(slotIndex))
-				self:RequestSlotSkill(slotIndex, false)
+				local skillId = self:GetSlotSkillId(slotIndex)
+				local session = _BattleHudPresenterLogic:GetBattleSession()
+				local queueIndex = session ~= nil and skillId ~= "" and self:GetQueueOrder(session.QueuedTileIds, skillId) or 0
+				if queueIndex > 0 then
+					log("[BattleQueueHUD] keyboard cancel requested slot=" .. tostring(slotIndex) .. " tile=" .. skillId .. " index=" .. tostring(queueIndex))
+					_BattleHudPresenterLogic:RequestRemoveQueueItem(queueIndex)
+				else
+					log("[BattleQueueHUD] keyboard register requested slot=" .. tostring(slotIndex))
+					self:RequestSlotSkill(slotIndex, false)
+				end
 				return
 			end
 		end

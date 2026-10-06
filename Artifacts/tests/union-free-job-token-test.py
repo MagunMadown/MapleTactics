@@ -72,7 +72,7 @@ lua.globals().repo = load_methods(
         "CountLegacyBlockEntries", "CopyLevelMap", "CopyRewardReceiptMap", "CountTableEntries",
         "NormalizeRewardReceiptMap", "PruneCommittedRewardKeys", "ReadNonNegativeInteger",
         "IsNonNegativeInteger", "ClampNonNegativeInteger", "ValidateCouponReceiptCodes",
-        "NormalizePaidPurchaseReceipts", "CopyPaidPurchaseReceipts",
+        "NormalizePaidPurchaseReceipts", "CopyPaidPurchaseReceipts", "NormalizeAscensionFirstClearRewardRuns",
     },
 )
 
@@ -92,6 +92,7 @@ assert products["job_unlock_free"]["Price"] == 0 and products["job_unlock"]["Pri
 lua.globals().products = lua.table_from(products, recursive=True)
 
 lua.execute(r'''
+_AscensionDifficultyLogic = {MaxLevel=7}
 log = function(...) end
 log_error = log
 _UnionShopServiceLogic = shop

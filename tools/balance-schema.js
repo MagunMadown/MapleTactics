@@ -129,6 +129,8 @@
       }
     } else if(s.EffectType==="THROW_BEHIND"){
       if(d.TargetingType!=="SELF"&&s.TargetSelector==="PRIMARY_TARGET"&&Number.isInteger(v)&&v>=1&&b==="")return "";
+    } else if(s.EffectType==="THROW_FORWARD"){
+      if(d.TargetingType!=="SELF"&&s.TargetSelector==="PRIMARY_TARGET"&&v===0&&a==="FARTHEST_EMPTY"&&b==="")return "";
     } else if(s.EffectType==="PUSH_DISTANCE"){
       if(d.TargetingType!=="SELF"&&["PRIMARY_TARGET","ALL_SKILL_TARGETS"].includes(s.TargetSelector)&&utilityPushModifiersOK(b)){
         if(a==="MAX"&&v===0)return "";

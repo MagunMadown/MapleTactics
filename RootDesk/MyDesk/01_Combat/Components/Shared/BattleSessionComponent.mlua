@@ -1,6 +1,11 @@
 @Component
 script BattleSessionComponent extends Component
 
+	@Sync property boolean TutorialActive = false
+	@Sync property integer TutorialStep = 0
+	@Sync property boolean TutorialGuardUsed = false
+	@Sync property string TutorialUserId = ""
+
 	@Sync property string PoisonMistCellSnapshot = ""
 
 	@Sync property string BattlePhase = "Setup"
@@ -34,6 +39,11 @@ script BattleSessionComponent extends Component
 	@Sync property integer UnionRewardBasePoints = 0
 	@Sync property integer UnionRewardBonusPoints = 0
 	@Sync property integer UnionRewardFinalPoints = 0
+	@Sync property integer UnionRewardAscensionLevel = 0
+	@Sync property number UnionRewardAscensionCoinMultiplier = 1
+	@Sync property integer UnionRewardUnionBonusPoints = 0
+	@Sync property integer UnionRewardAscensionBonusPoints = 0
+	@Sync property integer UnionRewardFirstClearCoinBonus = 0
 	@Sync property boolean UnionRewardWasCommitted = false
 	@Sync property boolean UnionRewardWasDuplicate = false
 	@Sync property boolean UnionRewardRunEnded = false
@@ -152,6 +162,7 @@ script BattleSessionComponent extends Component
 	@Sync property number CellStartX = -3.36
 	@Sync property number CellSpacing = 1.12
 	@Sync property number UnitY = 0.12
+	property number StageUnitYOffset = 0
 	property integer PlayerStartCell = 2
 	property integer LeftEnemyStartCell = 0
 	property integer RightEnemyStartCell = 6
@@ -174,6 +185,8 @@ script BattleSessionComponent extends Component
 	property number PushMotionDuration = 0.40
 	property number PushImpactDelay = 0.18
 	property string ActiveEffectSkillId = ""
+	property string CellEffectSortingLayer = "MapLayer0"
+	property integer CellEffectOrderInLayer = 30
 	property string ActiveHitEffectRuid = ""
 	property string ActiveHitSoundRuid = ""
 	property number ActiveEffectScale = 1
@@ -182,17 +195,20 @@ script BattleSessionComponent extends Component
 	-- from the inspector instead of retuning each authored row.
 	property number SkillSoundVolume = 1
 	-- Combat-feel tuning: adjust presentation tempo here without changing battle rules.
-	@Sync property number MoveActionDuration = 0.12
+	@Sync property number MoveActionDuration = 0.24
+	-- Enemy step curve; the player's jump step uses PlayerMoveCurve.
 	@Sync property string MoveCurve = "QUAD_EASE_OUT"
+	@Sync property string PlayerMoveCurve = "LINEAR"
 	@Sync property number MoveSnapThreshold = 0.01
 	property number MoveCompletionFallbackGrace = 0.05
 	@Sync property boolean EnablePlayerHopVisual = true
-	@Sync property number PlayerHopDuration = 0.13
-	@Sync property number PlayerHopHeight = 0.09
-	@Sync property number PlayerHopTakeoffSquashDuration = 0.02
-	@Sync property number PlayerHopLandingSquashDuration = 0.04
-	@Sync property number PlayerHopSquashXScale = 1.03
-	@Sync property number PlayerHopSquashYScale = 0.97
+	@Sync property number PlayerHopDuration = 0.24
+	@Sync property number PlayerHopHeight = 0.30
+	@Sync property number PlayerHopTakeoffSquashDuration = 0.03
+	@Sync property number PlayerHopLandingSquashDuration = 0.07
+	-- 1.0 disables the takeoff squash: it would land on the first airborne frames and read as a flicker.
+	@Sync property number PlayerHopSquashXScale = 1.0
+	@Sync property number PlayerHopSquashYScale = 1.0
 	@Sync property number PlayerHopLandingXScale = 1.04
 	@Sync property number PlayerHopLandingYScale = 0.96
 	@Sync property number PlayerHopPeakProgress = 0.50
@@ -394,7 +410,10 @@ script BattleSessionComponent extends Component
 	handler HandleUnitMovedEvent(UnitMovedEvent event)
 		-- Confirms that subscribers can observe a completed logical move, then ticks venom poison on the mover.
 		log("[BattleEvent] UnitMovedEvent received unit=" .. event.UnitId .. " from=" .. event.FromCell .. " to=" .. event.ToCell)
-		if event.FromCell ~= event.ToCell then self:ApplyPoisonOnMove(event.UnitId) end
+		if event.FromCell ~= event.ToCell then
+			_TutorialRulesLogic:OnUnitMoved(self, event.UnitId, event.FromCell, event.ToCell)
+			self:ApplyPoisonOnMove(event.UnitId)
+		end
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1125,6 +1144,7 @@ script BattleSessionComponent extends Component
 	method table TryPrototypeForceStageClear()
 		-- Skips remaining waves, then kills one retained enemy through the normal damage/death/victory pipeline.
 		local result = { Success = false, Reason = "UNKNOWN" }
+		if not _TutorialRulesLogic:ShouldRecordProgress(self) then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
 		if self.BattleResult ~= "" then
 			result.Reason = "BATTLE_ALREADY_ENDED"
 			return result
@@ -1318,7 +1338,8 @@ script BattleSessionComponent extends Component
 		self.CellCount = definition.CellCount
 		self.CellStartX = definition.CellStartX
 		self.CellSpacing = definition.CellSpacing
-		self.UnitY = definition.UnitY
+		-- Map terrain may rise above the stage reference; keep all floor probes above its walkable deck.
+		self.UnitY = definition.UnitY + self.StageUnitYOffset
 		self.PlayerStartCell = definition.PlayerStartCell
 		self.LeftEnemyStartCell = 0
 		self.RightEnemyStartCell = self.CellCount - 1
@@ -1334,7 +1355,7 @@ script BattleSessionComponent extends Component
 		end
 		self.TurnState:ConfigureQueueCapacity(baseQueueCapacity, self.MinQueueCapacity, self.MaxQueueCapacity, "JOB_AND_STAGE_DEFINITION")
 		self:PublishTurnStateSnapshot("STAGE_DEFINITION")
-		self.WaveRuntime:SetTotalWaves(validation.TotalWaves, "STAGE_DEFINITION")
+		self.WaveRuntime:SetTotalWaves(_TutorialRulesLogic:GetTotalWaves(self, validation.TotalWaves), "STAGE_DEFINITION")
 		self:PublishWaveStateSnapshot("STAGE_DEFINITION")
 		log("[BattleSession] stage definition applied stage=" .. self.StageId .. " region=" .. self.RegionId .. " index=" .. self.StageIndex .. " type=" .. self.StageType .. " display=" .. self.StageDisplayName .. " cells=" .. self.CellCount .. " startX=" .. self.CellStartX .. " spacing=" .. self.CellSpacing .. " playerCell=" .. self.PlayerStartCell .. " queue=" .. self.TileQueueCapacity)
 		return validation
@@ -2238,6 +2259,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryUseUtilitySkill()
+		-- Allow the tutorial guard only after recovery and the next attack has been queued.
+		if not self:IsTutorialCommandAllowed("UTILITY", "", 0) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		-- Seal leaves movement, facing, queue cleanup and consumables available.
 		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Reserves the existing immediate-action lock without consuming or rewriting queued skills.
@@ -2258,6 +2281,9 @@ script BattleSessionComponent extends Component
 			return { Success = false, Reason = "PLAYER_FROSTBITTEN" }
 		end
 		local definition = bundle.Definition
+		if not _TutorialRulesLogic:IsUtilityAllowed(self, definition.SkillId, bundle.Step.EffectType) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
 		local runtime = self:GetSkillRuntimeState("player_01")
 		if runtime == nil then return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" } end
 		local cooldown = runtime:CanUseSkill(definition.SkillId)
@@ -2286,6 +2312,7 @@ script BattleSessionComponent extends Component
 		local relicEffects = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
 		if relicEffects ~= nil then relicEffects:OnSkillCompleted(definition.SkillId) end
 		self.UtilityRemainingCooldown = runtime:GetRemainingCooldown(definition.SkillId)
+		_TutorialRulesLogic:OnUtilityUsed(self, result)
 		self:PublishTurnStateSnapshot("UTILITY_EXECUTED")
 		local duration = math.max(0.1, definition.ActionDuration) / self:GetSkillSpeedMultiplier()
 		local expectedEntry = self.EntryRequestId
@@ -2365,9 +2392,10 @@ script BattleSessionComponent extends Component
 			end
 			return relocation
 		end
-		if step.EffectType == "THROW_BEHIND" and step.TargetSelector == "PRIMARY_TARGET" then
-			-- Grabs the targeted enemy and lands it Value cells behind the caster. A missing target, a HEAVY one or
-			-- a blocked landing rejects the utility, so the cooldown is not spent.
+		if (step.EffectType == "THROW_BEHIND" or step.EffectType == "THROW_FORWARD") and step.TargetSelector == "PRIMARY_TARGET" then
+			-- Grabs the targeted enemy and lands it Value cells behind the caster (THROW_BEHIND) or on the farthest
+			-- empty cell beyond it in the facing direction, passing over units (THROW_FORWARD). A missing target, a
+			-- HEAVY one or no legal landing rejects the utility, so the cooldown is not spent.
 			local targets = _SkillTargetResolverLogic:Resolve(self, sourceUnit.UnitId, definition)
 			if targets.Success == false then return targets end
 			local targetId = targets.PrimaryTargetUnitId
@@ -2383,6 +2411,15 @@ script BattleSessionComponent extends Component
 				return { Success = false, Reason = "UTILITY_TARGET_HEAVY" }
 			end
 			local destination = sourceCell - direction * math.max(1, math.floor(step.Value))
+			if step.EffectType == "THROW_FORWARD" then
+				destination = -1
+				for distance = 1, self.CellCount do
+					local cell = targetUnit.CellIndex + direction * distance
+					if self:IsValidCell(cell) and self:IsCellOccupied(cell, targetId) == false then
+						destination = cell
+					end
+				end
+			end
 			if self:IsValidCell(destination) == false or self:IsCellOccupied(destination, targetId) then
 				return { Success = false, Reason = "UTILITY_NO_EMPTY_DESTINATION" }
 			end
@@ -2525,10 +2562,18 @@ script BattleSessionComponent extends Component
 		end
 	end
 
+	method boolean IsTutorialCommandAllowed(string commandType, string tileId, integer direction)
+		-- Shared client/server entry point delegates to the tutorial rules.
+		return _TutorialRulesLogic:IsCommandAllowed(self, commandType, tileId, direction)
+	end
+
 	@ExecSpace("ServerOnly")
 	method table TryQueuePlayerAction(string actionType, integer direction)
 		-- Accepts at most one player action and keeps the slot occupied until presentation time ends.
 		local result = { Success = false, Reason = "UNKNOWN" }
+		if not self:IsTutorialCommandAllowed(actionType, "", direction) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
 
 		if actionType ~= "MOVE" and actionType ~= "TURN" then
 			result.Reason = "INVALID_ACTION"
@@ -2779,6 +2824,7 @@ script BattleSessionComponent extends Component
 			executeDelay = math.max(0.02, math.min(0.05, executeDelay))
 			log("[BattleEnemyHandoff] from=" .. enemyHandoffSourceId .. " action=" .. enemyHandoffActionType .. " to=" .. preparedIntent.EnemyId .. " delay=" .. tostring(executeDelay))
 		end
+		executeDelay = _TutorialRulesLogic:GetEnemyExecuteDelay(self, isQueueingAttack, preparedIntent.EnemyId, executeDelay)
 		self.ActionTimerId = _TimerService:SetTimerOnce(execute, executeDelay)
 	end
 
@@ -3087,6 +3133,8 @@ script BattleSessionComponent extends Component
 			if preparedEnemyUnit == nil or actionPlan == nil then
 				return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING" }
 			end
+			local tutorialPlan = _TutorialRulesLogic:PrepareEnemyPlan(self, enemyUnitId, preparedEnemyUnit, actionPlan)
+			if tutorialPlan ~= nil then return tutorialPlan end
 			if actionPlan.PlanState ~= "EMPTY" then
 				actionPlan:ResetPlan("REPLAN")
 			end
@@ -4007,6 +4055,7 @@ script BattleSessionComponent extends Component
 		end
 
 		local beatDuration = math.max(0.02, math.min(0.06, self.EnemyToPlayerBeatDuration))
+		beatDuration = _TutorialRulesLogic:GetEnemyBeatDuration(self, actionType, beatDuration)
 		local expectedEntry = self.EntryRequestId
 		local expectedTurn = self.TurnState.TurnNumber
 		local finishTransition = function()
@@ -4038,6 +4087,7 @@ script BattleSessionComponent extends Component
 
 		self.TurnState:CompleteEnemyTurn("ENEMY_ROUND_COMPLETED")
 		self:PublishTurnStateSnapshot("PLAYER_TURN_REOPENED")
+		_TutorialRulesLogic:OnEnemyRoundCompleted(self)
 		self.StageTurnNumber = self.TurnNumber
 		self:AdvancePlayerSkillCooldowns("PLAYER_TURN_" .. self.TurnNumber)
 		self:ProcessAugmentTrigger("TURN_START", "TURN:" .. tostring(self.TurnNumber), 0)
@@ -4267,6 +4317,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryReorderBattleSkillSlot(integer sourceIndex, integer targetIndex, integer expectedRevision)
+		if not _TutorialRulesLogic:CanEditSkillQueue(self) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		local result = {
 			Success = false,
 			Reason = "UNKNOWN",
@@ -4563,6 +4614,10 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryQueueTile(string tileId)
+		-- Guide the first hit without changing normal queue or automatic turn behavior.
+		if not self:IsTutorialCommandAllowed("QUEUE_TILE", tileId, 0) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
 		-- Seal leaves movement, facing, queue cleanup and consumables available.
 		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Appends one supported tile up to the configurable queue capacity.
@@ -4627,6 +4682,9 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryExecuteQueuedTile()
+		if not self:IsTutorialCommandAllowed("EXECUTE_QUEUE", "", 0) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
 		-- Seal leaves movement, facing, queue cleanup and consumables available.
 		if self:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
 		-- Freezes the registered queue and starts an arbitrary-length sequential execution pass.
@@ -4890,6 +4948,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryClearQueuedTile()
+		if _TutorialRulesLogic:IsGuided(self) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		-- Clears every registered tile only while the player still owns an idle input phase.
 		local clearedCount = self.TurnState.QueuedTileCount
 		local result = self.TurnState:TryClearQueuedSkills()
@@ -4905,6 +4964,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryRemoveQueuedTileAt(integer queueIndex)
+		if not _TutorialRulesLogic:CanEditSkillQueue(self) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		-- Removes one queued tile without advancing the turn or starting the enemy round.
 		local result = self.TurnState:TryRemoveQueuedSkillAt(queueIndex)
 		if result.Success == false then
@@ -4919,6 +4979,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryReorderQueuedTile(integer fromIndex, integer toIndex, integer expectedQueueOrderRevision)
+		if _TutorialRulesLogic:IsGuided(self) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		local currentRevision = self.TurnState ~= nil and self.TurnState.QueueOrderRevision or 0
 		local currentQueue = self.TurnState ~= nil and self.TurnState.QueuedTileIds or ""
 		local result = {
@@ -4976,6 +5037,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryMoveQueuedTile(integer fromIndex, integer toIndex)
+		if _TutorialRulesLogic:IsGuided(self) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
 		-- Reorders the queued tiles without advancing the turn or starting the enemy round.
 		local result = self.TurnState:TryMoveQueuedSkill(fromIndex, toIndex)
 		if result.Success == false then
@@ -5054,7 +5116,9 @@ script BattleSessionComponent extends Component
 		end
 		self.ResultDefeatReset = resetResult
 		log("[BattleForfeit] run abandoned stage=" .. tostring(self.StageId) .. " turn=" .. tostring(self.TurnNumber))
-		return self:ReturnToLobbyAfterDefeat()
+		local returned = self:ReturnToLobbyAfterDefeat()
+		_NewPlayerTutorialLogic:ReleaseAfterReturn(self, returned)
+		return returned
 	end
 
 	@ExecSpace("ServerOnly")
@@ -5101,10 +5165,16 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ResetUnionRewardPresentation(string reason)
+		-- Clears the previous run receipt before building the next battle snapshot.
 		self.UnionRewardRunId = 0
 		self.UnionRewardBasePoints = 0
 		self.UnionRewardBonusPoints = 0
 		self.UnionRewardFinalPoints = 0
+		self.UnionRewardAscensionLevel = 0
+		self.UnionRewardAscensionCoinMultiplier = 1
+		self.UnionRewardUnionBonusPoints = 0
+		self.UnionRewardAscensionBonusPoints = 0
+		self.UnionRewardFirstClearCoinBonus = 0
 		self.UnionRewardWasCommitted = false
 		self.UnionRewardWasDuplicate = false
 		self.UnionRewardRunEnded = false
@@ -5114,6 +5184,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void RefreshUnionRewardPresentation()
+		-- Copies the committed server receipt and its bonus categories into client-safe sync fields.
 		if isvalid(self.PlayerEntity) == false then
 			return
 		end
@@ -5126,12 +5197,17 @@ script BattleSessionComponent extends Component
 		self.UnionRewardBasePoints = snapshot.BaseUnionPoints or 0
 		self.UnionRewardBonusPoints = snapshot.BonusUnionPoints or 0
 		self.UnionRewardFinalPoints = snapshot.FinalUnionPoints or 0
+		self.UnionRewardAscensionLevel = snapshot.AscensionLevel or 0
+		self.UnionRewardAscensionCoinMultiplier = snapshot.AscensionCoinMultiplier or 1
+		self.UnionRewardUnionBonusPoints = snapshot.UnionBonusUnionPoints or snapshot.BonusUnionPoints or 0
+		self.UnionRewardAscensionBonusPoints = snapshot.AscensionBonusUnionPoints or 0
+		self.UnionRewardFirstClearCoinBonus = snapshot.FirstClearCoinBonus or 0
 		self.UnionRewardWasCommitted = snapshot.WasCommitted == true
 		self.UnionRewardWasDuplicate = snapshot.WasDuplicate == true
 		self.UnionRewardRunEnded = snapshot.RunEnded == true
 		self.UnionRewardRunEndReason = snapshot.RunEndReason or ""
 		self.UnionRewardRevision = self.UnionRewardRevision + 1
-		log("[BattleResult] Union reward runId=" .. self.UnionRewardRunId .. " base=" .. self.UnionRewardBasePoints .. " bonus=" .. self.UnionRewardBonusPoints .. " final=" .. self.UnionRewardFinalPoints .. " committed=" .. tostring(self.UnionRewardWasCommitted) .. " ended=" .. tostring(self.UnionRewardRunEnded))
+		log("[BattleResult] Union reward runId=" .. self.UnionRewardRunId .. " base=" .. self.UnionRewardBasePoints .. " bonus=" .. self.UnionRewardBonusPoints .. " final=" .. self.UnionRewardFinalPoints .. " ascension=" .. self.UnionRewardAscensionLevel .. " multiplier=" .. self.UnionRewardAscensionCoinMultiplier .. " unionBonus=" .. self.UnionRewardUnionBonusPoints .. " ascensionBonus=" .. self.UnionRewardAscensionBonusPoints .. " firstClear=" .. self.UnionRewardFirstClearCoinBonus .. " committed=" .. tostring(self.UnionRewardWasCommitted) .. " ended=" .. tostring(self.UnionRewardRunEnded))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -5232,6 +5308,7 @@ script BattleSessionComponent extends Component
 				end
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CastEffectRuid)
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.HitEffectRuid)
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CellEffectRuid)
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.ProjectileRuid)
 				-- Audio clips warm the same way: an unloaded cast sound lands after its own swing, which
 				-- reads as a mistimed hit rather than a slow load.
@@ -5246,6 +5323,7 @@ script BattleSessionComponent extends Component
 		if utility.Success == true then
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastEffectRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitEffectRuid)
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CellEffectRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.ProjectileRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastSoundRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitSoundRuid)
@@ -5256,9 +5334,12 @@ script BattleSessionComponent extends Component
 		end
 
 		local slotIds = {}
+		local tutorialSlotIds = _TutorialRulesLogic:GetSessionSkillIds(self)
 		local slotNames = {}
 		local slotCooldownTurns = {}
-		if runOrderAvailable == true then
+		if tutorialSlotIds ~= nil then
+			slotIds = tutorialSlotIds
+		elseif runOrderAvailable == true then
 			slotIds = self:ParseSkillSlotPipe(runSlotIds)
 		else
 			-- Compatibility fallback only; valid runs initialize and persist their random default in the run owner.
@@ -5354,7 +5435,7 @@ script BattleSessionComponent extends Component
 		-- Warm the new utility's clips and sounds so its first cast looks like every later one.
 		local ruids = {}
 		local seen = {}
-		for _, ruid in ipairs({ definition.CastEffectRuid, definition.HitEffectRuid, definition.ProjectileRuid, definition.CastSoundRuid, definition.HitSoundRuid }) do
+		for _, ruid in ipairs({ definition.CastEffectRuid, definition.HitEffectRuid, definition.CellEffectRuid, definition.ProjectileRuid, definition.CastSoundRuid, definition.HitSoundRuid }) do
 			self:CollectPresentationRuid(ruids, seen, ruid)
 		end
 		if #ruids > 0 and isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
@@ -5531,10 +5612,21 @@ script BattleSessionComponent extends Component
 		end
 
 		difficulty = difficulty or "NORMAL"
-		if difficulty ~= "NORMAL" and difficulty ~= "HARD" then
+		local level = _AscensionDifficultyLogic:ResolveLevel(difficulty)
+		if entryMode == "CONTINUE_RUN" then
+			local existing = playerEntity:GetComponent("script.PlayerRunStateComponent")
+			level = existing ~= nil and _AscensionDifficultyLogic:ResolveLevel(existing.RunDifficulty) or -1
+		end
+		if level < 0 then
 			result.Reason = "INVALID_DIFFICULTY"
 			return result
 		end
+		if entryMode == "NEW_RUN" then
+			local unlocked = _AscensionProgressionLogic:ValidateSelection(playerEntity, level)
+			if unlocked.Success == false then result.Reason = unlocked.Reason return result end
+		end
+		difficulty = _AscensionDifficultyLogic:ToDifficulty(level)
+		_TutorialRulesLogic:InitializeSession(self, playerEntity, requestId)
 		local runState = nil
 		if entryMode == "NEW_RUN" then
 			runState = _RunManagerLogic:StartNewRun(playerEntity, runSeed)
@@ -5545,7 +5637,7 @@ script BattleSessionComponent extends Component
 			result.Reason = "RUN_STATE_UNAVAILABLE"
 			return result
 		end
-		if entryMode == "NEW_RUN" then runState.RunDifficulty = difficulty end
+		runState.RunDifficulty = difficulty
 		log("[BattleDifficulty] initialized difficulty=" .. runState.RunDifficulty .. " mode=" .. entryMode)
 		local jobResult = _RunManagerLogic:ApplyJobSelection(playerEntity, jobId)
 		if jobResult.Success == false then
@@ -5566,6 +5658,7 @@ script BattleSessionComponent extends Component
 		self.EntryMode = entryMode
 		self.SelectedCharacterId = characterId or ""
 		self.SelectedLoadoutId = loadoutId or ""
+		_TutorialRulesLogic:ApplyStartingHp(self, runState, entryMode)
 		self:RegisterPlayer(playerEntity)
 
 		local rebuildResult = self:RebuildBattleState("BATTLE_ENTRY")
@@ -5955,6 +6048,7 @@ script BattleSessionComponent extends Component
 			CombatFeel = {
 				PlayerMoveDuration = self.MoveActionDuration,
 				MoveCurve = self.MoveCurve,
+				PlayerMoveCurve = self.PlayerMoveCurve,
 				MoveSnapThreshold = self.MoveSnapThreshold,
 				PlayerHopEnabled = self.EnablePlayerHopVisual,
 				PlayerHopDuration = self.PlayerHopDuration,
@@ -5981,6 +6075,11 @@ script BattleSessionComponent extends Component
 				BaseUnionPoints = self.UnionRewardBasePoints,
 				BonusUnionPoints = self.UnionRewardBonusPoints,
 				FinalUnionPoints = self.UnionRewardFinalPoints,
+				AscensionLevel = self.UnionRewardAscensionLevel,
+				AscensionCoinMultiplier = self.UnionRewardAscensionCoinMultiplier,
+				UnionBonusUnionPoints = self.UnionRewardUnionBonusPoints,
+				AscensionBonusUnionPoints = self.UnionRewardAscensionBonusPoints,
+				FirstClearCoinBonus = self.UnionRewardFirstClearCoinBonus,
 				WasCommitted = self.UnionRewardWasCommitted,
 				WasDuplicate = self.UnionRewardWasDuplicate,
 				RunEnded = self.UnionRewardRunEnded,
@@ -6148,6 +6247,7 @@ script BattleSessionComponent extends Component
 	method table TryDiscardRunConsumable(Entity playerEntity, string consumableId, integer requestId, integer entryId, integer inventoryRevision)
 		-- Disposal bypasses effect usability, but retains ownership, turn and revision checks.
 		local result = { Success = false, Reason = "INVALID_PLAYER", ConsumesTurn = false, ConsumedAmount = 0 }
+		if _TutorialRulesLogic:IsGuided(self) then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
 		if not isvalid(playerEntity) or playerEntity ~= self.PlayerEntity or playerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then return result end
 		if requestId <= 0 then result.Reason = "INVALID_REQUEST_ID"; return result end
 		if self.ContentValidationState ~= "VALID" or self.BattleResult ~= "" or self.TurnState == nil or self.TurnState.BattlePhase ~= "PlayerTurn" or self.TurnState.IsActionProcessing then
@@ -6205,6 +6305,7 @@ script BattleSessionComponent extends Component
 	method table TryUseRunConsumable(Entity playerEntity, string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
 		-- Validates timing and inventory, executes the registered effect, then commits consumption exactly once.
 		local result = { Success = false, Reason = "UNKNOWN", ConsumableId = consumableId or "", AppliedAmount = 0, ConsumedAmount = 0, ConsumesTurn = false }
+		if not self:IsTutorialCommandAllowed("USE_CONSUMABLE", consumableId, 0) then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
 		if isvalid(playerEntity) == false or playerEntity ~= self.PlayerEntity or playerEntity.CurrentMap ~= self.Entity or entryId ~= self.EntryRequestId then
 			result.Reason = "INVALID_PLAYER"
 			return result
@@ -6281,6 +6382,7 @@ script BattleSessionComponent extends Component
 		result.CooldownBefore = effectResult.CooldownBefore or 0
 		result.CooldownAfter = effectResult.CooldownAfter or 0
 		log("[BattleConsumable] used ref=" .. consumableId .. " effect=" .. definition.EffectType .. " applied=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter .. " consumesTurn=" .. tostring(result.ConsumesTurn) .. " key=" .. useKey)
+		_TutorialRulesLogic:OnConsumableUsed(self, result)
 		return result
 	end
 
@@ -6362,6 +6464,7 @@ script BattleSessionComponent extends Component
 				-- Cleanse is available while a real hostile status is active.
 				if definition.EffectType == "CLEANSE" and unit.SealTurns <= 0 and unit.FrostbiteTurns <= 0 and unit.ConfuseTurns <= 0
 					and unit.BurnDamage <= 0 then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
+				if not self:IsTutorialCommandAllowed("USE_CONSUMABLE", itemId, 0) then usable = false; reason = "TUTORIAL_FOLLOW_GUIDE" end
 				table.insert(result.Items, { ConsumableId = itemId, DisplayOrder = definition.RowIndex, DisplayName = definition.DisplayName, Count = tonumber(count), EffectType = definition.EffectType, EffectValue = definition.EffectValue, IconKey = definition.IconKey, Description = definition.Description, Usable = usable, Reason = reason })
 			end
 		end
@@ -7375,6 +7478,20 @@ script BattleSessionComponent extends Component
 			self.ActiveEffectFlipX = sourceUnit.Facing == "Right"
 		end
 
+		-- The cell clip is tied to the struck cells, not the caster, so impact overrides below never mute it.
+		local cellEffectRuid = definition.CellEffectRuid or ""
+		if cellEffectRuid ~= "" then
+			local resolved = _SkillTargetResolverLogic:Resolve(self, sourceUnitId, definition)
+			local xs = {}
+			for _, cell in ipairs(resolved.TargetCellIndices or {}) do
+				table.insert(xs, self:GetCellPosition(cell).x)
+			end
+			if #xs > 0 then
+				self:PlayCellEffects(cellEffectRuid, xs, self.UnitY, self.ActiveEffectScale, self:GetSkillSpeedMultiplier())
+			end
+			log("[BattleEffect] cell effects requested skill=" .. self.ActiveEffectSkillId .. " ruid=" .. cellEffectRuid .. " cells=" .. table.concat(resolved.TargetCellIndices or {}, "|"))
+		end
+
 		local castEffectRuid = definition.CastEffectRuid or ""
 		if sourceUnit ~= nil and sourceUnit.Team == "Enemy" then
 			-- Only accepted damage emits enemy hit audio; PUSH/HEAL cannot replay it.
@@ -7405,6 +7522,27 @@ script BattleSessionComponent extends Component
 			sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
 		end
 		sourcePresentation:PlaySkillSound(sourceUnitId, "CAST", castSoundRuid, self:GetSkillSoundVolume())
+	end
+
+	@ExecSpace("Client")
+	method void PlayCellEffects(string effectRuid, table xs, number y, number scale, number playRate)
+		-- Plays one non-looping clip at each given board x. Purely presentational.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= self.Entity then return end
+		local safeScale = math.max(0.05, scale)
+		local options = {}
+		options["SortingLayer"] = self.CellEffectSortingLayer
+		options["OrderInLayer"] = self.CellEffectOrderInLayer
+		options["PlayRate"] = math.max(0.1, playRate)
+		local played = 0
+		for _, x in ipairs(xs) do
+			local serial = _EffectService:PlayEffect(effectRuid, self.Entity, Vector3(x, y, 0), 0, Vector3(safeScale, safeScale, 1), false, options)
+			if serial ~= 0 then played = played + 1 end
+		end
+		if played < #xs then
+			log_warning("[BattleEffect] cell effects partial ruid=" .. effectRuid .. " played=" .. played .. "/" .. #xs)
+		end
+		log("[BattleEffect] cell effects played ruid=" .. effectRuid .. " count=" .. played .. " y=" .. y .. " scale=" .. safeScale)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -7820,16 +7958,7 @@ script BattleSessionComponent extends Component
 		end
 
 		-- Skill damage uses the skill ID as the impact presentation key.
-		local damageContext = self._T.RelicDamageContext
-		local zeroDamage = damageContext ~= nil and damageContext.SkillId == skillId
-			and damageContext.SourceUnitId == sourceUnitId and damageContext.Definition.ZeroDamage == true
-		local damageResult
-		if zeroDamage then
-			-- Zero damage is final: relics and attack buffs cannot turn the trade-off back into damage.
-			damageResult = { Success = true, AppliedAmount = 0, HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ExactLethal = false }
-		else
-			damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount, skillId)
-		end
+		local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount, skillId)
 		if damageResult.Success == false then
 			result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
 			return result
@@ -7904,7 +8033,10 @@ script BattleSessionComponent extends Component
 			HpAfter = -1
 		}
 
-		if amount <= 0 then
+		local context = self._T.RelicDamageContext
+		local zeroBase = context ~= nil and context.SourceUnitId == sourceUnitId and context.SkillId == attackId
+			and context.Definition ~= nil and context.Definition.ZeroDamage == true
+		if amount < 0 or (amount == 0 and not zeroBase) then
 			result.Reason = "INVALID_AMOUNT"
 			return result
 		end
@@ -7945,7 +8077,7 @@ script BattleSessionComponent extends Component
 		local attackHit = self._T.AttackBuffHit
 		local fixedFollowup = attackHit ~= nil and attackHit.SourceUnitId == sourceUnitId
 			and attackHit.SkillId == attackId and attackHit.FixedFollowup == true
-		if fixedFollowup then amount = 1 end
+		if zeroBase then amount = 0 elseif fixedFollowup then amount = 1 end
 		if not fixedFollowup and isFixedDamage == false and sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
 			and attackerRun ~= nil and attackerEffects.ActiveRunSequence == attackerRun.RunSequence then
 			amount = amount + attackerEffects.AttackBonus
@@ -7983,6 +8115,11 @@ script BattleSessionComponent extends Component
 		if not isFixedDamage and sourceUnit.Team == "Player" and targetUnit.Team == "Enemy" then
 			amount = amount + _AugmentRuntimeLogic:GetConditionalDamageBonus(self._T.RelicDamageContext, sourceUnitId, attackId, targetUnit)
 		end
+		-- Minimum-one defenses must not create damage when the base and bonuses are zero.
+		if amount <= 0 then
+			return { Success = true, Reason = "ZERO_BASE_DAMAGE", AppliedAmount = 0,
+				HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ReachedZero = false, ExactLethal = false }
+		end
 		if targetUnit.Team == "Player" and defenderEffects ~= nil and defenderEffects.IsInitialized
 			and defenderRun ~= nil and defenderEffects.ActiveRunSequence == defenderRun.RunSequence then
 			amount = math.max(1, amount - defenderEffects.DefenseBonus)
@@ -8005,6 +8142,7 @@ script BattleSessionComponent extends Component
 		if not ignoresBuffs and defenderEffects ~= nil then
 			amount = math.max(0, amount - defenderEffects:GetFrontDamageReduction(sourceUnit, targetUnit))
 		end
+		amount = _TutorialRulesLogic:GetDamageAmount(self, targetUnit, amount)
 		local damageResult
 		if amount == 0 then
 			damageResult = { Success = true, Reason = "RELIC_FRONT_GUARDED", AppliedAmount = 0,
@@ -8222,7 +8360,7 @@ script BattleSessionComponent extends Component
 		end
 		if unit.Team == "Enemy" and isvalid(self.PlayerEntity) then
 			self.ResultKillCount = self.ResultKillCount + 1
-			_MonsterCollectionLogic:RecordDefeat(self.PlayerEntity, unit.EnemyDefinitionId)
+			if _TutorialRulesLogic:ShouldRecordProgress(self) then _MonsterCollectionLogic:RecordDefeat(self.PlayerEntity, unit.EnemyDefinitionId) end
 			local sourceEntity = self:FindUnitEntity(sourceUnitId)
 			if sourceEntity == self.PlayerEntity then
 				local relics = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
@@ -8247,7 +8385,7 @@ script BattleSessionComponent extends Component
 			self:ResetEnemyIntentCursor("UNIT_DIED")
 		end
 		self:PublishEnemyPlanSnapshot("UNIT_DIED")
-		if unit.Team == "Enemy" and self.DropRuntime ~= nil then
+		if unit.Team == "Enemy" and self.DropRuntime ~= nil and _TutorialRulesLogic:ShouldRecordProgress(self) then
 			local sourceEntity = self:FindUnitEntity(sourceUnitId)
 			local sourceUnit = nil
 			if isvalid(sourceEntity) then
@@ -8386,8 +8524,8 @@ script BattleSessionComponent extends Component
 			self.BattleResult = "Defeat"
 		end
 
-		local runResultRecorded = false
-		if isvalid(self.PlayerEntity) then
+		local runResultRecorded = not _TutorialRulesLogic:ShouldRecordProgress(self)
+		if isvalid(self.PlayerEntity) and _TutorialRulesLogic:ShouldRecordProgress(self) then
 			local playerUnit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
 			if playerUnit ~= nil then playerUnit:ClearAttackBuffs() end
 			if self.BattleResult == "Victory" and self.DropRuntime ~= nil then
@@ -8481,6 +8619,7 @@ script BattleSessionComponent extends Component
 		self:AdvancePlayerSkillCooldowns("PLAYER_TURN_" .. self.TurnNumber)
 		self:SpawnWave(nextWave)
 		if self.CurrentWave == nextWave then
+			_TutorialRulesLogic:OnWaveStarted(self, nextWave)
 			self.TurnState:SetPhase("PlayerTurn", "NEXT_WAVE_ACTIVE")
 			self:PublishTurnStateSnapshot("NEXT_WAVE_ACTIVE")
 			self.WaveRuntime:MarkWaveActive("NEXT_WAVE_ACTIVE")
@@ -8935,7 +9074,7 @@ script BattleSessionComponent extends Component
 			for _, step in ipairs(steps.Steps) do
 				if step.EffectType == "DAMAGE" then
 					if (step.ParameterA or "") ~= "SOURCE_BASIC_ATTACK" and step.Value > 0 then
-						return step.Value
+						return _DamageEffectExecutorLogic:ResolveDamageAmount(unit, step)
 					end
 					break
 				end
@@ -9371,7 +9510,7 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method number GetPlayerHopDuration()
 		-- Clamps only the cosmetic avatar hop to the prototype's requested timing range.
-		return math.max(0.12, math.min(0.16, self.PlayerHopDuration))
+		return math.max(0.12, math.min(0.35, self.PlayerHopDuration))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -9621,7 +9760,7 @@ script BattleSessionComponent extends Component
 
 		local startPosition = self:GetCellPosition(fromCell)
 		local targetPosition = self:GetCellPosition(toCell)
-		self:PlaceEntity(targetEntity, startPosition)
+		self:PlaceEntity(targetEntity, self:GetPlayerFloorPosition(startPosition))
 		self._T.playerGridMove = {
 			Entity = targetEntity,
 			StartPosition = startPosition,
@@ -9643,7 +9782,7 @@ script BattleSessionComponent extends Component
 		log("[BattleMoveVisual] started from=" .. tostring(fromCell)
 			.. " to=" .. tostring(toCell)
 			.. " duration=" .. tostring(self._T.playerGridMove.Duration)
-			.. " curve=" .. tostring(self.MoveCurve)
+			.. " curve=" .. tostring(self.PlayerMoveCurve)
 			.. " snap=" .. tostring(self.MoveSnapThreshold))
 		return true
 	end
@@ -9663,12 +9802,23 @@ script BattleSessionComponent extends Component
 		end
 		if targetEntity.CurrentMap ~= self.Entity then self:FinishPlayerGridMovePresentation("MAP_LEFT") return end
 
-		local step = _PlayerGridMovementLogic:Advance(movement, delta, self.MoveCurve, self.MoveSnapThreshold)
+		local step = _PlayerGridMovementLogic:Advance(movement, delta, self.PlayerMoveCurve, self.MoveSnapThreshold)
 		if step.Complete then
 			self:FinishPlayerGridMovePresentation("VISUAL_COMPLETE")
 			return
 		end
-		self:PlaceEntity(targetEntity, step.Position)
+		self:PlaceEntity(targetEntity, self:GetPlayerFloorPosition(step.Position))
+	end
+
+	@ExecSpace("ServerOnly")
+	method Vector2 GetPlayerFloorPosition(Vector2 position)
+		-- The player's Body rests on the foothold below UnitY. Writing UnitY on every step frame held the root
+		-- above the floor for the whole step and dropped it back afterwards, so grid steps write the floor height.
+		local footholds = self.Entity.FootholdComponent
+		if footholds == nil then return position end
+		local foothold = footholds:Raycast(Vector2(position.x, self.UnitY + 0.5), Vector2(0, -1), 10)
+		if foothold == nil or foothold:IsVertical() then return position end
+		return Vector2(position.x, foothold:GetYByX(position.x))
 	end
 
 	@ExecSpace("ServerOnly")
@@ -9690,7 +9840,7 @@ script BattleSessionComponent extends Component
 		end
 
 		local targetPosition = movement.TargetPosition
-		self:PlaceEntity(targetEntity, targetPosition)
+		self:PlaceEntity(targetEntity, self:GetPlayerFloorPosition(targetPosition))
 		if movement.RequestId ~= nil then
 			self:ReceivePlayerMoveResult(movement.RequestId, movement.Entry, movement.Context, true, true,
 				targetPosition.x, targetPosition.y, "MOVE_COMPLETE", movement.UserId)
@@ -9950,6 +10100,7 @@ script BattleSessionComponent extends Component
 		if self:IsValidPlayerRequest(senderUserId) == false or self.ResultReady == false then return end
 		if self.BattleResult ~= "Victory" and self.BattleResult ~= "Defeat" then return end
 		self.ResultReady = false
+		if _NewPlayerTutorialLogic:TryFinishSession(self) ~= nil then return end
 		if self.ResultRecorded == false then
 			local resultContext = self:CaptureBattleResultContext()
 			local recorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
@@ -10259,8 +10410,8 @@ script BattleSessionComponent extends Component
 					if entry.Stat == "ATTACK" and entry.Turns > buffHitIndex then attackBuff = attackBuff + entry.Amount end
 				end
 				local base = _DamageEffectExecutorLogic:ResolveDamageAmount(unit, step)
-				local first = definition.ZeroDamage == true and 0 or math.max(0, base + bonus - math.max(0, unit.AttackBuffAmount) + attackBuff + combo)
-				local followup = definition.ZeroDamage == true and 0 or 1 + combo
+				local first = math.max(0, (definition.ZeroDamage == true and 0 or base) + bonus - math.max(0, unit.AttackBuffAmount) + attackBuff + combo)
+				local followup = (definition.ZeroDamage == true and 0 or 1) + combo
 				step.PreviewDamageText = _BuffEffectExecutorLogic:FormatNumber(first)
 				if hits > 1 then step.PreviewDamageText = step.PreviewDamageText .. " + " .. _BuffEffectExecutorLogic:FormatNumber(followup) .. " × " .. tostring(hits - 1) .. "회" end
 				buffHitIndex = buffHitIndex + hits

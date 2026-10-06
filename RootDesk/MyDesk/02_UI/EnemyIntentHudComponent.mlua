@@ -66,6 +66,7 @@ script EnemyIntentHudComponent extends Component
 
 		self:UpdateViewPositions(session)
 		self:RefreshEnemySkillHover(player, session, delta)
+		_TutorialPresentationLogic:UpdateEnemyQueueHighlight(self, session)
 		self.RefreshElapsed = self.RefreshElapsed + delta
 		if self.RefreshElapsed < self.RefreshInterval then
 			return
@@ -184,9 +185,12 @@ script EnemyIntentHudComponent extends Component
 		end
 		local view = self.EnemyIntentTemplate:Clone("EnemyIntent_" .. unitId)
 		view.Enable = true
+		self:EnsureSpecialMarkers(view)
+		local monsterHighlight = _TutorialPresentationLogic:CreateMonsterHighlight(view)
 		self._T.EnemyViews[unitId] = {
 			View = view,
 			Enemy = enemyEntity,
+			MonsterHighlight = monsterHighlight,
 			HeadMarker = self:ResolveHeadMarker(enemyEntity),
 			HeadOffsetUiY = 0
 		}
@@ -221,33 +225,36 @@ script EnemyIntentHudComponent extends Component
 		local queuedIconBackgroundColors = self:SplitTokens(intent.QueuedIconBackgroundColors or "")
 		local queuedSpecialFlags = self:SplitTokens(intent.QueuedSpecialFlags or "")
 		self._T.ViewQueues[intent.UnitId] = queuedIds
+		local player = _UserService.LocalPlayer
+		local session = self:GetBattleSession(player)
 		for slotIndex = 1, 3 do
 			local slot = view:GetChildByName("QueueSlot0" .. tostring(slotIndex))
 			local tileId = queuedIds[slotIndex] or ""
 			if isvalid(slot) then
-				slot.Enable = tileId ~= ""
+				local hasSkill = tileId ~= ""
+				slot.Enable = hasSkill
 				slot.UITransformComponent.anchoredPosition = Vector2(self.QueueOffsetX, queueBaseY + (slotIndex - 1) * self.QueueSlotSpacing)
 				self:ApplyQueueSlotColor(slot, intent.State)
-				-- Special attacks (telegraph/status/control) get a gold frame and a corner tag.
-				local special = tileId ~= "" and queuedSpecialFlags[slotIndex] == "1"
-				local specialFrame = slot:GetChildByName("SpecialFrame")
-				if isvalid(specialFrame) then specialFrame.Enable = special end
-				local specialTag = slot:GetChildByName("SpecialTag")
-				if isvalid(specialTag) then specialTag.Enable = special end
+				_TutorialPresentationLogic:UpdateEnemyQueueMarkers(self, slot, session, slotIndex, hasSkill, queuedSpecialFlags[slotIndex] == "1")
 				local icon = slot:GetChildByName("SkillIcon")
-				if isvalid(icon) and icon.SpriteGUIRendererComponent ~= nil and tileId ~= "" then
-					local iconRuid = queuedIconRuids[slotIndex] or ""
-					if iconRuid == "" or iconRuid == "-" then
-						iconRuid = self:GetEnemySkillFallbackIconRuid(tileId)
+				if isvalid(icon) and icon.SpriteGUIRendererComponent ~= nil then
+					if hasSkill then
+						local iconRuid = queuedIconRuids[slotIndex] or ""
+						if iconRuid == "" or iconRuid == "-" then
+							iconRuid = self:GetEnemySkillFallbackIconRuid(tileId)
+						end
+						local innerBackground = slot:GetChildByName("InnerBackground")
+						if isvalid(innerBackground) and innerBackground.SpriteGUIRendererComponent ~= nil then
+							-- Restore the default too, because these slots are reused across skills.
+							innerBackground.SpriteGUIRendererComponent.Color = self:GetQueueIconBackgroundColor(queuedIconBackgroundColors[slotIndex] or "")
+						end
+						icon.Enable = true
+						icon.UITransformComponent.anchoredPosition = Vector2(self.SkillIconOffsetX, self.SkillIconOffsetY)
+						icon.UITransformComponent.RectSize = Vector2(self.SkillIconSize, self.SkillIconSize)
+						icon.SpriteGUIRendererComponent.ImageRUID = DataRef(self:NormalizeHudIconRuid(iconRuid))
+					else
+						icon.Enable = false
 					end
-					local innerBackground = slot:GetChildByName("InnerBackground")
-					if isvalid(innerBackground) and innerBackground.SpriteGUIRendererComponent ~= nil then
-						-- Restore the default too, because these slots are reused across skills.
-						innerBackground.SpriteGUIRendererComponent.Color = self:GetQueueIconBackgroundColor(queuedIconBackgroundColors[slotIndex] or "")
-					end
-					icon.UITransformComponent.anchoredPosition = Vector2(self.SkillIconOffsetX, self.SkillIconOffsetY)
-					icon.UITransformComponent.RectSize = Vector2(self.SkillIconSize, self.SkillIconSize)
-					icon.SpriteGUIRendererComponent.ImageRUID = DataRef(self:NormalizeHudIconRuid(iconRuid))
 				end
 			end
 		end
@@ -307,6 +314,7 @@ script EnemyIntentHudComponent extends Component
 					frame.Enable = false
 				end
 			end
+			_TutorialPresentationLogic:EnsureEnemyQueueHighlight(slot, background)
 			if isvalid(slot) and isvalid(readyLabel) and not isvalid(slot:GetChildByName("SpecialTag")) then
 				local tag = readyLabel:Clone("SpecialTag")
 				if isvalid(tag) and tag:AttachTo(slot) then
@@ -538,7 +546,7 @@ script EnemyIntentHudComponent extends Component
 	method void UpdateViewPositions(any session)
 		-- Tracks each enemy and measures how far above its origin the head marker sits, in UI
 		-- pixels, so the queue can clear sprites of any height at the current camera zoom.
-		for _, record in pairs(self._T.EnemyViews or {}) do
+		for unitId, record in pairs(self._T.EnemyViews or {}) do
 			if record ~= nil and isvalid(record.View) and isvalid(record.Enemy) and record.Enemy.TransformComponent ~= nil then
 				local worldPosition = record.Enemy.TransformComponent.WorldPosition
 				local screenPosition = _UILogic:WorldToScreenPosition(Vector2(worldPosition.x, worldPosition.y))
@@ -553,6 +561,7 @@ script EnemyIntentHudComponent extends Component
 					headOffsetUiY = headUiPosition.y - uiPosition.y
 				end
 				record.HeadOffsetUiY = headOffsetUiY
+				_TutorialPresentationLogic:UpdateMonsterHighlight(self, session, unitId, record, worldPosition, uiPosition, headOffsetUiY)
 			end
 		end
 	end
@@ -587,6 +596,7 @@ script EnemyIntentHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void HideAllViews(string reason)
 		-- Disable both overlay trees and log each hide transition only once.
+		_TutorialPresentationLogic:ResetHudHighlights(self)
 		self:UpdateAttackPlatforms(nil, {})
 		if self._T.LastHideReason ~= reason then
 			log("[EnemyIntentHUD] hidden reason=" .. reason)
@@ -609,6 +619,7 @@ script EnemyIntentHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnEndPlay()
 		-- Remove attack highlights together with their intent views.
+		_TutorialPresentationLogic:ResetHudHighlights(self)
 		self:UpdateAttackPlatforms(nil, {})
 		for _, record in pairs(self._T.EnemyViews or {}) do
 			if record ~= nil and isvalid(record.View) then

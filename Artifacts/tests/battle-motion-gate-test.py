@@ -348,8 +348,10 @@ function _TweenLogic:PlayTween(a,b,duration,ease,callback)
     self.LastTween=tween
     return tween
 end
-actor:SetLocalGridMoveOffset(.5)
+actor:SetLocalGridMoveOffset2D(.5)
 actor:BeginLocalGridMoveHop("owner",.13,.09,.02,.04,1.03,.97,1.05,.95,.5,"",3,7)
+-- The hop reads the frame clock, not the tween value, so advance the clock into the arc.
+_UtilLogic.ElapsedSeconds=_UtilLogic.ElapsedSeconds+.08
 _TweenLogic.LastCallback(.5)
 assert(math.abs(visual.TransformComponent.Position.x-.75)<.000001)
 assert(visual.TransformComponent.Position.y>2)
@@ -359,7 +361,7 @@ actor:PlayMoveHop("owner",.13,.09,.02,.04,1.03,.97,1.05,.95,.5,"",3,true,7)
 assert(_TweenLogic.Count==1)
 actor:PlayMoveHop("owner",.13,.09,.02,.04,1.03,.97,1.05,.95,.5,"",3,true,0)
 assert(_TweenLogic.Count==2)
-actor:SetLocalGridMoveOffset(.3); actor:ClearLocalGridMoveOffset()
+actor:SetLocalGridMoveOffset2D(.3); actor:ClearLocalGridMoveOffset()
 assert(actor._T.moveHopVisual~=nil)
 ''')
 scenario("actual fixed HIT duration remains 0.5 seconds", r'''
@@ -550,6 +552,9 @@ scenario("map enter without a new clear helper still restores the lobby avatar",
 local restored=0
 actor={_T={confirmedDeathAwaitSync=true}}
 function actor:RestoreAvatarDeathMotion(reason) assert(reason=="LOBBY_ENTER"); restored=restored+1 end
+actor.DisablePlayerAutomaticRenderLayer=function() end
+actor.EnsurePlayerRenderOrder=function() end
+actor.IsServer=function() return false end
 P.OnMapEnter(actor,{Valid=true,Name="lobby"})
 assert(restored==1 and not actor._T.confirmedDeathAwaitSync)
 ''')
@@ -557,6 +562,9 @@ scenario("map enter with strict unknown member lookup still restores the lobby a
 local restored=0
 actor=setmetatable({_T={confirmedDeathAwaitSync=true}}, {__index=function(self,key) error("unknown member "..key) end})
 function actor:RestoreAvatarDeathMotion(reason) assert(reason=="LOBBY_ENTER"); restored=restored+1 end
+actor.DisablePlayerAutomaticRenderLayer=function() end
+actor.EnsurePlayerRenderOrder=function() end
+actor.IsServer=function() return false end
 P.OnMapEnter(actor,{Valid=true,Name="lobby"})
 assert(restored==1 and not actor._T.confirmedDeathAwaitSync)
 ''')
@@ -565,6 +573,9 @@ local restored,cleared=0,0
 actor={_T={confirmedDeathAwaitSync=true}}
 function actor:ClearLocalGridMoveOffset() cleared=cleared+1 end
 function actor:RestoreAvatarDeathMotion(reason) assert(reason=="LOBBY_ENTER"); restored=restored+1 end
+actor.DisablePlayerAutomaticRenderLayer=function() end
+actor.EnsurePlayerRenderOrder=function() end
+actor.IsServer=function() return false end
 P.OnMapEnter(actor,{Valid=true,Name="lobby"})
 assert(cleared==1 and restored==1 and not actor._T.confirmedDeathAwaitSync)
 ''')
@@ -573,6 +584,9 @@ local restored,cleared=0,0
 actor={_T={confirmedDeathAwaitSync=true}}
 function actor:ClearLocalGridMoveOffset() cleared=cleared+1; error("old visual disappeared") end
 function actor:RestoreAvatarDeathMotion(reason) assert(reason=="LOBBY_ENTER"); restored=restored+1 end
+actor.DisablePlayerAutomaticRenderLayer=function() end
+actor.EnsurePlayerRenderOrder=function() end
+actor.IsServer=function() return false end
 P.OnMapEnter(actor,{Valid=true,Name="lobby"})
 assert(cleared==1 and restored==1 and not actor._T.confirmedDeathAwaitSync)
 ''')

@@ -1,0 +1,98 @@
+@Component
+script HardModeSunsetComponent extends Component
+
+	-- Each client lights only its own ascension run; the map's original background stays intact.
+	@Sync property string AscensionUserIds = ""
+	property Color SunsetColor = Color(1, 0.78, 0.72, 1)
+	property number SunsetIntensity = 1
+	property integer LightSerial = 0
+
+	method void OnBeginPlay()
+		-- Initializes the map-local poll on both sides without depending on player component sync.
+		self._T.pollRemaining = 0
+		if self:IsClient() then
+			log("[AscensionSunset] ready map=" .. self.Entity.Name)
+		end
+	end
+
+	method void OnUpdate(number delta)
+		-- Publishes server-owned difficulty and refreshes local light only when membership changes.
+		self._T.pollRemaining = (self._T.pollRemaining or 0) - delta
+		if self._T.pollRemaining > 0 then return end
+		self._T.pollRemaining = 0.1
+		if self:IsServer() then
+			self:PublishAscensionUsers()
+		else
+			self:RefreshSunset()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PublishAscensionUsers()
+		-- Reads each player's authoritative run so normal and ascension users can share this map.
+		local ascensionUsers = {}
+		local users = _UserService:GetUsersByMapComponent(self.Entity.MapComponent)
+		for _, player in ipairs(users or {}) do
+			if isvalid(player) and player.PlayerComponent ~= nil then
+				---@type PlayerRunStateComponent
+				local run = player:GetComponent("script.PlayerRunStateComponent")
+				if run ~= nil and _AscensionDifficultyLogic:ResolveLevel(run.RunDifficulty) > 0 then
+					table.insert(ascensionUsers, player.PlayerComponent.UserId)
+				end
+			end
+		end
+		table.sort(ascensionUsers)
+		local snapshot = #ascensionUsers > 0 and "|" .. table.concat(ascensionUsers, "|") .. "|" or ""
+		if self.AscensionUserIds ~= snapshot then
+			self.AscensionUserIds = snapshot
+			log("[AscensionSunset] difficulty published map=" .. self.Entity.Name .. " ascensionUsers=" .. tostring(#ascensionUsers))
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshSunset()
+		-- Applies the warm ambient light to this client after authoritative difficulty arrives.
+		local player = _UserService.LocalPlayer
+		local ascension = isvalid(player) and player.CurrentMap == self.Entity and player.PlayerComponent ~= nil
+		if ascension then
+			ascension = string.find(self.AscensionUserIds, "|" .. player.PlayerComponent.UserId .. "|", 1, true) ~= nil
+		end
+		if not ascension then
+			self:ClearSunset("NORMAL_OR_OTHER_MAP")
+			return
+		end
+		if self.LightSerial > 0 then return end
+		local lightInfo = GlobalTypeOverlayLightInfo(self.Entity, 0, self.SunsetColor, self.SunsetIntensity)
+		self.LightSerial = _OverlayLightService:SpawnGlobalTypeOverlayLight(lightInfo)
+		if self.LightSerial > 0 then
+			_OverlayLightService:SetOverlayLightEnabled(true)
+			log("[AscensionSunset] applied map=" .. self.Entity.Name .. " difficulty=ASCENSION light=" .. tostring(self.LightSerial))
+		else
+			log_warning("[AscensionSunset] light creation failed map=" .. self.Entity.Name)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ClearSunset(string reason)
+		-- Releases the owned light before another map renders, preserving its normal brightness.
+		if self.LightSerial <= 0 then return end
+		_OverlayLightService:DestroyOverlayLight(self.LightSerial)
+		self.LightSerial = 0
+		_OverlayLightService:SetOverlayLightEnabled(false)
+		log("[AscensionSunset] cleared map=" .. self.Entity.Name .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("LocalPlayer")
+	handler HandleLocalMapChanged(EntityMapChangedEvent event)
+		-- Clears immediately on transfer even when an inactive map stops receiving updates.
+		if event.NewMap ~= self.Entity then self:ClearSunset("MAP_LEAVE") end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Cleans up map unload and repeated Maker play sessions.
+		self:ClearSunset("END_PLAY")
+	end
+
+end

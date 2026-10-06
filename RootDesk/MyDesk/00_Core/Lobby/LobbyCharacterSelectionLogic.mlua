@@ -65,6 +65,9 @@ script LobbyCharacterSelectionLogic extends Logic
 	property integer PreviewWeaponRetryCount = 0
 	property integer MaxPreviewWeaponRetryCount = 120
 	property string AppliedPreviewWeaponJobId = ""
+	property string PreviewIdleAction = "stand1"
+	property boolean NeedsPreviewPoseRefresh = false
+	property any PreviewCostumeHandler = nil
 	property string PendingClassId = ""
 	property string SelectedClassId = ""
 	property integer SelectedJobIndex = 1
@@ -109,13 +112,16 @@ script LobbyCharacterSelectionLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
-		-- Keep a superseded preview request from consuming the latest refresh.
+		-- Refresh appearance after costume loading, then pose after the preview rebuild completes.
 		if self.IsPopupOpen and self.NeedsPreviewRefresh then
 			local revision = self.PreviewRevision
 			local ready = self:RefreshCharacterPreview()
 			if revision == self.PreviewRevision then
 				self.NeedsPreviewRefresh = ready == false
 			end
+		end
+		if self.IsPopupOpen and self.NeedsPreviewPoseRefresh then
+			self.NeedsPreviewPoseRefresh = self:RefreshPreviewPose() == false
 		end
 	end
 
@@ -487,6 +493,21 @@ script LobbyCharacterSelectionLogic extends Logic
 	method table GetPassivePresentation()
 		-- Show the same validated utility skill that combat assigns to this job.
 		local selected = self.AvailableClasses[self.SelectedJobIndex]
+		return self:BuildPassivePresentation(selected)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetJobPassivePresentation(string jobId)
+		-- Reuse the synchronized catalog without changing the class selection preview.
+		for _, entry in ipairs(_LobbyJobSelectionProvider:GetEntries()) do
+			if entry.Id == jobId then return self:BuildPassivePresentation(entry) end
+		end
+		return self:BuildPassivePresentation(nil)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table BuildPassivePresentation(any selected)
+		-- Share the ability description between class selection and the combat HUD.
 		if selected == nil then
 			return { Label = "없음", Text = "직업을 선택하면 고유 능력을 확인할 수 있습니다." }
 		end
@@ -501,6 +522,8 @@ script LobbyCharacterSelectionLogic extends Logic
 			if step.EffectSetId == "fairy_turn_effects" then description = description .. "\n벽이나 몬스터에 막히면 밀리던 적이 1턴 기절합니다.\nHEAVY 특성의 적은 밀려나지 않습니다." end
 		elseif step.EffectType == "THROW_BEHIND" then
 			description = "앞칸의 적을 자신의 뒤 " .. tostring(step.Value) .. "칸으로 넘깁니다.\n착지할 칸이 비어 있어야 하며, 무거운 적은 넘길 수 없습니다."
+		elseif step.EffectType == "THROW_FORWARD" then
+			description = "앞칸의 적을 바라보는 방향의 가장 먼 빈칸으로 날려 보냅니다.\n사이의 유닛은 넘어가며, 빈칸이 없거나 무거운 적이면 실패합니다."
 		elseif step.ParameterA == "FARTHEST_EMPTY_FORWARD" then
 			description = "바라보는 방향에서 가장 먼 빈칸으로 순간이동합니다."
 		elseif step.ParameterA == "BEHIND_FARTHEST_ENEMY_FORWARD" then
@@ -666,7 +689,7 @@ script LobbyCharacterSelectionLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method boolean RefreshCharacterPreview()
-		-- Copies the local player's appearance once per popup, then updates only the preview weapon.
+		-- Recopy after source costume changes; job changes only replace the preview weapon.
 		local previewJobId = self.PendingClassId
 		local revision = self.PreviewRevision
 		local weaponRetryPending = false
@@ -707,6 +730,7 @@ script LobbyCharacterSelectionLogic extends Logic
 			local preview = _PrototypeWeaponController:GetJobWeaponPreview(previewJobId)
 			if self.IsPopupOpen == false or revision ~= self.PreviewRevision then return false end
 			self:ClearPreviewWeaponSlots(costume)
+			self.PreviewIdleAction = "stand1"
 			local weaponApplied = false
 			local retryable = preview ~= nil and preview.Retryable == true
 			if retryable then
@@ -725,17 +749,47 @@ script LobbyCharacterSelectionLogic extends Logic
 				if preview.SubWeaponRUID ~= nil and preview.SubWeaponRUID ~= "" then
 					costume:SetEquip(MapleAvatarItemCategory.SubWeapon, preview.SubWeaponRUID)
 				end
+				self.PreviewIdleAction = _PrototypeWeaponController:GetWeaponIdleAction(preview.WeaponType)
 				weaponApplied = true
 			end
 			if retryable == false then
 				if self.IsPopupOpen == false or revision ~= self.PreviewRevision then return false end
 				self.AppliedPreviewWeaponJobId = previewJobId
+				self.NeedsPreviewPoseRefresh = true
 				log("[LobbyClassSelect] preview weapon updated job=" .. self.PendingClassId .. " applied=" .. tostring(weaponApplied))
 			end
 		end
 
 		local appearanceReady = self.IsPreviewAppearanceReady or self.PreviewAppearanceRetryCount >= self.MaxPreviewAppearanceRetryCount
 		return appearanceReady and weaponRetryPending == false
+	end
+
+	@ExecSpace("ClientOnly")
+	@EventSender("LocalPlayer")
+	handler HandlePlayerCostumeChanged(InitMapleCostumeEvent event)
+		-- Account skins can finish loading or change after the popup's first copy.
+		if self.IsPopupOpen == false then return end
+		self.PreviewRevision = self.PreviewRevision + 1
+		self.IsPreviewAppearanceReady = false
+		self.PreviewAppearanceRetryCount = 0
+		self.PreviewAppearanceFailureLogged = false
+		self.NeedsPreviewRefresh = true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean RefreshPreviewPose()
+		-- Apply the same action to the skin's body and equipped parts after costume rebuilds.
+		if not isvalid(self.CharacterPreviewRenderer) then return false end
+		local body = self.CharacterPreviewRenderer:GetBodyEntity()
+		if not isvalid(body) then return false end
+		local event = ActionStateChangedEvent()
+		event.CoreActionName = self.PreviewIdleAction
+		event.PartsActionName = self.PreviewIdleAction
+		event.PlayRate = 1
+		event.PlayType = SpriteAnimClipPlayType.ZigzagLoop
+		body:SendEvent(event)
+		log("[LobbyClassSelect] preview pose updated job=" .. self.PendingClassId .. " action=" .. self.PreviewIdleAction)
+		return true
 	end
 
 	@ExecSpace("ClientOnly")
@@ -859,6 +913,9 @@ script LobbyCharacterSelectionLogic extends Logic
 		if self:ConnectJobCards() == false then return false end
 		self.PassiveEnterHandler = self.PassiveSlot:ConnectEvent(UITouchEnterEvent, function() self:ShowPassiveTooltip() end)
 		self.PassiveExitHandler = self.PassiveSlot:ConnectEvent(UITouchExitEvent, function() self:HidePassiveTooltip() end)
+		self.PreviewCostumeHandler = previewEntity:ConnectEvent(InitMapleCostumeEvent, function()
+			self.NeedsPreviewPoseRefresh = true
+		end)
 		self.ConfirmClickHandler = confirmEntity:ConnectEvent(ButtonClickEvent, self.OnConfirmClicked)
 		self.CancelClickHandler = cancelEntity:ConnectEvent(ButtonClickEvent, self.OnCancelClicked)
 		self.IsUiConnected = true
@@ -879,6 +936,11 @@ script LobbyCharacterSelectionLogic extends Logic
 		if self.IsUiConnected == false then
 			return
 		end
+		if isvalid(self.CharacterPreviewRenderer) and self.PreviewCostumeHandler ~= nil then
+			self.CharacterPreviewRenderer.Entity:DisconnectEvent(InitMapleCostumeEvent, self.PreviewCostumeHandler)
+		end
+		self.PreviewCostumeHandler = nil
+		self.NeedsPreviewPoseRefresh = false
 		self:DisconnectButtonEvent(self.ConfirmJobButton, self.ConfirmClickHandler)
 		self:DisconnectButtonEvent(self.CancelJobButton, self.CancelClickHandler)
 		for _, binding in ipairs(self.JobCardBindings) do
