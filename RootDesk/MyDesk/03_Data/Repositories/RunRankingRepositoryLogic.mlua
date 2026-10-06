@@ -1,0 +1,192 @@
+@Logic
+script RunRankingRepositoryLogic extends Logic
+
+	property string IndexStoragePrefix = "RunRankingIndexV1:"
+	property string PublicStoragePrefix = "RunRankingPublicV1:"
+	property integer ScanLimit = 1000
+	property table PublishLocks = {}
+
+	@ExecSpace("ServerOnly")
+	method any GetIndexStorage()
+		-- One board has one world-wide sorted index shared across rooms and world instances.
+		return _DataStorageService:GetSortableDataStorage(self.IndexStoragePrefix .. _RunRankingPolicyLogic.BoardId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method any GetPublicStorage()
+		-- Only opted-in whitelisted snapshots live here; no foreign UserDataStorage is ever queried.
+		return _DataStorageService:GetGlobalDataStorage(self.PublicStoragePrefix .. _RunRankingPolicyLogic.BoardId)
+	end
+
+	method table Failure(integer code, string reason)
+		-- Quota and unavailable storage are explicit failures, not empty rankings.
+		return { Success = false, Reason = code == 1000005 and "RANKING_CREDIT_EXHAUSTED" or reason, ErrorCode = code }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ReadIndex(string profileCode)
+		-- Tag lookup restricts own-best queries; global scans stop after the first TopLimit unique accounts.
+		local config = _RunRankingPolicyLogic:ValidateConfiguration()
+		if not config.Success then return config end
+		local storage = self:GetIndexStorage()
+		if storage == nil then return { Success = false, Reason = "RANKING_STORAGE_UNAVAILABLE" } end
+		local code, pages = 0, nil
+		if profileCode == "" then
+			code, pages = storage:GetSortedAndWait(SortDirection.Descending, 0, _RunRankingPolicyLogic:EncodeScore(0, 0))
+		else
+			code, pages = storage:GetPagesAndWait(profileCode)
+		end
+		if code ~= 0 then return self:Failure(code, "RANKING_INDEX_LOAD_FAILED") end
+		if pages == nil then return { Success = false, Reason = "RANKING_INDEX_PAGES_MISSING" } end
+		local indices, seen = {}, {}
+		local scanned, finished, limited = 0, false, false
+		while not finished do
+			for _, item in ipairs(pages:GetCurrentPageDatas() or {}) do
+				if scanned >= self.ScanLimit then limited = true; finished = true; break end
+				scanned = scanned + 1
+				local info = item.KeyInfo
+				local owner = info ~= nil and info.Tag or ""
+				if type(owner) == "string" and owner ~= "" and #owner <= 64
+					and (profileCode == "" or owner == profileCode)
+					and type(info.Key) == "string" and #info.Key <= 100
+					and _RunBuildSnapshotLogic:IsSafeInteger(item.Value, 0) then
+					if profileCode ~= "" or not seen[owner] then
+						seen[owner] = true
+						table.insert(indices, { EntryId = info.Key, ProfileCode = owner, Score = item.Value })
+					end
+				end
+				if profileCode == "" and #indices >= _RunRankingPolicyLogic.TopLimit then finished = true; break end
+			end
+			if finished or pages.IsLastPage then break end
+			local nextCode = pages:LoadNextPageAndWait()
+			if nextCode ~= 0 then return self:Failure(nextCode, "RANKING_INDEX_LOAD_FAILED") end
+			pages:MoveToNextPageAndWait()
+		end
+		if profileCode ~= "" then
+			table.sort(indices, function(left, right)
+				if left.Score == right.Score then return left.EntryId < right.EntryId end
+				return left.Score > right.Score
+			end)
+		end
+		return { Success = true, Reason = limited and "RANKING_SCAN_LIMIT" or "OK", Indices = indices, ScanLimited = limited, Scanned = scanned }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ReadPublicBatch(table indices)
+		-- One payload batch verifies every selected score/key/tag before a build is exposed to viewers.
+		if #indices == 0 then return { Success = true, Reason = "OK", Entries = {} } end
+		local keys = {}
+		for _, index in ipairs(indices) do table.insert(keys, index.EntryId) end
+		local storage = self:GetPublicStorage()
+		if storage == nil then return { Success = false, Reason = "RANKING_STORAGE_UNAVAILABLE" } end
+		local code, pages = storage:BatchGetAndWait(keys)
+		if code ~= 0 then return self:Failure(code, "RANKING_PUBLIC_LOAD_FAILED") end
+		if pages == nil then return { Success = false, Reason = "RANKING_PUBLIC_PAGES_MISSING" } end
+		local values = {}
+		while true do
+			for _, item in ipairs(pages:GetCurrentPageDatas() or {}) do values[item.KeyInfo.Key] = item.Value end
+			if pages.IsLastPage then break end
+			local nextCode = pages:LoadNextPageAndWait()
+			if nextCode ~= 0 then return self:Failure(nextCode, "RANKING_PUBLIC_LOAD_FAILED") end
+			pages:MoveToNextPageAndWait()
+		end
+		local entries = {}
+		for _, index in ipairs(indices) do
+			local decoded = _RunPublicRecordContractLogic:Decode(values[index.EntryId] or "")
+			if not decoded.Success or decoded.Public.EntryId ~= index.EntryId
+				or decoded.Public.ProfileCode ~= index.ProfileCode or decoded.Public.Score ~= index.Score then
+				return { Success = false, Reason = "RANKING_INDEX_PAYLOAD_MISMATCH" }
+			end
+			table.insert(entries, decoded.Public)
+		end
+		return { Success = true, Reason = "OK", Entries = entries }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LoadTop()
+		-- Bounded scans return a correct leading prefix; a reached scan ceiling is visibly reported.
+		local index = self:ReadIndex("")
+		if not index.Success then return index end
+		local loaded = self:ReadPublicBatch(index.Indices)
+		if not loaded.Success then return loaded end
+		loaded.Entries = _RunRankingPolicyLogic:AssignRanks(loaded.Entries)
+		loaded.ScanLimited = index.ScanLimited
+		loaded.Reason = index.ScanLimited and "RANKING_SCAN_LIMIT" or "RANKING_LOADED"
+		return loaded
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LoadOwnBest(string profileCode)
+		-- Even outside the top list, the caller can see their own published best without a claimed exact rank.
+		local index = self:ReadIndex(profileCode)
+		if not index.Success then return index end
+		if index.ScanLimited then return { Success = false, Reason = "RANKING_OWN_SCAN_LIMIT" } end
+		if #index.Indices == 0 then return { Success = true, Reason = "NO_PUBLIC_RECORD", HasBest = false, Indices = {} } end
+		local loaded = self:ReadPublicBatch({ index.Indices[1] })
+		if not loaded.Success then return loaded end
+		return { Success = true, Reason = "OK", HasBest = true, Best = loaded.Entries[1], Indices = index.Indices }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table Publish(string profileCode, string nickname, table record)
+		-- Local locks reduce repeat clicks; immutable per-run keys prevent cross-instance score regression.
+		local public = _RunPublicRecordContractLogic:MakePublicRecord(profileCode, nickname, record)
+		if not public.Success then return public end
+		if self.PublishLocks[profileCode] then return { Success = false, Reason = "RANKING_PUBLISH_BUSY" } end
+		self.PublishLocks[profileCode] = true
+		local ok, result = pcall(function() return self:CommitPublicRecord(profileCode, public) end)
+		self.PublishLocks[profileCode] = nil
+		if not ok then
+			log_warning("[RunRanking] publish storage exception=" .. tostring(result))
+			return { Success = false, Reason = "RANKING_STORAGE_EXCEPTION" }
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CommitPublicRecord(string profileCode, table candidate)
+		-- Payload comes first; partial writes retry the same key and cannot point to missing private history.
+		local previous = self:LoadOwnBest(profileCode)
+		if not previous.Success then return previous end
+		if previous.HasBest and candidate.Public.Score <= previous.Best.Score then
+			self:CleanupInferiorIndices(previous)
+			return { Success = true, Reason = "RANKING_BEST_UNCHANGED", Best = previous.Best }
+		end
+		local payload = self:GetPublicStorage()
+		local index = self:GetIndexStorage()
+		if payload == nil or index == nil then return { Success = false, Reason = "RANKING_STORAGE_UNAVAILABLE" } end
+		local code, existing = payload:GetAndWait(candidate.Public.EntryId)
+		if code ~= 0 and code ~= 1000002 then return self:Failure(code, "RANKING_PUBLIC_LOAD_FAILED") end
+		if existing ~= nil and existing ~= "" then
+			local decoded = _RunPublicRecordContractLogic:Decode(existing)
+			if not decoded.Success or decoded.Public.EntryId ~= candidate.Public.EntryId or decoded.Public.Score ~= candidate.Public.Score then
+				return { Success = false, Reason = "RANKING_FINALIZATION_CONFLICT" }
+			end
+		else
+			local saveCode = payload:SetAndWait(candidate.Public.EntryId, candidate.Json)
+			if saveCode ~= 0 then return self:Failure(saveCode, "RANKING_PUBLIC_SAVE_FAILED") end
+		end
+		local info = DataStorageKeyInfo(candidate.Public.EntryId, "", profileCode)
+		local indexCode = index:SetByInfoAndWait(info, candidate.Public.Score)
+		if indexCode ~= 0 then return self:Failure(indexCode, "RANKING_INDEX_SAVE_FAILED") end
+		local committed = self:LoadOwnBest(profileCode)
+		if committed.Success and committed.HasBest then
+			self:CleanupInferiorIndices(committed)
+		end
+		-- Old public payloads stay immutable for in-flight readers; offline garbage collection is a later task.
+		return { Success = true, Reason = "RANKING_PUBLISHED", Best = committed.Best or candidate.Public }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CleanupInferiorIndices(table own)
+		-- Idempotent retries also repair known inferior indices; concurrent better immutable keys are never removed.
+		local retired = {}
+		for _, entry in ipairs(own.Indices or {}) do
+			if entry.Score < own.Best.Score then table.insert(retired, entry.EntryId) end
+		end
+		if #retired == 0 then return end
+		local code, deleted = self:GetIndexStorage():BatchDeleteAndWait(retired)
+		if code ~= 0 then log_warning("[RunRanking] inferior index cleanup pending code=" .. tostring(code)) end
+	end
+
+end

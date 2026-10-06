@@ -1,0 +1,138 @@
+@Logic
+script RunPublicRecordContractLogic extends Logic
+
+	property integer Version = 1
+	property integer MaxBytes = 4000
+
+	method string MakeEntryId(string profileCode, integer runId)
+		-- Identity and RunId come from authenticated server state, not arbitrary storage paths.
+		return profileCode .. ":" .. string.format("%.0f", runId)
+	end
+
+	method table MakePublicRecord(string profileCode, string nickname, table source)
+		-- Publish a whitelist only: no seed, account inventory, private history, HP, or internal diagnostics.
+		local candidate = _RunRankingPolicyLogic:ValidateCandidate(source)
+		if not candidate.Success then return candidate end
+		if type(profileCode) ~= "string" or profileCode == "" or #profileCode > 64 then
+			return { Success = false, Reason = "RANKING_PROFILE_MISSING" }
+		end
+		local name = nickname or "모험가"
+		if name == "" or #name > 120 then name = "모험가" end
+		local sanitizedName, removedCount = string.gsub(name, "[<>%c]", "")
+		local public = { Version = self.Version, BoardId = _RunRankingPolicyLogic.BoardId,
+			NodeGraphId = source.NodeGraphId, ResultRuleVersion = source.RuleVersion,
+			EntryId = self:MakeEntryId(profileCode, source.RunId), ProfileCode = profileCode,
+			Nickname = sanitizedName,
+			Score = _RunRankingPolicyLogic:EncodeScore(source.ConsumedTurns, source.HitsTaken),
+			Record = { RunId = source.RunId, JobId = source.JobId, EndReason = "COMPLETED",
+				EndedAtUtc = source.EndedAtUtc, ConsumedTurns = source.ConsumedTurns, HitsTaken = source.HitsTaken,
+				ElapsedSeconds = source.ElapsedSeconds, ClearedBattleCount = source.ClearedBattleCount,
+				RankEligible = true, Conditions = source.Conditions, Build = source.Build, RegionHistory = source.RegionHistory } }
+		local encoded = self:Encode(public)
+		if not encoded.Success then return encoded end
+		return { Success = true, Reason = "OK", Public = self:CopyPublic(public), Json = encoded.Json }
+	end
+
+	method table CopyPublic(table public)
+		-- Rebuild the whitelist even when decoding storage, so future private fields cannot leak through a reused DTO.
+		local source = public.Record
+		local record = { RunId = source.RunId, JobId = source.JobId, EndReason = source.EndReason,
+			EndedAtUtc = source.EndedAtUtc, ConsumedTurns = source.ConsumedTurns, HitsTaken = source.HitsTaken,
+			ElapsedSeconds = source.ElapsedSeconds, ClearedBattleCount = source.ClearedBattleCount, RankEligible = source.RankEligible }
+		record.Conditions = { Captured = source.Conditions.Captured, ObservedStart = source.Conditions.ObservedStart }
+		for _, field in ipairs({ "DifficultyId", "BalanceVersion", "SeasonId", "RankingRuleVersion", "AccountProgressionMode" }) do
+			record.Conditions[field] = source.Conditions[field]
+		end
+		record.RegionHistory = { Captured = source.RegionHistory.Captured, Complete = source.RegionHistory.Complete, Visits = {} }
+		for _, visit in ipairs(source.RegionHistory.Visits) do
+			table.insert(record.RegionHistory.Visits, { RegionId = visit.RegionId, Completed = visit.Completed,
+				ClearedBattles = visit.ClearedBattles, ConsumedTurns = visit.ConsumedTurns, HitsTaken = visit.HitsTaken })
+		end
+		record.Build = { Captured = source.Build.Captured, Relics = {}, Augments = {}, Skills = {} }
+		for _, relic in ipairs(source.Build.Relics) do table.insert(record.Build.Relics, { RelicId = relic.RelicId, Amount = relic.Amount }) end
+		for _, augment in ipairs(source.Build.Augments) do table.insert(record.Build.Augments, { AugmentId = augment.AugmentId, Stacks = augment.Stacks }) end
+		for _, skill in ipairs(source.Build.Skills) do
+			local ids = {}
+			for _, id in ipairs(skill.AugmentIds) do table.insert(ids, id) end
+			table.insert(record.Build.Skills, { SkillId = skill.SkillId, Amount = skill.Amount, SkillTier = skill.SkillTier, SlotIndex = skill.SlotIndex, AugmentIds = ids })
+		end
+		return { Version = public.Version, BoardId = public.BoardId, NodeGraphId = public.NodeGraphId, ResultRuleVersion = public.ResultRuleVersion,
+			EntryId = public.EntryId, ProfileCode = public.ProfileCode,
+			Nickname = public.Nickname, Score = public.Score, Record = record }
+	end
+
+	method table Validate(table public)
+		-- Stored projections are checked independently without pretending they are full private results.
+		local config = _RunRankingPolicyLogic:ValidateConfiguration()
+		if not config.Success then return config end
+		if type(public) ~= "table" or public.Version ~= self.Version or public.BoardId ~= _RunRankingPolicyLogic.BoardId
+			or public.NodeGraphId ~= _RunRankingPolicyLogic.NodeGraphId or public.ResultRuleVersion ~= _RunRankingPolicyLogic.ResultRuleVersion
+			or type(public.ProfileCode) ~= "string" or public.ProfileCode == "" or #public.ProfileCode > 64
+			or type(public.Nickname) ~= "string" or #public.Nickname > 120 or type(public.Record) ~= "table" then
+			return { Success = false, Reason = "RANKING_PUBLIC_RECORD_INVALID" }
+		end
+		local record = public.Record
+		if type(record.Build) ~= "table" or type(record.RegionHistory) ~= "table" then
+			return { Success = false, Reason = "RANKING_PUBLIC_BUILD_INVALID" }
+		end
+		for _, field in ipairs({ "RunId", "ConsumedTurns", "HitsTaken", "ClearedBattleCount" }) do
+			if not _RunBuildSnapshotLogic:IsSafeInteger(record[field], field == "RunId" and 1 or 0) then
+				return { Success = false, Reason = "RANKING_PUBLIC_RECORD_INVALID" }
+			end
+		end
+		if public.EntryId ~= self:MakeEntryId(public.ProfileCode, record.RunId)
+			or record.ConsumedTurns > _RunRankingPolicyLogic.MaxConsumedTurns or record.HitsTaken > _RunRankingPolicyLogic.MaxHitsTaken
+			or public.Score ~= _RunRankingPolicyLogic:EncodeScore(record.ConsumedTurns, record.HitsTaken)
+			or record.EndReason ~= "COMPLETED" or record.RankEligible ~= true
+			or type(record.JobId) ~= "string" or record.JobId == "" or #record.JobId > 100
+			or type(record.EndedAtUtc) ~= "string" or #record.EndedAtUtc > 100
+			or type(record.ElapsedSeconds) ~= "number" or record.ElapsedSeconds ~= record.ElapsedSeconds
+			or record.ElapsedSeconds < 0 or record.ElapsedSeconds == math.huge then
+			return { Success = false, Reason = "RANKING_PUBLIC_RECORD_INVALID" }
+		end
+		local conditions = _RunResultContractLogic:ValidateConditions(record.Conditions)
+		if not conditions.Success or not record.Conditions.Captured or not record.Conditions.ObservedStart then
+			return { Success = false, Reason = "RANKING_PUBLIC_CONDITIONS_INVALID" }
+		end
+		for _, field in ipairs({ "DifficultyId", "BalanceVersion", "SeasonId", "RankingRuleVersion", "AccountProgressionMode" }) do
+			if record.Conditions[field] ~= _RunRankingPolicyLogic[field] then return { Success = false, Reason = "RANKING_CONDITIONS_MISMATCH" } end
+		end
+		local build = _RunBuildSnapshotLogic:ValidateSnapshot(record.Build)
+		local region = _RunRegionHistoryContractLogic:ValidateSnapshot(record.RegionHistory)
+		if not build.Success or not record.Build.Captured or not region.Success or not record.RegionHistory.Captured
+			or not record.RegionHistory.Complete or #record.RegionHistory.Visits == 0 or record.ClearedBattleCount ~= region.ClearedBattleCount
+			or region.ConsumedTurns > record.ConsumedTurns or region.HitsTaken > record.HitsTaken then
+			return { Success = false, Reason = "RANKING_PUBLIC_BUILD_INVALID" }
+		end
+		return { Success = true, Reason = "OK" }
+	end
+
+	method table Encode(table public)
+		-- Empty lists are omitted with the existing build/region wire contracts, keeping snapshots immutable.
+		local validation = self:Validate(public)
+		if not validation.Success then return validation end
+		local stored = self:CopyPublic(public)
+		stored.Record.Build = _RunBuildSnapshotLogic:ToStorageSnapshot(stored.Record.Build)
+		stored.Record.RegionHistory = _RunRegionHistoryContractLogic:ToStorageSnapshot(stored.Record.RegionHistory)
+		local ok, json = pcall(function() return _HttpService:JSONEncode(stored) end)
+		if not ok or type(json) ~= "string" then return { Success = false, Reason = "RANKING_ENCODE_FAILED" } end
+		if #json > self.MaxBytes then return { Success = false, Reason = "RANKING_PUBLIC_TOO_LARGE" } end
+		return { Success = true, Reason = "OK", Json = json }
+	end
+
+	method table Decode(string json)
+		-- Corrupt or mismatched public snapshots fail closed instead of exposing private data as a fallback.
+		if json == nil or json == "" or #json > self.MaxBytes then return { Success = false, Reason = "RANKING_PUBLIC_RECORD_MISSING" } end
+		local ok, public = pcall(function() return _HttpService:JSONDecode(json) end)
+		if not ok or type(public) ~= "table" or type(public.Record) ~= "table"
+			or type(public.Record.Build) ~= "table" or type(public.Record.RegionHistory) ~= "table" then
+			return { Success = false, Reason = "RANKING_PUBLIC_RECORD_INVALID" }
+		end
+		public.Record.Build = _RunBuildSnapshotLogic:FromStorageSnapshot(public.Record.Build)
+		public.Record.RegionHistory = _RunRegionHistoryContractLogic:FromStorageSnapshot(public.Record.RegionHistory)
+		local validation = self:Validate(public)
+		if not validation.Success then return validation end
+		return { Success = true, Reason = "OK", Public = self:CopyPublic(public), Json = json }
+	end
+
+end

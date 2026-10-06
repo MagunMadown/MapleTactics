@@ -1,0 +1,80 @@
+@Logic
+script RunRegionHistoryContractLogic extends Logic
+
+	property integer MaxVisits = 16
+
+	method table EmptySnapshot()
+		-- Old records have no observed route; absence is not an empty successfully captured run.
+		return { Captured = false, Complete = false, Visits = {} }
+	end
+
+	method boolean IsCounter(any value)
+		-- Aggregate counters must survive JSON number conversion without accepting fractions or NaN.
+		return type(value) == "number" and value == value and value >= 0
+			and value <= 9007199254740991 and value == math.floor(value)
+	end
+
+	method table ValidateSnapshot(table snapshot)
+		-- Validates a bounded ordered visit list independently from live Stage/Node catalogs.
+		if type(snapshot) ~= "table" or type(snapshot.Captured) ~= "boolean"
+			or type(snapshot.Complete) ~= "boolean" or type(snapshot.Visits) ~= "table"
+			or #snapshot.Visits > self.MaxVisits or (snapshot.Complete and not snapshot.Captured) then
+			return { Success = false, Reason = "RUN_REGION_HISTORY_INVALID" }
+		end
+		local count = 0
+		local clears = 0
+		local turns = 0
+		local hits = 0
+		for index, visit in pairs(snapshot.Visits) do
+			if type(index) ~= "number" or index ~= math.floor(index) or index < 1 or index > #snapshot.Visits
+				or type(visit) ~= "table" or type(visit.RegionId) ~= "string" or visit.RegionId == ""
+				or #visit.RegionId > 64 or type(visit.Completed) ~= "boolean" then
+				return { Success = false, Reason = "RUN_REGION_VISIT_INVALID" }
+			end
+			for _, field in ipairs({ "ClearedBattles", "ConsumedTurns", "HitsTaken" }) do
+				if not self:IsCounter(visit[field]) then return { Success = false, Reason = "RUN_REGION_COUNTER_INVALID", Field = field } end
+			end
+			if visit.Completed and visit.ClearedBattles == 0 then return { Success = false, Reason = "RUN_REGION_COMPLETION_INVALID" } end
+			count = count + 1
+			clears = clears + visit.ClearedBattles
+			turns = turns + visit.ConsumedTurns
+			hits = hits + visit.HitsTaken
+		end
+		if count ~= #snapshot.Visits or (not snapshot.Captured and count > 0) then
+			return { Success = false, Reason = "RUN_REGION_HISTORY_INVALID" }
+		end
+		for index, visit in ipairs(snapshot.Visits) do
+			if index > 1 and snapshot.Visits[index - 1].RegionId == visit.RegionId then
+				return { Success = false, Reason = "RUN_REGION_CONSECUTIVE_DUPLICATE" }
+			end
+		end
+		if not self:IsCounter(clears) or not self:IsCounter(turns) or not self:IsCounter(hits) then
+			return { Success = false, Reason = "RUN_REGION_TOTAL_INVALID" }
+		end
+		return { Success = true, Reason = "OK", ClearedBattleCount = clears, ConsumedTurns = turns, HitsTaken = hits }
+	end
+
+	method table CopySnapshot(table snapshot)
+		-- Result freezing takes value copies so later run resets cannot mutate a queued result.
+		local copied = { Captured = snapshot.Captured, Complete = snapshot.Complete, Visits = {} }
+		for _, visit in ipairs(snapshot.Visits) do
+			table.insert(copied.Visits, { RegionId = visit.RegionId, Completed = visit.Completed,
+				ClearedBattles = visit.ClearedBattles, ConsumedTurns = visit.ConsumedTurns, HitsTaken = visit.HitsTaken })
+		end
+		return copied
+	end
+
+	method table ToStorageSnapshot(table snapshot)
+		-- MSW JSON cannot encode an untyped empty array; only omit empty Visits on the wire.
+		local stored = self:CopySnapshot(snapshot)
+		if #stored.Visits == 0 then stored.Visits = nil end
+		return stored
+	end
+
+	method table FromStorageSnapshot(table snapshot)
+		-- Normalize only an omitted known-schema array, never a false/string/corrupt array.
+		if snapshot.Visits == nil then snapshot.Visits = {} end
+		return snapshot
+	end
+
+end

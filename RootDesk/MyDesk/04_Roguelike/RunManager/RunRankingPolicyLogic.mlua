@@ -1,0 +1,82 @@
+@Logic
+script RunRankingPolicyLogic extends Logic
+
+	property string BoardId = "completion_normal_20261006"
+	property string DifficultyId = "NORMAL"
+	property string BalanceVersion = "balance_2026_10_06"
+	property string SeasonId = "all_time"
+	property string RankingRuleVersion = "completion_turns_hits_v1"
+	property string AccountProgressionMode = "ACCOUNT_APPLIED"
+	property string NodeGraphId = "prototype_run"
+	property string ResultRuleVersion = "run_result_v1"
+	property integer TopLimit = 20
+	property integer MaxConsumedTurns = 100000
+	property integer MaxHitsTaken = 9999
+
+	method table ValidateConfiguration()
+		-- Fail closed on invalid board settings before any storage namespace or score calculation is used.
+		for _, field in ipairs({ "BoardId", "DifficultyId", "BalanceVersion", "SeasonId", "RankingRuleVersion", "AccountProgressionMode", "NodeGraphId", "ResultRuleVersion" }) do
+			if type(self[field]) ~= "string" or self[field] == "" or #self[field] > (field == "BoardId" and 40 or 64) then
+				return { Success = false, Reason = "RANKING_CONFIG_INVALID", Field = field }
+			end
+		end
+		if self.BalanceVersion == "unversioned" or not _RunBuildSnapshotLogic:IsSafeInteger(self.TopLimit, 1) or self.TopLimit > 100
+			or not _RunBuildSnapshotLogic:IsSafeInteger(self.MaxConsumedTurns, 1) or not _RunBuildSnapshotLogic:IsSafeInteger(self.MaxHitsTaken, 0)
+			or self:EncodeScore(0, 0) > 9007199254740991 then return { Success = false, Reason = "RANKING_CONFIG_INVALID" } end
+		return { Success = true, Reason = "OK" }
+	end
+
+	method table ValidateCandidate(table record)
+		-- Only a complete, server-frozen run under this board's exact rules can be published.
+		local config = self:ValidateConfiguration()
+		if not config.Success then return config end
+		if type(record) ~= "table" then return { Success = false, Reason = "RANKING_RECORD_INVALID" } end
+		local valid = _RunResultContractLogic:ValidateRecord(record)
+		if not valid.Success then return valid end
+		if record.SchemaVersion ~= 3 then return { Success = false, Reason = "RANKING_LEGACY_RECORD" } end
+		if not record.RankEligible or record.EndReason ~= "COMPLETED" or record.RankExclusionReason ~= "" then
+			return { Success = false, Reason = "RANKING_RUN_EXCLUDED" }
+		end
+		local conditions = record.Conditions
+		if not conditions.Captured or not conditions.ObservedStart or not record.Build.Captured
+			or not record.RegionHistory.Captured or not record.RegionHistory.Complete or #record.RegionHistory.Visits == 0 then
+			return { Success = false, Reason = "RANKING_CAPTURE_INCOMPLETE" }
+		end
+		if conditions.BalanceVersion == "unversioned" or conditions.BalanceVersion == "" then
+			return { Success = false, Reason = "RANKING_BALANCE_UNVERSIONED" }
+		end
+		for _, field in ipairs({ "DifficultyId", "BalanceVersion", "SeasonId", "RankingRuleVersion", "AccountProgressionMode" }) do
+			if conditions[field] ~= self[field] then return { Success = false, Reason = "RANKING_CONDITIONS_MISMATCH", Field = field } end
+		end
+		if record.NodeGraphId ~= self.NodeGraphId or record.RuleVersion ~= self.ResultRuleVersion then
+			return { Success = false, Reason = "RANKING_ROUTE_RULE_MISMATCH" }
+		end
+		if record.ConsumedTurns > self.MaxConsumedTurns or record.HitsTaken > self.MaxHitsTaken then
+			return { Success = false, Reason = "RANKING_SCORE_OUT_OF_RANGE" }
+		end
+		return { Success = true, Reason = "OK" }
+	end
+
+	method integer EncodeScore(integer consumedTurns, integer hitsTaken)
+		-- Larger integer scores mean fewer turns first, then fewer hits; time is not a tiebreaker.
+		return (self.MaxConsumedTurns - consumedTurns) * (self.MaxHitsTaken + 1) + self.MaxHitsTaken - hitsTaken
+	end
+
+	method boolean IsBetter(table left, table right)
+		-- Equal turn/hit records keep the already published build, independent of publication time.
+		return right == nil or left.ConsumedTurns < right.ConsumedTurns
+			or (left.ConsumedTurns == right.ConsumedTurns and left.HitsTaken < right.HitsTaken)
+	end
+
+	method table AssignRanks(table entries)
+		-- Competition ranking gives identical performance identical ranks: 1, 1, 3.
+		local lastScore = nil
+		local rank = 0
+		for position, entry in ipairs(entries) do
+			if entry.Score ~= lastScore then rank = position; lastScore = entry.Score end
+			entry.Rank = rank
+		end
+		return entries
+	end
+
+end
