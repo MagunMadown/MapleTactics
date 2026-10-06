@@ -185,6 +185,8 @@ script BattleSessionComponent extends Component
 	property number PushMotionDuration = 0.40
 	property number PushImpactDelay = 0.18
 	property string ActiveEffectSkillId = ""
+	property string CellEffectSortingLayer = "MapLayer0"
+	property integer CellEffectOrderInLayer = 30
 	property string ActiveHitEffectRuid = ""
 	property string ActiveHitSoundRuid = ""
 	property number ActiveEffectScale = 1
@@ -1776,11 +1778,13 @@ script BattleSessionComponent extends Component
 					local queuedIconRuids = ""
 					local queuedIconBackgroundColors = ""
 					local queuedSpecialFlags = ""
+					local queuedOverlayKinds = ""
 					if hasVisibleQueue then
 						queuedTileNames = self:GetEnemyQueueDisplayNames(plan.PlannedActionSnapshot)
 						queuedIconRuids = self:GetEnemyQueueIconRuids(plan.PlannedActionSnapshot)
 						queuedIconBackgroundColors = self:GetEnemyQueueIconBackgroundColors(plan.PlannedActionSnapshot)
 						queuedSpecialFlags = self:GetEnemyQueueSpecialFlags(plan.PlannedActionSnapshot)
+						queuedOverlayKinds = self:GetEnemyQueueOverlayKinds(plan.PlannedActionSnapshot)
 					end
 					local targetCellSnapshot = plan.TargetCellSnapshot
 					if actionType == "SUMMON_ENEMIES" then
@@ -1864,7 +1868,8 @@ script BattleSessionComponent extends Component
 						plan.CastingSkillId ~= "" and plan.CastingSkillId or "-",
 						tostring(plan.InterruptHitsRequired),
 						tostring(plan.InterruptHitsReceived),
-						queuedSpecialFlags ~= "" and queuedSpecialFlags or "-"
+						queuedSpecialFlags ~= "" and queuedSpecialFlags or "-",
+						queuedOverlayKinds ~= "" and queuedOverlayKinds or "-"
 					}, ","))
 				end
 			end
@@ -1960,6 +1965,52 @@ script BattleSessionComponent extends Component
 			end
 		end
 		return table.concat(flags, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueOverlayKinds(string actionSnapshot)
+		-- Publishes one semantic badge key per queued skill; the client owns the replaceable artwork.
+		local kinds = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local fields = {}
+			for field in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(fields, field)
+			end
+			local skillId = fields[3] or ""
+			if skillId ~= "" and skillId ~= "-" then
+				local kind = self:GetEnemySkillOverlayKind(skillId)
+				table.insert(kinds, kind ~= "" and kind or "-")
+			end
+		end
+		return table.concat(kinds, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemySkillOverlayKind(string skillId)
+		-- Chooses the primary effect badge from authored effects before using attack tags as a fallback.
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success ~= true then return "" end
+		local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId or "")
+		local found = {}
+		for _, step in ipairs(effects.Success and effects.Steps or {}) do
+			found[step.EffectType] = true
+		end
+		if found.IGNITE or found.BURN then return "IGNITE" end
+		if found.FROSTBITE or found.FREEZE then return "FROSTBITE" end
+		if found.CONFUSE then return "CONFUSE" end
+		if found.POISON_MIST then return "POISON_MIST" end
+		if found.POISON then return "POISON" end
+		if found.STUN then return "STUN" end
+		if found.ATTACK_BUFF then return "ATTACK_BUFF" end
+		if found.HEAL then return "HEAL" end
+		if found.PUSH or found.PULL or found.SEAL or found.BOSS_SWAP then return "WARNING" end
+		local tags = "|" .. string.lower(definition.SkillTags or "") .. "|"
+		if string.find(tags, "|cast|", 1, true) ~= nil then return "WARNING" end
+		if string.find(tags, "|telegraph|", 1, true) ~= nil then
+			if string.find(tags, "|area|", 1, true) ~= nil then return "IMPACT" end
+			return "WARNING"
+		end
+		return ""
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2390,9 +2441,10 @@ script BattleSessionComponent extends Component
 			end
 			return relocation
 		end
-		if step.EffectType == "THROW_BEHIND" and step.TargetSelector == "PRIMARY_TARGET" then
-			-- Grabs the targeted enemy and lands it Value cells behind the caster. A missing target, a HEAVY one or
-			-- a blocked landing rejects the utility, so the cooldown is not spent.
+		if (step.EffectType == "THROW_BEHIND" or step.EffectType == "THROW_FORWARD") and step.TargetSelector == "PRIMARY_TARGET" then
+			-- Grabs the targeted enemy and lands it Value cells behind the caster (THROW_BEHIND) or on the farthest
+			-- empty cell beyond it in the facing direction, passing over units (THROW_FORWARD). A missing target, a
+			-- HEAVY one or no legal landing rejects the utility, so the cooldown is not spent.
 			local targets = _SkillTargetResolverLogic:Resolve(self, sourceUnit.UnitId, definition)
 			if targets.Success == false then return targets end
 			local targetId = targets.PrimaryTargetUnitId
@@ -2408,6 +2460,15 @@ script BattleSessionComponent extends Component
 				return { Success = false, Reason = "UTILITY_TARGET_HEAVY" }
 			end
 			local destination = sourceCell - direction * math.max(1, math.floor(step.Value))
+			if step.EffectType == "THROW_FORWARD" then
+				destination = -1
+				for distance = 1, self.CellCount do
+					local cell = targetUnit.CellIndex + direction * distance
+					if self:IsValidCell(cell) and self:IsCellOccupied(cell, targetId) == false then
+						destination = cell
+					end
+				end
+			end
 			if self:IsValidCell(destination) == false or self:IsCellOccupied(destination, targetId) then
 				return { Success = false, Reason = "UTILITY_NO_EMPTY_DESTINATION" }
 			end
@@ -5296,6 +5357,7 @@ script BattleSessionComponent extends Component
 				end
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CastEffectRuid)
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.HitEffectRuid)
+				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CellEffectRuid)
 				self:CollectPresentationRuid(presentationRuids, presentationSeen, definition.ProjectileRuid)
 				-- Audio clips warm the same way: an unloaded cast sound lands after its own swing, which
 				-- reads as a mistimed hit rather than a slow load.
@@ -5310,6 +5372,7 @@ script BattleSessionComponent extends Component
 		if utility.Success == true then
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastEffectRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitEffectRuid)
+			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CellEffectRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.ProjectileRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastSoundRuid)
 			self:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitSoundRuid)
@@ -5421,7 +5484,7 @@ script BattleSessionComponent extends Component
 		-- Warm the new utility's clips and sounds so its first cast looks like every later one.
 		local ruids = {}
 		local seen = {}
-		for _, ruid in ipairs({ definition.CastEffectRuid, definition.HitEffectRuid, definition.ProjectileRuid, definition.CastSoundRuid, definition.HitSoundRuid }) do
+		for _, ruid in ipairs({ definition.CastEffectRuid, definition.HitEffectRuid, definition.CellEffectRuid, definition.ProjectileRuid, definition.CastSoundRuid, definition.HitSoundRuid }) do
 			self:CollectPresentationRuid(ruids, seen, ruid)
 		end
 		if #ruids > 0 and isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
@@ -5748,6 +5811,7 @@ script BattleSessionComponent extends Component
 				local interruptHitsRequired = 0
 				local interruptHitsReceived = 0
 				local queuedSpecialFlags = ""
+				local queuedOverlayKinds = ""
 				if #fields >= 17 then
 					bossPhaseId = self:DecodeEnemyPlanField(fields[15])
 					bossPhaseIndex = math.floor(tonumber(fields[16]) or 0)
@@ -5791,6 +5855,9 @@ script BattleSessionComponent extends Component
 				if #fields >= 35 then
 					queuedSpecialFlags = self:DecodeEnemyPlanField(fields[35])
 				end
+				if #fields >= 36 then
+					queuedOverlayKinds = self:DecodeEnemyPlanField(fields[36])
+				end
 				local queuedTileIds = ""
 				-- Keep the client read model aligned with the server DTO: a completed or merely
 				-- selected action is not a newly filled enemy queue slot.
@@ -5823,6 +5890,7 @@ script BattleSessionComponent extends Component
 					queuedIconRuids = ""
 					queuedIconBackgroundColors = ""
 					queuedSpecialFlags = ""
+					queuedOverlayKinds = ""
 				end
 				-- Frozen summon plans are visible during the player turn before the enemy summons.
 				-- Summoning is a command without a TileId, but still occupies a monster skill queue slot.
@@ -5861,6 +5929,7 @@ script BattleSessionComponent extends Component
 					QueuedIconRuids = queuedIconRuids,
 					QueuedIconBackgroundColors = queuedIconBackgroundColors,
 					QueuedSpecialFlags = queuedSpecialFlags,
+					QueuedOverlayKinds = queuedOverlayKinds,
 					TelegraphKind = telegraphKind,
 					LandingCell = landingCell,
 					DeferredUntilTurn = deferredUntilTurn,
@@ -7464,6 +7533,20 @@ script BattleSessionComponent extends Component
 			self.ActiveEffectFlipX = sourceUnit.Facing == "Right"
 		end
 
+		-- The cell clip is tied to the struck cells, not the caster, so impact overrides below never mute it.
+		local cellEffectRuid = definition.CellEffectRuid or ""
+		if cellEffectRuid ~= "" then
+			local resolved = _SkillTargetResolverLogic:Resolve(self, sourceUnitId, definition)
+			local xs = {}
+			for _, cell in ipairs(resolved.TargetCellIndices or {}) do
+				table.insert(xs, self:GetCellPosition(cell).x)
+			end
+			if #xs > 0 then
+				self:PlayCellEffects(cellEffectRuid, xs, self.UnitY, self.ActiveEffectScale, self:GetSkillSpeedMultiplier())
+			end
+			log("[BattleEffect] cell effects requested skill=" .. self.ActiveEffectSkillId .. " ruid=" .. cellEffectRuid .. " cells=" .. table.concat(resolved.TargetCellIndices or {}, "|"))
+		end
+
 		local castEffectRuid = definition.CastEffectRuid or ""
 		if sourceUnit ~= nil and sourceUnit.Team == "Enemy" then
 			-- Only accepted damage emits enemy hit audio; PUSH/HEAL cannot replay it.
@@ -7494,6 +7577,27 @@ script BattleSessionComponent extends Component
 			sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
 		end
 		sourcePresentation:PlaySkillSound(sourceUnitId, "CAST", castSoundRuid, self:GetSkillSoundVolume())
+	end
+
+	@ExecSpace("Client")
+	method void PlayCellEffects(string effectRuid, table xs, number y, number scale, number playRate)
+		-- Plays one non-looping clip at each given board x. Purely presentational.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= self.Entity then return end
+		local safeScale = math.max(0.05, scale)
+		local options = {}
+		options["SortingLayer"] = self.CellEffectSortingLayer
+		options["OrderInLayer"] = self.CellEffectOrderInLayer
+		options["PlayRate"] = math.max(0.1, playRate)
+		local played = 0
+		for _, x in ipairs(xs) do
+			local serial = _EffectService:PlayEffect(effectRuid, self.Entity, Vector3(x, y, 0), 0, Vector3(safeScale, safeScale, 1), false, options)
+			if serial ~= 0 then played = played + 1 end
+		end
+		if played < #xs then
+			log_warning("[BattleEffect] cell effects partial ruid=" .. effectRuid .. " played=" .. played .. "/" .. #xs)
+		end
+		log("[BattleEffect] cell effects played ruid=" .. effectRuid .. " count=" .. played .. " y=" .. y .. " scale=" .. safeScale)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -7909,16 +8013,7 @@ script BattleSessionComponent extends Component
 		end
 
 		-- Skill damage uses the skill ID as the impact presentation key.
-		local damageContext = self._T.RelicDamageContext
-		local zeroDamage = damageContext ~= nil and damageContext.SkillId == skillId
-			and damageContext.SourceUnitId == sourceUnitId and damageContext.Definition.ZeroDamage == true
-		local damageResult
-		if zeroDamage then
-			-- Zero damage is final: relics and attack buffs cannot turn the trade-off back into damage.
-			damageResult = { Success = true, AppliedAmount = 0, HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ExactLethal = false }
-		else
-			damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount, skillId)
-		end
+		local damageResult = _EffectRouterLogic:ExecuteEffect(self, "DAMAGE", sourceUnitId, targetUnitId, damageAmount, skillId)
 		if damageResult.Success == false then
 			result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
 			return result
@@ -7993,7 +8088,10 @@ script BattleSessionComponent extends Component
 			HpAfter = -1
 		}
 
-		if amount <= 0 then
+		local context = self._T.RelicDamageContext
+		local zeroBase = context ~= nil and context.SourceUnitId == sourceUnitId and context.SkillId == attackId
+			and context.Definition ~= nil and context.Definition.ZeroDamage == true
+		if amount < 0 or (amount == 0 and not zeroBase) then
 			result.Reason = "INVALID_AMOUNT"
 			return result
 		end
@@ -8034,7 +8132,7 @@ script BattleSessionComponent extends Component
 		local attackHit = self._T.AttackBuffHit
 		local fixedFollowup = attackHit ~= nil and attackHit.SourceUnitId == sourceUnitId
 			and attackHit.SkillId == attackId and attackHit.FixedFollowup == true
-		if fixedFollowup then amount = 1 end
+		if zeroBase then amount = 0 elseif fixedFollowup then amount = 1 end
 		if not fixedFollowup and isFixedDamage == false and sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
 			and attackerRun ~= nil and attackerEffects.ActiveRunSequence == attackerRun.RunSequence then
 			amount = amount + attackerEffects.AttackBonus
@@ -8071,6 +8169,11 @@ script BattleSessionComponent extends Component
 		end
 		if not isFixedDamage and sourceUnit.Team == "Player" and targetUnit.Team == "Enemy" then
 			amount = amount + _AugmentRuntimeLogic:GetConditionalDamageBonus(self._T.RelicDamageContext, sourceUnitId, attackId, targetUnit)
+		end
+		-- Minimum-one defenses must not create damage when the base and bonuses are zero.
+		if amount <= 0 then
+			return { Success = true, Reason = "ZERO_BASE_DAMAGE", AppliedAmount = 0,
+				HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ReachedZero = false, ExactLethal = false }
 		end
 		if targetUnit.Team == "Player" and defenderEffects ~= nil and defenderEffects.IsInitialized
 			and defenderRun ~= nil and defenderEffects.ActiveRunSequence == defenderRun.RunSequence then
@@ -10362,8 +10465,8 @@ script BattleSessionComponent extends Component
 					if entry.Stat == "ATTACK" and entry.Turns > buffHitIndex then attackBuff = attackBuff + entry.Amount end
 				end
 				local base = _DamageEffectExecutorLogic:ResolveDamageAmount(unit, step)
-				local first = definition.ZeroDamage == true and 0 or math.max(0, base + bonus - math.max(0, unit.AttackBuffAmount) + attackBuff + combo)
-				local followup = definition.ZeroDamage == true and 0 or 1 + combo
+				local first = math.max(0, (definition.ZeroDamage == true and 0 or base) + bonus - math.max(0, unit.AttackBuffAmount) + attackBuff + combo)
+				local followup = (definition.ZeroDamage == true and 0 or 1) + combo
 				step.PreviewDamageText = _BuffEffectExecutorLogic:FormatNumber(first)
 				if hits > 1 then step.PreviewDamageText = step.PreviewDamageText .. " + " .. _BuffEffectExecutorLogic:FormatNumber(followup) .. " × " .. tostring(hits - 1) .. "회" end
 				buffHitIndex = buffHitIndex + hits

@@ -1,0 +1,99 @@
+@Component
+script PlayerRunRegionHistoryComponent extends Component
+
+	property integer ActiveRunSequence = 0
+	property table Visits = {}
+	property table AppliedBattleKeys = {}
+	property string ActiveBattleKey = ""
+	property boolean ActiveBattleEndsRegion = false
+	property boolean CompleteCapture = false
+	property integer RegionStartTurns = 0
+	property integer RegionStartHits = 0
+
+	@ExecSpace("ServerOnly")
+	method void BeginRun(integer runSequence, boolean observedStart)
+		-- Keeps region aggregates player-owned and resets only for a new authoritative run.
+		if runSequence <= 0 or self.ActiveRunSequence == runSequence then return end
+		self.ActiveRunSequence = runSequence
+		self.Visits = {}
+		self.AppliedBattleKeys = {}
+		self.ActiveBattleKey = ""
+		self.ActiveBattleEndsRegion = false
+		self.CompleteCapture = observedStart
+		self.RegionStartTurns = 0
+		self.RegionStartHits = 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkIncomplete()
+		-- An observation error cannot stop combat, but it must not produce a trusted ranking route.
+		self.CompleteCapture = false
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean UpdateCounters(integer runSequence, table stats)
+		-- Deltas use existing committed combat statistics, not turn numbers or queue length.
+		if type(stats) ~= "table" or runSequence ~= self.ActiveRunSequence or stats.RunSequence ~= runSequence
+			or not _RunRegionHistoryContractLogic:IsCounter(stats.ConsumedTurns)
+			or not _RunRegionHistoryContractLogic:IsCounter(stats.HitsTaken)
+			or stats.ConsumedTurns < self.RegionStartTurns or stats.HitsTaken < self.RegionStartHits then
+			self:MarkIncomplete()
+			return false
+		end
+		local visit = self.Visits[#self.Visits]
+		if visit ~= nil then
+			visit.ConsumedTurns = stats.ConsumedTurns - self.RegionStartTurns
+			visit.HitsTaken = stats.HitsTaken - self.RegionStartHits
+		end
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean EnterBattle(integer runSequence, string regionId, string battleKey, boolean endsRegion, table stats)
+		-- Called only after battle start commits; rest/shop nodes and failed travel do not append visits.
+		if self.ActiveBattleKey == battleKey and runSequence == self.ActiveRunSequence then return true end
+		if self.AppliedBattleKeys[battleKey] then self:MarkIncomplete() return false end
+		if regionId == "" or #regionId > 64 or battleKey == "" or not self:UpdateCounters(runSequence, stats) then
+			self:MarkIncomplete()
+			return false
+		end
+		local previous = self.Visits[#self.Visits]
+		if previous == nil or previous.RegionId ~= regionId then
+			if #self.Visits >= _RunRegionHistoryContractLogic.MaxVisits then self:MarkIncomplete() return false end
+			table.insert(self.Visits, { RegionId = regionId, Completed = false, ClearedBattles = 0, ConsumedTurns = 0, HitsTaken = 0 })
+			self.RegionStartTurns = stats.ConsumedTurns
+			self.RegionStartHits = stats.HitsTaken
+		end
+		self.ActiveBattleKey = battleKey
+		self.ActiveBattleEndsRegion = endsRegion
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean RecordBattleResult(integer runSequence, string battleKey, string battleResult, table stats)
+		-- Mirrors only a committed battle result; all retries share the same idempotency key.
+		if runSequence ~= self.ActiveRunSequence then return false end
+		if self.AppliedBattleKeys[battleKey] then return true end
+		if battleKey ~= self.ActiveBattleKey or #self.Visits == 0
+			or (battleResult ~= "Victory" and battleResult ~= "Defeat") then self:MarkIncomplete() return false end
+		if not self:UpdateCounters(runSequence, stats) then return false end
+		if battleResult == "Victory" then
+			local visit = self.Visits[#self.Visits]
+			visit.ClearedBattles = visit.ClearedBattles + 1
+			if self.ActiveBattleEndsRegion then visit.Completed = true end
+		end
+		self.AppliedBattleKeys[battleKey] = true
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetFinalSnapshot(integer runSequence, table stats)
+		-- Takes an immutable DTO once at run finalization; no per-turn persistence is introduced.
+		if runSequence ~= self.ActiveRunSequence then
+			return { Captured = true, Complete = false, Visits = {} }
+		end
+		self:UpdateCounters(runSequence, stats)
+		return _RunRegionHistoryContractLogic:CopySnapshot({ Captured = true, Complete = self.CompleteCapture, Visits = self.Visits })
+	end
+
+end

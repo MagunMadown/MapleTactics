@@ -88,9 +88,16 @@ test("required enemy skill cannot be blank even though WAIT permits blank",()=>{
   const t=copy();t.EnemyPatternSteps.rows[0].TileId="";
   assert.ok(S.validate(t).some(e=>e.code==="PATTERN_TILE_ID_MISSING"));
 });
-test("THROW_BEHIND utility effect follows ContentValidator.ValidateUtilityEffect",()=>{
-  const t=copy();const step=t.UtilitySkillEffectSteps.rows.find(r=>r.EffectType==="THROW_BEHIND");
+test("THROW_FORWARD utility effect follows ContentValidator.ValidateUtilityEffect",()=>{
+  const t=copy();const step=t.UtilitySkillEffectSteps.rows.find(r=>r.EffectType==="THROW_FORWARD");
   assert.ok(step);assert.deepEqual(S.validate(t),[]);
+  step.Value="1";
+  assert.ok(S.validate(t).some(e=>e.code==="INVALID_UTILITY_EFFECT_PARAMETERS"));
+});
+test("THROW_BEHIND utility effect follows ContentValidator.ValidateUtilityEffect",()=>{
+  const t=copy();const step=t.UtilitySkillEffectSteps.rows.find(r=>r.EffectType==="THROW_FORWARD");
+  assert.ok(step);Object.assign(step,{EffectType:"THROW_BEHIND",Value:"1",ParameterA:""});
+  assert.deepEqual(S.validate(t),[]);
   step.Value="0";
   assert.ok(S.validate(t).some(e=>e.code==="INVALID_UTILITY_EFFECT_PARAMETERS"));
 });

@@ -65,6 +65,7 @@ StageDefinitions(StageType=BOSS)
 - `ReinforcementPoolId`: EnemySpawnPools 참조. 빈 칸이면 비활성화.
 - `ReinforcementIntervalTurns`: 보충 간격(양의 정수). 페이즈 진입 후 이만큼의 턴이 지난 뒤 첫 보충을 시도한다.
 - `ReinforcementMaxAlive`: 최초 등장 잡몹을 포함한 살아 있는 일반 적 상한(1~4).
+- `ReinforcementSpawnRange`: 생성 위치. 빈 칸/0이면 플레이어에서 가장 먼 빈 칸, N≥1이면 플레이어 기준 N칸 이내 빈 칸(런 시드로 결정). 범위 안에 빈 칸이 없으면 다음 턴에 재시도한다. 주니어 발록 ENRAGED는 `2`.
 - 매 라운드 종료 경계에서만 시도하며 성공 시 다음 보충 턴을 갱신한다. 상한/빈 칸 부족 시 다음 턴에 재시도한다. 전투 종료·보스 사망·보충 없는 페이즈로 전환 시 중단한다.
 - 포장마차 DORMANT는 `region_06_food_cart_adds / 2 / 2`, DINNER_RUSH는 비활성화다. 기존 잡몹은 페이즈 전환 시 남고, 신규 잡몹도 공통 SpawnWaveEnemy와 SPAWN_WAIT 경로를 사용한다.
 
@@ -156,7 +157,7 @@ Phase 전환에 직접 연동되는 증원이 필요한 보스는 여전히
 |---|---|
 | Stage | `region_06_stage_08`, `StageType=BOSS`, 1 Wave (`CLEAR_ONLY`), Pool `region_06_stage_08_boss_pool` |
 | Enemy | `region_06_jr_balrog`, HP 44, `BasicAttackDamage=6`, `IsBoss=true` |
-| Model | `region06jrbalrog` (`Scale=1.2`, 화염구 `ProjectileHeight=1.2`) |
+| Model | `region06jrbalrog` (`Scale=1.2`, 화염구 `ProjectileHeight=0.3`) |
 | 할퀴기 (`attack1`) | `region_06_jr_balrog_claw`, 전방 1칸, 피해는 `BasicAttackDamage=6` |
 | 화염구 (`attack2`) | `region_06_jr_balrog_fireball`, 전방 3칸 안 첫 적에게 `info/ball` 투사체, 피해 5, 쿨타임 2 |
 | 불꽃 휩쓸기 (`attack3`) | `region_06_jr_balrog_flame_sweep`, 1턴 예고 후 전방 1~3칸, 피해 7 |

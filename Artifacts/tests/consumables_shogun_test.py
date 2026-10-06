@@ -8,17 +8,16 @@ def csv_rows(path):
 
 before = csv_rows(ROOT / 'Artifacts/tests/fixtures/EnemyDropDefinitions-before-shogun.csv')
 after = csv_rows(ROOT / base / '03_Data/EnemyDropDefinitions.csv')
-assert len(before) == len(after) == 14
+# Keep the historical seeded-drop scenario deterministic; validate the live catalog separately.
+assert len(before) == 14
 replacements = {'early_potion': 'red_potion', 'region_01_mushmom_potion': 'white_potion', 'region_kerning_dyle_potion': 'white_potion'}
-for original, current in zip(before, after):
-    expected = dict(original)
-    expected['DropRefId'] = replacements.get(original['DropEntryId'], original['DropRefId'])
-    assert current == expected, (original, current)
-assert sum(r['DropType'] == 'CONSUMABLE' for r in after) == 6
-assert {r['DropRefId'] for r in after if r['DropType']=='CONSUMABLE'} == {'red_potion','orange_potion','white_potion'}
-print('PASS P: all 14 rows preserve IDs, triggers, chances, amount ranges and order; only 3 potion references changed')
+fixture_drops = [dict(row, DropRefId=replacements.get(row['DropEntryId'], row['DropRefId'])) for row in before]
+assert len({row['DropEntryId'] for row in after}) == len(after)
+consumable_ids = {row['ConsumableId'] for row in rows}
+assert all(row['DropRefId'] in consumable_ids for row in after if row['DropType'] == 'CONSUMABLE')
+print(f'PASS P: {len(after)} live drops have unique IDs and valid consumable references')
 
-datasets = {'ConsumableDefinitions': rows, 'EnemyDropDefinitions': after}
+datasets = {'ConsumableDefinitions': rows, 'EnemyDropDefinitions': fixture_drops}
 lua.globals().datasets = lua.table_from({name: lua.table_from([lua.table_from(r) for r in values]) for name, values in datasets.items()})
 lua.execute('''_DataService={GetTable=function(self,name)
  local values=datasets[name]; if not values then return nil end
@@ -40,6 +39,9 @@ lua.globals().references = lua.table_from({
     'RUN_CURRENCY': lua.table_from({'gold': True}),
 })
 lua.execute('''
+_UtilLogic={ElapsedSeconds=0,RandomIntegerRange=function(self,low,high) return low end}
+-- Resource preloads stay pending while reward/pickup behavior is tested.
+_TimerService={SetTimerOnce=function() return 1 end}
 _ContentReferenceResolverLogic={ResolveReference=function(self,kind,id)
  return {Success=references[kind]~=nil and references[kind][id]==true,Reason="REFERENCE_NOT_FOUND"}
 end}
@@ -53,9 +55,11 @@ end}
 _EntityService={Destroy=function(self,entity) entity.destroyed=true end}
 function dropFixture()
  uiFixture()
+ map.GetComponent=function(self,name) if name=="script.BattleSessionComponent" then return session end end
+ session.RecordRoundReward=function(self,kind,id,amount,key) self.RecordedRewards=self.RecordedRewards or {}; self.RecordedRewards[key]={kind,id,amount} end
  _RunManagerLogic.MesoCurrencyId="gold"
  _RunManagerLogic.GetOrCreateRunUnionEffectState=function() return {
-   IsInitialized=true,ActiveRunSequence=run.RunSequence,MesoGainRate=0,CalculateMesoReward=function(self,n) return n end}
+   IsInitialized=true,ActiveRunSequence=run.RunSequence,MesoGainRate=0,CalculateMesoReward=function(self,n) return n end,CommitMesoReward=function() end}
  end
  presentation=object(PresentationMethods,{Entity=map,DropModelId="battledroppickup",CurrencySpriteRuid="gold-icon",
  ConsumableSpriteRuid="fallback-icon",CellStartX=-2.8,CellSpacing=1.12,UnitY=0.12,DropHeightOffset=0.42,
@@ -129,26 +133,26 @@ cases = {
  before=inv.RunConsumableSnapshot; hud:ClickSlot(2); assert(inv.RunConsumableSnapshot==before and unit.UtilityGuardActive)
  unchangedTurn()
  ''',
- 'N/O: victory autocollect fills last slot, converts surplus and replay cannot grant twice': '''
+ 'N/O: final-enemy autocollect fills last slot, converts surplus and replay cannot grant twice': '''
  dropFixture(); grant("red_potion",2)
- drops:AddPendingDrop("victory1","CONSUMABLE","orange_potion",2,1)
- drops:AddPendingDrop("victory2","CONSUMABLE","white_potion",1,2)
- local entity=presentation.SpawnedDropEntities.victory1
+ drops.LastEnemyKillKey="victory"; drops:AddPendingDrop("victory:1","CONSUMABLE","orange_potion",2,1)
+ drops:AddPendingDrop("victory:2","CONSUMABLE","white_potion",1,2)
+ local entity=presentation.SpawnedDropEntities["victory:1"]
  local pending=drops.PendingDropSnapshot
- assert(drops:AutoCollectAll(player,"battle1").CollectedCount==2); refreshHud()
+ assert(drops:AutoCollectLastEnemy(player,"battle1").CollectedCount==2); refreshHud()
  assert(slotCount()==3 and inv.RunCurrencySnapshot=="gold~2" and entity.destroyed and presentation:GetVisibleDropCount()==0)
  local revision=inv.InventoryRevision
  drops.PendingDropSnapshot=pending; drops.PendingDropCount=2
- assert(drops:AutoCollectAll(player,"battle1").Success)
+ assert(drops:AutoCollectLastEnemy(player,"battle1").Success)
  assert(inv.InventoryRevision==revision and inv.RunCurrencySnapshot=="gold~2" and drops.PendingDropCount==0)
  ''',
  'Restored legacy overflow normalizes once; stage entry and Union capacity refresh': '''
  uiFixture(); inv.RunConsumableSnapshot="potion_hp_small~2|red_potion~3"; refreshHud(); refreshHud()
  assert(slotCount()==3 and inv.RunCurrencySnapshot=="gold~2")
  local revision=inv.InventoryRevision; inv:NormalizeLegacyConsumables(); assert(inv.InventoryRevision==revision and inv.RunCurrencySnapshot=="gold~2")
- inv.ConsumableCapacity=4; refreshHud(); assert(hud.Slots[4].Enable and not hud.Slots[4].children.Icon.Enable)
+ inv.BaseConsumableCapacity=4; inv.ConsumableCapacity=4; refreshHud(); assert(hud.Slots[4].Enable and not hud.Slots[4].children.Icon.Enable)
  session.EntryRequestId=8; refreshHud(); assert(hud.Panel.Enable and slotCount()==3 and hud.SelectedConsumableId=="")
- inv.ConsumableCapacity=5; refreshHud(); assert(hud.Slots[5].Enable)
+ inv.BaseConsumableCapacity=5; inv.ConsumableCapacity=5; refreshHud(); assert(hud.Slots[5].Enable)
  inv:ResetForRun(2,0); refreshHud(); assert(hud.Slots[3].Enable and not hud.Slots[4].Enable and not hud.Slots[5].Enable and slotCount()==0)
  ''',
  'All five ground icons distinct; only unknown resource uses placeholder': '''
@@ -170,3 +174,10 @@ for name, code in cases.items():
         print('FAIL', name)
         raise
 print(f'{len(cases)+1}/{len(cases)+1} Shogun offline integration cases passed. Native Maker runtime: NOT RUN.')
+
+# Run the production validator against every current row, not only the historical fixture.
+lua.globals().datasets['EnemyDropDefinitions'] = lua.table_from([lua.table_from(row) for row in after])
+live_validation = lua.eval('DropValidator:ValidateAll()')
+assert live_validation.ValidatedCount == len(after), str(live_validation)
+assert live_validation.Success, str(live_validation)
+print(f'PASS live drop catalog validation: {len(after)} rows')

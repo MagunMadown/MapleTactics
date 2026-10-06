@@ -14,6 +14,7 @@ log=function() end; log_error=function() end
 local requests,raises=0,0
 _UpgradeSkillStageLogic={RequestUpgradeState=function() requests=requests+1 end}
 _GameUIPolishLogic={BringUIGroupToFront=function() raises=raises+1 end,ShowToast=function() end}
+_UILayerLogic={PushWindow=function() raises=raises+1 end,PopWindow=function() end}
 local run={RunSequence=1,LastBattleRecordKey='clear',RewardSelectionContext='1:clear|UPGRADE'}
 _UserService={LocalPlayer={CurrentMap={Name='new_skill_stage'},GetComponent=function() return run end}}
 local ui={_T={},ActiveMapName='battle',UpgradeContextName='UPGRADE',PanelEntity={Enable=false},

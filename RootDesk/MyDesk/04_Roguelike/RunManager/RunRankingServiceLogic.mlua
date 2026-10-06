@@ -1,0 +1,167 @@
+@Logic
+script RunRankingServiceLogic extends Logic
+
+	property number CacheSeconds = 30
+	property number RequestInterval = 10
+	property table RequestTimes = {}
+	property table PublishTimes = {}
+	property table TopCache = {}
+	property number CacheUntil = 0
+	property boolean ReadInProgress = false
+	property integer CacheRevision = 0
+	property number NextReadAt = 0
+	property table LastReadFailure = {}
+
+	@ExecSpace("ServerOnly")
+	method table GetTopSnapshot()
+		-- Storage is read on explicit demand only; all players in this instance share one bounded cache.
+		local now = _UtilLogic.ServerElapsedSeconds
+		if self.CacheUntil > now and self.TopCache.Success then return self.TopCache end
+		if now < self.NextReadAt then return self.LastReadFailure end
+		if self.ReadInProgress then return { Success = false, Reason = "RANKING_LOAD_BUSY" } end
+		self.ReadInProgress = true
+		local ok, loaded = pcall(function() return _RunRankingRepositoryLogic:LoadTop() end)
+		self.ReadInProgress = false
+		if not ok then
+			log_warning("[RunRanking] read storage exception=" .. tostring(loaded))
+			loaded = { Success = false, Reason = "RANKING_STORAGE_EXCEPTION" }
+		end
+		if loaded.Success then
+			self.CacheRevision = self.CacheRevision + 1
+			loaded.Revision = self.CacheRevision
+			loaded.UpdatedAtUtc = _RunResultContractLogic:FormatUtcTimestamp()
+			self.TopCache = loaded
+			self.CacheUntil = now + self.CacheSeconds
+			self.NextReadAt = 0
+		else
+			self.LastReadFailure = loaded
+			self.NextReadAt = now + (loaded.Reason == "RANKING_CREDIT_EXHAUSTED" and 60 or 5)
+		end
+		return loaded
+	end
+
+	@ExecSpace("Server")
+	method void RequestWorldRanking()
+		-- Authentication comes from senderUserId; callers cannot select a storage identity or submit a score.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) or player.PlayerComponent == nil then return end
+		local userId = player.PlayerComponent.UserId
+		local now = _UtilLogic.ServerElapsedSeconds
+		if now < (self.RequestTimes[userId] or 0) then self:SendReply(player, { Success = false, Reason = "RANKING_RATE_LIMIT" }); return end
+		self.RequestTimes[userId] = now + self.RequestInterval
+		local top = self:GetTopSnapshot()
+		if not top.Success then self:SendReply(player, top); return end
+		local profile = player.PlayerComponent.ProfileCode or ""
+		if profile == "" then self:SendReply(player, { Success = false, Reason = "RANKING_PROFILE_MISSING" }); return end
+		local ok, own = pcall(function() return _RunRankingRepositoryLogic:LoadOwnBest(profile) end)
+		if not ok then own = { Success = false, Reason = "RANKING_STORAGE_EXCEPTION" } end
+		self:SendReply(player, { Success = true, Reason = top.Reason, Entries = top.Entries,
+			OwnBest = own.Success and own.Best or nil, OwnBestReason = own.Reason,
+			ScanLimited = top.ScanLimited, UpdatedAtUtc = top.UpdatedAtUtc, CacheRevision = top.Revision })
+	end
+
+	@ExecSpace("Server")
+	method void RequestPublishMyRun(integer runId, boolean consent)
+		-- A RunId selects the caller's already saved retained record; all ranking data remains server-owned.
+		local player = _UserService:GetUserEntityByUserId(senderUserId)
+		if not isvalid(player) or player.PlayerComponent == nil then return end
+		if consent ~= true then self:SendReply(player, { Success = false, Reason = "RANKING_CONSENT_REQUIRED", Operation = "PUBLISH" }); return end
+		local userId = player.PlayerComponent.UserId
+		local now = _UtilLogic.ServerElapsedSeconds
+		if now < (self.PublishTimes[userId] or 0) then self:SendReply(player, { Success = false, Reason = "RANKING_RATE_LIMIT", Operation = "PUBLISH" }); return end
+		self.PublishTimes[userId] = now + self.RequestInterval
+		local state = player:GetComponent("script.PlayerRunResultComponent")
+		if state == nil or state.ReadInProgress or state.PendingResultCount > 0 then
+			self:SendReply(player, { Success = false, Reason = "RANKING_HISTORY_NOT_READY", Operation = "PUBLISH" }); return
+		end
+		local record = (state.CachedHistoryRecords or {})[runId]
+		if record == nil then self:SendReply(player, { Success = false, Reason = "RANKING_RUN_NOT_RETAINED", Operation = "PUBLISH" }); return end
+		local result = _RunRankingRepositoryLogic:Publish(player.PlayerComponent.ProfileCode or "", player.PlayerComponent.Nickname or "모험가", record)
+		result.Operation = "PUBLISH"
+		if result.Success then self.CacheUntil = 0; self.NextReadAt = 0 end
+		self:SendReply(player, result)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SendReply(Entity player, table result)
+		-- A targeted client RPC sends only public DTOs; private records and account data never enter this response.
+		local wire = { Version = 1, BoardId = _RunRankingPolicyLogic.BoardId, Success = result.Success,
+			Reason = result.Reason or "UNKNOWN", Operation = result.Operation or "QUERY",
+			OwnBestReason = result.OwnBestReason, ScanLimited = result.ScanLimited == true,
+			UpdatedAtUtc = result.UpdatedAtUtc, CacheRevision = result.CacheRevision }
+		local records = {}
+		if result.Entries ~= nil and #result.Entries > 0 then
+			wire.Entries = {}
+			for _, public in ipairs(result.Entries) do
+				local encoded = _RunPublicRecordContractLogic:Encode(public)
+				if not encoded.Success then return end
+				table.insert(wire.Entries, { Json = encoded.Json, Rank = public.Rank })
+				table.insert(records, public.Record)
+			end
+		end
+		local ownBest = result.OwnBest or result.Best
+		if ownBest ~= nil then
+			local encoded = _RunPublicRecordContractLogic:Encode(ownBest)
+			if encoded.Success then wire.OwnBestJson = encoded.Json; table.insert(records, ownBest.Record) end
+		end
+		_RunHistoryPresenterLogic:PublishPublicCatalogForPlayer(player, records)
+		local ok, encoded = pcall(function() return _HttpService:JSONEncode(wire) end)
+		if ok and type(encoded) == "string" and #encoded <= 150000 then self:ReceiveReply(encoded, player.PlayerComponent.UserId) end
+	end
+
+	@ExecSpace("Client")
+	method void ReceiveReply(string encoded)
+		-- Merge responses into a local display cache; failures preserve previously visible records.
+		if encoded == nil or #encoded > 150000 then return end
+		local ok, wire = pcall(function() return _HttpService:JSONDecode(encoded) end)
+		if not ok or type(wire) ~= "table" or wire.Version ~= 1 or wire.BoardId ~= _RunRankingPolicyLogic.BoardId then return end
+		local snapshot = self._T.ClientSnapshot or { Entries = {}, IsLoaded = false }
+		if wire.Operation == "QUERY" and wire.Success then
+			local entries = {}
+			for _, entry in ipairs(wire.Entries or {}) do
+				local decoded = _RunPublicRecordContractLogic:Decode(entry.Json)
+				if not decoded.Success then return end
+				decoded.Public.Rank = entry.Rank
+				table.insert(entries, decoded.Public)
+			end
+			snapshot.Entries = entries
+			snapshot.OwnBest = nil
+			snapshot.IsLoaded = true
+			snapshot.ScanLimited = wire.ScanLimited
+			snapshot.UpdatedAtUtc = wire.UpdatedAtUtc or ""
+		end
+		if wire.OwnBestJson ~= nil then
+			local own = _RunPublicRecordContractLogic:Decode(wire.OwnBestJson)
+			if not own.Success then return end
+			snapshot.OwnBest = own.Public
+		end
+		snapshot.Success = wire.Success
+		snapshot.Reason = wire.Reason
+		snapshot.OwnBestReason = wire.OwnBestReason
+		snapshot.Operation = wire.Operation
+		snapshot.Revision = (snapshot.Revision or 0) + 1
+		self._T.ClientSnapshot = snapshot
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetLocalWorldRankingSnapshot()
+		-- UI polling reads memory only; it never calls DataStorage or starts a timer-based refresh.
+		return self._T.ClientSnapshot or { Success = true, Reason = "NOT_REQUESTED", Entries = {}, IsLoaded = false, Revision = 0 }
+	end
+
+	@ExecSpace("ServerOnly")
+	@EventSender("Service", "UserService")
+	handler HandleRankingUserLeave(UserLeaveEvent event)
+		-- Bound per-user rate-limit memory to connected users rather than the lifetime of a busy world instance.
+		if event.UserId ~= nil then self.RequestTimes[event.UserId] = nil; self.PublishTimes[event.UserId] = nil end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Singleton caches are session-scoped and must not retain user identities after the world closes.
+		self.RequestTimes = {}; self.PublishTimes = {}; self.TopCache = {}; self.CacheUntil = 0
+		self.ReadInProgress = false
+		self.NextReadAt = 0; self.LastReadFailure = {}
+	end
+
+end
