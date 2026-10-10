@@ -276,6 +276,11 @@ closed value that a CSV cell can hold, update that catalog **in the same change*
 - what `Value` / `ParameterA` / `ParameterB` mean for an effect (e.g. a new `MULTI_HIT`-style damage mode, a new `MOVE_SELF` mode)
 - `ConditionId`, `TargetSelector`, `TargetingType`, `CostType`
 - `EnemyPatternSteps.ActionType` / `ConditionType` / `CELL_FREE` selectors, and what `ParamA` means for them
+- skill augment kinds (`AugmentEffects.ParamA` → `augment.modifiers`), and the Balance Studio mirrors of
+  `IsSkillModifierValid` / `CanBindSkillAugment` / `ApplySkillModifier` (`skillAugmentProblems`, `canBindAugment`,
+  `applyAugmentToConcept`), plus `Docs/Guide/Skill-Augment-Reroll-Guide.md`
+- relic special effects (`RelicDefinitions.SpecialEffectType`) — these live in the page's `RELIC_SPECIAL_EFFECTS`
+  constant, transcribed from `RelicDefinitionRepositoryLogic.DescribeSpecialEffect`
 
 Transcribe labels and rules from the code (validator + executor), never guess. Then run:
 

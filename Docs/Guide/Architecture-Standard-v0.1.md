@@ -670,8 +670,8 @@ Context는 요청 동안만 사용하는 값이다. Executor가 Context를 전�
 이 영역은 직업 정의와 시작 스킬 로더/검증기, 런 직업 스냅샷, 첫 실제
 `FORWARD_PUSH` JobMechanic, 런 스킬 소유권과 큐 허용 검사까지 구현되었다. 또한
 `JobPassiveSetId → AugmentId` 참조, 플레이어별 증강 상태, 최소 Trigger→Condition→Effect
-파이프라인까지 구현되었다. 강화가 끝난 스킬에 붙는 **스킬 증강**(14종, 스킬당 6단계 누적)과
-업그레이드 스테이지 3택·슬롯 리롤도 구현되었다(§12.5). 전역 증강의 후보 풀·충돌/다중 스택
+파이프라인까지 구현되었다. 보유한 스킬에 티어와 무관하게 붙는 **스킬 증강**(23종, 스킬당 4단계 누적)과
+업그레이드 보상 3택·슬롯 리롤도 구현되었다(§12.5). 전역 증강의 후보 풀·충돌/다중 스택
 정책과 상점 구매 어댑터는 후속 단계다.
 
 직업의 고정 선택값은 `PlayerRunStateComponent`, 런 중 추가될 수 있는 스킬 수량은
@@ -770,15 +770,17 @@ v0.1 초안의 단일 표(`FilterTags`/`ModifierType`/`TargetField`/`Value`) 계
 
 - 상태: 스킬별 증강 목록, 리롤권, 보상 제안 캐시는 `PlayerRunAugmentComponent`가 소유한다. 힐 횟수와 무한 치유는 `PlayerRunInventoryComponent`가 소유한다.
 - 판정·적용: `AugmentRuntimeLogic.CanBindSkillAugment` / `ApplySkillModifier`만 사용한다. 보상 카드, 전투, 큐 시간, HUD는 모두 `BuildSkillBundle`의 결과를 읽고 증강 효과를 따로 계산하지 않는다.
-- 누적: 한 스킬 최대 6단계(`MaxSkillAugmentStages`, 힐 제외)다. 각 단계는 앞 단계까지 적용된 스킬로 다시 판정하며, 맞지 않는 단계는 건너뛴다.
-- 보상 흐름: `StageTransitionManagerLogic.DetermineIntermediateMap` → `UpgradeSkillStageLogic`(서버) ↔ `UpgradeSkillStageUIComponent`(클라이언트).
+- 누적: 한 스킬 최대 4단계(`MaxSkillAugmentStages`, 힐 포함)다. 제안·적용할 때 앞 단계까지 적용된 스킬로 다시 판정하고, 보유한 증강을 재적용할 때는 다시 판정하지 않는다.
+- 전투 추가 효과(선제 타격·마무리 일격·몰아치기·충격파·묵직한 일격·전투 태세·지속 치유)는 `AugmentRuntimeLogic`의 전투 훅이 처리하고, `BattleSessionComponent`/`SkillExecutionLogic`은 그 훅만 부른다.
+- 티어 강화: 런 중에는 없다. 로비 스킬 트리(`SkillTreeServiceLogic`)가 영구 해금을 소유하고, 출발 때 저장한 해금 상태로 시작 스킬과 새 스킬 카드의 단계를 정한다.
+- 보상 흐름: `StageTransitionManagerLogic.DetermineIntermediateMap`(`ChooseRewardKind` 결과를 `RewardSelectionContext`에 `|NEW`/`|UPGRADE`로 저장, 맵은 항상 `new_skill_stage`) → `UpgradeSkillStageLogic`(서버) ↔ `UpgradeSkillStageUIComponent`(클라이언트).
   - 선택·건너뛰기·리롤은 모두 서버 Request다.
   - 보상 키 `upgrade_skill_stage:<LastBattleRecordKey>`로 한 번만 처리하며, 요청은 리비전과 카드 토큰으로 오래된 요청을 거절한다.
 - 리롤권: 런 시작 시 `BaseRerollCount` + 유니온 `AUGMENT_REROLL`, 전투 승리 시 `GrantClearReroll`(보스 확정, 그 외 20%)로 얻는다.
-  - 업그레이드 스테이지와 새 스킬 스테이지가 같은 개수를 쓴다.
+  - 업그레이드 보상과 새 스킬 보상이 같은 개수를 쓴다.
   - 카드가 실제로 바뀐 경우에만 차감한다.
 - 판매: 상점 스킬 판매(`ApplySkillSale`)는 그 스킬의 증강을 모두 제거하고 다음 업그레이드 보상을 새 기본 스킬 선택으로 바꾼다.
-- 데이터 추가: 새 `ParamA` 종류는 Validator(`IsSkillModifierValid`), `CanBindSkillAugment`, `ApplySkillModifier`, Balance Studio 어휘 카탈로그를 한 변경으로 함께 고친다.
+- 데이터 추가: 새 `ParamA` 종류는 Validator(`IsSkillModifierValid`), `CanBindSkillAugment`, `ApplySkillModifier`, 필요한 전투 훅, Balance Studio 어휘 카탈로그와 증강 판정 미러를 한 변경으로 함께 고친다.
 
 ---
 
@@ -995,6 +997,12 @@ Event는 이미 완료된 사실을 전달한다. Event 수신자가 같은 상�
 ---
 
 ## 21. 규격 변경 절차
+
+### 스킬 증강 확장 기록 갱신 (2026-10-10)
+
+- develop `f85c18d` 기준으로 스킬 증강이 23종(일반 18 · 히든 5), 스킬당 4단계(힐 포함), 티어 무관 부착, 히든 판정 10%로 바뀐 것을 문서에 반영했다. 업그레이드 보상은 증강 카드만 만들고, 티어 강화는 로비 스킬 트리로 옮겨 갔다.
+- `new_upgrade_stage` 맵은 삭제되었고 두 보상 모두 `new_skill_stage`에서 `RewardSelectionContext`로 구분한다.
+- `Skill-Augment-Reroll-Guide.md`와 §12, §12.5를 갱신했다. Balance Studio 증강 탭도 같은 규칙으로 맞췄다.
 
 ### 스킬 증강 누적·리롤 (2026-09-28)
 
