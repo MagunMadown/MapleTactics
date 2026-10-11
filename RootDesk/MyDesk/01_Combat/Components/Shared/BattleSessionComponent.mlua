@@ -2321,21 +2321,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void BeginEnemyTurnFromPlayerAction(string completionReason)
-		-- The authoritative action completion has already happened. Lock the enemy phase now,
-		-- then consume only the presentation handoff that this action still needs.
-		self:AdvanceConsumedPlayerActionEffects(completionReason)
-		if self.BattleResult ~= "" then return end
-		local handoffDelay = self.PlayerToEnemyBeatDuration
-		if completionReason == "IMMEDIATE_ACTION_COMPLETED" or completionReason == "SKILL_QUEUE_COMPLETED" then
-			handoffDelay = self.PlayerPresentationSettledBeatDuration
-		elseif completionReason == "SKILL_QUEUED" then
-			-- Reservation is a real turn handoff. Let its existing pop read before the enemy acts.
-			handoffDelay = self.QueuePopDuration
-		end
-		self.PlayerToEnemyBeatPending = true
-		self.PendingPlayerToEnemyHandoffDelay = math.max(0.016, math.min(0.12, handoffDelay))
-		log("[BattlePlayerHandoff] player action completed reason=" .. completionReason .. " remainingBeat=" .. tostring(self.PendingPlayerToEnemyHandoffDelay))
-		self:BeginEnemyTurn()
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:BeginEnemyTurnFromPlayerAction(self, completionReason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2356,104 +2343,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void BeginEnemyTurnFromEnemyAction(string completedEnemyId, string completedActionType)
-		-- Marks only the presentation cadence between two already-ordered enemy actions.
-		-- Authoritative completion happens before this method and the next intent still executes later.
-		self.EnemyToEnemyHandoffPending = true
-		self.PendingEnemyHandoffSourceId = completedEnemyId
-		self.PendingEnemyHandoffActionType = completedActionType
-		self:BeginEnemyTurn()
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:BeginEnemyTurnFromEnemyAction(self, completedEnemyId, completedActionType)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void BeginEnemyTurn()
-		-- Executes only actions that were frozen for every enemy before the player committed this turn.
-		local usePlayerTransitionBeat = self.PlayerToEnemyBeatPending
-		local playerHandoffDelay = self.PendingPlayerToEnemyHandoffDelay
-		local useEnemyTransitionBeat = self.EnemyToEnemyHandoffPending
-		local enemyHandoffSourceId = self.PendingEnemyHandoffSourceId
-		local enemyHandoffActionType = self.PendingEnemyHandoffActionType
-		self.PlayerToEnemyBeatPending = false
-		self.PendingPlayerToEnemyHandoffDelay = -1
-		self.EnemyToEnemyHandoffPending = false
-		self.PendingEnemyHandoffSourceId = ""
-		self.PendingEnemyHandoffActionType = ""
-		if self.SkillTestMode == true then
-			-- The dummy idles: pass through a locked enemy phase so turn counters and cooldowns still advance.
-			self.TurnState:BeginEnemyTurn("ENEMY_WAIT", 0, "SKILL_TEST_IDLE")
-			self:PublishTurnStateSnapshot("ENEMY_TURN_BEGIN")
-			self:CompleteEnemyTurn("WAIT", true, "SKILL_TEST_IDLE")
-			return
-		end
-		local preparedIntent = self:GetPreparedEnemyIntent()
-		if preparedIntent.State ~= "PREPARED" then
-			log_warning("[BattleEnemyIntent] compatibility cursor missing; selecting frozen plan turn=" .. self.TurnNumber)
-			local selection = self:PrepareNextEnemyIntent()
-			if selection.Success == false then
-				self.TurnState:BeginEnemyTurn("ENEMY_WAIT", 0, selection.Reason)
-				self:PublishTurnStateSnapshot("ENEMY_TURN_BEGIN")
-				self:CompleteEnemyTurn("WAIT", false, selection.Reason)
-				return
-			end
-			preparedIntent = self:GetPreparedEnemyIntent()
-		end
-
-		local enemyEntity = self:FindUnitEntity(preparedIntent.EnemyId)
-		local enemyPlan = nil
-		if isvalid(enemyEntity) then
-			enemyPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
-		end
-		self:AdvanceEnemySkillCooldowns(preparedIntent.EnemyId, "ENEMY_ACTION_BEGIN")
-		local isQueueingAttack = enemyPlan ~= nil and enemyPlan.PlanState == "INSERTING"
-		local enemyCommand = "ENEMY_" .. preparedIntent.ActionType
-		if isQueueingAttack then
-			enemyCommand = "ENEMY_QUEUE_TILE"
-		end
-		self.TurnState:BeginEnemyTurn(enemyCommand, preparedIntent.Direction, isQueueingAttack and "ATTACK_TILE_QUEUEING" or "PREPARED_INTENT")
-		self:PublishTurnStateSnapshot("ENEMY_TURN_BEGIN")
-		log("[BattleEnemyIntent] hold enemy=" .. preparedIntent.EnemyId .. " pattern=" .. preparedIntent.PatternId .. " step=" .. preparedIntent.StepIndex .. " action=" .. preparedIntent.ActionType .. " tile=" .. preparedIntent.TileId .. " telegraphRemaining=" .. preparedIntent.TelegraphTurnsRemaining .. " turn=" .. preparedIntent.PreparedTurn)
-		log("[BattleTurnFlow] phase=EnemyTurn turn=" .. self.TurnNumber)
-
-		local execute = function()
-			local enemyUnit = isvalid(enemyEntity) and enemyEntity:GetComponent("script.BattleUnitComponent") or nil
-			if enemyUnit ~= nil and enemyUnit.StopActionTurns > 0 then
-				enemyUnit.StopActionTurns = enemyUnit.StopActionTurns - 1
-				if enemyUnit.StopActionTurns == 0 then enemyUnit.StopMarkerRuid = "" end
-				log("[BattleStatus] enemy turn skipped unit=" .. preparedIntent.EnemyId)
-				self:CompleteQueuedAttackTrackingCommand(preparedIntent.EnemyId, "WAIT", true, "CONTROL_STATUS")
-				return
-			end
-			if isQueueingAttack then
-				self:AdvancePreparedEnemyQueue()
-				return
-			end
-			self:ExecutePreparedEnemyIntent()
-		end
-		local traitIds = ""
-		if isvalid(enemyEntity) then
-			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
-			if enemyUnit ~= nil then
-				traitIds = enemyUnit.EnemyTraitIds
-			end
-		end
-		-- The intent has already been selected and frozen. This value is presentation cadence only;
-		-- no AI result is applied until the callback actually executes the prepared intent.
-		local executeDelay = _EnemyTraitRouterLogic:GetEnemyThinkDuration(traitIds, self.EnemyThinkDuration)
-		if usePlayerTransitionBeat == true then
-			if playerHandoffDelay < 0 then
-				playerHandoffDelay = self.PlayerToEnemyBeatDuration
-			end
-			executeDelay = math.max(0.016, math.min(0.12, playerHandoffDelay))
-			log("[BattlePlayerHandoff] enemy action queued delay=" .. tostring(executeDelay) .. " enemy=" .. preparedIntent.EnemyId)
-		elseif useEnemyTransitionBeat == true then
-			executeDelay = self.EnemyToEnemyBeatDuration
-			if _EnemyTraitRouterLogic:HasTrait(traitIds, "QUICK") then
-				executeDelay = self.QuickEnemyToEnemyBeatDuration
-			end
-			executeDelay = math.max(0.02, math.min(0.05, executeDelay))
-			log("[BattleEnemyHandoff] from=" .. enemyHandoffSourceId .. " action=" .. enemyHandoffActionType .. " to=" .. preparedIntent.EnemyId .. " delay=" .. tostring(executeDelay))
-		end
-		executeDelay = _TutorialRulesLogic:GetEnemyExecuteDelay(self, isQueueingAttack, preparedIntent.EnemyId, executeDelay)
-		self.ActionTimerId = _TimerService:SetTimerOnce(execute, executeDelay)
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:BeginEnemyTurn(self)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2489,40 +2386,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void AdvancePreparedEnemyQueue()
-		-- Consumes this foe's turn by adding its attack Tile; readiness is evaluated on the following player turn.
-		self.ActionTimerId = 0
-		local intent = self:GetPreparedEnemyIntent()
-		if intent.State ~= "PREPARED" then
-			self:CompleteEnemyTurn("QUEUE_TILE", false, "INTENT_NOT_PREPARED")
-			return
-		end
-		local enemyEntity = self:FindUnitEntity(intent.EnemyId)
-		local enemyPlan = nil
-		local enemyUnit = nil
-		if isvalid(enemyEntity) then
-			enemyPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
-			enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
-		end
-		if enemyPlan == nil then
-			self:CompleteEnemyTurn("QUEUE_TILE", false, "ENEMY_PLAN_COMPONENT_MISSING")
-			return
-		end
-		local queueResult = enemyPlan:AdvanceQueueTurn()
-		if enemyUnit ~= nil then
-			self.LastEnemySpawnOrder = enemyUnit.SpawnOrder
-		end
-		if self.EnemyIntentRuntime ~= nil then
-			self.EnemyIntentRuntime:ResetIntent("ATTACK_TILE_QUEUE_TURN_COMPLETED")
-		end
-		self:PublishEnemyIntentSnapshot("ATTACK_TILE_QUEUE_TURN_COMPLETED")
-		self:PublishEnemyPlanSnapshot("ATTACK_TILE_QUEUE_TURN_COMPLETED")
-		log("[BattleEnemyQueue] advanced enemy=" .. intent.EnemyId .. " tile=" .. intent.TileId .. " success=" .. tostring(queueResult.Success) .. " ready=" .. tostring(queueResult.Ready) .. " queue=" .. tostring(queueResult.QueueTurnsElapsed or 0) .. "/" .. tostring(queueResult.QueueTurnsRequired or 0))
-		local nextResult = self:PrepareNextEnemyIntent()
-		if nextResult.Success == true then
-			self:BeginEnemyTurn()
-			return
-		end
-		self:CompleteEnemyTurn("QUEUE_TILE", queueResult.Success == true, queueResult.Reason)
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:AdvancePreparedEnemyQueue(self)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2573,37 +2438,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table LoadEnemyPlanActionToCompatibility(string enemyUnitId)
-		local enemyEntity = self:FindUnitEntity(enemyUnitId)
-		if isvalid(enemyEntity) == false then
-			return { Success = false, Reason = "ENEMY_MISSING" }
-		end
-		local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
-		if actionPlan == nil then
-			return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING" }
-		end
-		local action = actionPlan:GetCurrentAction()
-		if action.Success == false then
-			return action
-		end
-		local compatibilityActionType = action.ActionType
-		local compatibilityDirection = action.Direction
-		local compatibilityReason = action.ActionReason
-		if actionPlan.PlanState == "TRACKING" then
-			compatibilityActionType = actionPlan.NextCommandType ~= "" and actionPlan.NextCommandType or "WAIT"
-			compatibilityDirection = actionPlan.NextCommandDirection
-			compatibilityReason = actionPlan.ReadinessReason ~= "" and actionPlan.ReadinessReason or "TRACKING"
-		end
-		local intentRuntime = self:EnsureEnemyIntentComponent()
-		if intentRuntime == nil then
-			return { Success = false, Reason = "INTENT_STATE_MISSING" }
-		end
-		if intentRuntime.IntentState ~= "EMPTY" then
-			intentRuntime:ResetIntent("COMPATIBILITY_CURSOR_ADVANCE")
-		end
-		local result = intentRuntime:TryPrepare(enemyUnitId, action.PatternId, action.StepIndex, compatibilityActionType, action.TileId, action.TelegraphTurnsRemaining, compatibilityDirection, action.PreparedTurn, compatibilityReason)
-		self:PublishEnemyIntentSnapshot("PLAN_CURSOR_SELECTED")
-		self:PublishEnemyPlanSnapshot("PLAN_CURSOR_SELECTED")
-		return result
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		return _EnemyTurnExecutionLogic:LoadEnemyPlanActionToCompatibility(self, enemyUnitId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2621,319 +2457,50 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void RefreshPreparedEnemyTrackingCommand(string enemyUnitId)
-		-- A crossing player may change the direction of tracking, but never the loaded skill or its readiness.
-		local enemyEntity = self:FindUnitEntity(enemyUnitId)
-		local playerEntity = self:FindUnitEntity("player_01")
-		if isvalid(enemyEntity) == false or isvalid(playerEntity) == false then return end
-		local plan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
-		local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
-		local player = playerEntity:GetComponent("script.BattleUnitComponent")
-		if plan == nil or enemy == nil or player == nil or enemy.IsDead or player.IsDead then return end
-		if plan.PlanState ~= "TRACKING" then return end
-		if plan.NextCommandType ~= "TURN_TO_PLAYER" and plan.NextCommandType ~= "MOVE_TOWARD" then return end
-		local command = _EnemyIntentResolverLogic:ResolveTrackingCommand({
-			EnemyCellIndex = enemy.CellIndex, EnemyFacing = enemy.Facing, PlayerCellIndex = player.CellIndex
-		}, plan.NextCommandType)
-		if command.ActionType == plan.NextCommandType and command.Direction == plan.NextCommandDirection then return end
-		local updated = plan:SetTrackingState(command.Reason, command.ActionType, command.Direction, "")
-		if updated.Success then
-			self:LoadEnemyPlanActionToCompatibility(enemyUnitId)
-			log("[BattleEnemyQueue] tracking redirected enemy=" .. enemyUnitId .. " command=" .. command.ActionType .. " direction=" .. command.Direction)
-		end
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:RefreshPreparedEnemyTrackingCommand(self, enemyUnitId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void ExecutePreparedEnemyIntent()
-		-- Preserves the PatternStep and committed attacks; only relative tracking commands follow the live player.
-		self.ActionTimerId = 0
-		local intent = self:GetPreparedEnemyIntent()
-		if intent.State ~= "PREPARED" then
-			log_error("[BattleEnemyIntent] execute rejected state=" .. intent.State)
-			self:CompleteEnemyTurn("WAIT", false, "INTENT_NOT_PREPARED")
-			return
-		end
-
-		-- Execute the command shown before the player's action. Replan only next turn.
-		local beginResult = self.EnemyIntentRuntime:TryBeginExecution()
-		if beginResult.Success == false then
-			log_error("[BattleEnemyIntent] execute transition rejected reason=" .. beginResult.Reason)
-			self:CompleteEnemyTurn("WAIT", false, beginResult.Reason)
-			return
-		end
-		local executingEnemy = self:FindUnitEntity(intent.EnemyId)
-		local executingPlan = nil
-		if isvalid(executingEnemy) then
-			executingPlan = executingEnemy:GetComponent("script.EnemyActionPlanComponent")
-		end
-		if executingPlan == nil then
-			log_error("[BattleEnemyIntent] execute rejected reason=ENEMY_PLAN_COMPONENT_MISSING enemy=" .. intent.EnemyId)
-			self:CompleteEnemyTurn("WAIT", false, "ENEMY_PLAN_COMPONENT_MISSING")
-			return
-		end
-		local isTrackingCommand = executingPlan.PlanState == "TRACKING"
-			and (intent.ActionType == "TURN_TO_PLAYER" or intent.ActionType == "MOVE_TOWARD" or intent.ActionType == "WAIT")
-		local isMovement = intent.ActionType == "MOVE_TOWARD" or intent.ActionType == "MOVE_AWAY"
-			or intent.ActionType == "MOVE_FIXED_FACING"
-		local preMoveTurn = false
-		if isMovement and executingPlan.PlanState == "PREPARED" and (intent.Direction == -1 or intent.Direction == 1) then
-			local movingUnit = executingEnemy:GetComponent("script.BattleUnitComponent")
-			if movingUnit ~= nil then
-				local facingDirection = movingUnit.Facing == "Right" and 1 or -1
-				preMoveTurn = facingDirection ~= intent.Direction
-			end
-		end
-		if isTrackingCommand == false and preMoveTurn == false then
-			local planBegin = executingPlan:TryBeginCurrentAction()
-			if planBegin.Success == false then
-				log_error("[BattleEnemyIntent] plan execute rejected reason=" .. planBegin.Reason .. " enemy=" .. intent.EnemyId)
-				self:CompleteEnemyTurn("WAIT", false, planBegin.Reason)
-				return
-			end
-		end
-		self:PublishEnemyIntentSnapshot("EXECUTING")
-		self:PublishEnemyPlanSnapshot("ACTION_EXECUTING")
-		local actionDirection = intent.Direction
-		self.TurnState:UpdateEnemyAction(preMoveTurn and "ENEMY_TURN_TO_PLAYER" or "ENEMY_" .. intent.ActionType, actionDirection)
-		self:PublishTurnStateSnapshot("ENEMY_ACTION")
-		log("[BattleEnemyIntent] execute enemy=" .. intent.EnemyId .. " pattern=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " action=" .. intent.ActionType .. " tile=" .. intent.TileId .. " telegraphRemaining=" .. intent.TelegraphTurnsRemaining .. " preparedTurn=" .. intent.PreparedTurn .. " currentTurn=" .. self.TurnNumber)
-
-		local burnKilled = false
-		if intent.ActionType == "CHARGE_FORWARD" or intent.ActionType == "SUMMON_ENEMIES" or intent.ActionType == "BOSS_LAND_OPPOSITE" then
-			-- These skill actions bypass TryExecuteSkill; charge burn once on their committed execution.
-			local caster = executingEnemy:GetComponent("script.BattleUnitComponent")
-			if caster ~= nil and caster.BurnDamage > 0 then
-				self:ApplyStatusDamage(caster.UnitId, caster.BurnDamage, caster.BurnSourceUnitId, "BURN_CAST")
-				burnKilled = caster.IsDead or self.BattleResult ~= ""
-			end
-		end
-		local actionResult = nil
-		if burnKilled then
-			actionResult = { Success = true, Reason = "BURN_LETHAL" }
-		elseif preMoveTurn then
-			actionResult = self:TryFaceDirection(intent.EnemyId, actionDirection)
-		elseif intent.ActionType == "MOVE_TOWARD" then
-			actionResult = self:TryMoveInternal(intent.EnemyId, actionDirection, true)
-		elseif intent.ActionType == "MOVE_AWAY" then
-			actionResult = self:TryMoveAwayInternal(intent.EnemyId, actionDirection, true)
-		elseif intent.ActionType == "MOVE_FIXED_FACING" then
-			actionResult = self:TryMoveInternal(intent.EnemyId, intent.Direction, true)
-		elseif intent.ActionType == "TURN_TO_PLAYER" then
-			actionResult = self:TryFaceDirection(intent.EnemyId, actionDirection)
-		elseif intent.ActionType == "TELEGRAPH_TILE" then
-			actionResult = { Success = true, Reason = "TELEGRAPH_COMPLETED" }
-		elseif intent.ActionType == "CHARGE_FORWARD" then
-			actionResult = self:TryChargeForward(intent.EnemyId, intent.Direction, intent.TileId, executingPlan.TargetCellSnapshot)
-		elseif intent.ActionType == "CAST_INTERRUPTIBLE" then
-			actionResult = self:BeginEnemyInterruptibleCast(intent.EnemyId, intent.PatternId, intent.StepIndex, intent.TileId)
-		elseif intent.ActionType == "SUMMON_ENEMIES" then
-			local summoner = executingEnemy:GetComponent("script.FaustSummonComponent")
-			actionResult = { Success = false, Reason = "SUMMON_COMPONENT_MISSING_WAIT" }
-			if summoner ~= nil then
-				actionResult = summoner:TryPreparedSummon(self, executingPlan.TargetCellSnapshot)
-			end
-		elseif intent.ActionType == "BOSS_JUMP_TELEGRAPH" then
-			actionResult = self:BeginBossOppositeJump(intent.EnemyId)
-		elseif intent.ActionType == "BOSS_LAND_OPPOSITE" then
-			actionResult = self:ResolveBossOppositeLanding(intent.EnemyId, intent.TileId)
-		elseif intent.ActionType == "EXECUTE_TILE" and intent.TileId ~= "" then
-			-- Resolves the pattern's TileId through the enemy-only skill table and shared skill pipeline.
-			local castResult = self:ConsumeEnemyInterruptibleCast(intent.EnemyId, intent.TileId)
-			if castResult.CanExecute == false then
-				actionResult = { Success = false, Reason = "CAST_INTERRUPTED" }
-			else
-				actionResult = self:TryExecuteSkill(intent.EnemyId, intent.TileId)
-			end
-		else
-			 actionResult = { Success = true, Reason = intent.Reason }
-		end
-		if intent.ActionType == "SUMMON_ENEMIES" and actionResult.Success == false then
-			self.TurnState:UpdateEnemyAction("ENEMY_WAIT", 0)
-			self:PublishTurnStateSnapshot("SUMMON_BLOCKED_WAIT")
-		end
-		if isMovement and not preMoveTurn then
-			actionResult = self:ConvertBlockedEnemyMoveToWait(intent.EnemyId, intent.ActionType, actionDirection, actionResult)
-		end
-
-		local success = actionResult ~= nil and actionResult.Success == true
-		local reason = "EXECUTION_FAILED"
-		if actionResult ~= nil then
-			reason = actionResult.Reason
-		end
-
-		local duration = self:GetEnemyActionDuration(preMoveTurn and "TURN_TO_PLAYER" or intent.ActionType, intent.TileId)
-		if intent.ActionType == "EXECUTE_TILE" and actionResult ~= nil then
-			-- The actual impact delay already includes the final projectile; playback completion supplies the visual boundary.
-			duration = actionResult.PresentationHandoffDuration or 0.01
-		end
-		local completed = false
-		local complete = function()
-			if completed then
-				return
-			end
-			completed = true
-			self.ActionTimerId = 0
-			if isTrackingCommand or preMoveTurn then
-				self:CompleteQueuedAttackTrackingCommand(intent.EnemyId, intent.ActionType, success, reason)
-				return
-			end
-			self:CompletePreparedEnemyIntent(intent.EnemyId, intent.PatternId, intent.StepIndex, intent.ActionType, intent.TileId, intent.TelegraphTurnsRemaining, success, reason)
-		end
-		local movement = self._T.enemyGridMove
-		if actionResult ~= nil and actionResult.PresentationStarted == true
-			and movement ~= nil and movement.UnitId == intent.EnemyId then
-			movement.CompleteAction = complete
-			movement.TimerId = _TimerService:SetTimerOnce(function()
-				if self._T.enemyGridMove == movement then
-					self:FinishEnemyGridMovePresentation("FALLBACK_COMPLETE", true)
-				end
-			end, movement.Duration + math.max(0.02, self.MoveCompletionFallbackGrace))
-			self.ActionTimerId = movement.TimerId
-			return
-		end
-		local motionSequence = self:BeginMotionCompletionWait(complete)
-		self:SealMotionCompletionWhenImpactsFinish(motionSequence)
-		self.ActionTimerId = _TimerService:SetTimerOnce(function()
-			self.ActionTimerId = 0
-			self:MarkMotionCompletionReady(motionSequence)
-		end, duration)
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:ExecutePreparedEnemyIntent(self)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void CompleteQueuedAttackTrackingCommand(string enemyId, string actionType, boolean success, string reason)
-		-- A tracking command consumes one enemy action but never completes the queued attack's Pattern Step.
-		log("[BattleEnemyQueue] tracking complete enemy=" .. enemyId .. " action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
-		local enemyEntity = self:FindUnitEntity(enemyId)
-		if isvalid(enemyEntity) then
-			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
-			if enemyUnit ~= nil then
-				self.LastEnemySpawnOrder = enemyUnit.SpawnOrder
-			end
-		end
-		if self.EnemyIntentRuntime ~= nil then
-			self.EnemyIntentRuntime:ResetIntent("QUEUED_ATTACK_TRACKING_COMPLETED")
-		end
-		self:PublishEnemyIntentSnapshot("QUEUED_ATTACK_TRACKING_COMPLETED")
-		self:PublishEnemyPlanSnapshot("QUEUED_ATTACK_TRACKING_COMPLETED")
-		if self.BattleResult == "" then
-			local nextResult = self:PrepareNextEnemyIntent()
-			if nextResult.Success == true then
-				self:BeginEnemyTurnFromEnemyAction(enemyId, actionType)
-				return
-			end
-		end
-		self:CompleteEnemyTurn(actionType, success, reason)
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:CompleteQueuedAttackTrackingCommand(self, enemyId, actionType, success, reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table ConvertBlockedEnemyMoveToWait(string enemyId, string actionType, integer direction, table actionResult)
-		-- Normalizes spatial movement blocks into one consumed WAIT without hiding configuration or phase errors.
-		if actionResult == nil or actionResult.Success == true then
-			return actionResult
-		end
-		if actionResult.Reason ~= "OUT_OF_BOUNDS" and actionResult.Reason ~= "CELL_OCCUPIED" then
-			return actionResult
-		end
-		local blockedReason = actionResult.Reason
-		local result = {
-			Success = true,
-			Reason = "WAIT_" .. blockedReason,
-			WasBlocked = true,
-			BlockedReason = blockedReason,
-			OriginalActionType = actionType,
-			FromCell = actionResult.FromCell,
-			ToCell = actionResult.ToCell
-		}
-		self.TurnState:UpdateEnemyAction("ENEMY_WAIT", 0)
-		self:PublishTurnStateSnapshot("ENEMY_WAIT")
-		log("[BattleEnemyIntent] move blocked; wait enemy=" .. enemyId .. " action=" .. actionType .. " direction=" .. direction .. " reason=" .. blockedReason .. " from=" .. tostring(result.FromCell) .. " to=" .. tostring(result.ToCell))
-		return result
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		return _EnemyTurnExecutionLogic:ConvertBlockedEnemyMoveToWait(self, enemyId, actionType, direction, actionResult)
 	end
 
 	@ExecSpace("ServerOnly")
 	method number GetEnemyActionDuration(string actionType, string tileId)
-		-- Returns the presentation lock duration for each prepared enemy action meaning.
-		if actionType == "MOVE_TOWARD" or actionType == "MOVE_AWAY" or actionType == "MOVE_FIXED_FACING" then
-			return math.max(0.05, self.EnemyMoveActionDuration)
-		elseif actionType == "TURN_TO_PLAYER" then
-			return math.max(0.05, self.TurnActionDuration)
-		elseif actionType == "EXECUTE_TILE" or actionType == "CHARGE_FORWARD" then
-			return self:GetEnemySkillPresentationReadyDuration(tileId)
-		elseif actionType == "SUMMON_ENEMIES" then
-			return 0.6
-		elseif actionType == "BOSS_LAND_OPPOSITE" then
-			return self:GetEnemySkillPresentationReadyDuration(tileId)
-		elseif actionType == "TELEGRAPH_TILE" or actionType == "CAST_INTERRUPTIBLE" or actionType == "BOSS_JUMP_TELEGRAPH" then
-			return 0.05
-		end
-		return 0.05
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		return _EnemyTurnExecutionLogic:GetEnemyActionDuration(self, actionType, tileId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method number GetEnemySkillPresentationReadyDuration(string skillId)
-		-- Enemy-to-enemy sequencing follows the meaningful caster motion instead of the longer
-		-- generic action lock. Projectile skills retain the full flight-safe duration.
-		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
-		if validation.Success == false then
-			return math.max(0.1, self:GetSkillActionDuration(skillId))
-		end
-		local definition = validation.Data.Definition
-		if self:HasSkillProjectile(definition) then
-			return math.max(0.1, self:GetSkillActionDuration(skillId))
-		end
-		local speed = self:GetSkillSpeedMultiplier()
-		local authoredMotionDuration = definition.CasterMotionDuration or 0
-		if authoredMotionDuration <= 0 then
-			authoredMotionDuration = definition.ActionDuration or 0.1
-		end
-		local motionDuration = authoredMotionDuration / speed
-		local motionProfile = self:GetSkillMotionProfile(definition.MotionProfileId)
-		local impactReadyDuration = motionProfile.ImpactDelay or 0
-		return math.max(0.1, motionDuration, impactReadyDuration)
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		return _EnemyTurnExecutionLogic:GetEnemySkillPresentationReadyDuration(self, skillId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table BeginEnemyInterruptibleCast(string enemyId, string patternId, integer stepIndex, string skillId)
-		-- Reads the interruption threshold from the pattern row so boss difficulty remains data-driven.
-		local enemyEntity = self:FindUnitEntity(enemyId)
-		if isvalid(enemyEntity) == false then
-			return { Success = false, Reason = "ENEMY_NOT_FOUND" }
-		end
-		local plan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
-		if plan == nil then
-			return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING" }
-		end
-		local stepResult = _EnemyPatternStepRepositoryLogic:GetPatternStep(patternId, stepIndex)
-		if stepResult.Success == false then
-			return { Success = false, Reason = "CAST_PATTERN_STEP_NOT_FOUND" }
-		end
-		if stepResult.Step == nil then
-			return { Success = false, Reason = "CAST_PATTERN_STEP_NOT_FOUND" }
-		end
-		local requiredHits = math.max(1, math.floor(tonumber(stepResult.Step.ParamA) or 1))
-		local result = plan:BeginInterruptibleCast(skillId, requiredHits)
-		if result.Success == true then
-			self:PublishEnemyPlanSnapshot("CAST_STARTED")
-		end
-		return result
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		return _EnemyTurnExecutionLogic:BeginEnemyInterruptibleCast(self, enemyId, patternId, stepIndex, skillId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table ConsumeEnemyInterruptibleCast(string enemyId, string skillId)
-		local enemyEntity = self:FindUnitEntity(enemyId)
-		if isvalid(enemyEntity) == false then
-			return { Success = false, Reason = "ENEMY_NOT_FOUND", CanExecute = false }
-		end
-		local plan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
-		if plan == nil then
-			return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING", CanExecute = false }
-		end
-		local result = plan:ConsumeInterruptibleCast(skillId)
-		-- The interrupted plan is still ATTACK_READY here. Publishing after clearing its
-		-- cast flag would briefly resurrect the cancelled area before action completion.
-		if result.Reason ~= "CAST_NOT_REQUIRED" and result.Reason ~= "CAST_INTERRUPTED" then
-			self:PublishEnemyPlanSnapshot(result.Reason)
-		end
-		return result
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		return _EnemyTurnExecutionLogic:ConsumeEnemyInterruptibleCast(self, enemyId, skillId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3030,176 +2597,26 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CompletePreparedEnemyIntent(string enemyId, string patternId, integer stepIndex, string actionType, string tileId, integer telegraphTurnsRemaining, boolean success, string reason)
-		-- Advances within the enemy-owned queue; pattern progression occurs once after the full plan.
-		log("[BattleEnemyIntent] complete enemy=" .. enemyId .. " pattern=" .. patternId .. " step=" .. stepIndex .. " action=" .. actionType .. " tile=" .. tileId .. " telegraphRemaining=" .. telegraphTurnsRemaining .. " success=" .. tostring(success) .. " reason=" .. reason)
-		local completedEnemy = self:FindUnitEntity(enemyId)
-		local completedPlan = nil
-		local planCompletion = { Success = false, Reason = "ENEMY_MISSING", HasNextAction = false, AggregateSuccess = success }
-		local completedEnemyDied = false
-		if isvalid(completedEnemy) then
-			local completedUnit = completedEnemy:GetComponent("script.BattleUnitComponent")
-			completedPlan = completedEnemy:GetComponent("script.EnemyActionPlanComponent")
-			if completedPlan ~= nil then
-				planCompletion = completedPlan:CompleteCurrentAction(success, reason)
-			end
-			if completedUnit ~= nil then
-				self.LastEnemySpawnOrder = completedUnit.SpawnOrder
-				completedEnemyDied = completedUnit.IsDead == true
-			end
-		end
-		if self.EnemyIntentRuntime ~= nil then
-			self.EnemyIntentRuntime:ResetIntent("ACTION_COMPLETED")
-		end
-		self:PublishEnemyIntentSnapshot("ACTION_COMPLETED")
-		self:PublishEnemyPlanSnapshot("ACTION_COMPLETED")
-		if self.BattleResult ~= "" then
-			self:ClearPreparedEnemyIntent("BATTLE_ENDED")
-			self:CompleteEnemyTurn(actionType, success, reason)
-			return
-		end
-		if planCompletion.Success == true and planCompletion.HasNextAction == true then
-			local pendingAction = completedPlan ~= nil and completedPlan:GetCurrentAction() or { Success = false }
-			local pendingReason = pendingAction.Success == true and (pendingAction.ActionReason or "") or ""
-			if string.sub(pendingReason, 1, 12) == "POST_ATTACK_" then
-				local deferResult = completedPlan:DeferCurrentActionUntilTurn(self.TurnNumber + 1, "POST_ATTACK_NEXT_ENEMY_TURN")
-				self:PublishEnemyPlanSnapshot("POST_ATTACK_ACTION_DEFERRED")
-				if deferResult.Success == false then
-					log_error("[BattleEnemyIntent] defer failed enemy=" .. enemyId .. " reason=" .. deferResult.Reason)
-				else
-					log("[BattleEnemyIntent] deferred enemy=" .. enemyId .. " action=" .. pendingAction.ActionType .. " untilTurn=" .. deferResult.DeferredUntilTurn)
-					local nextEnemy = self:PrepareNextEnemyIntent()
-					if nextEnemy.Success == true then
-						self:BeginEnemyTurnFromEnemyAction(enemyId, actionType)
-						return
-					end
-					self:CompleteEnemyTurn(actionType, success, "POST_ATTACK_ACTION_DEFERRED")
-					return
-				end
-			end
-			local nextAction = self:LoadEnemyPlanActionToCompatibility(enemyId)
-			if nextAction.Success == true then
-				self:BeginEnemyTurnFromEnemyAction(enemyId, actionType)
-				return
-			end
-		end
-		if completedEnemyDied then
-			-- The death path already released this enemy's prepared step (e.g. BURN_LETHAL on its own cast).
-			log("[BattleEnemyIntent] pattern progression skipped enemy=" .. enemyId .. " pattern=" .. patternId .. " step=" .. stepIndex .. " reason=UNIT_DIED")
-		elseif actionType ~= "WAIT" or reason ~= "SPAWN_WAIT" then
-			local progression = self:CompleteEnemyPatternStep(enemyId, patternId, stepIndex, planCompletion.AggregateSuccess == true)
-			if progression.Success == false then
-				log_error("[BattleEnemyIntent] pattern progression failed enemy=" .. enemyId .. " pattern=" .. patternId .. " step=" .. stepIndex .. " reason=" .. progression.Reason)
-			end
-		end
-		if self.BattleResult == "" then
-			local nextResult = self:PrepareNextEnemyIntent()
-			if nextResult.Success == true then
-				log("[BattleEnemyIntent] advance next=" .. self.PreparedEnemyId .. " afterSpawnOrder=" .. self.LastEnemySpawnOrder)
-				self:BeginEnemyTurnFromEnemyAction(enemyId, actionType)
-				return
-			end
-		end
-		self:CompleteEnemyTurn(actionType, success, reason)
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:CompletePreparedEnemyIntent(self, enemyId, patternId, stepIndex, actionType, tileId, telegraphTurnsRemaining, success, reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table CompleteEnemyPatternStep(string enemyId, string patternId, integer stepIndex, boolean success)
-		-- Resolves immutable row links, then asks the per-enemy runner to own the mutable transition.
-		local enemyEntity = self:FindUnitEntity(enemyId)
-		if isvalid(enemyEntity) == false then
-			return { Success = false, Reason = "ENEMY_MISSING" }
-		end
-		local patternRunner = enemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
-		if patternRunner == nil then
-			return { Success = false, Reason = "PATTERN_RUNNER_MISSING" }
-		end
-		if patternRunner.PatternId ~= patternId then
-			-- A boss may cross a phase threshold after this round's plan was frozen. The frozen
-			-- action still resolves, but its old Step must not advance the replacement Pattern.
-			log("[BattleEnemyIntent] pattern progression skipped enemy=" .. enemyId .. " oldPattern=" .. patternId .. " currentPattern=" .. patternRunner.PatternId .. " reason=PATTERN_SUPERSEDED")
-			return { Success = true, Reason = "PATTERN_SUPERSEDED", PreviousPatternId = patternId, CurrentPatternId = patternRunner.PatternId }
-		end
-		local stepResult = _EnemyPatternStepRepositoryLogic:GetPatternStep(patternId, stepIndex)
-		if stepResult.Success == false then
-			return stepResult
-		end
-		return patternRunner:CompletePreparedStep(
-			patternId,
-			stepIndex,
-			success,
-			stepResult.Step.NextStepOnSuccess,
-			stepResult.Step.ActionType == "SUMMON_ENEMIES" and 1 or stepResult.Step.NextStepOnFailure,
-			stepResult.StepCount,
-			stepResult.Step.ActionType
-		)
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		return _EnemyTurnExecutionLogic:CompleteEnemyPatternStep(self, enemyId, patternId, stepIndex, success)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table CancelEnemyQueuedSkills(string enemyUnitId, string reason)
-		-- Drops one enemy's queued/charging attacks. The pattern runner releases the same step so the enemy
-		-- plans it again from scratch instead of resuming a half-consumed telegraph.
-		local enemyEntity = self:FindUnitEntity(enemyUnitId)
-		if isvalid(enemyEntity) == false then
-			return { Success = false, Reason = "ENEMY_NOT_FOUND", CancelledSkillIds = "" }
-		end
-		local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
-		if actionPlan == nil then
-			return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING", CancelledSkillIds = "" }
-		end
-		local currentAction = actionPlan:GetCurrentAction()
-		local result = actionPlan:CancelQueuedSkills(reason)
-		if result.Success == false then
-			return result
-		end
-		local patternRunner = enemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
-		if patternRunner ~= nil and currentAction.Success == true then
-			patternRunner:CancelPreparedStep(currentAction.PatternId, currentAction.StepIndex, reason)
-		end
-		-- The compatibility cursor may already point at this enemy; release it so the enemy round skips it.
-		if self.PreparedEnemyId == enemyUnitId then
-			local intentRuntime = self.EnemyIntentRuntime
-			if intentRuntime == nil then
-				intentRuntime = self:EnsureEnemyIntentComponent()
-			end
-			if intentRuntime ~= nil then
-				intentRuntime:ResetIntent(reason)
-			end
-			-- Hand the cursor to another enemy that is still holding a frozen plan, so the round keeps its order.
-			self:PrepareNextEnemyIntent()
-			self:PublishEnemyIntentSnapshot(reason)
-		end
-		self:PublishEnemyPlanSnapshot(reason)
-		log("[BattleEnemyIntent] queue cancelled enemy=" .. enemyUnitId .. " skills=" .. result.CancelledSkillIds .. " reason=" .. (reason or ""))
-		return result
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		return _EnemyTurnExecutionLogic:CancelEnemyQueuedSkills(self, enemyUnitId, reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void ClearPreparedEnemyIntent(string reason)
-		-- Cancels every per-enemy frozen plan at a real round/battle boundary.
-		self:FinishEnemyGridMovePresentation("INTENT_CLEAR_" .. reason, false)
-		local intentRuntime = self.EnemyIntentRuntime
-		if intentRuntime == nil then
-			intentRuntime = self:EnsureEnemyIntentComponent()
-		end
-		if self.BoardState ~= nil then
-			local livingEnemies = self.BoardState:CollectLivingEnemies()
-			for _, enemyEntity in ipairs(livingEnemies) do
-				local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
-				local patternRunner = enemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
-				if actionPlan ~= nil and actionPlan.PlanState ~= "EMPTY" then
-					local current = actionPlan:GetCurrentAction()
-					if patternRunner ~= nil and current.Success == true then
-						patternRunner:CancelPreparedStep(current.PatternId, current.StepIndex, reason)
-					end
-					actionPlan:ResetPlan(reason)
-				end
-			end
-		end
-		if intentRuntime ~= nil then
-			intentRuntime:ResetIntent(reason)
-		end
-		self:PublishEnemyIntentSnapshot(reason)
-		self:PublishEnemyPlanSnapshot(reason)
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:ClearPreparedEnemyIntent(self, reason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3234,68 +2651,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CompleteEnemyTurn(string actionType, boolean success, string reason)
-		-- The ordered enemy round is complete. Keep the enemy phase locked for a short visual beat,
-		-- then reopen the player turn without changing the authoritative completion result.
-		self.ActionTimerId = 0
-		if self.BattleResult ~= "" then
-			self.TurnState:ClearTransientState("BATTLE_ENDED")
-			self:PublishTurnStateSnapshot("BATTLE_ENDED")
-			log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason .. " result=" .. self.BattleResult)
-			return
-		end
-
-		if self.TurnState.BattlePhase ~= "EnemyTurn" then
-			log_warning("[BattleTurnTempo] completed enemy round ignored phase=" .. self.TurnState.BattlePhase .. " turn=" .. self.TurnState.TurnNumber .. " reason=" .. reason)
-			return
-		end
-
-		if self.TurnTransitionTimerId > 0 then
-			log_warning("[BattleTurnTempo] duplicate enemy-to-player transition blocked action=" .. actionType .. " reason=" .. reason)
-			return
-		end
-
-		local beatDuration = math.max(0.02, math.min(0.06, self.EnemyToPlayerBeatDuration))
-		beatDuration = _TutorialRulesLogic:GetEnemyBeatDuration(self, actionType, beatDuration)
-		local expectedEntry = self.EntryRequestId
-		local expectedTurn = self.TurnState.TurnNumber
-		local finishTransition = function()
-			if self.EntryRequestId ~= expectedEntry or self.TurnState.TurnNumber ~= expectedTurn then
-				log_warning("[BattleTurnTempo] stale enemy-to-player callback ignored entry=" .. expectedEntry .. " turn=" .. expectedTurn)
-				return
-			end
-			self:FinishEnemyToPlayerTransition(actionType, success, reason)
-		end
-		self.TurnTransitionTimerId = _TimerService:SetTimerOnce(finishTransition, beatDuration)
-		log("[BattleTurnTempo] enemy round completed action=" .. actionType .. " reason=" .. reason .. " playerReadyBeat=" .. tostring(beatDuration))
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:CompleteEnemyTurn(self, actionType, success, reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void FinishEnemyToPlayerTransition(string actionType, boolean success, string reason)
-		-- Called only after CompleteEnemyTurn confirmed the enemy round was finished.
-		-- This timer controls presentation tempo, never whether the round succeeded.
-		if self.TurnState.BattlePhase ~= "EnemyTurn" then
-			log_warning("[BattleTurnTempo] duplicate enemy-to-player callback ignored turn=" .. self.TurnState.TurnNumber)
-			return
-		end
-		self.TurnTransitionTimerId = 0
-		if self.BattleResult ~= "" then
-			self.TurnState:ClearTransientState("BATTLE_ENDED")
-			self:PublishTurnStateSnapshot("BATTLE_ENDED")
-			log("[BattleEnemy] transition ended action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason .. " result=" .. self.BattleResult)
-			return
-		end
-
-		self.TurnState:CompleteEnemyTurn("ENEMY_ROUND_COMPLETED")
-		self:PublishTurnStateSnapshot("PLAYER_TURN_REOPENED")
-		_TutorialRulesLogic:OnEnemyRoundCompleted(self)
-		self.StageTurnNumber = self.TurnNumber
-		self:AdvancePlayerSkillCooldowns("PLAYER_TURN_" .. self.TurnNumber)
-		self:ProcessAugmentTrigger("TURN_START", "TURN:" .. tostring(self.TurnNumber), 0)
-		self.LastEnemySpawnOrder = 0
-		self:EvaluateForcedSpawnAtTurnBoundary()
-		log("[BattleEnemy] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
-		log("[BattleTurnFlow] phase=PlayerTurn turn=" .. self.TurnNumber .. " stageTurn=" .. self.StageTurnNumber .. " wave=" .. self.CurrentWave)
-		self:PrepareEnemyIntent()
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		_EnemyTurnExecutionLogic:FinishEnemyToPlayerTransition(self, actionType, success, reason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -7536,22 +6899,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method integer ResolveEnemyRelativeMoveDirection(string enemyId, string actionType)
-		-- Relative movement/turns follow the live board after crossing or push effects; fixed moves and charges bypass this.
-		local enemyEntity = self:FindUnitEntity(enemyId)
-		local playerEntity = self:FindUnitEntity("player_01")
-		if isvalid(enemyEntity) == false or isvalid(playerEntity) == false then
-			return 0
-		end
-		local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
-		local player = playerEntity:GetComponent("script.BattleUnitComponent")
-		if enemy == nil or player == nil or enemy.CellIndex == player.CellIndex then
-			return 0
-		end
-		local towardDirection = player.CellIndex > enemy.CellIndex and 1 or -1
-		if actionType == "MOVE_AWAY" then
-			return -towardDirection
-		end
-		return towardDirection
+		-- Delegates enemy turn execution while this session owns its state and timers.
+		return _EnemyTurnExecutionLogic:ResolveEnemyRelativeMoveDirection(self, enemyId, actionType)
 	end
 
 	@ExecSpace("ServerOnly")
