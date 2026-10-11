@@ -186,4 +186,548 @@ script SkillExecutionLogic extends Logic
 		end
 	end
 
+	@ExecSpace("ServerOnly")
+	method number GetSkillActionDuration(any session, string skillId)
+		-- Scaled by the same multiplier as the motion, so the queue slot frees when the swing ends
+		-- instead of holding the turn for the original 1x duration.
+		local validation = session:GetEffectiveSkillValidation("player_01", skillId)
+		if validation.Success == false then
+			return 0.1
+		end
+		local definition = validation.Data.Definition
+		local speed = session:GetSkillSpeedMultiplier()
+		local motion = session:GetSkillMotionProfile(definition.MotionProfileId)
+		local authored = math.max(definition.ActionDuration / speed, motion.Duration or 0)
+		if session:HasSkillProjectile(definition) == false then
+			return math.max(0.1, authored)
+		end
+
+		-- A projectile skill resolves only after the shot lands, so the queue slot must outlive the
+		-- worst-case flight. Actual flight uses the real target distance; the clamp uses full range
+		-- because the target is not known until the shot is scheduled.
+		local launchDelay = session:GetProjectileLaunchDelay(definition)
+		local worstFlight = (definition.Range * session.CellSpacing) / session:GetSkillProjectileSpeed(definition)
+		-- A volley finishes on its last shot, so the slot has to cover the whole stream, not one arrow.
+		local volleySpan = math.max(0, definition.ProjectileInterval or 0) / speed * (math.max(1, definition.ProjectileCount or 1) - 1)
+		local minimumDuration = launchDelay + volleySpan + worstFlight
+		if session:IsSequentialProjectileVolley(definition, validation.Data.EffectSteps) then
+			local count = _DamageEffectExecutorLogic:GetHitCount(validation.Data.EffectSteps[1])
+			minimumDuration = launchDelay + count * worstFlight + math.max(0, count - 1) * math.max(0.001, definition.ProjectileInterval or 0) + 0.02
+		end
+		return math.max(0.1, authored, minimumDuration)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryExecuteSkill(any session, string sourceUnitId, string skillId)
+		-- Repeat the gate on the authoritative execution path, including already queued skills.
+		local relicRepeat = sourceUnitId == "player_01" and session._T.ReplayingRelicSkill == true
+		if sourceUnitId == "player_01" and session:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
+		local validation = session:GetEffectiveSkillValidation(sourceUnitId, skillId)
+		if validation.Success == false then
+			return {
+				Success = false,
+				Reason = validation.Reason,
+				DetailReason = validation.DetailReason or "",
+				SourceUnitId = sourceUnitId,
+				SkillId = skillId
+			}
+		end
+
+		local bundle = validation.Data
+		local definition = {}
+		for key, value in pairs(bundle.Definition) do definition[key] = value end
+		if sourceUnitId == "player_01" and not relicRepeat then session:ResolvePlayerConfusion(skillId, definition) end
+		local effectSteps = bundle.EffectSteps
+		local contextResult = _SkillExecutionLogic:BuildContext(session, sourceUnitId, skillId, definition)
+		if contextResult.Success == false then
+			return contextResult
+		end
+
+		-- A living enemy's attack attempt animates even when use checks or target resolution fail.
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local isEnemyAttack = sourceUnit.Team == "Enemy"
+		if isEnemyAttack then
+			session:PlayEnemyAttackMotion(sourceEntity, sourceUnitId, definition)
+			log("[EnemyAttackMotion] attempt unit=" .. sourceUnitId .. " skill=" .. skillId)
+		end
+
+		local runtimeState = session:GetSkillRuntimeState(sourceUnitId)
+		if runtimeState == nil then
+			return {
+				Success = false,
+				Reason = "SKILL_RUNTIME_STATE_MISSING",
+				SourceUnitId = sourceUnitId,
+				SkillId = skillId
+			}
+		end
+		local cooldownResult = relicRepeat and { Success = true } or runtimeState:CanUseSkill(skillId)
+		if cooldownResult.Success == false then
+			return {
+				Success = false,
+				Reason = cooldownResult.Reason,
+				RemainingTurns = cooldownResult.RemainingTurns,
+				SourceUnitId = sourceUnitId,
+				SkillId = skillId
+			}
+		end
+		local inventory = sourceEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if definition.CostType == "HEAL_CHARGE" then
+			if inventory == nil or (not inventory.HealUnlimited and inventory:GetHealCharges() < definition.CostValue) then
+				return { Success = false, Reason = "HEAL_CHARGES_EMPTY" }
+			end
+			if sourceUnit.CurrentHp >= sourceUnit.MaxHp then return { Success = false, Reason = "HP_FULL" } end
+		end
+		if sourceUnitId == "player_01" and session.TurnState ~= nil and session.TurnState.ExecutingTileIndex > 0 then
+			-- Acceptance precedes burn, charge spending and effects, which cannot be rolled back on a later failure.
+			session._T.QueueExecutionConsumedAction = true
+		end
+		if sourceUnit.BurnDamage > 0 then
+			session:ApplyStatusDamage(sourceUnitId, sourceUnit.BurnDamage, sourceUnit.BurnSourceUnitId, "BURN_CAST")
+			if sourceUnit.IsDead or session.BattleResult ~= "" then return { Success = true, Reason = "BURN_LETHAL", PresentationHandoffDuration = 0.01 } end
+		end
+		if definition.CostType == "HEAL_CHARGE" and not relicRepeat then inventory:SpendHealCharge(definition.CostValue) end
+		local isAttack = false
+		for _, step in ipairs(effectSteps) do
+			if step.EffectType == "DAMAGE" then isAttack = true end
+		end
+		contextResult.Data.PreviousSkillWasAttack = sourceUnit.PreviousSkillWasAttack
+		sourceUnit.PreviousSkillWasAttack = isAttack
+		session:AdvanceComboChain(sourceUnit, skillId, isAttack)
+		local relics = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if isAttack and sourceUnit.Team == "Player" and relics ~= nil and session:HasSkillProjectile(definition) then
+			local extraStars = relics:GetExtraShurikenCount(definition)
+			contextResult.Data.ExtraShurikenCount = extraStars
+			if extraStars > 0 then
+				definition.ExtraShurikenVolley = true
+				definition.ProjectileCount = math.max(1, definition.ProjectileCount or 1) + extraStars
+				definition.ProjectileInterval = math.max(0.25, definition.ProjectileInterval or 0)
+				log("[RunRelic] extra shuriken skill=" .. skillId .. " added=" .. extraStars)
+			end
+		end
+		if isAttack and sourceUnit.NextArrowCount > 0 then
+			contextResult.Data.ExtraArrowCount = sourceUnit.NextArrowCount
+			local extraArrow = _SkillDefinitionRepositoryLogic:GetSkillDefinition(sourceUnit.NextArrowSkillId)
+			definition.ExtraArrowProjectileRuid = extraArrow.ProjectileRuid
+			definition.ExtraArrowProjectileCount = sourceUnit.NextArrowCount
+			if not session:HasSkillProjectile(definition) then
+				local arrow = _SkillDefinitionRepositoryLogic:GetSkillDefinition(sourceUnit.NextArrowSkillId)
+				definition.ProjectileRuid = arrow.ProjectileRuid
+				definition.ProjectileSpeed = arrow.ProjectileSpeed
+				definition.ProjectileScale = arrow.ProjectileScale
+				definition.ProjectileHeight = arrow.ProjectileHeight
+				definition.ProjectileCount = 0
+			end
+			definition.ProjectileCount = (definition.ProjectileCount or 1) + sourceUnit.NextArrowCount
+			definition.ProjectileInterval = math.max(0.25, definition.ProjectileInterval or 0)
+			sourceUnit.NextArrowCount = 0
+			sourceUnit.NextArrowSkillId = ""
+		end
+		if not relicRepeat then
+			local reduction = relics ~= nil and relics:ConsumeLoadedCooldownReduction(skillId) or 0
+			local cooldownTurns = math.max(0, definition.CooldownTurns - reduction)
+			if sourceUnitId == "player_01" then runtimeState:StartPlayerCooldown(skillId, cooldownTurns)
+			else runtimeState:StartCooldown(skillId, cooldownTurns) end
+			-- Skills tagged `cooldown_group:<id>` enter cooldown together when any one of them is used.
+			local groupId = _SkillDefinitionRepositoryLogic:GetCooldownGroupId(definition.SkillTags)
+			if groupId ~= "" and cooldownTurns > 0 then
+				for _, memberId in ipairs(_SkillDefinitionRepositoryLogic:GetCooldownGroupSkillIds(groupId)) do
+					if memberId ~= skillId then
+						if sourceUnitId == "player_01" then runtimeState:StartPlayerCooldown(memberId, cooldownTurns)
+						else runtimeState:StartCooldown(memberId, cooldownTurns) end
+					end
+				end
+			end
+			if reduction > 0 then log("[RunRelic] loaded cooldown skill=" .. skillId .. " reduction=" .. reduction) end
+		end
+
+		-- Swap the avatar weapon before the motion starts so the swing shows the skill's own weapon.
+		session:ApplySkillWeapon(sourceUnitId, sourceEntity, definition)
+		local motionProfile = session:GetSkillMotionProfile(definition.MotionProfileId)
+		if definition.ExtraShurikenVolley == true then
+			-- Let the equipped claw select its native throwing action instead of the shared sword swing.
+			motionProfile.ActionName = ""
+		end
+		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourcePresentation ~= nil and isEnemyAttack == false then
+			if sourceEntity.PlayerControllerComponent ~= nil then
+				session:SendMotionPresentation(sourceEntity, "COMBAT", { UnitId = sourceUnitId, MotionKey = motionProfile.MotionKey, ActionName = motionProfile.ActionName, PlayRate = motionProfile.PlayRate, Duration = motionProfile.Duration })
+			else
+				session:PlayEnemyAttackMotion(sourceEntity, sourceUnitId, definition)
+			end
+		end
+		session:BeginSkillEffectPresentation(sourceUnitId, definition)
+
+		local context = contextResult.Data
+		local expectedEntry = session.EntryRequestId
+		local safeImpactDelay = math.max(0, motionProfile.ImpactDelay)
+		session:ClearSkillImpactTimers()
+		local castSequence = session._T.projectileCastSequence
+		local resolveEffects = function()
+			if session._T.projectileCastSequence ~= castSequence then return end
+			-- A delayed impact belongs to this living actor and this battle entry only.
+			if session.EntryRequestId ~= expectedEntry or session.BattleResult ~= ""
+				or not isvalid(sourceEntity) or sourceUnit.IsDead or sourceUnit.CurrentHp <= 0
+				or session:FindUnitEntity(sourceUnitId) ~= sourceEntity then
+				session.ImpactTimerId = 0
+				log("[SkillExecution] stale impact cancelled source=" .. sourceUnitId .. " skill=" .. skillId)
+				return
+			end
+			-- Resource loads inside death/drop handling can yield; keep the queue blocked until they return.
+			local effectResult = _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
+			if session._T.projectileCastSequence == castSequence then session.ImpactTimerId = 0 end
+			if effectResult.Success == false then
+				log_warning("[SkillExecution] failed skill=" .. skillId .. " source=" .. sourceUnitId .. " reason=" .. effectResult.Reason)
+			end
+		end
+
+		if session:IsSequentialProjectileVolley(definition, effectSteps) then
+			return session:LaunchSequentialProjectileVolley(context, effectSteps[1])
+		end
+		-- A projectile skill splits the impact in two: the shot leaves at its launch delay, and the
+		-- effects resolve only once it has crossed the board to the target cell.
+		local launchDelay = safeImpactDelay
+		local flightSeconds = 0
+		local totalImpactDelay = safeImpactDelay
+		if session:HasSkillProjectile(definition) then
+			launchDelay = session:GetProjectileLaunchDelay(definition)
+			flightSeconds = session:LaunchSkillProjectile(sourceUnitId, definition, launchDelay)
+			if flightSeconds > 0 then
+				totalImpactDelay = launchDelay + flightSeconds
+			end
+		end
+		if totalImpactDelay <= 0 then
+			local immediateResult = _SkillExecutionLogic:ExecuteEffectSteps(context, effectSteps)
+			if immediateResult ~= nil then
+				immediateResult.PresentationHandoffDuration = 0.01
+			end
+			return immediateResult
+		end
+
+		session.ImpactTimerId = _TimerService:SetTimerOnce(resolveEffects, totalImpactDelay)
+		log("[SkillExecution] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " steps=" .. #effectSteps .. " delay=" .. launchDelay .. " flight=" .. flightSeconds)
+		return {
+			Success = true,
+			Reason = "IMPACT_PENDING",
+			SourceUnitId = sourceUnitId,
+			SkillId = skillId,
+			StepCount = #effectSteps,
+			-- Wait for damage resolution; the existing completion gate waits for actual playback.
+			PresentationHandoffDuration = totalImpactDelay
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearSkillImpactTimers(any session)
+		-- Clear callbacks only; pending wave completion survives between queued skills.
+		session._T.projectileCastSequence = (session._T.projectileCastSequence or 0) + 1
+		-- One battle action resolves at a time, so a new cast always supersedes any pending impact.
+		if session.ImpactTimerId > 0 then
+			_TimerService:ClearTimer(session.ImpactTimerId)
+			session.ImpactTimerId = 0
+		end
+		-- A volley schedules one timer per shot, so every pending launch has to be dropped — not just
+		-- the most recent one, or the superseded cast keeps firing arrows into the next action.
+		local pendingShots = session._T.projectileTimerIds
+		if pendingShots ~= nil then
+			for _, timerId in ipairs(pendingShots) do
+				if timerId > 0 then
+					_TimerService:ClearTimer(timerId)
+				end
+			end
+		end
+		session._T.projectileTimerIds = {}
+	end
+
+	method number GetProjectileLaunchDelay(any session, table definition)
+		-- The shot leaves with the cast effect by default, so a ranged skill reads as "fire on cast"
+		-- rather than waiting for a melee swing's impact frame. ProjectileLaunchDelay only holds it
+		-- back, and is scaled like every other duration so it tracks the battle speed multiplier.
+		if definition == nil then
+			return 0
+		end
+		local authored = definition.ProjectileLaunchDelay or 0
+		if authored <= 0 then
+			return 0
+		end
+		return authored / session:GetSkillSpeedMultiplier()
+	end
+
+	method boolean HasSkillProjectile(any session, table definition)
+		-- Both columns are required together; the Validator rejects a RUID with no speed, and this
+		-- guard keeps a half-authored row from stalling the impact instead of just skipping the visual.
+		if definition == nil then
+			return false
+		end
+		local ruid = definition.ProjectileRuid or ""
+		local speed = definition.ProjectileSpeed or 0
+		return ruid ~= "" and speed > 0
+	end
+
+	method number GetSkillProjectileSpeed(any session, table definition)
+		-- Keep flying projectiles readable independently of the faster combat animation clock.
+		return math.max(0.1, (definition.ProjectileSpeed or 0) * 0.5)
+	end
+
+	method boolean IsSequentialProjectileVolley(any session, table definition, table effectSteps)
+		-- Single-target volleys resolve each projectile on arrival, regardless of weapon type.
+		return session:HasSkillProjectile(definition)
+			and effectSteps ~= nil and #effectSteps == 1
+			and effectSteps[1].EffectType == "DAMAGE"
+			and (definition.WeaponType == "CLAW" or definition.TargetingType == "FIRST_ENEMY_FORWARD")
+			and (effectSteps[1].ParameterA == "MULTI_HIT" or definition.ExtraShurikenVolley == true)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LaunchSequentialProjectileVolley(any session, table context, table effectStep)
+		-- Resolve each star on arrival, then aim the next at the nearest survivor in the original range.
+		local definition = context.Definition
+		local sourceId = context.SourceUnitId
+		local sourceEntity = session:FindUnitEntity(sourceId)
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local entryId = session.EntryRequestId
+		local castSequence = session._T.projectileCastSequence
+		local sourceCell = sourceUnit.CellIndex
+		local facing = sourceUnit.Facing
+		local direction = facing == "Right" and 1 or -1
+		local resolved = _SkillTargetResolverLogic:Resolve(session, sourceId, definition)
+		if resolved.Success == false then return resolved end
+		context.PrimaryTargetUnitId = resolved.PrimaryTargetUnitId
+		context.TargetUnitIds = resolved.TargetUnitIds
+		context.TargetCellIndices = resolved.TargetCellIndices
+		context.TargetCellsByUnitId = resolved.TargetCellsByUnitId
+		local cells = {}
+		for _, cell in ipairs(resolved.TargetCellIndices) do
+			local distance = (cell - sourceCell) * direction
+			if distance > 0 and distance <= definition.Range then table.insert(cells, cell) end
+		end
+		table.sort(cells, function(a, b) return (a - sourceCell) * direction < (b - sourceCell) * direction end)
+		local baseCount = _DamageEffectExecutorLogic:GetHitCount(effectStep)
+		local authoredCount = baseCount + (context.ExtraShurikenCount or 0)
+		local pierces = definition.TargetingType == "FIRST_ENEMY_PIERCE"
+		local shotCount = authoredCount + (context.ExtraArrowCount or 0)
+		context.ExtraArrowCount = 0
+		context.ExtraShurikenCount = 0
+		local speed = session:GetSkillProjectileSpeed(definition)
+		local interval = math.max(0, definition.ProjectileInterval or 0)
+		local launchDelay = session:GetProjectileLaunchDelay(definition)
+		local height = definition.ProjectileHeight or 0
+		local origin = session:GetCellPosition(sourceCell)
+		local startPosition = Vector2(origin.x, origin.y + height)
+		local results = {}
+		local shotIndex = 0
+		local stillActive = function()
+			return session.EntryRequestId == entryId and session._T.projectileCastSequence == castSequence
+				and session.BattleResult == "" and isvalid(sourceEntity) and not sourceUnit.IsDead
+				and sourceUnit.CurrentHp > 0 and session:FindUnitEntity(sourceId) == sourceEntity
+				and sourceUnit.CellIndex == sourceCell and sourceUnit.Facing == facing
+		end
+		local fireNext
+		fireNext = function()
+			if not stillActive() then
+				if session._T.projectileCastSequence == castSequence then session.ImpactTimerId = 0 end
+				return
+			end
+			shotIndex = shotIndex + 1
+			local targetId = ""
+			local aimCell = cells[#cells]
+			for _, cell in ipairs(cells) do
+				local target = session.BoardState:FindAtCell(cell, sourceId)
+				local unit = isvalid(target) and target:GetComponent("script.BattleUnitComponent") or nil
+				if unit ~= nil and not unit.IsDead and unit.CurrentHp > 0 and unit.Team ~= sourceUnit.Team then
+					targetId = unit.UnitId
+					aimCell = cell
+					break
+				end
+			end
+			if aimCell == nil then
+				_SkillExecutionLogic:NotifyRelicSkillCompleted(context)
+				_SkillExecutionLogic:ConsumeNextAttackBonusOnHit(context, results)
+				if session._T.projectileCastSequence == castSequence then session.ImpactTimerId = 0 end
+				return
+			end
+			if pierces and #cells > 0 then aimCell = cells[#cells] end
+			session:PublishSkillTargetResolution(context.SkillId, definition.TargetingType, targetId, tostring(aimCell), targetId ~= "" and "TARGETS_RESOLVED" or "NO_TARGET")
+			local targetPosition = session:GetCellPosition(aimCell)
+			local endPosition = Vector2(targetPosition.x, targetPosition.y + height)
+			local flight = math.abs(endPosition.x - startPosition.x) / speed
+			session.ProjectileSpawnCount = session.ProjectileSpawnCount + 1
+			if shotIndex > baseCount and shotIndex <= authoredCount then
+				local presentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+				local motion = session:GetSkillMotionProfile(definition.MotionProfileId)
+				if presentation ~= nil then
+					session:SendMotionPresentation(sourceEntity, "COMBAT", { UnitId = sourceId, MotionKey = motion.MotionKey, ActionName = "", PlayRate = motion.PlayRate, Duration = motion.Duration })
+				end
+				log("[RunRelic] extra shuriken throw skill=" .. context.SkillId .. " shot=" .. shotIndex)
+			end
+			local shotRuid = definition.ProjectileRuid
+			if shotIndex > authoredCount and (definition.ExtraArrowProjectileRuid or "") ~= "" then shotRuid = definition.ExtraArrowProjectileRuid end
+			session:SpawnSkillProjectile(context.SkillId, "SkillProjectile_" .. tostring(session.ProjectileSpawnCount), startPosition, endPosition, speed, shotRuid, definition.ProjectileScale or 1, direction > 0)
+			log("[SkillProjectile] volley launched skill=" .. context.SkillId .. " shot=" .. shotIndex .. "/" .. shotCount .. " target=" .. targetId .. " cell=" .. aimCell .. " flight=" .. flight)
+			session.ImpactTimerId = _TimerService:SetTimerOnce(function()
+				if not stillActive() then
+					if session._T.projectileCastSequence == castSequence then session.ImpactTimerId = 0 end
+					return
+				end
+				if targetId ~= "" then
+					local damage = shotIndex > 1 and 1 or effectStep.Value
+					local previousHit = session._T.AttackBuffHit
+					session._T.AttackBuffHit = { SourceUnitId = sourceId, SkillId = context.SkillId, FixedFollowup = shotIndex > 1 }
+					local previousContext = session._T.RelicDamageContext
+					session._T.RelicDamageContext = context
+					local hit = nil
+					if pierces and shotIndex <= authoredCount then
+						-- Burst keeps its original piercing targets, but each thrown star lands separately.
+						hit = _DamageEffectExecutorLogic:Execute(context, effectStep)
+					else
+						hit = session:ResolveSkillDamageImpact(sourceId, context.SkillId, targetId, aimCell, damage)
+					end
+					session._T.RelicDamageContext = previousContext
+					session._T.AttackBuffHit = previousHit
+					table.insert(results, { EffectType = "DAMAGE", Hit = hit.Hit == true })
+					log("[SkillProjectile] volley impact skill=" .. context.SkillId .. " shot=" .. shotIndex .. " target=" .. targetId .. " reason=" .. tostring(hit.Reason))
+				end
+				if shotIndex >= shotCount or session.BattleResult ~= "" then
+					_SkillExecutionLogic:NotifyRelicSkillCompleted(context)
+					_SkillExecutionLogic:ConsumeNextAttackBonusOnHit(context, results)
+					if session._T.projectileCastSequence == castSequence then session.ImpactTimerId = 0 end
+				elseif stillActive() then
+					session.ImpactTimerId = _TimerService:SetTimerOnce(fireNext, math.max(0.001, interval))
+				elseif session._T.projectileCastSequence == castSequence then
+					session.ImpactTimerId = 0
+				end
+			end, flight)
+		end
+		if launchDelay > 0 then
+			session.ImpactTimerId = _TimerService:SetTimerOnce(fireNext, launchDelay)
+		else
+			fireNext()
+		end
+		-- The queue timer is registered before later impacts; leave one tick so equal deadlines cannot cut off the last star.
+		local duration = launchDelay + shotCount * definition.Range * session.CellSpacing / speed + math.max(0, shotCount - 1) * math.max(0.001, interval) + 0.02
+		return { Success = true, Reason = "PROJECTILE_VOLLEY_PENDING", PresentationHandoffDuration = duration, SkillId = context.SkillId, SourceUnitId = sourceId }
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetProjectileAimCell(any session, string sourceUnitId, table definition)
+		-- The Target Resolver owns every targeting rule, so the aim point is read from its cell list
+		-- rather than re-derived here. Its last entry is the farthest cell the skill reaches: the
+		-- blocking enemy for FIRST_ENEMY_FORWARD, the outermost offset for RANGE_OFFSETS.
+		local resolved = _SkillTargetResolverLogic:Resolve(session, sourceUnitId, definition)
+		if resolved.Success == false then
+			return -1
+		end
+		local cells = resolved.TargetCellIndices
+		if cells == nil or #cells == 0 then
+			return -1
+		end
+		-- A shot never travels past the skill's Range, even when the targeting reaches further (the pierce
+		-- cell behind the first enemy): it vanishes at the range edge and the impact still resolves.
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		local sourceUnit = isvalid(sourceEntity) and sourceEntity:GetComponent("script.BattleUnitComponent") or nil
+		if sourceUnit == nil then
+			return cells[#cells]
+		end
+		local range = math.max(1, math.floor(tonumber(definition.Range) or 1))
+		local aimCell = -1
+		local aimDistance = 0
+		for _, cell in ipairs(cells) do
+			local distance = math.abs(cell - sourceUnit.CellIndex)
+			if distance <= range and distance > aimDistance then
+				aimCell = cell
+				aimDistance = distance
+			end
+		end
+		return aimCell
+	end
+
+	@ExecSpace("ServerOnly")
+	method number LaunchSkillProjectile(any session, string sourceUnitId, table definition, number launchDelay)
+		-- Schedules the shot for the motion's release frame and returns how long it will be in flight,
+		-- so the caller can delay the impact by exactly that much. Returns 0 for every non-projectile
+		-- skill, which leaves the original single-timer impact path untouched.
+		if session:HasSkillProjectile(definition) == false then
+			return 0
+		end
+
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			log_warning("[SkillProjectile] skipped skill=" .. (definition.SkillId or "") .. " reason=SOURCE_NOT_FOUND")
+			return 0
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			log_warning("[SkillProjectile] skipped skill=" .. (definition.SkillId or "") .. " reason=SOURCE_COMPONENT_MISSING")
+			return 0
+		end
+
+		local aimCell = session:GetProjectileAimCell(sourceUnitId, definition)
+		if aimCell < 0 then
+			log_warning("[SkillProjectile] skipped skill=" .. (definition.SkillId or "") .. " reason=NO_AIM_CELL")
+			return 0
+		end
+
+		-- Cell positions sit at the unit's own origin, so a shot fired straight from them skims the
+		-- floor. ProjectileHeight lifts the whole flight line to roughly where the weapon is held;
+		-- both ends move together, so the distance and therefore the flight time are unchanged.
+		local launchHeight = definition.ProjectileHeight or 0
+		local sourceCell = session:GetCellPosition(sourceUnit.CellIndex)
+		local aimCellPosition = session:GetCellPosition(aimCell)
+		local startPosition = Vector2(sourceCell.x, sourceCell.y + launchHeight)
+		local targetPosition = Vector2(aimCellPosition.x, aimCellPosition.y + launchHeight)
+		local speed = session:GetSkillProjectileSpeed(definition)
+		local distance = math.abs(targetPosition.x - startPosition.x)
+		if distance <= 0 or speed <= 0 then
+			return 0
+		end
+
+		local skillId = definition.SkillId or ""
+		local projectileRuid = definition.ProjectileRuid
+		local projectileScale = definition.ProjectileScale or 1
+		local flipX = sourceUnit.Facing == "Right"
+
+		-- A volley sends the same shot down the same path several times, spaced out in time. The gap is
+		-- scaled like every other authored duration so the stream tightens with the battle speed.
+		local shotCount = math.max(1, definition.ProjectileCount or 1)
+		local interval = math.max(0, definition.ProjectileInterval or 0) / session:GetSkillSpeedMultiplier()
+		local extraArrowCount = definition.ExtraArrowProjectileCount or 0
+		if extraArrowCount > 0 then interval = math.max(0.25, interval) end
+
+		session._T.projectileTimerIds = {}
+		for shotIndex = 0, shotCount - 1 do
+			session.ProjectileSpawnCount = session.ProjectileSpawnCount + 1
+			local projectileName = "SkillProjectile_" .. tostring(session.ProjectileSpawnCount)
+			local shotDelay = launchDelay + interval * shotIndex
+			local shotRuid = projectileRuid
+			if shotIndex >= shotCount - extraArrowCount and (definition.ExtraArrowProjectileRuid or "") ~= "" then
+				shotRuid = definition.ExtraArrowProjectileRuid
+			end
+			local spawnProjectile = function()
+				session:SpawnSkillProjectile(skillId, projectileName, startPosition, targetPosition, speed, shotRuid, projectileScale, flipX)
+			end
+			if shotDelay <= 0 then
+				spawnProjectile()
+			else
+				table.insert(session._T.projectileTimerIds, _TimerService:SetTimerOnce(spawnProjectile, shotDelay))
+			end
+		end
+
+		-- The impact waits for the *last* arrow, so the damage never lands while shots are still in the
+		-- air. A single shot reduces to the original "flight time" answer.
+		local flightSeconds = distance / speed
+		local lastArrival = interval * (shotCount - 1) + flightSeconds
+		log("[SkillProjectile] scheduled skill=" .. skillId .. " source=" .. sourceUnitId .. " fromCell=" .. sourceUnit.CellIndex .. " aimCell=" .. aimCell .. " distance=" .. distance .. " speed=" .. speed .. " flight=" .. flightSeconds .. " shots=" .. shotCount .. " interval=" .. interval .. " lastArrival=" .. lastArrival .. " launchDelay=" .. launchDelay)
+		return lastArrival
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEffectiveSkillValidation(any session, string sourceUnitId, string skillId)
+		-- Validate authored content first, then overlay only this actor's run-bound augment.
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if not validation.Success then return validation end
+		local source = session:FindUnitEntity(sourceUnitId)
+		if not isvalid(source) or source:GetComponent("script.PlayerRunAugmentComponent") == nil then return validation end
+		return { Success = true, Data = _AugmentRuntimeLogic:BuildSkillBundle(source, validation.Data.Definition, validation.Data.EffectSteps, "") }
+	end
+
 end
