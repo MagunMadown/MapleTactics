@@ -1,0 +1,483 @@
+@Logic
+script BattleDamageLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table ResolveFrontAttackImpact(any session, string sourceUnitId, string attackId, number damageAmount)
+		-- Re-reads the source cell and facing at impact time, so damage remains board-state based.
+		local result = {
+			Success = false,
+			Hit = false,
+			Reason = "UNKNOWN",
+			SourceUnitId = sourceUnitId,
+			AttackId = attackId,
+			TargetUnitId = "",
+			TargetCell = -1,
+			DamageAmount = 0,
+			TargetHpBefore = -1,
+			TargetHpAfter = -1
+		}
+
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		if session:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if sourceUnit.IsDead == true then
+			result.Reason = "SOURCE_DEAD"
+			return result
+		end
+
+		local facingDirection = -1
+		if sourceUnit.Facing == "Right" then
+			facingDirection = 1
+		end
+		result.TargetCell = sourceUnit.CellIndex + facingDirection
+
+		local targetEntity = nil
+		if session:IsValidCell(result.TargetCell) then
+			targetEntity = session:ResolveFrontTarget(sourceUnitId)
+		else
+			result.Reason = "MISS_OUT_OF_BOUNDS"
+		end
+
+		if isvalid(targetEntity) then
+			local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+			-- Forward the attack ID with damage so the router can select its impact presentation.
+			local damageResult = _EffectRouterLogic:ExecuteEffect(session, "DAMAGE", sourceUnitId, targetUnit.UnitId, damageAmount, attackId)
+			if damageResult.Success == false then
+				result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
+				log_error("[BattleAttack] damage failed source=" .. sourceUnitId .. " target=" .. targetUnit.UnitId .. " reason=" .. damageResult.Reason)
+				return result
+			end
+
+			result.Hit = true
+			result.Reason = "HIT"
+			result.TargetUnitId = targetUnit.UnitId
+			result.DamageAmount = damageResult.AppliedAmount
+			result.TargetHpBefore = damageResult.HpBefore
+			result.TargetHpAfter = damageResult.HpAfter
+		elseif result.Reason == "UNKNOWN" then
+			result.Reason = "MISS_EMPTY"
+		end
+
+		local attackEvent = BasicAttackResolvedEvent()
+		attackEvent.SourceUnitId = result.SourceUnitId
+		attackEvent.AttackId = result.AttackId
+		attackEvent.TargetUnitId = result.TargetUnitId
+		attackEvent.TargetCell = result.TargetCell
+		attackEvent.Hit = result.Hit
+		attackEvent.Reason = result.Reason
+		attackEvent.DamageAmount = result.DamageAmount
+		attackEvent.TargetHpBefore = result.TargetHpBefore
+		attackEvent.TargetHpAfter = result.TargetHpAfter
+		session.Entity:SendEvent(attackEvent)
+
+		result.Success = true
+		log("[BattleAttack] resolved attack=" .. result.AttackId .. " source=" .. result.SourceUnitId .. " facing=" .. sourceUnit.Facing .. " target=" .. result.TargetUnitId .. " cell=" .. result.TargetCell .. " hit=" .. tostring(result.Hit) .. " reason=" .. result.Reason .. " damage=" .. result.DamageAmount .. " hp=" .. result.TargetHpBefore .. "->" .. result.TargetHpAfter)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveSkillDamageImpact(any session, string sourceUnitId, string skillId, string targetUnitId, integer targetCell, number damageAmount)
+		-- Applies damage to an immutable impact-time target selected by the shared skill Target Resolver.
+		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, AttackId = skillId, TargetUnitId = targetUnitId, TargetCell = targetCell, DamageAmount = 0, TargetHpBefore = -1, TargetHpAfter = -1 }
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		local targetEntity = session:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		if isvalid(targetEntity) == false then
+			result.Reason = "TARGET_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if session:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
+			result.Reason = "TARGET_SAME_TEAM"
+			return result
+		end
+
+		-- Skill damage uses the skill ID as the impact presentation key.
+		local damageResult = _EffectRouterLogic:ExecuteEffect(session, "DAMAGE", sourceUnitId, targetUnitId, damageAmount, skillId)
+		if damageResult.Success == false then
+			result.Reason = "DAMAGE_FAILED_" .. damageResult.Reason
+			return result
+		end
+		result.Success = true
+		result.Hit = true
+		result.Reason = "HIT"
+		result.DamageAmount = damageResult.AppliedAmount
+		result.TargetHpBefore = damageResult.HpBefore
+		result.TargetHpAfter = damageResult.HpAfter
+		if damageResult.ExactLethal and sourceUnit.Team == "Player" and sourceEntity:GetComponent("script.PlayerRunAugmentComponent") ~= nil then
+			local effective = session:GetEffectiveSkillValidation(sourceUnitId, skillId)
+			local refund = effective.Success and (effective.Data.Definition.PreciseRefund or 0) or 0
+			local cooldown = session:GetSkillRuntimeState(sourceUnitId)
+			if refund > 0 and cooldown ~= nil then
+				cooldown:ReduceCooldown(skillId, math.min(refund, math.max(0, cooldown:GetRemainingCooldown(skillId) - 1)))
+				log("[SkillAugment] precise kill skill=" .. skillId .. " target=" .. targetUnitId)
+			end
+		end
+		if damageResult.AppliedAmount > 0 then
+			session:TryRegisterEnemyCastInterrupt(sourceUnitId, skillId, targetUnitId, result.DamageAmount)
+			local batch = session._T.damageNumberBatch
+			if batch == nil or batch.HitCount <= 1 then session:PlayActiveHitEffect(targetUnitId) end
+		end
+
+		local attackEvent = BasicAttackResolvedEvent()
+		attackEvent.SourceUnitId = sourceUnitId
+		attackEvent.AttackId = skillId
+		attackEvent.TargetUnitId = targetUnitId
+		attackEvent.TargetCell = targetCell
+		attackEvent.Hit = true
+		attackEvent.Reason = result.Reason
+		attackEvent.DamageAmount = result.DamageAmount
+		attackEvent.TargetHpBefore = result.TargetHpBefore
+		attackEvent.TargetHpAfter = result.TargetHpAfter
+		session.Entity:SendEvent(attackEvent)
+		log("[BattleSkillDamage] resolved skill=" .. skillId .. " source=" .. sourceUnitId .. " target=" .. targetUnitId .. " cell=" .. targetCell .. " damage=" .. result.DamageAmount .. " hp=" .. result.TargetHpBefore .. "->" .. result.TargetHpAfter)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyDamage(any session, string sourceUnitId, string targetUnitId, number amount, string attackId)
+		-- Owns the single HP mutation path and forwards the first zero-HP transition to death handling.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			AppliedAmount = 0,
+			HpBefore = -1,
+			HpAfter = -1
+		}
+
+		local context = session._T.RelicDamageContext
+		local zeroBase = context ~= nil and context.SourceUnitId == sourceUnitId and context.SkillId == attackId
+			and context.Definition ~= nil and context.Definition.ZeroDamage == true
+		if amount < 0 or (amount == 0 and not zeroBase) then
+			result.Reason = "INVALID_AMOUNT"
+			return result
+		end
+
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		local targetEntity = session:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		if isvalid(targetEntity) == false then
+			result.Reason = "TARGET_NOT_FOUND"
+			return result
+		end
+
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
+			result.Reason = "SAME_TEAM"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+
+		local poisonBefore = targetUnit.PoisonDamage
+		local attackerEffects = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		local defenderEffects = targetEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		local attackerRun = sourceEntity:GetComponent("script.PlayerRunStateComponent")
+		local defenderRun = targetEntity:GetComponent("script.PlayerRunStateComponent")
+		-- Push collisions and poison ticks are fixed hits, so the caster's attack bonuses never scale them.
+		local isFixedDamage = attackId == session.PushCollisionAttackId or attackId == session.VenomPoisonAttackId or attackId == "AUGMENT_SHOCKWAVE"
+		local attackHit = session._T.AttackBuffHit
+		local fixedFollowup = attackHit ~= nil and attackHit.SourceUnitId == sourceUnitId
+			and attackHit.SkillId == attackId and attackHit.FixedFollowup == true
+		if zeroBase then amount = 0 elseif fixedFollowup then amount = 1 end
+		if not fixedFollowup and isFixedDamage == false and sourceUnit.Team == "Player" and attackerEffects ~= nil and attackerEffects.IsInitialized
+			and attackerRun ~= nil and attackerEffects.ActiveRunSequence == attackerRun.RunSequence then
+			amount = amount + attackerEffects.AttackBonus
+			amount = amount + attackerEffects:GetDirectDamageBonus(sourceUnit, targetUnit)
+		end
+		if attackId == session.PushCollisionAttackId and sourceUnit.Team == "Player" and targetUnit.Team == "Enemy" and attackerEffects ~= nil then
+			amount = amount + attackerEffects:GetSpecialEffectValue("COLLISION_DAMAGE")
+		end
+		-- Self buffs live on the units, so both teams share one rule. The next-attack bonus is only read here;
+		-- SkillExecutionLogic spends it once the whole skill has landed so area skills boost every target.
+		local ignoresBuffs = attackId == "commander_poison_mist" or isFixedDamage
+		if sourceUnit.NextAttackBonus > 0 and not ignoresBuffs and not fixedFollowup then
+			amount = amount + sourceUnit.NextAttackBonus
+			log("[BattleBuff] next attack bonus added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " bonus=" .. tostring(sourceUnit.NextAttackBonus) .. " amount=" .. tostring(amount))
+		end
+		-- Set per cast by AdvanceComboChain and cleared with the queue, so it only scales the current skill's hits.
+		if sourceUnit.ComboAttackBonus > 0 and not ignoresBuffs then
+			amount = amount + sourceUnit.ComboAttackBonus
+			log("[BattleBuff] combo bonus added source=" .. sourceUnitId .. " target=" .. targetUnitId .. " bonus=" .. tostring(sourceUnit.ComboAttackBonus) .. " amount=" .. tostring(amount))
+		end
+		-- The executor shares one hit charge across area targets; each multi-hit index gets a new charge.
+		if not ignoresBuffs then
+			local hitScope = session._T.AttackBuffHit
+			local bonus = 0
+			if hitScope ~= nil and hitScope.SourceUnitId == sourceUnitId and hitScope.SkillId == attackId then
+				if hitScope.Amount == nil then hitScope.Amount = sourceUnit:ConsumeAttackBuffHit() end
+				bonus = hitScope.Amount
+			else
+				bonus = sourceUnit:ConsumeAttackBuffHit()
+			end
+			-- Follow-up hits still spend a hit charge, but never scale their base damage of one.
+			if not fixedFollowup then amount = amount + bonus end
+			if bonus > 0 then log("[BattleBuff] attack buff consumed source=" .. sourceUnitId .. " target=" .. targetUnitId .. " attack=" .. bonus .. " amount=" .. amount) end
+		end
+		if not isFixedDamage and sourceUnit.Team == "Player" and targetUnit.Team == "Enemy" then
+			amount = amount + _AugmentRuntimeLogic:GetConditionalDamageBonus(session._T.RelicDamageContext, sourceUnitId, attackId, targetUnit)
+		end
+		-- Minimum-one defenses must not create damage when the base and bonuses are zero.
+		if amount <= 0 then
+			return { Success = true, Reason = "ZERO_BASE_DAMAGE", AppliedAmount = 0,
+				HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ReachedZero = false, ExactLethal = false }
+		end
+		if targetUnit.Team == "Player" and defenderEffects ~= nil and defenderEffects.IsInitialized
+			and defenderRun ~= nil and defenderEffects.ActiveRunSequence == defenderRun.RunSequence then
+			amount = math.max(1, amount - defenderEffects.DefenseBonus)
+		end
+		if targetUnit.DefenseBuffAmount > 0 and not ignoresBuffs then
+			amount = math.max(1, amount - targetUnit.DefenseBuffAmount)
+			log("[BattleBuff] defense buff reduced source=" .. sourceUnitId .. " target=" .. targetUnitId .. " defense=" .. tostring(targetUnit.DefenseBuffAmount) .. " amount=" .. tostring(amount))
+		end
+		if targetUnit.AttackDamageCap > 0 and not ignoresBuffs then
+			amount = math.min(amount, targetUnit.AttackDamageCap)
+		end
+		-- BattleUnit retains the full UtilityGuardActive block, including zero damage.
+		if targetUnit.EnemyDefinitionId == "region_04_iron_hog" then
+			amount = math.max(0, amount - 1)
+			if amount == 0 then
+				return { Success = true, Reason = "IRON_ARMOR_BLOCKED", AppliedAmount = 0,
+					HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ExactLethal = false }
+			end
+		end
+		if not ignoresBuffs and defenderEffects ~= nil then
+			amount = math.max(0, amount - defenderEffects:GetFrontDamageReduction(sourceUnit, targetUnit))
+		end
+		amount = _TutorialRulesLogic:GetDamageAmount(session, targetUnit, amount)
+		local damageResult
+		if amount == 0 then
+			damageResult = { Success = true, Reason = "RELIC_FRONT_GUARDED", AppliedAmount = 0,
+				HpBefore = targetUnit.CurrentHp, HpAfter = targetUnit.CurrentHp, ReachedZero = false }
+			log("[RunRelic] front guard blocked source=" .. sourceUnitId .. " target=" .. targetUnitId)
+		else
+			damageResult = targetUnit:ApplyDamage(amount)
+		end
+		result.ExactLethal = damageResult.Success == true and damageResult.ReachedZero == true and amount == damageResult.HpBefore
+		if damageResult.Success == false then
+			result.Reason = damageResult.Reason
+			return result
+		end
+		if session.SkillTestMode == true and targetUnit.Team == "Enemy" then
+			-- The dummy's pips cap at its small max HP, so report the full post-buff hit separately.
+			_SkillTestLogic:RecordDummyHit(attackId, amount)
+		end
+		if session.SkillTestMode == true and targetUnit.Team == "Enemy" and damageResult.ReachedZero == true then
+			-- Training dummy: a lethal hit of any size refills HP instead of entering the death pipeline.
+			targetUnit:RestoreCurrentHp(targetUnit.MaxHp)
+			damageResult.ReachedZero = false
+			result.ExactLethal = false
+			log("[SkillTest] dummy refilled after lethal hit amount=" .. tostring(damageResult.AppliedAmount))
+		end
+		result.HpBefore = damageResult.HpBefore
+		result.HpAfter = damageResult.HpAfter
+		result.AppliedAmount = damageResult.AppliedAmount
+		local batch = session._T.damageNumberBatch
+		if batch ~= nil and (batch.SourceUnitId ~= sourceUnitId or batch.TargetUnitId ~= targetUnitId) then batch = nil end
+		local playImpact = damageResult.AppliedAmount > 0
+		if damageResult.AppliedAmount > 0 then
+			if sourceUnit.EnemyDefinitionId == "region_04_fire_boar" and not isFixedDamage and not damageResult.ReachedZero then
+				-- A guarded/zero-damage hit cannot ignite; preserve stronger indefinite player burns.
+				if targetUnit.BurnDamage <= 0 or targetUnit.BurnTurns > 0 then
+					targetUnit.BurnTurns = 1
+				end
+				targetUnit.BurnDamage = math.max(1, targetUnit.BurnDamage)
+				targetUnit.BurnSourceUnitId = sourceUnitId
+			end
+			if batch ~= nil then
+				table.insert(batch.Damages, damageResult.AppliedAmount)
+				batch.HitCount = batch.HitCount + 1
+				playImpact = batch.HitCount == 1
+			else
+				session:PresentDamageNumber(sourceEntity, targetEntity, damageResult.AppliedAmount)
+			end
+			if playImpact then session:PlayAcceptedEnemyImpact(sourceEntity, targetEntity, attackId) end
+		end
+		local strongHit = amount >= math.max(0.01, session.StrongHitDamageThreshold)
+		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourcePresentation ~= nil and playImpact then
+			sourcePresentation:PlayHitStop(sourceUnitId, strongHit, session.NormalHitStopDuration, session.StrongHitStopDuration)
+		end
+		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if targetPresentation ~= nil and playImpact then
+			session:SendMotionPresentation(targetEntity, "HIT", { UnitId = targetUnitId, Strong = strongHit, NormalStop = session.NormalHitStopDuration, StrongStop = session.StrongHitStopDuration, Reaction = session.HitReactionDuration, Flash = session.HitFlashDuration, SkipMotion = batch ~= nil })
+		end
+		if playImpact then session:PlayImpactCameraShake(strongHit) end
+		if targetUnit.Team == "Player" then
+			session:RefreshPlayerHpSnapshot("DAMAGE_APPLIED")
+		end
+		-- Consume only poison present before this hit. The skill context prevents repeated explosions.
+		local context = session._T.RelicDamageContext
+		if not isFixedDamage and damageResult.AppliedAmount > 0 and poisonBefore > 0 and attackerEffects ~= nil
+			and context ~= nil and context.SourceUnitId == sourceUnitId and context.SkillId == attackId
+			and attackerEffects:GetSpecialEffectValue("POISON_DETONATION") > 0
+			and string.find("|" .. (context.Definition.SkillTags or "") .. "|", "|fire|", 1, true) ~= nil then
+			context.RelicDetonatedTargets = context.RelicDetonatedTargets or {}
+			if not context.RelicDetonatedTargets[targetUnitId] then
+				context.RelicDetonatedTargets[targetUnitId] = true
+				targetUnit.PoisonDamage = 0
+				targetUnit.PoisonSourceUnitId = ""
+				targetUnit.PoisonMarkerRuid = ""
+				if not damageResult.ReachedZero then
+					if batch ~= nil then session:FlushDamageNumberBatch(batch) end
+					session:ApplyStatusDamage(targetUnitId, poisonBefore * attackerEffects:GetSpecialEffectValue("POISON_DETONATION"), sourceUnitId, "RELIC_POISON_DETONATION")
+					result.HpAfter = targetUnit.CurrentHp
+				end
+			end
+		end
+		-- New venom is applied after detonation and remains for a later skill use.
+		local venomAmount = 0
+		if not ignoresBuffs and targetUnit.Team == "Enemy" then
+			local hitScope = session._T.AttackBuffHit
+			if hitScope ~= nil and hitScope.SourceUnitId == sourceUnitId and hitScope.SkillId == attackId then
+				if hitScope.VenomAmount == nil then hitScope.VenomAmount = sourceUnit:ConsumeVenomBuffHit() end
+				venomAmount = hitScope.VenomAmount
+			else
+				venomAmount = sourceUnit:ConsumeVenomBuffHit()
+			end
+		end
+		if isFixedDamage == false and venomAmount > 0 and targetUnit.Team == "Enemy"
+			and damageResult.ReachedZero ~= true and not targetUnit.IsDead and targetUnit.CurrentHp > 0 then
+			targetUnit:ApplyPoison(sourceUnitId, venomAmount, sourceUnit.VenomMarkerRuid)
+		end
+		if not isFixedDamage and context ~= nil and context.SourceUnitId == sourceUnitId and context.SkillId == attackId then
+			_AugmentRuntimeLogic:OnSkillDamageApplied(context, sourceEntity, targetUnit, damageResult)
+		end
+		if damageResult.ReachedZero == true then
+			if batch ~= nil then session:FlushDamageNumberBatch(batch) end
+			-- Resolve the relic before the last enemy's death can clear encounter effects.
+			if not isFixedDamage and sourceUnit.Team == "Player" and targetUnit.Team == "Enemy"
+				and attackerEffects ~= nil and context ~= nil
+				and context.SourceUnitId == sourceUnitId and context.SkillId == attackId then
+				attackerEffects:OnSkillKill(attackId, session.TurnNumber)
+			end
+			session:HandleUnitDiedFromSource(targetUnitId, "DAMAGE", sourceUnitId)
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[BattleDamage] applied source=" .. sourceUnitId .. " target=" .. targetUnitId .. " amount=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryRegisterEnemyCastInterrupt(any session, string sourceUnitId, string skillId, string targetUnitId, number appliedDamage)
+		-- Interruption is a combat-domain consequence of a successful player skill hit, not a special case inside one skill.
+		local result = { Success = false, Reason = "NOT_INTERRUPTIBLE", Interrupted = false }
+		if appliedDamage <= 0 then
+			result.Reason = "NO_APPLIED_DAMAGE"
+			return result
+		end
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		local targetEntity = session:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false or isvalid(targetEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		local plan = targetEntity:GetComponent("script.EnemyActionPlanComponent")
+		if sourceUnit == nil or targetUnit == nil or plan == nil then
+			result.Reason = "COMPONENT_MISSING"
+			return result
+		end
+		if sourceUnit.Team ~= "Player" or targetUnit.Team ~= "Enemy" then
+			result.Reason = "INVALID_TEAMS"
+			return result
+		end
+		local executionIndex = session.ExecutingTileIndex
+		if session.TurnState ~= nil then
+			executionIndex = session.TurnState.ExecutingTileIndex
+		end
+		local hitKey = tostring(session.TurnNumber) .. ":" .. tostring(executionIndex) .. ":" .. skillId
+		result = plan:RegisterInterruptHit(skillId, hitKey)
+		if result.Success == true and result.Reason ~= "INTERRUPT_HIT_DUPLICATE" then
+			session:PublishEnemyPlanSnapshot(result.Reason)
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyPushCollisionDamage(any session, string sourceUnitId, any pushedUnit, integer blockedCell)
+		-- A pushed monster slamming into another monster hurts both by a fixed amount, separate from the
+		-- skill's own damage. Walls, the player and HEAVY monsters that refuse to move do not count.
+		if pushedUnit == nil or pushedUnit.IsDead == true or pushedUnit.Team ~= "Enemy" then
+			return
+		end
+		local blockerEntity = session.BoardState:FindAtCell(blockedCell, pushedUnit.UnitId)
+		if isvalid(blockerEntity) == false then
+			return
+		end
+		local blockerUnit = blockerEntity:GetComponent("script.BattleUnitComponent")
+		if blockerUnit == nil or blockerUnit.IsDead == true or blockerUnit.Team ~= "Enemy" then
+			return
+		end
+		-- Capture both ids first: the first hit can kill its target and change the board.
+		local pushedUnitId = pushedUnit.UnitId
+		local blockerUnitId = blockerUnit.UnitId
+		log("[BattlePushCollision] source=" .. sourceUnitId .. " pushed=" .. pushedUnitId .. " blocker=" .. blockerUnitId .. " cell=" .. tostring(blockedCell) .. " damage=" .. tostring(session.PushCollisionDamage))
+		session:ApplyDamage(sourceUnitId, pushedUnitId, session.PushCollisionDamage, session.PushCollisionAttackId)
+		session:ApplyDamage(sourceUnitId, blockerUnitId, session.PushCollisionDamage, session.PushCollisionAttackId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyStatusDamage(any session, string targetUnitId, number amount, string sourceUnitId, string status)
+		-- Ongoing poison/burn survive their caster's death and never inherit attack bonuses or attack-only caps.
+		local entity = session:FindUnitEntity(targetUnitId)
+		local unit = isvalid(entity) and entity:GetComponent("script.BattleUnitComponent") or nil
+		if unit == nil or unit.IsDead then return { Success = false, Reason = "TARGET_DEAD" } end
+		if unit.EnemyDefinitionId == "region_04_iron_hog" then
+			amount = math.max(0, amount - 1)
+			if amount == 0 then return { Success = true, Reason = "IRON_ARMOR_BLOCKED", AppliedAmount = 0 } end
+		end
+		local result = unit:ApplyDamage(amount)
+		if result.Success and result.AppliedAmount > 0 then
+			session:PresentDamageNumber(session:FindUnitEntity(sourceUnitId), entity, result.AppliedAmount)
+			local presentation = entity:GetComponent("script.BattleUnitPresentationComponent")
+			if presentation ~= nil then session:SendMotionPresentation(entity, "HIT", { UnitId = targetUnitId, Strong = false, NormalStop = session.NormalHitStopDuration, StrongStop = session.StrongHitStopDuration, Reaction = session.HitReactionDuration, Flash = session.HitFlashDuration, SkipMotion = false }) end
+			if unit.Team == "Player" then session:RefreshPlayerHpSnapshot(status) end
+			if result.ReachedZero then session:HandleUnitDiedFromSource(targetUnitId, status, sourceUnitId) end
+		end
+		log("[BattleStatus] tick=" .. status .. " unit=" .. targetUnitId .. " damage=" .. tostring(result.AppliedAmount or 0))
+		return result
+	end
+
+end
