@@ -502,6 +502,7 @@ script BattleSessionComponent extends Component
 		self.PrototypeTestEntryActive = false
 		self:CancelPlayerCombatPresentationHandoff("SESSION_END", false)
 		self:FinishPlayerGridMovePresentation("SESSION_END")
+		self._T.playerGridLandingCheck = nil
 		self:FinishEnemyGridMovePresentation("SESSION_END", false)
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
@@ -934,6 +935,7 @@ script BattleSessionComponent extends Component
 			end
 		end
 
+		self:UpdatePlayerGridLandingCheck(delta)
 		if not isvalid(self.PlayerEntity) or self.PlayerEntity.CurrentMap ~= self.Entity then
 			-- Clean an interrupted move once, then leave an inactive map's snapshots alone.
 			if self._T.playerGridMove ~= nil then self:UpdatePlayerGridMove(delta) end
@@ -6650,6 +6652,7 @@ script BattleSessionComponent extends Component
 		self.HudContextRevision = self.HudContextRevision + 1
 		self:CancelPlayerCombatPresentationHandoff("REBUILD_" .. reason, true)
 		self:FinishPlayerGridMovePresentation("REBUILD_" .. reason)
+		self._T.playerGridLandingCheck = nil
 		self:FinishEnemyGridMovePresentation("REBUILD_" .. reason, false)
 		if self.ActionTimerId > 0 then
 			_TimerService:ClearTimer(self.ActionTimerId)
@@ -9563,6 +9566,19 @@ script BattleSessionComponent extends Component
 	@ExecSpace("ServerOnly")
 	method void PlaceEntity(Entity targetEntity, Vector2 position)
 		-- Places Body-based players through MovementComponent and static units through TransformComponent.
+		if targetEntity == self.PlayerEntity then
+			self._T.playerGridLandingCheck = nil
+			local movement = self._T.playerGridMove
+			if movement ~= nil and movement.Entity == targetEntity and movement.ClientDriven then
+				self:FinishPlayerGridMovePresentation("AUTHORITATIVE_RELOCATION")
+			end
+			local request = self._T.lastPlayerMoveRequest
+			if request ~= nil and request.Player == targetEntity and not request.Cancelled then
+				request.Cancelled = true
+				self:ReceivePlayerMoveResult(request.Id, request.Entry, request.Context, false, true,
+					position.x, position.y, "AUTHORITATIVE_RELOCATION", targetEntity.PlayerComponent.UserId)
+			end
+		end
 		if targetEntity.MovementComponent ~= nil then
 			targetEntity.MovementComponent:SetPosition(position)
 			return
@@ -9841,7 +9857,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method boolean StartPlayerGridMovePresentation(Entity targetEntity, integer fromCell, integer toCell)
-		-- Starts the existing horizontal Root presentation and a separate client-only avatar hop.
+		-- Ordinary moves are client-driven; skill moves retain the server's root presentation.
 		if targetEntity == nil or isvalid(targetEntity) == false then
 			log_warning("[BattleMoveVisual] start skipped because player entity is invalid")
 			return false
@@ -9849,15 +9865,14 @@ script BattleSessionComponent extends Component
 
 		-- This is defensive only. The existing immediate-action lock prevents a second valid move.
 		self:FinishPlayerGridMovePresentation("REPLACED")
+		self._T.playerGridLandingCheck = nil
 
 		local startPosition = self:GetCellPosition(fromCell)
 		local targetPosition = self:GetCellPosition(toCell)
-		-- A requested step was already predicted by the owning client, which walks its own root through it
-		-- (player transforms sync client to server). Server writes on every frame arrived in steps, and the
-		-- avatar offset computed against them made the hop shake sideways on screen, so the server only times
-		-- the step and places the root once when it completes.
+		-- Keep the actual floor height for a deferred check, without folding the avatar hop into it.
 		local request = self._T.activePlayerMoveRequest
 		local clientDriven = request ~= nil
+		local groundY = targetEntity.TransformComponent.WorldPosition.y
 		if not clientDriven then self:PlaceEntity(targetEntity, self:GetPlayerFloorPosition(startPosition)) end
 		self._T.playerGridMove = {
 			Entity = targetEntity,
@@ -9867,7 +9882,8 @@ script BattleSessionComponent extends Component
 			Duration = self:GetPlayerMoveDuration(),
 			FromCell = fromCell,
 			ToCell = toCell,
-			ClientDriven = clientDriven
+			ClientDriven = clientDriven,
+			GroundY = groundY
 		}
 		if request ~= nil then
 			self._T.playerGridMove.RequestId = request.Id
@@ -9922,6 +9938,7 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void FinishPlayerGridMovePresentation(string reason)
+		-- Complete the turn immediately; only an accepted ordinary landing gets a deferred position check.
 		local movement = self._T.playerGridMove
 		if movement == nil then
 			return
@@ -9939,16 +9956,32 @@ script BattleSessionComponent extends Component
 		end
 
 		local targetPosition = movement.TargetPosition
-		self:PlaceEntity(targetEntity, self:GetPlayerFloorPosition(targetPosition))
+		local completed = reason == "VISUAL_COMPLETE" or reason == "ACTION_COMPLETE"
+		if movement.ClientDriven then
+			if completed then
+				targetPosition = Vector2(targetPosition.x, movement.GroundY)
+				local check = _PlayerGridMovementLogic:CreateLandingCheck(targetEntity, self.Entity, targetPosition,
+					movement.RequestId, movement.Entry, movement.Context)
+				check.ToCell = movement.ToCell
+				self._T.playerGridLandingCheck = check
+			else
+				self._T.playerGridLandingCheck = nil
+				local request = self._T.lastPlayerMoveRequest
+				if request ~= nil and request.Player == targetEntity and request.Id == movement.RequestId
+					and request.Entry == movement.Entry and request.Context == movement.Context then request.Cancelled = true end
+			end
+		else
+			self:PlaceEntity(targetEntity, self:GetPlayerFloorPosition(targetPosition))
+		end
 		if movement.RequestId ~= nil then
-			self:ReceivePlayerMoveResult(movement.RequestId, movement.Entry, movement.Context, true, true,
-				targetPosition.x, targetPosition.y, "MOVE_COMPLETE", movement.UserId)
+			self:ReceivePlayerMoveResult(movement.RequestId, movement.Entry, movement.Context, completed, true,
+				targetPosition.x, targetPosition.y, completed and "MOVE_COMPLETE" or "AUTHORITATIVE_RELOCATION", movement.UserId)
 		end
 		log("[BattleMoveVisual] completed from=" .. tostring(movement.FromCell)
 			.. " to=" .. tostring(movement.ToCell)
 			.. " reason=" .. tostring(reason)
-			.. " snappedX=" .. tostring(targetPosition.x)
-			.. " snappedY=" .. tostring(targetPosition.y))
+			.. " targetX=" .. tostring(targetPosition.x)
+			.. " targetY=" .. tostring(targetPosition.y))
 
 		if reason == "VISUAL_COMPLETE"
 			and self.TurnState ~= nil
@@ -9959,8 +9992,23 @@ script BattleSessionComponent extends Component
 				self.ActionTimerId = 0
 			end
 			local completionReason = movement.CompletionReason or "MOVE_VISUAL_COMPLETE"
-			log("[BattleTurnTempo] player move completed by visual snap reason=" .. completionReason)
+			log("[BattleTurnTempo] player move completed by presentation reason=" .. completionReason)
 			self:CompleteQueuedAction("MOVE", true, completionReason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdatePlayerGridLandingCheck(number delta)
+		-- A newer move, relocation, death or session generation must never be overwritten by an old landing.
+		local check = self._T.playerGridLandingCheck
+		if check == nil then return end
+		local player = check.Entity
+		local unit = isvalid(player) and player:GetComponent("script.BattleUnitComponent") or nil
+		if player ~= self.PlayerEntity or check.Entry ~= self.EntryRequestId or check.Context ~= self.HudContextRevision
+			or self.BattleResult ~= "" or unit == nil or unit.IsDead or unit.CellIndex ~= check.ToCell
+			or check.ToCell < 0 or check.ToCell >= self.CellCount
+			or _PlayerGridMovementLogic:UpdateLandingCheck(check, delta) then
+			self._T.playerGridLandingCheck = nil
 		end
 	end
 

@@ -29,14 +29,16 @@ lua.globals().movement = load("RootDesk/MyDesk/00_Core/Movement/PlayerGridMoveme
     "GetProfile", "GetDuration", "EvaluateCurve", "Advance", "HasLocalMove", "BeginLocalMove",
     "ResolveLocalMove", "CancelLocalMove", "OnUpdate", "OnEndPlay", "PlayHop",
     "CancelBlockedMove", "UpdateBlockedMove", "BeginBlockedMove", "IsBlockedMoveReason",
+    "CreateLandingCheck", "UpdateLandingCheck",
 })
 lua.globals().battle = load("RootDesk/MyDesk/01_Combat/Components/Shared/BattleSessionComponent.mlua", {
     "RequestMove", "ReceivePlayerMoveResult", "StartPlayerGridMovePresentation", "UpdatePlayerGridMove", "FinishPlayerGridMovePresentation", "PlayUnitMoveHop",
-    "GetPlayerFloorPosition",
+    "GetPlayerFloorPosition", "UpdatePlayerGridLandingCheck", "PlaceEntity", "CompleteQueuedAction", "OnEndPlay", "RebuildBattleState",
 })
 lua.globals().lobby = load("RootDesk/MyDesk/00_Core/LobbyGridMovementComponent.mlua", {
     "GetStepTargetX", "RequestMove", "ReceiveMoveContext", "ReceiveMoveResult", "OnUpdate", "SetGridControl",
     "UpdateLandingChecks",
+    "OnMapLeave", "OnEndPlay",
 })
 lua.globals().presenter = load("RootDesk/MyDesk/02_UI/BattleHudPresenterLogic.mlua", {"DispatchLocalCommand"})
 lua.execute(r'''
@@ -63,14 +65,16 @@ _UtilLogic={ElapsedSeconds=0}
 _BattleHudPresenterLogic={ReleasePendingLocalCommand=function(_,_,reason) released=released+1; releaseReason=reason end}
 _PlayerGridMovementLogic=movement
 realPlayHop=movement.PlayHop; realPlayUnitMoveHop=battle.PlayUnitMoveHop
+realPlaceEntity=battle.PlaceEntity; realCompleteQueuedAction=battle.CompleteQueuedAction
 -- Prediction reads the frame clock like the hop does; the engine advances it by each frame's delta.
 realMoveUpdate=movement.OnUpdate
 movement.OnUpdate=function(self,d) _UtilLogic.ElapsedSeconds=_UtilLogic.ElapsedSeconds+d; return realMoveUpdate(self,d) end
 function fixture()
-    released=0; releaseReason=''; offsets={}; hops=0; clears=0; timersCleared=0; placements={}; receipts={}; requests=0; serverHops={}; warnings=0
+    released=0; releaseReason=''; offsets={}; hops=0; clears=0; timersCleared=0; placements={}; receipts={}; requests=0; serverHops={}; warnings=0; rootWrites={}
     movement._T={}
     movement.BlockedMoveDistanceRatio=0.18; movement.BlockedMoveForwardDuration=0.06
     movement.BlockedMoveReturnDuration=0.14; movement.LandingSettleDuration=0.1
+    movement.LandingCheckDelay=0.5; movement.LandingCorrectionTolerance=0.05
     movement.PlayHop=realPlayHop
     map={}; other={}; cell={CellIndex=2,Team='Player',UnitId='player_01'}
     presentation={BeginLocalGridMoveHop=function(_,...) hops=hops+1; localHopArgs={...} end,
@@ -81,7 +85,9 @@ function fixture()
         return Vector3(p.x-self.WorldPosition.x,p.y-self.WorldPosition.y,p.z-self.WorldPosition.z)
     end})
     player=native({CurrentMap=map, Name='player', TransformComponent=transform, PlayerComponent=native({UserId='owner'}),
-        MovementComponent=native({Stop=function() end,SetWorldPosition=function(_,p) transform.WorldPosition=Vector3(p.x,p.y,0) end}),
+        MovementComponent=native({Stop=function() end,
+            SetWorldPosition=function(_,p) rootWrites[#rootWrites+1]=p; transform.WorldPosition=Vector3(p.x,p.y,0) end,
+            SetPosition=function(_,p) placements[#placements+1]=p; transform.WorldPosition=Vector3(p.x,p.y,0) end}),
         GetComponent=function(_,name)
             if name=='script.BattleUnitPresentationComponent' then return presentation end
             if name=='script.BattleUnitComponent' then return cell end
@@ -98,6 +104,8 @@ function fixture()
     battle._T={}; battle.Entity=map; battle.PlayerEntity=player; battle.EntryRequestId=7; battle.HudContextRevision=3
     for key,value in pairs(profile) do battle[key]=value end
     battle.BattlePhase='PlayerTurn'; battle.ActionTimerId=0; battle.TurnState={QueuedActionType='MOVE',IsActionProcessing=true}
+    battle.BattleResult=''
+    battle.CellCount=7
     battle.MoveCurve='QUAD_EASE_OUT'; battle.MoveSnapThreshold=0.01
     battle.GetCellPosition=function(_,n) return Vector2(n,0) end
     battle.GetPlayerMoveDuration=function() return 0.13 end
@@ -193,12 +201,14 @@ cases = {
         fixture(); battle:RequestMove(1,11,7,3)
         assert(battle._T.playerGridMove.RequestId==11 and receipts[1][9]=='owner')
         assert(serverHops[1][14]==11)
-        -- The requesting client walks its own root, so the server writes it only once, on completion.
+        -- Normal completion schedules a check and advances the turn without a server root write.
         assert(battle._T.playerGridMove.ClientDriven==true and #placements==0)
         battle:UpdatePlayerGridMove(0.05); assert(#placements==0)
         battle:UpdatePlayerGridMove(0.2)
         assert(battle._T.playerGridMove==nil and completedActions==1 and receipts[#receipts][5]==true)
-        assert(#placements==1 and placements[1].x==3)
+        assert(#placements==0 and #rootWrites==0 and battle._T.playerGridLandingCheck.Position.x==3)
+        transform.WorldPosition=Vector3(3,0,0); battle:UpdatePlayerGridLandingCheck(0.5)
+        assert(battle._T.playerGridLandingCheck==nil and #rootWrites==0)
         fixture(); battle:RequestMove(1,12,7,3); local before=#placements
         player.CurrentMap=other; battle.ActionTimerId=42; battle:UpdatePlayerGridMove(0.1)
         assert(battle._T.playerGridMove==nil and #placements==before and completedActions==0 and timersCleared==1)
@@ -213,7 +223,6 @@ cases = {
         lobby:RequestMove(1,2,4); assert(#receipts==2)
         assert(lobby:GetStepTargetX(0,-1)==0 and lobby:GetStepTargetX(4,1)==4)
         lobby.IsClient=function() return false end; lobby._T.gridPlayers={owner=player}; lobby._T.playerScanRemaining=1
-        lobby.LandingCheckDelay=0.5
         -- The client walks its own root; the server only times the step and leaves the transform alone.
         local before=transform.WorldPosition.x
         lobby:OnUpdate(0.3); assert(lobby._T.gridMoves.owner==nil and receipts[#receipts][4]==true)
@@ -373,6 +382,224 @@ cases = {
                 movement:OnUpdate(0.03); movement:OnEndPlay(); assert(requests==0 and hops==0)
             end
         end
+    ''',
+    "shared landing grace and X Y tolerance correct at most once in world coordinates": r'''
+        for _,offset in ipairs({Vector2(0,0),Vector2(0.04,0),Vector2(0,0.04),Vector2(0.06,0),Vector2(0,-0.06)}) do
+            fixture(); local target=Vector2(3,-1.25)
+            transform.WorldPosition=Vector3(target.x+offset.x,target.y+offset.y,0)
+            local check=movement:CreateLandingCheck(player,map,target,11,7,3)
+            assert(not movement:UpdateLandingCheck(check,0.49) and #rootWrites==0)
+            assert(movement:UpdateLandingCheck(check,0.02))
+            local expected=(math.abs(offset.x)>0.05 or math.abs(offset.y)>0.05) and 1 or 0
+            assert(#rootWrites==expected)
+            assert(movement:UpdateLandingCheck(check,1) and #rootWrites==expected)
+            if expected==1 then assert(rootWrites[1].x==target.x and rootWrites[1].y==target.y) end
+        end
+        fixture(); local check=movement:CreateLandingCheck(player,map,Vector2(0,0),1,0,4)
+        transform.WorldPosition=Vector3(0.05,-0.05,0)
+        assert(movement:UpdateLandingCheck(check,0.5) and #rootWrites==0)
+    ''',
+    "lobby normal landing and vertical drift use the battle correction policy": r'''
+        for _,dy in ipairs({0,0.04,0.06}) do
+            fixture(); lobby.Entity=map; lobby.CellSize=1; lobby.GridOriginX=2; lobby.MinX=0; lobby.MaxX=4
+            lobby._T={gridPlayers={owner=player},gridMoveContexts={owner=4},playerScanRemaining=2}
+            lobby.IsClient=function() return false end
+            lobby.ReceiveMoveResult=function(_,...) receipts[#receipts+1]={...} end
+            transform.WorldPosition=Vector3(2,-1.25,0); lobby:RequestMove(1,1,4)
+            transform.WorldPosition=Vector3(3,-1.25+dy,0); lobby:OnUpdate(0.3)
+            local check=lobby._T.gridLandingChecks.owner
+            assert(check.Position.y==-1.25 and check.RequestId==1 and check.Entry==0 and check.Context==4)
+            lobby:UpdateLandingChecks(0.49); assert(#rootWrites==0)
+            lobby:UpdateLandingChecks(0.02); assert(lobby._T.gridLandingChecks.owner==nil)
+            assert(#rootWrites==(dy>0.05 and 1 or 0)); lobby:UpdateLandingChecks(1)
+            assert(#rootWrites==(dy>0.05 and 1 or 0))
+        end
+    ''',
+    "battle completion and fallback keep actual ground Y and do not delay turn completion": r'''
+        for mode=1,2 do
+            fixture(); transform.WorldPosition=Vector3(2,-1.25,0); battle:RequestMove(1,11,7,3)
+            battle.ActionTimerId=42
+            if mode==1 then battle:UpdatePlayerGridMove(0.3)
+            else
+                battle.CompleteQueuedAction=realCompleteQueuedAction
+                battle.TurnState.CompleteImmediateAction=function(self)
+                    completedActions=completedActions+1; self.IsActionProcessing=false; self.QueuedActionType=''
+                end
+                battle.PublishTurnStateSnapshot=function() end
+                battle.BeginEnemyTurnFromPlayerAction=function() enemyTurnStarted=true end
+                enemyTurnStarted=false; battle:CompleteQueuedAction('MOVE',true,'FALLBACK')
+                assert(enemyTurnStarted)
+            end
+            local check=battle._T.playerGridLandingCheck
+            assert(check.Position.x==3 and check.Position.y==-1.25 and check.RequestId==11 and check.ToCell==3)
+            assert(#placements==0 and #rootWrites==0 and completedActions==1 and battle.ActionTimerId==0)
+            assert(receipts[#receipts][4]==true and receipts[#receipts][5]==true)
+            battle:UpdatePlayerGridLandingCheck(0.49); assert(#rootWrites==0)
+            battle:UpdatePlayerGridLandingCheck(0.02); assert(#rootWrites==1 and rootWrites[1].y==-1.25)
+            battle:UpdatePlayerGridLandingCheck(1); assert(#rootWrites==1)
+        end
+    ''',
+    "new approved moves discard previous landing checks but rejected requests do not": r'''
+        fixture(); battle:RequestMove(1,11,7,3); battle:UpdatePlayerGridMove(0.3)
+        battle.BattlePhase='EnemyTurn'; battle:RequestMove(1,12,7,3)
+        assert(battle._T.playerGridLandingCheck.RequestId==11)
+        battle.BattlePhase='PlayerTurn'; battle:RequestMove(1,13,7,3)
+        assert(battle._T.playerGridLandingCheck==nil and battle._T.playerGridMove.RequestId==13)
+        battle:UpdatePlayerGridLandingCheck(1); assert(#rootWrites==0)
+        fixture(); lobby.Entity=map; lobby.CellSize=1; lobby.GridOriginX=2; lobby.MinX=0; lobby.MaxX=4
+        lobby._T={gridPlayers={owner=player},gridMoveContexts={owner=4},playerScanRemaining=2}
+        lobby.IsClient=function() return false end; lobby.ReceiveMoveResult=function() end
+        lobby:RequestMove(1,1,4); lobby:OnUpdate(0.3); lobby:RequestMove(1,2,4)
+        assert(lobby._T.gridLandingChecks.owner==nil); lobby:UpdateLandingChecks(1); assert(#rootWrites==0)
+    ''',
+    "old landing checks are discarded on map identity cell death entry and context changes": r'''
+        for mode=1,8 do
+            fixture(); battle:RequestMove(1,11,7,3); battle:UpdatePlayerGridMove(0.3)
+            if mode==1 then player.CurrentMap=other
+            elseif mode==2 then battle.PlayerEntity=false
+            elseif mode==3 then cell.CellIndex=4
+            elseif mode==4 then cell.IsDead=true
+            elseif mode==5 then battle.EntryRequestId=8
+            elseif mode==6 then battle.HudContextRevision=4
+            elseif mode==7 then battle.BattleResult='WIN'
+            else battle.CellCount=3 end
+            battle:UpdatePlayerGridLandingCheck(1)
+            assert(battle._T.playerGridLandingCheck==nil and #rootWrites==0)
+        end
+        for mode=1,3 do
+            fixture(); lobby.Entity=map
+            lobby._T={gridPlayers={owner=player},gridMoveContexts={owner=4},gridLandingChecks={
+                owner=movement:CreateLandingCheck(player,map,Vector2(3,0),11,0,4)}}
+            if mode==1 then player.CurrentMap=other
+            elseif mode==2 then lobby._T.gridPlayers.owner=false
+            else lobby._T.gridMoveContexts.owner=5 end
+            lobby:UpdateLandingChecks(1); assert(lobby._T.gridLandingChecks.owner==nil and #rootWrites==0)
+        end
+    ''',
+    "forced relocation cancels the matching request once without replay or rollback": r'''
+        for completed=0,1 do
+            fixture(); profile.ClientRoot=true
+            movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile); movement:OnUpdate(0.05)
+            battle:RequestMove(1,1,7,3)
+            if completed==1 then battle:UpdatePlayerGridMove(0.3) end
+            battle.PlaceEntity=realPlaceEntity
+            battle:PlaceEntity(player,Vector2(5,-1.5))
+            assert(battle._T.playerGridMove==nil and battle._T.playerGridLandingCheck==nil)
+            local receipt=receipts[#receipts]
+            assert(receipt[1]==1 and receipt[4]==false and receipt[8]=='AUTHORITATIVE_RELOCATION')
+            local count=#receipts; battle:PlaceEntity(player,Vector2(6,-1.5)); assert(#receipts==count)
+            local writes=#rootWrites
+            movement:ResolveLocalMove(map,receipt[1],receipt[2],receipt[3],receipt[4],receipt[5],receipt[6],receipt[7],receipt[8])
+            movement:OnUpdate(0.1); battle:UpdatePlayerGridMove(1); battle:UpdatePlayerGridLandingCheck(1)
+            assert(transform.WorldPosition.x==6 and transform.WorldPosition.y==-1.5 and #rootWrites==writes)
+            assert(movement._T.localMove==nil and clears==1 and released==1 and player.CameraComponent.Damping.x==2.5)
+            local id=movement:BeginLocalMove(player,map,7,3,Vector2(7,-1.5),profile); assert(id==2)
+            movement:ResolveLocalMove(map,1,7,3,false,true,3,0,'AUTHORITATIVE_RELOCATION')
+            assert(movement._T.localMove.RequestId==2)
+        end
+    ''',
+    "client stops root writes at landing while awaiting receipt and during settle": r'''
+        fixture(); profile.ClientRoot=true; transform.WorldPosition=Vector3(2,-1.25,0)
+        movement:BeginLocalMove(player,map,7,3,Vector2(3,0.6),profile)
+        movement:ResolveLocalMove(map,1,7,3,true,false,3,0.6,'OK'); movement:OnUpdate(0.3)
+        assert(transform.WorldPosition.x==3 and transform.WorldPosition.y==-1.25)
+        local writes=#rootWrites; movement:OnUpdate(0.1); assert(#rootWrites==writes)
+        movement:ResolveLocalMove(map,1,7,3,true,true,3,-1.25,'DONE'); movement:OnUpdate(0.01)
+        assert(movement._T.localMove.Arrived and released==1 and #rootWrites==writes)
+        movement:OnUpdate(0.1); assert(movement._T.localMove==nil and #rootWrites==writes)
+        assert(player.CameraComponent.Damping.x==2.5)
+    ''',
+    "accepted receipt timeout and session rebuild never return a landed root to its origin": r'''
+        for mode=1,2 do
+            fixture(); profile.ClientRoot=true
+            movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile)
+            movement:ResolveLocalMove(map,1,7,3,true,false,3,0,'OK'); movement:OnUpdate(0.3)
+            local writes=#rootWrites
+            if mode==1 then movement:OnUpdate(2)
+            else transform.WorldPosition=Vector3(5,0,0); session.HudContextRevision=4; movement:OnUpdate(0.01) end
+            assert(movement._T.localMove==nil and #rootWrites==writes and transform.WorldPosition.x==(mode==1 and 3 or 5))
+        end
+    ''',
+    "skill movement retains server replay and invalidates pending normal landing": r'''
+        fixture(); battle:RequestMove(1,11,7,3); battle:UpdatePlayerGridMove(0.3)
+        battle.PlaceEntity=realPlaceEntity
+        assert(battle:StartPlayerGridMovePresentation(player,3,5))
+        assert(not battle._T.playerGridMove.ClientDriven and battle._T.playerGridLandingCheck==nil)
+        local count=#receipts; battle:UpdatePlayerGridMove(0.05); battle:UpdatePlayerGridMove(0.2)
+        assert(#placements==3 and placements[#placements].x==5 and #receipts==count)
+        assert(battle._T.playerGridLandingCheck==nil and #rootWrites==0)
+    ''',
+    "late accepted endpoint still replays after predicted travel has already landed": r'''
+        fixture(); profile.ClientRoot=true
+        movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile); movement:OnUpdate(0.3)
+        assert(movement._T.localMove.RootLanded and transform.WorldPosition.x==3)
+        movement:ResolveLocalMove(map,1,7,3,true,true,4,0,'CORRECTED'); movement:OnUpdate(0.05)
+        assert(transform.WorldPosition.x>3 and transform.WorldPosition.x<4)
+        movement:OnUpdate(0.06); assert(transform.WorldPosition.x==4 and not movement:HasLocalMove(map))
+    ''',
+    "full motion and authoritative displacement interrupt landing before any old root write": r'''
+        for mode=1,2 do
+            fixture(); profile.ClientRoot=true
+            movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile)
+            movement:ResolveLocalMove(map,1,7,3,true,true,3,0,'DONE')
+            movement:OnUpdate(0.2); movement:OnUpdate(0.05)
+            assert(movement._T.localMove.Arrived)
+            if mode==1 then presentation.IsFullMotionPending=function() return true end
+            else transform.WorldPosition=Vector3(5,0,0) end
+            local writes=#rootWrites; local releases=released; movement:OnUpdate(0.01)
+            assert(movement._T.localMove==nil and transform.WorldPosition.x==(mode==1 and 3 or 5)
+                and #rootWrites==writes and released==releases and clears==1)
+            assert(player.CameraComponent.Damping.x==2.5)
+        end
+    ''',
+    "session shutdown rebuild and lobby departure discard pending landing state": r'''
+        for mode=1,2 do
+            for active=0,1 do
+                fixture(); battle:RequestMove(1,11,7,3)
+                if active==0 then battle:UpdatePlayerGridMove(0.3) end
+                for _,name in ipairs({'ClearPoisonMists','ClearMotionCompletionWaits','ClearPrototypeBattleEntryRetry',
+                    'CancelPlayerCombatPresentationHandoff','FinishEnemyGridMovePresentation','ClearTurnTransitionTimer',
+                    'ClearEnemyToEnemyPresentationHandoff','ClearSkillImpactTimers','PublishTurnStateSnapshot',
+                    'ClearPreparedEnemyIntent','ResetUnionRewardPresentation'}) do battle[name]=function() end end
+                battle.ResultTransitionTimerId=0; battle.ActionTimerId=42; battle.TileQueueCapacity=5
+                battle.TurnState.QueuedTileIds=''
+                battle.TurnState.ResetTurnState=function(self) self.QueuedActionType=''; self.IsActionProcessing=false end
+                battle.WaveRuntime=nil
+                if mode==1 then battle:OnEndPlay()
+                else
+                    battle.RunContentValidationGate=function() return {Success=true} end
+                    battle.WaveRuntime={ClearAllTimers=function() end}
+                    battle.FindUnitEntity=function() return false end
+                    assert(battle:RebuildBattleState('TEST').Reason=='PLAYER_MISSING')
+                    assert(battle.HudContextRevision==4)
+                end
+                battle:UpdatePlayerGridLandingCheck(1)
+                assert(battle._T.playerGridMove==nil and battle._T.playerGridLandingCheck==nil
+                    and #rootWrites==0 and #placements==0 and battle.ActionTimerId==0)
+                if active==1 then assert(receipts[#receipts][8]=='AUTHORITATIVE_RELOCATION') end
+            end
+        end
+        for mode=1,2 do
+            fixture(); lobby.Entity=map
+            lobby._T={gridPlayers={owner=player},gridMoveContexts={owner=4},gridMoves={},gridLandingChecks={
+                owner=movement:CreateLandingCheck(player,map,Vector2(3,0),11,0,4)}}
+            if mode==1 then lobby:OnMapLeave(player) else lobby:OnEndPlay() end
+            lobby:UpdateLandingChecks(1)
+            assert(lobby._T.gridLandingChecks.owner==nil and #rootWrites==0)
+        end
+    ''',
+    "landing releases input and consecutive steps reuse the floor without a rollback write": r'''
+        fixture(); profile.ClientRoot=true; transform.WorldPosition=Vector3(2,-1.25,0)
+        local id=movement:BeginLocalMove(player,map,7,3,Vector2(3,0.6),profile)
+        movement:ResolveLocalMove(map,id,7,3,true,true,3,-1.25,'DONE')
+        movement:OnUpdate(0.2); movement:OnUpdate(0.05)
+        assert(not movement:HasLocalMove(map) and movement._T.localMove.Arrived and released==1)
+        local writes=#rootWrites
+        local nextId=movement:BeginLocalMove(player,map,7,3,Vector2(2,0.6),profile)
+        assert(nextId==2 and #rootWrites==writes and released==1 and movement._T.localMove.GroundY==-1.25)
+        movement:ResolveLocalMove(map,nextId,7,3,true,true,2,-1.25,'DONE'); movement:OnUpdate(0.3)
+        assert(transform.WorldPosition.x==2 and transform.WorldPosition.y==-1.25 and released==2 and clears==2)
+        assert(movement._T.localMove==nil and player.CameraComponent.Damping.x==2.5)
     ''',
 }
 for name, code in cases.items():

@@ -7,6 +7,8 @@ script PlayerGridMovementLogic extends Logic
 	-- After the authoritative position lands, a late server write can still lift the root for a frame;
 	-- keep the avatar on its ground line this long. Input is already released on arrival.
 	property number LandingSettleDuration = 0.1
+	property number LandingCheckDelay = 0.5
+	property number LandingCorrectionTolerance = 0.05
 
 	method integer GetDirection(any key)
 		-- Shares the battle movement key mapping with noncombat maps; the keys come from the player's settings.
@@ -68,6 +70,39 @@ script PlayerGridMovementLogic extends Logic
 	end
 
 	@ExecSpace("ServerOnly")
+	method table CreateLandingCheck(Entity player, Entity map, Vector2 position, integer requestId, integer entry, integer context)
+		-- Map components own the check; the target keeps the actual floor separate from the cosmetic hop.
+		return { Entity = player, Map = map, Position = position, Remaining = self.LandingCheckDelay,
+			RequestId = requestId, Entry = entry, Context = context }
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean UpdateLandingCheck(table check, number delta)
+		-- Inspect once after the same grace period on every map; normal landings never write the root.
+		if check.Finished then return true end
+		local player = check.Entity
+		if not isvalid(player) or not isvalid(check.Map) or player.CurrentMap ~= check.Map
+			or player.TransformComponent == nil or player.MovementComponent == nil then
+			check.Finished = true
+			return true
+		end
+		check.Remaining = check.Remaining - math.max(0, delta)
+		if check.Remaining > 0 then return false end
+		check.Finished = true
+		local current = player.TransformComponent.WorldPosition
+		local target = check.Position
+		local corrected = math.abs(current.x - target.x) > self.LandingCorrectionTolerance
+			or math.abs(current.y - target.y) > self.LandingCorrectionTolerance
+		if corrected then player.MovementComponent:SetWorldPosition(target) end
+		log("[GridMoveLanding] checked request=" .. tostring(check.RequestId)
+			.. " player=" .. tostring(player.Name) .. " map=" .. tostring(check.Map.Name)
+			.. " entry=" .. tostring(check.Entry) .. " context=" .. tostring(check.Context)
+			.. " from=" .. tostring(current.x) .. "," .. tostring(current.y)
+			.. " target=" .. tostring(target.x) .. "," .. tostring(target.y) .. " corrected=" .. tostring(corrected))
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
 	method void PlayHop(Entity player, string unitId, table profile, integer predictionRequestId)
 		-- Reuses the existing battle avatar presentation without attaching combat state to lobby players.
 		if profile.EnablePlayerHopVisual == false then return end
@@ -89,7 +124,7 @@ script PlayerGridMovementLogic extends Logic
 
 	@ExecSpace("ClientOnly")
 	method integer BeginLocalMove(Entity player, Entity map, integer entry, integer context, Vector2 target, table profile)
-		-- Predict only the avatar child. Collision, cell occupancy and the player root remain authoritative.
+		-- The owning client replays the common step; the server still approves the destination and turn.
 		if not isvalid(player) or player ~= _UserService.LocalPlayer or player.CurrentMap ~= map then return 0 end
 		local previous = self._T.localMove
 		if previous ~= nil and not previous.Arrived then return 0 end
@@ -198,6 +233,7 @@ script PlayerGridMovementLogic extends Logic
 			move.Elapsed = 0
 			move.StartTime = _UtilLogic.ElapsedSeconds
 			move.Duration = 0.10
+			move.RootLanded = false
 		end
 		move.TargetPosition = Vector2(targetX, targetY)
 	end
@@ -211,9 +247,11 @@ script PlayerGridMovementLogic extends Logic
 		self._T.localMove = nil
 		if isvalid(move.Player) then
 			if move.Camera ~= nil then move.Camera.Damping = move.CameraBaseDamping end
-			-- A client-driven step that never completed puts the root back where it began.
+			-- Rejected predictions roll back; accepted landings and authoritative relocations keep their root.
+			local preservePosition = reason == "AUTHORITATIVE_RELOCATION" or reason == "BATTLE_CONTEXT_CHANGED"
+				or (reason == "MOVE_RESPONSE_TIMEOUT" and move.Confirmed and move.RootLanded)
 			if move.Profile ~= nil and move.Profile.ClientRoot and not move.Arrived and move.RootOrigin ~= nil
-				and move.Player.CurrentMap == move.Map and move.Player.MovementComponent ~= nil then
+				and not preservePosition and move.Player.CurrentMap == move.Map and move.Player.MovementComponent ~= nil then
 				move.Player.MovementComponent:SetWorldPosition(move.RootOrigin)
 			end
 		end
@@ -250,6 +288,18 @@ script PlayerGridMovementLogic extends Logic
 		if move.Entry > 0 and (session == nil or session.EntryRequestId ~= move.Entry or session.HudContextRevision ~= move.Context or session.BattleResult ~= "") then
 			self:CancelLocalMove("BATTLE_CONTEXT_CHANGED") return
 		end
+		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
+		local motionStarted = false
+		if presentation ~= nil then
+			local ok, pending = pcall(function() return presentation:IsFullMotionPending() end)
+			motionStarted = ok and pending == true
+		end
+		local current = player.TransformComponent.WorldPosition
+		if motionStarted or (move.Profile.ClientRoot and move.RootLanded
+			and (math.abs(current.x - move.TargetPosition.x) > self.LandingCorrectionTolerance
+				or math.abs(current.y - move.GroundY) > self.LandingCorrectionTolerance)) then
+			self:CancelLocalMove("AUTHORITATIVE_RELOCATION") return
+		end
 		move.Age = move.Age + math.max(0, delta)
 		if move.Age >= 2 then self:CancelLocalMove("MOVE_RESPONSE_TIMEOUT") return end
 		local step = nil
@@ -265,13 +315,12 @@ script PlayerGridMovementLogic extends Logic
 		else
 			step = self:Advance(move, elapsed - move.Elapsed, move.Profile.PlayerMoveCurve, move.Profile.MoveSnapThreshold)
 		end
-		if move.Profile.ClientRoot and not move.Profile.ObstructionHint and player.MovementComponent ~= nil then
-			-- Lobby steps carry no combat authority, so the local root walks the step itself: camera, name tag and
-			-- avatar share one smooth path. The server only times the step and corrects a wrong landing.
+		if move.Profile.ClientRoot and not move.RootLanded and not move.Profile.ObstructionHint and player.MovementComponent ~= nil then
+			-- Stop root writes at the end of travel, even while the completion receipt is still in flight.
 			player.MovementComponent:SetWorldPosition(Vector2(step.Position.x, move.GroundY))
+			move.RootLanded = step.Complete
 		end
-		local current = player.TransformComponent.WorldPosition
-		local presentation = player:GetComponent("script.BattleUnitPresentationComponent")
+		current = player.TransformComponent.WorldPosition
 		if presentation ~= move.Presentation then
 			move.StopVisual()
 			move.BindPresentation(presentation)
@@ -293,7 +342,7 @@ script PlayerGridMovementLogic extends Logic
 			end)
 			if not ok or not applied then move.StopVisual() move.VisualFailed = true move.WarnVisualUnavailable("SET_FAILED") end
 		end
-		if step.Complete and move.Completed and math.abs(current.x - move.TargetPosition.x) <= 0.02 then
+		if step.Complete and move.Completed and math.abs(current.x - move.TargetPosition.x) <= self.LandingCorrectionTolerance then
 			if not move.Arrived then
 				move.Arrived = true
 				move.SettleRemaining = math.max(0, self.LandingSettleDuration)
@@ -301,15 +350,7 @@ script PlayerGridMovementLogic extends Logic
 				log("[GridMovePrediction] arrived request=" .. tostring(move.RequestId))
 			end
 			move.SettleRemaining = move.SettleRemaining - math.max(0, delta)
-			-- Attack and hit motions own the avatar child; stop holding it the moment one starts.
-			local motionStarted = false
-			if presentation ~= nil then
-				local ok, pending = pcall(function() return presentation:IsFullMotionPending() end)
-				motionStarted = ok and pending == true
-			end
-			if move.SettleRemaining <= 0 or motionStarted then
-				self:CancelLocalMove(motionStarted and "SETTLE_INTERRUPTED" or "AUTHORITATIVE_POSITION_RECEIVED")
-			end
+			if move.SettleRemaining <= 0 then self:CancelLocalMove("AUTHORITATIVE_POSITION_RECEIVED") end
 		end
 	end
 
