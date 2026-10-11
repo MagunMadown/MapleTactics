@@ -1,0 +1,531 @@
+@Logic
+script BattleUiStateLogic extends Logic
+
+	-- Projects synchronized combat state for client UI queries; map components retain all runtime state.
+
+	@ExecSpace("ClientOnly")
+	method table ParseEnemyPlanSnapshot(string serializedPlans)
+		-- Parses the server DTO only; no pattern, targeting, or trait rule is repeated on the client.
+		local plans = {}
+		for entry in string.gmatch(serializedPlans or "", "([^#]+)") do
+			local fields = {}
+			for field in string.gmatch(entry, "([^,]+)") do
+				table.insert(fields, field)
+			end
+			if #fields >= 14 and fields[1] ~= "" then
+				local unitId = self:DecodeEnemyPlanField(fields[1])
+				local traitIds = self:DecodeEnemyPlanField(fields[6])
+				local actionType = self:DecodeEnemyPlanField(fields[7])
+				local tileId = self:DecodeEnemyPlanField(fields[8])
+				local patternId = self:DecodeEnemyPlanField(fields[11])
+				local actionSnapshot = self:DecodeEnemyPlanField(fields[14])
+				local bossPhaseId = ""
+				local bossPhaseIndex = 0
+				local bossPhaseRevision = 0
+				local queueTurnsRequired = 0
+				local queueTurnsElapsed = 0
+				local readinessReason = ""
+				local nextCommandType = ""
+				local targetCellSnapshot = ""
+				local nextCommandDirection = 0
+				local entityName = ""
+				local queuedTileNames = ""
+				local queuedIconRuids = ""
+				local queuedIconBackgroundColors = ""
+				local telegraphKind = ""
+				local landingCell = -1
+				local deferredUntilTurn = 0
+				local castState = "NONE"
+				local castingSkillId = ""
+				local interruptHitsRequired = 0
+				local interruptHitsReceived = 0
+				local queuedSpecialFlags = ""
+				local queuedOverlayKinds = ""
+				if #fields >= 17 then
+					bossPhaseId = self:DecodeEnemyPlanField(fields[15])
+					bossPhaseIndex = math.floor(tonumber(fields[16]) or 0)
+					bossPhaseRevision = math.floor(tonumber(fields[17]) or 0)
+				end
+				if #fields >= 19 then
+					queueTurnsRequired = math.floor(tonumber(fields[18]) or 0)
+					queueTurnsElapsed = math.floor(tonumber(fields[19]) or 0)
+				end
+				if #fields >= 22 then
+					readinessReason = self:DecodeEnemyPlanField(fields[20])
+					nextCommandType = self:DecodeEnemyPlanField(fields[21])
+					targetCellSnapshot = self:DecodeEnemyPlanField(fields[22])
+				end
+				if #fields >= 23 then
+					nextCommandDirection = math.floor(tonumber(fields[23]) or 0)
+				end
+				if #fields >= 25 then
+					entityName = self:DecodeEnemyPlanField(fields[24])
+					queuedTileNames = self:DecodeEnemyPlanField(fields[25])
+				end
+				if #fields >= 26 then
+					queuedIconRuids = self:DecodeEnemyPlanField(fields[26])
+				end
+				if #fields >= 28 then
+					telegraphKind = self:DecodeEnemyPlanField(fields[27])
+					landingCell = math.floor(tonumber(fields[28]) or -1)
+				end
+				if #fields >= 29 then
+					deferredUntilTurn = math.floor(tonumber(fields[29]) or 0)
+				end
+				if #fields >= 30 then
+					queuedIconBackgroundColors = self:DecodeEnemyPlanField(fields[30])
+				end
+				if #fields >= 34 then
+					castState = self:DecodeEnemyPlanField(fields[31])
+					castingSkillId = self:DecodeEnemyPlanField(fields[32])
+					interruptHitsRequired = math.floor(tonumber(fields[33]) or 0)
+					interruptHitsReceived = math.floor(tonumber(fields[34]) or 0)
+				end
+				if #fields >= 35 then
+					queuedSpecialFlags = self:DecodeEnemyPlanField(fields[35])
+				end
+				if #fields >= 36 then
+					queuedOverlayKinds = self:DecodeEnemyPlanField(fields[36])
+				end
+				local queuedTileIds = ""
+				-- Keep the client read model aligned with the server DTO: a completed or merely
+				-- selected action is not a newly filled enemy queue slot.
+				local planState = self:DecodeEnemyPlanField(fields[3])
+				local hasInsertedQueue = planState == "TRACKING"
+					or planState == "ATTACK_READY"
+					or planState == "EXECUTING"
+					or (planState == "PREPARED" and tileId ~= "" and queueTurnsRequired > 0 and queueTurnsElapsed >= queueTurnsRequired)
+					or (planState == "INSERTING" and queueTurnsElapsed > 0 and string.find("|" .. traitIds .. "|", "|DOUBLE_STRIKE|", 1, true) ~= nil)
+				if hasInsertedQueue then
+					for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+						local actionFields = {}
+						for actionField in string.gmatch(actionEntry, "([^~]+)") do
+							table.insert(actionFields, actionField)
+						end
+						local queuedTileId = ""
+						if #actionFields >= 3 then
+							queuedTileId = self:DecodeEnemyPlanField(actionFields[3])
+						end
+						if queuedTileId ~= "" then
+							if queuedTileIds ~= "" then
+								queuedTileIds = queuedTileIds .. "|"
+							end
+							queuedTileIds = queuedTileIds .. queuedTileId
+						end
+					end
+				else
+					-- INSERTING is a selected future action, not an item already owned by the enemy queue.
+					queuedTileNames = ""
+					queuedIconRuids = ""
+					queuedIconBackgroundColors = ""
+					queuedSpecialFlags = ""
+					queuedOverlayKinds = ""
+				end
+				-- Frozen summon plans are visible during the player turn before the enemy summons.
+				-- Summoning is a command without a TileId, but still occupies a monster skill queue slot.
+				if actionType == "SUMMON_ENEMIES" and (fields[3] == "PREPARED" or fields[3] == "EXECUTING") then
+					queuedTileIds = "boss_summon"
+					queuedTileNames = #fields >= 25 and self:DecodeEnemyPlanField(fields[25]) or "몬스터 소환"
+					queuedIconRuids = #fields >= 26 and self:DecodeEnemyPlanField(fields[26]) or ""
+					queuedSpecialFlags = "1"
+					queuedOverlayKinds = "WARNING"
+				elseif (actionType == "BOSS_JUMP_TELEGRAPH" or actionType == "BOSS_LAND_OPPOSITE")
+					and (fields[3] == "PREPARED" or fields[3] == "EXECUTING") and tileId ~= "" then
+					-- This read-only command preview does not register a combat queue entry.
+					queuedTileIds = tileId
+					queuedTileNames = #fields >= 25 and self:DecodeEnemyPlanField(fields[25]) or ""
+					queuedIconRuids = #fields >= 26 and self:DecodeEnemyPlanField(fields[26]) or ""
+					queuedSpecialFlags = "1"
+					queuedOverlayKinds = actionType == "BOSS_JUMP_TELEGRAPH" and "JUMP_UP" or "JUMP_DOWN"
+				end
+				table.insert(plans, {
+					UnitId = unitId,
+					SpawnOrder = math.floor(tonumber(fields[2]) or 0),
+					State = self:DecodeEnemyPlanField(fields[3]),
+					CurrentActionIndex = math.floor(tonumber(fields[4]) or 0),
+					ActionCount = math.floor(tonumber(fields[5]) or 0),
+					TraitIds = traitIds,
+					CommandType = actionType,
+					TileId = tileId,
+					Direction = math.floor(tonumber(fields[9]) or 0),
+					TelegraphTurnsRemaining = math.floor(tonumber(fields[10]) or 0),
+					PatternId = patternId,
+					StepIndex = math.floor(tonumber(fields[12]) or 0),
+					Revision = math.floor(tonumber(fields[13]) or 0),
+					QueuedActionSnapshot = actionSnapshot,
+					QueuedTileIds = queuedTileIds,
+					BossPhaseId = bossPhaseId,
+					BossPhaseIndex = bossPhaseIndex,
+					BossPhaseRevision = bossPhaseRevision,
+					QueueTurnsRequired = queueTurnsRequired,
+					QueueTurnsElapsed = queueTurnsElapsed,
+					ReadinessReason = readinessReason,
+					NextCommandType = nextCommandType,
+					NextCommandDirection = nextCommandDirection,
+					TargetCells = targetCellSnapshot,
+					EntityName = entityName,
+					QueuedTileNames = queuedTileNames,
+					QueuedIconRuids = queuedIconRuids,
+					QueuedIconBackgroundColors = queuedIconBackgroundColors,
+					QueuedSpecialFlags = queuedSpecialFlags,
+					QueuedOverlayKinds = queuedOverlayKinds,
+					TelegraphKind = telegraphKind,
+					LandingCell = landingCell,
+					DeferredUntilTurn = deferredUntilTurn,
+					CastState = castState,
+					CastingSkillId = castingSkillId,
+					InterruptHitsRequired = interruptHitsRequired,
+					InterruptHitsReceived = interruptHitsReceived,
+					IsCastInterrupted = castState == "INTERRUPTED",
+					IsAttackReady = fields[3] == "ATTACK_READY",
+					IsQueueReady = hasInsertedQueue
+				})
+			end
+		end
+		table.sort(plans, function(left, right)
+			return left.SpawnOrder < right.SpawnOrder
+		end)
+		return plans
+	end
+
+	@ExecSpace("ClientOnly")
+	method string DecodeEnemyPlanField(string value)
+		-- Restores the empty-field sentinel used by the synchronized enemy plan snapshot.
+		if value == "-" then
+			return ""
+		end
+		return value or ""
+	end
+
+	@ExecSpace("ClientOnly")
+	method table Build(any session)
+		-- Builds one read-only client DTO from synchronized map, turn, wave, cooldown, and intent state.
+		local stateEntity = session.Entity:GetChildByName("BattleTurnState")
+		local turnState = nil
+		if stateEntity ~= nil then
+			turnState = stateEntity:GetComponent("script.BattleTurnComponent")
+		else
+			turnState = session.Entity:GetComponent("script.BattleTurnComponent")
+		end
+		local waveEntity = session.Entity:GetChildByName("BattleWaveState")
+		local waveState = nil
+		if waveEntity ~= nil then
+			waveState = waveEntity:GetComponent("script.BattleWaveComponent")
+		else
+			waveState = session.Entity:GetComponent("script.BattleWaveComponent")
+		end
+		local intentEntity = session.Entity:GetChildByName("BattleEnemyIntentState")
+		local intentState = nil
+		if intentEntity ~= nil then
+			intentState = intentEntity:GetComponent("script.EnemyIntentComponent")
+		else
+			intentState = session.Entity:GetComponent("script.EnemyIntentComponent")
+		end
+		if turnState == nil or waveState == nil then
+			return { Success = false, Reason = "BATTLE_STATE_MISSING" }
+		end
+
+		local runStats = _RunManagerLogic:GetLocalRunStatsSnapshot()
+		local cooldownSnapshot = ""
+		local cooldownRevision = 0
+		local runConsumableSnapshot = ""
+		local runCurrencySnapshot = ""
+		local runSkillSnapshot = ""
+		local runInventoryRevision = 0
+		local runHealCharges = -1
+		local runHealUnlimited = false
+		local runSkillInventoryRevision = 0
+		local runConsumableCapacity = 0
+		local ownedAugmentSnapshot = ""
+		local runAugmentRevision = 0
+		local localPlayer = _UserService.LocalPlayer
+		if localPlayer ~= nil then
+			local runtimeState = localPlayer:GetComponent("script.SkillRuntimeStateComponent")
+			if runtimeState ~= nil then
+				cooldownSnapshot = runtimeState.CooldownSnapshot
+				cooldownRevision = runtimeState.CooldownRevision
+			end
+			local runInventory = localPlayer:GetComponent("script.PlayerRunInventoryComponent")
+			if runInventory ~= nil then
+				runConsumableSnapshot = runInventory.RunConsumableSnapshot
+				runCurrencySnapshot = runInventory.RunCurrencySnapshot
+				runSkillSnapshot = runInventory.RunSkillSnapshot
+				runInventoryRevision = runInventory.InventoryRevision
+				runHealCharges = runInventory.HealCharges
+				runHealUnlimited = runInventory.HealUnlimited
+				runSkillInventoryRevision = runInventory.SkillInventoryRevision
+				runConsumableCapacity = runInventory.ConsumableCapacity
+			end
+			local runAugments = localPlayer:GetComponent("script.PlayerRunAugmentComponent")
+			if runAugments ~= nil then
+				ownedAugmentSnapshot = runAugments.OwnedAugmentSnapshot
+				runAugmentRevision = runAugments.AugmentRevision
+			end
+		end
+		local dropRuntime = session.Entity:GetComponent("script.BattleDropComponent")
+		local pendingDropSnapshot = ""
+		local pendingDropCount = 0
+		local dropRevision = 0
+		if dropRuntime ~= nil then
+			pendingDropSnapshot = dropRuntime.PendingDropSnapshot
+			pendingDropCount = dropRuntime.PendingDropCount
+			dropRevision = dropRuntime.DropRevision
+		end
+
+		local playerActionState = self:ResolvePlayerActionState(session, turnState)
+		local isIdlePlayerTurn = session.ContentValidationState == "VALID" and session.BattleResult == "" and turnState.BattlePhase == "PlayerTurn" and turnState.IsActionProcessing == false
+		local queueCount = turnState.QueuedTileCount
+		local effectiveCapacity = turnState.TileQueueCapacity
+		local queuedItems = {}
+		local queueIndex = 0
+		for skillId in string.gmatch(turnState.QueuedTileIds, "([^|]+)") do
+			queueIndex = queueIndex + 1
+			table.insert(queuedItems, { Index = queueIndex, SkillId = skillId })
+		end
+		local enemyIntents = self:ParseEnemyPlanSnapshot(session.EnemyPlanSnapshot)
+		local preparedIntent = {
+			State = session.PreparedEnemyIntentState,
+			EnemyId = session.PreparedEnemyId,
+			PatternId = session.PreparedEnemyPatternId,
+			StepIndex = session.PreparedEnemyStepIndex,
+			ActionType = session.PreparedEnemyActionType,
+			TileId = session.PreparedEnemyTileId,
+			TelegraphTurnsRemaining = session.PreparedEnemyTelegraphTurnsRemaining,
+			Direction = session.PreparedEnemyDirection,
+			PreparedTurn = session.PreparedEnemyTurn,
+			Reason = session.PreparedEnemyReason,
+			Revision = 0
+		}
+		if intentState ~= nil then
+			preparedIntent.State = intentState.IntentState
+			preparedIntent.EnemyId = intentState.EnemyId
+			preparedIntent.PatternId = intentState.PatternId
+			preparedIntent.StepIndex = intentState.StepIndex
+			preparedIntent.ActionType = intentState.ActionType
+			preparedIntent.TileId = intentState.TileId
+			preparedIntent.TelegraphTurnsRemaining = intentState.TelegraphTurnsRemaining
+			preparedIntent.Direction = intentState.Direction
+			preparedIntent.PreparedTurn = intentState.PreparedTurn
+			preparedIntent.Reason = intentState.IntentReason
+			preparedIntent.Revision = intentState.IntentRevision
+		end
+		if #enemyIntents == 0 and preparedIntent.State ~= "EMPTY" and preparedIntent.EnemyId ~= "" then
+			table.insert(enemyIntents, {
+				UnitId = preparedIntent.EnemyId,
+				State = preparedIntent.State,
+				PatternId = preparedIntent.PatternId,
+				StepIndex = preparedIntent.StepIndex,
+				CommandType = preparedIntent.ActionType,
+				TileId = preparedIntent.TileId,
+				TelegraphTurnsRemaining = preparedIntent.TelegraphTurnsRemaining,
+				Direction = preparedIntent.Direction,
+				PreparedTurn = preparedIntent.PreparedTurn,
+				Reason = preparedIntent.Reason,
+				Revision = preparedIntent.Revision,
+				QueuedTileIds = preparedIntent.TileId
+			})
+		end
+
+		local playerSealed = session:IsPlayerSealed()
+		local statusUnit = session:GetPlayerStatusUnit()
+		local playerFrostbitten = statusUnit ~= nil and statusUnit.FrostbiteTurns > 0
+		return {
+			Success = true,
+			Reason = "OK",
+			PlayerSealed = playerSealed,
+			PlayerFrostbitten = playerFrostbitten,
+			PlayerConfused = statusUnit ~= nil and statusUnit.ConfuseTurns > 0,
+			PlayerBurnDamage = statusUnit ~= nil and statusUnit.BurnDamage or 0,
+			PlayerBurnTurns = statusUnit ~= nil and statusUnit.BurnTurns or 0,
+			PoisonMistCells = session.PoisonMistCellSnapshot,
+			PlayerActionState = playerActionState,
+			RunStats = runStats,
+			CombatFeel = {
+				PlayerMoveDuration = session.MoveActionDuration,
+				MoveCurve = session.MoveCurve,
+				PlayerMoveCurve = session.PlayerMoveCurve,
+				MoveSnapThreshold = session.MoveSnapThreshold,
+				PlayerHopEnabled = session.EnablePlayerHopVisual,
+				PlayerHopDuration = session.PlayerHopDuration,
+				PlayerHopHeight = session.PlayerHopHeight,
+				PlayerHopTakeoffSquashDuration = session.PlayerHopTakeoffSquashDuration,
+				PlayerHopLandingSquashDuration = session.PlayerHopLandingSquashDuration,
+				PlayerHopSquashXScale = session.PlayerHopSquashXScale,
+				PlayerHopSquashYScale = session.PlayerHopSquashYScale,
+				AttackTransitionDelay = session.PlayerToEnemyBeatDuration,
+				EnemyTurnTransitionDelay = session.EnemyToPlayerBeatDuration,
+				QueuePopDuration = session.QueuePopDuration,
+				NormalHitStopDuration = session.NormalHitStopDuration,
+				StrongHitStopDuration = session.StrongHitStopDuration,
+				HitFlashDuration = session.HitFlashDuration,
+				HitReactionDuration = session.HitReactionDuration
+			},
+			RevisionKey = tostring(runStats.Revision) .. ":" .. tostring(runStats.RunSequence) .. ":" .. tostring(turnState.StateRevision) .. ":" .. tostring(turnState.QueueCapacityRevision) .. ":" .. tostring(turnState.QueueOrderRevision) .. ":" .. tostring(turnState.CommandResultRevision) .. ":" .. tostring(cooldownRevision) .. ":" .. tostring(runInventoryRevision) .. ":" .. tostring(runAugmentRevision) .. ":" .. tostring(session.AugmentRuntimeRevision) .. ":" .. tostring(dropRevision) .. ":" .. tostring(session.SelectedJobRevision) .. ":" .. tostring(session.JobMechanicRevision) .. ":" .. tostring(session.SkillTargetRevision) .. ":" .. tostring(session.ContentValidationRevision) .. ":" .. tostring(waveState.CurrentWave) .. ":" .. tostring(session.EnemyPlanRevision) .. ":" .. tostring(preparedIntent.Revision) .. ":" .. preparedIntent.State .. ":" .. preparedIntent.EnemyId .. ":" .. preparedIntent.ActionType .. ":" .. preparedIntent.TileId .. ":" .. tostring(session.UnionRewardRevision) .. ":" .. session.BattleResult .. ":" .. tostring(playerSealed) .. ":" .. session.PoisonMistCellSnapshot,
+			Phase = turnState.BattlePhase,
+			TurnNumber = turnState.TurnNumber,
+			IsProcessing = turnState.IsActionProcessing,
+			BattleResult = session.BattleResult,
+			UnionReward = {
+				RewardRunId = session.UnionRewardRunId,
+				BaseUnionPoints = session.UnionRewardBasePoints,
+				BonusUnionPoints = session.UnionRewardBonusPoints,
+				FinalUnionPoints = session.UnionRewardFinalPoints,
+				AscensionLevel = session.UnionRewardAscensionLevel,
+				AscensionCoinMultiplier = session.UnionRewardAscensionCoinMultiplier,
+				UnionBonusUnionPoints = session.UnionRewardUnionBonusPoints,
+				AscensionBonusUnionPoints = session.UnionRewardAscensionBonusPoints,
+				FirstClearCoinBonus = session.UnionRewardFirstClearCoinBonus,
+				WasCommitted = session.UnionRewardWasCommitted,
+				WasDuplicate = session.UnionRewardWasDuplicate,
+				RunEnded = session.UnionRewardRunEnded,
+				RunEndReason = session.UnionRewardRunEndReason,
+				Revision = session.UnionRewardRevision
+			},
+			Stage = {
+				StageId = session.StageId,
+				RegionId = session.RegionId,
+				StageIndex = session.StageIndex,
+				StageType = session.StageType,
+				DisplayName = session.StageDisplayName,
+				SchemaVersion = session.StageSchemaVersion
+			},
+			Commands = {
+				CanMove = isIdlePlayerTurn and not playerFrostbitten,
+				CanTurn = isIdlePlayerTurn,
+				CanQueue = isIdlePlayerTurn and not playerSealed and queueCount < effectiveCapacity,
+				CanExecute = isIdlePlayerTurn and not playerSealed and queueCount > 0,
+				CanClear = isIdlePlayerTurn and queueCount > 0,
+				CanRemove = isIdlePlayerTurn and queueCount > 0,
+				CanReorder = isIdlePlayerTurn and queueCount > 1
+			},
+			LastCommand = {
+				Type = turnState.LastCommandType,
+				Success = turnState.LastCommandSuccess,
+				Reason = turnState.LastCommandReason,
+				Revision = turnState.CommandResultRevision
+			},
+			LastSkillTarget = {
+				SkillId = session.LastSkillTargetSkillId,
+				TargetingType = session.LastSkillTargetingType,
+				TargetUnitIds = session.LastSkillTargetUnitIds,
+				TargetCellIndices = session.LastSkillTargetCellIndices,
+				Reason = session.LastSkillTargetReason,
+				Revision = session.SkillTargetRevision
+			},
+			ContentValidation = {
+				State = session.ContentValidationState,
+				IsReady = session.ContentValidationState == "VALID",
+				Reason = session.ContentValidationReason,
+				ErrorCount = session.ContentValidationErrorCount,
+				ErrorSnapshot = session.ContentValidationErrorSnapshot,
+				Revision = session.ContentValidationRevision
+			},
+			Job = {
+				JobId = session.SelectedJobId,
+				MechanicId = session.SelectedJobMechanicId,
+				PassiveSetId = session.SelectedJobPassiveSetId,
+				StartingSkillIds = session.SelectedJobStartingSkillIds,
+				BaseMaxHp = session.SelectedJobBaseMaxHp,
+				BaseQueueCapacity = session.SelectedJobBaseQueueCapacity,
+				Revision = session.SelectedJobRevision
+			},
+			JobMechanic = {
+				LastMechanicId = session.LastJobMechanicId,
+				LastSuccess = session.LastJobMechanicSuccess,
+				LastReason = session.LastJobMechanicReason,
+				Revision = session.JobMechanicRevision
+			},
+			RunAugments = {
+				OwnedSnapshot = ownedAugmentSnapshot,
+				LastTriggerType = session.LastAugmentTriggerType,
+				LastTriggerReason = session.LastAugmentTriggerReason,
+				LastExecutedCount = session.LastAugmentExecutedCount,
+				RuntimeRevision = session.AugmentRuntimeRevision,
+				Revision = runAugmentRevision
+			},
+			PlayerQueue = {
+				BaseCapacity = turnState.BaseQueueCapacity,
+				BonusCapacity = turnState.QueueCapacityBonus,
+				EffectiveCapacity = effectiveCapacity,
+				MinCapacity = turnState.QueueCapacityMin,
+				MaxCapacity = turnState.QueueCapacityMax,
+				Count = queueCount,
+				RemainingSlots = math.max(0, effectiveCapacity - queueCount),
+				IsFull = queueCount >= effectiveCapacity,
+				IsOverCapacity = queueCount > effectiveCapacity,
+				QueuedTileIds = turnState.QueuedTileIds,
+				Items = queuedItems,
+				ExecutingTileIds = turnState.ExecutingTileIds,
+				ExecutingIndex = turnState.ExecutingTileIndex,
+				ModifierSnapshot = turnState.QueueCapacityModifierSnapshot,
+				QueueOrderRevision = turnState.QueueOrderRevision,
+				ReorderReceipt = {
+					Revision = session.QueueReorderReceiptRevision,
+					RequestId = session.QueueLastRequestId,
+					Success = session.QueueLastRequestSuccess,
+					Reason = session.QueueLastRequestReason,
+					SourceIndex = session.QueueLastSourceIndex,
+					TargetIndex = session.QueueLastTargetIndex,
+					QueueOrderRevision = session.QueueLastOrderRevision
+				},
+				Revision = turnState.QueueCapacityRevision
+			},
+			EnemyIntentMode = "PER_ENEMY_RANGE_AWARE_QUEUE_V2",
+			EnemyPlanRevision = session.EnemyPlanRevision,
+			EnemyPlanCount = session.EnemyPlanCount,
+			EnemyIntents = enemyIntents,
+			CooldownSnapshot = cooldownSnapshot,
+			CooldownRevision = cooldownRevision,
+			RunInventory = {
+				CurrencySnapshot = runCurrencySnapshot,
+				ConsumableSnapshot = runConsumableSnapshot,
+				SkillSnapshot = runSkillSnapshot,
+				ConsumableCapacity = runConsumableCapacity,
+				SkillRevision = runSkillInventoryRevision,
+				HealCharges = runHealCharges,
+				HealUnlimited = runHealUnlimited,
+				Revision = runInventoryRevision
+			},
+			Drops = {
+				PendingSnapshot = pendingDropSnapshot,
+				PendingCount = pendingDropCount,
+				Revision = dropRevision
+			},
+			Wave = {
+				Current = waveState.CurrentWave,
+				Total = waveState.TotalWaves,
+				State = waveState.WaveState,
+				ForceSpawnPending = waveState.ForceSpawnPending,
+				ForceSpawnPendingReason = waveState.ForceSpawnPendingReason
+			}
+		}
+	end
+
+	@ExecSpace("ClientOnly")
+	method string ResolvePlayerActionState(any session, any turnState)
+		-- Derives presentation state from the existing authoritative turn state; it owns no rules or transitions.
+		if session.BattleResult ~= "" or session.ContentValidationState ~= "VALID" then
+			return "LOCKED"
+		end
+		if turnState == nil or turnState.BattlePhase ~= "PlayerTurn" then
+			return "WAITING_ENEMY_TURN"
+		end
+		if turnState.IsActionProcessing == true then
+			if turnState.QueuedActionType == "MOVE" then
+				return "MOVING"
+			end
+			if turnState.QueuedActionType == "TURN" then
+				return "TURNING"
+			end
+			if turnState.ExecutingTileIds ~= "" then
+				return "EXECUTING_ATTACK"
+			end
+			return "LOCKED"
+		end
+		if turnState.QueuedTileCount > 0 then
+			return "PREPARING_ATTACK"
+		end
+		return "READY"
+	end
+
+end
