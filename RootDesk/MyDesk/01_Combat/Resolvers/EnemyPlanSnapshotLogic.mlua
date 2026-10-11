@@ -1,0 +1,348 @@
+@Logic
+script EnemyPlanSnapshotLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table BuildSnapshot(any session)
+		-- Builds a compact read-only list so UI can render every enemy without running AI rules.
+		local entries = {}
+		if session.BoardState ~= nil then
+			local livingEnemies = session.BoardState:CollectLivingEnemies()
+			for _, enemyEntity in ipairs(livingEnemies) do
+				local unit = enemyEntity:GetComponent("script.BattleUnitComponent")
+				local plan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+				if unit ~= nil and plan ~= nil and plan.PlanState ~= "EMPTY" then
+					local bossPhase = enemyEntity:GetComponent("script.BossPhaseStateComponent")
+					local bossPhaseId = ""
+					local bossPhaseIndex = 0
+					local bossPhaseRevision = 0
+					if bossPhase ~= nil then
+						bossPhaseId = bossPhase.PhaseId
+						bossPhaseIndex = bossPhase.PhaseIndex
+						bossPhaseRevision = bossPhase.PhaseRevision
+					end
+					local current = plan:GetCurrentAction()
+					local actionType = ""
+					local tileId = ""
+					local direction = 0
+					local telegraphTurns = 0
+					local patternId = unit.EnemyPatternId
+					local stepIndex = 0
+					if current.Success == true then
+						actionType = current.ActionType
+						tileId = current.TileId
+						direction = current.Direction
+						telegraphTurns = current.TelegraphTurnsRemaining
+						patternId = current.PatternId
+						stepIndex = current.StepIndex
+					end
+					-- Individually inserted skills are already owned while the next skill is loading.
+					local hasVisibleQueue = plan.PlanState == "TRACKING"
+						or plan.PlanState == "ATTACK_READY"
+						or plan.PlanState == "EXECUTING"
+						or (plan.PlanState == "PREPARED" and tileId ~= "" and plan.QueueTurnsRequired > 0 and plan.QueueTurnsElapsed >= plan.QueueTurnsRequired)
+						or (plan.PlanState == "INSERTING" and plan.QueueSkillsIndividually and plan.PlannedActionCount > 0)
+					local queuedTileNames = ""
+					local queuedIconRuids = ""
+					local queuedIconBackgroundColors = ""
+					local queuedSpecialFlags = ""
+					local queuedOverlayKinds = ""
+					if hasVisibleQueue then
+						queuedTileNames = self:GetEnemyQueueDisplayNames(plan.PlannedActionSnapshot)
+						queuedIconRuids = self:GetEnemyQueueIconRuids(plan.PlannedActionSnapshot)
+						queuedIconBackgroundColors = self:GetEnemyQueueIconBackgroundColors(plan.PlannedActionSnapshot)
+						queuedSpecialFlags = self:GetEnemyQueueSpecialFlags(plan.PlannedActionSnapshot)
+						queuedOverlayKinds = self:GetEnemyQueueOverlayKinds(plan.PlannedActionSnapshot)
+					end
+					local targetCellSnapshot = plan.TargetCellSnapshot
+					if actionType == "SUMMON_ENEMIES" then
+						local summoner = enemyEntity:GetComponent("script.FaustSummonComponent")
+						if summoner ~= nil then
+							queuedTileNames = summoner.SummonDisplayName
+							queuedIconRuids = summoner.SummonIconRuid
+						end
+					end
+					local telegraphKind = ""
+					local landingCell = -1
+					if actionType == "BOSS_JUMP_TELEGRAPH" or actionType == "BOSS_LAND_OPPOSITE" then
+						-- Immediate boss commands still publish their authored icon for the intent preview.
+						local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(tileId)
+						if definition.Success then
+							queuedTileNames = definition.DisplayName
+							queuedIconRuids = definition.HudIconRuid or ""
+						end
+						local telegraph = _EnemyTelegraphLogic:BuildBossLandingTelegraph(session, unit, tileId)
+						if telegraph.Success == true then
+							targetCellSnapshot = telegraph.TargetCells
+							telegraphKind = telegraph.TelegraphKind
+							landingCell = telegraph.LandingCell
+						end
+					elseif actionType == "CHARGE_FORWARD" then
+						-- Charge executes the committed line, even after its original target moves.
+						telegraphKind = "CHARGE_LINE"
+					elseif actionType == "TELEGRAPH_TILE" or actionType == "EXECUTE_TILE" then
+						-- Resolve this action's range, not a previous queued skill's cached cells.
+						-- Boogie's two-cell seal and one-cell body attack have different ranges.
+						local telegraph = _EnemyTelegraphLogic:BuildSkillAreaTelegraph(session, unit, tileId)
+						if telegraph.Success == true then
+							targetCellSnapshot = telegraph.TargetCells
+							if plan.PlanState == "ATTACK_READY" or plan.PlanState == "EXECUTING"
+								or (actionType == "TELEGRAPH_TILE" and plan.PlanState == "PREPARED") then
+								telegraphKind = telegraph.TelegraphKind
+							end
+						end
+					end
+					-- An interrupted cast keeps its queued icon/status until the action resolves,
+					-- but its attack cells are no longer a valid warning for any client.
+					if plan.CastState == "INTERRUPTED" and plan.CastingSkillId == tileId then
+						targetCellSnapshot = ""
+						telegraphKind = ""
+						landingCell = -1
+					end
+					local displayActionType = actionType
+					if plan.PlanState == "PREPARED" and (actionType == "MOVE_TOWARD" or actionType == "MOVE_AWAY" or actionType == "MOVE_FIXED_FACING")
+						and (direction == -1 or direction == 1) then
+						local facingDirection = unit.Facing == "Right" and 1 or -1
+						if facingDirection ~= direction then
+							displayActionType = "TURN_TO_PLAYER"
+						end
+					end
+					table.insert(entries, table.concat({
+						unit.UnitId,
+						tostring(unit.SpawnOrder),
+						plan.PlanState,
+						tostring(plan.CurrentActionIndex),
+						tostring(plan.PlannedActionCount),
+						plan.TraitIds ~= "" and plan.TraitIds or "-",
+						displayActionType ~= "" and displayActionType or "-",
+						tileId ~= "" and tileId or "-",
+						tostring(direction),
+						tostring(telegraphTurns),
+						patternId ~= "" and patternId or "-",
+						tostring(stepIndex),
+						tostring(plan.PlanRevision),
+						plan.PlannedActionSnapshot ~= "" and plan.PlannedActionSnapshot or "-",
+						bossPhaseId ~= "" and bossPhaseId or "-",
+						tostring(bossPhaseIndex),
+						tostring(bossPhaseRevision),
+						tostring(plan.QueueTurnsRequired),
+						tostring(plan.QueueTurnsElapsed),
+						plan.ReadinessReason ~= "" and plan.ReadinessReason or "-",
+						plan.NextCommandType ~= "" and plan.NextCommandType or "-",
+						targetCellSnapshot ~= "" and targetCellSnapshot or "-",
+						tostring(plan.NextCommandDirection),
+						enemyEntity.Name ~= "" and enemyEntity.Name or "-",
+						queuedTileNames ~= "" and queuedTileNames or "-",
+						queuedIconRuids ~= "" and queuedIconRuids or "-",
+						telegraphKind ~= "" and telegraphKind or "-",
+						tostring(landingCell),
+						tostring(plan.DeferredUntilTurn),
+						queuedIconBackgroundColors ~= "" and queuedIconBackgroundColors or "-",
+						plan.CastState ~= "" and plan.CastState or "NONE",
+						plan.CastingSkillId ~= "" and plan.CastingSkillId or "-",
+						tostring(plan.InterruptHitsRequired),
+						tostring(plan.InterruptHitsReceived),
+						queuedSpecialFlags ~= "" and queuedSpecialFlags or "-",
+						queuedOverlayKinds ~= "" and queuedOverlayKinds or "-"
+					}, ","))
+				end
+			end
+		end
+		return { Snapshot = table.concat(entries, "#"), Count = #entries }
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueDisplayNames(string actionSnapshot)
+		-- Resolves authoring DisplayName values on the server so UI never reads server-only DataSets.
+		local names = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local actionFields = {}
+			for actionField in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(actionFields, actionField)
+			end
+			local tileId = ""
+			if #actionFields >= 3 then
+				tileId = actionFields[3]
+				if tileId == "-" then
+					tileId = ""
+				end
+			end
+			if tileId ~= "" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(tileId)
+				local displayName = tileId
+				if definition.Success == true and definition.DisplayName ~= nil and definition.DisplayName ~= "" then
+					displayName = definition.DisplayName
+				end
+				table.insert(names, displayName)
+			end
+		end
+		return table.concat(names, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueIconRuids(string actionSnapshot)
+		-- Presentation data is authored beside the Skill row and published for client-only HUDs.
+		local iconRuids = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local actionFields = {}
+			for actionField in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(actionFields, actionField)
+			end
+			local tileId = #actionFields >= 3 and actionFields[3] or ""
+			if tileId ~= "" and tileId ~= "-" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(tileId)
+				local iconRuid = ""
+				if definition.Success == true then
+					iconRuid = definition.HudIconRuid or ""
+				end
+
+				table.insert(iconRuids, iconRuid ~= "" and iconRuid or "-")
+			end
+		end
+		return table.concat(iconRuids, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueIconBackgroundColors(string actionSnapshot)
+		-- Preserve slot placeholders and omit # on the wire because it separates enemy records.
+		local colors = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local fields = {}
+			for field in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(fields, field)
+			end
+			local tileId = fields[3] or ""
+			if tileId ~= "" and tileId ~= "-" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(tileId)
+				local color = definition.Success and (definition.HudIconBackgroundColor or "") or ""
+				table.insert(colors, string.match(color, "^#%x%x%x%x%x%x%x%x$") and string.sub(color, 2) or "-")
+			end
+		end
+		return table.concat(colors, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueSpecialFlags(string actionSnapshot)
+		-- One 1/0 flag per queued slot so the client HUD can mark special attacks without the server-only skill tables.
+		local flags = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local fields = {}
+			for field in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(fields, field)
+			end
+			local tileId = fields[3] or ""
+			if tileId ~= "" and tileId ~= "-" then
+				table.insert(flags, self:GetEnemyActionOverlayKind(tileId, fields[2] or "") ~= "" and "1" or "0")
+			end
+		end
+		return table.concat(flags, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyQueueOverlayKinds(string actionSnapshot)
+		-- Publishes one semantic badge key per queued skill; the client owns the replaceable artwork.
+		local kinds = {}
+		for actionEntry in string.gmatch(actionSnapshot or "", "([^>]+)") do
+			local fields = {}
+			for field in string.gmatch(actionEntry, "([^~]+)") do
+				table.insert(fields, field)
+			end
+			local skillId = fields[3] or ""
+			if skillId ~= "" and skillId ~= "-" then
+				local kind = self:GetEnemyActionOverlayKind(skillId, fields[2] or "")
+				table.insert(kinds, kind ~= "" and kind or "-")
+			end
+		end
+		return table.concat(kinds, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemyActionOverlayKind(string skillId, string actionType)
+		-- Pattern commands may be special even when they reuse a plain damage skill.
+		if actionType == "BOSS_JUMP_TELEGRAPH" then return "JUMP_UP" end
+		if actionType == "BOSS_LAND_OPPOSITE" then return "JUMP_DOWN" end
+		local kind = self:GetEnemySkillOverlayKind(skillId)
+		if kind ~= "" then return kind end
+		if actionType == "TELEGRAPH_TILE" or actionType == "CAST_INTERRUPTIBLE"
+			or actionType == "CHARGE_FORWARD" or actionType == "SUMMON_ENEMIES" then return "WARNING" end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method string GetEnemySkillOverlayKind(string skillId)
+		-- Chooses the primary effect badge from authored effects before using attack tags as a fallback.
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success ~= true then return "" end
+		local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId or "")
+		local found = {}
+		for _, step in ipairs(effects.Success and effects.Steps or {}) do
+			found[step.EffectType] = true
+		end
+		if found.IGNITE or found.BURN then return "IGNITE" end
+		if found.FROSTBITE or found.FREEZE then return "FROSTBITE" end
+		if found.CONFUSE then return "CONFUSE" end
+		if found.POISON_MIST then return "POISON_MIST" end
+		if found.POISON then return "POISON" end
+		if found.STUN then return "STUN" end
+		if found.ATTACK_BUFF then return "ATTACK_BUFF" end
+		if found.HEAL then return "HEAL" end
+		if found.PUSH or found.PULL or found.SEAL or found.BOSS_SWAP then return "WARNING" end
+		local tags = "|" .. string.lower(definition.SkillTags or "") .. "|"
+		if string.find(tags, "|cast|", 1, true) ~= nil then return "WARNING" end
+		if string.find(tags, "|area|", 1, true) ~= nil
+			or (definition.TargetingType == "RANGE_OFFSETS" and string.find(definition.TargetOffsets or "", "|", 1, true) ~= nil) then
+			return "IMPACT"
+		end
+		for _, tag in ipairs({ "telegraph", "charge", "control", "status", "support", "buff" }) do
+			if string.find(tags, "|" .. tag .. "|", 1, true) ~= nil then return "WARNING" end
+		end
+		-- Newly authored non-damage effects remain visible even before receiving dedicated artwork.
+		for effectType, _ in pairs(found) do
+			if effectType ~= "DAMAGE" then return "WARNING" end
+		end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildEnemySkillHover(any session, string enemyUnitId, any enemyUnit, table definition)
+		-- Builds the tooltip and range after the session validates the requester and enemy.
+		local effects = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId or "")
+		local text = self:BuildEnemySkillHoverText(enemyUnit, definition, effects.Success and effects.Steps or {})
+		local cells = {}
+		if definition.TargetingType ~= "SELF" and definition.TargetingType ~= "BOARD_PARITY" then
+			local target = _SkillTargetResolverLogic:Resolve(session, enemyUnitId, definition)
+			cells = target.Success and target.TargetCellIndices or {}
+		end
+		return { Text = text, Cells = cells }
+	end
+
+	@ExecSpace("ServerOnly")
+	method string BuildEnemySkillHoverText(any enemyUnit, table definition, table steps)
+		-- Player-facing summary of an enemy skill: range, cooldown, damage and every status it applies.
+		local special = self:GetEnemySkillOverlayKind(definition.SkillId) ~= ""
+		local lines = { (definition.DisplayName or definition.SkillId) .. (special and "  [특수 공격]" or "") }
+		table.insert(lines, "범위: " .. _SkillCodexProvider:DescribeRange(definition))
+		local tags = "|" .. string.lower(definition.SkillTags or "") .. "|"
+		if string.find(tags, "|telegraph|", 1, true) ~= nil then table.insert(lines, "예고 후 발동: 표시된 칸을 피하세요") end
+		if (definition.CooldownTurns or 0) > 0 then table.insert(lines, "재사용 대기: " .. tostring(math.floor(definition.CooldownTurns)) .. "턴") end
+		for _, step in ipairs(steps or {}) do
+			local kind = step.EffectType
+			local value = _BuffEffectExecutorLogic:FormatNumber(step.Value or 0)
+			local turns = tostring(math.max(1, math.floor(tonumber(step.ParameterA) or 1)))
+			local text = ""
+			if kind == "DAMAGE" then
+				local amount = _DamageEffectExecutorLogic:ResolveDamageAmount(enemyUnit, step)
+				text = "피해: " .. _BuffEffectExecutorLogic:FormatNumber(amount)
+			elseif kind == "IGNITE" then text = "효과: 화상 - " .. turns .. "행동 동안 스킬을 쓸 때마다 피해 " .. value
+			elseif kind == "FROSTBITE" then text = "효과: 동상 - " .. turns .. "행동 동안 이동 불가 (동상/혼란 중에는 안 걸림)"
+			elseif kind == "CONFUSE" then text = "효과: 혼란 - 다음 스킬 " .. turns .. "회는 몸이 반대로 돌아 시전 (동상/혼란 중에는 안 걸림)"
+			elseif kind == "SEAL" then text = "효과: 봉인 - " .. turns .. "턴 동안 스킬 예약/실행 불가"
+			elseif kind == "POISON_MIST" then text = "효과: 독안개 - " .. turns .. "턴 동안 해당 칸에서 피해 " .. value
+			elseif kind == "PUSH" then text = "효과: " .. value .. "칸 밀치기"
+			elseif kind == "PULL" then text = "효과: " .. value .. "칸 끌어오기"
+			elseif kind == "TURN_TARGET" then text = "효과: 대상의 방향을 뒤집음"
+			else text = _BuffEffectExecutorLogic:DescribeEffectSteps({step}) end
+			if text ~= "" then table.insert(lines, text) end
+		end
+		return table.concat(lines, "\n")
+	end
+end
