@@ -24,7 +24,7 @@ lua = LuaRuntime(unpack_returned_tuples=True)
 
 def load_methods(path, names):
     """Compile exact method bodies; fail if source formatting/names change."""
-    source = (ROOT / path).read_text(encoding="utf-8-sig")
+    source = (ROOT / path).read_text(encoding="utf-8-sig").expandtabs(4)
     result = lua.table()
     found = set()
     pattern = r"^([ \t]+)method\s+\w+\s+(\w+)\((.*?)\)\n(.*?)^\1end\s*$"
