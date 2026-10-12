@@ -371,31 +371,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void PreviewLocalTurnFacing()
-		-- Gives direction input an immediate visual response without mutating authoritative BattleUnit facing.
-		local player = _UserService.LocalPlayer
-		if isvalid(player) == false or player.PlayerControllerComponent == nil then
-			return
-		end
-
-		local currentDirection = player.PlayerControllerComponent.LookDirectionX
-		if currentDirection >= 0 then
-			player.PlayerControllerComponent.LookDirectionX = -1
-		else
-			player.PlayerControllerComponent.LookDirectionX = 1
-		end
-		log("[BattleInputFeedback] local turn preview direction=" .. tostring(player.PlayerControllerComponent.LookDirectionX))
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:PreviewLocalTurnFacing(self)
 	end
 
 	@ExecSpace("Client")
 	method void ConfirmLocalPlayerFacing(string facing)
-		-- Confirms or rolls back the optimistic visual from the server-authoritative facing value.
-		local player = _UserService.LocalPlayer
-		if isvalid(player) == false or player.PlayerControllerComponent == nil then
-			return
-		end
-
-		player.PlayerControllerComponent.LookDirectionX = facing == "Right" and 1 or -1
-		log("[BattleInputFeedback] authoritative facing=" .. tostring(facing))
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:ConfirmLocalPlayerFacing(self, facing)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -525,318 +508,98 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ClearMotionCompletionWaits()
-		-- Entry changes invalidate every outstanding presentation acknowledgement.
-		for _, wait in pairs(self._T.motionCompletionWaits or {}) do
-			_TimerService:ClearTimer(wait.TimerId)
-			if wait.ProducerTimerId > 0 then _TimerService:ClearTimer(wait.ProducerTimerId) end
-			if wait.RetryTimerId > 0 then _TimerService:ClearTimer(wait.RetryTimerId) end
-		end
-		self._T.motionCompletionWaits = {}
-		self._T.waveMotionCompletion = nil
-		if isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
-			self:CancelClientMotionCompletionWaits(self._T.motionCompletionSequence or 0, self.PlayerEntity.PlayerComponent.UserId)
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:ClearMotionCompletionWaits(self)
 	end
 
 	@ExecSpace("Client")
 	method void CancelClientMotionCompletionWaits(integer throughSequence)
-		self._T.clientCancelledMotionSequence = math.max(self._T.clientCancelledMotionSequence or 0, throughSequence)
-		for sequence, wait in pairs(self._T.clientMotionCompletionWaits or {}) do
-			if sequence <= throughSequence then
-				if wait.TimerId > 0 then _TimerService:ClearTimer(wait.TimerId) end
-				self._T.clientMotionCompletionWaits[sequence] = nil
-			end
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:CancelClientMotionCompletionWaits(self, throughSequence)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table GetMotionPresentationLedger()
-		local ledger = self._T.motionPresentationLedger
-		if ledger == nil or ledger.Entry ~= self.EntryRequestId then
-			self._T.motionPresentationEpoch = (self._T.motionPresentationEpoch or 0) + 1
-			ledger = { Entry = self.EntryRequestId, Epoch = self._T.motionPresentationEpoch, Count = 0, Records = {} }
-			self._T.motionPresentationLedger = ledger
-		end
-		return ledger
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleMotionCompletionLogic:GetMotionPresentationLedger(self)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void DiscardMotionPresentationLedger()
-		local ledger = self._T.motionPresentationLedger
-		self:ClearMotionCompletionWaits()
-		self._T.motionPresentationLedger = nil
-		if ledger ~= nil and isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
-			self:DiscardClientMotionPresentationLedger(ledger.Epoch, self.PlayerEntity.PlayerComponent.UserId)
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:DiscardMotionPresentationLedger(self)
 	end
 
 	@ExecSpace("Client")
 	method void DiscardClientMotionPresentationLedger(integer throughEpoch)
-		self._T.clientDiscardedMotionEpoch = math.max(self._T.clientDiscardedMotionEpoch or 0, throughEpoch)
-		local ledger = self._T.clientMotionPresentationLedger
-		if ledger ~= nil and ledger.Epoch <= throughEpoch then
-			for _, wait in pairs(self._T.clientMotionCompletionWaits or {}) do
-				if wait.TimerId > 0 then _TimerService:ClearTimer(wait.TimerId) end
-			end
-			self._T.clientMotionCompletionWaits = {}
-			self._T.clientMotionPresentationLedger = nil
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:DiscardClientMotionPresentationLedger(self, throughEpoch)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void SendMotionPresentation(Entity unitEntity, string kind, table data)
-		-- Each visual launch is counted before dispatch, including queued HIT and synchronized deaths.
-		if isvalid(unitEntity) == false or isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil or self.PlayerEntity.CurrentMap ~= self.Entity then return end
-		local recipientUserId = self.PlayerEntity.PlayerComponent.UserId
-		if unitEntity:GetComponent("script.BattleUnitPresentationComponent") == nil then return end
-		local ledger = self:GetMotionPresentationLedger()
-		ledger.Count = ledger.Count + 1
-		local receipt = ledger.Count
-		ledger.Records[receipt] = { Entity = unitEntity, Kind = kind, Data = data }
-		self:ReceiveMotionPresentation(unitEntity, kind, data, receipt, ledger.Entry, ledger.Epoch)
-		-- A late producer invalidates an earlier acknowledgement until this new launch has arrived.
-		for sequence, wait in pairs(self._T.motionCompletionWaits or {}) do
-			if wait.Entry == ledger.Entry and wait.Epoch == ledger.Epoch and wait.Sealed then
-				wait.ExpectedReceipts = receipt
-				wait.ClientReady = false
-				self:AwaitClientMotionCompletion(sequence, wait.Entry, wait.Epoch, receipt, recipientUserId)
-			end
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:SendMotionPresentation(self, unitEntity, kind, data)
 	end
 
 	@ExecSpace("ClientOnly")
 	method table GetClientMotionPresentationLedger(integer entry, integer epoch)
-		-- RPC epochs, rather than arrival of a synchronized property, identify the active presentation entry.
-		if epoch <= (self._T.clientDiscardedMotionEpoch or 0) then return nil end
-		local ledger = self._T.clientMotionPresentationLedger
-		if ledger ~= nil and epoch < ledger.Epoch then return nil end
-		if ledger == nil or epoch > ledger.Epoch then
-			for _, wait in pairs(self._T.clientMotionCompletionWaits or {}) do
-				if wait.TimerId > 0 then _TimerService:ClearTimer(wait.TimerId) end
-			end
-			self._T.clientMotionCompletionWaits = {}
-			ledger = { Entry = entry, Epoch = epoch, Count = 0, Seen = {}, Presentations = {}, Included = {} }
-			self._T.clientMotionPresentationLedger = ledger
-			local presentations = self.Entity:GetChildComponentsByTypeName("script.BattleUnitPresentationComponent", true)
-			for _, presentation in pairs(presentations) do
-				presentation._T.confirmedDeathAwaitSync = false
-				ledger.Included[presentation] = true
-				table.insert(ledger.Presentations, presentation)
-			end
-			local player = _UserService.LocalPlayer
-			local presentation = isvalid(player) and player:GetComponent("script.BattleUnitPresentationComponent") or nil
-			if presentation ~= nil and ledger.Included[presentation] ~= true then
-				presentation._T.confirmedDeathAwaitSync = false
-				ledger.Included[presentation] = true
-				table.insert(ledger.Presentations, presentation)
-			end
-		end
-		if ledger.Entry ~= entry then return nil end
-		return ledger
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleMotionCompletionLogic:GetClientMotionPresentationLedger(self, entry, epoch)
 	end
 
 	@ExecSpace("Client")
 	method void ReceiveMotionPresentation(Entity unitEntity, string kind, table data, integer receipt, integer entry, integer epoch)
-		local player = _UserService.LocalPlayer
-		if isvalid(player) == false or player.CurrentMap ~= self.Entity then return end
-		local ledger = self:GetClientMotionPresentationLedger(entry, epoch)
-		if ledger == nil or ledger.Seen[receipt] then return end
-		local presentation = isvalid(unitEntity) and unitEntity.CurrentMap == self.Entity and unitEntity:GetComponent("script.BattleUnitPresentationComponent") or nil
-		-- Replication may create the target after this RPC. Leave it missing so the replay can start it.
-		if presentation == nil then return end
-		ledger.Seen[receipt] = "STARTING"
-		if presentation ~= nil then
-			if ledger.Included[presentation] ~= true then
-				ledger.Included[presentation] = true
-				table.insert(ledger.Presentations, presentation)
-			end
-			if kind == "COMBAT" then
-				presentation:PlayCombatMotion(data.UnitId, data.MotionKey, data.ActionName, data.PlayRate, data.Duration, false)
-			elseif kind == "SPRITE" then
-				presentation:PlaySpriteMotion(data.UnitId, data.Ruid, data.PlayRate, data.Duration, data.Facing, false)
-			elseif kind == "HIT" then
-				presentation:PlayHitImpact(data.UnitId, data.Strong, data.NormalStop, data.StrongStop, data.Reaction, data.Flash, data.SkipMotion)
-			elseif kind == "DEATH" then
-				presentation:RefreshDefeatedDisplay(data.UnitId, data.Team, true)
-				local unit = unitEntity:GetComponent("script.BattleUnitComponent")
-				presentation._T.confirmedDeathAwaitSync = unit == nil or unit.IsDead ~= true
-				presentation._T.confirmedDeathIdentity = { UnitId = data.UnitId, Team = data.Team }
-			end
-		end
-		-- Count only after the launch was dispatched locally; queued motions still count as pending.
-		ledger.Seen[receipt] = true
-		ledger.Count = ledger.Count + 1
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:ReceiveMotionPresentation(self, unitEntity, kind, data, receipt, entry, epoch)
 	end
 
 	@ExecSpace("Client")
 	method void CancelMotionPresentationReceipt(integer receipt, integer entry, integer epoch)
-		-- Only the server can classify a launch as unnecessary because its target was removed.
-		local player = _UserService.LocalPlayer
-		if isvalid(player) == false or player.CurrentMap ~= self.Entity then return end
-		local ledger = self:GetClientMotionPresentationLedger(entry, epoch)
-		if ledger == nil or ledger.Seen[receipt] then return end
-		ledger.Seen[receipt] = true
-		ledger.Count = ledger.Count + 1
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:CancelMotionPresentationReceipt(self, receipt, entry, epoch)
 	end
 
 	@ExecSpace("ServerOnly")
 	method integer BeginMotionCompletionWait(any complete)
-		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil or self.PlayerEntity.CurrentMap ~= self.Entity then return 0 end
-		self._T.motionCompletionSequence = (self._T.motionCompletionSequence or 0) + 1
-		local sequence = self._T.motionCompletionSequence
-		local ledger = self:GetMotionPresentationLedger()
-		local entry = ledger.Entry
-		self._T.motionCompletionWaits = self._T.motionCompletionWaits or {}
-		local wait = { Complete = complete, Entry = entry, Epoch = ledger.Epoch, TimerId = 0, ProducerTimerId = 0, RetryTimerId = 0, ServerReady = false, ClientReady = false, Sealed = false, ExpectedReceipts = -1 }
-		self._T.motionCompletionWaits[sequence] = wait
-		local retry = nil
-		retry = function()
-			if self._T.motionCompletionWaits[sequence] ~= wait then return end
-			if self.EntryRequestId ~= entry then self:ClearMotionCompletionWaits(); return end
-			if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil or self.PlayerEntity.CurrentMap ~= self.Entity then
-				self:DiscardMotionPresentationLedger()
-				return
-			end
-			self:AwaitClientMotionCompletion(sequence, entry, wait.Epoch, wait.ExpectedReceipts, self.PlayerEntity.PlayerComponent.UserId)
-			wait.RetryTimerId = _TimerService:SetTimerOnce(retry, 1)
-		end
-		-- Retrying is safe: launches and acknowledgements are deduplicated by epoch/receipt/sequence.
-		retry()
-		return sequence
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleMotionCompletionLogic:BeginMotionCompletionWait(self, complete)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void SealMotionCompletionWait(integer sequence)
-		local wait = self._T.motionCompletionWaits ~= nil and self._T.motionCompletionWaits[sequence] or nil
-		if wait == nil or wait.Entry ~= self.EntryRequestId then return end
-		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil or self.PlayerEntity.CurrentMap ~= self.Entity then return end
-		local ledger = self:GetMotionPresentationLedger()
-		wait.Sealed = true
-		wait.ExpectedReceipts = ledger.Count
-		self:AwaitClientMotionCompletion(sequence, wait.Entry, wait.Epoch, ledger.Count, self.PlayerEntity.PlayerComponent.UserId)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:SealMotionCompletionWait(self, sequence)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void SealMotionCompletionWhenImpactsFinish(integer sequence)
-		local wait = self._T.motionCompletionWaits ~= nil and self._T.motionCompletionWaits[sequence] or nil
-		if wait == nil or wait.Entry ~= self.EntryRequestId then return end
-		wait.ProducerTimerId = 0
-		if self.ImpactTimerId > 0 then
-			wait.ProducerTimerId = _TimerService:SetTimerOnce(function() self:SealMotionCompletionWhenImpactsFinish(sequence) end, 0.02)
-			return
-		end
-		self:SealMotionCompletionWait(sequence)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:SealMotionCompletionWhenImpactsFinish(self, sequence)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void MarkMotionCompletionReady(integer sequence)
-		local wait = self._T.motionCompletionWaits ~= nil and self._T.motionCompletionWaits[sequence] or nil
-		if wait == nil then return end
-		if wait.ServerReady then return end
-		wait.ServerReady = true
-		-- The emergency timeout starts after the server lower bound, never during an unfinished impact.
-		wait.TimerId = _TimerService:SetTimerOnce(function()
-			if self._T.motionCompletionWaits[sequence] ~= wait then return end
-			if wait.Entry ~= self.EntryRequestId or isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil or self.PlayerEntity.CurrentMap ~= self.Entity then return end
-			if not wait.Sealed then return end
-			self._T.motionCompletionWaits[sequence] = nil
-			if wait.ProducerTimerId > 0 then _TimerService:ClearTimer(wait.ProducerTimerId) end
-			if wait.RetryTimerId > 0 then _TimerService:ClearTimer(wait.RetryTimerId) end
-			self:CancelClientMotionCompletionWaits(sequence, self.PlayerEntity.PlayerComponent.UserId)
-			log_warning("[BattleMotionGate] acknowledgement timeout sequence=" .. sequence)
-			wait.Complete()
-		end, 60)
-		self:TryReleaseMotionCompletionWait(sequence)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:MarkMotionCompletionReady(self, sequence)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void TryReleaseMotionCompletionWait(integer sequence)
-		local wait = self._T.motionCompletionWaits ~= nil and self._T.motionCompletionWaits[sequence] or nil
-		if wait == nil or not wait.ServerReady or not wait.ClientReady or not wait.Sealed then return end
-		if wait.Entry ~= self.EntryRequestId or isvalid(self.PlayerEntity) == false or self.PlayerEntity.PlayerComponent == nil or self.PlayerEntity.CurrentMap ~= self.Entity then return end
-		if self:GetMotionPresentationLedger().Count ~= wait.ExpectedReceipts then return end
-		self._T.motionCompletionWaits[sequence] = nil
-		_TimerService:ClearTimer(wait.TimerId)
-		if wait.ProducerTimerId > 0 then _TimerService:ClearTimer(wait.ProducerTimerId) end
-		if wait.RetryTimerId > 0 then _TimerService:ClearTimer(wait.RetryTimerId) end
-		self:CancelClientMotionCompletionWaits(sequence, self.PlayerEntity.PlayerComponent.UserId)
-		log("[BattleMotionGate] released sequence=" .. sequence)
-		wait.Complete()
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:TryReleaseMotionCompletionWait(self, sequence)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void WaitForMotionCompletion(any complete)
-		local sequence = self:BeginMotionCompletionWait(complete)
-		self:SealMotionCompletionWhenImpactsFinish(sequence)
-		self:MarkMotionCompletionReady(sequence)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:WaitForMotionCompletion(self, complete)
 	end
 
 	@ExecSpace("Client")
 	method void AwaitClientMotionCompletion(integer sequence, integer entry, integer epoch, integer expectedReceipts)
-		-- The final launch count seals the producer: an empty scene before delayed RPCs arrive is not completion.
-		local player = _UserService.LocalPlayer
-		if isvalid(player) == false or player.CurrentMap ~= self.Entity then return end
-		if sequence <= (self._T.clientCancelledMotionSequence or 0) then return end
-		local ledger = self:GetClientMotionPresentationLedger(entry, epoch)
-		if ledger == nil then return end
-		self._T.clientMotionCompletionWaits = self._T.clientMotionCompletionWaits or {}
-		local wait = self._T.clientMotionCompletionWaits[sequence]
-		if wait == nil then
-			wait = { Entry = entry, Epoch = epoch, ExpectedReceipts = -1, TimerId = 0, AckedCount = -1, LastReplay = _UtilLogic.ElapsedSeconds }
-			self._T.clientMotionCompletionWaits[sequence] = wait
-		end
-		if wait.Entry ~= entry or wait.Epoch ~= epoch then return end
-		wait.ExpectedReceipts = math.max(wait.ExpectedReceipts, expectedReceipts)
-		if wait.ExpectedReceipts >= 0 and wait.AckedCount == wait.ExpectedReceipts then
-			self:ConfirmMotionCompletion(sequence, entry, epoch, wait.AckedCount)
-			return
-		end
-		if wait.TimerId > 0 then return end
-		local poll = nil
-		poll = function()
-			wait.TimerId = 0
-			if self._T.clientMotionCompletionWaits[sequence] ~= wait or self._T.clientMotionPresentationLedger ~= ledger then return end
-			if isvalid(self.Entity) == false or isvalid(player) == false or player.CurrentMap ~= self.Entity then
-				self._T.clientMotionCompletionWaits[sequence] = nil
-				return
-			end
-			local busy = wait.ExpectedReceipts < 0 or ledger.Count < wait.ExpectedReceipts
-			if busy == false then
-				for _, presentation in ipairs(ledger.Presentations) do
-					if isvalid(presentation.Entity) and presentation.Entity.CurrentMap == self.Entity then
-						if presentation._T.confirmedDeathAwaitSync then
-							local unit = presentation.Entity:GetComponent("script.BattleUnitComponent")
-							if unit == nil or unit.IsDead ~= true then busy = true break end
-							-- An older presentation can clear death state on an earlier HP sync.
-							local motion = presentation._T.fullMotion
-							if (motion ~= nil and (motion.Kind == "DEATH" or motion.Kind == "AVATAR_DEATH")) or (presentation.DeathMotionTimerId or 0) > 0 then
-								presentation.DeathMotionActive = true
-							end
-							local identity = presentation._T.confirmedDeathIdentity
-							presentation:RefreshDefeatedDisplay(identity ~= nil and identity.UnitId or unit.UnitId, identity ~= nil and identity.Team or unit.Team, true)
-							presentation._T.confirmedDeathAwaitSync = false
-							presentation._T.confirmedDeathIdentity = nil
-						end
-						if presentation:IsFullMotionPending() then busy = true break end
-					end
-				end
-			elseif wait.ExpectedReceipts >= 0 and _UtilLogic.ElapsedSeconds - wait.LastReplay >= 0.5 then
-				local missing = {}
-				for receipt = 1, wait.ExpectedReceipts do
-					if not ledger.Seen[receipt] then table.insert(missing, tostring(receipt)) end
-					if #missing >= 64 then break end
-				end
-				wait.LastReplay = _UtilLogic.ElapsedSeconds
-				self:RequestMissingMotionPresentations(sequence, entry, epoch, table.concat(missing, "|"))
-			end
-			if busy == false then
-				wait.AckedCount = wait.ExpectedReceipts
-				self:ConfirmMotionCompletion(sequence, entry, epoch, wait.ExpectedReceipts)
-				return
-			end
-			wait.TimerId = _TimerService:SetTimerOnce(poll, 0.01)
-		end
-		wait.TimerId = _TimerService:SetTimerOnce(poll, 0.01)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMotionCompletionLogic:AwaitClientMotionCompletion(self, sequence, entry, epoch, expectedReceipts)
 	end
 
 	@ExecSpace("Server")
@@ -846,20 +609,7 @@ script BattleSessionComponent extends Component
 		local ledger = self._T.motionPresentationLedger
 		if wait == nil or not wait.Sealed or wait.Entry ~= entry or wait.Epoch ~= epoch or self.EntryRequestId ~= entry then return end
 		if ledger == nil or ledger.Epoch ~= epoch then return end
-		local count = 0
-		for value in string.gmatch(missingReceipts or "", "([^|]+)") do
-			local receipt = tonumber(value)
-			local record = receipt ~= nil and receipt >= 1 and receipt <= wait.ExpectedReceipts and ledger.Records[receipt] or nil
-			if record ~= nil then
-				if isvalid(record.Entity) == false or record.Entity.CurrentMap ~= self.Entity or record.Entity:GetComponent("script.BattleUnitPresentationComponent") == nil then
-					self:CancelMotionPresentationReceipt(receipt, entry, epoch, senderUserId)
-				else
-					self:ReceiveMotionPresentation(record.Entity, record.Kind, record.Data, receipt, entry, epoch, senderUserId)
-				end
-			end
-			count = count + 1
-			if count >= 64 then return end
-		end
+		_BattleMotionCompletionLogic:ResendMissingMotionPresentations(self, ledger, wait, entry, epoch, missingReceipts, senderUserId)
 	end
 
 	@ExecSpace("Server")
@@ -1386,39 +1136,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ConfigureEnemyMovementPresentation(Entity enemyEntity, table spawnDefinition)
-		-- Injects the complete per-enemy motion profile without changing logical combat timing.
-		if isvalid(enemyEntity) == false or spawnDefinition == nil then
-			return
-		end
-		local presentation = enemyEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if presentation == nil then
-			return
-		end
-		presentation.IdleMotionRuid = spawnDefinition.IdleMotionRuid or ""
-		-- Idle is the restoration baseline; only action motions receive the combat speedup.
-		presentation.IdleMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.IdleMotionPlayRate) or 1)
-		presentation.MovementMotionRuid = spawnDefinition.MoveMotionRuid or ""
-		if presentation.MovementMotionRuid == "" then
-			presentation.MovementMotionRuid = presentation.IdleMotionRuid
-		end
-		presentation.MovementMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.MoveMotionPlayRate) or 1) * 3
-		presentation.HitMotionRuid = spawnDefinition.HitMotionRuid or ""
-		presentation.HitMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.HitMotionPlayRate) or 1) * 3
-		presentation.HitMotionDuration = math.max(0.05, tonumber(spawnDefinition.HitMotionDuration) or 0.25)
-		presentation.AttackMotionRuid = spawnDefinition.AttackMotionRuid or ""
-		presentation.AttackMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.AttackMotionPlayRate) or 1) * 3
-		presentation.AttackMotionDuration = math.max(0.05, tonumber(spawnDefinition.AttackMotionDuration) or 0.35)
-		presentation.DeathMotionRuid = spawnDefinition.DeathMotionRuid or ""
-		presentation.DeathMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.DeathMotionPlayRate) or 1) * 3
-		presentation.DeathMotionDuration = math.max(0.05, tonumber(spawnDefinition.DeathMotionDuration) or 0.5)
-		presentation.GroundVisualOffsetY = tonumber(spawnDefinition.VisualOffsetY) or 0
-		log("[EnemyMotionProfile] configured definition=" .. tostring(spawnDefinition.EnemyDefinitionId)
-			.. " idle=" .. tostring(presentation.IdleMotionRuid)
-			.. " move=" .. tostring(presentation.MovementMotionRuid)
-			.. " hit=" .. tostring(presentation.HitMotionRuid)
-			.. " attack=" .. tostring(presentation.AttackMotionRuid)
-			.. " death=" .. tostring(presentation.DeathMotionRuid)
-			.. " groundOffsetY=" .. tostring(presentation.GroundVisualOffsetY))
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:ConfigureEnemyMovementPresentation(self, enemyEntity, spawnDefinition)
 	end
 
 
@@ -2048,33 +1767,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CompletePlayerCombatPresentationHandoff(string reason)
-		local playerEntity = self.PlayerEntity
-		if playerEntity == nil or isvalid(playerEntity) == false then
-			playerEntity = self:FindUnitEntity("player_01")
-		end
-		if playerEntity == nil or isvalid(playerEntity) == false then
-			return
-		end
-		local presentation = playerEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if presentation ~= nil then
-			presentation:CompleteCombatMotionHandoff("player_01", reason)
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:CompletePlayerCombatPresentationHandoff(self, reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void CancelPlayerCombatPresentationHandoff(string reason, boolean restoreToStand)
-		self:DiscardMotionPresentationLedger()
-		local playerEntity = self.PlayerEntity
-		if playerEntity == nil or isvalid(playerEntity) == false then
-			playerEntity = self:FindUnitEntity("player_01")
-		end
-		if playerEntity == nil or isvalid(playerEntity) == false then
-			return
-		end
-		local presentation = playerEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if presentation ~= nil then
-			presentation:CancelCombatMotionHandoff("player_01", reason, restoreToStand)
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:CancelPlayerCombatPresentationHandoff(self, reason, restoreToStand)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2383,19 +2083,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ApplyFacing(Entity targetEntity, string facing)
-		-- Uses the native player look direction so the three-layer avatar renderer turns correctly.
-		if targetEntity.PlayerControllerComponent == nil then
-			return
-		end
-
-		if facing == "Right" then
-			targetEntity.PlayerControllerComponent.LookDirectionX = 1
-		else
-			targetEntity.PlayerControllerComponent.LookDirectionX = -1
-		end
-		if targetEntity.PlayerComponent ~= nil then
-			self:ConfirmLocalPlayerFacing(facing, targetEntity.PlayerComponent.UserId)
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:ApplyFacing(self, targetEntity, facing)
 	end
 
 	@ExecSpace("Server")
@@ -3014,38 +2703,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("Client")
 	method void PreloadSkillPresentation(string ruidCsv)
-		-- Warms the client resource cache with this run's cast / hit / projectile clips.
-		-- These RUIDs are only ever assigned at cast time, so on a cold cache the renderer keeps showing
-		-- whatever it had while the clip loads -- long enough to cover a whole projectile flight. Loading
-		-- them up front is what makes the first cast of a skill look like every later one.
-		if ruidCsv == "" then
-			return
-		end
-
-		local ruids = {}
-		for ruid in string.gmatch(ruidCsv, "([^|]+)") do
-			table.insert(ruids, ruid)
-		end
-		if #ruids == 0 then
-			return
-		end
-
-		local requested = #ruids
-		log("[SkillPreload] requested count=" .. tostring(requested))
-		_ResourceService:PreloadAsync(ruids, function(results)
-			local succeeded = 0
-			local failed = 0
-			for _, status in pairs(results or {}) do
-				if status == PreloadResultStatus.Success then
-					succeeded = succeeded + 1
-				else
-					failed = failed + 1
-					log_warning("[SkillPreload] resource rejected status=" .. tostring(status))
-				end
-			end
-			-- Purely an optimisation: a failure here costs the old first-cast flicker, never gameplay.
-			log("[SkillPreload] complete requested=" .. tostring(requested) .. " success=" .. tostring(succeeded) .. " failed=" .. tostring(failed))
-		end)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:PreloadSkillPresentation(self, ruidCsv)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3649,15 +3308,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ApplySkillWeapon(string sourceUnitId, Entity sourceEntity, table definition)
-		-- Presentation-only hop into the weapon catalog. Never gates execution: a data or costume
-		-- problem downgrades to a log line and the skill still resolves.
-		if isvalid(sourceEntity) == false then
-			return
-		end
-		local weaponResult = _SkillWeaponEquipLogic:ApplyWeaponForSkill(sourceEntity, definition)
-		if weaponResult.Success == false then
-			log_warning("[SkillWeapon] skill=" .. (definition.SkillId or "") .. " unit=" .. sourceUnitId .. " reason=" .. weaponResult.Reason)
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:ApplySkillWeapon(self, sourceUnitId, sourceEntity, definition)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3706,138 +3358,26 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void SpawnSkillProjectile(string skillId, string projectileName, Vector2 startPosition, Vector2 targetPosition, number speed, string projectileRuid, number projectileScale, boolean flipX)
-		-- The model stays native-only and the mover is attached here, so a missing .codeblock can never
-		-- silently drop the component out of the spawned entity.
-		local mapEntity = self.Entity.CurrentMap
-		if mapEntity == nil then
-			log_warning("[SkillProjectile] spawn failed skill=" .. skillId .. " reason=MAP_MISSING")
-			return
-		end
-
-		local projectile = _SpawnService:SpawnByModelId(
-			self.ProjectileModelId,
-			projectileName,
-			Vector3(startPosition.x, startPosition.y, 0),
-			mapEntity
-		)
-		if isvalid(projectile) == false then
-			log_warning("[SkillProjectile] spawn failed skill=" .. skillId .. " model=" .. self.ProjectileModelId .. " reason=SPAWN_RETURNED_NIL")
-			return
-		end
-
-		local mover = projectile:AddComponent("SkillProjectileComponent")
-		if mover == nil then
-			log_warning("[SkillProjectile] spawn failed skill=" .. skillId .. " reason=COMPONENT_ATTACH_FAILED")
-			projectile:Destroy()
-			return
-		end
-		mover:Launch(startPosition, targetPosition, speed, projectileRuid, projectileScale, flipX, self.ProjectileOrderInLayer)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_SkillExecutionLogic:SpawnSkillProjectile(self, skillId, projectileName, startPosition, targetPosition, speed, projectileRuid, projectileScale, flipX)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void BeginSkillEffectPresentation(string sourceUnitId, table definition)
-		-- Plays the caster-side effect and latches the target-side effect for this action's impact frame.
-		-- Battle actions resolve strictly one at a time, so a single latched slot is enough.
-		self.ActiveEffectSkillId = definition.SkillId or ""
-		self.ActiveHitEffectRuid = definition.HitEffectRuid or ""
-		self.ActiveHitSoundRuid = definition.HitSoundRuid or ""
-		self.ActiveEffectScale = definition.EffectScale or 1
-		self.ActiveEffectFlipX = false
-
-		local sourceEntity = self:FindUnitEntity(sourceUnitId)
-		if isvalid(sourceEntity) == false then
-			return
-		end
-		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
-		if sourceUnit ~= nil then
-			self.ActiveEffectFlipX = sourceUnit.Facing == "Right"
-		end
-
-		-- The cell clip is tied to the struck cells, not the caster, so impact overrides below never mute it.
-		local cellEffectRuid = definition.CellEffectRuid or ""
-		if cellEffectRuid ~= "" then
-			local resolved = _SkillTargetResolverLogic:Resolve(self, sourceUnitId, definition)
-			local xs = {}
-			for _, cell in ipairs(resolved.TargetCellIndices or {}) do
-				table.insert(xs, self:GetCellPosition(cell).x)
-			end
-			if #xs > 0 then
-				self:PlayCellEffects(cellEffectRuid, xs, self.UnitY, self.ActiveEffectScale, self:GetSkillSpeedMultiplier())
-			end
-			log("[BattleEffect] cell effects requested skill=" .. self.ActiveEffectSkillId .. " ruid=" .. cellEffectRuid .. " cells=" .. table.concat(resolved.TargetCellIndices or {}, "|"))
-		end
-
-		local castEffectRuid = definition.CastEffectRuid or ""
-		if sourceUnit ~= nil and sourceUnit.Team == "Enemy" then
-			-- Only accepted damage emits enemy hit audio; PUSH/HEAL cannot replay it.
-			self.ActiveHitSoundRuid = ""
-			if _EnemyImpactPresentationLogic:GetHitEffect(sourceUnit.EnemyDefinitionId, definition.SkillId) ~= "" then
-				-- The old CAST is a target hit clip; its replacement belongs to the damaged avatar.
-				castEffectRuid = ""
-				self.ActiveHitEffectRuid = ""
-			end
-		end
-
-		local castSoundRuid = definition.CastSoundRuid or ""
-		if castEffectRuid == "" and castSoundRuid == "" then
-			return
-		end
-		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if sourcePresentation == nil then
-			log_warning("[BattleEffect] cast skipped unit=" .. sourceUnitId .. " skill=" .. self.ActiveEffectSkillId .. " reason=PRESENTATION_MISSING")
-			return
-		end
-		-- The sound is authored independently of the clip, so a skill with only one of the two still
-		-- presents that half; both calls no-op on an empty RUID.
-		local castFrames = definition.CastEffectFrames or ""
-		if castEffectRuid ~= "" and string.find(castFrames, "|", 1, true) ~= nil then
-			-- A frame list is a hand-built flipbook of static sprites, shown one after another on the caster.
-			sourcePresentation:PlaySkillEffectFrames(sourceUnitId, "CAST", castFrames, self.ActiveEffectScale, self.ActiveEffectFlipX, self.CastEffectFrameDuration / self:GetSkillSpeedMultiplier())
-		else
-			sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
-		end
-		sourcePresentation:PlaySkillSound(sourceUnitId, "CAST", castSoundRuid, self:GetSkillSoundVolume())
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:BeginSkillEffectPresentation(self, sourceUnitId, definition)
 	end
 
 	@ExecSpace("Client")
 	method void PlayCellEffects(string effectRuid, table xs, number y, number scale, number playRate)
-		-- Plays one non-looping clip at each given board x. Purely presentational.
-		local player = _UserService.LocalPlayer
-		if isvalid(player) == false or player.CurrentMap ~= self.Entity then return end
-		local safeScale = math.max(0.05, scale)
-		local options = {}
-		options["SortingLayer"] = self.CellEffectSortingLayer
-		options["OrderInLayer"] = self.CellEffectOrderInLayer
-		options["PlayRate"] = math.max(0.1, playRate)
-		local played = 0
-		for _, x in ipairs(xs) do
-			local serial = _EffectService:PlayEffect(effectRuid, self.Entity, Vector3(x, y, 0), 0, Vector3(safeScale, safeScale, 1), false, options)
-			if serial ~= 0 then played = played + 1 end
-		end
-		if played < #xs then
-			log_warning("[BattleEffect] cell effects partial ruid=" .. effectRuid .. " played=" .. played .. "/" .. #xs)
-		end
-		log("[BattleEffect] cell effects played ruid=" .. effectRuid .. " count=" .. played .. " y=" .. y .. " scale=" .. safeScale)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:PlayCellEffects(self, effectRuid, xs, y, scale, playRate)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void PlayActiveHitEffect(string targetUnitId)
-		-- Presents the latched hit effect and hit sound on one target at its impact frame; never gates
-		-- gameplay resolution.
-		if self.ActiveHitEffectRuid == "" and self.ActiveHitSoundRuid == "" then
-			return
-		end
-		local targetEntity = self:FindUnitEntity(targetUnitId)
-		if isvalid(targetEntity) == false then
-			return
-		end
-		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if targetPresentation == nil then
-			log_warning("[BattleEffect] hit skipped unit=" .. targetUnitId .. " skill=" .. self.ActiveEffectSkillId .. " reason=PRESENTATION_MISSING")
-			return
-		end
-		targetPresentation:PlaySkillEffect(targetUnitId, "HIT", self.ActiveHitEffectRuid, self.ActiveEffectScale, self.ActiveEffectFlipX, self:GetSkillSpeedMultiplier())
-		targetPresentation:PlaySkillSound(targetUnitId, "HIT", self.ActiveHitSoundRuid, self:GetSkillSoundVolume())
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:PlayActiveHitEffect(self, targetUnitId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3848,43 +3388,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method number GetSkillSoundVolume()
-		-- Clamped to the engine's accepted 0~1 range so a mistyped inspector value cannot mute or
-		-- distort the whole skill sound layer.
-		return math.max(0, math.min(1, self.SkillSoundVolume))
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleCombatPresentationLogic:GetSkillSoundVolume(self)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table GetSkillMotionProfile(string motionProfileId)
-		-- Authored values describe the skill at 1x; the speed multiplier scales them on the way out,
-		-- so the swing, the impact frame, and the effect play rate all move together.
-		local speed = self:GetSkillSpeedMultiplier()
-		if motionProfileId == "heavy_slash" then
-			return {
-				MotionKey = self.HeavySlashMotionKey,
-				ActionName = self.HeavySlashActionName,
-				PlayRate = self.HeavySlashMotionPlayRate * speed,
-				Duration = self.HeavySlashMotionDuration / speed,
-				ImpactDelay = self.HeavySlashImpactDelay / speed,
-				EffectPlayRate = speed
-			}
-		elseif motionProfileId == "push" then
-			return {
-				MotionKey = self.PushMotionKey,
-				ActionName = self.PushActionName,
-				PlayRate = self.PushMotionPlayRate * speed,
-				Duration = self.PushMotionDuration / speed,
-				ImpactDelay = self.PushImpactDelay / speed,
-				EffectPlayRate = speed
-			}
-		end
-		return {
-			MotionKey = self.BasicSlashMotionKey,
-			ActionName = self.BasicSlashActionName,
-			PlayRate = self.BasicSlashMotionPlayRate * speed,
-			Duration = self.BasicSlashMotionDuration / speed,
-			ImpactDelay = self.BasicSlashImpactDelay / speed,
-			EffectPlayRate = speed
-		}
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleCombatPresentationLogic:GetSkillMotionProfile(self, motionProfileId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3925,25 +3436,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void PlayAcceptedEnemyImpact(Entity sourceEntity, Entity targetEntity, string attackId)
-		-- Called once for positive damage before death cleanup; all selection uses this hit's explicit source and attack.
-		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
-		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
-		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if sourceUnit == nil or targetUnit == nil or presentation == nil then return end
-		if targetUnit.Team == "Enemy" then
-			local sound = _EnemyImpactPresentationLogic:GetDamageSound(targetUnit.EnemyDefinitionId)
-			presentation:PlaySkillSound(targetUnit.UnitId, "MONSTER_DAMAGE", sound, self:GetSkillSoundVolume())
-		elseif targetUnit.Team == "Player" and sourceUnit.Team == "Enemy" then
-			local sound = _EnemyImpactPresentationLogic:GetImpactSound(sourceUnit.EnemyDefinitionId, attackId)
-			presentation:PlaySkillSound(targetUnit.UnitId, "ENEMY_HIT", sound, self:GetSkillSoundVolume())
-			local effect = _EnemyImpactPresentationLogic:GetHitEffect(sourceUnit.EnemyDefinitionId, attackId)
-			if effect ~= "" then
-				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(attackId)
-				local scale = definition.EffectScale or 1
-				presentation:PlaySkillEffect(targetUnit.UnitId, "HIT", effect, scale, sourceUnit.Facing == "Right", self:GetSkillSpeedMultiplier())
-			end
-		end
-		log("[EnemyImpact] accepted source=" .. sourceUnit.UnitId .. " target=" .. targetUnit.UnitId .. " attack=" .. tostring(attackId))
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:PlayAcceptedEnemyImpact(self, sourceEntity, targetEntity, attackId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -3970,20 +3464,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void PresentDamageNumbers(Entity sourceEntity, Entity targetEntity, table appliedAmounts, number delayPerAttack)
-		-- Resolve cosmetic selection once; the native service spaces values inside one damage list.
-		if not isvalid(targetEntity) or appliedAmounts == nil or #appliedAmounts == 0 then return end
-		local target = targetEntity:GetComponent("script.BattleUnitComponent")
-		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if target == nil or presentation == nil then return end
-		local playerTarget = target.Team == "Player"
-		local skinId = _DamageSkinDefinitionRepositoryLogic.DefaultOutgoingSkinId
-		if playerTarget then
-			skinId = presentation.IncomingDamageSkinId
-		elseif isvalid(sourceEntity) then
-			local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
-			if sourcePresentation ~= nil then skinId = sourcePresentation.OutgoingDamageSkinId end
-		end
-		presentation:PlayDamageNumbers(target.UnitId, appliedAmounts, skinId, playerTarget, delayPerAttack)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:PresentDamageNumbers(self, sourceEntity, targetEntity, appliedAmounts, delayPerAttack)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4239,51 +3721,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void PlayEnemyAttackMotion(Entity sourceEntity, string unitId, table definition)
-		-- Priority: enemy attack -> skill caster fallback -> enemy move -> enemy idle/model.
-		if isvalid(sourceEntity) == false or definition == nil then
-			return
-		end
-		local presentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if presentation == nil then
-			return
-		end
-		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
-		local motionRuid = presentation.AttackMotionRuid or ""
-		local motionPlayRate = tonumber(presentation.AttackMotionPlayRate) or 1
-		local motionDuration = tonumber(presentation.AttackMotionDuration) or 0.35
-		local source = "ENEMY_DEFINITION"
-		if motionRuid == "" or string.find("|" .. (definition.SkillTags or "") .. "|", "|caster_motion|", 1, true) ~= nil then
-			motionRuid = definition.CasterMotionRuid or ""
-			motionPlayRate = (tonumber(definition.CasterMotionPlayRate) or 1) * 3
-			motionDuration = tonumber(definition.CasterMotionDuration) or tonumber(definition.ActionDuration) or 0.35
-			source = "SKILL_FALLBACK"
-		end
-		if motionRuid == "" then
-			motionRuid = presentation.MovementMotionRuid or ""
-			motionPlayRate = tonumber(presentation.MovementMotionPlayRate) or 1
-			source = "MOVE_FALLBACK"
-		end
-		if motionRuid == "" then
-			motionRuid = presentation.IdleMotionRuid or ""
-			motionPlayRate = tonumber(presentation.IdleMotionPlayRate) or 1
-			source = "IDLE_FALLBACK"
-		end
-		if motionRuid == "" then
-			log_warning("[EnemyAttackMotion] skipped unit=" .. unitId .. " reason=MOTION_RUID_MISSING")
-			return
-		end
-		local speed = self:GetSkillSpeedMultiplier()
-		local skillDuration = tonumber(definition.CasterMotionDuration) or tonumber(definition.ActionDuration) or 0
-		motionDuration = math.max(motionDuration, skillDuration) / speed
-		self:SendMotionPresentation(sourceEntity, "SPRITE", { UnitId = unitId, Ruid = motionRuid, PlayRate = motionPlayRate * speed, Duration = motionDuration, Facing = sourceUnit ~= nil and sourceUnit.Facing or "" })
-		log("[EnemyAttackMotion] selected unit=" .. unitId
-			.. " definition=" .. tostring(sourceUnit ~= nil and sourceUnit.EnemyDefinitionId or "")
-			.. " skill=" .. tostring(definition.SkillId)
-			.. " ruid=" .. motionRuid
-			.. " source=" .. source
-			.. " fallback=" .. tostring(source ~= "ENEMY_DEFINITION")
-			.. " facing=" .. tostring(sourceUnit ~= nil and sourceUnit.Facing or "UNKNOWN")
-			.. " duration=" .. tostring(motionDuration))
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:PlayEnemyAttackMotion(self, sourceEntity, unitId, definition)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4363,91 +3802,20 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("Client")
 	method void LockBoardCamera(number boardCenterX)
-		-- Switches away from the moving player to a fixed board-center camera target.
-		local player = _UserService.LocalPlayer
-		if isvalid(player) == false or player.CameraComponent == nil then
-			log_error("[BattleCamera] local player camera missing")
-			return
-		end
-
-		local anchor = self.Entity:GetChildByName("BattleCameraAnchor", false)
-		if isvalid(anchor) == false or anchor.CameraComponent == nil or anchor.TransformComponent == nil then
-			log_error("[BattleCamera] BattleCameraAnchor missing")
-			return
-		end
-
-		local playerCamera = player.CameraComponent
-		local boardCamera = anchor.CameraComponent
-		local anchorX = anchor.TransformComponent.WorldPosition.x
-		boardCamera.CameraOffset = Vector2(boardCenterX - anchorX, playerCamera.CameraOffset.y)
-		boardCamera.ScreenOffset = playerCamera.ScreenOffset
-		boardCamera.ZoomRatio = playerCamera.ZoomRatio
-		boardCamera.ConfineCameraArea = false
-		boardCamera.Damping = Vector2(0, 0)
-		boardCamera.DeadZone = Vector2(0, 0)
-		boardCamera.SoftZone = Vector2(0, 0)
-
-		_CameraService.TransitionBlendTime = 0
-		_CameraService:SwitchCameraTo(boardCamera)
-		log("[BattleCamera] fixed anchor active centerX=" .. boardCenterX .. " anchorX=" .. anchorX .. " offsetX=" .. boardCamera.CameraOffset.x)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:LockBoardCamera(self, boardCenterX)
 	end
 
 	@ExecSpace("Client")
 	method void StopImpactCameraShake()
-		if self.ImpactCameraShakeMidTimerId > 0 then
-			_TimerService:ClearTimer(self.ImpactCameraShakeMidTimerId)
-			self.ImpactCameraShakeMidTimerId = 0
-		end
-		if self.ImpactCameraShakeLateTimerId > 0 then
-			_TimerService:ClearTimer(self.ImpactCameraShakeLateTimerId)
-			self.ImpactCameraShakeLateTimerId = 0
-		end
-		if self.ImpactCameraShakeRestoreTimerId > 0 then
-			_TimerService:ClearTimer(self.ImpactCameraShakeRestoreTimerId)
-			self.ImpactCameraShakeRestoreTimerId = 0
-		end
-		local anchor = self.Entity:GetChildByName("BattleCameraAnchor", false)
-		if self.HasImpactCameraBaseOffset and isvalid(anchor) and anchor.CameraComponent ~= nil then
-			anchor.CameraComponent.CameraOffset = self.ImpactCameraBaseOffset
-		end
-		self.HasImpactCameraBaseOffset = false
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:StopImpactCameraShake(self)
 	end
 
 	@ExecSpace("Client")
 	method void PlayImpactCameraShake(boolean strongHit)
-		-- Reuses the fixed board camera and restores its exact offset; no camera controller is replaced.
-		self:StopImpactCameraShake()
-		local anchor = self.Entity:GetChildByName("BattleCameraAnchor", false)
-		if isvalid(anchor) == false or anchor.CameraComponent == nil then
-			return
-		end
-		local boardCamera = anchor.CameraComponent
-		local baseOffset = boardCamera.CameraOffset
-		local amplitude = strongHit and self.StrongCameraShakeAmplitude or self.NormalCameraShakeAmplitude
-		local duration = math.max(0.05, math.min(0.10, self.ImpactCameraShakeDuration))
-		self.ImpactCameraBaseOffset = baseOffset
-		self.HasImpactCameraBaseOffset = true
-		boardCamera.CameraOffset = Vector2(baseOffset.x + amplitude, baseOffset.y + amplitude * 0.35)
-		self.ImpactCameraShakeMidTimerId = _TimerService:SetTimerOnce(function()
-			if boardCamera ~= nil and isvalid(boardCamera.Entity) then
-				boardCamera.CameraOffset = Vector2(baseOffset.x - amplitude * 0.65, baseOffset.y - amplitude * 0.25)
-			end
-			self.ImpactCameraShakeMidTimerId = 0
-		end, duration * 0.34)
-		self.ImpactCameraShakeLateTimerId = _TimerService:SetTimerOnce(function()
-			if boardCamera ~= nil and isvalid(boardCamera.Entity) then
-				boardCamera.CameraOffset = Vector2(baseOffset.x + amplitude * 0.25, baseOffset.y)
-			end
-			self.ImpactCameraShakeLateTimerId = 0
-		end, duration * 0.68)
-		self.ImpactCameraShakeRestoreTimerId = _TimerService:SetTimerOnce(function()
-			if boardCamera ~= nil and isvalid(boardCamera.Entity) then
-				boardCamera.CameraOffset = baseOffset
-			end
-			self.ImpactCameraShakeRestoreTimerId = 0
-			self.HasImpactCameraBaseOffset = false
-		end, duration)
-		log("[BattleCamera] impact shake strong=" .. tostring(strongHit) .. " amplitude=" .. tostring(amplitude) .. " duration=" .. tostring(duration))
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleCombatPresentationLogic:PlayImpactCameraShake(self, strongHit)
 	end
 
 	method boolean IsValidCell(integer cellIndex)
@@ -4462,48 +3830,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void PlaceEntity(Entity targetEntity, Vector2 position)
-		-- Places Body-based players through MovementComponent and static units through TransformComponent.
-		if targetEntity == self.PlayerEntity then
-			self._T.playerGridLandingCheck = nil
-			local movement = self._T.playerGridMove
-			if movement ~= nil and movement.Entity == targetEntity and movement.ClientDriven then
-				self:FinishPlayerGridMovePresentation("AUTHORITATIVE_RELOCATION")
-			end
-			local request = self._T.lastPlayerMoveRequest
-			if request ~= nil and request.Player == targetEntity and not request.Cancelled then
-				request.Cancelled = true
-				self:ReceivePlayerMoveResult(request.Id, request.Entry, request.Context, false, true,
-					position.x, position.y, "AUTHORITATIVE_RELOCATION", targetEntity.PlayerComponent.UserId)
-			end
-		end
-		if targetEntity.MovementComponent ~= nil then
-			targetEntity.MovementComponent:SetPosition(position)
-			return
-		end
-
-		if targetEntity.TransformComponent == nil then
-			log_error("[BattleSession] TransformComponent missing entity=" .. targetEntity.Name)
-			return
-		end
-
-		local current = targetEntity.TransformComponent.Position
-		local groundVisualOffsetY = 0
-		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if presentation ~= nil then
-			groundVisualOffsetY = tonumber(presentation.GroundVisualOffsetY) or 0
-		end
-		-- UnitY is a spawn reference; unlike players, these units have no Body to settle on the floor.
-		local groundY = self.UnitY
-		local footholds = self.Entity.FootholdComponent
-		if footholds ~= nil then
-			-- Start just above the board, below upper platforms; cover the lower battle floors too.
-			local foothold = footholds:Raycast(Vector2(position.x, self.UnitY + 0.5), Vector2(0, -1), 10)
-			if foothold ~= nil and foothold:IsVertical() == false then
-				groundY = foothold:GetYByX(position.x)
-			end
-		end
-		local hopOffsetY = position.y - self.UnitY
-		targetEntity.TransformComponent.Position = Vector3(position.x, groundY + hopOffsetY + groundVisualOffsetY, current.z)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:PlaceEntity(self, targetEntity, position)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4520,230 +3848,32 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void PlayUnitMoveHop(Entity targetEntity)
-		-- Selects only presentation defaults. Per-character Presentation overrides remain authoritative.
-		if targetEntity == nil or isvalid(targetEntity) == false then
-			return
-		end
-		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
-		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if unit == nil or presentation == nil then
-			log_warning("[CharacterHopVisual] skipped reason=UNIT_PRESENTATION_UNAVAILABLE entity=" .. tostring(targetEntity.Name))
-			return
-		end
-
-		if unit.Team == "Player" then
-			local moveRequest = self._T.activePlayerMoveRequest
-			_PlayerGridMovementLogic:PlayHop(targetEntity, unit.UnitId, _PlayerGridMovementLogic:GetProfile(self), moveRequest ~= nil and moveRequest.Id or 0)
-			-- Reuse the native player jump cue once per accepted grid movement.
-			presentation:PlaySkillSound(unit.UnitId, "MOVE_JUMP", _MaplePreferencesLogic.JumpSound, self:GetSkillSoundVolume())
-			return
-		end
-
-		if unit.Team == "Enemy" and self.EnableEnemyHopVisual then
-			local movementMotionRuid = "" -- Keep the actor's sprite when no per-enemy motion is authored.
-			local movementMotionPlayRate = self.EnemyHopAnimationPlayRate
-			if presentation.MovementMotionRuid ~= nil and presentation.MovementMotionRuid ~= "" then
-				movementMotionRuid = presentation.MovementMotionRuid
-				movementMotionPlayRate = presentation.MovementMotionPlayRate
-			end
-			presentation:PlayMoveHop(
-				unit.UnitId,
-				math.max(0.12, math.min(0.16, self.EnemyHopDuration)),
-				self.EnemyHopHeight,
-				self.EnemyHopTakeoffSquashDuration,
-				self.EnemyHopLandingSquashDuration,
-				self.EnemyHopSquashXScale,
-				self.EnemyHopSquashYScale,
-				self.EnemyHopLandingXScale,
-				self.EnemyHopLandingYScale,
-				self.EnemyHopPeakProgress,
-				movementMotionRuid,
-				movementMotionPlayRate,
-				true
-			)
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:PlayUnitMoveHop(self, targetEntity)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table GetEnemyMoveHopProfile(Entity targetEntity)
-		-- Resolves one server-side snapshot for both position and client appearance timing.
-		local profile = {
-			Enabled = self.EnableEnemyHopVisual,
-			Duration = self.EnemyHopDuration,
-			Height = self.EnemyHopHeight,
-			Takeoff = self.EnemyHopTakeoffSquashDuration,
-			Landing = self.EnemyHopLandingSquashDuration,
-			SquashX = self.EnemyHopSquashXScale,
-			SquashY = self.EnemyHopSquashYScale,
-			LandingX = self.EnemyHopLandingXScale,
-			LandingY = self.EnemyHopLandingYScale,
-			Peak = self.EnemyHopPeakProgress,
-			-- A global monster clip can replace an unrelated enemy sprite. Only use per-enemy authored motion.
-			AnimationRuid = "",
-			AnimationPlayRate = self.EnemyHopAnimationPlayRate
-		}
-		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if presentation ~= nil then
-			if presentation.MovementMotionRuid ~= "" then
-				profile.AnimationRuid = presentation.MovementMotionRuid
-				profile.AnimationPlayRate = presentation.MovementMotionPlayRate
-			end
-			if presentation.UseCustomMoveHopProfile then
-				profile.Enabled = profile.Enabled and presentation.CustomMoveHopEnabled
-				profile.Duration = presentation.CustomMoveHopDuration
-				profile.Height = presentation.CustomMoveHopHeight
-				profile.Takeoff = presentation.CustomMoveHopTakeoffDuration
-				profile.Landing = presentation.CustomMoveHopLandingDuration
-				profile.SquashX = presentation.CustomMoveHopSquashScale.x
-				profile.SquashY = presentation.CustomMoveHopSquashScale.y
-				profile.LandingX = presentation.CustomMoveHopLandingScale.x
-				profile.LandingY = presentation.CustomMoveHopLandingScale.y
-				profile.Peak = presentation.CustomMoveHopPeakProgress
-				if presentation.CustomMoveHopAnimationRuid ~= "" then
-					profile.AnimationRuid = presentation.CustomMoveHopAnimationRuid
-					profile.AnimationPlayRate = presentation.CustomMoveHopAnimationPlayRate
-				end
-			end
-		end
-		local actionDuration = math.max(0.05, self.EnemyMoveActionDuration)
-		profile.Duration = profile.Enabled and math.max(actionDuration, math.max(0.12, math.min(0.16, profile.Duration))) or actionDuration
-		profile.Height = profile.Enabled and math.max(0, profile.Height) or 0
-		profile.Peak = math.max(0.45, math.min(0.55, profile.Peak))
-		return profile
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleMovementPresentationLogic:GetEnemyMoveHopProfile(self, targetEntity)
 	end
 
 	@ExecSpace("ServerOnly")
 	method boolean StartEnemyGridMovePresentation(Entity targetEntity, integer fromCell, integer toCell)
-		-- Ordinary enemy moves share the player curve, with all position axes owned by the server.
-		if isvalid(targetEntity) == false or targetEntity.TransformComponent == nil then
-			log_warning("[EnemyMoveVisual] skipped reason=TRANSFORM_UNAVAILABLE")
-			return false
-		end
-		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
-		if unit == nil or unit.IsDead or unit.IsAirborne then
-			return false
-		end
-		self:FinishEnemyGridMovePresentation("REPLACED", false)
-		local profile = self:GetEnemyMoveHopProfile(targetEntity)
-		local startPosition = self:GetCellPosition(fromCell)
-		self:PlaceEntity(targetEntity, startPosition)
-		self._T.enemyGridMove = {
-			Entity = targetEntity,
-			UnitId = unit.UnitId,
-			FromCell = fromCell,
-			ToCell = toCell,
-			StartPosition = startPosition,
-			TargetPosition = self:GetCellPosition(toCell),
-			Elapsed = 0,
-			Duration = profile.Duration,
-			Height = profile.Height,
-			Peak = profile.Peak,
-			TimerId = 0,
-			CompleteAction = nil,
-			LoggedIntermediate = false
-		}
-		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-		if presentation ~= nil and profile.Enabled then
-			presentation:PlayMoveHop(unit.UnitId, profile.Duration, profile.Height, profile.Takeoff, profile.Landing,
-				profile.SquashX, profile.SquashY, profile.LandingX, profile.LandingY, profile.Peak,
-				profile.AnimationRuid, profile.AnimationPlayRate, false)
-		end
-		log("[EnemyMoveVisual] started unit=" .. unit.UnitId .. " from=" .. tostring(fromCell)
-			.. " to=" .. tostring(toCell) .. " duration=" .. tostring(profile.Duration)
-			.. " height=" .. tostring(profile.Height) .. " curve=" .. tostring(self.MoveCurve))
-		return true
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleMovementPresentationLogic:StartEnemyGridMovePresentation(self, targetEntity, fromCell, toCell)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void UpdateEnemyGridMove(number delta)
-		-- Advances one accepted move without touching logical occupancy or emitting another move event.
-		local movement = self._T.enemyGridMove
-		if movement == nil then
-			return
-		end
-		if self.BattleResult ~= "" then
-			self:FinishEnemyGridMovePresentation("BATTLE_ENDED", false)
-			return
-		end
-		if isvalid(self.PlayerEntity) == false or self.PlayerEntity.CurrentMap ~= self.Entity then
-			self:FinishEnemyGridMovePresentation("PLAYER_LEFT_MAP", false)
-			return
-		end
-		local targetEntity = movement.Entity
-		if isvalid(targetEntity) == false or targetEntity.TransformComponent == nil then
-			self:FinishEnemyGridMovePresentation("ENTITY_REMOVED", true)
-			return
-		end
-		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
-		if unit == nil or unit.IsDead or unit.IsAirborne or unit.CellIndex ~= movement.ToCell
-			or targetEntity.CurrentMap ~= self.Entity then
-			self:FinishEnemyGridMovePresentation("UNIT_INTERRUPTED", true)
-			return
-		end
-		movement.Elapsed = movement.Elapsed + math.max(0, delta)
-		local progress = math.min(1, movement.Elapsed / movement.Duration)
-		if progress >= 1 then
-			self:FinishEnemyGridMovePresentation("VISUAL_COMPLETE", true)
-			return
-		end
-		local eased = self:EvaluatePlayerMoveCurve(progress)
-		local x = movement.StartPosition.x + (movement.TargetPosition.x - movement.StartPosition.x) * eased
-		if math.abs(movement.TargetPosition.x - x) <= math.max(0, self.MoveSnapThreshold) then
-			x = movement.TargetPosition.x
-		end
-		local yOffset = 0
-		if progress <= movement.Peak then
-			yOffset = math.sin(progress / movement.Peak * math.pi * 0.5) * movement.Height
-		else
-			yOffset = math.cos((progress - movement.Peak) / (1 - movement.Peak) * math.pi * 0.5) * movement.Height
-		end
-		self:PlaceEntity(targetEntity, Vector2(x, movement.TargetPosition.y + yOffset))
-		if movement.LoggedIntermediate == false and progress > 0 then
-			movement.LoggedIntermediate = true
-			log("[EnemyMoveVisual] intermediate unit=" .. movement.UnitId .. " progress=" .. tostring(progress)
-				.. " x=" .. tostring(x) .. " yOffset=" .. tostring(yOffset))
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:UpdateEnemyGridMove(self, delta)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void FinishEnemyGridMovePresentation(string reason, boolean completeAction)
-		-- Releases ownership before callbacks, so visual completion and fallback cannot finish twice.
-		local movement = self._T.enemyGridMove
-		if movement == nil then
-			return
-		end
-		self._T.enemyGridMove = nil
-		if movement.TimerId > 0 then
-			_TimerService:ClearTimer(movement.TimerId)
-			if self.ActionTimerId == movement.TimerId then
-				self.ActionTimerId = 0
-			end
-		end
-		local targetEntity = movement.Entity
-		if isvalid(targetEntity) then
-			local unit = targetEntity:GetComponent("script.BattleUnitComponent")
-			if targetEntity.TransformComponent ~= nil and targetEntity.CurrentMap == self.Entity then
-				local cell = unit ~= nil and unit.CellIndex or movement.ToCell
-				self:PlaceEntity(targetEntity, self:GetCellPosition(cell))
-			end
-			local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-			if presentation ~= nil then
-				presentation:StopMoveHopVisual(reason)
-			end
-		end
-		if movement.IsCharge and isvalid(targetEntity) then
-			local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
-			if presentation ~= nil then presentation:StopSpriteMotion(movement.UnitId, reason) end
-			if (reason == "VISUAL_COMPLETE" or reason == "FALLBACK_COMPLETE") and movement.Impact ~= nil and self.BattleResult == "" then
-				movement.Impact()
-			end
-		end
-		log("[EnemyMoveVisual] completed unit=" .. movement.UnitId .. " from=" .. tostring(movement.FromCell)
-			.. " to=" .. tostring(movement.ToCell) .. " reason=" .. reason .. " completeAction=" .. tostring(completeAction))
-		if completeAction and movement.CompleteAction ~= nil and self.BattleResult == ""
-			and isvalid(self.PlayerEntity) and self.PlayerEntity.CurrentMap == self.Entity then
-			movement.CompleteAction()
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:FinishEnemyGridMovePresentation(self, reason, completeAction)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -4754,159 +3884,32 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method boolean StartPlayerGridMovePresentation(Entity targetEntity, integer fromCell, integer toCell)
-		-- Ordinary moves are client-driven; skill moves retain the server's root presentation.
-		if targetEntity == nil or isvalid(targetEntity) == false then
-			log_warning("[BattleMoveVisual] start skipped because player entity is invalid")
-			return false
-		end
-
-		-- This is defensive only. The existing immediate-action lock prevents a second valid move.
-		self:FinishPlayerGridMovePresentation("REPLACED")
-		self._T.playerGridLandingCheck = nil
-
-		local startPosition = self:GetCellPosition(fromCell)
-		local targetPosition = self:GetCellPosition(toCell)
-		-- Keep the actual floor height for a deferred check, without folding the avatar hop into it.
-		local request = self._T.activePlayerMoveRequest
-		local clientDriven = request ~= nil
-		local groundY = targetEntity.TransformComponent.WorldPosition.y
-		if not clientDriven then self:PlaceEntity(targetEntity, self:GetPlayerFloorPosition(startPosition)) end
-		self._T.playerGridMove = {
-			Entity = targetEntity,
-			StartPosition = startPosition,
-			TargetPosition = targetPosition,
-			Elapsed = 0,
-			Duration = self:GetPlayerMoveDuration(),
-			FromCell = fromCell,
-			ToCell = toCell,
-			ClientDriven = clientDriven,
-			GroundY = groundY
-		}
-		if request ~= nil then
-			self._T.playerGridMove.RequestId = request.Id
-			self._T.playerGridMove.Entry = request.Entry
-			self._T.playerGridMove.Context = request.Context
-			self._T.playerGridMove.UserId = request.UserId
-		end
-		self:PlayUnitMoveHop(targetEntity)
-
-		log("[BattleMoveVisual] started from=" .. tostring(fromCell)
-			.. " to=" .. tostring(toCell)
-			.. " clientDriven=" .. tostring(clientDriven)
-			.. " duration=" .. tostring(self._T.playerGridMove.Duration)
-			.. " curve=" .. tostring(self.PlayerMoveCurve)
-			.. " snap=" .. tostring(self.MoveSnapThreshold))
-		return true
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleMovementPresentationLogic:StartPlayerGridMovePresentation(self, targetEntity, fromCell, toCell)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void UpdatePlayerGridMove(number delta)
-		local movement = self._T.playerGridMove
-		if movement == nil then
-			return
-		end
-
-		local targetEntity = movement.Entity
-		if targetEntity == nil or isvalid(targetEntity) == false then
-			self._T.playerGridMove = nil
-			log_warning("[BattleMoveVisual] cancelled because player entity became invalid")
-			return
-		end
-		if targetEntity.CurrentMap ~= self.Entity then self:FinishPlayerGridMovePresentation("MAP_LEFT") return end
-
-		local step = _PlayerGridMovementLogic:Advance(movement, delta, self.PlayerMoveCurve, self.MoveSnapThreshold)
-		if step.Complete then
-			self:FinishPlayerGridMovePresentation("VISUAL_COMPLETE")
-			return
-		end
-		if not movement.ClientDriven then self:PlaceEntity(targetEntity, self:GetPlayerFloorPosition(step.Position)) end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:UpdatePlayerGridMove(self, delta)
 	end
 
 	@ExecSpace("ServerOnly")
 	method Vector2 GetPlayerFloorPosition(Vector2 position)
-		-- The player's Body rests on the foothold below UnitY. Writing UnitY on every step frame held the root
-		-- above the floor for the whole step and dropped it back afterwards, so grid steps write the floor height.
-		local footholds = self.Entity.FootholdComponent
-		if footholds == nil then return position end
-		local foothold = footholds:Raycast(Vector2(position.x, self.UnitY + 0.5), Vector2(0, -1), 10)
-		if foothold == nil or foothold:IsVertical() then return position end
-		return Vector2(position.x, foothold:GetYByX(position.x))
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleMovementPresentationLogic:GetPlayerFloorPosition(self, position)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void FinishPlayerGridMovePresentation(string reason)
-		-- Complete the turn immediately; only an accepted ordinary landing gets a deferred position check.
-		local movement = self._T.playerGridMove
-		if movement == nil then
-			return
-		end
-
-		self._T.playerGridMove = nil
-		local targetEntity = movement.Entity
-		if targetEntity == nil or isvalid(targetEntity) == false then
-			return
-		end
-		if targetEntity.CurrentMap ~= self.Entity then
-			-- A late old-map update must never place the actor back on its former board.
-			if self.ActionTimerId > 0 then _TimerService:ClearTimer(self.ActionTimerId) self.ActionTimerId = 0 end
-			return
-		end
-
-		local targetPosition = movement.TargetPosition
-		local completed = reason == "VISUAL_COMPLETE" or reason == "ACTION_COMPLETE"
-		if movement.ClientDriven then
-			if completed then
-				targetPosition = Vector2(targetPosition.x, movement.GroundY)
-				local check = _PlayerGridMovementLogic:CreateLandingCheck(targetEntity, self.Entity, targetPosition,
-					movement.RequestId, movement.Entry, movement.Context)
-				check.ToCell = movement.ToCell
-				self._T.playerGridLandingCheck = check
-			else
-				self._T.playerGridLandingCheck = nil
-				local request = self._T.lastPlayerMoveRequest
-				if request ~= nil and request.Player == targetEntity and request.Id == movement.RequestId
-					and request.Entry == movement.Entry and request.Context == movement.Context then request.Cancelled = true end
-			end
-		else
-			self:PlaceEntity(targetEntity, self:GetPlayerFloorPosition(targetPosition))
-		end
-		if movement.RequestId ~= nil then
-			self:ReceivePlayerMoveResult(movement.RequestId, movement.Entry, movement.Context, completed, true,
-				targetPosition.x, targetPosition.y, completed and "MOVE_COMPLETE" or "AUTHORITATIVE_RELOCATION", movement.UserId)
-		end
-		log("[BattleMoveVisual] completed from=" .. tostring(movement.FromCell)
-			.. " to=" .. tostring(movement.ToCell)
-			.. " reason=" .. tostring(reason)
-			.. " targetX=" .. tostring(targetPosition.x)
-			.. " targetY=" .. tostring(targetPosition.y))
-
-		if reason == "VISUAL_COMPLETE"
-			and self.TurnState ~= nil
-			and self.TurnState.QueuedActionType == "MOVE"
-			and self.TurnState.IsActionProcessing == true then
-			if self.ActionTimerId > 0 then
-				_TimerService:ClearTimer(self.ActionTimerId)
-				self.ActionTimerId = 0
-			end
-			local completionReason = movement.CompletionReason or "MOVE_VISUAL_COMPLETE"
-			log("[BattleTurnTempo] player move completed by presentation reason=" .. completionReason)
-			self:CompleteQueuedAction("MOVE", true, completionReason)
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:FinishPlayerGridMovePresentation(self, reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void UpdatePlayerGridLandingCheck(number delta)
-		-- A newer move, relocation, death or session generation must never be overwritten by an old landing.
-		local check = self._T.playerGridLandingCheck
-		if check == nil then return end
-		local player = check.Entity
-		local unit = isvalid(player) and player:GetComponent("script.BattleUnitComponent") or nil
-		if player ~= self.PlayerEntity or check.Entry ~= self.EntryRequestId or check.Context ~= self.HudContextRevision
-			or self.BattleResult ~= "" or unit == nil or unit.IsDead or unit.CellIndex ~= check.ToCell
-			or check.ToCell < 0 or check.ToCell >= self.CellCount
-			or _PlayerGridMovementLogic:UpdateLandingCheck(check, delta) then
-			self._T.playerGridLandingCheck = nil
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleMovementPresentationLogic:UpdatePlayerGridLandingCheck(self, delta)
 	end
 
 	@ExecSpace("ServerOnly")

@@ -1,0 +1,462 @@
+@Logic
+script BattleCombatPresentationLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method number GetSkillSpeedMultiplier(any session)
+		-- An invalid inspector speed must never stall or invert skill playback.
+		return math.max(0.1, session.SkillSpeedMultiplier)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConfigureEnemyMovementPresentation(any session, Entity enemyEntity, table spawnDefinition)
+		-- Injects the complete per-enemy motion profile without changing logical combat timing.
+		if isvalid(enemyEntity) == false or spawnDefinition == nil then
+			return
+		end
+		local presentation = enemyEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			return
+		end
+		presentation.IdleMotionRuid = spawnDefinition.IdleMotionRuid or ""
+		-- Idle is the restoration baseline; only action motions receive the combat speedup.
+		presentation.IdleMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.IdleMotionPlayRate) or 1)
+		presentation.MovementMotionRuid = spawnDefinition.MoveMotionRuid or ""
+		if presentation.MovementMotionRuid == "" then
+			presentation.MovementMotionRuid = presentation.IdleMotionRuid
+		end
+		presentation.MovementMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.MoveMotionPlayRate) or 1) * 3
+		presentation.HitMotionRuid = spawnDefinition.HitMotionRuid or ""
+		presentation.HitMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.HitMotionPlayRate) or 1) * 3
+		presentation.HitMotionDuration = math.max(0.05, tonumber(spawnDefinition.HitMotionDuration) or 0.25)
+		presentation.AttackMotionRuid = spawnDefinition.AttackMotionRuid or ""
+		presentation.AttackMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.AttackMotionPlayRate) or 1) * 3
+		presentation.AttackMotionDuration = math.max(0.05, tonumber(spawnDefinition.AttackMotionDuration) or 0.35)
+		presentation.DeathMotionRuid = spawnDefinition.DeathMotionRuid or ""
+		presentation.DeathMotionPlayRate = math.max(0.1, tonumber(spawnDefinition.DeathMotionPlayRate) or 1) * 3
+		presentation.DeathMotionDuration = math.max(0.05, tonumber(spawnDefinition.DeathMotionDuration) or 0.5)
+		presentation.GroundVisualOffsetY = tonumber(spawnDefinition.VisualOffsetY) or 0
+		log("[EnemyMotionProfile] configured definition=" .. tostring(spawnDefinition.EnemyDefinitionId)
+			.. " idle=" .. tostring(presentation.IdleMotionRuid)
+			.. " move=" .. tostring(presentation.MovementMotionRuid)
+			.. " hit=" .. tostring(presentation.HitMotionRuid)
+			.. " attack=" .. tostring(presentation.AttackMotionRuid)
+			.. " death=" .. tostring(presentation.DeathMotionRuid)
+			.. " groundOffsetY=" .. tostring(presentation.GroundVisualOffsetY))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompletePlayerCombatPresentationHandoff(any session, string reason)
+		local playerEntity = session.PlayerEntity
+		if playerEntity == nil or isvalid(playerEntity) == false then
+			playerEntity = session:FindUnitEntity("player_01")
+		end
+		if playerEntity == nil or isvalid(playerEntity) == false then
+			return
+		end
+		local presentation = playerEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			presentation:CompleteCombatMotionHandoff("player_01", reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CancelPlayerCombatPresentationHandoff(any session, string reason, boolean restoreToStand)
+		session:DiscardMotionPresentationLedger()
+		local playerEntity = session.PlayerEntity
+		if playerEntity == nil or isvalid(playerEntity) == false then
+			playerEntity = session:FindUnitEntity("player_01")
+		end
+		if playerEntity == nil or isvalid(playerEntity) == false then
+			return
+		end
+		local presentation = playerEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			presentation:CancelCombatMotionHandoff("player_01", reason, restoreToStand)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PreloadSkillPresentation(any session, string ruidCsv)
+		-- Warms the client resource cache with this run's cast / hit / projectile clips.
+		-- These RUIDs are only ever assigned at cast time, so on a cold cache the renderer keeps showing
+		-- whatever it had while the clip loads -- long enough to cover a whole projectile flight. Loading
+		-- them up front is what makes the first cast of a skill look like every later one.
+		if ruidCsv == "" then
+			return
+		end
+
+		local ruids = {}
+		for ruid in string.gmatch(ruidCsv, "([^|]+)") do
+			table.insert(ruids, ruid)
+		end
+		if #ruids == 0 then
+			return
+		end
+
+		local requested = #ruids
+		log("[SkillPreload] requested count=" .. tostring(requested))
+		_ResourceService:PreloadAsync(ruids, function(results)
+			local succeeded = 0
+			local failed = 0
+			for _, status in pairs(results or {}) do
+				if status == PreloadResultStatus.Success then
+					succeeded = succeeded + 1
+				else
+					failed = failed + 1
+					log_warning("[SkillPreload] resource rejected status=" .. tostring(status))
+				end
+			end
+			-- Purely an optimisation: a failure here costs the old first-cast flicker, never gameplay.
+			log("[SkillPreload] complete requested=" .. tostring(requested) .. " success=" .. tostring(succeeded) .. " failed=" .. tostring(failed))
+		end)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplySkillWeapon(any session, string sourceUnitId, Entity sourceEntity, table definition)
+		-- Presentation-only hop into the weapon catalog. Never gates execution: a data or costume
+		-- problem downgrades to a log line and the skill still resolves.
+		if isvalid(sourceEntity) == false then
+			return
+		end
+		local weaponResult = _SkillWeaponEquipLogic:ApplyWeaponForSkill(sourceEntity, definition)
+		if weaponResult.Success == false then
+			log_warning("[SkillWeapon] skill=" .. (definition.SkillId or "") .. " unit=" .. sourceUnitId .. " reason=" .. weaponResult.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void BeginSkillEffectPresentation(any session, string sourceUnitId, table definition)
+		-- Plays the caster-side effect and latches the target-side effect for this action's impact frame.
+		-- Battle actions resolve strictly one at a time, so a single latched slot is enough.
+		session.ActiveEffectSkillId = definition.SkillId or ""
+		session.ActiveHitEffectRuid = definition.HitEffectRuid or ""
+		session.ActiveHitSoundRuid = definition.HitSoundRuid or ""
+		session.ActiveEffectScale = definition.EffectScale or 1
+		session.ActiveEffectFlipX = false
+
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			return
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit ~= nil then
+			session.ActiveEffectFlipX = sourceUnit.Facing == "Right"
+		end
+
+		-- The cell clip is tied to the struck cells, not the caster, so impact overrides below never mute it.
+		local cellEffectRuid = definition.CellEffectRuid or ""
+		if cellEffectRuid ~= "" then
+			local resolved = _SkillTargetResolverLogic:Resolve(session, sourceUnitId, definition)
+			local xs = {}
+			for _, cell in ipairs(resolved.TargetCellIndices or {}) do
+				table.insert(xs, session:GetCellPosition(cell).x)
+			end
+			if #xs > 0 then
+				session:PlayCellEffects(cellEffectRuid, xs, session.UnitY, session.ActiveEffectScale, session:GetSkillSpeedMultiplier())
+			end
+			log("[BattleEffect] cell effects requested skill=" .. session.ActiveEffectSkillId .. " ruid=" .. cellEffectRuid .. " cells=" .. table.concat(resolved.TargetCellIndices or {}, "|"))
+		end
+
+		local castEffectRuid = definition.CastEffectRuid or ""
+		if sourceUnit ~= nil and sourceUnit.Team == "Enemy" then
+			-- Only accepted damage emits enemy hit audio; PUSH/HEAL cannot replay it.
+			session.ActiveHitSoundRuid = ""
+			if _EnemyImpactPresentationLogic:GetHitEffect(sourceUnit.EnemyDefinitionId, definition.SkillId) ~= "" then
+				-- The old CAST is a target hit clip; its replacement belongs to the damaged avatar.
+				castEffectRuid = ""
+				session.ActiveHitEffectRuid = ""
+			end
+		end
+
+		local castSoundRuid = definition.CastSoundRuid or ""
+		if castEffectRuid == "" and castSoundRuid == "" then
+			return
+		end
+		local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourcePresentation == nil then
+			log_warning("[BattleEffect] cast skipped unit=" .. sourceUnitId .. " skill=" .. session.ActiveEffectSkillId .. " reason=PRESENTATION_MISSING")
+			return
+		end
+		-- The sound is authored independently of the clip, so a skill with only one of the two still
+		-- presents that half; both calls no-op on an empty RUID.
+		local castFrames = definition.CastEffectFrames or ""
+		if castEffectRuid ~= "" and string.find(castFrames, "|", 1, true) ~= nil then
+			-- A frame list is a hand-built flipbook of static sprites, shown one after another on the caster.
+			sourcePresentation:PlaySkillEffectFrames(sourceUnitId, "CAST", castFrames, session.ActiveEffectScale, session.ActiveEffectFlipX, session.CastEffectFrameDuration / session:GetSkillSpeedMultiplier())
+		else
+			sourcePresentation:PlaySkillEffect(sourceUnitId, "CAST", castEffectRuid, session.ActiveEffectScale, session.ActiveEffectFlipX, session:GetSkillSpeedMultiplier())
+		end
+		sourcePresentation:PlaySkillSound(sourceUnitId, "CAST", castSoundRuid, session:GetSkillSoundVolume())
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayCellEffects(any session, string effectRuid, table xs, number y, number scale, number playRate)
+		-- Plays one non-looping clip at each given board x. Purely presentational.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= session.Entity then return end
+		local safeScale = math.max(0.05, scale)
+		local options = {}
+		options["SortingLayer"] = session.CellEffectSortingLayer
+		options["OrderInLayer"] = session.CellEffectOrderInLayer
+		options["PlayRate"] = math.max(0.1, playRate)
+		local played = 0
+		for _, x in ipairs(xs) do
+			local serial = _EffectService:PlayEffect(effectRuid, session.Entity, Vector3(x, y, 0), 0, Vector3(safeScale, safeScale, 1), false, options)
+			if serial ~= 0 then played = played + 1 end
+		end
+		if played < #xs then
+			log_warning("[BattleEffect] cell effects partial ruid=" .. effectRuid .. " played=" .. played .. "/" .. #xs)
+		end
+		log("[BattleEffect] cell effects played ruid=" .. effectRuid .. " count=" .. played .. " y=" .. y .. " scale=" .. safeScale)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayActiveHitEffect(any session, string targetUnitId)
+		-- Presents the latched hit effect and hit sound on one target at its impact frame; never gates
+		-- gameplay resolution.
+		if session.ActiveHitEffectRuid == "" and session.ActiveHitSoundRuid == "" then
+			return
+		end
+		local targetEntity = session:FindUnitEntity(targetUnitId)
+		if isvalid(targetEntity) == false then
+			return
+		end
+		local targetPresentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if targetPresentation == nil then
+			log_warning("[BattleEffect] hit skipped unit=" .. targetUnitId .. " skill=" .. session.ActiveEffectSkillId .. " reason=PRESENTATION_MISSING")
+			return
+		end
+		targetPresentation:PlaySkillEffect(targetUnitId, "HIT", session.ActiveHitEffectRuid, session.ActiveEffectScale, session.ActiveEffectFlipX, session:GetSkillSpeedMultiplier())
+		targetPresentation:PlaySkillSound(targetUnitId, "HIT", session.ActiveHitSoundRuid, session:GetSkillSoundVolume())
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetSkillSoundVolume(any session)
+		-- Clamped to the engine's accepted 0~1 range so a mistyped inspector value cannot mute or
+		-- distort the whole skill sound layer.
+		return math.max(0, math.min(1, session.SkillSoundVolume))
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetSkillMotionProfile(any session, string motionProfileId)
+		-- Authored values describe the skill at 1x; the speed multiplier scales them on the way out,
+		-- so the swing, the impact frame, and the effect play rate all move together.
+		local speed = session:GetSkillSpeedMultiplier()
+		if motionProfileId == "heavy_slash" then
+			return {
+				MotionKey = session.HeavySlashMotionKey,
+				ActionName = session.HeavySlashActionName,
+				PlayRate = session.HeavySlashMotionPlayRate * speed,
+				Duration = session.HeavySlashMotionDuration / speed,
+				ImpactDelay = session.HeavySlashImpactDelay / speed,
+				EffectPlayRate = speed
+			}
+		elseif motionProfileId == "push" then
+			return {
+				MotionKey = session.PushMotionKey,
+				ActionName = session.PushActionName,
+				PlayRate = session.PushMotionPlayRate * speed,
+				Duration = session.PushMotionDuration / speed,
+				ImpactDelay = session.PushImpactDelay / speed,
+				EffectPlayRate = speed
+			}
+		end
+		return {
+			MotionKey = session.BasicSlashMotionKey,
+			ActionName = session.BasicSlashActionName,
+			PlayRate = session.BasicSlashMotionPlayRate * speed,
+			Duration = session.BasicSlashMotionDuration / speed,
+			ImpactDelay = session.BasicSlashImpactDelay / speed,
+			EffectPlayRate = speed
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayEnemyAttackMotion(any session, Entity sourceEntity, string unitId, table definition)
+		-- Priority: enemy attack -> skill caster fallback -> enemy move -> enemy idle/model.
+		if isvalid(sourceEntity) == false or definition == nil then
+			return
+		end
+		local presentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation == nil then
+			return
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local motionRuid = presentation.AttackMotionRuid or ""
+		local motionPlayRate = tonumber(presentation.AttackMotionPlayRate) or 1
+		local motionDuration = tonumber(presentation.AttackMotionDuration) or 0.35
+		local source = "ENEMY_DEFINITION"
+		if motionRuid == "" or string.find("|" .. (definition.SkillTags or "") .. "|", "|caster_motion|", 1, true) ~= nil then
+			motionRuid = definition.CasterMotionRuid or ""
+			motionPlayRate = (tonumber(definition.CasterMotionPlayRate) or 1) * 3
+			motionDuration = tonumber(definition.CasterMotionDuration) or tonumber(definition.ActionDuration) or 0.35
+			source = "SKILL_FALLBACK"
+		end
+		if motionRuid == "" then
+			motionRuid = presentation.MovementMotionRuid or ""
+			motionPlayRate = tonumber(presentation.MovementMotionPlayRate) or 1
+			source = "MOVE_FALLBACK"
+		end
+		if motionRuid == "" then
+			motionRuid = presentation.IdleMotionRuid or ""
+			motionPlayRate = tonumber(presentation.IdleMotionPlayRate) or 1
+			source = "IDLE_FALLBACK"
+		end
+		if motionRuid == "" then
+			log_warning("[EnemyAttackMotion] skipped unit=" .. unitId .. " reason=MOTION_RUID_MISSING")
+			return
+		end
+		local speed = session:GetSkillSpeedMultiplier()
+		local skillDuration = tonumber(definition.CasterMotionDuration) or tonumber(definition.ActionDuration) or 0
+		motionDuration = math.max(motionDuration, skillDuration) / speed
+		session:SendMotionPresentation(sourceEntity, "SPRITE", { UnitId = unitId, Ruid = motionRuid, PlayRate = motionPlayRate * speed, Duration = motionDuration, Facing = sourceUnit ~= nil and sourceUnit.Facing or "" })
+		log("[EnemyAttackMotion] selected unit=" .. unitId
+			.. " definition=" .. tostring(sourceUnit ~= nil and sourceUnit.EnemyDefinitionId or "")
+			.. " skill=" .. tostring(definition.SkillId)
+			.. " ruid=" .. motionRuid
+			.. " source=" .. source
+			.. " fallback=" .. tostring(source ~= "ENEMY_DEFINITION")
+			.. " facing=" .. tostring(sourceUnit ~= nil and sourceUnit.Facing or "UNKNOWN")
+			.. " duration=" .. tostring(motionDuration))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayAcceptedEnemyImpact(any session, Entity sourceEntity, Entity targetEntity, string attackId)
+		-- Called once for positive damage before death cleanup; all selection uses this hit's explicit source and attack.
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if sourceUnit == nil or targetUnit == nil or presentation == nil then return end
+		if targetUnit.Team == "Enemy" then
+			local sound = _EnemyImpactPresentationLogic:GetDamageSound(targetUnit.EnemyDefinitionId)
+			presentation:PlaySkillSound(targetUnit.UnitId, "MONSTER_DAMAGE", sound, session:GetSkillSoundVolume())
+		elseif targetUnit.Team == "Player" and sourceUnit.Team == "Enemy" then
+			local sound = _EnemyImpactPresentationLogic:GetImpactSound(sourceUnit.EnemyDefinitionId, attackId)
+			presentation:PlaySkillSound(targetUnit.UnitId, "ENEMY_HIT", sound, session:GetSkillSoundVolume())
+			local effect = _EnemyImpactPresentationLogic:GetHitEffect(sourceUnit.EnemyDefinitionId, attackId)
+			if effect ~= "" then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(attackId)
+				local scale = definition.EffectScale or 1
+				presentation:PlaySkillEffect(targetUnit.UnitId, "HIT", effect, scale, sourceUnit.Facing == "Right", session:GetSkillSpeedMultiplier())
+			end
+		end
+		log("[EnemyImpact] accepted source=" .. sourceUnit.UnitId .. " target=" .. targetUnit.UnitId .. " attack=" .. tostring(attackId))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FlushDamageNumberBatch(any session, table batch)
+		-- Consume before dispatch so a reentrant callback cannot display the same hits twice.
+		if batch == nil or batch.Damages == nil or #batch.Damages == 0 then return end
+		local amounts = batch.Damages
+		batch.Damages = {}
+		session:PresentDamageNumbers(session:FindUnitEntity(batch.SourceUnitId), session:FindUnitEntity(batch.TargetUnitId), amounts, 0.08)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PresentDamageNumbers(any session, Entity sourceEntity, Entity targetEntity, table appliedAmounts, number delayPerAttack)
+		-- Resolve cosmetic selection once; the native service spaces values inside one damage list.
+		if not isvalid(targetEntity) or appliedAmounts == nil or #appliedAmounts == 0 then return end
+		local target = targetEntity:GetComponent("script.BattleUnitComponent")
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if target == nil or presentation == nil then return end
+		local playerTarget = target.Team == "Player"
+		local skinId = _DamageSkinDefinitionRepositoryLogic.DefaultOutgoingSkinId
+		if playerTarget then
+			skinId = presentation.IncomingDamageSkinId
+		elseif isvalid(sourceEntity) then
+			local sourcePresentation = sourceEntity:GetComponent("script.BattleUnitPresentationComponent")
+			if sourcePresentation ~= nil then skinId = sourcePresentation.OutgoingDamageSkinId end
+		end
+		presentation:PlayDamageNumbers(target.UnitId, appliedAmounts, skinId, playerTarget, delayPerAttack)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void LockBoardCamera(any session, number boardCenterX)
+		-- Switches away from the moving player to a fixed board-center camera target.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CameraComponent == nil then
+			log_error("[BattleCamera] local player camera missing")
+			return
+		end
+
+		local anchor = session.Entity:GetChildByName("BattleCameraAnchor", false)
+		if isvalid(anchor) == false or anchor.CameraComponent == nil or anchor.TransformComponent == nil then
+			log_error("[BattleCamera] BattleCameraAnchor missing")
+			return
+		end
+
+		local playerCamera = player.CameraComponent
+		local boardCamera = anchor.CameraComponent
+		local anchorX = anchor.TransformComponent.WorldPosition.x
+		boardCamera.CameraOffset = Vector2(boardCenterX - anchorX, playerCamera.CameraOffset.y)
+		boardCamera.ScreenOffset = playerCamera.ScreenOffset
+		boardCamera.ZoomRatio = playerCamera.ZoomRatio
+		boardCamera.ConfineCameraArea = false
+		boardCamera.Damping = Vector2(0, 0)
+		boardCamera.DeadZone = Vector2(0, 0)
+		boardCamera.SoftZone = Vector2(0, 0)
+
+		_CameraService.TransitionBlendTime = 0
+		_CameraService:SwitchCameraTo(boardCamera)
+		log("[BattleCamera] fixed anchor active centerX=" .. boardCenterX .. " anchorX=" .. anchorX .. " offsetX=" .. boardCamera.CameraOffset.x)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StopImpactCameraShake(any session)
+		if session.ImpactCameraShakeMidTimerId > 0 then
+			_TimerService:ClearTimer(session.ImpactCameraShakeMidTimerId)
+			session.ImpactCameraShakeMidTimerId = 0
+		end
+		if session.ImpactCameraShakeLateTimerId > 0 then
+			_TimerService:ClearTimer(session.ImpactCameraShakeLateTimerId)
+			session.ImpactCameraShakeLateTimerId = 0
+		end
+		if session.ImpactCameraShakeRestoreTimerId > 0 then
+			_TimerService:ClearTimer(session.ImpactCameraShakeRestoreTimerId)
+			session.ImpactCameraShakeRestoreTimerId = 0
+		end
+		local anchor = session.Entity:GetChildByName("BattleCameraAnchor", false)
+		if session.HasImpactCameraBaseOffset and isvalid(anchor) and anchor.CameraComponent ~= nil then
+			anchor.CameraComponent.CameraOffset = session.ImpactCameraBaseOffset
+		end
+		session.HasImpactCameraBaseOffset = false
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PlayImpactCameraShake(any session, boolean strongHit)
+		-- Reuses the fixed board camera and restores its exact offset; no camera controller is replaced.
+		session:StopImpactCameraShake()
+		local anchor = session.Entity:GetChildByName("BattleCameraAnchor", false)
+		if isvalid(anchor) == false or anchor.CameraComponent == nil then
+			return
+		end
+		local boardCamera = anchor.CameraComponent
+		local baseOffset = boardCamera.CameraOffset
+		local amplitude = strongHit and session.StrongCameraShakeAmplitude or session.NormalCameraShakeAmplitude
+		local duration = math.max(0.05, math.min(0.10, session.ImpactCameraShakeDuration))
+		session.ImpactCameraBaseOffset = baseOffset
+		session.HasImpactCameraBaseOffset = true
+		boardCamera.CameraOffset = Vector2(baseOffset.x + amplitude, baseOffset.y + amplitude * 0.35)
+		session.ImpactCameraShakeMidTimerId = _TimerService:SetTimerOnce(function()
+			if boardCamera ~= nil and isvalid(boardCamera.Entity) then
+				boardCamera.CameraOffset = Vector2(baseOffset.x - amplitude * 0.65, baseOffset.y - amplitude * 0.25)
+			end
+			session.ImpactCameraShakeMidTimerId = 0
+		end, duration * 0.34)
+		session.ImpactCameraShakeLateTimerId = _TimerService:SetTimerOnce(function()
+			if boardCamera ~= nil and isvalid(boardCamera.Entity) then
+				boardCamera.CameraOffset = Vector2(baseOffset.x + amplitude * 0.25, baseOffset.y)
+			end
+			session.ImpactCameraShakeLateTimerId = 0
+		end, duration * 0.68)
+		session.ImpactCameraShakeRestoreTimerId = _TimerService:SetTimerOnce(function()
+			if boardCamera ~= nil and isvalid(boardCamera.Entity) then
+				boardCamera.CameraOffset = baseOffset
+			end
+			session.ImpactCameraShakeRestoreTimerId = 0
+			session.HasImpactCameraBaseOffset = false
+		end, duration)
+		log("[BattleCamera] impact shake strong=" .. tostring(strongHit) .. " amplitude=" .. tostring(amplitude) .. " duration=" .. tostring(duration))
+	end
+
+end

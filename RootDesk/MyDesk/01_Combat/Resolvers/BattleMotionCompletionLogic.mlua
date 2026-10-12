@@ -1,0 +1,339 @@
+@Logic
+script BattleMotionCompletionLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method void ClearMotionCompletionWaits(any session)
+		-- Entry changes invalidate every outstanding presentation acknowledgement.
+		for _, wait in pairs(session._T.motionCompletionWaits or {}) do
+			_TimerService:ClearTimer(wait.TimerId)
+			if wait.ProducerTimerId > 0 then _TimerService:ClearTimer(wait.ProducerTimerId) end
+			if wait.RetryTimerId > 0 then _TimerService:ClearTimer(wait.RetryTimerId) end
+		end
+		session._T.motionCompletionWaits = {}
+		session._T.waveMotionCompletion = nil
+		if isvalid(session.PlayerEntity) and session.PlayerEntity.PlayerComponent ~= nil then
+			session:CancelClientMotionCompletionWaits(session._T.motionCompletionSequence or 0, session.PlayerEntity.PlayerComponent.UserId)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelClientMotionCompletionWaits(any session, integer throughSequence)
+		session._T.clientCancelledMotionSequence = math.max(session._T.clientCancelledMotionSequence or 0, throughSequence)
+		for sequence, wait in pairs(session._T.clientMotionCompletionWaits or {}) do
+			if sequence <= throughSequence then
+				if wait.TimerId > 0 then _TimerService:ClearTimer(wait.TimerId) end
+				session._T.clientMotionCompletionWaits[sequence] = nil
+			end
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetMotionPresentationLedger(any session)
+		local ledger = session._T.motionPresentationLedger
+		if ledger == nil or ledger.Entry ~= session.EntryRequestId then
+			session._T.motionPresentationEpoch = (session._T.motionPresentationEpoch or 0) + 1
+			ledger = { Entry = session.EntryRequestId, Epoch = session._T.motionPresentationEpoch, Count = 0, Records = {} }
+			session._T.motionPresentationLedger = ledger
+		end
+		return ledger
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DiscardMotionPresentationLedger(any session)
+		local ledger = session._T.motionPresentationLedger
+		session:ClearMotionCompletionWaits()
+		session._T.motionPresentationLedger = nil
+		if ledger ~= nil and isvalid(session.PlayerEntity) and session.PlayerEntity.PlayerComponent ~= nil then
+			session:DiscardClientMotionPresentationLedger(ledger.Epoch, session.PlayerEntity.PlayerComponent.UserId)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DiscardClientMotionPresentationLedger(any session, integer throughEpoch)
+		session._T.clientDiscardedMotionEpoch = math.max(session._T.clientDiscardedMotionEpoch or 0, throughEpoch)
+		local ledger = session._T.clientMotionPresentationLedger
+		if ledger ~= nil and ledger.Epoch <= throughEpoch then
+			for _, wait in pairs(session._T.clientMotionCompletionWaits or {}) do
+				if wait.TimerId > 0 then _TimerService:ClearTimer(wait.TimerId) end
+			end
+			session._T.clientMotionCompletionWaits = {}
+			session._T.clientMotionPresentationLedger = nil
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SendMotionPresentation(any session, Entity unitEntity, string kind, table data)
+		-- Each visual launch is counted before dispatch, including queued HIT and synchronized deaths.
+		if isvalid(unitEntity) == false or isvalid(session.PlayerEntity) == false or session.PlayerEntity.PlayerComponent == nil or session.PlayerEntity.CurrentMap ~= session.Entity then return end
+		local recipientUserId = session.PlayerEntity.PlayerComponent.UserId
+		if unitEntity:GetComponent("script.BattleUnitPresentationComponent") == nil then return end
+		local ledger = session:GetMotionPresentationLedger()
+		ledger.Count = ledger.Count + 1
+		local receipt = ledger.Count
+		ledger.Records[receipt] = { Entity = unitEntity, Kind = kind, Data = data }
+		session:ReceiveMotionPresentation(unitEntity, kind, data, receipt, ledger.Entry, ledger.Epoch)
+		-- A late producer invalidates an earlier acknowledgement until this new launch has arrived.
+		for sequence, wait in pairs(session._T.motionCompletionWaits or {}) do
+			if wait.Entry == ledger.Entry and wait.Epoch == ledger.Epoch and wait.Sealed then
+				wait.ExpectedReceipts = receipt
+				wait.ClientReady = false
+				session:AwaitClientMotionCompletion(sequence, wait.Entry, wait.Epoch, receipt, recipientUserId)
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetClientMotionPresentationLedger(any session, integer entry, integer epoch)
+		-- RPC epochs, rather than arrival of a synchronized property, identify the active presentation entry.
+		if epoch <= (session._T.clientDiscardedMotionEpoch or 0) then return nil end
+		local ledger = session._T.clientMotionPresentationLedger
+		if ledger ~= nil and epoch < ledger.Epoch then return nil end
+		if ledger == nil or epoch > ledger.Epoch then
+			for _, wait in pairs(session._T.clientMotionCompletionWaits or {}) do
+				if wait.TimerId > 0 then _TimerService:ClearTimer(wait.TimerId) end
+			end
+			session._T.clientMotionCompletionWaits = {}
+			ledger = { Entry = entry, Epoch = epoch, Count = 0, Seen = {}, Presentations = {}, Included = {} }
+			session._T.clientMotionPresentationLedger = ledger
+			local presentations = session.Entity:GetChildComponentsByTypeName("script.BattleUnitPresentationComponent", true)
+			for _, presentation in pairs(presentations) do
+				presentation._T.confirmedDeathAwaitSync = false
+				ledger.Included[presentation] = true
+				table.insert(ledger.Presentations, presentation)
+			end
+			local player = _UserService.LocalPlayer
+			local presentation = isvalid(player) and player:GetComponent("script.BattleUnitPresentationComponent") or nil
+			if presentation ~= nil and ledger.Included[presentation] ~= true then
+				presentation._T.confirmedDeathAwaitSync = false
+				ledger.Included[presentation] = true
+				table.insert(ledger.Presentations, presentation)
+			end
+		end
+		if ledger.Entry ~= entry then return nil end
+		return ledger
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ReceiveMotionPresentation(any session, Entity unitEntity, string kind, table data, integer receipt, integer entry, integer epoch)
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= session.Entity then return end
+		local ledger = session:GetClientMotionPresentationLedger(entry, epoch)
+		if ledger == nil or ledger.Seen[receipt] then return end
+		local presentation = isvalid(unitEntity) and unitEntity.CurrentMap == session.Entity and unitEntity:GetComponent("script.BattleUnitPresentationComponent") or nil
+		-- Replication may create the target after this RPC. Leave it missing so the replay can start it.
+		if presentation == nil then return end
+		ledger.Seen[receipt] = "STARTING"
+		if presentation ~= nil then
+			if ledger.Included[presentation] ~= true then
+				ledger.Included[presentation] = true
+				table.insert(ledger.Presentations, presentation)
+			end
+			if kind == "COMBAT" then
+				presentation:PlayCombatMotion(data.UnitId, data.MotionKey, data.ActionName, data.PlayRate, data.Duration, false)
+			elseif kind == "SPRITE" then
+				presentation:PlaySpriteMotion(data.UnitId, data.Ruid, data.PlayRate, data.Duration, data.Facing, false)
+			elseif kind == "HIT" then
+				presentation:PlayHitImpact(data.UnitId, data.Strong, data.NormalStop, data.StrongStop, data.Reaction, data.Flash, data.SkipMotion)
+			elseif kind == "DEATH" then
+				presentation:RefreshDefeatedDisplay(data.UnitId, data.Team, true)
+				local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+				presentation._T.confirmedDeathAwaitSync = unit == nil or unit.IsDead ~= true
+				presentation._T.confirmedDeathIdentity = { UnitId = data.UnitId, Team = data.Team }
+			end
+		end
+		-- Count only after the launch was dispatched locally; queued motions still count as pending.
+		ledger.Seen[receipt] = true
+		ledger.Count = ledger.Count + 1
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelMotionPresentationReceipt(any session, integer receipt, integer entry, integer epoch)
+		-- Only the server can classify a launch as unnecessary because its target was removed.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= session.Entity then return end
+		local ledger = session:GetClientMotionPresentationLedger(entry, epoch)
+		if ledger == nil or ledger.Seen[receipt] then return end
+		ledger.Seen[receipt] = true
+		ledger.Count = ledger.Count + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer BeginMotionCompletionWait(any session, any complete)
+		if isvalid(session.PlayerEntity) == false or session.PlayerEntity.PlayerComponent == nil or session.PlayerEntity.CurrentMap ~= session.Entity then return 0 end
+		session._T.motionCompletionSequence = (session._T.motionCompletionSequence or 0) + 1
+		local sequence = session._T.motionCompletionSequence
+		local ledger = session:GetMotionPresentationLedger()
+		local entry = ledger.Entry
+		session._T.motionCompletionWaits = session._T.motionCompletionWaits or {}
+		local wait = { Complete = complete, Entry = entry, Epoch = ledger.Epoch, TimerId = 0, ProducerTimerId = 0, RetryTimerId = 0, ServerReady = false, ClientReady = false, Sealed = false, ExpectedReceipts = -1 }
+		session._T.motionCompletionWaits[sequence] = wait
+		local retry = nil
+		retry = function()
+			if session._T.motionCompletionWaits[sequence] ~= wait then return end
+			if session.EntryRequestId ~= entry then session:ClearMotionCompletionWaits(); return end
+			if isvalid(session.PlayerEntity) == false or session.PlayerEntity.PlayerComponent == nil or session.PlayerEntity.CurrentMap ~= session.Entity then
+				session:DiscardMotionPresentationLedger()
+				return
+			end
+			session:AwaitClientMotionCompletion(sequence, entry, wait.Epoch, wait.ExpectedReceipts, session.PlayerEntity.PlayerComponent.UserId)
+			wait.RetryTimerId = _TimerService:SetTimerOnce(retry, 1)
+		end
+		-- Retrying is safe: launches and acknowledgements are deduplicated by epoch/receipt/sequence.
+		retry()
+		return sequence
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SealMotionCompletionWait(any session, integer sequence)
+		local wait = session._T.motionCompletionWaits ~= nil and session._T.motionCompletionWaits[sequence] or nil
+		if wait == nil or wait.Entry ~= session.EntryRequestId then return end
+		if isvalid(session.PlayerEntity) == false or session.PlayerEntity.PlayerComponent == nil or session.PlayerEntity.CurrentMap ~= session.Entity then return end
+		local ledger = session:GetMotionPresentationLedger()
+		wait.Sealed = true
+		wait.ExpectedReceipts = ledger.Count
+		session:AwaitClientMotionCompletion(sequence, wait.Entry, wait.Epoch, ledger.Count, session.PlayerEntity.PlayerComponent.UserId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SealMotionCompletionWhenImpactsFinish(any session, integer sequence)
+		local wait = session._T.motionCompletionWaits ~= nil and session._T.motionCompletionWaits[sequence] or nil
+		if wait == nil or wait.Entry ~= session.EntryRequestId then return end
+		wait.ProducerTimerId = 0
+		if session.ImpactTimerId > 0 then
+			wait.ProducerTimerId = _TimerService:SetTimerOnce(function() session:SealMotionCompletionWhenImpactsFinish(sequence) end, 0.02)
+			return
+		end
+		session:SealMotionCompletionWait(sequence)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void MarkMotionCompletionReady(any session, integer sequence)
+		local wait = session._T.motionCompletionWaits ~= nil and session._T.motionCompletionWaits[sequence] or nil
+		if wait == nil then return end
+		if wait.ServerReady then return end
+		wait.ServerReady = true
+		-- The emergency timeout starts after the server lower bound, never during an unfinished impact.
+		wait.TimerId = _TimerService:SetTimerOnce(function()
+			if session._T.motionCompletionWaits[sequence] ~= wait then return end
+			if wait.Entry ~= session.EntryRequestId or isvalid(session.PlayerEntity) == false or session.PlayerEntity.PlayerComponent == nil or session.PlayerEntity.CurrentMap ~= session.Entity then return end
+			if not wait.Sealed then return end
+			session._T.motionCompletionWaits[sequence] = nil
+			if wait.ProducerTimerId > 0 then _TimerService:ClearTimer(wait.ProducerTimerId) end
+			if wait.RetryTimerId > 0 then _TimerService:ClearTimer(wait.RetryTimerId) end
+			session:CancelClientMotionCompletionWaits(sequence, session.PlayerEntity.PlayerComponent.UserId)
+			log_warning("[BattleMotionGate] acknowledgement timeout sequence=" .. sequence)
+			wait.Complete()
+		end, 60)
+		session:TryReleaseMotionCompletionWait(sequence)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryReleaseMotionCompletionWait(any session, integer sequence)
+		local wait = session._T.motionCompletionWaits ~= nil and session._T.motionCompletionWaits[sequence] or nil
+		if wait == nil or not wait.ServerReady or not wait.ClientReady or not wait.Sealed then return end
+		if wait.Entry ~= session.EntryRequestId or isvalid(session.PlayerEntity) == false or session.PlayerEntity.PlayerComponent == nil or session.PlayerEntity.CurrentMap ~= session.Entity then return end
+		if session:GetMotionPresentationLedger().Count ~= wait.ExpectedReceipts then return end
+		session._T.motionCompletionWaits[sequence] = nil
+		_TimerService:ClearTimer(wait.TimerId)
+		if wait.ProducerTimerId > 0 then _TimerService:ClearTimer(wait.ProducerTimerId) end
+		if wait.RetryTimerId > 0 then _TimerService:ClearTimer(wait.RetryTimerId) end
+		session:CancelClientMotionCompletionWaits(sequence, session.PlayerEntity.PlayerComponent.UserId)
+		log("[BattleMotionGate] released sequence=" .. sequence)
+		wait.Complete()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void WaitForMotionCompletion(any session, any complete)
+		local sequence = session:BeginMotionCompletionWait(complete)
+		session:SealMotionCompletionWhenImpactsFinish(sequence)
+		session:MarkMotionCompletionReady(sequence)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void AwaitClientMotionCompletion(any session, integer sequence, integer entry, integer epoch, integer expectedReceipts)
+		-- The final launch count seals the producer: an empty scene before delayed RPCs arrive is not completion.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.CurrentMap ~= session.Entity then return end
+		if sequence <= (session._T.clientCancelledMotionSequence or 0) then return end
+		local ledger = session:GetClientMotionPresentationLedger(entry, epoch)
+		if ledger == nil then return end
+		session._T.clientMotionCompletionWaits = session._T.clientMotionCompletionWaits or {}
+		local wait = session._T.clientMotionCompletionWaits[sequence]
+		if wait == nil then
+			wait = { Entry = entry, Epoch = epoch, ExpectedReceipts = -1, TimerId = 0, AckedCount = -1, LastReplay = _UtilLogic.ElapsedSeconds }
+			session._T.clientMotionCompletionWaits[sequence] = wait
+		end
+		if wait.Entry ~= entry or wait.Epoch ~= epoch then return end
+		wait.ExpectedReceipts = math.max(wait.ExpectedReceipts, expectedReceipts)
+		if wait.ExpectedReceipts >= 0 and wait.AckedCount == wait.ExpectedReceipts then
+			session:ConfirmMotionCompletion(sequence, entry, epoch, wait.AckedCount)
+			return
+		end
+		if wait.TimerId > 0 then return end
+		local poll = nil
+		poll = function()
+			wait.TimerId = 0
+			if session._T.clientMotionCompletionWaits[sequence] ~= wait or session._T.clientMotionPresentationLedger ~= ledger then return end
+			if isvalid(session.Entity) == false or isvalid(player) == false or player.CurrentMap ~= session.Entity then
+				session._T.clientMotionCompletionWaits[sequence] = nil
+				return
+			end
+			local busy = wait.ExpectedReceipts < 0 or ledger.Count < wait.ExpectedReceipts
+			if busy == false then
+				for _, presentation in ipairs(ledger.Presentations) do
+					if isvalid(presentation.Entity) and presentation.Entity.CurrentMap == session.Entity then
+						if presentation._T.confirmedDeathAwaitSync then
+							local unit = presentation.Entity:GetComponent("script.BattleUnitComponent")
+							if unit == nil or unit.IsDead ~= true then busy = true break end
+							-- An older presentation can clear death state on an earlier HP sync.
+							local motion = presentation._T.fullMotion
+							if (motion ~= nil and (motion.Kind == "DEATH" or motion.Kind == "AVATAR_DEATH")) or (presentation.DeathMotionTimerId or 0) > 0 then
+								presentation.DeathMotionActive = true
+							end
+							local identity = presentation._T.confirmedDeathIdentity
+							presentation:RefreshDefeatedDisplay(identity ~= nil and identity.UnitId or unit.UnitId, identity ~= nil and identity.Team or unit.Team, true)
+							presentation._T.confirmedDeathAwaitSync = false
+							presentation._T.confirmedDeathIdentity = nil
+						end
+						if presentation:IsFullMotionPending() then busy = true break end
+					end
+				end
+			elseif wait.ExpectedReceipts >= 0 and _UtilLogic.ElapsedSeconds - wait.LastReplay >= 0.5 then
+				local missing = {}
+				for receipt = 1, wait.ExpectedReceipts do
+					if not ledger.Seen[receipt] then table.insert(missing, tostring(receipt)) end
+					if #missing >= 64 then break end
+				end
+				wait.LastReplay = _UtilLogic.ElapsedSeconds
+				session:RequestMissingMotionPresentations(sequence, entry, epoch, table.concat(missing, "|"))
+			end
+			if busy == false then
+				wait.AckedCount = wait.ExpectedReceipts
+				session:ConfirmMotionCompletion(sequence, entry, epoch, wait.ExpectedReceipts)
+				return
+			end
+			wait.TimerId = _TimerService:SetTimerOnce(poll, 0.01)
+		end
+		wait.TimerId = _TimerService:SetTimerOnce(poll, 0.01)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResendMissingMotionPresentations(any session, table ledger, table wait, integer entry, integer epoch, string missingReceipts, string recipientUserId)
+		-- Replays only receipts allowed by the validated server-owned gate.
+		local count = 0
+		for value in string.gmatch(missingReceipts or "", "([^|]+)") do
+			local receipt = tonumber(value)
+			local record = receipt ~= nil and receipt >= 1 and receipt <= wait.ExpectedReceipts and ledger.Records[receipt] or nil
+			if record ~= nil then
+				if isvalid(record.Entity) == false or record.Entity.CurrentMap ~= session.Entity or record.Entity:GetComponent("script.BattleUnitPresentationComponent") == nil then
+					session:CancelMotionPresentationReceipt(receipt, entry, epoch, recipientUserId)
+				else
+					session:ReceiveMotionPresentation(record.Entity, record.Kind, record.Data, receipt, entry, epoch, recipientUserId)
+				end
+			end
+			count = count + 1
+			if count >= 64 then return end
+		end
+	end
+
+end
