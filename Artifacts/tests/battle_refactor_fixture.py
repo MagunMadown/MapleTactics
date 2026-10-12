@@ -5,6 +5,7 @@ import re
 ROOT = Path(__file__).resolve().parents[2]
 OWNERS = (
     "Resolvers/BattleUiStateLogic",
+    "Resolvers/BattleMovementLogic",
     "Skills/SkillExecutionLogic",
     "Skills/SkillTargetResolverLogic",
     "Resolvers/EnemyPlanningLogic",

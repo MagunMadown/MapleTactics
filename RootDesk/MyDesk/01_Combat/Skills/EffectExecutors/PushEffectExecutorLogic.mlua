@@ -33,12 +33,12 @@ script PushEffectExecutorLogic extends Logic
 			local pushResult = nil
 			if isTurn then
 				-- TURN_TARGET flips the target's facing in place (it has to turn back before it can strike again).
-				pushResult = context.BattleSession:ResolveTurnImpactOnTarget(context.SourceUnitId, targetUnitId)
+				pushResult = self:ResolveTurnImpactOnTarget(context.BattleSession, context.SourceUnitId, targetUnitId)
 			elseif isPull then
 				-- PULL drags the target to Value cells in front of the caster (1 = right in front).
-				pushResult = context.BattleSession:ResolvePullImpactOnTarget(context.SourceUnitId, targetUnitId, math.max(1, math.floor(tonumber(effectStep.Value) or 1)))
+				pushResult = self:ResolvePullImpactOnTarget(context.BattleSession, context.SourceUnitId, targetUnitId, math.max(1, math.floor(tonumber(effectStep.Value) or 1)))
 			else
-				pushResult = context.BattleSession:ResolvePushImpactOnTarget(context.SourceUnitId, targetUnitId)
+				pushResult = self:ResolvePushImpactOnTarget(context.BattleSession, context.SourceUnitId, targetUnitId)
 			end
 			table.insert(result.Results, pushResult)
 			-- An earlier DAMAGE step of the same skill may have killed this target; that is a miss, not an error.
@@ -57,6 +57,287 @@ script PushEffectExecutorLogic extends Logic
 		result.Success = true
 		local resolvedReason = isTurn and "TURN_RESOLVED" or (isPull and "PULL_RESOLVED" or "PUSH_RESOLVED")
 		result.Reason = result.Hit and resolvedReason or "MISS_EMPTY"
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolvePushImpact(any session, string sourceUnitId)
+		-- Re-resolves the front target and moves it one logical cell away from the source.
+		local result = {
+			Success = false,
+			Hit = false,
+			Reason = "UNKNOWN",
+			SourceUnitId = sourceUnitId,
+			TargetUnitId = "",
+			TargetCell = -1,
+			FromCell = -1,
+			ToCell = -1
+		}
+
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil then
+			result.Reason = "SOURCE_COMPONENT_MISSING"
+			return result
+		end
+		if session:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if sourceUnit.IsDead == true then
+			result.Reason = "SOURCE_DEAD"
+			return result
+		end
+
+		local direction = -1
+		if sourceUnit.Facing == "Right" then
+			direction = 1
+		end
+		result.TargetCell = sourceUnit.CellIndex + direction
+		local targetEntity = session:ResolveFrontTarget(sourceUnitId)
+		if isvalid(targetEntity) == false then
+			result.Success = true
+			result.Reason = session:IsValidCell(result.TargetCell) and "MISS_EMPTY" or "MISS_OUT_OF_BOUNDS"
+			log("[BattlePush] resolved source=" .. sourceUnitId .. " target= cell=" .. result.TargetCell .. " reason=" .. result.Reason)
+			return result
+		end
+
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		result.Hit = true
+		result.TargetUnitId = targetUnit.UnitId
+		result.FromCell = targetUnit.CellIndex
+		result.ToCell = targetUnit.CellIndex + direction
+		if targetUnit.Team == "Enemy" and _EnemyTraitRouterLogic:BlocksForcedDisplacement(targetUnit.EnemyTraitIds) then
+			result.Success = true
+			result.ToCell = result.FromCell
+			result.Reason = "PUSH_BLOCKED_HEAVY_TRAIT"
+			log("[EnemyTrait] HEAVY blocked push target=" .. result.TargetUnitId .. " cell=" .. result.FromCell)
+			return result
+		end
+		if session:IsValidCell(result.ToCell) == false then
+			result.Success = true
+			result.Reason = "PUSH_BLOCKED_OUT_OF_BOUNDS"
+			log("[BattlePush] resolved source=" .. sourceUnitId .. " target=" .. result.TargetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+			return result
+		end
+		if session:IsCellOccupied(result.ToCell, targetUnit.UnitId) then
+			result.Success = true
+			result.Reason = "PUSH_BLOCKED_OCCUPIED"
+			log("[BattlePush] resolved source=" .. sourceUnitId .. " target=" .. result.TargetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+			session:ApplyPushCollisionDamage(sourceUnitId, targetUnit, result.ToCell)
+			return result
+		end
+
+		local cellChange = targetUnit:ApplyCellChange(result.ToCell)
+		if cellChange.Success == false then
+			result.Success = false
+			result.Reason = cellChange.Reason
+			return result
+		end
+		session:PlaceEntity(targetEntity, session:GetCellPosition(result.ToCell))
+		local movedEvent = UnitMovedEvent()
+		movedEvent.UnitId = targetUnit.UnitId
+		movedEvent.FromCell = result.FromCell
+		movedEvent.ToCell = result.ToCell
+		session.Entity:SendEvent(movedEvent)
+
+		result.Success = true
+		result.Reason = "PUSHED"
+		log("[BattlePush] resolved source=" .. sourceUnitId .. " target=" .. result.TargetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolvePushImpactOnTarget(any session, string sourceUnitId, string targetUnitId)
+		-- Applies the existing one-cell push rule to a target already selected by SkillTargetResolverLogic.
+		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, TargetUnitId = targetUnitId, TargetCell = -1, FromCell = -1, ToCell = -1 }
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		local targetEntity = session:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false then
+			result.Reason = "SOURCE_NOT_FOUND"
+			return result
+		end
+		if isvalid(targetEntity) == false then
+			result.Reason = "TARGET_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if session:IsTeamTurn(sourceUnit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
+			result.Reason = "TARGET_SAME_TEAM"
+			return result
+		end
+
+		-- Push away from the caster, so a target behind it (a negative RANGE_OFFSETS entry) is not pushed into the caster.
+		local direction = sourceUnit.Facing == "Right" and 1 or -1
+		if targetUnit.CellIndex ~= sourceUnit.CellIndex then
+			direction = targetUnit.CellIndex > sourceUnit.CellIndex and 1 or -1
+		end
+		result.Hit = true
+		result.TargetCell = targetUnit.CellIndex
+		result.FromCell = targetUnit.CellIndex
+		result.ToCell = targetUnit.CellIndex + direction
+		-- The impact lands even when displacement is later blocked, so present the hit before those branches.
+		session:PlayActiveHitEffect(targetUnitId)
+		if targetUnit.Team == "Enemy" and _EnemyTraitRouterLogic:BlocksForcedDisplacement(targetUnit.EnemyTraitIds) then
+			result.Success = true
+			result.ToCell = result.FromCell
+			result.Reason = "PUSH_BLOCKED_HEAVY_TRAIT"
+			log("[EnemyTrait] HEAVY blocked push target=" .. targetUnitId .. " cell=" .. result.FromCell)
+			return result
+		end
+		if session:IsValidCell(result.ToCell) == false then
+			result.Success = true
+			result.Reason = "PUSH_BLOCKED_OUT_OF_BOUNDS"
+			return result
+		end
+		if session:IsCellOccupied(result.ToCell, targetUnitId) then
+			result.Success = true
+			result.Reason = "PUSH_BLOCKED_OCCUPIED"
+			session:ApplyPushCollisionDamage(sourceUnitId, targetUnit, result.ToCell)
+			return result
+		end
+
+		local cellChange = targetUnit:ApplyCellChange(result.ToCell)
+		if cellChange.Success == false then
+			result.Reason = cellChange.Reason
+			return result
+		end
+		session:PlaceEntity(targetEntity, session:GetCellPosition(result.ToCell))
+		local movedEvent = UnitMovedEvent()
+		movedEvent.UnitId = targetUnit.UnitId
+		movedEvent.FromCell = result.FromCell
+		movedEvent.ToCell = result.ToCell
+		session.Entity:SendEvent(movedEvent)
+		result.Success = true
+		result.Reason = "PUSHED"
+		log("[BattlePushTarget] resolved source=" .. sourceUnitId .. " target=" .. targetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolvePullImpactOnTarget(any session, string sourceUnitId, string targetUnitId, integer landingDistance)
+		-- Drags a target toward the caster until it stands landingDistance cells in front of it. If that cell is
+		-- taken, it stops at the closest free cell on the way; a target already that close, or HEAVY, stays put.
+		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, TargetUnitId = targetUnitId, FromCell = -1, ToCell = -1 }
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		local targetEntity = session:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false or isvalid(targetEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
+			result.Reason = "TARGET_SAME_TEAM"
+			return result
+		end
+
+		local direction = targetUnit.CellIndex > sourceUnit.CellIndex and 1 or -1
+		local distance = math.abs(targetUnit.CellIndex - sourceUnit.CellIndex)
+		result.Hit = true
+		result.FromCell = targetUnit.CellIndex
+		result.ToCell = targetUnit.CellIndex
+		result.Success = true
+		if targetUnit.Team == "Enemy" and _EnemyTraitRouterLogic:BlocksForcedDisplacement(targetUnit.EnemyTraitIds) then
+			result.Reason = "PULL_BLOCKED_HEAVY_TRAIT"
+			log("[EnemyTrait] HEAVY blocked pull target=" .. targetUnitId .. " cell=" .. result.FromCell)
+			return result
+		end
+		local landing = -1
+		for step = math.max(1, landingDistance), distance - 1 do
+			local cell = sourceUnit.CellIndex + direction * step
+			if session:IsValidCell(cell) and session:IsCellOccupied(cell, targetUnitId) == false then
+				landing = cell
+				break
+			end
+		end
+		if landing < 0 then
+			result.Reason = distance <= landingDistance and "PULL_ALREADY_CLOSE" or "PULL_BLOCKED_OCCUPIED"
+			log("[BattlePull] resolved source=" .. sourceUnitId .. " target=" .. targetUnitId .. " from=" .. result.FromCell .. " reason=" .. result.Reason)
+			return result
+		end
+		-- The relocation boundary owns occupancy, drop pickup and the moved event (which also ticks poison).
+		local relocation = session:RelocateUnitForMechanic(targetUnitId, landing, "SKILL_PULL")
+		if relocation.Success == false then
+			result.Reason = "PULL_BLOCKED_" .. tostring(relocation.Reason)
+			return result
+		end
+		result.ToCell = landing
+		result.Reason = "PULLED"
+		log("[BattlePull] resolved source=" .. sourceUnitId .. " target=" .. targetUnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " reason=" .. result.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveTurnImpactOnTarget(any session, string sourceUnitId, string targetUnitId)
+		-- Reverses a hit target's facing in place. Unlike TryTurn it runs on the caster's turn, so the target's
+		-- own phase is not checked; the target then needs its own turn action to face the caster again.
+		local result = { Success = false, Hit = false, Reason = "UNKNOWN", SourceUnitId = sourceUnitId, TargetUnitId = targetUnitId, PreviousFacing = "", CurrentFacing = "" }
+		local sourceEntity = session:FindUnitEntity(sourceUnitId)
+		local targetEntity = session:FindUnitEntity(targetUnitId)
+		if isvalid(sourceEntity) == false or isvalid(targetEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if sourceUnit == nil or targetUnit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if sourceUnit.IsDead == true or targetUnit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+		if sourceUnitId == targetUnitId or (sourceUnit.Team == targetUnit.Team and sourceUnit.Team ~= "Enemy") then
+			result.Reason = "TARGET_SAME_TEAM"
+			return result
+		end
+
+		result.PreviousFacing = targetUnit.Facing
+		local facingResult = targetUnit:ApplyFacingState(targetUnit.Facing == "Right" and "Left" or "Right")
+		if facingResult.Success == false then
+			result.Reason = facingResult.Reason
+			return result
+		end
+		result.CurrentFacing = facingResult.CurrentFacing
+		session:ApplyFacing(targetEntity, targetUnit.Facing)
+		local turnedEvent = UnitTurnedEvent()
+		turnedEvent.UnitId = targetUnit.UnitId
+		turnedEvent.PreviousFacing = result.PreviousFacing
+		turnedEvent.CurrentFacing = result.CurrentFacing
+		session.Entity:SendEvent(turnedEvent)
+		result.Success = true
+		result.Hit = true
+		result.Reason = "TURNED"
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then presentation:ShowConfusionMarker() end
+		log("[BattleTurnTarget] resolved source=" .. sourceUnitId .. " target=" .. targetUnitId .. " from=" .. result.PreviousFacing .. " to=" .. result.CurrentFacing .. " cell=" .. targetUnit.CellIndex)
 		return result
 	end
 
