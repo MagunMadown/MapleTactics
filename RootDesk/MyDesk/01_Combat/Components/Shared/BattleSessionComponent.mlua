@@ -1436,46 +1436,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void CleanupRegisteredEnemies(string reason)
-		-- Hazards belong to this battle only.
-		self:ClearPoisonMists()
-		-- Unregisters and destroys only runtime enemy entities while preserving the stage player.
-		if self.BoardState == nil then
-			return
-		end
-
-		local registeredUnits = self.BoardState:CollectRegisteredUnits()
-		for _, unitEntity in ipairs(registeredUnits) do
-			local unit = unitEntity:GetComponent("script.BattleUnitComponent")
-			if unit ~= nil and unit.Team == "Enemy" then
-				self.BoardState:UnregisterUnit(unit.UnitId)
-				if isvalid(unitEntity) then
-					_EntityService:Destroy(unitEntity)
-				end
-			end
-		end
-		self.EnemyEntity = nil
-		log("[BattleWave] enemies cleaned reason=" .. reason)
+		-- Delegate settlement to its owner while this map component retains battle state.
+		_BattleOutcomeLogic:CleanupRegisteredEnemies(self, reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void CleanupDefeatedEnemies(string reason)
-		-- Removes dead enemies only so forced waves can overlap with survivors from earlier waves.
-		if self.BoardState == nil then
-			return
-		end
-		local removedCount = 0
-		local registeredUnits = self.BoardState:CollectRegisteredUnits()
-		for _, unitEntity in ipairs(registeredUnits) do
-			local unit = unitEntity:GetComponent("script.BattleUnitComponent")
-			if unit ~= nil and unit.Team == "Enemy" and unit.IsDead == true then
-				self.BoardState:UnregisterUnit(unit.UnitId)
-				if isvalid(unitEntity) then
-					_EntityService:Destroy(unitEntity)
-				end
-				removedCount = removedCount + 1
-			end
-		end
-		log("[BattleWave] defeated enemies cleaned reason=" .. reason .. " count=" .. removedCount)
+		-- Delegate settlement to its owner while this map component retains battle state.
+		_BattleOutcomeLogic:CleanupDefeatedEnemies(self, reason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -5091,304 +5059,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void HandleUnitDiedFromSource(string unitId, string cause, string sourceUnitId)
-		-- Marks one unit dead, resolves contextual drops, advances waves, and checks battle completion.
-		local unitEntity = self:FindUnitEntity(unitId)
-		if isvalid(unitEntity) == false then
-			log_error("[BattleDeath] failed unit=" .. unitId .. " reason=UNIT_NOT_FOUND")
-			return
-		end
-
-		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
-		if unit == nil then
-			log_error("[BattleDeath] failed unit=" .. unitId .. " reason=COMPONENT_MISSING")
-			return
-		end
-		if self.BattleResult ~= "" then
-			log("[BattleDeath] ignored unit=" .. unitId .. " reason=BATTLE_ALREADY_ENDED result=" .. self.BattleResult)
-			return
-		end
-		if unit.IsDead == true then
-			log_warning("[BattleDeath] duplicate ignored unit=" .. unitId)
-			return
-		end
-
-		-- Keep death identity stable even if a yielding drop load overlaps entity cleanup.
-		local deathTeam = unit.Team
-		local deathIsBoss = unit.IsBoss
-		local deathEntry = self.EntryRequestId
-		-- Reserve death order before sound, collection, or drop resource loading can yield.
-		local settlement = nil
-		if deathTeam == "Enemy" then
-			settlement = self._T.EnemyDeathSettlement
-			if settlement == nil or settlement.Entry ~= deathEntry then
-				settlement = { Entry = deathEntry, PendingCount = 0, LastKillKey = "" }
-				self._T.EnemyDeathSettlement = settlement
-			end
-			settlement.PendingCount = settlement.PendingCount + 1
-			settlement.LastKillKey = self.StageId .. ":" .. tostring(self.CurrentWave) .. ":" .. tostring(unit.SpawnOrder) .. ":" .. unit.UnitId
-		end
-		local deathState = unit:MarkDead()
-		if deathState.Success == false then
-			if settlement ~= nil then settlement.PendingCount = settlement.PendingCount - 1 end
-			log_error("[BattleDeath] state transition failed unit=" .. unitId .. " reason=" .. deathState.Reason)
-			return
-		end
-		self:SendMotionPresentation(unitEntity, "DEATH", { UnitId = unitId, Team = deathTeam })
-		self:RemovePoisonMistsForSource(unitId)
-		if unit.Team == "Player" then
-			unit.SealTurns = 0
-			unit.FrostbiteTurns = 0
-			unit.ConfuseTurns = 0
-			self:ClearPoisonMists()
-		end
-		if unit.Team == "Enemy" then
-			-- Plays once per confirmed death; duplicate death calls already returned above.
-			local deathSound = _EnemyImpactPresentationLogic:GetDeathSound(unit.EnemyDefinitionId)
-			local deathPresentation = unitEntity:GetComponent("script.BattleUnitPresentationComponent")
-			if deathSound ~= "" and deathPresentation ~= nil then
-				deathPresentation:PlaySkillSound(unitId, "MONSTER_DEATH", deathSound, self:GetSkillSoundVolume())
-			end
-		end
-		if unit.Team == "Enemy" and isvalid(self.PlayerEntity) then
-			self.ResultKillCount = self.ResultKillCount + 1
-			if _TutorialRulesLogic:ShouldRecordProgress(self) then _MonsterCollectionLogic:RecordDefeat(self.PlayerEntity, unit.EnemyDefinitionId) end
-			local sourceEntity = self:FindUnitEntity(sourceUnitId)
-			if sourceEntity == self.PlayerEntity then
-				local relics = sourceEntity:GetComponent("script.PlayerRunRelicEffectComponent")
-				if relics ~= nil then relics:OnEnemyKilled(unitId) end
-			end
-		end
-		local summoner = unitEntity:GetComponent("script.FaustSummonComponent")
-		if summoner ~= nil then
-			summoner:RemoveSummon(self)
-		end
-		local defeatedPlan = unitEntity:GetComponent("script.EnemyActionPlanComponent")
-		local defeatedRunner = unitEntity:GetComponent("script.EnemyPatternRunnerComponent")
-		if defeatedPlan ~= nil and defeatedPlan.PlanState ~= "EMPTY" then
-			local currentAction = defeatedPlan:GetCurrentAction()
-			if defeatedRunner ~= nil and currentAction.Success == true then
-				defeatedRunner:CancelPreparedStep(currentAction.PatternId, currentAction.StepIndex, "UNIT_DIED")
-			end
-			defeatedPlan:ResetPlan("UNIT_DIED")
-		end
-		local preparedIntent = self:GetPreparedEnemyIntent()
-		if preparedIntent.EnemyId == unitId then
-			self:ResetEnemyIntentCursor("UNIT_DIED")
-			-- Hand the cursor to another enemy still holding a frozen plan so the next enemy turn starts from it.
-			-- During the enemy round CompletePreparedEnemyIntent advances the cursor itself.
-			if self.TurnState ~= nil and self.TurnState.BattlePhase == "PlayerTurn" then
-				self:PrepareNextEnemyIntent()
-			end
-		end
-		self:PublishEnemyPlanSnapshot("UNIT_DIED")
-		if unit.Team == "Enemy" and self.DropRuntime ~= nil and _TutorialRulesLogic:ShouldRecordProgress(self) then
-			local sourceEntity = self:FindUnitEntity(sourceUnitId)
-			local sourceUnit = nil
-			if isvalid(sourceEntity) then
-				sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
-			end
-			if sourceUnit ~= nil and sourceUnit.Team == "Player" then
-				self.CurrentPlayerActionKillCount = self.CurrentPlayerActionKillCount + 1
-			end
-			local triggerResult = _EnemyDropTriggerResolverLogic:Resolve(unit.IsBoss, self.CurrentPlayerActionKillCount)
-			local dropResult = self.DropRuntime:ResolveEnemyDeath(
-				self.RunSeed,
-				self.StageId,
-				self.CurrentWave,
-				unit.EnemyDefinitionId,
-				unit.UnitId,
-				unit.SpawnOrder,
-				unit.CellIndex,
-				triggerResult.TriggerSnapshot,
-				self.UnionItemDropRate
-			)
-			if self.PremiumMagnetPet then
-				self.DropRuntime:AutoCollectMagnetDrops(self.PlayerEntity, self.StageId .. ":" .. tostring(self.EntryRequestId))
-			end
-			if dropResult.Success == false then
-				log_error("[BattleDeath] drop failed unit=" .. unitId .. " reason=" .. dropResult.Reason)
-			end
-		end
-		if settlement ~= nil then settlement.PendingCount = settlement.PendingCount - 1 end
-		if self.EntryRequestId ~= deathEntry or self.BattleResult ~= "" then return end
-		if deathTeam == "Enemy" and deathIsBoss then
-			self._T.BossDefeated = true
-			self.WaveRuntime:CancelPendingSpawns("BOSS_DEFEATED")
-			self:ClearPoisonMists()
-			-- Boss defeat ends the encounter; remaining adds grant no extra kills or drops.
-			for _, add in ipairs(self.BoardState:CollectLivingEnemies()) do
-				local addUnit = add:GetComponent("script.BattleUnitComponent")
-				if addUnit ~= nil then
-					addUnit:MarkDead()
-					self.BoardState:UnregisterUnit(addUnit.UnitId)
-				end
-				_EntityService:Destroy(add)
-			end
-			log("[BattleBoss] defeated; remaining enemies removed unit=" .. unitId)
-		end
-		if deathTeam == "Enemy" and self.BoardState ~= nil then
-			local livingEnemies = self.BoardState:CollectLivingEnemies()
-			if #livingEnemies > 0 then
-				log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=CONTINUE livingEnemies=" .. #livingEnemies)
-				return
-			end
-		end
-		local executingQueue = self.TurnState ~= nil and self.TurnState.ExecutingTileIndex > 0
-		local executingUtility = self.TurnState ~= nil and self.TurnState.IsActionProcessing
-			and self.TurnState.QueuedActionType == "UTILITY"
-		if deathTeam == "Enemy" and ((not deathIsBoss and executingQueue) or executingUtility) then
-			-- Finish the accepted player action before its reserved state is cleared by wave or victory settlement.
-			self:ClearForcedSpawnSchedule(executingUtility and "UTILITY_CLEAR_PENDING" or "QUEUE_CLEAR_PENDING")
-			self._T.PendingClear = { UnitId = unitId, Cause = cause, Entry = self.EntryRequestId }
-			log("[BattlePlayerActionBoundary] clear deferred action=" .. (executingUtility and "UTILITY" or "SKILL_QUEUE") .. " unit=" .. unitId)
-			return
-		end
-		self:FinishEmptyBattlefield(unitId, cause, deathTeam)
+		-- Delegate settlement to its owner while this map component retains battle state.
+		_BattleOutcomeLogic:HandleUnitDiedFromSource(self, unitId, cause, sourceUnitId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void FinishEmptyBattlefield(string unitId, string cause, string team)
-		-- Settle only a confirmed opposing-team clear or the actual player death.
-		if self.BattleResult ~= "" then return end
-		if team == "Enemy" then
-			if self.BoardState == nil or #self.BoardState:CollectLivingEnemies() > 0 then return end
-			local settlement = self._T.EnemyDeathSettlement
-			if settlement ~= nil and settlement.Entry == self.EntryRequestId and settlement.PendingCount > 0 then
-				log("[BattleResult] waiting for enemy drops pending=" .. tostring(settlement.PendingCount))
-				return
-			end
-		elseif team == "Player" then
-			local playerUnit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
-			if playerUnit == nil or playerUnit.UnitId ~= unitId or not playerUnit.IsDead then
-				log_warning("[BattleResult] settlement rejected unit=" .. unitId .. " reason=PLAYER_NOT_DEAD")
-				return
-			end
-		else
-			log_warning("[BattleResult] settlement rejected unit=" .. unitId .. " reason=INVALID_DEATH_TEAM team=" .. tostring(team))
-			return
-		end
-		self._T.PendingClear = nil
-		self:ClearForcedSpawnSchedule("ALL_ENEMIES_DEFEATED")
-		self:ClearTurnTransitionTimer("ALL_ENEMIES_DEFEATED")
-		self:ClearMotionCompletionWaits()
-		if team == "Enemy" then
-			self:CompletePlayerCombatPresentationHandoff("ENEMIES_DEFEATED")
-		end
-		self.PlayerToEnemyBeatPending = false
-		self.PendingPlayerToEnemyHandoffDelay = -1
-		self:ClearEnemyToEnemyPresentationHandoff("UNIT_DEATH_" .. unitId)
-		self:ClearSkillImpactTimers()
-		if self.ActionTimerId > 0 then
-			_TimerService:ClearTimer(self.ActionTimerId)
-			self.ActionTimerId = 0
-		end
-		if team == "Enemy" then
-			if (self.CurrentWave < self.TotalWaves or self.WaveRuntime.PendingSpawnCount > 0) and not self._T.BossDefeated then
-				self.TurnState:ClearActionState("WAVE_CLEARED")
-				self.TurnState:SetPhase("WaveTransition", "WAVE_CLEARED")
-				self:PublishTurnStateSnapshot("WAVE_CLEARED")
-				log("[BattleQueueBoundary] boundary=WAVE_CLEARED policy=PRESERVE queue=" .. self.TurnState.QueuedTileIds)
-				self:ClearPreparedEnemyIntent("WAVE_CLEARED")
-				local clearedWave = self.CurrentWave
-				local nextWave = self.WaveRuntime.PendingSpawnCount > 0 and clearedWave or clearedWave + 1
-				local transitionDelay = math.max(self.CurrentClearSpawnDelay, self.EnemyDeathPresentationDelay)
-				local motionSequence = self:BeginMotionCompletionWait(function() self:AdvanceWaveAfterMotion(clearedWave, nextWave) end)
-				self._T.waveMotionCompletion = { Sequence = motionSequence, Entry = self.EntryRequestId, ClearedWave = clearedWave, NextWave = nextWave }
-				self:SealMotionCompletionWhenImpactsFinish(motionSequence)
-				self.WaveRuntime:ScheduleWaveTransition(clearedWave, nextWave, transitionDelay)
-				self:PublishWaveStateSnapshot("WAVE_CLEARED")
-				log("[BattleWave] cleared stage=" .. self.StageNumber .. " wave=" .. clearedWave .. "/" .. self.TotalWaves .. " nextWave=" .. nextWave)
-				return
-			end
-
-			local queuedBeforeVictory = self.TurnState.QueuedTileIds
-			self.TurnState:ClearTransientState("STAGE_CLEARED")
-			self.TurnState:SetPhase("BattleEnded", "STAGE_CLEARED")
-			self:PublishTurnStateSnapshot("STAGE_CLEARED")
-			log("[BattleQueueBoundary] boundary=VICTORY policy=CLEAR before=" .. queuedBeforeVictory .. " after=" .. self.TurnState.QueuedTileIds)
-			self.WaveRuntime:SetWaveState("StageCleared", "STAGE_CLEARED")
-			self:PublishWaveStateSnapshot("STAGE_CLEARED")
-			self.BattleResult = "Victory"
-		else
-			local queuedBeforeDefeat = self.TurnState.QueuedTileIds
-			self.TurnState:ClearTransientState("PLAYER_DEFEATED")
-			self.TurnState:SetPhase("BattleEnded", "PLAYER_DEFEATED")
-			self:PublishTurnStateSnapshot("PLAYER_DEFEATED")
-			log("[BattleQueueBoundary] boundary=DEFEAT policy=CLEAR before=" .. queuedBeforeDefeat .. " after=" .. self.TurnState.QueuedTileIds)
-			self.WaveRuntime:SetWaveState("Failed", "PLAYER_DEFEATED")
-			self:PublishWaveStateSnapshot("PLAYER_DEFEATED")
-			self.BattleResult = "Defeat"
-		end
-
-		local runResultRecorded = not _TutorialRulesLogic:ShouldRecordProgress(self)
-		if isvalid(self.PlayerEntity) and _TutorialRulesLogic:ShouldRecordProgress(self) then
-			local playerUnit = self.PlayerEntity:GetComponent("script.BattleUnitComponent")
-			if playerUnit ~= nil then playerUnit:ClearAttackBuffs() end
-			if self.BattleResult == "Victory" and self.DropRuntime ~= nil then
-				local dropRecordKey = self.StageId .. ":" .. tostring(self.EntryRequestId)
-				local settlement = self._T.EnemyDeathSettlement
-				if settlement ~= nil and settlement.Entry == self.EntryRequestId then
-					self.DropRuntime.LastEnemyKillKey = settlement.LastKillKey
-				end
-				local collectResult = self.DropRuntime:AutoCollectLastEnemy(self.PlayerEntity, dropRecordKey)
-				if collectResult.Success == false then
-					log_error("[BattleResult] drop auto collect failed reason=" .. collectResult.Reason .. " remaining=" .. collectResult.FailedCount)
-				end
-			elseif self.DropRuntime ~= nil then
-				self.DropRuntime:DiscardPending("BATTLE_DEFEAT")
-			end
-			local resultContext = self:CaptureBattleResultContext()
-			runResultRecorded = _RunManagerLogic:RecordBattleResult(self.PlayerEntity, self.StageId, self.StageNumber, self.BattleResult, self.EntryRequestId)
-			if self:IsBattleResultContextCurrent(resultContext) == false then
-				log_warning("[BattleResult] stale settlement continuation cancelled")
-				return
-			end
-			local relics = self.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
-			if relics ~= nil then relics:EndBattleEffects() end
-			if runResultRecorded == true then
-				if self.BattleResult == "Victory" then
-					local augments = self.PlayerEntity:GetComponent("script.PlayerRunAugmentComponent")
-					if augments ~= nil then
-						local before = augments.AvailableRerollCount
-						augments:GrantClearReroll(self.StageId .. ":" .. tostring(self.EntryRequestId), self._T.BossDefeated == true)
-						self:RecordRoundReward("REROLL", "augment_reroll", augments.AvailableRerollCount - before, "boss_or_round_reroll")
-					end
-				end
-				if self.BattleResult == "Victory" and self._T.BossDefeated == true then
-					if relics ~= nil then
-						local reward = relics:GrantBossClassRelic(self.StageId .. ":" .. tostring(self.EntryRequestId))
-						if reward.Success and reward.RelicId ~= nil then
-							self:RecordRoundReward("ITEM", reward.RelicId, 1, "boss_class_relic")
-						end
-					end
-					local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
-					if inventory ~= nil then
-						local before = inventory.HealCharges
-						inventory:GrantBossHealCharge(self.StageId .. ":" .. tostring(self.EntryRequestId))
-						self:RecordRoundReward("HEAL_CHARGE", "heal", inventory.HealCharges - before, "boss_heal")
-					end
-				end
-				self:RefreshUnionRewardPresentation()
-			end
-		end
-		log("[BattleDeath] unit=" .. unitId .. " cause=" .. cause .. " result=" .. self.BattleResult .. " wave=" .. self.CurrentWave)
-		log("[BattleResult] result=" .. self.BattleResult .. " stage=" .. self.StageNumber .. " wave=" .. self.CurrentWave .. "/" .. self.TotalWaves .. " turn=" .. self.TurnNumber .. " runRecorded=" .. tostring(runResultRecorded))
-		self.ResultRecorded = runResultRecorded
-		self.ResultElapsedSeconds = math.max(0, math.floor(_UtilLogic.ElapsedSeconds - self.ResultStartTime))
-		-- ResultGold records gross grants, including overflow conversion, independently of spending.
-		local readinessContext = self:CaptureBattleResultContext()
-		local motionSequence = self:BeginMotionCompletionWait(function()
-			if self:IsBattleResultContextCurrent(readinessContext) and self.BattleResult ~= "" then
-				self.ResultReady = true
-				log("[BattleResult] ready for confirmation kills=" .. self.ResultKillCount)
-			end
-		end)
-		self:SealMotionCompletionWhenImpactsFinish(motionSequence)
-		self.ResultTransitionTimerId = _TimerService:SetTimerOnce(function()
-			if self:IsBattleResultContextCurrent(readinessContext) == false then return end
-			self.ResultTransitionTimerId = 0
-			self:MarkMotionCompletionReady(motionSequence)
-		end, math.max(0.1, self.EnemyDeathPresentationDelay))
+		-- Delegate settlement to its owner while this map component retains battle state.
+		_BattleOutcomeLogic:FinishEmptyBattlefield(self, unitId, cause, team)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -5403,26 +5081,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void AdvanceWaveAfterMotion(integer clearedWave, integer nextWave)
-		-- Dead entities remain visible until their completed animation and hold have been acknowledged.
-		if self.BattleResult ~= "" or self.CurrentWave ~= clearedWave or self.TurnState == nil
-			or self.TurnState.BattlePhase ~= "WaveTransition" then
-			return
-		end
-		self.TurnState:OpenPlayerTurn(self.TurnNumber + 1, "NEXT_WAVE")
-		self:PublishTurnStateSnapshot("NEXT_WAVE")
-		self.StageTurnNumber = self.TurnNumber
-		-- A new wave opens a new player turn even when there were no surviving enemies to act.
-		self:AdvancePlayerSkillCooldowns("PLAYER_TURN_" .. self.TurnNumber)
-		self:SpawnWave(nextWave)
-		if self.CurrentWave == nextWave then
-			_TutorialRulesLogic:OnWaveStarted(self, nextWave)
-			self.TurnState:SetPhase("PlayerTurn", "NEXT_WAVE_ACTIVE")
-			self:PublishTurnStateSnapshot("NEXT_WAVE_ACTIVE")
-			self.WaveRuntime:MarkWaveActive("NEXT_WAVE_ACTIVE")
-			self:PublishWaveStateSnapshot("NEXT_WAVE_ACTIVE")
-			self:ProcessAugmentTrigger("TURN_START", "TURN:" .. tostring(self.TurnNumber), 0)
-			self:PrepareEnemyIntent()
-		end
+		-- Delegate settlement to its owner while this map component retains battle state.
+		_BattleOutcomeLogic:AdvanceWaveAfterMotion(self, clearedWave, nextWave)
 	end
 
 	@ExecSpace("ServerOnly")
