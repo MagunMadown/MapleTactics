@@ -1,6 +1,10 @@
 # MapleTactics M1 GDD
 
-Stage: Phase 1 prototype in progress, bidirectional combat expansion planned
+> 🔖 **AI 안내 — 재개 시**: `msw-planning`을 먼저 로드하고 Roadmap·GDD·존재하는 Phase 문서·`Archive/As-built.md`를 확인한다. 구현이나 `⬜/🟡/✅` 상태 변경·Phase 완료 처리 전에는 스킬의 `references/build-management.md`를 **전체** 읽는다. 현재 항목 판정은 Phase 문서, GDD §9는 그 상태의 미러다.
+
+Last updated: 2026-10-12
+
+Stage: Phase 1 prototype in progress — Phase 0 오류 위치 진단 보완·사용자 검증 대기
 
 Milestone: M1 playable vertical slice
 
@@ -57,9 +61,9 @@ M1 수직 슬라이스는 헤네시스와 첫 분기만 검증한다. 이후 콘
 
 구조 검증은 직업 1종, 적 2종, 보스 1종, 타일 4종, 증강 3종으로 먼저 수행한다. 구조가 통과한 뒤 값으로 목표 수량까지 확장한다.
 
-### 4.1 확장 월드맵 콘텐츠 목표
+### 4.1 확장 월드맵 경로와 현재 데이터
 
-M1 이후에는 다음 6개 마을을 하나의 도시 경로 그래프로 확장한다.
+6개 마을의 Region/Stage/Map 및 노드 경로는 현재 데이터에 존재한다. 아래 경로의 해금·상점·합류 및 각 20전투 기록은 2026-10-12 Maker에서 실제 피해 처리로 진행을 가속한 NORMAL 런으로 확인했다. 일반 전술 조작만의 완주와 완성 콘텐츠·실기기 검증은 standing Roadmap Backlog를 따른다.
 
 | 순서 | 출발 마을 | 경로 상점 | 도착 마을 | 경로 |
 |---:|---|---|---|---|
@@ -79,15 +83,15 @@ M1 이후에는 다음 6개 마을을 하나의 도시 경로 그래프로 확�
 
 | RegionId | 마을 | 일반전 MapId | 보스전 MapId | 경로 순서 |
 |---|---|---|---|---|
-| `region_01` | 헤네시스 | `region_01_battle` | `region_01_boss` | 시작 지역 |
-| `region_02` | 커닝시티 | `region_02_battle` | `region_02_boss` | `UPPER` 2번째 |
-| `region_03` | 엘리니아 | `region_03_battle` | `region_03_boss` | `LOWER` 2번째 |
-| `region_04` | 페리온 | `region_04_battle` | `region_04_boss` | `UPPER` 3번째 |
-| `region_05` | 노틸러스 | `nautilus_battle` | `nautilus_boss` | `LOWER` 3번째 |
-| `region_06` | 슬리피우드 | `sleepywood_ant_tunnel` | `sleepywood_food_cart_boss` | 공통 합류 지역 |
+| `henesys` | 헤네시스 | `henesys_battle` | `henesys_boss` | 시작 지역 |
+| `region_Kerning_City` | 커닝시티 | `kerning_city_battle`, `kerning_city_battle2` | `kerning_city_boss` | UPPER 2번째 |
+| `ellinia` | 엘리니아 | `ellinia_battle` | `ellinia_boss` | LOWER 2번째 |
+| `region_04` | 페리온 | `perion_01_battle`, `perion_02_battle`, `perion_03_battle` | `perion_boss` | 위쪽 중간 지역 |
+| `region_05` | 노틸러스 | `nautilus_battle`, `nautilus_interior_01`, `nautilus_interior_02` | `nautilus_boss` | 아래쪽 중간 지역 |
+| `region_06` | 슬리피우드 | `sleepywood_ant_tunnel`, `sleepywood_temple_battle` | `sleepywood_food_cart_boss`, `sleepywood_temple_boss` | 공통 합류 지역 |
 
-- 일반전 물리 맵 재사용 범위는 같은 Region 내부로 제한한다. 예를 들어 커닝시티의 여러 일반 Stage는 `region_02_battle`을 함께 사용하지만 헤네시스의 `region_01_battle`은 사용하지 않는다.
-- 보스전은 지역별 배경과 전조 연출을 독립 제작할 수 있도록 각 Region의 `region_XX_boss` 맵으로 분리한다.
+- 일반전 물리 맵 재사용 범위는 같은 Region 내부로 제한한다. 커닝시티 Stage 1/2는 `kerning_city_battle`, Stage 3은 `kerning_city_battle2`를 사용하며 헤네시스 맵을 공유하지 않는다.
+- 보스전은 지역별 배경과 전조 연출을 독립 제작할 수 있도록 실제 CSV가 가리키는 보스 맵으로 분리한다. 과거 `region_XX_*` 명명 예시는 현재 파일명으로 재생성·이름 변경하는 지시가 아니다.
 - `StageId`는 콘텐츠 식별자이고 `MapId`는 물리 맵이므로 계속 분리한다. 표시용 `2-1` 같은 번호는 Region/Stage 데이터에서 결정한다.
 
 ## 5. 직업 설계 원칙
@@ -130,13 +134,13 @@ M1 직업 슬롯:
 - 지역별 등장 몬스터는 `EnemySpawnPools`(MonsterPoolId)로 정의하며, 헤네시스/엘리니아/슬리피우드처럼 지역마다 다른 몬스터 구성을 원시 타입 변경 없이 표로 교체한다.
 - 모든 마을 간 연결은 `출발 마을 → SHOP 노드 → 도착 마을`의 3단계 Edge로 정의한다. 도시 UI가 상점 로직을 직접 소유하지 않는다.
 - 출발 마을의 클리어 조건을 만족하면 해당 Edge의 상점이 열리고, 상점 방문을 마치면 연결된 다음 마을이 선택 가능해진다.
-- 현재 프로토타입은 헤네시스 `1-1` 클리어를 첫 Edge 해금 조건으로 사용한다. 정식 지역 확장 시에는 각 `RegionDefinitions`의 최종 노드 또는 보스 클리어를 기본 조건으로 사용한다.
+- 현재 첫 Edge는 헤네시스 `1-4` 보스 클리어 뒤 열린다. 각 지역의 실제 최종 노드/보스와 다음 SHOP 경계는 현재 NodeDefinitions를 따른다.
 - 상점 방문 여부, 구매 결과, 선택 경로와 현재 마을은 서버 권위의 플레이어 Run 상태가 소유한다. 월드맵 UI는 이 Snapshot을 표시하고 요청만 전송한다.
 - 각 Edge 상점은 서로 다른 방문 `NodeId`를 유지하고 공통 `shop_relic`을 사용하며 `ShopVisitBtn` UI와 공통 Shop Controller를 재사용한다.
-- `StageMapRoutes`는 각 StageId를 소속 Region의 `region_XX_battle` 또는 `region_XX_boss`로 라우팅한다. 서로 다른 마을을 하나의 Region 물리 맵으로 합치지 않는다.
+- `StageMapRoutes`의 현재 28개 StageId는 위 표의 실제 MapId로 라우팅한다. 서로 다른 마을을 하나의 Region 물리 맵으로 합치지 않는다. 상점 이후 UI 선택·서버 승인·실제 맵 전환은 2026-10-12 기능 검증 기록을 따른다.
 - 헤네시스 보스 뒤에는 위·아래 상점 중 하나를 고르는 배타적 분기가 있다. 서버가 승인한 `SelectedNodeId`와 상점 방문 상태의 `ActiveNodeId`가 현재 런의 경로 원본이며, 상점 완료 뒤에도 반대 경로는 잠긴다.
-- 두 분기는 같은 `shop` 물리 맵과 공통 `shop_relic`의 33종을 사용한다. 미보유 유물 중 동일 가중치로 하나만 진열하고 같은 방문에서는 재추첨하지 않는다. 구매 후 판매 완료로 남으며 미구매 퇴장과 전체 보유 시 빈 상점 퇴장을 허용한다.
-- 유물 가격은 1골드, 보유는 현재 런 한정이다. 안경·펜던트·귀고리는 공격력 +1, 모자·신발은 최대 및 현재 체력 +1, 견장·벨트·옷은 방어력 +1이다. 여러 능력치와 서로 다른 유물 효과를 합산한다.
+- 두 분기는 같은 `shop` 물리 맵과 공통 `shop_relic`을 사용한다. 현재 등록 유물은 50종이며 활성·직업·미보유·미구매 조건을 만족하는 후보 중 최대 3개를 일반:특수 개별 가중치 3:1로 진열한다. 같은 방문에서는 재추첨하지 않으며 포션 3종은 별도로 표시한다. 미구매 퇴장과 유물 후보가 없는 방문의 포션 구매·퇴장을 허용한다.
+- 유물 가격은 ShopEntries.PriceAmount(현재 35~80골드)를 따르며 보유는 현재 런 한정이다. 능력치·특수 효과·직업 제한은 RelicDefinitions를 따른다. 여러 능력치와 서로 다른 유물 효과를 합산하고, 가격·정의는 새 런에 캡처한다.
 - 서버가 ID 정렬 후보를 RunSeed·NodeId·방문 순번으로 결정적으로 추첨하고 진열 ID만 구매 허용한다. 데이터 정의와 가격은 새 런에 캡처하며 진행 중인 런에는 변경을 소급하지 않는다.
 - 체력은 이전 적용 합계와 차이만 반영해 5/10→6/11을 유지한다. 실제 양수 타격마다 공격력을 더하고 방어력을 빼되 최소 피해 1, UtilityGuardActive는 0을 유지한다. 빗나감·회복에는 적용하지 않는다.
 
@@ -154,23 +158,25 @@ M1 직업 슬롯:
 
 | 시스템 | MSW 구현 |
 |---|---|
-| 전투 세션 | 맵 엔티티 `BattleSessionComponent` |
-| 보드 점유와 다중 유닛 | 맵 엔티티 `BoardStateComponent` |
+| 전투 세션 | 맵 엔티티 `BattleSessionComponent`: 책임 로직 호출·RPC 검증·동기화·생명주기 연결 |
+| 보드 점유와 다중 유닛 | 맵 수명의 `BoardStateComponent`(전용 상태 자식 엔티티 우선) |
 | 개별 적 패턴 상태 | 적 엔티티 `EnemyPatternRunnerComponent` |
 | 개별 적 공격 큐 상태 | 적 엔티티 `EnemyActionPlanComponent` |
 | 적 Intent 읽기 모델 | 서버 `PreparedIntent` Snapshot + Client용 읽기 전용 DTO/Event |
-| 스테이지/웨이브 진행 | 맵 엔티티 `StageFlowComponent` |
-| 전투 격리 | 플레이어당 Instance Room/Instance Map |
+| 스테이지/웨이브 진행 | 맵 수명의 `BattleWaveComponent`와 결과/Run 담당 로직 연결 |
+| 현재 전투 운영 | Static Map + `sector01.maxUserNo=1`; 플레이어당 Instance 격리는 현재 구현으로 판정하지 않음 |
 | 플레이어 런 상태 | 플레이어 엔티티 `PlayerRunStateComponent` |
 | 정적 데이터 | UserDataSet + CSV |
 | UI | `.ui` + UIBuilder + ClientOnly Logic |
 | 적/플레이어 엔티티 | `.model` + ModelBuilder |
-| 맵 배치 | Region별 `region_XX_battle.map` + `region_XX_boss.map`; 같은 Region 내부 일반 Stage만 전투 맵을 재사용하고 `StageId`와 `MapId`는 CSV로 분리 라우팅 |
+| 맵 배치 | 실제 MapId는 §4.1/StageMapRoutes 기준; 같은 Region 내부 재사용, StageId와 MapId는 CSV로 분리 |
 | 월드맵 진행 | `RegionDefinitions` + `NodeDefinitions` + 서버 `PlayerRunStateComponent` Snapshot |
 | 마을 간 상점 | Edge별 `NodeId`, 공통 `shop_relic` 및 `ShopVisitBtn`, RUN_SCOPED Shop Controller |
 | 전투 이벤트 | `@Event extends EventType` |
 | 무상태 규칙 | `@Logic` Resolver/Router |
-| 현재 전투 맵 타입 | MapleTile(0); 전투 유닛 이동은 물리 이동이 아닌 서버 권위 Cell Snapshot |
+| 현재 전투 맵 타입·일반 이동 | MapleTile(0), 물리 Body는 Rigidbody 기준. 서버 셀·턴 검증 + 소유 클라이언트 공통 루트 재생·착지 검사 |
+
+2026-10-12 정적 대조: 맵 26개 모두 MapleTile(0)·Static Map, 전투 세션 맵 20개, StageMapRoutes 28행. API 기준은 사용자 승인 CoreVersion 26.10.0.0이다. 이 문서 정리는 맵/모델/설정을 수정하거나 새 Play를 수행한 결과가 아니다.
 
 협업 시 소유권은 다음과 같이 분리한다.
 
@@ -180,32 +186,58 @@ M1 직업 슬롯:
 - 기존 ActionType만 사용하는 새 적은 `.mlua` 수정 없이 표 행 추가로 완성하는 것을 기본 완료 기준으로 한다.
 - 새 원시 ActionType이 정말 필요할 때만 Router, Validator 허용 목록, 데이터 사전, 회귀 테스트를 한 변경 단위로 확장한다.
 
-## 9. 로드맵
+## 9. 로드맵 — Phase 상태 미러
 
-- [ ] Phase 0 — 맵/이동/RPC/데이터/큐 재타깃 기술 검증
-- [ ] Phase 1 — 전투 코어 수직 슬라이스 + CSV 기반 단일 전투 맵 재사용
-  - 🟡 통합 유물 상점 — 33종 미보유 랜덤 1개, 방문 고정·구매 검증·효과 합산·HP 차이 적용·단일 행/HUD·경로 잠금. 로컬 Lua 검증 완료, Maker Refresh·Play 검증 대기
-  - 🟡 엘리니아 전투 무대 1차 시각 패스 — 전투 구조는 유지하고 헤네시스 복제 장식을 엘리니아 숲 테마로 교체, Maker 화면 검토 대기
-- [ ] Phase 2 — 데이터 기반 타일과 일반 적
-- [ ] Phase 3 — 스테이지와 보스 패턴
-- [ ] Phase 4 — 직업 4종과 증강
-- [ ] Phase 5 — 제작자 검증 도구와 재현 테스트
-- [ ] Phase 6 — 연출, 저장, 출시 준비
+상태는 `⬜ Not started / 🟡 Implemented (untested) / ✅ Tested`만 사용한다. 현재 Phase 문서의 항목을 아래에 한 번씩 미러한다. 증거를 확인하지 못한 항목은 완료로 올리지 않으며, Phase 0/1은 모두 열린 상태다.
 
-M1 이후 콘텐츠 확장 트랙:
-- 🟡 동의 기반 월드 완주 랭킹 — 동일 일반 난이도/밸런스/시즌/성장 적용 조건, 적은 턴→피격 및 공동 순위, 서버 캐시·상위 20명·내 공개 최고·선택 공개 빌드. Maker 격리 저장·대상 DTO·버튼 이벤트 검증; 실제 출시 완주/다중 인스턴스/모바일/포인터 운영 게이트는 대기. 상세는 Phase1 및 `Guide/Run-World-Ranking-Guide.md` 참조.
-- 🟡 개인 기록 v3·리전 집계 — 시작 조건 캡처, 실제 전투 클리어 수, 리전별 진행·v1/v2 읽기 호환. Maker 등록/런타임 검증 대기.
-- 🟡 개인 기록 리전 경로 표시 — 지역 진행 탭·경로 요약·클리어/턴/피격 표시. 로컬 Lua 회귀 14개와 UIBuilder 검사 통과, Maker 검증 대기.
+### 🟡 Phase 0 — 기술 검증
 
-- ✅ 개인 플레이 기록 — 최근 10판과 개인 최고 기록, 종료 시점 스킬·증강·유물 빌드의 로비 UI. 저장 규격 유지, Maker DTO·버튼 이벤트·PC 렌더 검증; 공개 랭킹·시즌과 실제 포인터/모바일/발행 검증은 별도 범위.
-- [ ] 헤네시스 첫 분기 계약을 Dataset 기반 공통 City/Shop Edge로 전환
-- [ ] 커닝시티 지역 + 커닝시티→페리온 상점
-- [ ] 엘리니아 지역 + 엘리니아→노틸러스 상점
-- [ ] 페리온 지역 + 페리온→슬리피우드 상점
-- [ ] 노틸러스 지역 + 노틸러스→슬리피우드 상점
-- [ ] 슬리피우드 합류 지역과 양쪽 경로 회귀 검증
+- ✅ P0-01 — 맵/Body·격리 계약; Player/DefaultPlayer 상속·스폰 77행의 적 모델 50개 및 Body 없는 공통 배치 경로 확인
+- ✅ P0-02 — 논리 셀 이동; 20개 맵 41/41 이동·착지와 로비/전투 공통 경로 검증
+- ✅ P0-03 — 서버 Command 왕복; Maker INVALID_SENDER 및 실제 클라이언트 entry/context·중복 요청 무변경 확인. 실제 다른 계정·인스턴스는 별도
+- ✅ P0-04 — 큐 재타깃; 기존 Maker Push 이후 Miss와 실제 제어 API, 최신 제어/큐 회귀 통과
+- 🟡 P0-05 — UserDataSet 로드·검증; 실제 Dataset 정상 로드·복제본 Range/중복 거절·원본 보존 확인; 기본 진단의 Column/Value 누락 보완 필요
+- 🟡 P0-06 — 통합 검증; 관련 build/runtime·회귀 통과; P0-05 Column/Value 진단 보완과 실제 UI 포인터 검증 대기
 
-세부 완료 조건은 `MapleTactics-M1-Implementation-Plan.md`를 따른다.
+### 🟡 Phase 1 — 전투 코어 수직 슬라이스
+
+- 🟡 P1-S0 — 전투 무대·셀 가이드; 배치·HUD 구현, 사용자 화면 검토 대기
+- 🟡 P1-S1 — 플레이어·적 배치; Unit·표시 구현, 사용자 화면 검토 대기
+- 🟡 P1-S2 — 한 칸 이동; 20개 맵 41/41·정밀 이벤트 40개 통과, 화면 체감·물리 정밀 입력 대기
+- 🟡 P1-S3 — 방향 전환; 최신 Maker W 전환 통과, UI 포인터·화면 검토 대기
+- 🟡 P1-S4 — 공격·HP; 피해 회귀·Maker 실제 피해/표시 통과, 화면 검토 대기
+- 🟡 P1-S5 — 사망·승패·리셋; 사망/승패·복귀 회귀와 Maker 근거 있음, 실제 Retry 포인터 대기
+- 🟡 P1-S6 — Intent·적 행동; 계획/표시/실행 구현·회귀 통과, 사용자 가독성 검토 대기
+- 🟡 P1-S7 — 턴·입력 잠금; 턴·중복 완료·승패 회귀 통과, UI 통합 검토 대기
+- 🟡 P1-S8 — 스킬 등록·큐 실행; 현재 기본 큐 3·슬롯 6·Maker 장전/실행 통과, 포인터 대기
+- 🟡 P1-S9 — 순차 큐 재타깃; 실제 제어 API·큐 회귀 통과, 사용자 화면 검토 대기
+- ✅ P1-S10 — Effect Router; 기존 Maker DAMAGE/PUSH 및 최신 경계/점유·제어 회귀로 잔여 검사 확인
+- ✅ P1-S10.5 — Prepared Intent; Phase 문서의 기존 Maker 준비/유지/실행 근거 유지
+- ✅ P1-S10.6 — 공격 타일 보유·사거리 추적; Phase 문서의 기존 Maker 근접/원거리/QUICK 근거 유지
+- ✅ P1-S11 — 추적·고정 방향 이동; 기존 Maker 경계/점유 WAIT 근거 유지
+- ✅ P1-S12 — Board Registry; 기존 Maker 조회/순서/사망 제외 근거 유지
+- ✅ P1-S13 — 다중 적 배치; 기존 Maker 개별/전체 사망·Reset 근거 유지
+- ✅ P1-S14 — Stage/Map 분리; 기존 라우팅 검증 유지, 현재 맵명은 StageMapRoutes 기준
+- ✅ P1-S15 — 헤네시스 무대; 기존 일반전/보스전 화면 검증 유지
+- 🟡 P1-S16 — 도시 경로·상점 게이트; Maker 상·하단 경로·해금·반대 경로 잠금 확인; 실제 포인터·화면 검토 대기
+- 🟡 P1-SHOP — 통합 유물 상점; Maker 구매/무구매·재열기·중복/잔액 부족·다음 전투·새 런 확인; 실제 포인터·화면 검토 대기
+- 🟡 P1-ELLINIA — 엘리니아 시각 패스; 구현·기본 이동 검증 있음, 사용자 화면 검토 대기
+- 🟡 P1-TUT-SPLIT — 튜토리얼·세션 분리 통합; TUT-04/05·BS-04/05/07의 포인터·실기기·체감 검증 대기
+- ✅ P1-AUX — 세션 보조 로직 6개 정리; 288개 공개 계약, 회귀 18개 모음·Maker 이동/장전/실행 검증 통과
+
+세부 현재 판정은 [Phase 0](MapleTactics-M1-Phase0.md), [Phase 1](MapleTactics-M1-Phase1.md), [검증 근거](../Artifacts/plan-reconciliation-20261012/verification.md)를 따른다. 개인 기록·공개 랭킹은 기존 후속 범위이며 이번 대조로 M1의 요구 범위나 완료 상태를 넓히지 않는다.
+
+### 이후 독립 Phase 계획
+
+- ⬜ Phase 2 — 데이터 기반 타일과 일반 적
+- ⬜ Phase 3 — 스테이지와 보스 패턴
+- ⬜ Phase 4 — 직업 4종과 증강
+- ⬜ Phase 5 — 제작자 검증 도구와 재현 테스트
+- ⬜ Phase 6 — 연출, 저장, 출시 준비
+
+위 항목은 독립 Phase 상세계획·전체 완료 기준을 아직 대조하지 않은 기존 로드맵이다. 일부 기능은 Phase 1 구현 기록에서 선행 구현·검증됐으므로 이 목록만 보고 다시 만들지 않는다. 상태를 올릴 때는 해당 Phase의 상세 작업과 증거를 먼저 연결한다.
+
+M1 이후 지역·상점·기록·랭킹 확장은 [standing Roadmap Backlog](MapleTactics-Roadmap.md#backlog)를 단일 원본으로 따른다. 지역별 파일과 데이터가 존재한다는 이유만으로 양쪽 경로·해금·완주가 검증됐다고 판정하지 않는다. 세부 M1 완료 조건은 `MapleTactics-M1-Implementation-Plan.md`를 대조하되, 그 초기 설계의 오래된 맵명/키/수치는 현재 Phase 문서와 CSV 원본을 우선한다.
 
 ## 10. 제외 범위
 
@@ -215,7 +247,7 @@ M1 이후 콘텐츠 확장 트랙:
 - 메타 진행, 과금 연동, 랭킹은 M1 코어 루프 이후로 미룬다.
 - M1은 `ShopDefinitions`/`ShopEntries` 기반 RUN_SCOPED 런 상점의 서버 흐름, NPC 상점 UI와 디버그 DTO를 포함한다. `ShopItemDefinitions` 기반 Meta/World Shop, 장착, 영구 구매 상태, 실제 결제 연동은 이후 범위다.
 - 커닝시티·엘리니아·페리온·노틸러스·슬리피우드의 완성 전투 콘텐츠는 M1 수직 슬라이스 이후 범위다. M1에서는 6개 도시 표시, 첫 분기, 공통 상점 Edge 계약까지만 검증한다.
-- 상점 퇴장 뒤 엘리니아·커닝시티 경로의 잠금 표시는 M1에 포함하지만 실제 목적지 맵과 Stage 연결은 후속 Backlog다.
+- 상점 퇴장 뒤 선택 경로 잠금은 M1에 포함한다. 엘리니아·커닝시티의 실제 맵/Stage/노드 연결은 이미 데이터에 있으며, 상점 이후 UI 진입·해금·양쪽 경로 합류는 2026-10-12 제어된 기능 검증을 통과했다. 완성 콘텐츠·일반 전술 전체 완주·실기기 검증은 후속 Backlog다.
 - 스테이지 클리어 보상(`StageRewardDefinitions`)으로 `RUN_SCOPED`/`META_PERSISTENT` 재화를 지급하는 흐름은 M1 범위에 포함한다. `PREMIUM_CASH` 재화는 보상으로 지급하지 않는다.
 
 ## 11. 성공 기준
@@ -230,6 +262,7 @@ M1 이후 콘텐츠 확장 트랙:
 
 | 날짜 | 유형 | 변경 | 이유 | 영향 |
 |---|---|---|---|---|
+| 2026-10-12 | 검증·수정 | 제어된 NORMAL 상·하단 각 20전투/상점/새 런/v3 UI 검증, 이동 nil·다른 경로 응답 문맥 오류 수정 | 실제 진행에서 재현된 오류와 오래된 검증 대기를 현재 근거로 갱신 | 기존 저장 키·세션 책임·데이터 유지. 회귀 20모음(전투/코어 296그룹)·schema 74개 통과. P0-05 Column/Value 진단 보완과 사용자/실기기 검증은 미완료 |
 | 2026-10-06 | 추가 | 동의 기반 월드 완주 랭킹과 공개 빌드 조회, 별도 policy/contract/repository/service, 기본 밸런스 버전 고정 | 기존 개인 최근 10판을 공개하지 않고 동일 조건의 성적과 빌드를 비교하기 위함 | 기존 기록/보상 키 유지, RunHistoryUI 확장, Maker 격리 저장·대상 DTO·버튼 이벤트 확인. 다중 인스턴스/실제 출시/모바일/포인터는 별도 게이트 |
 | 2026-10-03 | 추가 | 개인 기록 v3의 서버 시작 조건·실제 클리어 건수·리전 단위 경로 및 완료 표시 | 랭킹 비교 조건을 구분하고 스테이지 로그 없이 진행 경로를 이해하기 위함 | Phase1 후속 기록 작업·Run-Ranking-Workplan; 기존 개인 최고 정책/저장 키 유지. 공개 랭킹은 별도 정책·저장소로 분리 |
 | 2026-10-01 | 추가 | 최근 10판·개인 최고 기록과 종료 빌드 조회 UI를 로비 메뉴와 사서 위즈 NPC에 연결 | 플레이 기록을 게임 안에서 확인하고 후속 랭킹과 분리된 개인 히스토리 규격을 제공 | Run 결과 저장 계약은 유지, 02_UI 표시 어댑터·RunHistoryUI와 기존 LobbyInteraction 라우팅 재사용; Maker DTO·버튼/터치 이벤트·실제 E키·PC 렌더 검증, 실제 포인터/모바일 별도 |
@@ -262,3 +295,4 @@ M1 이후 콘텐츠 확장 트랙:
 | 2026-08-29 | 수정 | 전투 맵 타입 문서를 실제 `MapleTile(0)` 구현에 맞추고 `region_05` 노틸러스 콘텐츠 확장을 시작 | 문서의 SideViewRectTile 표기가 실제 전투 맵·Foothold 구성과 달랐으며, 지역 번호와 진행 난이도를 분리해야 함 | GDD §8, Region/Stage/Map 데이터, 노틸러스 제작 가이드 |
 | 2026-09-03 | 추가 | 적 Pattern 공용 행동에 피해 스킬로 끊을 수 있는 `CAST_INTERRUPTIBLE`을 추가하고 킹크랑 2 Phase 버블 캐논에 적용 | 플레이어가 보스의 강한 공격을 수동적으로 피하기만 하지 않고 큐 구성과 공격 횟수로 대응하게 하며, 보스 ID 하드코딩 없이 다른 적도 같은 규격을 재사용하기 위함 | EnemyPatternSteps, EnemyActionPlan, Battle UI DTO, Boss 제작 가이드 |
 | 2026-09-12 | 수정 | 두 상점 목록을 shop_relic 33종 랜덤 단일 진열로 통합하고 유물 세 능력치 추가 | 사용자 확정 계획 구현 | 데이터 사전 §20, Phase 1; 경로 식별은 NodeId 유지, Maker 검증 대기 |
+| 2026-10-12 | 수정 | 현재 MapleTile/Static 1명 운영·클라이언트 일반 이동·실제 MapId 및 Phase 0/1 상태 미러 정리 | 오래된 map01/SideViewRectTile 권고와 미착수·미구현 표기가 기존 구현/검증과 불일치 | 게임 소스·데이터·핵심 규칙은 변경하지 않음. P0-02/04와 Slice 10의 근거 확인, 보조 정리 완료 반영. 포인터·실기기·상점 통합·현재 증거 미수집 항목은 🟡 유지 |

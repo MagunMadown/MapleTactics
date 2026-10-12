@@ -1,8 +1,54 @@
 # MapleTactics M1 Phase 1 - 화면으로 확인하는 기본 전투
 
-상태: 🟡 In progress  
+> 🔖 **AI 안내 — 재개 시**: `msw-planning`을 먼저 로드하고 Roadmap·GDD·존재하는 Phase 문서·`Archive/As-built.md`를 확인한다. 구현이나 `⬜/🟡/✅` 상태 변경·Phase 완료 처리 전에는 스킬의 `references/build-management.md`를 **전체** 읽는다. 현재 항목 판정은 Phase 문서, GDD §9는 그 상태의 미러다.
+
+상태: 🟡 In progress — 상점·경로 기능 검증 완료, 사용자 화면·실기기 검증 대기
+Last updated: 2026-10-12
 목표: 복잡한 프레임워크를 먼저 만들지 않고, Maker 화면에서 직접 확인할 수 있는 작은 전투 기능을 하나씩 완성한다.  
 진행 원칙: 한 Slice를 구현하고 실제 화면과 로그로 검증한 뒤에만 다음 Slice로 넘어간다.
+
+## 현재 상태 체크리스트 — 2026-10-12
+
+| ID | 상태 | 작업 | 확인된 범위·남은 확인 |
+|---|---|---|---|
+| P1-S0 | 🟡 | 전투 무대·셀 가이드 | 배치·HUD 구현, 사용자 화면 검토 대기 |
+| P1-S1 | 🟡 | 플레이어·적 배치 | Unit·표시 구현, 사용자 화면 검토 대기 |
+| P1-S2 | 🟡 | 한 칸 이동 | 20개 맵 41/41·정밀 이벤트 40개 통과, 화면 체감·물리 정밀 입력 대기 |
+| P1-S3 | 🟡 | 방향 전환 | 최신 Maker W 전환 통과, UI 포인터·화면 검토 대기 |
+| P1-S4 | 🟡 | 공격·HP | 피해 회귀·Maker 실제 피해/표시 통과, 화면 검토 대기 |
+| P1-S5 | 🟡 | 사망·승패·리셋 | 사망/승패·복귀 회귀와 Maker 근거 있음, 실제 Retry 포인터 대기 |
+| P1-S6 | 🟡 | Intent·적 행동 | 계획/표시/실행 구현·회귀 통과, 사용자 가독성 검토 대기 |
+| P1-S7 | 🟡 | 턴·입력 잠금 | 턴·중복 완료·승패 회귀 통과, UI 통합 검토 대기 |
+| P1-S8 | 🟡 | 스킬 등록·큐 실행 | 현재 기본 큐 3·슬롯 6·Maker 장전/실행 통과, 포인터 대기 |
+| P1-S9 | 🟡 | 순차 큐 재타깃 | 실제 제어 API·큐 회귀 통과, 사용자 화면 검토 대기 |
+| P1-S10 | ✅ | Effect Router | 기존 Maker DAMAGE/PUSH 및 최신 경계/점유·제어 회귀로 잔여 검사 확인 |
+| P1-S10.5 | ✅ | Prepared Intent | Phase 문서의 기존 Maker 준비/유지/실행 근거 유지 |
+| P1-S10.6 | ✅ | 공격 타일 보유·사거리 추적 | Phase 문서의 기존 Maker 근접/원거리/QUICK 근거 유지 |
+| P1-S11 | ✅ | 추적·고정 방향 이동 | 기존 Maker 경계/점유 WAIT 근거 유지 |
+| P1-S12 | ✅ | Board Registry | 기존 Maker 조회/순서/사망 제외 근거 유지 |
+| P1-S13 | ✅ | 다중 적 배치 | 기존 Maker 개별/전체 사망·Reset 근거 유지 |
+| P1-S14 | ✅ | Stage/Map 분리 | 기존 라우팅 검증 유지, 현재 맵명은 StageMapRoutes 기준 |
+| P1-S15 | ✅ | 헤네시스 무대 | 기존 일반전/보스전 화면 검증 유지 |
+| P1-S16 | 🟡 | 도시 경로·상점 게이트 | Maker 상·하단 경로·해금·반대 경로 잠금 확인; 실제 포인터·화면 검토 대기 |
+| P1-SHOP | 🟡 | 통합 유물 상점 | Maker 구매/무구매·재열기·중복/잔액 부족·다음 전투·새 런 확인; 실제 포인터·화면 검토 대기 |
+| P1-ELLINIA | 🟡 | 엘리니아 시각 패스 | 구현·기본 이동 검증 있음, 사용자 화면 검토 대기 |
+| P1-TUT-SPLIT | 🟡 | 튜토리얼·세션 분리 통합 | TUT-04/05·BS-04/05/07의 포인터·실기기·체감 검증 대기 |
+| P1-AUX | ✅ | 세션 보조 로직 6개 정리 | 288개 공개 계약, 회귀 18개 모음·Maker 이동/장전/실행 검증 통과 |
+
+근거: [튜토리얼·세션 통합](../Artifacts/tutorial-session-refactor/verification.md), [20개 맵 이동](../Artifacts/tutorial-session-refactor/movement-feel-verification/verification.md), [보조 로직 정리](../Artifacts/tutorial-session-refactor/auxiliary-logic-cleanup/verification.md), [문서 대조 기록](../Artifacts/plan-reconciliation-20261012/verification.md).
+
+현재 판정은 이 표를 기준으로 한다. 아래 초기 Slice 설계와 날짜별 수치는 당시 기록이며 새 구현 지시가 아니다. 일반 이동·방향 전환·큐·HP·Intent HUD가 아직 없다는 초기 설명을 현재의 미구현으로 해석하지 않는다. 상점/후속 지역의 도구 기반 기능 검증은 2026-10-12 기록을 따른다. 포인터·화면 체감·실기기 및 일반 전술 조작만으로 전체 런 완주는 남는다.
+
+개인 기록·공개 랭킹은 기존 후속 범위이며 이 표를 근거로 M1 코어 범위를 넓히거나 출시 완료를 선언하지 않는다. 해당 운영 게이트는 [Roadmap](MapleTactics-Roadmap.md)을 따른다.
+
+## 2026-10-12 — 상점·양쪽 경로·개인 기록 기능 검증
+
+- Maker의 NORMAL 진입과 실제 ApplyDamage→사망→드롭→웨이브/승리→결과→UI 노드 선택 경로로 상단·하단 각각 20전투를 완료했다. 상단은 헤네시스/커닝시티/페리온/슬리피우드, 하단은 헤네시스/엘리니아/노틸러스/슬리피우드이며 지역별 4·4·4·8 완료와 발록 이후 로비 복귀를 확인했다. 진행 가속용 피해 호출을 사용했으며 일반 전술 입력만의 완주·밸런스 검증으로 확대하지 않는다.
+- 실제 UI 버튼 이벤트/RPC로 상점 구매·건너뛰기·닫기/재열기·퇴장·반대 경로 잠금·다음 전투를 확인했다. 자연 획득 골드로 상단 40골드 work_gloves, 최종 소스 반복 런 첫 상점에서 35골드 squishy_shoes를 구매했다. 중복·잔액 부족·빨간 포션 검사는 별도 격리 런에 25골드를 지급한 조건이며 정상 경제 수입으로 취급하지 않는다.
+- 새 런에서 상점 방문/영수증/구매 목록과 이전 구매 유물·능력치가 초기화됐다. 최종 소스에서 이전 상단 버튼의 pending=true가 남은 상태로 하단 잠금 요청을 보내도 현재 하단 경로를 유지했다.
+- v3 Conditions 시작 관측·NORMAL/ACCOUNT_APPLIED, 실제 Clear 20·지역별 합계·Regions 페이지 및 Skills/Relics/Augments 탭 초기화·배지 표시를 실제 기록 UI로 확인했다. Maker 결과는 RankEligible=false/MAKER_TEST이며 공개 등록하지 않았다.
+- 재현된 공통 이동 PresentationProbeRemaining nil 산술과 다른 경로의 거절 응답이 현재 지도를 바꾸는 문제를 기존 담당 로직 두 곳에서 수정했다. 최종 회귀 20개 모음(전투/코어 16개 296그룹), Balance schema 74개와 vocabulary 검사를 통과했다.
+- P1-S16/P1-SHOP은 기능 증거를 확보했으나 사용자 포인터·화면 기준이 남아 🟡를 유지한다. P0-05의 기본 Column/Value 진단 누락도 별도 잔여 구현이다. [상세 검증·제한 범위](../Artifacts/normal-run-validation-20261012/verification.md).
 
 ## 2026-10-06 — 동의 기반 월드 완주 랭킹 (후속 저장 기능)
 
@@ -16,8 +62,8 @@
 
 ## 2026-10-03 — 개인 기록 v3·리전 진행 (후속 저장 기능)
 
-- 🟡 Implemented (untested): 시작 조건 메타데이터·실제 전투 클리어 수·리전 집계와 v1/v2 읽기 호환. Maker 등록/런타임 검증 대기.
-- 🟡 Implemented (untested): 기존 플레이 기록 창의 지역 진행 탭·경로 요약·실제 클리어 수 표시. 로컬 Lua 회귀 14개 및 UIBuilder 구조 검사 통과, Maker 등록/런타임 검증 대기.
+- 🟡 Implemented (untested): 시작 조건 메타데이터·실제 전투 클리어 수·리전 집계와 v1/v2 읽기 호환. 로컬 회귀 근거는 있으나 정상 런 전체에서 실제 집계 검증은 대기.
+- 🟡 Implemented (untested): 기존 플레이 기록 창의 지역 진행 탭·경로 요약·실제 클리어 수 표시. 로컬 Lua 회귀 14개와 UIBuilder 검사 통과; 실제 정상 런의 리전 통계·탭 표시 검증 대기. 기록 창/랭킹의 기존 Maker 확인과 구분한다.
 - 공개 랭킹과 타인의 공개 빌드는 2026-10-06 별도 저장소/정책/표시 계층으로 구현했다. v3 실제 전투 집계의 전체 런 회귀는 여전히 별도 확인 대상이다. 범위·단계·검증 기준은 `Guide/Run-Ranking-Workplan.md`와 standing Roadmap에 기록한다.
 
 
@@ -27,7 +73,7 @@
 - 🟡 Implemented (untested): RelicDefinitions 세 정수 보너스, 새 런 정의 캡처, 구매 즉시 합산 및 HP 차이 적용, 전투 진입 복구·새 런 초기화.
 - 🟡 Implemented (untested): 실제 타격별 공격력·방어력, 최소 피해 1, 완전 방어 0. 상점 단일 행·효과 설명·전투 HUD 연결.
 - 로컬 Lua 테스트: 실제 mLua 메서드로 추첨 재현성·구매 거절·중복 처리·HP 5/10→6/11·전투 피해를 검증. 엔진 서비스와 UI 렌더링은 모의 객체이므로 Maker 검증을 대체하지 않는다.
-- 남은 Verify: Maker Refresh → build/normal 로그 → Play에서 양쪽 경로, 실제 구매·퇴장·다음 전투·새 런 검증. 현재 세션에 Maker MCP 실행 도구가 없어 런타임 증거 미수집.
+- 남은 Verify: Maker MCP로 양쪽 경로, 실제 구매·무구매 퇴장·다음 전투·새 런을 검증한다. 당시 도구 부재는 이력이며 현재 도구는 연결되어 있다. 이번 문서 정리에서 상점 검증을 새로 수행하지 않았다.
 
 ## 2026-08-29 — 헤네시스 이후 분기형 런 상점
 
@@ -43,11 +89,11 @@
 
 ## 2026-08-30 — 엘리니아 전투 무대 1차 시각 패스
 
-- 🟡 상태: Implemented (MapBuilder 정적 검증 및 Maker 화면 검토 대기)
+- 🟡 상태: Implemented (untested) — 현재 맵의 정적 정보와 기본 이동 검증 있음, 사용자 화면 검토 대기
 - 대상: `map/ellinia_battle.map`의 전투 구조·foothold·Battle 컴포넌트는 유지하고, 헤네시스 복제 장식만 엘리니아 숲 테마로 교체한다.
 - 시각 기준: 짙은 청록 배경, 푸른 마력 나무, 매달린 덩굴, 나무집, 숲 등불, 발광 식물로 헤네시스의 밝은 들판과 즉시 구분한다.
-- 실제 Stage 연결은 별도 범위다. 아래쪽 상점 완료 후 `region_03`/엘리니아 첫 Stage로 라우팅하는 데이터·게이트 작업은 Roadmap Backlog에 유지한다.
-- 완료 기준: `TileMapMode=0`, foothold 48개와 전투 컴포넌트가 보존되고 모든 신규 `SpriteRUID`가 비어 있지 않으며, Maker에서 전투 셀·플레이어·적을 가리지 않는지 확인한다.
+- 현재 `ellinia` Region과 `ellinia_stage_01→ellinia_battle` 라우팅, `shop_lower→ellinia_stage01_battle` 노드 연결은 존재한다. 상점 이후 실제 UI 진입·해금·맵 전환은 2026-10-12 제어된 정상 진행에서 확인했다. 사용자 숲 테마 가독성 검토와 전체 전술 플레이는 Roadmap Backlog에 남는다.
+- 완료 기준: MapleTile(0), 현재 전투/지형 계약과 유효한 SpriteRUID를 유지하고 사용자 화면에서 가독성을 확인한다. 2026-10-12 MapBuilder 기준 `ellinia_battle` foothold는 34개다. 과거 문서의 48개를 현재 맵 변경 지시로 사용하지 않는다.
 
 ## 2026-10-01 — 개인 플레이 기록 UI (후속 저장 기능)
 
@@ -83,15 +129,13 @@
 
 ## 2. 맵과 화면 기준
 
-- 대상 맵: `map/map01.map`
-- 현재 맵: MapleTile(0), `RigidbodyComponent`
-- 권장 최종 맵: SideViewRectTile(2), `SideviewbodyComponent`
-- 권장 화면: PC 가로 12.8 x 7.2 world units
-- 기본 전투 보드: 화면 중앙에 6개 논리 셀
-- 현재 초기 배치: Player Cell 1, Enemy Cell 4
-- 월드 좌표는 CellIndex에서 계산하고, 판정은 Transform 좌표가 아닌 CellIndex로 한다.
-
-맵 타입 변경은 사용자가 Maker Hierarchy에서 수행한다. 전환 후 `refresh`하고 실제 `TileMapMode`를 다시 확인하기 전에는 이동 Body/API를 확정하지 않는다.
+- 일반전 기준 `henesys_battle`, 보스전 `henesys_boss`, 연습 `skill_test`, 로비 `lobby`. `map01`은 초기 이력이며 현재 파일이 아니다.
+- 전체 맵 26개와 전투 세션 맵 20개는 MapleTile(0)·Static Map이다. 물리 엔티티의 요구 Body는 `RigidbodyComponent`; 운영은 현재 Sector 최대 인원 1명이다. SideViewRectTile 전환이나 Instance Map 구현을 전제로 새 작업을 시작하지 않는다.
+- API 기준은 사용자 승인 CoreVersion 26.10.0.0이다.
+- PC 가로 기준은 12.8×7.2 world units, 1 world unit=100px. 현재 전투 보드는 StageDefinitions의 5/7/9칸이며 셀 위치·간격·시작 셀은 Stage 행을 따른다. 기본 큐는 3, 표시 슬롯은 6이다.
+- 기본 키는 A/D 또는 좌/우 이동, W 또는 위 방향 전환, 숫자 1~6 장전, Space 실행이다. 실제 키는 GameSettings 설정을 우선한다. F 기본 공격·Space 방향 전환은 초기 프로토타입 이력이다.
+- 서버가 논리 셀·점유·턴·요청을 검증하고 소유 클라이언트가 공통 PlayerGridMovementLogic으로 일반 이동 루트를 재생한다. 로비/전투 기본 이동은 0.24초·LINEAR·홉 높이 0.30·홉 배율 1을 공유한다. 완료 후 0.5초 유예, 오차 0.05 초과 시 한 번 보정하며 전투 턴은 이 검사를 기다리지 않는다.
+- 스킬 이동·순간이동·넉백은 일반 이동과 구분하며 오래된 이동/착지 응답을 정리한다. 카메라·이름표·HP의 사람의 렌더 체감은 대기다.
 
 ## 3. 진행 규칙
 
@@ -105,9 +149,11 @@
 
 ## 4. 마이크로 수직 슬라이스
 
+아래 최소 구현·미구현 목록은 초기 Slice 설계의 이력이다. 현재 완료/대기는 상단 상태표와 각 Slice 상태를 따른다. 당시 고정 피해·스킬 ID·큐 용량을 현재 데이터에 덮어쓰지 않는다.
+
 ### Slice 0 - 빈 전투 무대와 셀 가이드
 
-- 🟡 상태: Maker verified, user review pending — 기존 발판 위 7개 셀 표식 배치, HUD는 다음 단계
+- 🟡 상태: Implemented (untested) — 배치·HUD 구현 및 기존 Maker 근거 있음; 사용자 화면 검토 대기
 - 화면 결과: 전투 무대, 7개 셀 위치, Player/Enemy 시작 위치 표시가 보인다.
 - 최소 구현:
   - 확정된 맵 타입과 Body 기록
@@ -124,7 +170,7 @@
 
 ### Slice 1 - 플레이어와 적 한 명 배치
 
-- 🟡 상태: Maker verified, user review pending — Player 시작점과 Enemy 시각 모델 배치, 런타임 컴포넌트는 다음 단계
+- 🟡 상태: Implemented (untested) — Unit·표시 컴포넌트 구현 및 기존 Maker 근거 있음; 사용자 화면 검토 대기
 - 화면 결과: 플레이어와 적이 지정 셀에 서 있다.
 - 최소 구현:
   - 테스트 Player/Enemy 모델 각 1개
@@ -141,7 +187,7 @@
 
 ### Slice 2 - 한 칸 이동
 
-- 🟡 상태: 이동 코어 Maker verified, UI 버튼·CellIndex 표시 pending
+- 🟡 상태: Implemented (untested) — 20개 맵 이동·착지/경계/점유와 공통 경로 검증 통과; UI 가독성·체감 검토 대기
 - 화면 결과: 좌/우 키를 누르면 플레이어가 정확히 한 셀 이동한다.
 - 최소 구현:
   - `LeftArrow`/`A`, `RightArrow`/`D` 키 입력
@@ -162,8 +208,8 @@
 
 ### Slice 3 - 방향 전환
 
-- 🟡 상태: 키보드 방향 전환 코어 구현, UI 버튼 pending
-- 화면 결과: `Space` 키로 플레이어가 이동 없이 좌/우를 바라본다.
+- 🟡 상태: Implemented (untested) — 최신 Maker W 방향 전환 통과; 실제 UI 포인터·화면 검토 대기
+- 화면 결과: 기본 설정의 `W`/`UpArrow`로 이동 없이 좌/우를 바라본다.
 - 최소 구현:
   - `BattleUnitComponent.Facing`의 `Left`/`Right` 전환
   - `PlayerControllerComponent.LookDirectionX`로 Avatar 방향 표현
@@ -179,7 +225,7 @@
 
 ### Slice 4 - 인접 기본 공격과 HP
 
-- 🟡 상태: 앞 셀 판정, 고정 피해 3, 적 HP 텍스트, 피격 플래시, 플레이어 기본 공격 모션 구현
+- 🟡 상태: Implemented (untested) — 실제 피해/표시와 피해 회귀 통과; 사용자 화면 검토 대기
 - 화면 결과: 공격 버튼을 누르면 바라보는 방향의 바로 앞 적 HP가 감소한다.
 - 최소 구현:
   - `F` 키 기본 공격 입력
@@ -204,7 +250,7 @@
 
 ### Slice 5 - 사망과 전투 리셋
 
-- 🟡 상태: HP 0 사망·승패·Reset Maker 검증 완료, 사용자 화면 검토 pending
+- 🟡 상태: Implemented (untested) — 사망·승패·복귀 API/회귀 확인; 실제 Retry 포인터·화면 검토 대기
 - 화면 결과: HP가 0이 되면 적이 사라지거나 사망 상태로 바뀌고 승리 문구가 표시된다.
 - 최소 구현:
   - HP 0 Clamp
@@ -222,7 +268,7 @@
 
 ### Slice 6 - 적 Intent와 한 번의 적 행동
 
-- 🟡 상태: 최소 런타임 Intent Maker 검증 완료 — 거리 기반 이동/인접 공격 구현, Intent UI pending
+- 🟡 상태: Implemented (untested) — Intent DTO·HUD·계획/실행 구현과 검증 근거 있음; 사용자 가독성 검토 대기
 - 화면 결과: 적 머리 위 또는 HUD에 다음 행동이 보이고, `적 행동` 버튼을 누르면 실행된다.
 - 최소 구현:
   - Intent 하나: 플레이어 쪽으로 한 칸 이동 또는 인접 공격
@@ -239,7 +285,7 @@
 
 ### Slice 7 - 플레이어 행동 뒤 적 행동이 이어지는 한 턴
 
-- 🟡 상태: 턴 코어와 최소 큐 HUD Maker 검증 완료 — 공통 행동 큐, 입력 잠금, 적 행동, Turn 증가와 상태 표시 구현; 사망/Reset pending
+- 🟡 상태: Implemented (untested) — 턴·입력 잠금·중복 완료·승패 회귀 근거 있음; UI 통합 검토 대기
 - 화면 결과: 플레이어가 이동/전환/공격하면 적 행동과 Turn 증가가 자동으로 이어진다.
 - 최소 구현:
   - Phase: `PLAYER_INPUT`, `ENEMY_ACTION`, `CLEANUP`
@@ -257,7 +303,7 @@
 
 ### Slice 8 - 공격 타일 선택·등록과 실행
 
-- 🟡 상태: 두 공격 선택과 가변 용량 타일 큐 Maker 검증 완료, 사용자 화면 검토 pending
+- 🟡 상태: Implemented (untested) — 현재 기본 큐 3·슬롯 6의 장전/실행 Maker 확인; 드래그·취소 포인터 대기
 - 화면 결과: `기본 베기`와 `강한 베기`를 기본 2칸 큐에 순서대로 넣고 실행한다.
 - 최소 구현:
   - Tile Runtime: `basic_slash`, `heavy_slash`
@@ -275,7 +321,7 @@
 
 ### Slice 9 - 두 칸 큐와 재타깃
 
-- 🟡 상태: 밀치기 타일과 두 칸 순차 큐 재타깃 Maker 검증 완료, 사용자 화면 검토 pending
+- 🟡 상태: Implemented (untested) — 제어 API·순차 재타깃·큐 회귀 확인; 사용자 화면 검토 대기
 - 화면 결과: `밀치기 -> 검` 두 타일을 순서대로 실행하고, 두 번째 공격이 밀친 뒤의 현재 위치에서 타깃을 다시 찾는다.
 - 최소 구현:
   - Push 효과 한 개
@@ -292,7 +338,7 @@
 
 ### Slice 10 - 두 번째 사례가 생긴 부분만 인터페이스화
 
-- 🟡 상태: Implemented (core paths tested) — Maker refresh/build 통과, `DAMAGE`/`PUSH` 실제 분기 확인. 경계 밀치기 회귀 검증은 남음
+- ✅ 상태: Tested — 기존 Maker DAMAGE/PUSH, 통합 검증의 실제 제어 API, 최신 제어 20개·큐 14개 회귀로 경계/점유 재검증 확인
 - 화면 결과: 기존 플레이 결과는 변하지 않지만 새 타일 하나를 작은 설정값으로 추가할 수 있다.
 - 리팩터링 대상:
   - `DAMAGE`, `PUSH`가 생겼으므로 Effect Router 추출
@@ -425,14 +471,14 @@
 
 ### Slice 14 - CSV 기반 일반전 맵 재사용과 보스 맵 분리
 
-- ✅ 상태: Verified — `region_01_boss` 생성, 1-4 CSV 라우팅, 서버 런타임 맵 전환과 콘텐츠 검증 통과.
-- 화면 결과: 1-1~1-3은 같은 `region_01_battle` 물리 맵을 재사용하고 1-4는 `region_01_boss`로 이동하며, 각 StageDefinitions·Wave 데이터로 독립 초기화된다.
+- ✅ 상태: Tested — 기존 Stage/Map 분리 검증 유지. 현재 1-1~1-3→henesys_battle, 1-4→henesys_boss는 StageMapRoutes로 확인
+- 화면 결과: 1-1~1-3은 같은 `henesys_battle` 물리 맵을 재사용하고 1-4는 `henesys_boss`로 이동하며, 각 StageDefinitions·Wave 데이터로 독립 초기화된다.
 - 최소 구현:
-  - `StageMapRoutes.csv`의 1-1~1-3은 `MapId=region_01_battle`, 1-4는 `MapId=region_01_boss`로 설정
+  - `StageMapRoutes.csv`의 1-1~1-3은 `MapId=henesys_battle`, 1-4는 `MapId=henesys_boss`로 설정
   - 월드맵 지연 진입 요청의 현재 맵 검사를 실제 로비 맵명 `lobby`로 통일
   - 공용 맵의 `BattleSessionComponent.AutoStartPrototypeBattle=false`
   - Static Map 격리를 위해 `sector01.maxUserNo=1`
-  - 일반전 공용 물리 맵 `region_01_battle`을 복제해 전투 컴포넌트 계약이 같은 `region_01_boss` 생성
+  - 일반전 공용 물리 맵 `henesys_battle`을 복제해 전투 컴포넌트 계약이 같은 `henesys_boss` 생성
 - 불변식:
   - `StageId`는 콘텐츠 식별자이고 `MapId`는 물리 이동 대상이다.
   - 준비된 BattleEntry가 없는 직접 맵 진입은 전투를 자동 시작하지 않는다.
@@ -445,7 +491,7 @@
 
 ### Slice 15 - 헤네시스 일반전·머쉬맘 보스전 배경 구성
 
-- ✅ 상태: Verified — 교체 가능한 장식 모델과 일반전·보스전 배치 완료, 두 맵의 플레이 카메라 가독성과 오류·경고 0건 확인.
+- ✅ 상태: Tested — 기존 헤네시스 일반전/보스전 화면 검증 유지. 현재 물리 맵 이름은 henesys_battle/henesys_boss
 - 화면 결과: 일반전은 밝은 헤네시스 외곽 사냥터, 보스전은 같은 지역의 더 울창한 버섯 숲으로 구분되며 6칸 전투 정보는 가려지지 않는다.
 - 최소 구현:
   - 장식 SpriteRUID를 교체 가능한 `.model`로 분리
@@ -459,7 +505,7 @@
 
 ## 5. 이후 Phase로 넘길 것
 
-Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
+Phase 1이 모두 검증된 뒤 다음 순서로 확장한다. 이 목록은 초기 확장 순서다. 쿨다운·FreePlay·Dataset·Spawn·직업 등은 이미 일부 선행 구현됐으므로 현재 체크리스트와 구현 기록을 대조한 뒤 남은 범위만 진행한다.
 
 1. 타일 쿨다운과 FreePlay
 2. 일반 적 Pattern과 InitialFacingPolicy 데이터
@@ -474,40 +520,18 @@ Phase 1이 모두 검증된 뒤 다음 순서로 확장한다.
 
 ### 월드맵 지역 확장 순서
 
-Phase 1의 헤네시스 첫 분기는 이후 지역을 추가하기 위한 기준 구현이다. 후속 콘텐츠는 아래 순서와 계약을 유지한다.
+데이터상의 경로는 `헤네시스→커닝시티→페리온→슬리피우드`와 `헤네시스→엘리니아→노틸러스→슬리피우드`이며 마을 사이에는 상점 노드가 있다. 현재 RegionDefinitions·StageMapRoutes·NodeDefinitions에는 6개 지역과 28개 Stage 경로가 존재한다. 2026-10-12에는 실제 피해 처리로 진행을 가속한 NORMAL 런에서 UI 해금·상점 방문·양쪽 경로 합류·각 20전투 기록까지 확인했다. 일반 전술 조작만의 전체 완주와 콘텐츠별 독립 검증은 별도다.
 
-| RegionId | 마을 | 물리 맵 세트 | 연결 |
-|---|---|---|---|
-| `region_01` | 헤네시스 | `region_01_battle`, `region_01_boss` | 시작 |
-| `region_02` | 커닝시티 | `region_02_battle`, `region_02_boss` | `region_01 → region_02 → region_04 → region_06` |
-| `region_03` | 엘리니아 | `region_03_battle`, `region_03_boss` | `region_01 → region_03 → region_05 → region_06` |
-| `region_04` | 페리온 | `region_04_battle`, `region_04_boss` | 위쪽 중간 지역 |
-| `region_05` | 노틸러스 | `nautilus_battle`, `nautilus_boss` | 아래쪽 중간 지역 |
-| `region_06` | 슬리피우드 | `sleepywood_ant_tunnel`, `sleepywood_food_cart_boss` | 양쪽 경로 합류 |
+| 현재 RegionId | 마을 | 실제 MapId 세트 |
+|---|---|---|
+| henesys | 헤네시스 | henesys_battle, henesys_boss |
+| region_Kerning_City | 커닝시티 | kerning_city_battle, kerning_city_battle2, kerning_city_boss |
+| ellinia | 엘리니아 | ellinia_battle, ellinia_boss |
+| region_04 | 페리온 | perion_01_battle, perion_02_battle, perion_03_battle, perion_boss |
+| region_05 | 노틸러스 | nautilus_battle, nautilus_interior_01, nautilus_interior_02, nautilus_boss |
+| region_06 | 슬리피우드 | sleepywood_ant_tunnel, sleepywood_temple_battle, sleepywood_food_cart_boss, sleepywood_temple_boss |
 
-```text
-로비
-└─ 헤네시스
-   ├─ 상점(Henesys→Kerning) → 커닝시티 → 상점(Kerning→Perion) → 페리온 → 상점(Perion→Sleepywood) ┐
-   └─ 상점(Henesys→Ellinia) → 엘리니아 → 상점(Ellinia→Nautilus) → 노틸러스 → 상점(Nautilus→Sleepywood) ┘
-                                                                                                      ↓
-                                                                                                  슬리피우드
-```
-
-후속 구현 체크리스트:
-
-- [ ] `RegionDefinitions`에 커닝시티·엘리니아·페리온·노틸러스·슬리피우드 추가
-- [ ] Region마다 `region_XX_battle.map`과 `region_XX_boss.map`을 별도 생성
-- [ ] 같은 Region의 일반 Stage만 해당 `region_XX_battle`을 재사용하고 다른 마을 맵은 공유하지 않음
-- [ ] `StageMapRoutes`의 모든 StageId를 소속 Region의 일반전/보스전 MapId로 연결
-- [ ] `NodeDefinitions`에 도시별 전투/보스 노드와 6개 Edge 상점 노드 추가
-- [ ] 모든 상점 표시와 클릭은 공통 `ShopVisitBtn` 및 Shop Controller 사용
-- [ ] Edge별 `ShopId`, 출발 `RegionId`, 도착 `RegionId`, 해금 조건을 데이터로 정의
-- [ ] 마을 클리어 전에는 다음 상점과 도시를 클릭할 수 없도록 서버 Run Snapshot으로 게이트
-- [ ] 상점 방문 완료 후에만 해당 Edge의 다음 마을을 클릭 가능하게 전환
-- [ ] `UPPER`/`LOWER` 최초 선택을 Run 동안 유지하고 반대 경로를 비활성화
-- [ ] 두 경로가 슬리피우드에서 동일한 진행 상태로 합류하는지 검증
-- [ ] UI 코드에 도시별 `if`를 늘리지 않고 Dataset 행 추가만으로 노드를 확장
+새 파일을 `region_XX_*` 이름으로 다시 만드는 작업을 지시하지 않는다. 현재 MapId는 CSV 원본을 따르고, 후속 지역의 상점 Edge·해금·합류 기능은 [검증 기록](../Artifacts/normal-run-validation-20261012/verification.md)을, 공통 UI 확장 감사·완성 콘텐츠·일반 전술 완주는 [Roadmap Backlog](MapleTactics-Roadmap.md#backlog)를 따른다. 파일·행의 존재만으로 완료를 판정하지 않는다.
 
 ## 6. 사용자와 함께 확인할 화면 체크포인트
 
@@ -521,7 +545,9 @@ Phase 1의 헤네시스 첫 분기는 이후 지역을 추가하기 위한 기�
 
 화면 판단이 필요한 항목은 AI가 임의로 `✅ Tested` 처리하지 않는다. 구현은 `🟡`로 두고 사용자 확인 후 `✅`로 변경한다.
 
-## 7. 구현 기록
+## 7. 구현 기록 — 날짜별 이력
+
+아래 맵명·수치·입력·미구현 표기는 각 날짜의 당시 상태다. 현재 작업 상태는 상단 체크리스트와 §2를 따르며, 이력의 `map01`·초기 설정을 현재 파일이나 새 작업 지시로 사용하지 않는다.
 
 ### 2026-07-18 — 기본 전투 오브젝트 배치
 
@@ -1017,7 +1043,7 @@ Phase 1의 헤네시스 첫 분기는 이후 지역을 추가하기 위한 기�
 
 ### 2026-08-26 — 6개 마을·마을 간 상점 확장 기준
 
-- 상태: 📋 Planned — Phase 1 이후 콘텐츠 확장 계약 확정
+- 상태: ⬜ Not started — 당시 Phase 1 이후 확장 계약; 현재 존재하는 데이터/맵과 정상 진행 검증 대기는 Roadmap Backlog를 따른다.
 - 현재 Slice 16의 헤네시스 `1-1 → 상점 → 커닝시티/엘리니아` 흐름을 모든 도시 연결의 기준으로 재사용
 - 현재 커닝시티/엘리니아가 헤네시스 전투 Stage를 임시 재사용하는 연결은 프로토타입 전용이며, 지역 콘텐츠 추가 시 각각 `region_02_*`, `region_03_*` 맵과 Stage 데이터로 교체
 - 위쪽 경로: `헤네시스 → 상점 → 커닝시티 → 상점 → 페리온 → 상점 → 슬리피우드`
