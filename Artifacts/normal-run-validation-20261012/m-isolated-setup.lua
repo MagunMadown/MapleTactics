@@ -1,0 +1,17 @@
+local p=_UserService.UserEntities.Values[1]
+assert(isvalid(p) and p.CurrentMap.Name=="lobby")
+local profile=_UnionProfileRepositoryLogic:GetUnionProfile(p)
+assert(profile.Success)
+_RunManagerLogic._T.NormalVerifyPlayer=p
+_UnionProfileRepositoryLogic._T.VerifyOriginalStorageKey=_UnionProfileRepositoryLogic.StorageKey
+_RunResultRepositoryLogic._T.VerifyOriginalKeys={_RunResultRepositoryLogic.StorageKey,_RunResultRepositoryLogic.HistoryIndexKey,_RunResultRepositoryLogic.RecordKeyPrefix}
+_UnionProfileRepositoryLogic.StorageKey="NormalRunVerify20261012M_UnionProfile"
+_UnionProfileRepositoryLogic.RawByStorageUserKey[profile.StorageUserKey]=""
+_UnionProfileRepositoryLogic.StoredRecordExistsByStorageUserKey[profile.StorageUserKey]=false
+_RunResultRepositoryLogic.StorageKey="NormalRunVerify20261012M_Latest"
+_RunResultRepositoryLogic.HistoryIndexKey="NormalRunVerify20261012M_History"
+_RunResultRepositoryLogic.RecordKeyPrefix="NormalRunVerify20261012M_Record:"
+local selection=_LobbyCharacterSelectionLogic:GetOrCreateTemporaryClassState(p)
+assert(selection~=nil)
+selection:SetSelectedJobId("warrior")
+log("[FlowVerify] M_ISOLATED_PREPARED prefix=NormalRunVerify20261012M")

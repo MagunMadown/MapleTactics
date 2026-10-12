@@ -118,4 +118,39 @@ exitButton:OnUpdate(0.016)
 assert(opened==1 and not exitButton.ClosePending and not buttonEntity.Visible)
 print('PASS pending closure survives transient missing player and completes after recovery')
 ''')
-print("All 8 HUD/shop lifecycle groups passed. Maker runtime: NOT RUN.")
+lua.globals().regionButton = load("WorldMapFutureRegionButtonComponent.mlua", {"HandleEntryResult"})
+lua.execute(r'''
+local opens=0
+local minimap={CurrentMode='POST_SHOP_ROUTE',SelectedRouteId='shop_upper',OpenWorldMapMode=function(self,mode,source,route)
+ opens=opens+1; self.SelectedRouteId=route; assert(mode=='POST_SHOP_ROUTE'); return true
+end}
+_EntityService={GetEntityByPath=function(_,path)
+ assert(path=='/ui/DefaultGroup'); return {GetComponent=function() return minimap end}
+end}
+regionButton.Entity={ButtonComponent={Enable=false}}
+regionButton.RequiredRouteId='shop_lower'; regionButton.RequestPending=false
+regionButton:HandleEntryResult(false,'NODE_NOT_AVAILABLE')
+assert(opens==0 and minimap.SelectedRouteId=='shop_upper' and not regionButton.Entity.ButtonComponent.Enable)
+print('PASS unsolicited rejection cannot unlock or replace the selected shop route')
+regionButton.RequiredRouteId='shop_upper'; regionButton.RequestPending=true
+minimap.SelectedRouteId='shop_lower'
+regionButton:HandleEntryResult(false,'NODE_NOT_AVAILABLE')
+assert(opens==0 and minimap.SelectedRouteId=='shop_lower' and not regionButton.Entity.ButtonComponent.Enable)
+minimap.SelectedRouteId='shop_upper'; minimap.CurrentMode='SHOP_CHOICE'
+regionButton:HandleEntryResult(false,'LATE_REJECTION')
+assert(opens==0 and minimap.CurrentMode=='SHOP_CHOICE' and not regionButton.Entity.ButtonComponent.Enable)
+print('PASS previous-route pending requests cannot restore a different route or screen')
+for _,route in ipairs({'shop_upper','shop_lower','shop_perion_sleepywood'}) do
+ minimap.CurrentMode='POST_SHOP_ROUTE'; minimap.SelectedRouteId=route
+ regionButton.RequiredRouteId=route; regionButton.RequestPending=true
+ regionButton:HandleEntryResult(true,'OK')
+ assert(regionButton.RequestPending)
+ local before=opens
+ regionButton:HandleEntryResult(false,'TRANSFER_FAILED')
+ assert(opens==before+1 and not regionButton.RequestPending and regionButton.Entity.ButtonComponent.Enable and minimap.SelectedRouteId==route)
+ regionButton:HandleEntryResult(false,'DUPLICATE_REJECTION')
+ assert(opens==before+1)
+end
+print('PASS a pending region rejection restores its route once and remains retryable')
+''')
+print("All 11 HUD/shop/route lifecycle groups passed. Maker runtime: NOT RUN.")

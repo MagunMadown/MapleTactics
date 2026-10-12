@@ -158,6 +158,22 @@ assert dict(lobby_profile.items()) == dict(battle_profile.items()), "normal move
 print("PASS real lobby/battle defaults share the complete movement profile")
 
 cases = {
+    "retained move without a probe timer retries missing helpers in lobby and battle": r'''
+        for _,entry in ipairs({0,7}) do
+            fixture(); local values=presentation; local setter=values.SetLocalGridMoveOffset2D
+            values.SetLocalGridMoveOffset2D=nil; presentation=scriptProxy(values,{})
+            movement:BeginLocalMove(player,map,entry,3,Vector2(3,0),profile)
+            movement._T.localMove.PresentationProbeRemaining=nil
+            movement:OnUpdate(0.1)
+            assert(math.abs(movement._T.localMove.PresentationProbeRemaining-0.4)<0.00001 and warnings==1)
+            movement:OnUpdate(0.41)
+            assert(movement._T.localMove.PresentationProbeRemaining==0.5 and #offsets==0)
+            values.SetLocalGridMoveOffset2D=setter; movement:OnUpdate(0.51)
+            assert(movement._T.localMove.VisualReady and #offsets==1 and warnings==1)
+            player.CurrentMap=other; movement:OnUpdate(0.01)
+            assert(movement._T.localMove==nil and released==1 and clears==1)
+        end
+    ''',
     "immediate avatar prediction leaves authoritative root/cell unchanged": r'''
         fixture(); local id=movement:BeginLocalMove(player,map,7,3,Vector2(3,0),profile)
         assert(id==1 and hops==1 and movement:HasLocalMove(map))
