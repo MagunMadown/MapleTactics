@@ -7,9 +7,11 @@ import sys
 if os.environ.get("LUPA_PATH"):
     sys.path.insert(0, os.environ["LUPA_PATH"])
 from lupa.lua54 import LuaRuntime
+from battle_refactor_fixture import wire_logic_owners
 
 ROOT = Path(__file__).resolve().parents[2]
 lua = LuaRuntime(unpack_returned_tuples=True)
+wire_logic_owners(lua)
 
 
 def load(path, names):
@@ -26,7 +28,7 @@ def load(path, names):
 
 
 lua.globals().movement = load("RootDesk/MyDesk/00_Core/Movement/PlayerGridMovementLogic.mlua", {
-    "GetProfile", "GetDuration", "EvaluateCurve", "Advance", "HasLocalMove", "BeginLocalMove",
+    "GetProfile", "GetHopDuration", "GetDuration", "EvaluateCurve", "Advance", "HasLocalMove", "BeginLocalMove",
     "ResolveLocalMove", "CancelLocalMove", "OnUpdate", "OnEndPlay", "PlayHop",
     "CancelBlockedMove", "UpdateBlockedMove", "BeginBlockedMove", "IsBlockedMoveReason",
     "CreateLandingCheck", "UpdateLandingCheck",
@@ -143,6 +145,17 @@ function oldMoveRecord()
         Duration=0.13,Confirmed=false,Completed=false}
 end
 ''')
+
+# Use real session defaults: a copied common fixture used to hide lobby/battle profile drift.
+session_source = (ROOT / "RootDesk/MyDesk/01_Combat/Components/Shared/BattleSessionComponent.mlua").read_text(encoding="utf-8-sig")
+session_defaults = lua.table()
+for name, raw in re.findall(r"property\s+\w+\s+(\w+)\s*=\s*([^\n]+)", session_source):
+    if name in lua.globals().movement.GetProfile(lua.globals().movement, None).keys():
+        session_defaults[name] = lua.eval(raw)
+lobby_profile = lua.globals().movement.GetProfile(lua.globals().movement, None)
+battle_profile = lua.globals().movement.GetProfile(lua.globals().movement, session_defaults)
+assert dict(lobby_profile.items()) == dict(battle_profile.items()), "normal movement profiles differ between lobby and battle"
+print("PASS real lobby/battle defaults share the complete movement profile")
 
 cases = {
     "immediate avatar prediction leaves authoritative root/cell unchanged": r'''
