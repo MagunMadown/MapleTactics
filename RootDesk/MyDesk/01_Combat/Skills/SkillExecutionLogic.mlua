@@ -730,4 +730,67 @@ script SkillExecutionLogic extends Logic
 		return { Success = true, Data = _AugmentRuntimeLogic:BuildSkillBundle(source, validation.Data.Definition, validation.Data.EffectSteps, "") }
 	end
 
+	@ExecSpace("ServerOnly")
+	method void ResetPlayerSkillChain(any session, string reason)
+		-- PREVIOUS_ATTACK means the previous accepted skill in this execution queue, never an earlier turn.
+		local playerEntity = session:FindUnitEntity("player_01")
+		if isvalid(playerEntity) == false then return end
+		local unit = playerEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then return end
+		unit.PreviousSkillWasAttack = false
+		-- The combo chain also counts within one executing queue only.
+		unit.ComboChainCount = 0
+		unit.ComboAttackBonus = 0
+		log("[BattleSkillChain] reset reason=" .. reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceComboChain(any session, any sourceUnit, string skillId, boolean isAttack)
+		-- While a combo buff is active, each attack skill in the executing queue raises the chain by one and
+		-- deals chain × ComboBuffAmount extra damage. Non-attack skills neither count nor break the chain.
+		if isAttack == false or sourceUnit.ComboBuffAmount <= 0 then
+			sourceUnit.ComboAttackBonus = 0
+			return
+		end
+		sourceUnit.ComboChainCount = sourceUnit.ComboChainCount + 1
+		sourceUnit.ComboAttackBonus = sourceUnit.ComboChainCount * sourceUnit.ComboBuffAmount
+		log("[BattleBuff] combo chain unit=" .. sourceUnit.UnitId .. " skill=" .. skillId .. " chain=" .. sourceUnit.ComboChainCount .. " bonus=" .. tostring(sourceUnit.ComboAttackBonus))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvancePlayerSkillCooldowns(any session, string reason)
+		-- A guard lasts through one enemy round; utilities share the existing turn cooldown clock.
+		if isvalid(session.PlayerEntity) then
+			local unit = session.PlayerEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then
+				unit.UtilityGuardActive = false
+				-- Timed session buffs share this clock so "N턴" on a buff and on a cooldown mean the same thing.
+				local buffResult = unit:AdvanceBuffTurns(reason)
+				if buffResult.MaxHpChanged == true then
+					session:RefreshPlayerHpSnapshot("MAX_HP_BUFF_EXPIRED")
+				end
+			end
+		end
+		local runtimeState = session:GetSkillRuntimeState("player_01")
+		if runtimeState == nil then
+			log_warning("[BattleCooldown] advance skipped reason=SKILL_RUNTIME_STATE_MISSING turn=" .. session.TurnNumber)
+			return
+		end
+		runtimeState:AdvancePlayerCooldowns(reason)
+		session.UtilityRemainingCooldown = runtimeState:GetRemainingCooldown(session.UtilitySkillId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceEnemySkillCooldowns(any session, string enemyUnitId, string reason)
+		-- Enemy cooldowns advance on that enemy's own action, independent of player queue size.
+		local enemy = session:FindUnitEntity(enemyUnitId)
+		local unit = isvalid(enemy) and enemy:GetComponent("script.BattleUnitComponent") or nil
+		if unit ~= nil then unit:AdvanceBuffTurns(reason) end
+		local runtimeState = session:GetSkillRuntimeState(enemyUnitId)
+		if runtimeState == nil then
+			return
+		end
+		runtimeState:AdvanceCooldowns(1, reason)
+	end
+
 end

@@ -34,6 +34,7 @@ g.Session = load(Path(os.environ.get("ORIGINAL_SESSION", COMBAT / "Components/Sh
     "CompleteQueuedAction", "CompleteTileQueueExecution",
 })
 g._BattleOutcomeLogic = load(COMBAT / "Resolvers/BattleOutcomeLogic.mlua")
+g._BattleQueueLogic = load(COMBAT / "Skills/BattleQueueLogic.mlua")
 g.Unit = load(COMBAT / "Components/Shared/BattleUnitComponent.mlua", {"MarkDead"})
 g.Turn = load(COMBAT / "Components/Shared/BattleTurnComponent.mlua", {
     "ClearActionState", "ClearTransientState", "SetPhase", "CompleteSkillQueue", "CompleteImmediateAction",

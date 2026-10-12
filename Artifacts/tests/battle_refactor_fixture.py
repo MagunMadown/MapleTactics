@@ -10,6 +10,8 @@ OWNERS = (
     "Skills/SkillTargetResolverLogic",
     "Resolvers/EnemyPlanningLogic",
     "Skills/EffectExecutors/EnemySpecialEffectExecutorLogic",
+    "Skills/BattleQueueLogic",
+    "Skills/BattleQuickbarLogic",
 )
 
 
