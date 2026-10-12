@@ -1,0 +1,203 @@
+@Logic
+script EnemyBossMechanicLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method integer GetOppositeEdgeCell(any session, integer cellIndex)
+		if cellIndex <= (session.CellCount - 1) * 0.5 then
+			return session.CellCount - 1
+		end
+		return 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BeginBossOppositeJump(any session, string enemyId)
+		-- Freezes the opposite edge at takeoff so later player movement cannot retarget the landing.
+		local enemyEntity = session:FindUnitEntity(enemyId)
+		if isvalid(enemyEntity) == false then
+			return { Success = false, Reason = "ENEMY_NOT_FOUND" }
+		end
+		local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
+		if enemy == nil or enemy.IsBoss ~= true or enemy.IsDead == true then
+			return { Success = false, Reason = "BOSS_UNAVAILABLE" }
+		end
+		local landingCell = session:GetOppositeEdgeCell(enemy.CellIndex)
+		local result = enemy:SetAirborneState(true, landingCell)
+		if result.Success == true then
+			log("[BossJump] takeoff enemy=" .. enemyId .. " from=" .. enemy.CellIndex .. " landing=" .. landingCell)
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResolveBossOppositeLanding(any session, string enemyId, string landingSkillId)
+		-- Landing owns overlap resolution: push toward center first, then try the opposite side.
+		local result = { Success = false, Reason = "UNKNOWN", EnemyId = enemyId, LandingCell = -1, PlayerPushed = false, PlayerFromCell = -1, PlayerToCell = -1 }
+		local enemyEntity = session:FindUnitEntity(enemyId)
+		local playerEntity = session:FindUnitEntity("player_01")
+		if isvalid(enemyEntity) == false or isvalid(playerEntity) == false then
+			result.Reason = "LANDING_UNIT_MISSING"
+			return result
+		end
+		local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
+		local player = playerEntity:GetComponent("script.BattleUnitComponent")
+		if enemy == nil or player == nil or enemy.IsBoss ~= true or enemy.IsAirborne ~= true then
+			result.Reason = "BOSS_NOT_AIRBORNE"
+			return result
+		end
+		local landingCell = enemy.PendingLandingCell
+		result.LandingCell = landingCell
+		if session:IsValidCell(landingCell) == false then
+			result.Reason = "INVALID_LANDING_CELL"
+			return result
+		end
+
+		if player.IsDead == false and player.CellIndex == landingCell then
+			local centerDirection = landingCell <= (session.CellCount - 1) * 0.5 and 1 or -1
+			local pushResult = session:RelocateUnitForMechanic("player_01", player.CellIndex + centerDirection, "BOSS_LANDING_CENTER_PUSH")
+			if pushResult.Success == false then
+				pushResult = session:RelocateUnitForMechanic("player_01", player.CellIndex - centerDirection, "BOSS_LANDING_REVERSE_PUSH")
+			end
+			if pushResult.Success == false then
+				result.Reason = "LANDING_OVERLAP_UNRESOLVED_" .. pushResult.Reason
+				return result
+			end
+			result.PlayerPushed = true
+			result.PlayerFromCell = pushResult.FromCell
+			result.PlayerToCell = pushResult.ToCell
+		end
+
+		if session:IsCellOccupied(landingCell, enemyId) then
+			result.Reason = "LANDING_CELL_OCCUPIED"
+			return result
+		end
+		local fromCell = enemy.CellIndex
+		local cellResult = enemy:ApplyCellChange(landingCell)
+		if cellResult.Success == false then
+			result.Reason = cellResult.Reason
+			return result
+		end
+		session:PlaceEntity(enemyEntity, session:GetCellPosition(landingCell))
+		enemy:SetAirborneState(false, -1)
+		local facing = player.CellIndex >= landingCell and "Right" or "Left"
+		enemy:ApplyFacingState(facing)
+		session:ApplyFacing(enemyEntity, enemy.Facing)
+		local impactResult = nil
+		if landingSkillId ~= nil and landingSkillId ~= "" then
+			impactResult = session:TryExecuteSkill(enemyId, landingSkillId)
+			result.ImpactSuccess = impactResult.Success
+			result.ImpactReason = impactResult.Reason
+		end
+		result.Success = true
+		result.Reason = "BOSS_LANDED"
+		log("[BossJump] landed enemy=" .. enemyId .. " from=" .. fromCell .. " to=" .. landingCell .. " playerPush=" .. tostring(result.PlayerPushed) .. " player=" .. result.PlayerFromCell .. "->" .. result.PlayerToCell .. " impact=" .. tostring(result.ImpactSuccess) .. ":" .. tostring(result.ImpactReason))
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean CanSkeletonSwapWithCommander(any session, string unitId)
+		-- Only a Perion commander's summoned soldier may relieve its engaged commander.
+		if session.StageId ~= "region_04_stage_04" or session.BattleResult ~= "" or session._T.BossDefeated then
+			return false
+		end
+		local soldierEntity = session:FindUnitEntity(unitId)
+		local playerEntity = session:FindUnitEntity("player_01")
+		if not isvalid(soldierEntity) or not isvalid(playerEntity) then return false end
+		local soldier = soldierEntity:GetComponent("script.BattleUnitComponent")
+		local player = playerEntity:GetComponent("script.BattleUnitComponent")
+		if soldier == nil or player == nil then return false end
+		local commanderEntity = soldier._T.SkeletonCommander
+		if not isvalid(commanderEntity) or commanderEntity.CurrentMap ~= session.Entity then return false end
+		local commander = commanderEntity:GetComponent("script.BattleUnitComponent")
+		if commander == nil or session:FindUnitEntity(commander.UnitId) ~= commanderEntity then return false end
+		if (soldier.EnemyDefinitionId ~= "region_04_skeleton_soldier" and soldier.EnemyDefinitionId ~= "region_04_skeleton_officer") or soldier.Team ~= "Enemy"
+			or commander.EnemyDefinitionId ~= "region_04_commander_skeleton" or not commander.IsBoss or commander.Team ~= "Enemy" then
+			return false
+		end
+		for _, unit in ipairs({ soldier, commander, player }) do
+			if unit.IsDead or unit.CurrentHp <= 0 or unit.IsAirborne or not session:IsValidCell(unit.CellIndex) then return false end
+		end
+		return soldier.CellIndex ~= commander.CellIndex
+			and math.abs(soldier.CellIndex - player.CellIndex) >= 2
+			and math.abs(commander.CellIndex - player.CellIndex) == 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SwapSkeletonWithCommander(any session, string unitId)
+		-- Revalidate a frozen plan at impact; cooldown was already consumed by skill execution.
+		if session.TurnState == nil or session.TurnState.BattlePhase ~= "EnemyTurn" or not session:CanSkeletonSwapWithCommander(unitId) then
+			return { Success = false, Reason = "COMMANDER_RELIEF_UNAVAILABLE" }
+		end
+		local soldierEntity = session:FindUnitEntity(unitId)
+		local soldier = soldierEntity:GetComponent("script.BattleUnitComponent")
+		local commanderEntity = soldier._T.SkeletonCommander
+		local commander = commanderEntity:GetComponent("script.BattleUnitComponent")
+		local soldierCell = soldier.CellIndex
+		local commanderCell = commander.CellIndex
+		-- Leave a commander-owned hazard at the departure cell before committing the swap.
+		local poisonCells = {}
+		for cell = commanderCell - 1, commanderCell + 1 do
+			if session:IsValidCell(cell) then table.insert(poisonCells, cell) end
+		end
+		session:ExecuteEnemySpecialEffect({ SourceUnitId = commander.UnitId, TargetCellIndices = poisonCells },
+			{ EffectType = "POISON_MIST", Value = 1, ParameterA = "2" })
+		-- Commit both cells before publishing movement so observers never see an occupied destination.
+		soldier:ApplyCellChange(commanderCell)
+		commander:ApplyCellChange(soldierCell)
+		local player = session:FindUnitEntity("player_01"):GetComponent("script.BattleUnitComponent")
+		soldier:ApplyFacingState(player.CellIndex > commanderCell and "Right" or "Left")
+		commander:ApplyFacingState(player.CellIndex > soldierCell and "Right" or "Left")
+		session:PlaceEntity(soldierEntity, session:GetCellPosition(commanderCell))
+		session:PlaceEntity(commanderEntity, session:GetCellPosition(soldierCell))
+		session:PlayUnitMoveHop(soldierEntity)
+		session:PlayUnitMoveHop(commanderEntity)
+		for _, move in ipairs({ { UnitId = unitId, FromCell = soldierCell, ToCell = commanderCell },
+			{ UnitId = commander.UnitId, FromCell = commanderCell, ToCell = soldierCell } }) do
+			local movedEvent = UnitMovedEvent()
+			movedEvent.UnitId = move.UnitId
+			movedEvent.FromCell = move.FromCell
+			movedEvent.ToCell = move.ToCell
+			session.Entity:SendEvent(movedEvent)
+		end
+		session:PublishEnemyPlanSnapshot("COMMANDER_RELIEF")
+		log("[BattleBoss] skeleton relief soldier=" .. unitId .. " commander=" .. commander.UnitId)
+		return { Success = true, Reason = "COMMANDER_RELIEVED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer RollBoardParity(any session, string unitId, string skillId)
+		-- Picks even (0) or odd (1) board cells when a BOARD_PARITY attack is queued; the warning cells and the
+		-- impact both read this stored pick, so the attack lands exactly where it was announced.
+		if session._T.BoardParity == nil then session._T.BoardParity = {} end
+		local parity = _UtilLogic:RandomIntegerRange(0, 1)
+		session._T.BoardParity[unitId .. "|" .. skillId] = parity
+		log("[BoardParity] rolled unit=" .. unitId .. " skill=" .. skillId .. " parity=" .. parity)
+		return parity
+	end
+
+	@ExecSpace("ServerOnly")
+	method integer GetBoardParity(any session, string unitId, string skillId)
+		-- Returns the parity fixed when the attack was queued; an unqueued cast (tests) rolls one on demand.
+		local stored = session._T.BoardParity ~= nil and session._T.BoardParity[unitId .. "|" .. skillId] or nil
+		if stored == nil then
+			return session:RollBoardParity(unitId, skillId)
+		end
+		return stored
+	end
+
+	@ExecSpace("ServerOnly")
+	method void NotifyBossPhaseAdvanced(any session, integer phaseIndex)
+		-- Bridges a boss phase transition to the wave runtime. Ownership stays split: the
+		-- wave component decides whether the current wave arms a BOSS_PHASE trigger, and the
+		-- actual spawn still runs through EvaluateForcedSpawnAtTurnBoundary on the next turn
+		-- boundary, so no enemy is injected while an action is resolving.
+		if session.WaveRuntime == nil then
+			return
+		end
+		local trigger = session.WaveRuntime:ApplyBossPhaseTrigger(phaseIndex, "BOSS_PHASE_CHANGED")
+		if trigger.Pended == true then
+			session:PublishWaveStateSnapshot("BOSS_PHASE_SPAWN_PENDING")
+			log("[BattleSession] boss phase reinforcement queued phase=" .. phaseIndex .. " wave=" .. session.WaveRuntime.PendingWaveNumber)
+		end
+	end
+
+end

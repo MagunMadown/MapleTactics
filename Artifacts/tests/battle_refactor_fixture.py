@@ -11,6 +11,8 @@ OWNERS = (
     "Resolvers/BattleResultLogic",
     "Resolvers/BattleConsumableLogic",
     "Resolvers/BattleUiStateLogic",
+    "Resolvers/BattleActionLogic",
+    "Resolvers/EnemyBossMechanicLogic",
     "Resolvers/BattleMovementLogic",
     "Skills/SkillExecutionLogic",
     "Skills/SkillTargetResolverLogic",

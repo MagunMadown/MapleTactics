@@ -761,18 +761,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void NotifyBossPhaseAdvanced(integer phaseIndex)
-		-- Bridges a boss phase transition to the wave runtime. Ownership stays split: the
-		-- wave component decides whether the current wave arms a BOSS_PHASE trigger, and the
-		-- actual spawn still runs through EvaluateForcedSpawnAtTurnBoundary on the next turn
-		-- boundary, so no enemy is injected while an action is resolving.
-		if self.WaveRuntime == nil then
-			return
-		end
-		local trigger = self.WaveRuntime:ApplyBossPhaseTrigger(phaseIndex, "BOSS_PHASE_CHANGED")
-		if trigger.Pended == true then
-			self:PublishWaveStateSnapshot("BOSS_PHASE_SPAWN_PENDING")
-			log("[BattleSession] boss phase reinforcement queued phase=" .. phaseIndex .. " wave=" .. self.WaveRuntime.PendingWaveNumber)
-		end
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_EnemyBossMechanicLogic:NotifyBossPhaseAdvanced(self, phaseIndex)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1191,126 +1181,26 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TryQueuePlayerAction(string actionType, integer direction)
-		-- Accepts at most one player action and keeps the slot occupied until presentation time ends.
-		local result = { Success = false, Reason = "UNKNOWN" }
-		if not self:IsTutorialCommandAllowed(actionType, "", direction) then
-			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
-		end
-
-		if actionType ~= "MOVE" and actionType ~= "TURN" then
-			result.Reason = "INVALID_ACTION"
-			return result
-		end
-
-		if actionType == "MOVE" and direction ~= -1 and direction ~= 1 then
-			result.Reason = "INVALID_DIRECTION"
-			return result
-		end
-		if actionType == "MOVE" and self:IsPlayerFrostbitten() then
-			result.Reason = "PLAYER_FROSTBITTEN"
-			return result
-		end
-
-		result = self.TurnState:TryReserveImmediateAction(actionType, direction)
-		if result.Success == false then
-			return result
-		end
-		self:PublishTurnStateSnapshot("IMMEDIATE_ACTION_QUEUED")
-		log("[BattleQueue] queued action=" .. actionType .. " direction=" .. direction)
-		return self:ExecuteQueuedAction()
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleActionLogic:TryQueuePlayerAction(self, actionType, direction)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table ExecuteQueuedAction()
-		-- Dispatches the queued action through the existing authoritative action functions.
-		local actionType = self.TurnState.QueuedActionType
-		local direction = self.TurnState.QueuedActionDirection
-		if actionType == "" then
-			return { Success = false, Reason = "ACTION_MISSING" }
-		end
-
-		self.CurrentPlayerActionKillCount = 0
-		log("[BattleQueue] started action=" .. actionType .. " direction=" .. direction)
-
-		local actionResult = nil
-		if actionType == "MOVE" then
-			actionResult = self:TryMove("player_01", direction)
-		elseif actionType == "TURN" then
-			actionResult = self:TryTurn("player_01")
-		end
-
-		if actionResult == nil or actionResult.Success == false then
-			local reason = "EXECUTION_FAILED"
-			if actionResult ~= nil then
-				reason = actionResult.Reason
-			end
-			self:CompleteQueuedAction(actionType, false, reason)
-			return actionResult or { Success = false, Reason = reason }
-		end
-
-		local duration = self:GetActionDuration(actionType)
-		local complete = function()
-			self:CompleteQueuedAction(actionType, true, actionResult.Reason)
-		end
-		if actionType == "MOVE" and actionResult.PresentationStarted == true and self._T.playerGridMove ~= nil then
-			-- The visual snap is the primary completion signal. This slightly-late timer is only a
-			-- fail-safe so a lost presentation update can never leave the authoritative turn locked.
-			self._T.playerGridMove.CompletionReason = actionResult.Reason
-			self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration + math.max(0.02, self.MoveCompletionFallbackGrace))
-			return actionResult
-		end
-		self.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
-		return actionResult
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleActionLogic:ExecuteQueuedAction(self)
 	end
 
 	@ExecSpace("ServerOnly")
 	method number GetActionDuration(string actionType)
-		if actionType == "MOVE" then
-			return self:GetPlayerMoveDuration()
-		elseif actionType == "TURN" then
-			return math.max(0.05, self.PlayerTurnActionDuration)
-		elseif actionType == "PUSH" then
-			return math.max(0.1, self.PushActionDuration)
-		end
-
-		return 0.05
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _BattleActionLogic:GetActionDuration(self, actionType)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void CompleteQueuedAction(string actionType, boolean success, string reason)
-		-- A valid player action hands control to the enemy; invalid actions release input immediately.
-		if self.TurnState == nil or self.TurnState.QueuedActionType ~= actionType then
-			log_warning("[BattleTurnTempo] duplicate immediate completion blocked action=" .. actionType .. " reason=" .. reason)
-			return
-		end
-		if actionType == "MOVE" then
-			self:FinishPlayerGridMovePresentation("ACTION_COMPLETE")
-		end
-		self.ActionTimerId = 0
-		self.TurnState:CompleteImmediateAction(reason)
-		self:PublishTurnStateSnapshot("IMMEDIATE_ACTION_COMPLETED")
-		log("[BattleQueue] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
-		if self.BattleResult ~= "" then
-			return
-		end
-		local pending = actionType == "UTILITY" and self._T.PendingClear or nil
-		if pending ~= nil then
-			self._T.PendingClear = nil
-			if pending.Entry == self.EntryRequestId and self.BoardState ~= nil
-				and #self.BoardState:CollectLivingEnemies() == 0 then
-				-- The accepted utility still consumes its action when its impact leaves no enemy round to run.
-				self:AdvanceConsumedPlayerActionEffects("IMMEDIATE_ACTION_COMPLETED")
-				if self.BattleResult ~= "" then return end
-				self:FinishEmptyBattlefield(pending.UnitId, pending.Cause, "Enemy")
-				return
-			end
-		end
-
-		if success == true then
-			self:BeginEnemyTurnFromPlayerAction("IMMEDIATE_ACTION_COMPLETED")
-			return
-		end
-
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleActionLogic:CompleteQueuedAction(self, actionType, success, reason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1321,18 +1211,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void AdvanceConsumedPlayerActionEffects(string completionReason)
-		-- Every consumed action spends status duration, including queues that clear a wave without an enemy round.
-		self:RecordRunConsumedPlayerTurn()
-		local playerUnit = isvalid(self.PlayerEntity) and self.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
-		if playerUnit ~= nil then playerUnit:AdvanceNegativeStatusTurns() end
-		if self.BoardState ~= nil then
-			for _, enemyEntity in ipairs(self.BoardState:CollectLivingEnemies()) do
-				local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
-				if enemy ~= nil and enemy.BurnTurns > 0 then enemy:AdvanceNegativeStatusTurns() end
-			end
-		end
-		self:AdvancePoisonMists()
-		log("[BattlePlayerActionBoundary] effects advanced reason=" .. completionReason .. " result=" .. self.BattleResult)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_BattleActionLogic:AdvanceConsumedPlayerActionEffects(self, completionReason)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1393,15 +1273,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void ResetEnemyIntentCursor(string reason)
-		-- Clears only the map-scoped selection cursor. Enemy-owned queued Tiles survive into later turns.
-		local intentRuntime = self.EnemyIntentRuntime
-		if intentRuntime == nil then
-			intentRuntime = self:EnsureEnemyIntentComponent()
-		end
-		if intentRuntime ~= nil then
-			intentRuntime:ResetIntent(reason)
-		end
-		self:PublishEnemyIntentSnapshot(reason)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_EnemyPlanningLogic:ResetEnemyIntentCursor(self, reason)
 	end
 
 
@@ -1419,15 +1292,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table GetPreparedEnemyIntent()
-		-- Returns a copy so callers cannot mutate the synchronized snapshot fields.
-		local intentRuntime = self.EnemyIntentRuntime
-		if intentRuntime == nil then
-			intentRuntime = self:EnsureEnemyIntentComponent()
-		end
-		if intentRuntime == nil then
-			return { State = "EMPTY", EnemyId = "", PatternId = "", StepIndex = 0, ActionType = "", TileId = "", TelegraphTurnsRemaining = 0, Direction = 0, PreparedTurn = 0, Reason = "INTENT_STATE_MISSING", Revision = 0 }
-		end
-		return intentRuntime:GetSnapshot()
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _EnemyPlanningLogic:GetPreparedEnemyIntent(self)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -1480,94 +1346,20 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method integer GetOppositeEdgeCell(integer cellIndex)
-		if cellIndex <= (self.CellCount - 1) * 0.5 then
-			return self.CellCount - 1
-		end
-		return 0
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _EnemyBossMechanicLogic:GetOppositeEdgeCell(self, cellIndex)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table BeginBossOppositeJump(string enemyId)
-		-- Freezes the opposite edge at takeoff so later player movement cannot retarget the landing.
-		local enemyEntity = self:FindUnitEntity(enemyId)
-		if isvalid(enemyEntity) == false then
-			return { Success = false, Reason = "ENEMY_NOT_FOUND" }
-		end
-		local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
-		if enemy == nil or enemy.IsBoss ~= true or enemy.IsDead == true then
-			return { Success = false, Reason = "BOSS_UNAVAILABLE" }
-		end
-		local landingCell = self:GetOppositeEdgeCell(enemy.CellIndex)
-		local result = enemy:SetAirborneState(true, landingCell)
-		if result.Success == true then
-			log("[BossJump] takeoff enemy=" .. enemyId .. " from=" .. enemy.CellIndex .. " landing=" .. landingCell)
-		end
-		return result
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _EnemyBossMechanicLogic:BeginBossOppositeJump(self, enemyId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table ResolveBossOppositeLanding(string enemyId, string landingSkillId)
-		-- Landing owns overlap resolution: push toward center first, then try the opposite side.
-		local result = { Success = false, Reason = "UNKNOWN", EnemyId = enemyId, LandingCell = -1, PlayerPushed = false, PlayerFromCell = -1, PlayerToCell = -1 }
-		local enemyEntity = self:FindUnitEntity(enemyId)
-		local playerEntity = self:FindUnitEntity("player_01")
-		if isvalid(enemyEntity) == false or isvalid(playerEntity) == false then
-			result.Reason = "LANDING_UNIT_MISSING"
-			return result
-		end
-		local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
-		local player = playerEntity:GetComponent("script.BattleUnitComponent")
-		if enemy == nil or player == nil or enemy.IsBoss ~= true or enemy.IsAirborne ~= true then
-			result.Reason = "BOSS_NOT_AIRBORNE"
-			return result
-		end
-		local landingCell = enemy.PendingLandingCell
-		result.LandingCell = landingCell
-		if self:IsValidCell(landingCell) == false then
-			result.Reason = "INVALID_LANDING_CELL"
-			return result
-		end
-
-		if player.IsDead == false and player.CellIndex == landingCell then
-			local centerDirection = landingCell <= (self.CellCount - 1) * 0.5 and 1 or -1
-			local pushResult = self:RelocateUnitForMechanic("player_01", player.CellIndex + centerDirection, "BOSS_LANDING_CENTER_PUSH")
-			if pushResult.Success == false then
-				pushResult = self:RelocateUnitForMechanic("player_01", player.CellIndex - centerDirection, "BOSS_LANDING_REVERSE_PUSH")
-			end
-			if pushResult.Success == false then
-				result.Reason = "LANDING_OVERLAP_UNRESOLVED_" .. pushResult.Reason
-				return result
-			end
-			result.PlayerPushed = true
-			result.PlayerFromCell = pushResult.FromCell
-			result.PlayerToCell = pushResult.ToCell
-		end
-
-		if self:IsCellOccupied(landingCell, enemyId) then
-			result.Reason = "LANDING_CELL_OCCUPIED"
-			return result
-		end
-		local fromCell = enemy.CellIndex
-		local cellResult = enemy:ApplyCellChange(landingCell)
-		if cellResult.Success == false then
-			result.Reason = cellResult.Reason
-			return result
-		end
-		self:PlaceEntity(enemyEntity, self:GetCellPosition(landingCell))
-		enemy:SetAirborneState(false, -1)
-		local facing = player.CellIndex >= landingCell and "Right" or "Left"
-		enemy:ApplyFacingState(facing)
-		self:ApplyFacing(enemyEntity, enemy.Facing)
-		local impactResult = nil
-		if landingSkillId ~= nil and landingSkillId ~= "" then
-			impactResult = self:TryExecuteSkill(enemyId, landingSkillId)
-			result.ImpactSuccess = impactResult.Success
-			result.ImpactReason = impactResult.Reason
-		end
-		result.Success = true
-		result.Reason = "BOSS_LANDED"
-		log("[BossJump] landed enemy=" .. enemyId .. " from=" .. fromCell .. " to=" .. landingCell .. " playerPush=" .. tostring(result.PlayerPushed) .. " player=" .. result.PlayerFromCell .. "->" .. result.PlayerToCell .. " impact=" .. tostring(result.ImpactSuccess) .. ":" .. tostring(result.ImpactReason))
-		return result
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _EnemyBossMechanicLogic:ResolveBossOppositeLanding(self, enemyId, landingSkillId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2026,123 +1818,38 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method table TrySkillTestAssignSlot(integer slotIndex, string skillId)
-		-- Skill test map only: equips any valid player skill into one fixed battle slot.
-		if self.SkillTestMode ~= true then
-			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
-		end
-		if slotIndex ~= math.floor(slotIndex) or slotIndex < 1 or slotIndex > self.SkillSlotCount then
-			return { Success = false, Reason = "SLOT_INDEX_OUT_OF_RANGE" }
-		end
-		if isvalid(self.PlayerEntity) == false then
-			return { Success = false, Reason = "PLAYER_UNAVAILABLE" }
-		end
-		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
-		if validation.Success == false then
-			return { Success = false, Reason = validation.DetailReason or validation.Reason }
-		end
-		local inventory = self.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
-		if inventory == nil then
-			return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" }
-		end
-		local applyResult = inventory:ApplySkillTestBarSlot(slotIndex, skillId)
-		if applyResult.Success == false then
-			return applyResult
-		end
-		self:RefreshSkillTestPresentation("SKILL_TEST_ASSIGN")
-		log("[SkillTest] slot assigned slot=" .. tostring(slotIndex) .. " skill=" .. skillId .. " slots=" .. self.SkillSlotIds)
-		return { Success = true, Reason = "OK", SlotIds = self.SkillSlotIds }
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _SkillTestLogic:TrySkillTestAssignSlot(self, slotIndex, skillId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table TrySkillTestAssignUtility(string jobId)
-		-- Skill test map only: makes the utility button use another job's utility so every utility can be tried.
-		if self.SkillTestMode ~= true then
-			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
-		end
-		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(jobId)
-		if bundle.Success == false then
-			return bundle
-		end
-		local definition = bundle.Definition
-		self.SkillTestUtilityJobId = jobId
-		self.UtilitySkillId = definition.SkillId
-		self.UtilitySkillIconRuid = definition.IconRuid
-		self.UtilityMaxCooldown = definition.CooldownTurns
-		local runtime = self:GetSkillRuntimeState("player_01")
-		if runtime ~= nil then
-			runtime:ResetSkillRuntimeState("SKILL_TEST_UTILITY_ASSIGN")
-		end
-		self.UtilityRemainingCooldown = 0
-		-- Warm the new utility's clips and sounds so its first cast looks like every later one.
-		local ruids = {}
-		local seen = {}
-		for _, ruid in ipairs({ definition.CastEffectRuid, definition.HitEffectRuid, definition.CellEffectRuid, definition.ProjectileRuid, definition.CastSoundRuid, definition.HitSoundRuid }) do
-			self:CollectPresentationRuid(ruids, seen, ruid)
-		end
-		if #ruids > 0 and isvalid(self.PlayerEntity) and self.PlayerEntity.PlayerComponent ~= nil then
-			self:PreloadSkillPresentation(table.concat(ruids, "|"), self.PlayerEntity.PlayerComponent.UserId)
-		end
-		self:PublishTurnStateSnapshot("SKILL_TEST_UTILITY")
-		log("[SkillTest] utility assigned job=" .. jobId .. " skill=" .. definition.SkillId)
-		return { Success = true, Reason = "OK", SkillId = definition.SkillId }
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _SkillTestLogic:TrySkillTestAssignUtility(self, jobId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void RefreshSkillTestUtility()
-		-- Re-reads the equipped utility so an edited cooldown or icon reaches the utility HUD.
-		if self.SkillTestMode ~= true or self.UtilitySkillId == "" then
-			return
-		end
-		local jobId = self.SkillTestUtilityJobId ~= "" and self.SkillTestUtilityJobId or self.SelectedJobId
-		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(jobId)
-		if bundle.Success == false then
-			return
-		end
-		self.UtilitySkillIconRuid = bundle.Definition.IconRuid
-		self.UtilityMaxCooldown = bundle.Definition.CooldownTurns
-		self.UtilityRemainingCooldown = math.min(self.UtilityRemainingCooldown, self.UtilityMaxCooldown)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_SkillTestLogic:RefreshSkillTestUtility(self)
 	end
 
 	@ExecSpace("ServerOnly")
 	method void RefreshSkillTestPresentation(string reason)
-		-- Forces the slot rebuild so edited names/cooldowns/icons reach the HUD even when ownership is unchanged.
-		if self.SkillTestMode ~= true or isvalid(self.PlayerEntity) == false then
-			return
-		end
-		self.SkillSlotSourceSnapshot = ""
-		self:RefreshSkillSlots(reason, self.PlayerEntity)
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		_SkillTestLogic:RefreshSkillTestPresentation(self, reason)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table ResetSkillTestCooldowns()
-		if self.SkillTestMode ~= true then
-			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
-		end
-		local runtimeState = self:GetSkillRuntimeState("player_01")
-		if runtimeState == nil then
-			return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" }
-		end
-		runtimeState:ResetSkillRuntimeState("SKILL_TEST_RESET")
-		self.UtilityRemainingCooldown = 0
-		log("[SkillTest] cooldowns reset")
-		return { Success = true, Reason = "OK" }
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _SkillTestLogic:ResetSkillTestCooldowns(self)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table RestoreSkillTestDummy()
-		if self.SkillTestMode ~= true or self.BoardState == nil then
-			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
-		end
-		local restored = 0
-		for _, enemyEntity in ipairs(self.BoardState:CollectLivingEnemies()) do
-			local unit = enemyEntity:GetComponent("script.BattleUnitComponent")
-			if unit ~= nil then
-				unit:RestoreCurrentHp(unit.MaxHp)
-				restored = restored + 1
-			end
-		end
-		log("[SkillTest] dummy restored count=" .. tostring(restored))
-		return { Success = restored > 0, Reason = restored > 0 and "OK" or "NO_DUMMY" }
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _SkillTestLogic:RestoreSkillTestDummy(self)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2544,34 +2251,8 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method Entity ResolveFrontTarget(string sourceUnitId)
-		-- Returns a living opposing unit occupying the source unit's front cell.
-		local sourceEntity = self:FindUnitEntity(sourceUnitId)
-		if isvalid(sourceEntity) == false then
-			return nil
-		end
-
-		local sourceUnit = sourceEntity:GetComponent("script.BattleUnitComponent")
-		if sourceUnit == nil then
-			return nil
-		end
-
-		local facingDirection = -1
-		if sourceUnit.Facing == "Right" then
-			facingDirection = 1
-		end
-		local targetCell = sourceUnit.CellIndex + facingDirection
-
-		if self.BoardState == nil then
-			return nil
-		end
-		local candidate = self.BoardState:FindAtCell(targetCell, sourceUnitId)
-		if isvalid(candidate) then
-			local unit = candidate:GetComponent("script.BattleUnitComponent")
-			if unit ~= nil and (unit.Team ~= sourceUnit.Team or sourceUnit.Team == "Enemy") then
-				return candidate
-			end
-		end
-		return nil
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _SkillTargetResolverLogic:ResolveFrontTarget(self, sourceUnitId)
 	end
 
 	@ExecSpace("Server")
@@ -2628,72 +2309,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method boolean CanSkeletonSwapWithCommander(string unitId)
-		-- Only a Perion commander's summoned soldier may relieve its engaged commander.
-		if self.StageId ~= "region_04_stage_04" or self.BattleResult ~= "" or self._T.BossDefeated then
-			return false
-		end
-		local soldierEntity = self:FindUnitEntity(unitId)
-		local playerEntity = self:FindUnitEntity("player_01")
-		if not isvalid(soldierEntity) or not isvalid(playerEntity) then return false end
-		local soldier = soldierEntity:GetComponent("script.BattleUnitComponent")
-		local player = playerEntity:GetComponent("script.BattleUnitComponent")
-		if soldier == nil or player == nil then return false end
-		local commanderEntity = soldier._T.SkeletonCommander
-		if not isvalid(commanderEntity) or commanderEntity.CurrentMap ~= self.Entity then return false end
-		local commander = commanderEntity:GetComponent("script.BattleUnitComponent")
-		if commander == nil or self:FindUnitEntity(commander.UnitId) ~= commanderEntity then return false end
-		if (soldier.EnemyDefinitionId ~= "region_04_skeleton_soldier" and soldier.EnemyDefinitionId ~= "region_04_skeleton_officer") or soldier.Team ~= "Enemy"
-			or commander.EnemyDefinitionId ~= "region_04_commander_skeleton" or not commander.IsBoss or commander.Team ~= "Enemy" then
-			return false
-		end
-		for _, unit in ipairs({ soldier, commander, player }) do
-			if unit.IsDead or unit.CurrentHp <= 0 or unit.IsAirborne or not self:IsValidCell(unit.CellIndex) then return false end
-		end
-		return soldier.CellIndex ~= commander.CellIndex
-			and math.abs(soldier.CellIndex - player.CellIndex) >= 2
-			and math.abs(commander.CellIndex - player.CellIndex) == 1
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _EnemyBossMechanicLogic:CanSkeletonSwapWithCommander(self, unitId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method table SwapSkeletonWithCommander(string unitId)
-		-- Revalidate a frozen plan at impact; cooldown was already consumed by skill execution.
-		if self.TurnState == nil or self.TurnState.BattlePhase ~= "EnemyTurn" or not self:CanSkeletonSwapWithCommander(unitId) then
-			return { Success = false, Reason = "COMMANDER_RELIEF_UNAVAILABLE" }
-		end
-		local soldierEntity = self:FindUnitEntity(unitId)
-		local soldier = soldierEntity:GetComponent("script.BattleUnitComponent")
-		local commanderEntity = soldier._T.SkeletonCommander
-		local commander = commanderEntity:GetComponent("script.BattleUnitComponent")
-		local soldierCell = soldier.CellIndex
-		local commanderCell = commander.CellIndex
-		-- Leave a commander-owned hazard at the departure cell before committing the swap.
-		local poisonCells = {}
-		for cell = commanderCell - 1, commanderCell + 1 do
-			if self:IsValidCell(cell) then table.insert(poisonCells, cell) end
-		end
-		self:ExecuteEnemySpecialEffect({ SourceUnitId = commander.UnitId, TargetCellIndices = poisonCells },
-			{ EffectType = "POISON_MIST", Value = 1, ParameterA = "2" })
-		-- Commit both cells before publishing movement so observers never see an occupied destination.
-		soldier:ApplyCellChange(commanderCell)
-		commander:ApplyCellChange(soldierCell)
-		local player = self:FindUnitEntity("player_01"):GetComponent("script.BattleUnitComponent")
-		soldier:ApplyFacingState(player.CellIndex > commanderCell and "Right" or "Left")
-		commander:ApplyFacingState(player.CellIndex > soldierCell and "Right" or "Left")
-		self:PlaceEntity(soldierEntity, self:GetCellPosition(commanderCell))
-		self:PlaceEntity(commanderEntity, self:GetCellPosition(soldierCell))
-		self:PlayUnitMoveHop(soldierEntity)
-		self:PlayUnitMoveHop(commanderEntity)
-		for _, move in ipairs({ { UnitId = unitId, FromCell = soldierCell, ToCell = commanderCell },
-			{ UnitId = commander.UnitId, FromCell = commanderCell, ToCell = soldierCell } }) do
-			local movedEvent = UnitMovedEvent()
-			movedEvent.UnitId = move.UnitId
-			movedEvent.FromCell = move.FromCell
-			movedEvent.ToCell = move.ToCell
-			self.Entity:SendEvent(movedEvent)
-		end
-		self:PublishEnemyPlanSnapshot("COMMANDER_RELIEF")
-		log("[BattleBoss] skeleton relief soldier=" .. unitId .. " commander=" .. commander.UnitId)
-		return { Success = true, Reason = "COMMANDER_RELIEVED" }
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _EnemyBossMechanicLogic:SwapSkeletonWithCommander(self, unitId)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -2728,23 +2351,14 @@ script BattleSessionComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method integer RollBoardParity(string unitId, string skillId)
-		-- Picks even (0) or odd (1) board cells when a BOARD_PARITY attack is queued; the warning cells and the
-		-- impact both read this stored pick, so the attack lands exactly where it was announced.
-		if self._T.BoardParity == nil then self._T.BoardParity = {} end
-		local parity = _UtilLogic:RandomIntegerRange(0, 1)
-		self._T.BoardParity[unitId .. "|" .. skillId] = parity
-		log("[BoardParity] rolled unit=" .. unitId .. " skill=" .. skillId .. " parity=" .. parity)
-		return parity
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _EnemyBossMechanicLogic:RollBoardParity(self, unitId, skillId)
 	end
 
 	@ExecSpace("ServerOnly")
 	method integer GetBoardParity(string unitId, string skillId)
-		-- Returns the parity fixed when the attack was queued; an unqueued cast (tests) rolls one on demand.
-		local stored = self._T.BoardParity ~= nil and self._T.BoardParity[unitId .. "|" .. skillId] or nil
-		if stored == nil then
-			return self:RollBoardParity(unitId, skillId)
-		end
-		return stored
+		-- Delegates to the owner while keeping session state and the public call boundary.
+		return _EnemyBossMechanicLogic:GetBoardParity(self, unitId, skillId)
 	end
 
 	@ExecSpace("ServerOnly")

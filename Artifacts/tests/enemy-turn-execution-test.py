@@ -7,12 +7,14 @@ import sys
 if os.environ.get("LUPA_PATH"):
     sys.path.insert(0, os.environ["LUPA_PATH"])
 from lupa.lua54 import LuaRuntime
+from battle_refactor_fixture import wire_logic_owners
 
 ROOT = Path(__file__).resolve().parents[2]
 COMBAT = ROOT / "RootDesk/MyDesk/01_Combat"
 SHARED = COMBAT / "Components/Shared"
 METHOD = re.compile(r"^\tmethod\s+\w+\s+(\w+)\(([^)]*)\)\n(.*?)^\tend$", re.M | re.S)
 lua = LuaRuntime(unpack_returned_tuples=True)
+wire_logic_owners(lua)
 
 
 def load(path, names=None):
