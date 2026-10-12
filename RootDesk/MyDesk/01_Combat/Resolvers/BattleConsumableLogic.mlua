@@ -1,0 +1,190 @@
+@Logic
+script BattleConsumableLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table TryDiscardRunConsumable(any session, Entity playerEntity, string consumableId, integer requestId, integer entryId, integer inventoryRevision)
+		-- Disposal bypasses effect usability, but retains ownership, turn and revision checks.
+		local result = { Success = false, Reason = "INVALID_PLAYER", ConsumesTurn = false, ConsumedAmount = 0 }
+		if _TutorialRulesLogic:IsGuided(session) then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
+		if not isvalid(playerEntity) or playerEntity ~= session.PlayerEntity or playerEntity.CurrentMap ~= session.Entity or entryId ~= session.EntryRequestId then return result end
+		if requestId <= 0 then result.Reason = "INVALID_REQUEST_ID"; return result end
+		if session.ContentValidationState ~= "VALID" or session.BattleResult ~= "" or session.TurnState == nil or session.TurnState.BattlePhase ~= "PlayerTurn" or session.TurnState.IsActionProcessing then
+			result.Reason = "INVALID_CONSUMABLE_TIMING"; return result
+		end
+		local unit = playerEntity:GetComponent("script.BattleUnitComponent")
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local run = playerEntity:GetComponent("script.PlayerRunStateComponent")
+		if unit == nil or unit.IsDead or inventory == nil or run == nil or run.RunState ~= "Active" or inventory.ActiveRunSequence ~= run.RunSequence then return result end
+		if inventory.InventoryRevision ~= inventoryRevision then result.Reason = "STALE_INVENTORY"; return result end
+		local key = tostring(run.RunSequence) .. ":" .. tostring(entryId) .. ":discard:" .. tostring(inventoryRevision) .. ":" .. tostring(requestId)
+		local consumed = inventory:Consume(consumableId, 1, key)
+		result.Success = consumed.Success
+		result.Reason = consumed.Success and "CONSUMABLE_DISCARDED" or consumed.Reason
+		result.ConsumedAmount = consumed.ConsumedAmount or 0
+		result.InventoryRevision = inventory.InventoryRevision
+		log("[BattleConsumable] discard ref=" .. consumableId .. " success=" .. tostring(result.Success) .. " amount=" .. result.ConsumedAmount)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryUseRunConsumable(any session, Entity playerEntity, string consumableId, integer requestId, string targetSkillId, integer entryId, integer inventoryRevision)
+		-- Validates timing and inventory, executes the registered effect, then commits consumption exactly once.
+		local result = { Success = false, Reason = "UNKNOWN", ConsumableId = consumableId or "", AppliedAmount = 0, ConsumedAmount = 0, ConsumesTurn = false }
+		if not session:IsTutorialCommandAllowed("USE_CONSUMABLE", consumableId, 0) then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
+		if isvalid(playerEntity) == false or playerEntity ~= session.PlayerEntity or playerEntity.CurrentMap ~= session.Entity or entryId ~= session.EntryRequestId then
+			result.Reason = "INVALID_PLAYER"
+			return result
+		end
+		if requestId <= 0 then
+			result.Reason = "INVALID_REQUEST_ID"
+			return result
+		end
+		if session.ContentValidationState ~= "VALID" or session.BattleResult ~= "" or session.TurnState == nil or session.TurnState.BattlePhase ~= "PlayerTurn" or session.TurnState.IsActionProcessing == true then
+			result.Reason = "INVALID_CONSUMABLE_TIMING"
+			return result
+		end
+
+		local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(consumableId)
+		if definition.Success == false then
+			result.Reason = definition.Reason
+			result.DetailReason = definition.DetailReason or ""
+			return result
+		end
+		if definition.TargetType ~= "SELF" and definition.TargetType ~= "OWNED_SKILL" then
+			result.Reason = "UNSUPPORTED_CONSUMABLE_TARGET"
+			return result
+		end
+
+		local runState = _RunManagerLogic:GetOrCreateRunState(playerEntity)
+		if runState == nil then
+			result.Reason = "RUN_STATE_UNAVAILABLE"
+			return result
+		end
+		local useKey = tostring(runState.RunSequence) .. ":" .. session.StageId .. ":" .. tostring(session.EntryRequestId) .. ":consumable:" .. tostring(inventoryRevision) .. ":" .. tostring(requestId)
+		local availability = _RunManagerLogic:CanUseRunConsumable(playerEntity, consumableId, useKey)
+		if availability.Success == false then
+			result.Reason = availability.Reason
+			return result
+		end
+		if availability.AlreadyApplied == true then
+			result.Success = true
+			result.Reason = "DUPLICATE_USE_IGNORED"
+			return result
+		end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.InventoryRevision ~= inventoryRevision then
+			result.Reason = "STALE_INVENTORY"
+			return result
+		end
+
+		local targetEntity = session:FindUnitEntity("player_01")
+		if isvalid(targetEntity) == false then
+			result.Reason = "TARGET_NOT_FOUND"
+			return result
+		end
+		local targetUnit = targetEntity:GetComponent("script.BattleUnitComponent")
+		local effectResult = _ConsumableEffectRouterLogic:Execute(definition, targetUnit, targetSkillId)
+		if effectResult.Success == false then
+			result.Reason = effectResult.Reason
+			return result
+		end
+
+		local consumeResult = _RunManagerLogic:ConsumeRunConsumable(playerEntity, consumableId, useKey)
+		if consumeResult.Success == false then
+			log_error("[BattleConsumable] commit failed after effect key=" .. useKey .. " reason=" .. consumeResult.Reason)
+			result.Reason = "CONSUMABLE_COMMIT_FAILED"
+			return result
+		end
+		result.Success = true
+		result.Reason = "CONSUMABLE_USED"
+		result.AppliedAmount = effectResult.AppliedAmount or 0
+		result.HpBefore = effectResult.HpBefore or -1
+		result.HpAfter = effectResult.HpAfter or -1
+		result.ConsumedAmount = consumeResult.ConsumedAmount or 0
+		result.ConsumesTurn = false
+		result.InventoryRevision = inventory.InventoryRevision
+		result.TargetSkillId = targetSkillId or ""
+		result.CooldownBefore = effectResult.CooldownBefore or 0
+		result.CooldownAfter = effectResult.CooldownAfter or 0
+		log("[BattleConsumable] used ref=" .. consumableId .. " effect=" .. definition.EffectType .. " applied=" .. result.AppliedAmount .. " hp=" .. result.HpBefore .. "->" .. result.HpAfter .. " consumesTurn=" .. tostring(result.ConsumesTurn) .. " key=" .. useKey)
+		_TutorialRulesLogic:OnConsumableUsed(session, result)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildConsumableHudState(any session)
+		-- Reuses run inventory and cooldown owners without creating client-authoritative state.
+		local result = { Success = false, Items = {}, Skills = {}, Capacity = 0, CanUse = false, EntryId = session.EntryRequestId }
+		if not isvalid(session.PlayerEntity) then return result end
+		local inventory = session.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		local runtime = session.PlayerEntity:GetComponent("script.SkillRuntimeStateComponent")
+		local unit = session.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if inventory == nil or runtime == nil or unit == nil then return result end
+		inventory:NormalizeLegacyConsumables()
+		result.Success = true
+		result.Capacity = inventory.ConsumableCapacity
+		result.CooldownRevision = runtime.CooldownRevision
+		result.CurrentHp = unit.CurrentHp
+		result.MaxHp = unit.MaxHp
+		result.InventoryRevision = inventory.InventoryRevision
+		result.RunSequence = inventory.ActiveRunSequence
+		result.CanUse = inventory.ActiveRunSequence > 0 and not unit.IsDead and session.ContentValidationState == "VALID" and session.BattleResult == "" and session.TurnState ~= nil and session.TurnState.BattlePhase == "PlayerTurn" and not session.TurnState.IsActionProcessing
+		for _, skillId in ipairs(inventory:GetDistinctOwnedSkillIds()) do
+			local cooldown = runtime:GetRemainingCooldown(skillId)
+			if cooldown > 0 then
+				local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+				table.insert(result.Skills, { SkillId = skillId, DisplayName = definition.DisplayName or skillId, Cooldown = cooldown })
+			end
+		end
+		for itemId, count in string.gmatch(inventory.RunConsumableSnapshot or "", "([^|~]+)~(%d+)") do
+			local definition = _ConsumableDefinitionRepositoryLogic:GetDefinition(itemId)
+			if tonumber(count) > 0 and definition.Success then
+				local usable = result.CanUse
+				local reason = ""
+				if definition.EffectType == "HEAL" and unit.CurrentHp >= unit.MaxHp then usable = false; reason = "HP_ALREADY_FULL" end
+				if definition.EffectType == "COOLDOWN_REDUCTION" and #result.Skills == 0 then usable = false; reason = "NO_COOLDOWN_SKILLS" end
+				-- Cleanse is available while a real hostile status is active.
+				if definition.EffectType == "CLEANSE" and unit.SealTurns <= 0 and unit.FrostbiteTurns <= 0 and unit.ConfuseTurns <= 0
+					and unit.BurnDamage <= 0 then usable = false; reason = "NO_NEGATIVE_STATUS_EFFECTS" end
+				if not session:IsTutorialCommandAllowed("USE_CONSUMABLE", itemId, 0) then usable = false; reason = "TUTORIAL_FOLLOW_GUIDE" end
+				table.insert(result.Items, { ConsumableId = itemId, DisplayOrder = definition.RowIndex, DisplayName = definition.DisplayName, Count = tonumber(count), EffectType = definition.EffectType, EffectValue = definition.EffectValue, IconKey = definition.IconKey, Description = definition.Description, Usable = usable, Reason = reason })
+			end
+		end
+		table.sort(result.Items, function(left, right) return left.DisplayOrder < right.DisplayOrder end)
+		return result
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean SubmitConsumableDiscard(any session, string consumableId)
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or player.CurrentMap ~= session.Entity then return false end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then return false end
+		if session._T.ConsumablePending and session._T.ConsumablePendingEntry == session.EntryRequestId and session._T.ConsumablePendingRun == inventory.ActiveRunSequence then return false end
+		if session.ContentValidationState ~= "VALID" or session.BattleResult ~= "" or session.BattlePhase ~= "PlayerTurn" or session.IsActionProcessing then return false end
+		session.ConsumableRequestSequence = session.ConsumableRequestSequence + 1
+		session._T.ConsumablePending = true
+		session._T.ConsumablePendingEntry = session.EntryRequestId
+		session._T.ConsumablePendingRun = inventory.ActiveRunSequence
+		session:RequestDiscardConsumable(consumableId, session.ConsumableRequestSequence, session.EntryRequestId, inventory.InventoryRevision)
+		return true
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean SubmitConsumableUse(any session, string consumableId, string targetSkillId)
+		-- Shares the hotkey/HUD request counter and waits for the authoritative receipt.
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or player.CurrentMap ~= session.Entity then return false end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then return false end
+		if session._T.ConsumablePending and session._T.ConsumablePendingEntry == session.EntryRequestId and session._T.ConsumablePendingRun == inventory.ActiveRunSequence then return false end
+		if session.ContentValidationState ~= "VALID" or session.BattleResult ~= "" or session.BattlePhase ~= "PlayerTurn" or session.IsActionProcessing then return false end
+		session.ConsumableRequestSequence = session.ConsumableRequestSequence + 1
+		session._T.ConsumablePending = true
+		session._T.ConsumablePendingEntry = session.EntryRequestId
+		session._T.ConsumablePendingRun = inventory.ActiveRunSequence
+		session:RequestUseConsumable(consumableId, session.ConsumableRequestSequence, targetSkillId, session.EntryRequestId, inventory.InventoryRevision)
+		return true
+	end
+
+end

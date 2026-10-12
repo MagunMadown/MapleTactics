@@ -528,4 +528,308 @@ script BattleUiStateLogic extends Logic
 		return "READY"
 	end
 
+	@ExecSpace("ServerOnly")
+	method void RefreshHudProgressSnapshot(any session)
+		-- Presentation only. Never validate or gate battle entry through this optional path.
+		local run = nil
+		if isvalid(session.PlayerEntity) then run = session.PlayerEntity:GetComponent("script.PlayerRunStateComponent") end
+		local graphId = run ~= nil and run.CurrentNodeGraphId or ""
+		local nodeId = run ~= nil and run.CurrentNodeId or ""
+		local context = session.StageId .. "~" .. tostring(session.EntryRequestId) .. "~" .. tostring(session.HudContextRevision)
+		local cacheKey = context .. "~" .. session.RegionId .. "~" .. graphId .. "~" .. nodeId .. "~" .. tostring(run ~= nil and run.RunSequence or 0)
+		if session._T.HudProgressCacheKey == cacheKey then return end
+		session._T.HudProgressCacheKey = cacheKey
+		session.HudProgressSnapshot = ""
+		-- Reward-map transitions may retain the completed Run node. The HUD follows
+		-- the active battle StageId without changing authoritative Run progression.
+		local currentNode = _NodeDefinitionRepositoryLogic:FindNodeByStageId(session.StageId)
+		if currentNode.Success ~= true then return end
+		graphId = currentNode.NodeGraphId
+		local graph = _NodeDefinitionRepositoryLogic:GetGraphDefinitions(graphId)
+		if graph.Success ~= true then return end
+		local nodes = {}
+		local battles = {}
+		local stages = {}
+		local count = 0
+		for _, node in ipairs(graph.Definitions) do
+			if node.Enabled == true then
+				if nodes[node.NodeId] ~= nil then return end
+				nodes[node.NodeId] = node
+				if node.NodeType == "BATTLE" or node.NodeType == "BOSS" then
+					local stage = _StageDefinitionRepositoryLogic:GetStageDefinition(node.StageId)
+					if stage.Success ~= true or stage.MatchCount ~= 1 then return end
+					if stage.StageType ~= "NORMAL" and stage.StageType ~= "BOSS" then return end
+					stages[node.NodeId] = stage
+					if stage.RegionId == session.RegionId then
+						battles[node.NodeId] = node
+						count = count + 1
+					end
+				end
+			end
+		end
+		if battles[currentNode.NodeId] == nil or count == 0 then return end
+		local nextBattle = {}
+		local incoming = {}
+		for id, battle in pairs(battles) do
+			local cursor = battle
+			local seen = {}
+			-- A boss is the regional endpoint; outgoing shops/regions are not part of this strip.
+			if stages[id].StageType ~= "BOSS" then
+				while cursor ~= nil do
+					if seen[cursor.NodeId] then return end
+					seen[cursor.NodeId] = true
+					local nextId = nil
+					for candidate in string.gmatch(cursor.NextNodeIds or "", "([^|]+)") do
+						if nextId ~= nil then return end
+						nextId = candidate
+					end
+					if nextId == nil then break end
+					cursor = nodes[nextId]
+					if cursor == nil then return end
+					if stages[nextId] ~= nil then
+						if battles[nextId] ~= nil then
+							nextBattle[id] = nextId
+							incoming[nextId] = (incoming[nextId] or 0) + 1
+						end
+						break
+					end
+					if cursor.NodeType ~= "REST" and cursor.NodeType ~= "SHOP" then return end
+				end
+			end
+		end
+		local head = nil
+		for id, _ in pairs(battles) do
+			if (incoming[id] or 0) > 1 then return end
+			if incoming[id] == nil then
+				if head ~= nil then return end
+				head = id
+			end
+		end
+		local entries = { context }
+		local visited = {}
+		local visitedStages = {}
+		local included = 0
+		local foundCurrent = false
+		while head ~= nil do
+			if visited[head] then return end
+			visited[head] = true
+			local stage = stages[head]
+			if visitedStages[stage.StageId] or string.find(stage.StageId, "[~|]") ~= nil then return end
+			visitedStages[stage.StageId] = true
+			if stage.StageId == session.StageId then foundCurrent = true end
+			table.insert(entries, stage.StageId .. "~" .. stage.StageType)
+			included = included + 1
+			head = nextBattle[head]
+		end
+		if included ~= count or not foundCurrent then return end
+		session.HudProgressSnapshot = table.concat(entries, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshHudRelicSnapshot(any session)
+		-- Optional display data only; membership and quantities stay owned by the run inventory.
+		local player = session.PlayerEntity
+		if not isvalid(player) or player.CurrentMap ~= session.Entity then
+			session.HudRelicSnapshot = ""
+			session._T.HudRelicCache = nil
+			return
+		end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil or inventory.ActiveRunSequence <= 0 or _RelicDefinitionRepositoryLogic == nil then
+			session.HudRelicSnapshot = ""
+			session._T.HudRelicCache = nil
+			return
+		end
+		local snapshot = inventory.RunItemSnapshot or ""
+		local context = session.StageId .. "~" .. tostring(session.EntryRequestId) .. "~" .. tostring(session.HudContextRevision)
+		local cached = session._T.HudRelicCache
+		if cached ~= nil and cached.Inventory == inventory and cached.Context == context
+			and cached.RunSequence == inventory.ActiveRunSequence and cached.Revision == inventory.InventoryRevision
+			and cached.Snapshot == snapshot then return end
+		local items = {}
+		local seen = {}
+		for entry in string.gmatch(snapshot, "([^|]+)") do
+			local captures = { string.match(entry, "^([^~]+)~([^~]+)$") }
+
+			local itemId = captures[1]
+
+			local amount = captures[2]
+			local quantity = tonumber(amount) or 0
+			if itemId ~= nil and quantity > 0 and not seen[itemId] then
+				seen[itemId] = true
+				local effects = player:GetComponent("script.PlayerRunRelicEffectComponent")
+				local definition = effects ~= nil and effects.ActiveRunSequence == inventory.ActiveRunSequence and effects.Definitions[itemId] or nil
+				local ok = definition ~= nil
+				if ok and definition ~= nil and definition.Success == true then
+					table.insert(items, { RelicId = itemId, DisplayName = definition.DisplayName,
+						IconImageRUID = definition.IconImageRUID, EffectDescription = definition.EffectDescription, Quantity = quantity })
+				end
+			end
+		end
+		-- Preserve snapshot order (stable ItemId order); it is not acquisition order.
+		session.HudRelicSnapshot = ""
+		if #items > 0 then
+			session.HudRelicSnapshot = _HttpService:JSONEncode({ Items = items, ItemSnapshot = snapshot,
+			UserId = player.PlayerComponent.UserId, RunSequence = inventory.ActiveRunSequence,
+			InventoryRevision = inventory.InventoryRevision, MapId = session.Entity.Id, StageId = session.StageId,
+			EntryRequestId = session.EntryRequestId, HudContextRevision = session.HudContextRevision })
+		end
+		session._T.HudRelicCache = { Inventory = inventory, Context = context, RunSequence = inventory.ActiveRunSequence,
+			Revision = inventory.InventoryRevision, Snapshot = snapshot }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshPlayerHpSnapshot(any session, string reason)
+		-- Mirrors runtime-owned player HP onto the placed battle session for reliable client UI sync.
+		if isvalid(session.PlayerEntity) == false then
+			return
+		end
+		local playerUnit = session.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if playerUnit == nil or playerUnit.Team ~= "Player" then
+			return
+		end
+		local currentHp = math.max(0, playerUnit.CurrentHp)
+		local maxHp = math.max(1, playerUnit.MaxHp)
+		if session.PlayerCurrentHp == currentHp and session.PlayerMaxHp == maxHp then
+			return
+		end
+		session.PlayerCurrentHp = currentHp
+		session.PlayerMaxHp = maxHp
+		session.PlayerHpRevision = session.PlayerHpRevision + 1
+		if reason ~= nil and reason ~= "" then
+			log("[BattlePlayerHp] synced reason=" .. reason .. " hp=" .. tostring(currentHp) .. "/" .. tostring(maxHp) .. " revision=" .. tostring(session.PlayerHpRevision))
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildSkillHoverDamageSteps(any session, table definition, table steps)
+		-- Preview outgoing damage without consuming buffs or modifying the effective skill bundle.
+		local preview = {}
+		local unit = isvalid(session.PlayerEntity) and session.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
+		if unit == nil then return steps end
+		local relics = session.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		local bonus = math.max(0, unit.NextAttackBonus) + math.max(0, unit.AttackBuffAmount)
+		if relics ~= nil and relics:IsCurrentRun() then
+			bonus = bonus + relics.AttackBonus
+			if relics:GetSpecialEffectValue("KILL_ATTACK_BATTLE") > 0 then bonus = bonus + relics.BattleKillAttackBonus end
+			if unit.CurrentHp >= unit.MaxHp then bonus = bonus + relics:GetSpecialEffectValue("FULL_HP_DAMAGE") end
+			if unit.CurrentHp * 2 <= unit.MaxHp then bonus = bonus + relics:GetSpecialEffectValue("LOW_HP_DAMAGE") end
+		end
+		local combo = unit.ComboBuffTurns > 0 and unit.ComboBuffAmount * (unit.ComboChainCount + 1) or 0
+		local extraHits = unit.NextArrowCount
+		if relics ~= nil then extraHits = extraHits + relics:GetExtraShurikenCount(definition) end
+		local buffHitIndex = 0
+		for _, original in ipairs(steps) do
+			local step = {}
+			for key, value in pairs(original) do step[key] = value end
+			if step.EffectType == "DAMAGE" then
+				local hits = _DamageEffectExecutorLogic:GetHitCount(step) + extraHits
+				extraHits = 0
+				local attackBuff = 0
+				for _, entry in pairs(unit.TimedBuffEntries) do
+					if entry.Stat == "ATTACK" and entry.Turns > buffHitIndex then attackBuff = attackBuff + entry.Amount end
+				end
+				local base = _DamageEffectExecutorLogic:ResolveDamageAmount(unit, step)
+				local first = math.max(0, (definition.ZeroDamage == true and 0 or base) + bonus - math.max(0, unit.AttackBuffAmount) + attackBuff + combo)
+				local followup = (definition.ZeroDamage == true and 0 or 1) + combo
+				step.PreviewDamageText = _BuffEffectExecutorLogic:FormatNumber(first)
+				if hits > 1 then step.PreviewDamageText = step.PreviewDamageText .. " + " .. _BuffEffectExecutorLogic:FormatNumber(followup) .. " × " .. tostring(hits - 1) .. "회" end
+				buffHitIndex = buffHitIndex + hits
+			end
+			table.insert(preview, step)
+		end
+		return preview
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetBattleSnapshot(any session)
+		-- Stable read model for server-side lobby, waiting, result, and flow controllers.
+		local turnState = session:EnsureTurnStateComponent()
+		local waveRuntime = session:EnsureWaveStateComponent()
+		local dropRuntime = session:EnsureDropStateComponent()
+		local ownedSkillSnapshot = ""
+		local skillInventoryRevision = 0
+		local ownedAugmentSnapshot = ""
+		local augmentRevision = 0
+		if isvalid(session.PlayerEntity) then
+			local inventory = session.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+			if inventory ~= nil then
+				ownedSkillSnapshot = inventory.RunSkillSnapshot
+				skillInventoryRevision = inventory.SkillInventoryRevision
+			end
+			local augmentState = session.PlayerEntity:GetComponent("script.PlayerRunAugmentComponent")
+			if augmentState ~= nil then
+				ownedAugmentSnapshot = augmentState.OwnedAugmentSnapshot
+				augmentRevision = augmentState.AugmentRevision
+			end
+		end
+		return {
+			Success = true,
+			Reason = "OK",
+			EntryRequestId = session.EntryRequestId,
+			EntryMode = session.EntryMode,
+			StageId = session.StageId,
+			RegionId = session.RegionId,
+			StageIndex = session.StageIndex,
+			StageType = session.StageType,
+			StageDisplayName = session.StageDisplayName,
+			WaveTableId = session.WaveTableId,
+			StageRuleId = session.StageRuleId,
+			StageSchemaVersion = session.StageSchemaVersion,
+			StageNumber = session.StageNumber,
+			RunSeed = session.RunSeed,
+			CharacterId = session.SelectedCharacterId,
+			JobId = session.SelectedJobId,
+			JobMechanicId = session.SelectedJobMechanicId,
+			JobPassiveSetId = session.SelectedJobPassiveSetId,
+			JobStartingSkillIds = session.SelectedJobStartingSkillIds,
+			JobBaseMaxHp = session.SelectedJobBaseMaxHp,
+			JobBaseQueueCapacity = session.SelectedJobBaseQueueCapacity,
+			JobRevision = session.SelectedJobRevision,
+			OwnedSkillSnapshot = ownedSkillSnapshot,
+			SkillInventoryRevision = skillInventoryRevision,
+			OwnedAugmentSnapshot = ownedAugmentSnapshot,
+			AugmentRevision = augmentRevision,
+			LastAugmentTriggerType = session.LastAugmentTriggerType,
+			LastAugmentTriggerReason = session.LastAugmentTriggerReason,
+			LastAugmentExecutedCount = session.LastAugmentExecutedCount,
+			LoadoutId = session.SelectedLoadoutId,
+			BattlePhase = turnState.BattlePhase,
+			BattleResult = session.BattleResult,
+			TurnNumber = turnState.TurnNumber,
+			CurrentWave = waveRuntime.CurrentWave,
+			TotalWaves = waveRuntime.TotalWaves,
+			CellCount = session.CellCount,
+			PlayerStartCell = session.PlayerStartCell,
+			QueueCapacity = turnState.TileQueueCapacity,
+			PendingDropSnapshot = dropRuntime.PendingDropSnapshot,
+			PendingDropCount = dropRuntime.PendingDropCount,
+			DropRevision = dropRuntime.DropRevision
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method void SendSkillHover(any session, string skillId, integer requestId, string recipientUserId)
+		-- Builds the preview after ownership and throttle checks at the session RPC.
+		local validation = session:GetEffectiveSkillValidation("player_01", skillId)
+		if not validation.Success then return end
+		local definition = validation.Data.Definition
+		local previewSteps = session:BuildSkillHoverDamageSteps(definition, validation.Data.EffectSteps)
+		local text = definition.DisplayName .. "\n" .. _SkillCodexProvider:BuildReadableDescription(definition, previewSteps)
+		for _, step in ipairs(previewSteps) do
+			if step.EffectType == "DAMAGE" then
+				text = text .. "\n현재 공격력·버프 반영 (대상별 추가 피해·방어 적용 전)"
+				break
+			end
+		end
+		local inventory = session.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if skillId == "heal" and inventory ~= nil then
+			text = text .. "\n남은 횟수: " .. (inventory.HealUnlimited and "무제한" or tostring(math.max(0, inventory.HealCharges)))
+		end
+		local target = _SkillTargetResolverLogic:Resolve(session, "player_01", definition)
+		local cells = target.Success and target.TargetCellIndices or {}
+		if definition.TargetingType == "SELF" then cells = {} end
+		session:ReceiveSkillHover(skillId, requestId, text, cells, recipientUserId)
+	end
+
 end
