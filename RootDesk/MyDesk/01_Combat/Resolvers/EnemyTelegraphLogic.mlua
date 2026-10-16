@@ -1,0 +1,106 @@
+@Logic
+script EnemyTelegraphLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table BuildBossLandingTelegraph(any session, any unit, string skillId)
+		-- The server owns landing/range calculation; UI only renders this immutable DTO.
+		local result = { Success = false, TelegraphKind = "", LandingCell = -1, TargetCells = "" }
+		if unit == nil or unit.IsBoss ~= true or session.CellCount <= 0 then
+			return result
+		end
+		local landingCell = unit.PendingLandingCell
+		if unit.IsAirborne ~= true or session:IsValidCell(landingCell) == false then
+			landingCell = 0
+			if unit.CellIndex <= (session.CellCount - 1) * 0.5 then
+				landingCell = session.CellCount - 1
+			end
+		end
+		local cells = { tostring(landingCell) }
+		local seen = { [landingCell] = true }
+		local inwardDirection = landingCell == 0 and 1 or -1
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == true then
+			for token in string.gmatch(definition.TargetOffsets or "", "([^|]+)") do
+				local offset = math.abs(math.floor(tonumber(token) or 0))
+				local targetCell = landingCell + inwardDirection * offset
+				if offset > 0 and session:IsValidCell(targetCell) and seen[targetCell] ~= true then
+					seen[targetCell] = true
+					table.insert(cells, tostring(targetCell))
+				end
+			end
+		end
+		result.Success = true
+		result.TelegraphKind = "BOSS_LANDING"
+		result.LandingCell = landingCell
+		result.TargetCells = table.concat(cells, "|")
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildChargeTelegraph(any session, any unit, integer direction, string skillId)
+		-- Reuses the shared target-cell snapshot; the client only renders this server-owned line.
+		local result = { Success = false, TelegraphKind = "", LandingCell = -1, TargetCells = "" }
+		if unit == nil or unit.IsDead == true or session.BoardState == nil or session.CellCount <= 0 then
+			return result
+		end
+		if direction ~= -1 and direction ~= 1 then
+			direction = unit.Facing == "Right" and 1 or -1
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			return result
+		end
+		local cells = {}
+		local maxDistance = math.max(1, math.min(session.CellCount, math.floor(tonumber(definition.Range) or 1)))
+		for offset = 1, maxDistance do
+			local cellIndex = unit.CellIndex + direction * offset
+			if session:IsValidCell(cellIndex) == false then
+				break
+			end
+			local occupantEntity = session.BoardState:FindAtCell(cellIndex, unit.UnitId)
+			if isvalid(occupantEntity) then
+				local occupantUnit = occupantEntity:GetComponent("script.BattleUnitComponent")
+				if occupantUnit ~= nil and occupantUnit.IsDead == false and (occupantUnit.Team ~= unit.Team or unit.Team == "Enemy") then
+					table.insert(cells, tostring(cellIndex))
+				end
+				break
+			end
+			table.insert(cells, tostring(cellIndex))
+		end
+		result.Success = true
+		result.TelegraphKind = "CHARGE_LINE"
+		result.TargetCells = table.concat(cells, "|")
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildSkillAreaTelegraph(any session, any unit, string skillId)
+		-- Uses the same target resolver as impact execution so the warning cells cannot drift from damage.
+		local result = { Success = false, TelegraphKind = "", LandingCell = -1, TargetCells = "" }
+		if unit == nil or unit.IsDead == true or session.BoardState == nil or skillId == "" then
+			return result
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			return result
+		end
+		-- Show potential reach, not the ray truncated by the player's current position.
+		if definition.TargetingType == "FIRST_ENEMY_FORWARD" then
+			local cells = {}
+			local direction = unit.Facing == "Right" and 1 or -1
+			for offset = 1, math.max(1, definition.Range) do
+				local cell = unit.CellIndex + direction * offset
+				if session:IsValidCell(cell) then table.insert(cells, cell) end
+			end
+			return { Success = true, TelegraphKind = "SKILL_AREA", LandingCell = -1, TargetCells = _SkillTargetResolverLogic:SerializeIntegers(cells) }
+		end
+		local targetResult = _SkillTargetResolverLogic:Resolve(session, unit.UnitId, definition)
+		if targetResult.Success == false then
+			return result
+		end
+		result.Success = true
+		result.TelegraphKind = "SKILL_AREA"
+		result.TargetCells = _SkillTargetResolverLogic:SerializeIntegers(targetResult.TargetCellIndices)
+		return result
+	end
+end

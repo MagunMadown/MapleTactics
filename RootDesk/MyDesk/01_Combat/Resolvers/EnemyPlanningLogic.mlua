@@ -1,0 +1,496 @@
+@Logic
+script EnemyPlanningLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table BuildEnemyIntent(any session, string enemyUnitId)
+		-- Loads validated PatternStep rows, then adapts authoritative unit state into the stateless resolver contract.
+		local playerEntity = session:FindUnitEntity("player_01")
+		local enemyEntity = session:FindUnitEntity(enemyUnitId)
+		if isvalid(playerEntity) == false or isvalid(enemyEntity) == false then
+			return { ActionType = "WAIT", TileId = "", Direction = 0, Reason = "UNIT_MISSING", PatternId = "", StepIndex = 1 }
+		end
+
+		local player = playerEntity:GetComponent("script.BattleUnitComponent")
+		local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
+		if player == nil or enemy == nil or player.IsDead == true or enemy.IsDead == true then
+			return { ActionType = "WAIT", TileId = "", Direction = 0, Reason = "UNIT_UNAVAILABLE", PatternId = "", StepIndex = 1 }
+		end
+		local patternRunner = enemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
+		if patternRunner == nil then
+			log_error("[BattleEnemyIntent] pattern runner missing enemy=" .. enemyUnitId)
+			return { ActionType = "WAIT", TileId = "", Direction = 0, Reason = "PATTERN_RUNNER_MISSING", PatternId = enemy.EnemyPatternId, StepIndex = 1, PatternStepCount = 0 }
+		end
+		if patternRunner.PatternId ~= enemy.EnemyPatternId then
+			-- Reset/rebuild can replace an enemy definition while reusing its stable UnitId.
+			-- The BattleUnit definition is authoritative; a step index from the previous pattern cannot be carried over safely.
+			local previousPatternId = patternRunner.PatternId
+			local alignment = patternRunner:InitializePattern(enemy.EnemyPatternId, 1)
+			if alignment.Success == false then
+				log_error("[BattleEnemyIntent] pattern runner resync failed enemy=" .. enemyUnitId .. " unitPattern=" .. enemy.EnemyPatternId .. " runnerPattern=" .. previousPatternId .. " reason=" .. alignment.Reason)
+				return { ActionType = "WAIT", TileId = "", Direction = 0, Reason = "PATTERN_RUNNER_RESYNC_FAILED_" .. alignment.Reason, PatternId = enemy.EnemyPatternId, StepIndex = 1, PatternStepCount = 0 }
+			end
+			log_warning("[BattleEnemyIntent] pattern runner resynced enemy=" .. enemyUnitId .. " previous=" .. previousPatternId .. " current=" .. enemy.EnemyPatternId)
+		end
+
+		local patternValidation = _EnemyPatternContentValidatorLogic:ValidateById(enemy.EnemyPatternId)
+		if patternValidation.Success == false then
+			local detailReason = patternValidation.DetailReason or patternValidation.Reason
+			log_error("[BattleEnemyIntent] pattern rejected enemy=" .. enemyUnitId .. " pattern=" .. enemy.EnemyPatternId .. " reason=" .. detailReason)
+			return { ActionType = "WAIT", TileId = "", Direction = 0, Reason = "PATTERN_INVALID_" .. detailReason, PatternId = enemy.EnemyPatternId, StepIndex = 1 }
+		end
+
+		local summoner = enemyEntity:GetComponent("script.BossSummonComponent")
+		if session:CanSkeletonSwapWithCommander(enemyUnitId) then
+			local swapRuntime = session:GetSkillRuntimeState(enemyUnitId)
+			if swapRuntime ~= nil and swapRuntime:CanUseSkill("perion_skeleton_boss_swap").Success then
+				return { ActionType = "EXECUTE_TILE", TileId = "perion_skeleton_boss_swap", Direction = 0,
+					Reason = "COMMANDER_RELIEF", PatternId = enemy.EnemyPatternId,
+					StepIndex = patternRunner.CurrentStepIndex, PatternStepCount = #patternValidation.Data.Steps, TelegraphTurnsRemaining = 0 }
+			end
+		end
+		local summonReady = summoner ~= nil and summoner:CanSummon(session, session:GetOppositeEdgeCell(enemy.CellIndex))
+		local startStepIndex = patternRunner.CurrentStepIndex
+		if summonReady and summoner.PrioritizeSummon then
+			-- Only newly prepared actions may prioritize reinforcements; published plans stay frozen.
+			startStepIndex = 1
+		end
+		-- Resolve cooldowns before choosing a PatternStep, so an unavailable special
+		-- follows its authored failure link to the basic attack instead of queuing a wait.
+		local skillReadyById = {}
+		local skillRuntime = session:GetSkillRuntimeState(enemyUnitId)
+		if skillRuntime ~= nil then
+			for _, step in ipairs(patternValidation.Data.Steps) do
+				if step.TileId ~= nil and step.TileId ~= "" and skillReadyById[step.TileId] == nil then
+					skillReadyById[step.TileId] = skillRuntime:CanUseSkill(step.TileId).Success == true
+				end
+			end
+		end
+		return _EnemyIntentResolverLogic:ResolvePatternIntent({
+			SummonReady = summonReady,
+			EnemyUnitId = enemyUnitId,
+			PatternId = enemy.EnemyPatternId,
+			StartStepIndex = startStepIndex,
+			TelegraphTurnsRemaining = patternRunner.TelegraphTurnsRemaining,
+			EnemyCellIndex = enemy.CellIndex,
+			EnemyFacing = enemy.Facing,
+			EnemyCurrentHp = enemy.CurrentHp,
+			EnemyMaxHp = enemy.MaxHp,
+			EnemyIsBoss = enemy.IsBoss,
+			EnemyIsAirborne = enemy.IsAirborne,
+			PlayerCellIndex = player.CellIndex,
+			CellFreeBySelector = self:BuildEnemyCellFreeSnapshot(session, enemyUnitId, enemy.CellIndex, enemy.Facing, player.CellIndex),
+			SkillReadyById = skillReadyById
+		}, patternValidation.Data.Steps)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table BuildEnemyCellFreeSnapshot(any session, string enemyUnitId, integer enemyCellIndex, string enemyFacing, integer playerCellIndex)
+		-- Converts live BoardState occupancy into immutable selector booleans for the stateless Resolver.
+		local directions = _EnemyIntentResolverLogic:ResolveRelativeDirections(enemyCellIndex, enemyFacing, playerCellIndex)
+		return {
+			FRONT = self:IsPatternCellFree(session, enemyCellIndex + directions.FacingDirection, enemyUnitId),
+			BACK = self:IsPatternCellFree(session, enemyCellIndex - directions.FacingDirection, enemyUnitId),
+			TOWARD_PLAYER = self:IsPatternCellFree(session, enemyCellIndex + directions.PlayerDirection, enemyUnitId),
+			AWAY_FROM_PLAYER = self:IsPatternCellFree(session, enemyCellIndex - directions.PlayerDirection, enemyUnitId)
+		}
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsPatternCellFree(any session, integer cellIndex, string ignoredUnitId)
+		-- Out-of-range cells are never valid destinations even when no unit occupies them.
+		if session:IsValidCell(cellIndex) == false or session.BoardState == nil then
+			return false
+		end
+		return isvalid(session.BoardState:FindAtCell(cellIndex, ignoredUnitId)) == false
+	end
+
+	@ExecSpace("ServerOnly")
+	method table PrepareEnemyIntent(any session)
+		-- Freezes every living enemy plan while the board still represents the same player decision point.
+		session.LastEnemySpawnOrder = 0
+		session:ResetEnemyIntentCursor("PLAN_ALL_ENEMIES")
+		if session.SkillTestMode == true then
+			-- The training dummy never plans an action, so no telegraph or queue icon is shown.
+			session:PublishEnemyPlanSnapshot("SKILL_TEST_IDLE")
+			return { Success = true, Reason = "SKILL_TEST_IDLE", PreparedCount = 0, SelectionReason = "SKILL_TEST_IDLE" }
+		end
+		if session.BoardState == nil then
+			return { Success = false, Reason = "REGISTRY_MISSING" }
+		end
+		local livingEnemies = session.BoardState:CollectLivingEnemies()
+		local preparedCount = 0
+		for _, enemyEntity in ipairs(livingEnemies) do
+			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+			local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+			if enemyUnit ~= nil and actionPlan ~= nil then
+				if actionPlan.PlanState == "COMPLETED" then
+					actionPlan:ResetPlan("NEXT_ENEMY_DECISION")
+				end
+				local planResult = { Success = true, Reason = "EXISTING_PLAN_PRESERVED" }
+				if actionPlan.PlanState == "EMPTY" then
+					planResult = self:PrepareEnemyIntentForUnit(session, enemyUnit.UnitId)
+				elseif actionPlan.PlanState == "TRACKING" then
+					-- Freeze every queued enemy's readiness before the player commits a Command.
+					planResult = self:RefreshQueuedAttackReadiness(session, enemyUnit.UnitId)
+				end
+				if planResult.Success == true then
+					-- Freeze recovery movement at the player decision point, just like tracking movement.
+					if actionPlan.PlanState == "PREPARED" and actionPlan.PlannedActions ~= nil then
+						local action = actionPlan.PlannedActions[actionPlan.CurrentActionIndex]
+						if action ~= nil and (action.ActionType == "MOVE_TOWARD" or action.ActionType == "MOVE_AWAY" or action.ActionType == "TURN_TO_PLAYER") then
+							action.Direction = session:ResolveEnemyRelativeMoveDirection(enemyUnit.UnitId, action.ActionType)
+						end
+					end
+					preparedCount = preparedCount + 1
+				else
+					log_error("[EnemyRoundPlan] enemy plan failed enemy=" .. enemyUnit.UnitId .. " reason=" .. planResult.Reason)
+				end
+			end
+		end
+		session:PublishEnemyPlanSnapshot("ALL_PLANS_FROZEN")
+		local selection = self:PrepareNextEnemyIntent(session)
+		log("[EnemyRoundPlan] frozen turn=" .. session.TurnNumber .. " living=" .. #livingEnemies .. " prepared=" .. preparedCount .. " selected=" .. session.PreparedEnemyId .. " revision=" .. session.EnemyPlanRevision)
+		return { Success = preparedCount > 0, Reason = preparedCount > 0 and "ALL_PLANS_FROZEN" or "NO_ENEMY_PLAN_PREPARED", PreparedCount = preparedCount, SelectionReason = selection.Reason }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table PrepareNextEnemyIntent(any session)
+		-- Moves the compatibility cursor to the next already-frozen per-enemy plan; it never rebuilds AI here.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
+
+		if session.BattleResult ~= "" then
+			result.Reason = "BATTLE_ENDED"
+			return result
+		end
+		local currentIntent = session:GetPreparedEnemyIntent()
+		if currentIntent.State ~= "EMPTY" then
+			result.Reason = "INTENT_ALREADY_PREPARED"
+			return result
+		end
+
+		if session.BoardState == nil then
+			result.Reason = "REGISTRY_MISSING"
+			return result
+		end
+		local livingEnemies = session.BoardState:CollectLivingEnemies()
+		local selectedUnitId = ""
+		for _, enemyEntity in ipairs(livingEnemies) do
+			local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+			local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+			if enemyUnit ~= nil and actionPlan ~= nil
+				and (actionPlan.PlanState == "INSERTING" or actionPlan.PlanState == "TRACKING" or actionPlan.PlanState == "ATTACK_READY" or actionPlan.PlanState == "PREPARED")
+				and actionPlan.DeferredUntilTurn <= session.TurnNumber
+				and enemyUnit.SpawnOrder > session.LastEnemySpawnOrder then
+				selectedUnitId = enemyUnit.UnitId
+				break
+			end
+		end
+		if selectedUnitId == "" then
+			result.Reason = "NO_NEXT_LIVING_ENEMY"
+			return result
+		end
+
+		return session:LoadEnemyPlanActionToCompatibility(selectedUnitId)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table PrepareEnemyIntentForUnit(any session, string enemyUnitId)
+		-- Resolves one base pattern step, decorates it through traits, and stores it on the enemy object.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
+		if session.BattleResult ~= "" then
+			result.Reason = "BATTLE_ENDED"
+			return result
+		end
+		local spawningEnemy = session:FindUnitEntity(enemyUnitId)
+		if isvalid(spawningEnemy) then
+			local spawnPlan = spawningEnemy:GetComponent("script.EnemyActionPlanComponent")
+			local spawnUnit = spawningEnemy:GetComponent("script.BattleUnitComponent")
+			if spawnPlan ~= nil and spawnUnit ~= nil and spawnUnit.IsDead == false and spawnPlan.SpawnWaitPending == true then
+				-- Do not select a skill, apply QUICK/other traits, or advance the pattern during the first enemy turn.
+				return spawnPlan:ReplacePlan(enemyUnitId, {
+					{ ActionType = "WAIT", TileId = "", Direction = 0, Reason = "SPAWN_WAIT" }
+				}, session.TurnNumber, spawnUnit.EnemyTraitIds, "SPAWN_WAIT", 0)
+			end
+		end
+		local intent = self:BuildEnemyIntent(session, enemyUnitId)
+		if intent.PatternId == nil or intent.PatternId == "" then
+			-- Preserve the actual planning failure (for example UNIT_UNAVAILABLE after a zero-HP reset)
+			-- instead of passing an empty id to the runner and reporting a misleading mismatch.
+			return { Success = false, Reason = intent.Reason or "ENEMY_INTENT_UNAVAILABLE" }
+		end
+		local preparedMovementPolicy = ""
+		local preparedEnemyEntity = session:FindUnitEntity(enemyUnitId)
+		if isvalid(preparedEnemyEntity) == false then
+			return { Success = false, Reason = "ENEMY_MISSING_AFTER_PREPARE" }
+		else
+			local preparedEnemyUnit = preparedEnemyEntity:GetComponent("script.BattleUnitComponent")
+			local actionPlan = preparedEnemyEntity:GetComponent("script.EnemyActionPlanComponent")
+			if preparedEnemyUnit ~= nil then
+				preparedMovementPolicy = preparedEnemyUnit.EnemyMovementPolicy
+			end
+			if preparedEnemyUnit == nil or actionPlan == nil then
+				return { Success = false, Reason = "ENEMY_PLAN_COMPONENT_MISSING" }
+			end
+			local tutorialPlan = _TutorialRulesLogic:PrepareEnemyPlan(session, enemyUnitId, preparedEnemyUnit, actionPlan)
+			if tutorialPlan ~= nil then return tutorialPlan end
+			if actionPlan.PlanState ~= "EMPTY" then
+				actionPlan:ResetPlan("REPLAN")
+			end
+			local patternRunner = preparedEnemyEntity:GetComponent("script.EnemyPatternRunnerComponent")
+			if patternRunner == nil then
+				return { Success = false, Reason = "PATTERN_RUNNER_MISSING" }
+			end
+			local traitPlan = _EnemyTraitRouterLogic:BuildActionPlan(preparedEnemyUnit.EnemyTraitIds, intent, preparedEnemyUnit.IsBoss)
+			if traitPlan.Success == false then
+				return traitPlan
+			end
+			-- An authored recovery step owns retreat; do not append a second automatic retreat.
+			local selectedStep = _EnemyPatternStepRepositoryLogic:GetPatternStep(intent.PatternId, intent.StepIndex)
+			if selectedStep.Success and selectedStep.Step ~= nil then
+				local nextIndex = selectedStep.Step.NextStepOnSuccess
+				if nextIndex == nil or nextIndex <= 0 then
+					nextIndex = intent.StepIndex % math.max(1, intent.PatternStepCount or 1) + 1
+				end
+				local nextStep = _EnemyPatternStepRepositoryLogic:GetPatternStep(intent.PatternId, nextIndex)
+				local lastAction = traitPlan.Actions[#traitPlan.Actions]
+				if nextStep.Success and nextStep.Step ~= nil and nextStep.Step.ActionType == "MOVE_AWAY"
+					and lastAction ~= nil and lastAction.Reason == "POST_ATTACK_MOVE_AWAY" then
+					table.remove(traitPlan.Actions)
+					log("[EnemyActionPlan] authored retreat retained enemy=" .. enemyUnitId)
+				end
+			end
+			local markResult = patternRunner:TryMarkPrepared(intent.PatternId, intent.StepIndex, intent.PatternStepCount or 0, intent.ActionType, intent.TelegraphTurnsRemaining or 0)
+			if markResult.Success == false and markResult.Reason == "PATTERN_ID_MISMATCH" then
+				-- Recover once at the mutation boundary in case reset/rebuild swapped runtime state after intent resolution.
+				local previousPatternId = patternRunner.PatternId
+				local recovery = patternRunner:InitializePattern(intent.PatternId, intent.StepIndex)
+				if recovery.Success == true then
+					markResult = patternRunner:TryMarkPrepared(intent.PatternId, intent.StepIndex, intent.PatternStepCount or 0, intent.ActionType, intent.TelegraphTurnsRemaining or 0)
+					log_warning("[BattleEnemyIntent] pattern mismatch recovered enemy=" .. enemyUnitId .. " previous=" .. previousPatternId .. " current=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " success=" .. tostring(markResult.Success))
+				else
+					return { Success = false, Reason = "PATTERN_MISMATCH_RECOVERY_FAILED_" .. recovery.Reason }
+				end
+			end
+			if markResult.Success == false then
+				return markResult
+			end
+			local queueTurnsRequired = 0
+			if intent.TileId ~= nil and intent.TileId ~= "" then
+				local skillDefinition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(intent.TileId)
+				if skillDefinition.Success == true then
+					queueTurnsRequired = math.max(1, math.floor(tonumber(skillDefinition.EnemyQueueTurns) or 1))
+					if skillDefinition.TargetingType == "BOARD_PARITY" then
+						session:RollBoardParity(enemyUnitId, intent.TileId)
+					end
+				else
+					patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, "QUEUE_SKILL_MISSING")
+					return { Success = false, Reason = "QUEUE_SKILL_MISSING" }
+				end
+			end
+			result = actionPlan:ReplacePlan(enemyUnitId, traitPlan.Actions, session.TurnNumber, preparedEnemyUnit.EnemyTraitIds, intent.Reason, queueTurnsRequired)
+			if result.Success == false then
+				patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, result.Reason)
+				return result
+			end
+			if intent.ActionType == "EXECUTE_TILE" and self:IsTelegraphFollowUp(session, patternRunner, intent.PatternId, intent.TileId) then
+				actionPlan:LockTelegraphFollowUp()
+			end
+			if intent.ActionType == "SUMMON_ENEMIES" then
+				local summoner = preparedEnemyEntity:GetComponent("script.BossSummonComponent")
+				if summoner ~= nil then
+					actionPlan.TargetCellSnapshot = summoner:PrepareSummon(session, session:GetOppositeEdgeCell(preparedEnemyUnit.CellIndex))
+				end
+			end
+			local preparedAction = actionPlan:GetCurrentAction()
+			if preparedAction.Success == true and preparedAction.ActionType == "CHARGE_FORWARD" then
+				-- Freeze the warned cells with the round plan. Charge execution must not reacquire a player
+				-- who moved beyond the line that was visible during the preceding PlayerTurn.
+				local telegraph = _EnemyTelegraphLogic:BuildChargeTelegraph(session, preparedEnemyUnit, preparedAction.Direction, preparedAction.TileId)
+				if telegraph.Success == true then
+					actionPlan.TargetCellSnapshot = telegraph.TargetCells
+				end
+			end
+			if actionPlan.PlanState == "TRACKING" then
+				local readiness = self:RefreshQueuedAttackReadiness(session, enemyUnitId)
+				if readiness.Success == false then
+					patternRunner:CancelPreparedStep(intent.PatternId, intent.StepIndex, readiness.Reason)
+					actionPlan:ResetPlan(readiness.Reason)
+					return readiness
+				end
+			end
+		end
+		log("[BattleEnemyIntent] plan enemy=" .. enemyUnitId .. " pattern=" .. intent.PatternId .. " step=" .. intent.StepIndex .. " action=" .. intent.ActionType .. " tile=" .. intent.TileId .. " telegraphRemaining=" .. (intent.TelegraphTurnsRemaining or 0) .. " direction=" .. intent.Direction .. " turn=" .. session.TurnNumber .. " policy=" .. preparedMovementPolicy .. " reason=" .. intent.Reason)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsTelegraphFollowUp(any session, any patternRunner, string patternId, string tileId)
+		-- True when the step just completed was a successful warning (TELEGRAPH_TILE or cast start) for the same skill.
+		if patternRunner == nil or tileId == nil or tileId == "" then
+			return false
+		end
+		if patternRunner.PatternId ~= patternId or patternRunner.LastCompletionSuccess ~= true or patternRunner.LastCompletedStepIndex <= 0 then
+			return false
+		end
+		local previous = _EnemyPatternStepRepositoryLogic:GetPatternStep(patternId, patternRunner.LastCompletedStepIndex)
+		return previous.Success == true and previous.Step ~= nil
+			and (previous.Step.ActionType == "TELEGRAPH_TILE" or previous.Step.ActionType == "CAST_INTERRUPTIBLE")
+			and previous.Step.TileId == tileId
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RefreshQueuedAttackReadiness(any session, string enemyUnitId)
+		-- Converts the queued attack Tile into a turn, move, wait, or committed attack without changing Pattern Step.
+		local enemyEntity = session:FindUnitEntity(enemyUnitId)
+		local playerEntity = session:FindUnitEntity("player_01")
+		if isvalid(enemyEntity) == false or isvalid(playerEntity) == false then
+			return { Success = false, Reason = "READINESS_UNIT_MISSING" }
+		end
+		local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+		local playerUnit = playerEntity:GetComponent("script.BattleUnitComponent")
+		local actionPlan = enemyEntity:GetComponent("script.EnemyActionPlanComponent")
+		if enemyUnit == nil or playerUnit == nil or actionPlan == nil then
+			return { Success = false, Reason = "READINESS_COMPONENT_MISSING" }
+		end
+		if actionPlan.PlanState ~= "TRACKING" then
+			return { Success = false, Reason = "PLAN_NOT_TRACKING" }
+		end
+		local action = actionPlan:GetCurrentAction()
+		if action.Success == false or (action.ActionType ~= "EXECUTE_TILE" and action.ActionType ~= "TELEGRAPH_TILE") or action.TileId == "" then
+			return { Success = false, Reason = "QUEUED_ATTACK_ACTION_MISSING" }
+		end
+		local definitionResult = _SkillDefinitionRepositoryLogic:GetSkillDefinition(action.TileId)
+		if definitionResult.Success == false then
+			return definitionResult
+		end
+		local runtimeState = session:GetSkillRuntimeState(enemyUnitId)
+		if runtimeState ~= nil then
+			local cooldownResult = runtimeState:CanUseSkill(action.TileId)
+			if cooldownResult.Success == false then
+				local trackingResult = actionPlan:SetTrackingState("SKILL_COOLDOWN", "WAIT", 0, "")
+				if trackingResult.Success == false then
+					return trackingResult
+				end
+				return {
+					Success = true,
+					Reason = "SKILL_COOLDOWN",
+					Readiness = "COOLDOWN",
+					NextCommandType = "WAIT",
+					Direction = 0,
+					TargetCellSnapshot = "",
+					RemainingTurns = cooldownResult.RemainingTurns,
+					PatternId = action.PatternId,
+					StepIndex = action.StepIndex,
+					PatternStepCount = action.PatternStepCount,
+					TileId = action.TileId,
+					PreparedTurn = action.PreparedTurn,
+					TelegraphTurnsRemaining = action.TelegraphTurnsRemaining
+				}
+			end
+		end
+		if actionPlan.TelegraphLocked == true then
+			-- The warned cells are final: fire along the current facing without turning, approaching or re-targeting.
+			local locked = _EnemyTelegraphLogic:BuildSkillAreaTelegraph(session, enemyUnit, action.TileId)
+			local lockedCells = locked.Success == true and locked.TargetCells or ""
+			local lockedResult = actionPlan:MarkAttackReady("TELEGRAPH_LOCKED", lockedCells)
+			if lockedResult.Success == false then
+				return lockedResult
+			end
+			return {
+				Success = true,
+				Reason = "TELEGRAPH_LOCKED",
+				Readiness = "READY",
+				NextCommandType = "EXECUTE_TILE",
+				Direction = 0,
+				TargetCellSnapshot = lockedCells,
+				PatternId = action.PatternId,
+				StepIndex = action.StepIndex,
+				PatternStepCount = action.PatternStepCount,
+				TileId = action.TileId,
+				PreparedTurn = action.PreparedTurn,
+				TelegraphTurnsRemaining = action.TelegraphTurnsRemaining
+			}
+		end
+		local relative = _EnemyIntentResolverLogic:ResolveRelativeDirections(enemyUnit.CellIndex, enemyUnit.Facing, playerUnit.CellIndex)
+		local allyCells = {}
+		if session.BoardState ~= nil then
+			for _, allyEntity in ipairs(session.BoardState:CollectLivingEnemies()) do
+				local ally = allyEntity:GetComponent("script.BattleUnitComponent")
+				if ally ~= nil and ally.UnitId ~= enemyUnitId and not ally.IsDead then allyCells[ally.CellIndex] = true end
+			end
+		end
+		local readiness = _EnemyIntentResolverLogic:ResolveQueuedAttackReadiness({
+			EnemyCellIndex = enemyUnit.CellIndex,
+			EnemyFacing = enemyUnit.Facing,
+			PlayerCellIndex = playerUnit.CellIndex,
+			TowardPlayerCellFree = self:IsPatternCellFree(session, enemyUnit.CellIndex + relative.PlayerDirection, enemyUnitId),
+			AllyCells = allyCells,
+			EnemyIsBoss = enemyUnit.IsBoss == true
+		}, definitionResult)
+		if readiness.Success == false then
+			return readiness
+		end
+		local holdsPosition = action.ActionType == "TELEGRAPH_TILE" or _EnemyTraitRouterLogic:HasTrait(enemyUnit.EnemyTraitIds, "HOLD_POSITION")
+		if holdsPosition and (readiness.Readiness == "NEEDS_MOVE" or (readiness.Readiness == "BLOCKED" and readiness.Reason == "BLOCKED")) then
+			-- Telegraphs and HOLD_POSITION enemies stay put: they may face the player first, but never walk toward
+			-- them; once facing, the warning commits to the current cells even if the player is out of reach.
+			local stayed = _EnemyTelegraphLogic:BuildSkillAreaTelegraph(session, enemyUnit, action.TileId)
+			readiness.Readiness = "READY"
+			readiness.Reason = "READY_HOLD_POSITION"
+			readiness.NextCommandType = action.ActionType
+			readiness.Direction = 0
+			readiness.TargetCellSnapshot = stayed.Success == true and stayed.TargetCells or ""
+		end
+		if readiness.Readiness == "READY" then
+			local readyResult = actionPlan:MarkAttackReady(readiness.Reason, readiness.TargetCellSnapshot)
+			if readyResult.Success == false then
+				return readyResult
+			end
+		else
+			local trackingResult = actionPlan:SetTrackingState(readiness.Reason, readiness.NextCommandType, readiness.Direction, readiness.TargetCellSnapshot)
+			if trackingResult.Success == false then
+				return trackingResult
+			end
+		end
+		readiness.PatternId = action.PatternId
+		readiness.StepIndex = action.StepIndex
+		readiness.PatternStepCount = action.PatternStepCount
+		readiness.TileId = action.TileId
+		readiness.PreparedTurn = action.PreparedTurn
+		readiness.TelegraphTurnsRemaining = action.TelegraphTurnsRemaining
+		return readiness
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ResetEnemyIntentCursor(any session, string reason)
+		-- Clears only the map-scoped selection cursor. Enemy-owned queued Tiles survive into later turns.
+		local intentRuntime = session.EnemyIntentRuntime
+		if intentRuntime == nil then
+			intentRuntime = session:EnsureEnemyIntentComponent()
+		end
+		if intentRuntime ~= nil then
+			intentRuntime:ResetIntent(reason)
+		end
+		session:PublishEnemyIntentSnapshot(reason)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetPreparedEnemyIntent(any session)
+		-- Returns a copy so callers cannot mutate the synchronized snapshot fields.
+		local intentRuntime = session.EnemyIntentRuntime
+		if intentRuntime == nil then
+			intentRuntime = session:EnsureEnemyIntentComponent()
+		end
+		if intentRuntime == nil then
+			return { State = "EMPTY", EnemyId = "", PatternId = "", StepIndex = 0, ActionType = "", TileId = "", TelegraphTurnsRemaining = 0, Direction = 0, PreparedTurn = 0, Reason = "INTENT_STATE_MISSING", Revision = 0 }
+		end
+		return intentRuntime:GetSnapshot()
+	end
+
+end

@@ -623,4 +623,125 @@ script SkillTestLogic extends Logic
 		return result
 	end
 
+	@ExecSpace("ServerOnly")
+	method table TrySkillTestAssignSlot(any session, integer slotIndex, string skillId)
+		-- Skill test map only: equips any valid player skill into one fixed battle slot.
+		if session.SkillTestMode ~= true then
+			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
+		end
+		if slotIndex ~= math.floor(slotIndex) or slotIndex < 1 or slotIndex > session.SkillSlotCount then
+			return { Success = false, Reason = "SLOT_INDEX_OUT_OF_RANGE" }
+		end
+		if isvalid(session.PlayerEntity) == false then
+			return { Success = false, Reason = "PLAYER_UNAVAILABLE" }
+		end
+		local validation = _ContentValidatorLogic:ValidateSkillById(skillId)
+		if validation.Success == false then
+			return { Success = false, Reason = validation.DetailReason or validation.Reason }
+		end
+		local inventory = session.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then
+			return { Success = false, Reason = "RUN_INVENTORY_UNAVAILABLE" }
+		end
+		local applyResult = inventory:ApplySkillTestBarSlot(slotIndex, skillId)
+		if applyResult.Success == false then
+			return applyResult
+		end
+		session:RefreshSkillTestPresentation("SKILL_TEST_ASSIGN")
+		log("[SkillTest] slot assigned slot=" .. tostring(slotIndex) .. " skill=" .. skillId .. " slots=" .. session.SkillSlotIds)
+		return { Success = true, Reason = "OK", SlotIds = session.SkillSlotIds }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TrySkillTestAssignUtility(any session, string jobId)
+		-- Skill test map only: makes the utility button use another job's utility so every utility can be tried.
+		if session.SkillTestMode ~= true then
+			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
+		end
+		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(jobId)
+		if bundle.Success == false then
+			return bundle
+		end
+		local definition = bundle.Definition
+		session.SkillTestUtilityJobId = jobId
+		session.UtilitySkillId = definition.SkillId
+		session.UtilitySkillIconRuid = definition.IconRuid
+		session.UtilityMaxCooldown = definition.CooldownTurns
+		local runtime = session:GetSkillRuntimeState("player_01")
+		if runtime ~= nil then
+			runtime:ResetSkillRuntimeState("SKILL_TEST_UTILITY_ASSIGN")
+		end
+		session.UtilityRemainingCooldown = 0
+		-- Warm the new utility's clips and sounds so its first cast looks like every later one.
+		local ruids = {}
+		local seen = {}
+		for _, ruid in ipairs({ definition.CastEffectRuid, definition.HitEffectRuid, definition.CellEffectRuid, definition.ProjectileRuid, definition.CastSoundRuid, definition.HitSoundRuid }) do
+			session:CollectPresentationRuid(ruids, seen, ruid)
+		end
+		if #ruids > 0 and isvalid(session.PlayerEntity) and session.PlayerEntity.PlayerComponent ~= nil then
+			session:PreloadSkillPresentation(table.concat(ruids, "|"), session.PlayerEntity.PlayerComponent.UserId)
+		end
+		session:PublishTurnStateSnapshot("SKILL_TEST_UTILITY")
+		log("[SkillTest] utility assigned job=" .. jobId .. " skill=" .. definition.SkillId)
+		return { Success = true, Reason = "OK", SkillId = definition.SkillId }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshSkillTestUtility(any session)
+		-- Re-reads the equipped utility so an edited cooldown or icon reaches the utility HUD.
+		if session.SkillTestMode ~= true or session.UtilitySkillId == "" then
+			return
+		end
+		local jobId = session.SkillTestUtilityJobId ~= "" and session.SkillTestUtilityJobId or session.SelectedJobId
+		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(jobId)
+		if bundle.Success == false then
+			return
+		end
+		session.UtilitySkillIconRuid = bundle.Definition.IconRuid
+		session.UtilityMaxCooldown = bundle.Definition.CooldownTurns
+		session.UtilityRemainingCooldown = math.min(session.UtilityRemainingCooldown, session.UtilityMaxCooldown)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshSkillTestPresentation(any session, string reason)
+		-- Forces the slot rebuild so edited names/cooldowns/icons reach the HUD even when ownership is unchanged.
+		if session.SkillTestMode ~= true or isvalid(session.PlayerEntity) == false then
+			return
+		end
+		session.SkillSlotSourceSnapshot = ""
+		session:RefreshSkillSlots(reason, session.PlayerEntity)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ResetSkillTestCooldowns(any session)
+		if session.SkillTestMode ~= true then
+			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
+		end
+		local runtimeState = session:GetSkillRuntimeState("player_01")
+		if runtimeState == nil then
+			return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" }
+		end
+		runtimeState:ResetSkillRuntimeState("SKILL_TEST_RESET")
+		session.UtilityRemainingCooldown = 0
+		log("[SkillTest] cooldowns reset")
+		return { Success = true, Reason = "OK" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RestoreSkillTestDummy(any session)
+		if session.SkillTestMode ~= true or session.BoardState == nil then
+			return { Success = false, Reason = "NOT_SKILL_TEST_MAP" }
+		end
+		local restored = 0
+		for _, enemyEntity in ipairs(session.BoardState:CollectLivingEnemies()) do
+			local unit = enemyEntity:GetComponent("script.BattleUnitComponent")
+			if unit ~= nil then
+				unit:RestoreCurrentHp(unit.MaxHp)
+				restored = restored + 1
+			end
+		end
+		log("[SkillTest] dummy restored count=" .. tostring(restored))
+		return { Success = restored > 0, Reason = restored > 0 and "OK" or "NO_DUMMY" }
+	end
+
 end

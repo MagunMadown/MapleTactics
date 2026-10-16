@@ -11,7 +11,7 @@
 | 3 | 🟡 Maker verified, release pending | 동일 조건 완주 정책·불변 공개 저장·서버 캐시·조회 UI. 실제 출시/다중 인스턴스 회귀 대기 | 상위 완주 기록과 내 공개 최고 기록 비교 |
 | 4 | ✅ Maker DTO/event verified | 선택 공개 빌드 사본 조회. 실제 포인터/모바일은 운영 게이트로 별도 관리 | 다른 사람의 스킬·증강·유물 구성 확인 |
 
-각 단계는 로컬 회귀 검사 후 Maker Refresh/build/Play 검증을 한다. 2026-10-06 Maker 연결이 복구되어 공개 저장·대상 RPC·UI 이벤트 검증을 수행했다. v3 실제 전투 집계의 전체 런, 출시·다중 인스턴스·모바일·물리 포인터는 아직 미검증이며 구현/단일 Maker 검사와 구분한다.
+각 단계는 로컬 회귀 검사 후 Maker Refresh/build/Play 검증을 한다. 2026-10-06 Maker 연결이 복구되어 공개 저장·대상 RPC·UI 이벤트 검증을 수행했다. v3 실제 전투 집계는 2026-10-12 제어된 NORMAL 상·하단 각 20전투와 실제 기록 UI로 확인했다. 일반 전술 입력만의 전체 완주, 출시·다중 인스턴스·모바일·물리 포인터는 아직 미검증이다.
 
 ## 1. 기록 규격
 
@@ -42,6 +42,8 @@
 - 점수와 공개 사본은 별도 저장 작업이다. 불변 `ProfileCode:RunId` payload를 먼저 쓰고 점수/Tag를 나중에 쓴다. key/tag/score/버전을 검증하고 같은 키 재시도를 허용한다. 중간 실패로 없는 빌드를 가리키지 않으며 동시 저점 기록이 더 높은 별도 키를 덮어쓰지 않는다. 낮은 인덱스는 정리하지만 과거 payload 장기 GC는 이후 작업이다.
 
 ## 검증 체크리스트
+
+2026-10-12: 실제 ApplyDamage로 진행을 가속한 NORMAL 런에서 상단 RunId 61·하단 RunId 63 각각 Clear 20, 시작 관측·NORMAL/ACCOUNT_APPLIED, 방문 4개·클리어 4/4/4/8·모두 완료 및 턴/피격 합계를 확인했다. 실제 기록 UI의 통계/지역 경로·페이지 2·Skills/Relics/Augments/Regions 탭 초기화와 완료 배지를 확인했다. 새 런의 상점/인벤토리/유물 초기화도 확인했다. Maker 결과는 RankEligible=false/MAKER_TEST로 공개 등록하지 않았으며, 도구 UI 이벤트를 물리 포인터로 취급하지 않는다. 1/2번은 사람의 표시·실기기 검토가 남아 🟡를 유지한다. [상세 근거](../../Artifacts/normal-run-validation-20261012/verification.md).
 
 2026-10-06: 기존 개인 15개 + 공개 13개 로컬 Lua mock 회귀 통과. Maker 격리 저장에서 등록 4회, 최고 교체/중복 무시, Tag 기반 본인 최고, 3계정 순위 1/2/2, 빌드 보존 확인. 테스트 인덱스/payload 각 4키 정리 code 0. 대상 클라이언트 RPC·공개 DTO·목록/탭/내 최고/화면 전환 버튼 이벤트 확인. 최종 소스의 격리 등록·조회 재검사/키 정리와 Play 재시작의 `RANKING_LOADED`, build/runtime Error·Warning 0 확인. 실제 Escape 창 닫기/동의 초기화 확인. 실제 여러 인스턴스 경쟁 및 네트워크 장애는 mock/별도 출시 검증 경계다. 운영 설정은 [월드 랭킹 가이드](Run-World-Ranking-Guide.md)에 기록한다.
 

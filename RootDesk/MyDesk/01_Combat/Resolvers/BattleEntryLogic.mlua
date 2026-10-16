@@ -1,0 +1,783 @@
+@Logic
+script BattleEntryLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table ResolvePrototypeTestStage(any session)
+		local mapId = session.Entity.Name
+		if session.SkillTestMode == true then
+			-- The test map borrows a real stage only for board layout and job/run bootstrap; it is not routed.
+			return {
+				Success = true,
+				Reason = "OK",
+				StageId = session.SkillTestStageId,
+				MapId = mapId,
+				Source = "SKILL_TEST"
+			}
+		end
+		if session.PrototypeTestStageOverride ~= nil and session.PrototypeTestStageOverride ~= "" then
+			local overrideRoute = _StageMapRouteRepositoryLogic:GetMapRoute(session.PrototypeTestStageOverride)
+			if overrideRoute.Success == false then
+				return overrideRoute
+			end
+			if overrideRoute.MapId ~= mapId then
+				return {
+					Success = false,
+					Reason = "PROTOTYPE_STAGE_MAP_MISMATCH",
+					DetailReason = "EXPECTED_" .. mapId .. "_ACTUAL_" .. overrideRoute.MapId,
+					StageId = session.PrototypeTestStageOverride,
+					MapId = mapId
+				}
+			end
+			return {
+				Success = true,
+				Reason = "OK",
+				StageId = session.PrototypeTestStageOverride,
+				MapId = mapId,
+				Source = "MAP_OVERRIDE"
+			}
+		end
+
+		local defaultRoute = _StageMapRouteRepositoryLogic:GetDefaultStageForMap(mapId)
+		if defaultRoute.Success == true then
+			return defaultRoute
+		end
+
+		-- Backward compatibility for older prototype maps that have not registered StageMapRoutes yet.
+		local fallbackRoute = _StageMapRouteRepositoryLogic:GetMapRoute(session.StageId)
+		if fallbackRoute.Success == true and fallbackRoute.MapId == mapId then
+			log_warning("[BattlePrototypeEntry] legacy StageId fallback map=" .. mapId .. " stage=" .. session.StageId)
+			return {
+				Success = true,
+				Reason = "OK",
+				StageId = session.StageId,
+				MapId = mapId,
+				Source = "LEGACY_STAGE_ID"
+			}
+		end
+		return defaultRoute
+	end
+
+	@ExecSpace("ServerOnly")
+	method table StartPrototypeBattleFromMap(any session, Entity playerEntity, string targetStageId)
+		-- Initializes a direct Maker Play session through the production NEW_RUN boundary for realistic HP, skills, queue, and inventory.
+		local unionReadiness = _UnionEffectResolverLogic:GetEffectSnapshot(playerEntity)
+		if unionReadiness.Success == false then
+			return {
+				Success = false,
+				Reason = unionReadiness.Reason or "UNION_EFFECT_UNAVAILABLE",
+				DetailReason = unionReadiness.DetailReason or "",
+				Retryable = session:IsPrototypeBattleEntryRetryableReason(unionReadiness.Reason)
+			}
+		end
+		-- Run/profile setup can yield; the retry tick must not start a second entry while one is still running.
+		if session.PrototypeTestEntryInFlight == true then
+			return { Success = false, Reason = "PROTOTYPE_ENTRY_IN_FLIGHT", Retryable = true }
+		end
+		local resolvedJobId = _RunManagerLogic:ResolveJobId(session.PrototypeTestJobId)
+		local requestId = math.max(1, session.PrototypeTestEntryRequestId)
+		local runSeed = math.max(1, session.PrototypeTestRunSeed)
+		session.PrototypeTestEntryInFlight = true
+		local result = session:InitializeFromEntry(
+			playerEntity,
+			targetStageId,
+			session.PrototypeTestCharacterId,
+			resolvedJobId,
+			session.PrototypeTestLoadoutId,
+			runSeed,
+			"NEW_RUN",
+			requestId,
+			"NORMAL"
+		)
+		session.PrototypeTestEntryInFlight = false
+		if result.Success == true then
+			local runState = playerEntity:GetComponent("script.PlayerRunStateComponent")
+			if runState ~= nil then
+				runState.PrototypeTestMode = true
+			end
+			session.PrototypeTestEntryActive = true
+			log("[BattlePrototypeEntry] started stage=" .. targetStageId .. " job=" .. resolvedJobId .. " seed=" .. runSeed .. " request=" .. requestId)
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean IsPrototypeBattleEntryRetryableReason(any session, string reason)
+		-- Restricts automatic retries to transient Union profile readiness states.
+		return reason == "PROFILE_LOAD_IN_PROGRESS"
+			or reason == "PROTOTYPE_ENTRY_IN_FLIGHT"
+			or reason == "PROFILE_NOT_LOADED"
+			or reason == "PROFILE_CACHE_MISSING"
+			or reason == "USER_DATA_STORAGE_UNAVAILABLE"
+	end
+
+	@ExecSpace("ServerOnly")
+	method void QueuePrototypeBattleEntryRetry(any session, Entity playerEntity, string targetStageId, string reason)
+		-- Holds one direct-Play request while the player profile finishes loading.
+		session.PrototypeTestEntryPending = true
+		session.PrototypeTestPendingPlayer = playerEntity
+		session.PrototypeTestPendingStageId = targetStageId
+		session.PrototypeTestRetryElapsed = 0
+		session.PrototypeTestRetryCount = 0
+		log("[BattlePrototypeEntry] waiting stage=" .. targetStageId .. " reason=" .. (reason or "PROFILE_NOT_READY"))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdatePrototypeBattleEntryRetry(any session, number delta)
+		-- Retries the production NEW_RUN boundary at a bounded interval without starting a partial battle.
+		if isvalid(session.PrototypeTestPendingPlayer) == false then
+			log_error("[BattlePrototypeEntry] retry cancelled reason=PLAYER_UNAVAILABLE")
+			session:ClearPrototypeBattleEntryRetry("PLAYER_UNAVAILABLE")
+			return
+		end
+		session.PrototypeTestRetryElapsed = session.PrototypeTestRetryElapsed + math.max(0, delta)
+		if session.PrototypeTestRetryElapsed < session.PrototypeTestRetryInterval then
+			return
+		end
+		session.PrototypeTestRetryElapsed = 0
+		session.PrototypeTestRetryCount = session.PrototypeTestRetryCount + 1
+		local result = session:StartPrototypeBattleFromMap(session.PrototypeTestPendingPlayer, session.PrototypeTestPendingStageId)
+		if result.Success == true then
+			session:ClearPrototypeBattleEntryRetry("STARTED")
+			return
+		end
+		if result.Retryable == true and session.PrototypeTestRetryCount < session.PrototypeTestMaxRetryCount then
+			if session.PrototypeTestRetryCount % 10 == 0 then
+				log("[BattlePrototypeEntry] still waiting stage=" .. session.PrototypeTestPendingStageId .. " retry=" .. session.PrototypeTestRetryCount .. "/" .. session.PrototypeTestMaxRetryCount .. " reason=" .. result.Reason)
+			end
+			return
+		end
+		log_error("[BattlePrototypeEntry] retry exhausted stage=" .. session.PrototypeTestPendingStageId .. " retry=" .. session.PrototypeTestRetryCount .. " reason=" .. result.Reason .. " detail=" .. (result.DetailReason or ""))
+		session:ClearPrototypeBattleEntryRetry("RETRY_EXHAUSTED")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ClearPrototypeBattleEntryRetry(any session, string reason)
+		-- Releases the map-scoped direct-Play retry state after success, failure, or teardown.
+		if session.PrototypeTestEntryPending == true then
+			log("[BattlePrototypeEntry] retry cleared reason=" .. (reason or ""))
+		end
+		session.PrototypeTestEntryPending = false
+		session.PrototypeTestPendingPlayer = nil
+		session.PrototypeTestPendingStageId = ""
+		session.PrototypeTestRetryElapsed = 0
+		session.PrototypeTestRetryCount = 0
+	end
+
+	@ExecSpace("ServerOnly")
+	method void StartStageById(any session, string stageId)
+		-- Hazards belong to this battle only.
+		session:ClearPoisonMists()
+		-- Starts one exact StageId. Region, order, and type always come from StageDefinitions.
+		local stageResult = session:LoadAndApplyStageDefinition(stageId)
+		if stageResult.Success == false then
+			session.TurnState:SetPhase("DataError", "STAGE_DATA_ERROR")
+			session:PublishTurnStateSnapshot("STAGE_DATA_ERROR")
+			session.WaveRuntime:SetWaveState("DataError", "STAGE_DATA_ERROR")
+			session:PublishWaveStateSnapshot("STAGE_DATA_ERROR")
+			log_error("[BattleSession] stage start rejected stage=" .. stageId .. " reason=" .. stageResult.Reason .. " detail=" .. (stageResult.DetailReason or ""))
+			return
+		end
+		log("[BattleSession] stage definition loaded stageId=" .. session.StageId)
+		session.StageTurnNumber = 0
+		session.BattleResult = ""
+		session.ResultReady = false
+		session.ResultRecorded = false
+		session.ResultDefeatReset = {}
+		session.ResultKillCount = 0
+		session.ResultElapsedSeconds = 0
+		session.ResultGold = 0
+		session.ResultRewardSnapshot = ""
+		session._T.RoundRewardEntries = {}
+		session._T.RoundRewardReceipts = {}
+		session.ResultStartTime = _UtilLogic.ElapsedSeconds
+		_MonsterCollectionLogic:GetRecord(session.PlayerEntity)
+		local inventory = isvalid(session.PlayerEntity) and session.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent") or nil
+		session.ResultStartGold = inventory ~= nil and inventory:GetSnapshotAmount(inventory.RunCurrencySnapshot, "gold") or 0
+		session:ResetUnionRewardPresentation("STAGE_START")
+		session.DropRuntime:ResetDropState("STAGE_START")
+		session.WaveRuntime:ResetWaveState(session.TotalWaves, "STAGE_START")
+		session:PublishWaveStateSnapshot("STAGE_START")
+		log("[BattleWave] stage started stage=" .. session.StageNumber .. " stageId=" .. session.StageId .. " waveTable=" .. session.WaveTableId .. " seed=" .. session.RunSeed .. " totalWaves=" .. session.TotalWaves)
+		session:SpawnWave(1)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table LoadAndApplyStageDefinition(any session, string stageId)
+		local validation = _ContentValidatorLogic:ValidateStageById(stageId)
+		if validation.Success == false then
+			return validation
+		end
+
+		local definition = validation.Data
+		session.StageId = definition.StageId
+		session.RegionId = definition.RegionId
+		session.StageIndex = definition.StageIndex
+		session.StageType = definition.StageType
+		session.StageNumber = definition.StageIndex
+		session.StageDisplayName = definition.DisplayName
+		session.WaveTableId = definition.WaveTableId
+		session.StageRuleId = definition.StageRuleId
+		session.StageSchemaVersion = definition.SchemaVersion
+		session.CellCount = definition.CellCount
+		session.CellStartX = definition.CellStartX
+		session.CellSpacing = definition.CellSpacing
+		-- Map terrain may rise above the stage reference; keep all floor probes above its walkable deck.
+		session.UnitY = definition.UnitY + session.StageUnitYOffset
+		session.PlayerStartCell = definition.PlayerStartCell
+		session.LeftEnemyStartCell = 0
+		session.RightEnemyStartCell = session.CellCount - 1
+		if session.DropRuntime ~= nil then
+			session.DropRuntime:ConfigurePresentation(session.CellStartX, session.CellSpacing, session.UnitY)
+		end
+		local baseQueueCapacity = session.SelectedJobBaseQueueCapacity
+		if baseQueueCapacity == nil or baseQueueCapacity <= 0 then
+			baseQueueCapacity = definition.QueueCapacity
+		end
+		if baseQueueCapacity == nil or baseQueueCapacity <= 0 then
+			baseQueueCapacity = session.DefaultQueueCapacity
+		end
+		session.TurnState:ConfigureQueueCapacity(baseQueueCapacity, session.MinQueueCapacity, session.MaxQueueCapacity, "JOB_AND_STAGE_DEFINITION")
+		session:PublishTurnStateSnapshot("STAGE_DEFINITION")
+		session.WaveRuntime:SetTotalWaves(_TutorialRulesLogic:GetTotalWaves(session, validation.TotalWaves), "STAGE_DEFINITION")
+		session:PublishWaveStateSnapshot("STAGE_DEFINITION")
+		log("[BattleSession] stage definition applied stage=" .. session.StageId .. " region=" .. session.RegionId .. " index=" .. session.StageIndex .. " type=" .. session.StageType .. " display=" .. session.StageDisplayName .. " cells=" .. session.CellCount .. " startX=" .. session.CellStartX .. " spacing=" .. session.CellSpacing .. " playerCell=" .. session.PlayerStartCell .. " queue=" .. session.TileQueueCapacity)
+		return validation
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RegisterPlayer(any session, Entity player)
+		-- Initializes one player as the controllable logical battle unit.
+		if player == nil or player.PlayerComponent == nil then
+			return
+		end
+
+		if session.PlayerEntity ~= nil and session.PlayerEntity == player then
+			return
+		end
+
+		local previousRunSeed = session.RunSeed
+		session.PlayerEntity = player
+		local runState = _RunManagerLogic:EnsureRunState(player, session.RunSeed)
+		if runState ~= nil then
+			session.RunSeed = runState.RunSeed
+			if runState.SelectedJobId == "" then
+				_RunManagerLogic:ApplyJobSelection(player, "")
+			end
+			session:ApplyRunJobConfiguration(runState, player)
+			if session.TurnState ~= nil and session.SelectedJobBaseQueueCapacity > 0 then
+				session.TurnState:ConfigureQueueCapacity(session.SelectedJobBaseQueueCapacity, session.MinQueueCapacity, session.MaxQueueCapacity, "JOB_REGISTERED")
+				session:PublishTurnStateSnapshot("JOB_REGISTERED")
+			end
+			log("[BattleRun] context synced sequence=" .. runState.RunSequence .. " seed=" .. session.RunSeed .. " state=" .. runState.RunState)
+		end
+		if player.PlayerControllerComponent ~= nil then
+			player.PlayerControllerComponent.Enable = false
+		end
+
+		if player.MovementComponent ~= nil then
+			player.MovementComponent:Stop()
+		end
+
+		local playerMaxHp = session.SelectedJobBaseMaxHp
+		if runState ~= nil and runState.RunHpInitialized == true then
+			playerMaxHp = runState.RunMaxHp
+		end
+		if playerMaxHp <= 0 then
+			playerMaxHp = 100
+		end
+		session:ConfigureUnit(player, "player_01", "Player", session.PlayerStartCell, "Right", playerMaxHp, 1)
+		session:RestorePlayerRunHp(player, runState, "PLAYER_REGISTERED")
+		session:RefreshPlayerHpSnapshot("PLAYER_REGISTERED")
+		if session.CurrentWave > 0 and previousRunSeed ~= session.RunSeed then
+			log("[BattleRun] rebuilding for restored seed previous=" .. previousRunSeed .. " current=" .. session.RunSeed)
+			session:RebuildBattleState("RUN_CONTEXT_SYNC")
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RestorePlayerRunHp(any session, Entity playerEntity, any runState, string reason)
+		-- Restores the player-owned run HP after battle-unit initialization on every map entry or rebuild.
+		if isvalid(playerEntity) == false or runState == nil then
+			return { Success = false, Reason = "RUN_HP_CONTEXT_MISSING" }
+		end
+		local playerUnit = playerEntity:GetComponent("script.BattleUnitComponent")
+		if playerUnit == nil then
+			return { Success = false, Reason = "PLAYER_UNIT_MISSING" }
+		end
+		local hpSnapshot = runState:EnsureRunHpInitialized(playerUnit.MaxHp, reason)
+		if hpSnapshot.Success == false then
+			return hpSnapshot
+		end
+		local effects = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if effects ~= nil then effects:Recalculate() end
+		playerUnit.MaxHp = runState.RunMaxHp
+		local restoreResult = playerUnit:RestoreCurrentHp(runState.RunCurrentHp)
+		log("[RunHp] restored stage=" .. session.StageId .. " hp=" .. restoreResult.HpAfter .. "/" .. restoreResult.MaxHp .. " reason=" .. (reason or ""))
+		return restoreResult
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ConfigureUnit(any session, Entity targetEntity, string unitId, string team, integer cellIndex, string facing, number maxHp, integer spawnOrder)
+		-- Convenience path for player units; enemies defer registry visibility until definition setup completes.
+		local initialization = session:InitializeUnitState(targetEntity, unitId, team, cellIndex, facing, maxHp, spawnOrder)
+		if initialization.Success == false then
+			log_error("[BattleSession] unit initialization failed unit=" .. unitId .. " reason=" .. initialization.Reason)
+			return
+		end
+		local registration = session:RegisterConfiguredUnit(targetEntity)
+		if registration.Success == false then
+			log_error("[BattleSession] registry rejected unit=" .. unitId .. " reason=" .. registration.Reason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table InitializeUnitState(any session, Entity targetEntity, string unitId, string team, integer cellIndex, string facing, number maxHp, integer spawnOrder)
+		-- Builds a complete unit object before it becomes visible to BoardState and turn planning.
+		if session:IsValidCell(cellIndex) == false then
+			return { Success = false, Reason = "INVALID_INITIAL_CELL" }
+		end
+
+		local unit = session:EnsureUnitComponent(targetEntity)
+		if unit == nil then
+			return { Success = false, Reason = "UNIT_COMPONENT_MISSING" }
+		end
+		session:EnsurePresentationComponent(targetEntity)
+		local skillRuntimeState = session:EnsureSkillRuntimeStateComponent(targetEntity)
+		if skillRuntimeState == nil then
+			return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" }
+		end
+		skillRuntimeState:ResetSkillRuntimeState("UNIT_CONFIGURED")
+
+		local initializeResult = unit:InitializeBattleState(unitId, team, cellIndex, facing, maxHp, spawnOrder)
+		if initializeResult.Success == false then
+			return initializeResult
+		end
+		session:ApplyFacing(targetEntity, facing)
+
+		local position = session:GetCellPosition(cellIndex)
+		session:PlaceEntity(targetEntity, position)
+		if team == "Player" and targetEntity.PlayerComponent ~= nil then
+			session:LockBoardCamera(session:GetBoardCenterX(), targetEntity.PlayerComponent.UserId)
+		end
+		return { Success = true, Reason = "UNIT_STATE_INITIALIZED", UnitId = unitId, PositionX = position.x }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RegisterConfiguredUnit(any session, Entity targetEntity)
+		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then return { Success = false, Reason = "UNIT_COMPONENT_MISSING" } end
+		if session.BoardState == nil then
+			return { Success = false, Reason = "REGISTRY_MISSING" }
+		end
+		local registerResult = session.BoardState:RegisterUnit(targetEntity)
+		if registerResult.Success == false then
+			return registerResult
+		end
+		local position = session:GetCellPosition(unit.CellIndex)
+		log("[BattleSession] unit registered id=" .. unit.UnitId .. " team=" .. unit.Team .. " cell=" .. unit.CellIndex .. " spawnOrder=" .. unit.SpawnOrder .. " x=" .. position.x)
+		return { Success = true, Reason = "UNIT_REGISTERED", UnitId = unit.UnitId }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyRunJobConfiguration(any session, any runState, Entity playerEntity)
+		-- Copies the player-owned job snapshot into synchronized map-scoped battle state.
+		if runState == nil then
+			return
+		end
+		local runOwner = playerEntity
+		if isvalid(runOwner) == false then
+			runOwner = session.PlayerEntity
+		end
+		session.SelectedJobId = runState.SelectedJobId
+		session.SkillTestUtilityJobId = ""
+		session.SelectedJobMechanicId = runState.SelectedJobMechanicId
+		session.SelectedJobPassiveSetId = runState.SelectedJobPassiveSetId
+		local utility = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(session.SelectedJobId)
+		session.UtilitySkillId = utility.Success and utility.Definition.SkillId or ""
+		session.UtilitySkillIconRuid = utility.Success and utility.Definition.IconRuid or ""
+		session.UtilityMaxCooldown = utility.Success and utility.Definition.CooldownTurns or 0
+		session.UtilityRemainingCooldown = 0
+		session.SelectedJobStartingSkillIds = runState.StartingSkillIds
+		session.SelectedJobBaseMaxHp = runState.JobBaseMaxHp
+		session.SelectedJobBaseQueueCapacity = runState.JobBaseQueueCapacity
+		session.SelectedJobRevision = runState.JobRevision
+		local unionSnapshot = _RunManagerLogic:GetRunUnionEffectSnapshot(runOwner)
+		if unionSnapshot.Success == true then
+			session.UnionItemDropRate = unionSnapshot.ItemDropRate
+			session.PremiumMagnetPet = unionSnapshot.MagnetPetOwned == true
+		else
+			session.UnionItemDropRate = 0
+			session.PremiumMagnetPet = false
+			log_error("[UnionEffect] battle snapshot unavailable reason=" .. (unionSnapshot.Reason or "UNKNOWN"))
+		end
+		log("[BattleJob] configuration applied job=" .. session.SelectedJobId .. " mechanic=" .. session.SelectedJobMechanicId .. " passive=" .. session.SelectedJobPassiveSetId .. " hp=" .. session.SelectedJobBaseMaxHp .. " queue=" .. session.SelectedJobBaseQueueCapacity .. " skills=" .. session.SelectedJobStartingSkillIds .. " revision=" .. session.SelectedJobRevision)
+		session:RefreshSkillSlots("JOB_APPLIED", runOwner)
+	end
+
+	@ExecSpace("ServerOnly")
+	method table StartNewRun(any session, integer runSeed)
+		-- Asks the player-owned run state to begin, then rebuilds this map-scoped battle.
+		if isvalid(session.PlayerEntity) == false then
+			return {
+				Success = false,
+				Reason = "PLAYER_MISSING"
+			}
+		end
+		local runState = _RunManagerLogic:StartNewRun(session.PlayerEntity, runSeed)
+		if runState == nil then
+			return {
+				Success = false,
+				Reason = "RUN_STATE_UNAVAILABLE"
+			}
+		end
+		local jobResult = _RunManagerLogic:ApplyJobSelection(session.PlayerEntity, session.SelectedJobId)
+		if jobResult.Success == false then
+			return jobResult
+		end
+		session:ApplyRunJobConfiguration(runState, session.PlayerEntity)
+		session.RunSeed = runState.RunSeed
+		log("[BattleRun] new run requested sequence=" .. runState.RunSequence .. " seed=" .. session.RunSeed)
+		return session:RebuildBattleState("NEW_RUN")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table InitializeFromEntry(any session, Entity playerEntity, string stageId, string characterId, string jobId, string loadoutId, integer runSeed, string entryMode, integer requestId, string difficulty)
+		-- Public map-session initializer used only through BattleGatewayLogic.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			RequestId = requestId,
+			StageId = stageId
+		}
+		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
+			result.Reason = "INVALID_PLAYER"
+			return result
+		end
+		if stageId == nil or stageId == "" then
+			result.Reason = "INVALID_STAGE_ID"
+			return result
+		end
+		if requestId > 0 and requestId == session.LastInitializedEntryRequestId then
+			result.Reason = "DUPLICATE_ENTRY_INITIALIZATION"
+			log_warning("[BattleSession] duplicate entry initialization blocked request=" .. requestId .. " stageId=" .. stageId)
+			return result
+		end
+		log("[BattleSession] initialize from entry stageId=" .. stageId .. " request=" .. requestId)
+		local stageValidation = _ContentValidatorLogic:ValidateStageById(stageId)
+		if stageValidation.Success == false then
+			result.Reason = stageValidation.Reason
+			result.DetailReason = stageValidation.DetailReason or ""
+			return result
+		end
+		if entryMode ~= "NEW_RUN" and entryMode ~= "CONTINUE_RUN" then
+			result.Reason = "INVALID_ENTRY_MODE"
+			return result
+		end
+
+		difficulty = difficulty or "NORMAL"
+		local level = _AscensionDifficultyLogic:ResolveLevel(difficulty)
+		if entryMode == "CONTINUE_RUN" then
+			local existing = playerEntity:GetComponent("script.PlayerRunStateComponent")
+			level = existing ~= nil and _AscensionDifficultyLogic:ResolveLevel(existing.RunDifficulty) or -1
+		end
+		if level < 0 then
+			result.Reason = "INVALID_DIFFICULTY"
+			return result
+		end
+		if entryMode == "NEW_RUN" then
+			local unlocked = _AscensionProgressionLogic:ValidateSelection(playerEntity, level)
+			if unlocked.Success == false then result.Reason = unlocked.Reason return result end
+		end
+		difficulty = _AscensionDifficultyLogic:ToDifficulty(level)
+		_TutorialRulesLogic:InitializeSession(session, playerEntity, requestId)
+		local runState = nil
+		if entryMode == "NEW_RUN" then
+			runState = _RunManagerLogic:StartNewRun(playerEntity, runSeed)
+		else
+			runState = _RunManagerLogic:EnsureRunState(playerEntity, runSeed)
+		end
+		if runState == nil then
+			result.Reason = "RUN_STATE_UNAVAILABLE"
+			return result
+		end
+		runState.RunDifficulty = difficulty
+		log("[BattleDifficulty] initialized difficulty=" .. runState.RunDifficulty .. " mode=" .. entryMode)
+		local jobResult = _RunManagerLogic:ApplyJobSelection(playerEntity, jobId)
+		if jobResult.Success == false then
+			result.Reason = jobResult.Reason
+			result.DetailReason = jobResult.DetailReason or ""
+			return result
+		end
+		session:ApplyRunJobConfiguration(runState, playerEntity)
+
+		local applyResult = session:LoadAndApplyStageDefinition(stageId)
+		if applyResult.Success == false then
+			result.Reason = applyResult.Reason
+			result.DetailReason = applyResult.DetailReason or ""
+			return result
+		end
+		session.RunSeed = runState.RunSeed
+		session.EntryRequestId = requestId
+		session.EntryMode = entryMode
+		session.SelectedCharacterId = characterId or ""
+		session.SelectedLoadoutId = loadoutId or ""
+		_TutorialRulesLogic:ApplyStartingHp(session, runState, entryMode)
+		session:RegisterPlayer(playerEntity)
+
+		local rebuildResult = session:RebuildBattleState("BATTLE_ENTRY")
+		result.Success = rebuildResult.Success
+		result.Reason = rebuildResult.Reason
+		if result.Success == true then
+			session.LastInitializedEntryRequestId = requestId
+		end
+		log("[BattleSession] entry initialized request=" .. requestId .. " stage=" .. session.StageId .. " character=" .. session.SelectedCharacterId .. " job=" .. session.SelectedJobId .. " loadout=" .. session.SelectedLoadoutId .. " seed=" .. session.RunSeed .. " mode=" .. session.EntryMode .. " success=" .. tostring(result.Success))
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RunContentValidationGate(any session, string reason)
+		-- Coordinates startup validation while domain validators retain all content rules.
+		local validation = nil
+		if session.RequireValidContentAtStartup == false then
+			validation = {
+				Success = true,
+				Reason = "VALIDATION_DISABLED",
+				ErrorCount = 0,
+				ErrorSnapshot = ""
+			}
+		else
+			validation = _ContentValidatorLogic:ValidateAllContent()
+		end
+		if validation == nil then
+			validation = {
+				Success = false,
+				Reason = "VALIDATOR_UNAVAILABLE",
+				ErrorCount = 1,
+				ErrorSnapshot = "ContentValidatorLogic[0]=VALIDATOR_UNAVAILABLE"
+			}
+		end
+		session:ApplyContentValidationResult(validation, reason)
+		return validation
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RebuildBattleState(any session, string reason)
+		session._T.PendingClear = nil
+		session._T.QueueExecutionConsumedAction = nil
+		session._T.BossDefeated = false
+		session._T.EnemyDeathSettlement = nil
+		-- Clears transient battle state, then rebuilds the selected Stage through the normal spawn path.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN"
+		}
+		local contentValidation = session:RunContentValidationGate("REBUILD_" .. reason)
+		if contentValidation.Success == false then
+			result.Reason = "CONTENT_VALIDATION_BLOCKED"
+			result.DetailReason = contentValidation.Reason
+			result.ErrorCount = contentValidation.ErrorCount
+			result.ErrorSnapshot = contentValidation.ErrorSnapshot
+			return result
+		end
+
+		-- Presentation generation invalidates cached HUD references even when StageId and UnitId repeat.
+		session.HudContextRevision = session.HudContextRevision + 1
+		session:CancelPlayerCombatPresentationHandoff("REBUILD_" .. reason, true)
+		session:FinishPlayerGridMovePresentation("REBUILD_" .. reason)
+		session._T.playerGridLandingCheck = nil
+		session:FinishEnemyGridMovePresentation("REBUILD_" .. reason, false)
+		if session.ActionTimerId > 0 then
+			_TimerService:ClearTimer(session.ActionTimerId)
+			session.ActionTimerId = 0
+		end
+		session:ClearTurnTransitionTimer("REBUILD_" .. reason)
+		session.PlayerToEnemyBeatPending = false
+		session.PendingPlayerToEnemyHandoffDelay = -1
+		session:ClearEnemyToEnemyPresentationHandoff("REBUILD_" .. reason)
+		session:ClearSkillImpactTimers()
+		session.WaveRuntime:ClearAllTimers(reason)
+
+		local queuedBeforeReset = session.TurnState.QueuedTileIds
+		session.BattleResult = ""
+		session:ResetUnionRewardPresentation("REBUILD_" .. reason)
+		session.PlayerExitObservedAfterBattle = false
+		session.StageTurnNumber = 0
+		session.TurnState:ResetTurnState(session.TileQueueCapacity, reason)
+		session:PublishTurnStateSnapshot(reason)
+		log("[BattleQueueBoundary] boundary=" .. reason .. " policy=CLEAR before=" .. queuedBeforeReset .. " after=" .. session.TurnState.QueuedTileIds)
+		session.LastEnemySpawnOrder = 0
+		session:ClearPreparedEnemyIntent(reason)
+
+		local playerEntity = session:FindUnitEntity("player_01")
+		if isvalid(playerEntity) == false then
+			result.Reason = "PLAYER_MISSING"
+			return result
+		end
+		session:CleanupRegisteredEnemies(reason)
+		session.PlayerEntity = playerEntity
+		local runState = _RunManagerLogic:EnsureRunState(playerEntity, session.RunSeed)
+		local playerMaxHp = session.SelectedJobBaseMaxHp
+		if playerMaxHp <= 0 then
+			playerMaxHp = 100
+		end
+		session:ConfigureUnit(playerEntity, "player_01", "Player", session.PlayerStartCell, "Right", playerMaxHp, 1)
+		session:RestorePlayerRunHp(playerEntity, runState, "BATTLE_REBUILD_" .. reason)
+		session:RefreshPlayerHpSnapshot("BATTLE_REBUILD_" .. reason)
+		session:StartStageById(session.StageId)
+
+		result.Success = true
+		result.Reason = reason
+		log("[BattleReset] completed reason=" .. reason .. " seed=" .. session.RunSeed .. " stage=" .. session.StageNumber .. " wave=" .. session.CurrentWave .. "/" .. session.TotalWaves .. " playerCell=" .. session.PlayerStartCell .. " enemyHp=" .. session.CurrentEnemyMaxHp)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void TryStartBattle(any session)
+		-- Enters the first player turn after a player and at least one wave enemy have registered.
+		if session:IsContentValidationReady() == false then
+			return
+		end
+		local playerEntity = session:FindUnitEntity("player_01")
+		if isvalid(playerEntity) == false or session.BoardState == nil then
+			return
+		end
+		local livingEnemies = session.BoardState:CollectLivingEnemies()
+		if #livingEnemies == 0 then
+			return
+		end
+		session.PlayerEntity = playerEntity
+		session.EnemyEntity = livingEnemies[1]
+
+		if session.BattlePhase == "PlayerTurn" then
+			return
+		end
+
+		session.TurnState:OpenPlayerTurn(1, "BATTLE_READY")
+		session:PublishTurnStateSnapshot("BATTLE_READY")
+		session.WaveRuntime:MarkWaveActive("BATTLE_READY")
+		session:PublishWaveStateSnapshot("BATTLE_READY")
+		session.StageTurnNumber = 1
+		local relics = playerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relics ~= nil then relics:BeginBattle(session.StageId, session.EntryRequestId) end
+		session:ProcessAugmentTrigger("TURN_START", "TURN:1", 0)
+		log("[BattleSession] ready phase=" .. session.BattlePhase .. " stage=" .. session.StageNumber .. " wave=" .. session.CurrentWave .. "/" .. session.TotalWaves .. " turn=" .. session.TurnNumber .. " playerCell=" .. session.PlayerStartCell .. " livingEnemies=" .. #livingEnemies .. " enemyHp=" .. session.CurrentEnemyMaxHp)
+		log("[BattleSession] battle started stageId=" .. session.StageId .. " wave=" .. session.CurrentWave)
+		session:PrepareEnemyIntent()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryPrototypeForceStageClear(any session)
+		-- Skips remaining waves, then kills one retained enemy through the normal damage/death/victory pipeline.
+		local result = { Success = false, Reason = "UNKNOWN" }
+		if not _TutorialRulesLogic:ShouldRecordProgress(session) then result.Reason = "TUTORIAL_FOLLOW_GUIDE"; return result end
+		if session.BattleResult ~= "" then
+			result.Reason = "BATTLE_ALREADY_ENDED"
+			return result
+		end
+		if session.BoardState == nil or session.TurnState == nil or session.WaveRuntime == nil then
+			result.Reason = "BATTLE_STATE_UNAVAILABLE"
+			return result
+		end
+		if isvalid(session.PlayerEntity) == false then
+			result.Reason = "PLAYER_UNAVAILABLE"
+			return result
+		end
+
+		local livingEnemies = session.BoardState:CollectLivingEnemies()
+		if livingEnemies == nil or #livingEnemies == 0 then
+			result.Reason = "NO_LIVING_ENEMY"
+			return result
+		end
+
+		-- Retain one enemy so ApplyDamage can enter the exact production victory boundary.
+		local finalEnemy = livingEnemies[1]
+		for index = 2, #livingEnemies do
+			local enemyEntity = livingEnemies[index]
+			if isvalid(enemyEntity) then
+				local enemyUnit = enemyEntity:GetComponent("script.BattleUnitComponent")
+				if enemyUnit ~= nil then
+					session.BoardState:UnregisterUnit(enemyUnit.UnitId)
+				end
+				_EntityService:Destroy(enemyEntity)
+			end
+		end
+
+		local finalUnit = finalEnemy:GetComponent("script.BattleUnitComponent")
+		if finalUnit == nil then
+			result.Reason = "FINAL_ENEMY_COMPONENT_MISSING"
+			return result
+		end
+		local waveResult = session.WaveRuntime:ForceFinalWaveForPrototypeTest("PROTOTYPE_FORCE_CLEAR")
+		if waveResult.Success == false then
+			result.Reason = waveResult.Reason
+			return result
+		end
+		session:PublishWaveStateSnapshot("PROTOTYPE_FORCE_CLEAR")
+		local damageAmount = math.max(1, finalUnit.CurrentHp)
+		local damageResult = session:ApplyDamage("player_01", finalUnit.UnitId, damageAmount, "prototype_force_clear")
+		if damageResult.Success == false then
+			result.Reason = damageResult.Reason
+			return result
+		end
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[BattlePrototypeTest] force clear accepted stage=" .. session.StageId .. " skippedEnemies=" .. tostring(math.max(0, #livingEnemies - 1)))
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean UpdateEntryPolicy(any session, number delta)
+		-- Route the first visible player through the existing entry path exactly once.
+		if session.PrototypeTestEntryPending == true then
+			session:UpdatePrototypeBattleEntryRetry(delta)
+			return true
+		end
+		-- Release builds load every static map. Empty sessions only need a short entry poll.
+		local scanned = false
+		local users = nil
+		if session.EntryPolicyResolved == false or session.BattleResult ~= "" or session.PlayerExitObservedAfterBattle or session.BattlePhase == "Setup" or not isvalid(session.PlayerEntity) or session.PlayerEntity.CurrentMap ~= session.Entity then
+			session._T.EntryUserScanRemaining = (session._T.EntryUserScanRemaining or 0) - math.max(0, delta)
+			if session._T.EntryUserScanRemaining <= 0 then
+				session._T.EntryUserScanRemaining = 0.15
+				users = _UserService:GetUsersByMapComponent(session.Entity.MapComponent)
+				scanned = true
+			end
+		end
+		if session.EntryPolicyResolved == false then
+			if users ~= nil then
+				for _, player in ipairs(users) do
+					session:OnMapEnter(player)
+					break
+				end
+			end
+			return true
+		end
+		-- Static maps can be re-entered between polls, without an observed empty frame.
+		-- Only consume a requested transfer: PREPARED alone is also used while rewards
+		-- are still being selected in the previous battle on this same physical map.
+		if scanned then
+			if users ~= nil and #users > 0 then
+				for _, player in ipairs(users) do
+					local entryState = player:GetComponent("script.BattleEntryStateComponent")
+					if entryState ~= nil and entryState.EntryState == "PREPARED" and entryState.RequestId ~= session.LastInitializedEntryRequestId and entryState.LastTransferRequestId == entryState.RequestId then
+						local destination = _BattleGatewayLogic:ValidatePreparedBattleDestination(player, session, entryState)
+						if destination.Success then
+							log("[BattleSession] prepared re-entry detected request=" .. entryState.RequestId .. " stage=" .. entryState.StageId)
+							session:OnMapEnter(player)
+							break
+						end
+					end
+				end
+			else
+				if session.PlayerExitObservedAfterBattle == false then
+					session.PlayerExitObservedAfterBattle = true
+					log("[BattleSession] player exit observed after battle stage=" .. session.StageId)
+				end
+			end
+		end
+
+		return false
+	end
+
+end

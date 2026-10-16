@@ -1,0 +1,376 @@
+@Logic
+script BattleQueueLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method string GetTileActionType(string tileId)
+		-- Only a validated skill can become a queued execution action.
+		local validation = _ContentValidatorLogic:ValidateSkillById(tileId)
+		if validation.Success == true then
+			return "EXECUTE_SKILL"
+		end
+		return ""
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryQueueTile(any session, string tileId)
+		-- Guide the first hit without changing normal queue or automatic turn behavior.
+		if not session:IsTutorialCommandAllowed("QUEUE_TILE", tileId, 0) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
+		-- Seal leaves movement, facing, queue cleanup and consumables available.
+		if session:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
+		-- Appends one supported tile up to the configurable queue capacity.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			QueueIndex = -1,
+			QueueCount = session.QueuedTileCount,
+			ConsumesTurn = true
+		}
+
+		local capacity = session.TurnState.TileQueueCapacity
+
+		local skillValidation = session:GetEffectiveSkillValidation("player_01", tileId)
+		if skillValidation.Success == false then
+			result.Reason = skillValidation.Reason
+			result.DetailReason = skillValidation.DetailReason or ""
+			return result
+		end
+		local ownership = _RunManagerLogic:CanUseRunSkill(session.PlayerEntity, tileId)
+		if ownership.Success == false then
+			result.Reason = ownership.Reason
+			result.OwnedAmount = ownership.OwnedAmount or 0
+			log_warning("[BattleTileQueue] ownership rejected tile=" .. tileId .. " reason=" .. result.Reason .. " owned=" .. result.OwnedAmount)
+			return result
+		end
+
+		local runtimeState = session:GetSkillRuntimeState("player_01")
+		if runtimeState == nil then
+			result.Reason = "SKILL_RUNTIME_STATE_MISSING"
+			return result
+		end
+		local cooldownResult = runtimeState:CanUseSkill(tileId)
+		if cooldownResult.Success == false then
+			result.Reason = cooldownResult.Reason
+			result.RemainingTurns = cooldownResult.RemainingTurns
+			return result
+		end
+		local definition = skillValidation.Data.Definition
+		if definition.CooldownTurns > 0 and session.TurnState:QueueContainsSkill(session.TurnState.QueuedTileIds, tileId) then
+			result.Reason = "COOLDOWN_RESERVED"
+			result.RemainingTurns = definition.CooldownTurns
+			return result
+		end
+
+		result = session.TurnState:TryAppendSkill(tileId)
+		if result.Success == false then
+			return result
+		end
+		result.ConsumesTurn = definition.FreePlay ~= true
+		local relics = session.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relics ~= nil and relics:OnSkillLoaded(tileId, session.TurnNumber, not result.ConsumesTurn) then result.ConsumesTurn = false end
+		session:PublishTurnStateSnapshot("SKILL_QUEUED")
+		log("[BattleTileQueue] registered tile=" .. tileId .. " index=" .. result.QueueIndex .. " count=" .. result.QueueCount .. "/" .. capacity .. " turn=" .. session.TurnNumber .. " consumesTurn=" .. tostring(result.ConsumesTurn))
+		if result.ConsumesTurn == true and session.BattleResult == "" then
+			session:BeginEnemyTurnFromPlayerAction("SKILL_QUEUED")
+		else
+			log("[BattleTurnFlow] freeplay queue retained tile=" .. tileId .. " turn=" .. session.TurnNumber)
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryExecuteQueuedTile(any session)
+		if not session:IsTutorialCommandAllowed("EXECUTE_QUEUE", "", 0) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
+		-- Seal leaves movement, facing, queue cleanup and consumables available.
+		if session:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
+		-- Freezes the registered queue and starts an arbitrary-length sequential execution pass.
+		local result = session.TurnState:TryFreezeSkillQueue()
+		if result.Success == false then
+			return result
+		end
+		session:ResetPlayerSkillChain("QUEUE_STARTED")
+		session._T.QueueExecutionConsumedAction = false
+		session.CurrentPlayerActionKillCount = 0
+		session:PublishTurnStateSnapshot("SKILL_QUEUE_FROZEN")
+		log("[BattleTileQueue] execution started count=" .. session:GetTileIdCount(session.ExecutingTileIds) .. " capacity=" .. session.TileQueueCapacity .. " turn=" .. session.TurnNumber)
+		session:ExecuteNextQueuedTile()
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ExecuteNextQueuedTile(any session)
+		-- Resolves exactly one tile, then advances only after its action duration has completed.
+		local tileCount = session.TurnState:GetTileIdCount(session.TurnState.ExecutingTileIds)
+		if session.TurnState.ExecutingTileIndex <= 0 or session.TurnState.ExecutingTileIndex > tileCount then
+			session:CompleteTileQueueExecution(true, "QUEUE_COMPLETE")
+			return
+		end
+
+		local tileId = session.TurnState:GetTileIdAt(session.TurnState.ExecutingTileIds, session.TurnState.ExecutingTileIndex)
+		local actionType = session:GetTileActionType(tileId)
+		if actionType == "" then
+			session:CompleteTileQueueExecution(false, "UNKNOWN_SKILL")
+			return
+		end
+
+		session.TurnState:SetExecutingAction(actionType, 0)
+		session:PublishTurnStateSnapshot("SKILL_EXECUTING")
+		log("[BattleTileQueue] tile started index=" .. session.ExecutingTileIndex .. "/" .. tileCount .. " tile=" .. tileId .. " action=" .. actionType)
+
+		local actionResult = nil
+		local isRelicRepeat = session._T.RelicRepeatIndex == session.TurnState.ExecutingTileIndex
+		session._T.ReplayingRelicSkill = isRelicRepeat
+		if actionType == "EXECUTE_SKILL" then
+			actionResult = session:TryExecuteSkill("player_01", tileId)
+		end
+		session._T.ReplayingRelicSkill = false
+		session._T.RelicRepeatIndex = nil
+
+		if actionResult == nil or actionResult.Success == false then
+			local reason = "EXECUTION_FAILED"
+			if actionResult ~= nil then
+				reason = actionResult.Reason
+			end
+			session:CompleteTileQueueExecution(false, reason)
+			return
+		end
+
+		local completedIndex = session.TurnState.ExecutingTileIndex
+		local relics = session.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		local repeatSkill = not isRelicRepeat and relics ~= nil and relics:ConsumeReadyEffect("REPEAT_SKILL_INTERVAL", session.TurnNumber)
+		local expectedEntry = session.EntryRequestId
+		local executingQueue = session.TurnState.ExecutingTileIds
+		-- Impact time is only a lower bound: do not cut the cast short to start the next tile.
+		local duration = session:GetQueueSkillHandoffDuration(tileId, actionResult)
+		local complete = function()
+			if session.EntryRequestId ~= expectedEntry or session.TurnState.ExecutingTileIds ~= executingQueue
+				or session.TurnState.ExecutingTileIndex ~= completedIndex then return end
+			session.ActionTimerId = 0
+			log("[BattleTileQueue] tile completed index=" .. completedIndex .. "/" .. tileCount .. " tile=" .. tileId .. " reason=" .. actionResult.Reason)
+			if session.BattleResult ~= "" then
+				session:CompleteTileQueueExecution(true, "BATTLE_ENDED")
+				return
+			end
+			if repeatSkill and session._T.PendingClear == nil then
+				session._T.RelicRepeatIndex = completedIndex
+				log("[RunRelic] repeat cast skill=" .. tileId .. " index=" .. completedIndex)
+				session:ExecuteNextQueuedTile()
+				return
+			end
+			session.TurnState:AdvanceExecutingSkill()
+			session:PublishTurnStateSnapshot("SKILL_ADVANCED")
+			session:ExecuteNextQueuedTile()
+		end
+		local motionSequence = session:BeginMotionCompletionWait(complete)
+		session:SealMotionCompletionWhenImpactsFinish(motionSequence)
+		local awaitImpact = nil
+		awaitImpact = function()
+			session.ActionTimerId = 0
+			if session.EntryRequestId ~= expectedEntry or session.TurnState.ExecutingTileIds ~= executingQueue
+				or session.TurnState.ExecutingTileIndex ~= completedIndex then return end
+			-- Sequential flight timers can drift by a frame; never advance while a star is pending.
+			if session.ImpactTimerId > 0 then
+				session.ActionTimerId = _TimerService:SetTimerOnce(awaitImpact, 0.02)
+				return
+			end
+			session:MarkMotionCompletionReady(motionSequence)
+		end
+		session.ActionTimerId = _TimerService:SetTimerOnce(awaitImpact, duration)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompleteTileQueueExecution(any session, boolean success, string reason)
+		-- A rejected first cast is free; once a cast starts applying effects or costs the action is consumed.
+		local consumedAction = success or session._T.QueueExecutionConsumedAction == true
+		session._T.QueueExecutionConsumedAction = nil
+		session._T.RelicRepeatIndex = nil
+		session._T.ReplayingRelicSkill = false
+		local relics = isvalid(session.PlayerEntity) and session.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent") or nil
+		if relics ~= nil then relics.LoadedCooldownReductions = {} end
+		-- Like attack charges, a combo is only spent by a queue that actually attacked while it was active.
+		local playerUnit = isvalid(session.PlayerEntity) and session.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
+		local comboAttacked = playerUnit ~= nil and playerUnit.ComboChainCount > 0
+		session:ResetPlayerSkillChain(reason)
+		if comboAttacked then playerUnit:AdvanceComboQueueTurns(reason) end
+		local executedCount = session.TurnState:GetTileIdCount(session.TurnState.ExecutingTileIds)
+		session.ActionTimerId = 0
+		session:CompletePlayerCombatPresentationHandoff(reason)
+		session.TurnState:CompleteSkillQueue(reason)
+		session:PublishTurnStateSnapshot("SKILL_QUEUE_COMPLETED")
+		log("[BattleTileQueue] execution completed success=" .. tostring(success) .. " reason=" .. reason .. " count=" .. executedCount .. " consumedAction=" .. tostring(consumedAction))
+
+		if session.BattleResult ~= "" then
+			return
+		end
+		if _BattleOutcomeLogic:CompletePendingClear(session, consumedAction, "SKILL_QUEUE_COMPLETED") then return end
+		if consumedAction then
+			session:BeginEnemyTurnFromPlayerAction("SKILL_QUEUE_COMPLETED")
+			return
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetQueueSkillHandoffDuration(any session, string skillId, table actionResult)
+		-- Queue chaining uses actual impacts; the motion gate still preserves full attack and hit playback.
+		local validation = session:GetEffectiveSkillValidation("player_01", skillId)
+		if validation.Success == false then return session:GetSkillActionDuration(skillId) end
+		local definition = validation.Data.Definition
+		local speed = session:GetSkillSpeedMultiplier()
+		local motion = session:GetSkillMotionProfile(definition.MotionProfileId)
+		local authored = math.max(0.1, definition.ActionDuration / speed, motion.Duration or 0)
+		if actionResult.Reason == "PROJECTILE_VOLLEY_PENDING" then
+			-- Each sequential shot owns ImpactTimerId until the final hit; its range estimate is not a delay.
+			return authored
+		end
+		return math.max(authored, actionResult.PresentationHandoffDuration or 0)
+	end
+
+	method string GetTileIdAt(any session, string serializedQueue, integer targetIndex)
+		if targetIndex <= 0 then
+			return ""
+		end
+		local index = 0
+		for tileId in string.gmatch(serializedQueue, "([^|]+)") do
+			index = index + 1
+			if index == targetIndex then
+				return tileId
+			end
+		end
+		return ""
+	end
+
+	method boolean QueueContainsSkill(any session, string serializedQueue, string skillId)
+		for queuedSkillId in string.gmatch(serializedQueue, "([^|]+)") do
+			if queuedSkillId == skillId then
+				return true
+			end
+		end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryClearQueuedTile(any session)
+		if _TutorialRulesLogic:IsGuided(session) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
+		-- Clears every registered tile only while the player still owns an idle input phase.
+		local clearedCount = session.TurnState.QueuedTileCount
+		local result = session.TurnState:TryClearQueuedSkills()
+		if result.Success == false then
+			return result
+		end
+		session:PublishTurnStateSnapshot("SKILL_QUEUE_CLEARED")
+		local relics = session.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relics ~= nil then relics.LoadedCooldownReductions = {} end
+		log("[BattleTileQueue] cleared count=" .. clearedCount .. " turn=" .. session.TurnNumber)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryRemoveQueuedTileAt(any session, integer queueIndex)
+		if not _TutorialRulesLogic:CanEditSkillQueue(session) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
+		-- Removes one queued tile without advancing the turn or starting the enemy round.
+		local result = session.TurnState:TryRemoveQueuedSkillAt(queueIndex)
+		if result.Success == false then
+			return result
+		end
+		session:PublishTurnStateSnapshot("SKILL_QUEUE_ITEM_REMOVED")
+		local relics = session.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relics ~= nil then relics:CancelLoadedSkill(result.RemovedSkillId) end
+		log("[BattleTileQueue] removed index=" .. queueIndex .. " tile=" .. result.RemovedSkillId .. " remaining=" .. result.QueueCount .. " turn=" .. session.TurnNumber)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryReorderQueuedTile(any session, integer fromIndex, integer toIndex, integer expectedQueueOrderRevision)
+		if _TutorialRulesLogic:IsGuided(session) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
+		local currentRevision = session.TurnState ~= nil and session.TurnState.QueueOrderRevision or 0
+		local currentQueue = session.TurnState ~= nil and session.TurnState.QueuedTileIds or ""
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			FromIndex = fromIndex,
+			ToIndex = toIndex,
+			PreviousQueue = currentQueue,
+			QueuedTileIds = currentQueue,
+			QueueOrderRevision = currentRevision
+		}
+		if fromIndex ~= math.floor(fromIndex) or toIndex ~= math.floor(toIndex) then
+			result.Reason = "INVALID_QUEUE_INDEX_TYPE"
+			return result
+		end
+		if expectedQueueOrderRevision ~= math.floor(expectedQueueOrderRevision) then
+			result.Reason = "INVALID_QUEUE_REVISION_TYPE"
+			return result
+		end
+		if session.ContentValidationState ~= "VALID" then
+			result.Reason = "CONTENT_NOT_READY"
+			return result
+		end
+		if session.BattleResult ~= "" then
+			result.Reason = "BATTLE_ALREADY_ENDED"
+			return result
+		end
+		if session.TurnState == nil or session.TurnState.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "NOT_PLAYER_DECISION_STATE"
+			return result
+		end
+		if session.TurnState.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+		if session.TurnState.ExecutingTileIds ~= "" then
+			result.Reason = "EXECUTION_SNAPSHOT_ACTIVE"
+			return result
+		end
+		if expectedQueueOrderRevision ~= session.TurnState.QueueOrderRevision then
+			result.Reason = "STALE_QUEUE_REVISION"
+			return result
+		end
+		if session.TurnState.QueuedTileCount < 2 then
+			result.Reason = "QUEUE_REORDER_NOT_NEEDED"
+			return result
+		end
+
+		result = session:TryMoveQueuedTile(fromIndex, toIndex)
+		result.PreviousQueue = currentQueue
+		result.QueuedTileIds = session.TurnState.QueuedTileIds
+		result.QueueOrderRevision = session.TurnState.QueueOrderRevision
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryMoveQueuedTile(any session, integer fromIndex, integer toIndex)
+		if _TutorialRulesLogic:IsGuided(session) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
+		-- Reorders the queued tiles without advancing the turn or starting the enemy round.
+		local result = session.TurnState:TryMoveQueuedSkill(fromIndex, toIndex)
+		if result.Success == false then
+			return result
+		end
+		if result.Reason == "MOVED" then
+			session:PublishTurnStateSnapshot("SKILL_QUEUE_ITEM_MOVED")
+			log("[BattleTileQueue] moved tile=" .. result.MovedSkillId .. " from=" .. fromIndex .. " to=" .. toIndex .. " queue=" .. session.TurnState.QueuedTileIds .. " turn=" .. session.TurnNumber)
+		end
+		return result
+	end
+
+	method integer GetTileIdCount(any session, string serializedQueue)
+		if serializedQueue == "" then
+			return 0
+		end
+		local count = 0
+		for _ in string.gmatch(serializedQueue, "([^|]+)") do
+			count = count + 1
+		end
+		return count
+	end
+
+	method string AppendTileId(any session, string serializedQueue, string tileId)
+		if serializedQueue == "" then
+			return tileId
+		end
+		return serializedQueue .. "|" .. tileId
+	end
+
+end
