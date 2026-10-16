@@ -197,71 +197,23 @@ script SkillDefinitionRepositoryLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table GetSkillDefinition(string skillId)
-		local result = {
-			Success = false,
-			Reason = "UNKNOWN_SKILL",
-			SkillId = skillId
-		}
-		if skillId == nil or skillId == "" then
-			result.Reason = "INVALID_SKILL_ID"
-			return result
-		end
-
-		local matchedDefinition = nil
-		local matchCount = 0
-		for _, dataSetName in ipairs(self:GetSkillDataSetNames()) do
-			local dataSet = _DataService:GetTable(dataSetName)
-			if dataSet ~= nil then
-				for rowIndex = 1, dataSet:GetRowCount() do
-					if dataSet:GetCell(rowIndex, "SkillId") == skillId then
-						matchCount = matchCount + 1
-						if matchedDefinition == nil then
-							matchedDefinition = self:ConvertSkillRow(dataSet, rowIndex)
-						end
-					end
-				end
-			end
-		end
-		if matchedDefinition ~= nil then
-			matchedDefinition.MatchCount = matchCount
-			self:ApplyTestDefinitionOverrides(matchedDefinition)
-			return matchedDefinition
-		end
-
-		log_warning("[SkillDefinition] missing skill=" .. skillId .. " dataset=" .. self.SkillDataSetName)
+		-- Apply live test overrides only after copying the immutable cached definition.
+		if skillId == nil or skillId == "" then return { Success = false, Reason = "INVALID_SKILL_ID", SkillId = skillId } end
+		local definition = self:GetDefinitionIndex().Definitions[skillId]
+		if definition == nil then return { Success = false, Reason = "UNKNOWN_SKILL", SkillId = skillId } end
+		local result = self:CopyRow(definition)
+		self:ApplyTestDefinitionOverrides(result)
 		return result
 	end
 
 	@ExecSpace("ServerOnly")
 	method table GetEffectSteps(string effectSetId)
-		local result = {
-			Success = false,
-			Reason = "EFFECT_SET_NOT_FOUND",
-			EffectSetId = effectSetId,
-			Steps = {}
-		}
-		if effectSetId == nil or effectSetId == "" then
-			result.Reason = "INVALID_EFFECT_SET_ID"
-			return result
-		end
-
-		local dataSet = _DataService:GetTable(self.EffectStepDataSetName)
-		if dataSet ~= nil then
-			for rowIndex = 1, dataSet:GetRowCount() do
-				if dataSet:GetCell(rowIndex, "EffectSetId") == effectSetId then
-					table.insert(result.Steps, self:ConvertEffectStepRow(dataSet, rowIndex))
-				end
-			end
-		end
-
-		if #result.Steps == 0 then
-			log_warning("[SkillEffectData] missing effectSet=" .. effectSetId .. " dataset=" .. self.EffectStepDataSetName)
-			return result
-		end
-
-		table.sort(result.Steps, function(left, right)
-			return left.StepIndex < right.StepIndex
-		end)
+		-- Callers receive mutable copies; override removal immediately reveals base data.
+		local result = { Success = false, Reason = "EFFECT_SET_NOT_FOUND", EffectSetId = effectSetId, Steps = {} }
+		if effectSetId == nil or effectSetId == "" then result.Reason = "INVALID_EFFECT_SET_ID"; return result end
+		local steps = self:GetEffectIndex().Sets[effectSetId]
+		if steps == nil then return result end
+		for _, step in ipairs(steps) do table.insert(result.Steps, self:CopyRow(step)) end
 		self:ApplyTestEffectOverrides(effectSetId, result.Steps)
 		result.Success = true
 		result.Reason = "OK"
@@ -546,6 +498,88 @@ script SkillDefinitionRepositoryLogic extends Logic
 		end
 		local normalized = string.lower(tostring(cellValue or ""))
 		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Maker Play starts with a fresh view of all authored data.
+		self:InvalidateCache()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Do not retain dataset objects between play sessions.
+		self:InvalidateCache()
+	end
+
+	method table CopyRow(table row)
+		-- Converted rows contain scalar values only; callers own their mutable copies.
+		local copy = {}
+		for key, value in pairs(row) do copy[key] = value end
+		return copy
+	end
+
+	@ExecSpace("ServerOnly")
+	method void InvalidateCache()
+		-- In-place data editors must call this; overrides remain an independent layer.
+		self._T.DefinitionCache = nil
+		self._T.EffectCache = nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetDefinitionIndex()
+		-- Check only seven dataset identities on warm reads, never their rows.
+		local config = self.SkillDataSetName .. "|" .. self.JobSkillDataSetNames .. "|" .. self.EnemySkillDataSetName
+		local cache = self._T.DefinitionCache
+		local names = self:GetSkillDataSetNames()
+		local dataSets = {}
+		local unchanged = cache ~= nil and cache.Config == config
+		for index, dataSetName in ipairs(names) do
+			local dataSet = _DataService:GetTable(dataSetName)
+			dataSets[index] = dataSet
+			if unchanged and cache.DataSets[index] ~= dataSet then unchanged = false end
+		end
+		if unchanged then return cache end
+		cache = { Config = config, DataSets = dataSets, Definitions = {} }
+		for index, _ in ipairs(names) do
+			local dataSet = dataSets[index]
+			if dataSet ~= nil then
+				for rowIndex = 1, dataSet:GetRowCount() do
+					local definition = self:ConvertSkillRow(dataSet, rowIndex)
+					local previous = cache.Definitions[definition.SkillId]
+					if previous == nil then
+						definition.MatchCount = 1
+						cache.Definitions[definition.SkillId] = definition
+					else
+						previous.MatchCount = previous.MatchCount + 1
+					end
+				end
+			end
+		end
+		self._T.DefinitionCache = cache
+		return cache
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEffectIndex()
+		-- Keep sorted base rows immutable; validation still sees duplicate indices.
+		local dataSet = _DataService:GetTable(self.EffectStepDataSetName)
+		local cache = self._T.EffectCache
+		if cache ~= nil and cache.Name == self.EffectStepDataSetName and cache.DataSet == dataSet then return cache end
+		cache = { Name = self.EffectStepDataSetName, DataSet = dataSet, Sets = {} }
+		if dataSet ~= nil then
+			for rowIndex = 1, dataSet:GetRowCount() do
+				local step = self:ConvertEffectStepRow(dataSet, rowIndex)
+				if cache.Sets[step.EffectSetId] == nil then cache.Sets[step.EffectSetId] = {} end
+				table.insert(cache.Sets[step.EffectSetId], step)
+			end
+		end
+		for _, steps in pairs(cache.Sets) do
+			table.sort(steps, function(left, right) return left.StepIndex < right.StepIndex end)
+		end
+		self._T.EffectCache = cache
+		return cache
 	end
 
 end

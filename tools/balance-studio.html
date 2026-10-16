@@ -1829,6 +1829,8 @@
     EnemyDefinitions: {
       EnemyDefinitionId: "적 전투 정의 고유 ID.",
       MaxHp: "최대 HP.",
+      FlatDamageReduction: "타격·상태이상 틱마다 적용되는 고정 피해 감소. 최소 피해 0. 빈 값은 0, 유한한 0 이상 숫자.",
+      AscensionHpBonus: "승천 HP 보너스. 빈 값은 1, 0 이상 정수. 난이도 배율과 일반 몬스터 HP 상한은 런타임에서 적용.",
       BasicAttackDamage: "기본 공격 피해.",
       PatternId: "EnemyPatternSteps 참조.",
       MovementPolicy: "TRACK_PLAYER(추적) 또는 FIXED_FACING(현재 방향 고정).",
@@ -6042,6 +6044,7 @@
         rowIndex, enemyId,
         displayName: get("DisplayName") || enemyId,
         maxHp: get("MaxHp"), basicAttackDamage: get("BasicAttackDamage"),
+        flatDamageReduction: Number(get("FlatDamageReduction")) || 0, ascensionHpBonus: get("AscensionHpBonus"),
         patternId: get("PatternId"),
         isBoss: get("IsBoss").trim().toLowerCase() === "true",
         stages, firstStage,
@@ -6247,6 +6250,8 @@
       const vEl = document.createElement("div"); vEl.className = "stat-v"; vEl.textContent = c.basicAttackDamage || "—";
       stats.appendChild(kEl); stats.appendChild(vEl);
     }
+    buildEditableStat(stats, "고정 피해 감소", "EnemyDefinitions", c.rowIndex, "FlatDamageReduction");
+    buildEditableStat(stats, "승천 HP 보너스", "EnemyDefinitions", c.rowIndex, "AscensionHpBonus");
     const patK = document.createElement("div"); patK.className = "stat-k"; patK.textContent = "패턴 ID";
     const patV = document.createElement("div"); patV.className = "stat-v"; patV.style.fontSize = "var(--fs-2xs)"; patV.textContent = c.patternId || "—";
     stats.appendChild(patK); stats.appendChild(patV);
@@ -8306,6 +8311,17 @@
     }
 
     rows.forEach((row, ri) => {
+      if (def.fileName === "EnemyDefinitions.csv") {
+        for (const field of ["FlatDamageReduction", "AscensionHpBonus"]) {
+          const index = header.indexOf(field);
+          const raw = index < 0 ? "" : row[index];
+          if (raw === "" || raw === undefined) continue;
+          const value = Number(raw);
+          if (raw.trim() === "" || !Number.isFinite(value) || value < 0 || (field === "AscensionHpBonus" && !Number.isInteger(value))) {
+            issues.push({row: ri, col: field, level: "error", msg: "0 이상의 유한한 " + (field === "AscensionHpBonus" ? "정수" : "숫자") + "여야 합니다 (게임 검증: INVALID_ENEMY_" + field + ")."});
+          }
+        }
+      }
       if (header[0] === "SchemaVersion" && (!row[0] || row[0].trim() === "")) {
         issues.push({ row: ri, col: "SchemaVersion", level: "error", msg: "SchemaVersion이 비어 있습니다." });
       }
@@ -11311,22 +11327,17 @@
 
   // ---------- Kill math: how many casts / hits ----------
   //
-  // Player side: per cast, every unconditional DAMAGE step deals
-  // (Value + bonus) × hits (DamageEffectExecutorLogic sends each MULTI_HIT hit
-  // through the normal damage path, so a per-hit relic/buff bonus is added per
-  // hit). Combo (PREVIOUS_ATTACK) steps and SOURCE_BASIC_ATTACK steps are left
-  // out. Enemy side: an enemy's hardest-hitting damaging skill in any phase;
-  // SOURCE_BASIC_ATTACK uses its BasicAttackDamage. Player defense lowers each
-  // hit, minimum 1.
-
-  function castDamage(steps, bonus, basicAttack) {
+  // Unconditional DAMAGE only: first hit uses Value + bonus, follow-ups use 1.
+  // Flat reduction is applied to every hit, minimum zero. Conditional/DoT/augment
+  // effects and ascension HP scaling are outside this baseline comparison.
+  function castDamage(steps, bonus, basicAttack, reduction = 0) {
     let total = 0, counted = false;
     steps.forEach((s) => {
       if (s.effectType !== "DAMAGE" || s.condition) return;
       const v = s.paramA === "SOURCE_BASIC_ATTACK" ? basicAttack : s.value;
       if (v === null || v === undefined || !Number.isFinite(v)) return;
       counted = true;
-      total += Math.max(1, v + bonus) + Math.max(0, s.hits - 1);
+      total += Math.max(0, v + bonus - reduction) + Math.max(0, s.hits - 1) * Math.max(0, 1 - reduction);
     });
     return counted ? total : 0;
   }
@@ -11384,7 +11395,7 @@
       .map((s) => ({ s, dmg: castDamage(s.steps, opts.bonus, null) })).filter((x) => x.dmg > 0)
       .sort((a, b) => (Number(a.s.tier) || 0) - (Number(b.s.tier) || 0) || b.dmg - a.dmg);
 
-    const card1 = dashCard(`${job ? job.name : ""} 스킬로 몇 번 써야 잡나`, "칸 숫자 = 그 몬스터를 잡는 데 필요한 시전 횟수(연계 피해 제외). 스킬 피해·몬스터 HP는 여기서 바로 고칠 수 있습니다.", true);
+    const card1 = dashCard(`${job ? job.name : ""} 스킬로 몇 번 써야 잡나`, "칸 숫자 = 몬스터별 고정 감소를 매 타격에 적용한 시전 횟수. 기본 HP 기준이며 연계·상태이상·증강·승천 보정 제외. 스킬 피해·몬스터 HP는 여기서 바로 고칠 수 있습니다.", true);
     if (!jobSkills.length || !regionEnemies.length) {
       card1.appendChild(Object.assign(document.createElement("div"), { className: "dash-empty", textContent: "피해 스킬 또는 몬스터가 없습니다." }));
     } else {
@@ -11415,11 +11426,12 @@
         }
         tr.appendChild(th);
         regionEnemies.forEach((e) => {
-          const n = hitsToKill(Number(e.maxHp) || 0, dmg);
+          const targetDamage = castDamage(s.steps, opts.bonus, null, e.flatDamageReduction);
+          const n = hitsToKill(Number(e.maxHp) || 0, targetDamage);
           const td = document.createElement("td");
           td.className = "kill-cell k" + (n === null ? "x" : Math.min(n, 5));
-          td.textContent = n === null ? "—" : String(n);
-          td.title = `${s.displayName} → ${e.displayName}: ${dmg} 피해 × ${n} = HP ${e.maxHp}`;
+          td.textContent = n === null ? "처치 불가" : String(n);
+          td.title = `${s.displayName} → ${e.displayName}: ${targetDamage} 피해/시전 (타격당 감소 ${e.flatDamageReduction}) · HP ${e.maxHp} · ${n === null ? "피해 0으로 처치 불가" : n + "회 필요"}`;
           tr.appendChild(td);
         });
         tb.appendChild(tr);

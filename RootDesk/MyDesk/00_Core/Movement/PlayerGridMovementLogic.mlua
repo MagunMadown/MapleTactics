@@ -194,17 +194,26 @@ script PlayerGridMovementLogic extends Logic
 			return move.VisualReady and begin or nil
 		end
 		self._T.localMove = move
+		if profile.ObstructionHint then move.BindPresentation(presentation) else self:StartLocalMoveHop(move) end
+		return self._T.nextMoveRequestId
+	end
+
+	@ExecSpace("ClientOnly")
+	method void StartLocalMoveHop(table move)
+		-- Use the same hop when an apparently blocked request is accepted by the server.
+		local profile = move.Profile
+		local player = move.Player
+		local presentation = move.Presentation
 		local beginHop = move.BindPresentation(presentation)
-		if beginHop ~= nil and profile.EnablePlayerHopVisual and not profile.ObstructionHint then
+		if beginHop ~= nil and profile.EnablePlayerHopVisual then
 			move.VisualStarted = true
 			local started = pcall(beginHop, presentation, player.PlayerComponent.UserId, self:GetDuration(profile), profile.PlayerHopHeight,
 				profile.PlayerHopTakeoffSquashDuration, profile.PlayerHopLandingSquashDuration,
 				profile.PlayerHopSquashXScale, profile.PlayerHopSquashYScale,
 				profile.PlayerHopLandingXScale, profile.PlayerHopLandingYScale,
-				profile.PlayerHopPeakProgress, "", profile.PlayerHopAnimationPlayRate, self._T.nextMoveRequestId)
+				profile.PlayerHopPeakProgress, "", profile.PlayerHopAnimationPlayRate, move.RequestId)
 			if not started then move.StopVisual() move.VisualFailed = true move.WarnVisualUnavailable("HOP_FAILED") end
 		end
-		return self._T.nextMoveRequestId
 	end
 
 	@ExecSpace("ClientOnly")
@@ -223,11 +232,14 @@ script PlayerGridMovementLogic extends Logic
 			return
 		end
 		if move.Profile.ObstructionHint then
-			local position = move.LastVisualPosition or move.StartPosition
+			local current = move.Player.TransformComponent.WorldPosition
+			local position = Vector2(current.x, move.GroundY)
 			move.StartPosition = Vector2(position.x, targetY)
 			move.Elapsed = 0
 			move.StartTime = _UtilLogic.ElapsedSeconds
 			move.Profile.ObstructionHint = false
+			move.RootLanded = false
+			self:StartLocalMoveHop(move)
 		end
 		move.Confirmed = true
 		move.Completed = move.Completed or completed
@@ -311,15 +323,10 @@ script PlayerGridMovementLogic extends Logic
 		-- Wall-clock elapsed instead of summed deltas: the frame that started the move adds nothing yet.
 		local elapsed = math.max(move.Elapsed, _UtilLogic.ElapsedSeconds - (move.StartTime or _UtilLogic.ElapsedSeconds))
 		if move.Profile.ObstructionHint and not move.Confirmed then
-			-- This is a visual hint, never a client rejection: class pushes still reach the server.
-			move.Elapsed = elapsed
-			local t = math.min(1, move.Elapsed / math.max(0.03, self.BlockedMoveForwardDuration))
-			local distance = move.Profile.AttemptCellSize * math.max(0.05, math.min(0.25, self.BlockedMoveDistanceRatio))
-			local x = move.StartPosition.x + move.Profile.AttemptDirection * distance * (1 - (1 - t) * (1 - t))
-			step = { Position = Vector2(x, move.StartPosition.y), Complete = false }
-		else
-			step = self:Advance(move, elapsed - move.Elapsed, move.Profile.PlayerMoveCurve, move.Profile.MoveSnapThreshold)
+			-- Wait at the current floor. Rejection plays one recoil; acceptance starts one full common hop.
+			return
 		end
+		step = self:Advance(move, elapsed - move.Elapsed, move.Profile.PlayerMoveCurve, move.Profile.MoveSnapThreshold)
 		if move.Profile.ClientRoot and not move.RootLanded and not move.Profile.ObstructionHint and player.MovementComponent ~= nil then
 			-- Stop root writes at the end of travel, even while the completion receipt is still in flight.
 			player.MovementComponent:SetWorldPosition(Vector2(step.Position.x, move.GroundY))
