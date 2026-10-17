@@ -849,7 +849,8 @@
   table.drop-exc { margin-top: 6px; }
 
   /* ---- stage view ---- */
-  .stage-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  .stage-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .stage-grid > .stage-card { min-width: 0; overflow-x: auto; }
   .stage-top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 16px; align-items: start; }
   @media (max-width: 900px) { .stage-top { grid-template-columns: 1fr; } }
   table.stage-waves td.stage-cands { min-width: 260px; }
@@ -1001,14 +1002,14 @@
 -->
 <script type="application/json" id="vocabCatalog">
 {
-  "catalogVersion": "2026-10-10 augment rules sync (develop f85c18d)",
+  "catalogVersion": "2026-10-17 battle session split sync (develop 502994c)",
   "sources": [
     "RootDesk/MyDesk/03_Data/Repositories/ContentValidatorLogic.mlua",
     "RootDesk/MyDesk/03_Data/Repositories/EnemyPatternContentValidatorLogic.mlua",
     "RootDesk/MyDesk/01_Combat/Resolvers/EffectRouterLogic.mlua",
     "RootDesk/MyDesk/01_Combat/Resolvers/EnemyIntentResolverLogic.mlua",
     "RootDesk/MyDesk/01_Combat/Skills/EffectExecutors/*.mlua",
-    "RootDesk/MyDesk/01_Combat/Components/Shared/BattleSessionComponent.mlua (ExecuteCombatModifier)"
+    "RootDesk/MyDesk/01_Combat/Skills/UtilitySkillExecutionLogic.mlua (ExecuteUtilityEffect)"
   ],
   "wave": {
     "spawnTriggerModes": {
@@ -2221,7 +2222,7 @@
       when: "특수기 효과 수치를 조절할 때.",
       important: "Value, EffectType(GUARD/MOVE_SELF/PUSH_DISTANCE), ParameterB(PUSH_DISTANCE 보조 옵션)",
       related: "← UtilitySkillDefinitions",
-      warnings: "일반 SkillEffectSteps와 스키마는 같지만 효과 계약은 ValidateUtilityEffect가 따로 검사합니다(BattleSessionComponent.ExecuteUtilityEffect 기준). PUSH_DISTANCE의 ParameterB는 CARRY_CASTER / CANCEL_QUEUE를 |로 묶은 목록이며 중복·다른 값은 거부됩니다(예: 파도 = CARRY_CASTER|CANCEL_QUEUE).",
+      warnings: "일반 SkillEffectSteps와 스키마는 같지만 효과 계약은 ValidateUtilityEffect가 따로 검사합니다(UtilitySkillExecutionLogic.ExecuteUtilityEffect 기준). PUSH_DISTANCE의 ParameterB는 CARRY_CASTER / CANCEL_QUEUE를 |로 묶은 목록이며 중복·다른 값은 거부됩니다(예: 파도 = CARRY_CASTER|CANCEL_QUEUE).",
     },
     SkillEffectSteps: {
       what: "모든 Skill 계열 표가 공유하는, 실제 피해량·회복량·버프를 정의하는 표입니다. '데미지를 바꾸고 싶다면 여기.'",
@@ -5612,8 +5613,8 @@
   // Every animationclip slot the game reads, shown whether filled or empty so
   // an empty one can be set ("+"), with the timing columns that belong to it.
   // What each slot does is taken from the game code, not guessed:
-  //  - Cast/Hit effect, projectile: BattleSessionComponent plays them as-is.
-  //  - Player swing: avatar action from MotionProfileId (GetSkillMotionProfile);
+  //  - Cast/Hit effect, projectile: SkillExecutionLogic / BattleCombatPresentationLogic play them as-is.
+  //  - Player swing: avatar action from MotionProfileId (BattleCombatPresentationLogic.GetSkillMotionProfile);
   //    there is no RUID for it — the avatar plays its own swing.
   //  - Enemy CasterMotionRuid: only used when the enemy has no AttackMotionRuid
   //    or the skill has the caster_motion tag (PlayEnemyAttackMotion).
@@ -5789,7 +5790,7 @@
     sel.addEventListener("change", () => commitCellValue(c.tableName, c.rowIndex, "MotionProfileId", sel.value));
     const note = document.createElement("div");
     note.className = "anim-note";
-    note.textContent = "RUID가 아니라 아바타 동작입니다. 동작·시간은 BattleSessionComponent 기본값.";
+    note.textContent = "RUID가 아니라 아바타 동작입니다. 동작·시간은 BattleSessionComponent 속성값(BattleCombatPresentationLogic.GetSkillMotionProfile이 읽음).";
     slot.append(cap, sel, note);
     return slot;
   }
@@ -11186,28 +11187,43 @@
 
   // ---------- Stage view: waves, pools, boss reinforcement, board ----------
 
-  // BattleSessionComponent spawns wave enemy #1, #3, ... from
-  // LeftEnemyStartCell (0) searching right and #2, #4, ... from
-  // RightEnemyStartCell (6) searching left (FindAvailableSpawnCell). Those are
-  // component defaults; a map can override them.
-  const ENEMY_START_LEFT = 0;
-  const ENEMY_START_RIGHT = 6;
+  // BattleWaveComponent.SelectSpawnCell / SelectVariantSpawnCell (SpawnSidePolicy
+  // BALANCED, ascension 0). Slot k of the first batch:
+  // - BOSS stage: even k from the right edge (CellCount - 1) searching left, odd k
+  //   from cell 0 searching right; any free cell.
+  // - other stages: one of three per-run variants (GetSpawnVariantIndex =
+  //   (runSeed + stage hash) % 3 + 1). A: wave 1 slot 1 from the left, then
+  //   alternating; B: mirrored; C: seeded spread. All skip cells within 1 of the
+  //   player.
+  // The first batch is capped by MaxConcurrent and free cells (DrainPendingWave).
+  function simulateFirstSpawns(n, playerCell, count, mode) {
+    const taken = new Set(playerCell >= 0 && playerCell < n ? [playerCell] : []);
+    const spawns = new Map();
+    for (let k = 1; k <= count; k++) {
+      let cell = -1;
+      for (let o = 0; o < n && cell < 0; o++) {
+        let c;
+        if (mode === "BOSS") c = k % 2 === 0 ? n - 1 - o : o;
+        else {
+          let fromRight = (1 + k) % 2 !== 0;
+          if (mode === "B") fromRight = !fromRight;
+          c = fromRight ? n - 1 - o : o;
+          if (Math.abs(c - playerCell) <= 1) continue;
+        }
+        if (!taken.has(c)) cell = c;
+      }
+      if (cell < 0) break;
+      taken.add(cell);
+      spawns.set(cell, k);
+    }
+    return spawns;
+  }
 
-  function buildBoardPreview(cellCount, playerCell, firstWaveCount) {
+  function buildBoardPreview(cellCount, playerCell, firstWaveCount, mode = "BOSS") {
     const wrap = document.createElement("div");
     wrap.className = "board-preview";
     const n = Math.max(0, Math.min(20, Math.floor(cellCount) || 0));
-    const valid = (c) => c >= 0 && c < n;
-    const spawnCell = (pref, dir, taken) => {
-      for (let o = 0; o < n; o++) { const c = pref + o * dir; if (valid(c) && !taken.has(c)) return c; }
-      return -1;
-    };
-    const taken = new Set(valid(playerCell) ? [playerCell] : []);
-    const spawns = new Map();
-    for (let i = 1; i <= Math.min(firstWaveCount, n); i++) {
-      const c = i % 2 === 0 ? spawnCell(ENEMY_START_RIGHT, -1, taken) : spawnCell(ENEMY_START_LEFT, 1, taken);
-      if (c >= 0) { taken.add(c); spawns.set(c, i); }
-    }
+    const spawns = simulateFirstSpawns(n, playerCell, Math.min(firstWaveCount, n), mode);
     for (let c = 0; c < n; c++) {
       const cell = document.createElement("div");
       cell.className = "board-cell";
@@ -11270,13 +11286,21 @@
       const def = state.tables.get("StageDefinitions");
       const cellCount = Number(def.rows[s.rowIndex][def.header.indexOf("CellCount")]) || 0;
       const playerCell = Number(def.rows[s.rowIndex][def.header.indexOf("PlayerStartCell")]);
-      const firstCount = waves.length ? Math.floor(Number(waves[0].get("SpawnCount")) || 0) : 0;
-      boardBox.appendChild(buildBoardPreview(cellCount, playerCell, firstCount));
-      boardBox.appendChild(Object.assign(document.createElement("div"), { className: "econ-shop",
-        textContent: "1웨이브 기준: 홀수 번째 적은 0번 칸부터 오른쪽으로, 짝수 번째는 6번 칸부터 왼쪽으로 빈 칸을 찾아 등장 (BattleSessionComponent 기본값)" }));
-      if (cellCount && ENEMY_START_RIGHT >= cellCount) {
+      const firstCount = waves.length ? Math.min(Math.floor(Number(waves[0].get("SpawnCount")) || 0), Math.max(1, Math.floor(Number(waves[0].get("MaxConcurrent")) || 1))) : 0;
+      const isBossStage = (s.stageType || "").toUpperCase() === "BOSS";
+      const boardNote = (text) => boardBox.appendChild(Object.assign(document.createElement("div"), { className: "econ-shop", textContent: text }));
+      if (isBossStage) {
+        boardBox.appendChild(buildBoardPreview(cellCount, playerCell, firstCount, "BOSS"));
+        boardNote("1웨이브 첫 등장(승천 0): 홀수 번째 적은 0번 칸부터 오른쪽으로, 짝수 번째는 마지막 칸부터 왼쪽으로 빈 칸을 찾음 (BattleWaveComponent.SelectSpawnCell)");
+      } else {
+        boardBox.appendChild(buildBoardPreview(cellCount, playerCell, firstCount, "A"));
+        boardNote("배치 A");
+        boardBox.appendChild(buildBoardPreview(cellCount, playerCell, firstCount, "B"));
+        boardNote("배치 B · 1웨이브 첫 등장(승천 0, 동시 수까지). 런마다 A·B·C 중 하나이며 C는 시드로 분산. 모두 플레이어 양옆 1칸은 피함 (BattleWaveComponent.SelectVariantSpawnCell)");
+      }
+      if (cellCount && firstCount > 0 && simulateFirstSpawns(Math.floor(cellCount), playerCell, firstCount, isBossStage ? "BOSS" : "A").size < firstCount) {
         boardBox.appendChild(Object.assign(document.createElement("div"), { className: "stage-warn",
-          textContent: `오른쪽 적 시작 칸 기본값(${ENEMY_START_RIGHT})이 칸 수(${cellCount}) 밖입니다 — 가장 가까운 빈 칸으로 밀려납니다.` }));
+          textContent: `첫 등장 ${firstCount}마리를 놓을 안전한 빈 칸이 부족합니다 — 남은 적은 칸이 비거나 강제 턴이 될 때까지 대기합니다.` }));
       }
       if (!waves.length) {
         card.appendChild(Object.assign(document.createElement("div"), { className: "dash-empty", textContent: `웨이브 표(${s.waveTableId || "없음"})에 행이 없습니다.` }));
