@@ -1,6 +1,6 @@
 # 스킬 증강·리롤 가이드
 
-기준: `develop` `f85c18d` (2026-10-10, main `b5d1018`과 내용 동일). 이 문서의 규칙과 수치는 아래 코드와 CSV에서 옮겨 적었다.
+기준: `develop` `f85c18d` (2026-10-10). 2026-10-17 `502994c`에서 전투 세션 분리에 맞춰 코드 위치만 갱신했다(규칙·수치 변화 없음). 이 문서의 규칙과 수치는 아래 코드와 CSV에서 옮겨 적었다.
 코드가 바뀌면 코드가 우선이며, 이 문서를 같은 변경에서 갱신한다.
 
 - 데이터: `03_Data/AugmentDefinitions.csv`, `03_Data/AugmentEffects.csv` (`ExclusiveGroup=SKILL_AUGMENT` 행)
@@ -142,7 +142,7 @@ new_skill_stage · UPGRADE (증강 3택)        new_skill_stage · NEW (새 스�
 
 ## 4. 적용 결과 (`ApplySkillModifier`)
 
-증강은 CSV 원본을 바꾸지 않는다. 전투(`BattleSessionComponent.GetEffectiveSkillValidation`),
+증강은 CSV 원본을 바꾸지 않는다. 전투(`SkillExecutionLogic.GetEffectiveSkillValidation`, 세션 메서드는 위임만 한다),
 보상 카드 설명, 큐 시간, 스킬 HUD가 모두 `GetEffectiveSkillBundle` → `BuildSkillBundle`의 같은 결과를 읽는다.
 
 ### 4.1 수치 변화
@@ -168,7 +168,7 @@ new_skill_stage · UPGRADE (증강 3택)        new_skill_stage · NEW (새 스�
 |---|---|---|
 | `FIRST_STRIKE` | 시전마다 대상별 첫 직접 타격 때 대상 HP가 최대면 피해 +합계 Amount. 투사체도 같다 | `GetConditionalDamageBonus` |
 | `EXECUTE` | 같은 시점에 대상 HP가 1 이상이고 최대 HP의 30% 이하면 피해 +합계 Amount | `GetConditionalDamageBonus` |
-| `PRECISE` | 이 스킬의 피해로 적 HP가 정확히 0이 되면(`ExactLethal`) 남은 쿨타임을 `min(합계 Amount, 남은 쿨타임 − 1)`만큼 줄인다 | `BattleSessionComponent` |
+| `PRECISE` | 이 스킬의 피해로 적 HP가 정확히 0이 되면(`ExactLethal`) 남은 쿨타임을 `min(합계 Amount, 남은 쿨타임 − 1)`만큼 줄인다 | `BattleDamageLogic` |
 | `KILL_REFUND` | 직접 피해로 적 HP가 0이 되면 시전당 1회, 남은 쿨타임을 `min(Amount, 남은 쿨타임 − 1)`만큼 줄인다 | `OnSkillDamageApplied` |
 | `BATTLE_STANCE` | 피해를 주면 시전당 1회 방어 +Amount 버프(`ApplyTimedBuff` 지속 1, CSV 설명은 "다음 적 턴 종료까지"). 공용 키 `AUGMENT_BATTLE_STANCE`라 여러 스킬에서 겹치지 않고 갱신된다 | `OnSkillDamageApplied` |
 | `SHOCKWAVE` | 원래 타격이 모두 끝난 뒤, 첫 적중 대상 칸의 양옆 1칸에 있는 다른 적에게 고정 피해 Amount. 별도 공격 ID(`AUGMENT_SHOCKWAVE`)라 공격 버프·독·환급·연쇄 충격파가 붙지 않는다 | `CompleteSkillAugment` |
@@ -308,7 +308,7 @@ new_skill_stage · UPGRADE (증강 3택)        new_skill_stage · NEW (새 스�
 | 붙는지 판정 | `AugmentRuntimeLogic.CanBindSkillAugment` |
 | 수치 적용·누적 | `AugmentRuntimeLogic.ApplySkillModifier` / `BuildSkillBundle` / `GetEffectiveSkillBundle` |
 | 전투 추가 효과 | `AugmentRuntimeLogic.GetConditionalDamageBonus` / `OnSkillDamageApplied` / `CompleteSkillAugment` / `QueueSkillRegeneration` / `AdvanceSkillRegeneration` |
-| 전투에서 읽기 | `BattleSessionComponent.GetEffectiveSkillValidation` (정밀 처형 환급·무위의 준비 피해 0 처리 포함), `SkillExecutionLogic` (시전 완료 시 `CompleteSkillAugment`) |
+| 전투에서 읽기 | `SkillExecutionLogic.GetEffectiveSkillValidation`, `BattleDamageLogic` (정밀 처형 환급, 선제·마무리 피해, `OnSkillDamageApplied` 호출, 무위의 준비 피해 0 처리), `SkillExecutionLogic` (시전 완료 시 `CompleteSkillAugment`), `HealEffectExecutorLogic` (`QueueSkillRegeneration`), `AugmentRuntimeLogic.ProcessAugmentTrigger` (턴 시작 시 `AdvanceSkillRegeneration`) |
 | 보유·리롤권 상태 | `PlayerRunAugmentComponent` (`SetSkillAugment`, `RemoveSkillAugments`, `GrantClearReroll`, `ResetForRun`) |
 | 3택 생성·적용·리롤 | `UpgradeSkillStageLogic` (`BuildUpgradeState`, `RequestApplyUpgrade`, `RequestSkipUpgrade`, `RequestReroll`) |
 | 3택 화면 | `UpgradeSkillStageUIComponent` (`ui/UpgradeSkillStageUI`) |
