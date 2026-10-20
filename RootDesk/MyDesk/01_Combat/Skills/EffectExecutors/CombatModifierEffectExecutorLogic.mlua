@@ -1,0 +1,83 @@
+@Logic
+script CombatModifierEffectExecutorLogic extends Logic
+
+	method boolean IsCombatModifierEffect(string effectType)
+		-- Data-driven status and combo effects share the existing session and target snapshot.
+		return effectType == "FREEZE" or effectType == "STUN" or effectType == "POISON" or effectType == "BURN"
+			or effectType == "NEXT_ARROW" or effectType == "REDUCE_OWN_COOLDOWN" or effectType == "PUSH_ADJACENT"
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ExecuteCombatModifier(any session, table context, table step)
+		-- Applies modifiers only to surviving snapshot targets; session support uses the same caster owner.
+		local sourceEntity = session:FindUnitEntity(context.SourceUnitId)
+		local source = isvalid(sourceEntity) and sourceEntity:GetComponent("script.BattleUnitComponent") or nil
+		if source == nil or source.IsDead then return { Success = false, Reason = "SOURCE_DEAD" } end
+		local kind = step.EffectType
+		if kind == "NEXT_ARROW" then
+			source.NextArrowCount = math.max(source.NextArrowCount, math.floor(step.Value))
+			source.NextArrowSkillId = context.SkillId
+			return { Success = true, Hit = true, Reason = "NEXT_ARROW_ARMED" }
+		elseif kind == "REDUCE_OWN_COOLDOWN" then
+			local runtime = session:GetSkillRuntimeState(context.SourceUnitId)
+			if runtime ~= nil then
+				local reduction = step.Value
+				local floor = context.Definition ~= nil and (context.Definition.AugmentCooldownFloor or 0) or 0
+				if floor > 0 then reduction = math.min(reduction, math.max(0, runtime:GetRemainingCooldown(context.SkillId) - floor)) end
+				runtime:ReduceCooldown(context.SkillId, reduction)
+			end
+			return { Success = true, Hit = true, Reason = "COMBO_COOLDOWN_REDUCED" }
+		end
+		local targets = _SkillTargetResolverLogic:SelectEffectTargets(context, step.TargetSelector)
+		local applied = false
+		for _, id in ipairs(targets) do
+			local entity = session:FindUnitEntity(id)
+			local unit = isvalid(entity) and entity:GetComponent("script.BattleUnitComponent") or nil
+			if unit ~= nil and not unit.IsDead and unit.CurrentHp > 0 and id ~= context.SourceUnitId then
+				if kind == "FREEZE" or kind == "STUN" then
+					if step.Value >= 100 or _UtilLogic:RandomIntegerRange(1, 100) <= step.Value then
+						unit.StopActionTurns = math.max(unit.StopActionTurns, tonumber(step.ParameterA) or 1)
+						unit.StopMarkerRuid = kind == "FREEZE" and "a65071cc048342ef93decf4c49dd696f" or "602b777092204ca7a4b191d538b72de9"
+						applied = true
+					end
+				elseif kind == "POISON" then
+					unit:ApplyPoison(context.SourceUnitId, step.Value, step.ParameterB or "")
+					applied = true
+				elseif kind == "BURN" then
+					unit.BurnDamage = math.max(unit.BurnDamage, step.Value)
+					unit.BurnTurns = 0
+					unit.BurnSourceUnitId = context.SourceUnitId
+					applied = true
+				elseif kind == "PUSH_ADJACENT" and math.abs(unit.CellIndex - source.CellIndex) == 1 then
+					-- Select adjacent targets once, then push cell by cell without crossing blockers.
+					for pushIndex = 1, math.max(0, math.floor(step.Value)) do
+						local pushed = session:ResolvePushImpactOnTarget(context.SourceUnitId, id)
+						applied = applied or pushed.Hit == true
+						if pushed.Success ~= true or pushed.Reason ~= "PUSHED" then break end
+					end
+				end
+			end
+		end
+		log("[BattleStatus] effect=" .. kind .. " skill=" .. context.SkillId .. " applied=" .. tostring(applied))
+		return { Success = true, Hit = applied, Reason = applied and "MODIFIER_APPLIED" or "NO_STATUS_TARGET" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyPoisonOnMove(any session, string unitId)
+		-- A poisoned unit takes its poison damage every time it changes cells, however it was moved.
+		if session.BattleResult ~= "" then
+			return
+		end
+		local unitEntity = session:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			return
+		end
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead == true or unit.PoisonDamage <= 0 then
+			return
+		end
+		local damage = session:ApplyStatusDamage(unitId, unit.PoisonDamage, unit.PoisonSourceUnitId, "POISON_MOVE")
+		log("[BattlePoison] tick unit=" .. unitId .. " source=" .. unit.PoisonSourceUnitId .. " damage=" .. tostring(unit.PoisonDamage) .. " success=" .. tostring(damage.Success) .. " reason=" .. tostring(damage.Reason))
+	end
+
+end

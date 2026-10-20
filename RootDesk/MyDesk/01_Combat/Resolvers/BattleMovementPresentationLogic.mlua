@@ -1,0 +1,481 @@
+@Logic
+script BattleMovementPresentationLogic extends Logic
+
+	@ExecSpace("ClientOnly")
+	method void PreviewLocalTurnFacing(any session)
+		-- Gives direction input an immediate visual response without mutating authoritative BattleUnit facing.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.PlayerControllerComponent == nil then
+			return
+		end
+
+		local currentDirection = player.PlayerControllerComponent.LookDirectionX
+		if currentDirection >= 0 then
+			player.PlayerControllerComponent.LookDirectionX = -1
+		else
+			player.PlayerControllerComponent.LookDirectionX = 1
+		end
+		log("[BattleInputFeedback] local turn preview direction=" .. tostring(player.PlayerControllerComponent.LookDirectionX))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConfirmLocalPlayerFacing(any session, string facing)
+		-- Confirms or rolls back the optimistic visual from the server-authoritative facing value.
+		local player = _UserService.LocalPlayer
+		if isvalid(player) == false or player.PlayerControllerComponent == nil then
+			return
+		end
+
+		player.PlayerControllerComponent.LookDirectionX = facing == "Right" and 1 or -1
+		log("[BattleInputFeedback] authoritative facing=" .. tostring(facing))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyFacing(any session, Entity targetEntity, string facing)
+		-- Uses the native player look direction so the three-layer avatar renderer turns correctly.
+		if targetEntity.PlayerControllerComponent == nil then
+			return
+		end
+
+		if facing == "Right" then
+			targetEntity.PlayerControllerComponent.LookDirectionX = 1
+		else
+			targetEntity.PlayerControllerComponent.LookDirectionX = -1
+		end
+		if targetEntity.PlayerComponent ~= nil then
+			session:ConfirmLocalPlayerFacing(facing, targetEntity.PlayerComponent.UserId)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlaceEntity(any session, Entity targetEntity, Vector2 position)
+		-- Places Body-based players through MovementComponent and static units through TransformComponent.
+		if targetEntity == session.PlayerEntity then
+			session._T.playerGridLandingCheck = nil
+			local movement = session._T.playerGridMove
+			if movement ~= nil and movement.Entity == targetEntity and movement.ClientDriven then
+				session:FinishPlayerGridMovePresentation("AUTHORITATIVE_RELOCATION")
+			end
+			local request = session._T.lastPlayerMoveRequest
+			if request ~= nil and request.Player == targetEntity and not request.Cancelled then
+				request.Cancelled = true
+				session:ReceivePlayerMoveResult(request.Id, request.Entry, request.Context, false, true,
+					position.x, position.y, "AUTHORITATIVE_RELOCATION", targetEntity.PlayerComponent.UserId)
+			end
+		end
+		if targetEntity.MovementComponent ~= nil then
+			targetEntity.MovementComponent:SetPosition(position)
+			return
+		end
+
+		if targetEntity.TransformComponent == nil then
+			log_error("[BattleSession] TransformComponent missing entity=" .. targetEntity.Name)
+			return
+		end
+
+		local current = targetEntity.TransformComponent.Position
+		local groundVisualOffsetY = 0
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			groundVisualOffsetY = tonumber(presentation.GroundVisualOffsetY) or 0
+		end
+		-- UnitY is a spawn reference; unlike players, these units have no Body to settle on the floor.
+		local groundY = session.UnitY
+		local footholds = session.Entity.FootholdComponent
+		if footholds ~= nil then
+			-- Start just above the board, below upper platforms; cover the lower battle floors too.
+			local foothold = footholds:Raycast(Vector2(position.x, session.UnitY + 0.5), Vector2(0, -1), 10)
+			if foothold ~= nil and foothold:IsVertical() == false then
+				groundY = foothold:GetYByX(position.x)
+			end
+		end
+		local hopOffsetY = position.y - session.UnitY
+		targetEntity.TransformComponent.Position = Vector3(position.x, groundY + hopOffsetY + groundVisualOffsetY, current.z)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void PlayUnitMoveHop(any session, Entity targetEntity)
+		-- Selects only presentation defaults. Per-character Presentation overrides remain authoritative.
+		if targetEntity == nil or isvalid(targetEntity) == false then
+			return
+		end
+		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if unit == nil or presentation == nil then
+			log_warning("[CharacterHopVisual] skipped reason=UNIT_PRESENTATION_UNAVAILABLE entity=" .. tostring(targetEntity.Name))
+			return
+		end
+
+		if unit.Team == "Player" then
+			local moveRequest = session._T.activePlayerMoveRequest
+			_PlayerGridMovementLogic:PlayHop(targetEntity, unit.UnitId, _PlayerGridMovementLogic:GetProfile(session), moveRequest ~= nil and moveRequest.Id or 0)
+			-- Reuse the native player jump cue once per accepted grid movement.
+			presentation:PlaySkillSound(unit.UnitId, "MOVE_JUMP", _MaplePreferencesLogic.JumpSound, session:GetSkillSoundVolume())
+			return
+		end
+
+		if unit.Team == "Enemy" and session.EnableEnemyHopVisual then
+			local movementMotionRuid = "" -- Keep the actor's sprite when no per-enemy motion is authored.
+			local movementMotionPlayRate = session.EnemyHopAnimationPlayRate
+			if presentation.MovementMotionRuid ~= nil and presentation.MovementMotionRuid ~= "" then
+				movementMotionRuid = presentation.MovementMotionRuid
+				movementMotionPlayRate = presentation.MovementMotionPlayRate
+			end
+			presentation:PlayMoveHop(
+				unit.UnitId,
+				math.max(0.12, math.min(0.16, session.EnemyHopDuration)),
+				session.EnemyHopHeight,
+				session.EnemyHopTakeoffSquashDuration,
+				session.EnemyHopLandingSquashDuration,
+				session.EnemyHopSquashXScale,
+				session.EnemyHopSquashYScale,
+				session.EnemyHopLandingXScale,
+				session.EnemyHopLandingYScale,
+				session.EnemyHopPeakProgress,
+				movementMotionRuid,
+				movementMotionPlayRate,
+				true
+			)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetEnemyMoveHopProfile(any session, Entity targetEntity)
+		-- Resolves one server-side snapshot for both position and client appearance timing.
+		local profile = {
+			Enabled = session.EnableEnemyHopVisual,
+			Duration = session.EnemyHopDuration,
+			Height = session.EnemyHopHeight,
+			Takeoff = session.EnemyHopTakeoffSquashDuration,
+			Landing = session.EnemyHopLandingSquashDuration,
+			SquashX = session.EnemyHopSquashXScale,
+			SquashY = session.EnemyHopSquashYScale,
+			LandingX = session.EnemyHopLandingXScale,
+			LandingY = session.EnemyHopLandingYScale,
+			Peak = session.EnemyHopPeakProgress,
+			-- A global monster clip can replace an unrelated enemy sprite. Only use per-enemy authored motion.
+			AnimationRuid = "",
+			AnimationPlayRate = session.EnemyHopAnimationPlayRate
+		}
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil then
+			if presentation.MovementMotionRuid ~= "" then
+				profile.AnimationRuid = presentation.MovementMotionRuid
+				profile.AnimationPlayRate = presentation.MovementMotionPlayRate
+			end
+			if presentation.UseCustomMoveHopProfile then
+				profile.Enabled = profile.Enabled and presentation.CustomMoveHopEnabled
+				profile.Duration = presentation.CustomMoveHopDuration
+				profile.Height = presentation.CustomMoveHopHeight
+				profile.Takeoff = presentation.CustomMoveHopTakeoffDuration
+				profile.Landing = presentation.CustomMoveHopLandingDuration
+				profile.SquashX = presentation.CustomMoveHopSquashScale.x
+				profile.SquashY = presentation.CustomMoveHopSquashScale.y
+				profile.LandingX = presentation.CustomMoveHopLandingScale.x
+				profile.LandingY = presentation.CustomMoveHopLandingScale.y
+				profile.Peak = presentation.CustomMoveHopPeakProgress
+				if presentation.CustomMoveHopAnimationRuid ~= "" then
+					profile.AnimationRuid = presentation.CustomMoveHopAnimationRuid
+					profile.AnimationPlayRate = presentation.CustomMoveHopAnimationPlayRate
+				end
+			end
+		end
+		local actionDuration = math.max(0.05, session.EnemyMoveActionDuration)
+		profile.Duration = profile.Enabled and math.max(actionDuration, math.max(0.12, math.min(0.16, profile.Duration))) or actionDuration
+		profile.Height = profile.Enabled and math.max(0, profile.Height) or 0
+		profile.Peak = math.max(0.45, math.min(0.55, profile.Peak))
+		return profile
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean StartEnemyGridMovePresentation(any session, Entity targetEntity, integer fromCell, integer toCell)
+		-- Ordinary enemy moves share the player curve, with all position axes owned by the server.
+		if isvalid(targetEntity) == false or targetEntity.TransformComponent == nil then
+			log_warning("[EnemyMoveVisual] skipped reason=TRANSFORM_UNAVAILABLE")
+			return false
+		end
+		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead or unit.IsAirborne then
+			return false
+		end
+		session:FinishEnemyGridMovePresentation("REPLACED", false)
+		local profile = session:GetEnemyMoveHopProfile(targetEntity)
+		local startPosition = session:GetCellPosition(fromCell)
+		session:PlaceEntity(targetEntity, startPosition)
+		session._T.enemyGridMove = {
+			Entity = targetEntity,
+			UnitId = unit.UnitId,
+			FromCell = fromCell,
+			ToCell = toCell,
+			StartPosition = startPosition,
+			TargetPosition = session:GetCellPosition(toCell),
+			Elapsed = 0,
+			Duration = profile.Duration,
+			Height = profile.Height,
+			Peak = profile.Peak,
+			TimerId = 0,
+			CompleteAction = nil,
+			LoggedIntermediate = false
+		}
+		local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+		if presentation ~= nil and profile.Enabled then
+			presentation:PlayMoveHop(unit.UnitId, profile.Duration, profile.Height, profile.Takeoff, profile.Landing,
+				profile.SquashX, profile.SquashY, profile.LandingX, profile.LandingY, profile.Peak,
+				profile.AnimationRuid, profile.AnimationPlayRate, false)
+		end
+		log("[EnemyMoveVisual] started unit=" .. unit.UnitId .. " from=" .. tostring(fromCell)
+			.. " to=" .. tostring(toCell) .. " duration=" .. tostring(profile.Duration)
+			.. " height=" .. tostring(profile.Height) .. " curve=" .. tostring(session.MoveCurve))
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdateEnemyGridMove(any session, number delta)
+		-- Advances one accepted move without touching logical occupancy or emitting another move event.
+		local movement = session._T.enemyGridMove
+		if movement == nil then
+			return
+		end
+		if session.BattleResult ~= "" then
+			session:FinishEnemyGridMovePresentation("BATTLE_ENDED", false)
+			return
+		end
+		if isvalid(session.PlayerEntity) == false or session.PlayerEntity.CurrentMap ~= session.Entity then
+			session:FinishEnemyGridMovePresentation("PLAYER_LEFT_MAP", false)
+			return
+		end
+		local targetEntity = movement.Entity
+		if isvalid(targetEntity) == false or targetEntity.TransformComponent == nil then
+			session:FinishEnemyGridMovePresentation("ENTITY_REMOVED", true)
+			return
+		end
+		local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead or unit.IsAirborne or unit.CellIndex ~= movement.ToCell
+			or targetEntity.CurrentMap ~= session.Entity then
+			session:FinishEnemyGridMovePresentation("UNIT_INTERRUPTED", true)
+			return
+		end
+		movement.Elapsed = movement.Elapsed + math.max(0, delta)
+		local progress = math.min(1, movement.Elapsed / movement.Duration)
+		if progress >= 1 then
+			session:FinishEnemyGridMovePresentation("VISUAL_COMPLETE", true)
+			return
+		end
+		local eased = session:EvaluatePlayerMoveCurve(progress)
+		local x = movement.StartPosition.x + (movement.TargetPosition.x - movement.StartPosition.x) * eased
+		if math.abs(movement.TargetPosition.x - x) <= math.max(0, session.MoveSnapThreshold) then
+			x = movement.TargetPosition.x
+		end
+		local yOffset = 0
+		if progress <= movement.Peak then
+			yOffset = math.sin(progress / movement.Peak * math.pi * 0.5) * movement.Height
+		else
+			yOffset = math.cos((progress - movement.Peak) / (1 - movement.Peak) * math.pi * 0.5) * movement.Height
+		end
+		session:PlaceEntity(targetEntity, Vector2(x, movement.TargetPosition.y + yOffset))
+		if movement.LoggedIntermediate == false and progress > 0 then
+			movement.LoggedIntermediate = true
+			log("[EnemyMoveVisual] intermediate unit=" .. movement.UnitId .. " progress=" .. tostring(progress)
+				.. " x=" .. tostring(x) .. " yOffset=" .. tostring(yOffset))
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishEnemyGridMovePresentation(any session, string reason, boolean completeAction)
+		-- Releases ownership before callbacks, so visual completion and fallback cannot finish twice.
+		local movement = session._T.enemyGridMove
+		if movement == nil then
+			return
+		end
+		session._T.enemyGridMove = nil
+		if movement.TimerId > 0 then
+			_TimerService:ClearTimer(movement.TimerId)
+			if session.ActionTimerId == movement.TimerId then
+				session.ActionTimerId = 0
+			end
+		end
+		local targetEntity = movement.Entity
+		if isvalid(targetEntity) then
+			local unit = targetEntity:GetComponent("script.BattleUnitComponent")
+			if targetEntity.TransformComponent ~= nil and targetEntity.CurrentMap == session.Entity then
+				local cell = unit ~= nil and unit.CellIndex or movement.ToCell
+				session:PlaceEntity(targetEntity, session:GetCellPosition(cell))
+			end
+			local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+			if presentation ~= nil then
+				presentation:StopMoveHopVisual(reason)
+			end
+		end
+		if movement.IsCharge and isvalid(targetEntity) then
+			local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+			if presentation ~= nil then presentation:StopSpriteMotion(movement.UnitId, reason) end
+			if (reason == "VISUAL_COMPLETE" or reason == "FALLBACK_COMPLETE") and movement.Impact ~= nil and session.BattleResult == "" then
+				movement.Impact()
+			end
+		end
+		log("[EnemyMoveVisual] completed unit=" .. movement.UnitId .. " from=" .. tostring(movement.FromCell)
+			.. " to=" .. tostring(movement.ToCell) .. " reason=" .. reason .. " completeAction=" .. tostring(completeAction))
+		if completeAction and movement.CompleteAction ~= nil and session.BattleResult == ""
+			and isvalid(session.PlayerEntity) and session.PlayerEntity.CurrentMap == session.Entity then
+			movement.CompleteAction()
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean StartPlayerGridMovePresentation(any session, Entity targetEntity, integer fromCell, integer toCell)
+		-- Ordinary moves are client-driven; skill moves retain the server's root presentation.
+		if targetEntity == nil or isvalid(targetEntity) == false then
+			log_warning("[BattleMoveVisual] start skipped because player entity is invalid")
+			return false
+		end
+
+		-- This is defensive only. The existing immediate-action lock prevents a second valid move.
+		session:FinishPlayerGridMovePresentation("REPLACED")
+		session._T.playerGridLandingCheck = nil
+
+		local startPosition = session:GetCellPosition(fromCell)
+		local targetPosition = session:GetCellPosition(toCell)
+		-- Keep the actual floor height for a deferred check, without folding the avatar hop into it.
+		local request = session._T.activePlayerMoveRequest
+		local clientDriven = request ~= nil
+		local groundY = targetEntity.TransformComponent.WorldPosition.y
+		if not clientDriven then session:PlaceEntity(targetEntity, session:GetPlayerFloorPosition(startPosition)) end
+		session._T.playerGridMove = {
+			Entity = targetEntity,
+			StartPosition = startPosition,
+			TargetPosition = targetPosition,
+			Elapsed = 0,
+			Duration = session:GetPlayerMoveDuration(),
+			FromCell = fromCell,
+			ToCell = toCell,
+			ClientDriven = clientDriven,
+			GroundY = groundY
+		}
+		if request ~= nil then
+			session._T.playerGridMove.RequestId = request.Id
+			session._T.playerGridMove.Entry = request.Entry
+			session._T.playerGridMove.Context = request.Context
+			session._T.playerGridMove.UserId = request.UserId
+		end
+		session:PlayUnitMoveHop(targetEntity)
+
+		log("[BattleMoveVisual] started from=" .. tostring(fromCell)
+			.. " to=" .. tostring(toCell)
+			.. " clientDriven=" .. tostring(clientDriven)
+			.. " duration=" .. tostring(session._T.playerGridMove.Duration)
+			.. " curve=" .. tostring(session.PlayerMoveCurve)
+			.. " snap=" .. tostring(session.MoveSnapThreshold))
+		return true
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdatePlayerGridMove(any session, number delta)
+		local movement = session._T.playerGridMove
+		if movement == nil then
+			return
+		end
+
+		local targetEntity = movement.Entity
+		if targetEntity == nil or isvalid(targetEntity) == false then
+			session._T.playerGridMove = nil
+			log_warning("[BattleMoveVisual] cancelled because player entity became invalid")
+			return
+		end
+		if targetEntity.CurrentMap ~= session.Entity then session:FinishPlayerGridMovePresentation("MAP_LEFT") return end
+
+		local step = _PlayerGridMovementLogic:Advance(movement, delta, session.PlayerMoveCurve, session.MoveSnapThreshold)
+		if step.Complete then
+			session:FinishPlayerGridMovePresentation("VISUAL_COMPLETE")
+			return
+		end
+		if not movement.ClientDriven then session:PlaceEntity(targetEntity, session:GetPlayerFloorPosition(step.Position)) end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void FinishPlayerGridMovePresentation(any session, string reason)
+		-- Complete the turn immediately; only an accepted ordinary landing gets a deferred position check.
+		local movement = session._T.playerGridMove
+		if movement == nil then
+			return
+		end
+
+		session._T.playerGridMove = nil
+		local targetEntity = movement.Entity
+		if targetEntity == nil or isvalid(targetEntity) == false then
+			return
+		end
+		if targetEntity.CurrentMap ~= session.Entity then
+			-- A late old-map update must never place the actor back on its former board.
+			if session.ActionTimerId > 0 then _TimerService:ClearTimer(session.ActionTimerId) session.ActionTimerId = 0 end
+			return
+		end
+
+		local targetPosition = movement.TargetPosition
+		local completed = reason == "VISUAL_COMPLETE" or reason == "ACTION_COMPLETE"
+		if movement.ClientDriven then
+			if completed then
+				targetPosition = Vector2(targetPosition.x, movement.GroundY)
+				local check = _PlayerGridMovementLogic:CreateLandingCheck(targetEntity, session.Entity, targetPosition,
+					movement.RequestId, movement.Entry, movement.Context)
+				check.ToCell = movement.ToCell
+				session._T.playerGridLandingCheck = check
+			else
+				session._T.playerGridLandingCheck = nil
+				local request = session._T.lastPlayerMoveRequest
+				if request ~= nil and request.Player == targetEntity and request.Id == movement.RequestId
+					and request.Entry == movement.Entry and request.Context == movement.Context then request.Cancelled = true end
+			end
+		else
+			session:PlaceEntity(targetEntity, session:GetPlayerFloorPosition(targetPosition))
+		end
+		if movement.RequestId ~= nil then
+			session:ReceivePlayerMoveResult(movement.RequestId, movement.Entry, movement.Context, completed, true,
+				targetPosition.x, targetPosition.y, completed and "MOVE_COMPLETE" or "AUTHORITATIVE_RELOCATION", movement.UserId)
+		end
+		log("[BattleMoveVisual] completed from=" .. tostring(movement.FromCell)
+			.. " to=" .. tostring(movement.ToCell)
+			.. " reason=" .. tostring(reason)
+			.. " targetX=" .. tostring(targetPosition.x)
+			.. " targetY=" .. tostring(targetPosition.y))
+
+		if reason == "VISUAL_COMPLETE"
+			and session.TurnState ~= nil
+			and session.TurnState.QueuedActionType == "MOVE"
+			and session.TurnState.IsActionProcessing == true then
+			if session.ActionTimerId > 0 then
+				_TimerService:ClearTimer(session.ActionTimerId)
+				session.ActionTimerId = 0
+			end
+			local completionReason = movement.CompletionReason or "MOVE_VISUAL_COMPLETE"
+			log("[BattleTurnTempo] player move completed by presentation reason=" .. completionReason)
+			session:CompleteQueuedAction("MOVE", true, completionReason)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method Vector2 GetPlayerFloorPosition(any session, Vector2 position)
+		-- The player's Body rests on the foothold below UnitY. Writing UnitY on every step frame held the root
+		-- above the floor for the whole step and dropped it back afterwards, so grid steps write the floor height.
+		local footholds = session.Entity.FootholdComponent
+		if footholds == nil then return position end
+		local foothold = footholds:Raycast(Vector2(position.x, session.UnitY + 0.5), Vector2(0, -1), 10)
+		if foothold == nil or foothold:IsVertical() then return position end
+		return Vector2(position.x, foothold:GetYByX(position.x))
+	end
+
+	@ExecSpace("ServerOnly")
+	method void UpdatePlayerGridLandingCheck(any session, number delta)
+		-- A newer move, relocation, death or session generation must never be overwritten by an old landing.
+		local check = session._T.playerGridLandingCheck
+		if check == nil then return end
+		local player = check.Entity
+		local unit = isvalid(player) and player:GetComponent("script.BattleUnitComponent") or nil
+		if player ~= session.PlayerEntity or check.Entry ~= session.EntryRequestId or check.Context ~= session.HudContextRevision
+			or session.BattleResult ~= "" or unit == nil or unit.IsDead or unit.CellIndex ~= check.ToCell
+			or check.ToCell < 0 or check.ToCell >= session.CellCount
+			or _PlayerGridMovementLogic:UpdateLandingCheck(check, delta) then
+			session._T.playerGridLandingCheck = nil
+		end
+	end
+
+end

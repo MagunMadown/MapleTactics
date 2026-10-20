@@ -1,0 +1,144 @@
+@Logic
+script BattleActionLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method boolean IsTeamTurn(any session, string team)
+		-- Interprets the published phase without changing the session's state owner.
+		if team == "Player" then
+			return session.BattlePhase == "PlayerTurn"
+		elseif team == "Enemy" then
+			return session.BattlePhase == "EnemyTurn"
+		end
+		return false
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryQueuePlayerAction(any session, string actionType, integer direction)
+		-- Accepts at most one player action and keeps the slot occupied until presentation time ends.
+		local result = { Success = false, Reason = "UNKNOWN" }
+		if not session:IsTutorialCommandAllowed(actionType, "", direction) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
+
+		if actionType ~= "MOVE" and actionType ~= "TURN" then
+			result.Reason = "INVALID_ACTION"
+			return result
+		end
+
+		if actionType == "MOVE" and direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+		if actionType == "MOVE" and session:IsPlayerFrostbitten() then
+			result.Reason = "PLAYER_FROSTBITTEN"
+			return result
+		end
+
+		result = session.TurnState:TryReserveImmediateAction(actionType, direction)
+		if result.Success == false then
+			return result
+		end
+		session:PublishTurnStateSnapshot("IMMEDIATE_ACTION_QUEUED")
+		log("[BattleQueue] queued action=" .. actionType .. " direction=" .. direction)
+		return session:ExecuteQueuedAction()
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ExecuteQueuedAction(any session)
+		-- Dispatches the queued action through the existing authoritative action functions.
+		local actionType = session.TurnState.QueuedActionType
+		local direction = session.TurnState.QueuedActionDirection
+		if actionType == "" then
+			return { Success = false, Reason = "ACTION_MISSING" }
+		end
+
+		session.CurrentPlayerActionKillCount = 0
+		log("[BattleQueue] started action=" .. actionType .. " direction=" .. direction)
+
+		local actionResult = nil
+		if actionType == "MOVE" then
+			actionResult = session:TryMove("player_01", direction)
+		elseif actionType == "TURN" then
+			actionResult = session:TryTurn("player_01")
+		end
+
+		if actionResult == nil or actionResult.Success == false then
+			local reason = "EXECUTION_FAILED"
+			if actionResult ~= nil then
+				reason = actionResult.Reason
+			end
+			session:CompleteQueuedAction(actionType, false, reason)
+			return actionResult or { Success = false, Reason = reason }
+		end
+
+		local duration = session:GetActionDuration(actionType)
+		local complete = function()
+			session:CompleteQueuedAction(actionType, true, actionResult.Reason)
+		end
+		if actionType == "MOVE" and actionResult.PresentationStarted == true and session._T.playerGridMove ~= nil then
+			-- The visual snap is the primary completion signal. This slightly-late timer is only a
+			-- fail-safe so a lost presentation update can never leave the authoritative turn locked.
+			session._T.playerGridMove.CompletionReason = actionResult.Reason
+			session.ActionTimerId = _TimerService:SetTimerOnce(complete, duration + math.max(0.02, session.MoveCompletionFallbackGrace))
+			return actionResult
+		end
+		session.ActionTimerId = _TimerService:SetTimerOnce(complete, duration)
+		return actionResult
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetActionDuration(any session, string actionType)
+		if actionType == "MOVE" then
+			return session:GetPlayerMoveDuration()
+		elseif actionType == "TURN" then
+			return math.max(0.05, session.PlayerTurnActionDuration)
+		elseif actionType == "PUSH" then
+			return math.max(0.1, session.PushActionDuration)
+		end
+
+		return 0.05
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CompleteQueuedAction(any session, string actionType, boolean success, string reason)
+		-- A valid player action hands control to the enemy; invalid actions release input immediately.
+		if session.TurnState == nil or session.TurnState.QueuedActionType ~= actionType then
+			log_warning("[BattleTurnTempo] duplicate immediate completion blocked action=" .. actionType .. " reason=" .. reason)
+			return
+		end
+		if actionType == "MOVE" then
+			session:FinishPlayerGridMovePresentation("ACTION_COMPLETE")
+		end
+		session.ActionTimerId = 0
+		session.TurnState:CompleteImmediateAction(reason)
+		session:PublishTurnStateSnapshot("IMMEDIATE_ACTION_COMPLETED")
+		log("[BattleQueue] completed action=" .. actionType .. " success=" .. tostring(success) .. " reason=" .. reason)
+		if session.BattleResult ~= "" then
+			return
+		end
+		if actionType == "UTILITY" and _BattleOutcomeLogic:CompletePendingClear(session, true, "IMMEDIATE_ACTION_COMPLETED") then return end
+
+		if success == true then
+			session:BeginEnemyTurnFromPlayerAction("IMMEDIATE_ACTION_COMPLETED")
+			return
+		end
+
+	end
+
+	@ExecSpace("ServerOnly")
+	method void AdvanceConsumedPlayerActionEffects(any session, string completionReason)
+		-- Every consumed action spends status duration, including queues that clear a wave without an enemy round.
+		session:RecordRunConsumedPlayerTurn()
+		local playerUnit = isvalid(session.PlayerEntity) and session.PlayerEntity:GetComponent("script.BattleUnitComponent") or nil
+		if playerUnit ~= nil then playerUnit:AdvanceNegativeStatusTurns() end
+		if session.BoardState ~= nil then
+			for _, enemyEntity in ipairs(session.BoardState:CollectLivingEnemies()) do
+				local enemy = enemyEntity:GetComponent("script.BattleUnitComponent")
+				if enemy ~= nil and enemy.BurnTurns > 0 then enemy:AdvanceNegativeStatusTurns() end
+			end
+		end
+		session:AdvancePoisonMists()
+		log("[BattlePlayerActionBoundary] effects advanced reason=" .. completionReason .. " result=" .. session.BattleResult)
+	end
+
+end

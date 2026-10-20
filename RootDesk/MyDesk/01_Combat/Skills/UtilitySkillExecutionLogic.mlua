@@ -1,0 +1,285 @@
+@Logic
+script UtilitySkillExecutionLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table TryUseUtilitySkill(BattleSessionComponent session)
+		-- Allow the tutorial guard only after recovery and the next attack has been queued.
+		if not session:IsTutorialCommandAllowed("UTILITY", "", 0) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
+		-- Seal leaves movement, facing, queue cleanup and consumables available.
+		if session:IsPlayerSealed() then return { Success = false, Reason = "PLAYER_SEALED" } end
+		-- Reserves the existing immediate-action lock without consuming or rewriting queued skills.
+		if session.TurnState == nil or session.BoardState == nil or session.BattleResult ~= ""
+			or session.BattlePhase ~= "PlayerTurn" then
+			return { Success = false, Reason = "INVALID_PHASE" }
+		end
+		local unit = session.PlayerEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead or unit.IsAirborne then
+			return { Success = false, Reason = "UNIT_UNAVAILABLE" }
+		end
+		local utilityJobId = session.SelectedJobId
+		if session.SkillTestMode == true and session.SkillTestUtilityJobId ~= "" then utilityJobId = session.SkillTestUtilityJobId end
+		local bundle = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(utilityJobId)
+		if bundle.Success == false then return bundle end
+		-- Frostbite roots the player: self-moving utilities are blocked like grid moves.
+		if bundle.Step ~= nil and bundle.Step.EffectType == "MOVE_SELF" and session:IsPlayerFrostbitten() then
+			return { Success = false, Reason = "PLAYER_FROSTBITTEN" }
+		end
+		local definition = bundle.Definition
+		if not _TutorialRulesLogic:IsUtilityAllowed(session, definition.SkillId, bundle.Step.EffectType) then
+			return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" }
+		end
+		local runtime = session:GetSkillRuntimeState("player_01")
+		if runtime == nil then return { Success = false, Reason = "SKILL_RUNTIME_STATE_MISSING" } end
+		local cooldown = runtime:CanUseSkill(definition.SkillId)
+		if cooldown.Success == false then return cooldown end
+		local reserved = session.TurnState:TryReserveImmediateAction("UTILITY", 0)
+		if reserved.Success == false then return reserved end
+		session.CurrentPlayerActionKillCount = 0
+		local result = session:ExecuteUtilityEffect(definition, bundle.Step, unit)
+		if result.Success == false then
+			session:CompleteQueuedAction("UTILITY", false, result.Reason)
+			return result
+		end
+		unit.PreviousSkillWasAttack = false
+		if unit.BurnDamage > 0 then
+			session:ApplyStatusDamage(unit.UnitId, unit.BurnDamage, unit.BurnSourceUnitId, "BURN_CAST")
+			if unit.IsDead or session.BattleResult ~= "" then return { Success = true, Reason = "BURN_LETHAL" } end
+		end
+		-- A utility effect resolves synchronously, so this is still cast time; arming the presentation only
+		-- after acceptance keeps a rejected cast (no target, blocked destination) silent. This presents the
+		-- authored cast clip and sound; hit clips are played by the effect itself (throw, push).
+		session:BeginSkillEffectPresentation(unit.UnitId, definition)
+		session.UtilitySkillId = definition.SkillId
+		session.UtilitySkillIconRuid = definition.IconRuid
+		session.UtilityMaxCooldown = definition.CooldownTurns
+		runtime:StartPlayerCooldown(definition.SkillId, definition.CooldownTurns)
+		local relicEffects = session.PlayerEntity:GetComponent("script.PlayerRunRelicEffectComponent")
+		if relicEffects ~= nil then relicEffects:OnSkillCompleted(definition.SkillId) end
+		session.UtilityRemainingCooldown = runtime:GetRemainingCooldown(definition.SkillId)
+		_TutorialRulesLogic:OnUtilityUsed(session, result)
+		session:PublishTurnStateSnapshot("UTILITY_EXECUTED")
+		local duration = math.max(0.1, definition.ActionDuration) / session:GetSkillSpeedMultiplier()
+		local expectedEntry = session.EntryRequestId
+		local expectedTurn = session.TurnState.TurnNumber
+		local expectedPlayer = session.PlayerEntity
+		local completeUtility = function()
+			if isvalid(session.Entity) == false or isvalid(expectedPlayer) == false
+				or session.PlayerEntity ~= expectedPlayer or expectedPlayer.CurrentMap ~= session.Entity
+				or session.EntryRequestId ~= expectedEntry or session.TurnState == nil
+				or session.TurnState.TurnNumber ~= expectedTurn then return end
+			session:CompleteQueuedAction("UTILITY", true, result.Reason)
+		end
+		session.ActionTimerId = _TimerService:SetTimerOnce(completeUtility, duration)
+		if session.ActionTimerId == 0 then
+			log_warning("[BattlePlayerActionBoundary] utility completion timer unavailable; resolving immediately")
+			completeUtility()
+		end
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ExecuteUtilityEffect(BattleSessionComponent session, table definition, table step, any sourceUnit)
+		-- Executes the authored utility effect through existing board, push and HP boundaries.
+		local direction = sourceUnit.Facing == "Right" and 1 or -1
+		local sourceCell = sourceUnit.CellIndex
+		if step.EffectType == "GUARD" and step.TargetSelector == "SELF_UNIT"
+			and step.ParameterA == "UNTIL_NEXT_PLAYER_TURN" and step.ParameterB == "ALL_DAMAGE" then
+			sourceUnit.UtilityGuardActive = true
+			return { Success = true, Reason = "UTILITY_GUARD_ACTIVE" }
+		end
+		if step.EffectType == "MOVE_SELF" and step.TargetSelector == "SELF_UNIT" then
+			local destination = -1
+			local landedInFront = false
+			if step.ParameterA == "FARTHEST_EMPTY_FORWARD" then
+				for distance = 1, session.CellCount do
+					local cell = sourceCell + direction * distance
+					if session:IsValidCell(cell) and session:IsCellOccupied(cell, sourceUnit.UnitId) == false then
+						destination = cell
+					end
+				end
+			elseif step.ParameterA == "BEHIND_FARTHEST_ENEMY_FORWARD" and step.ParameterB == "REQUIRE_EMPTY" then
+				local farthestEnemy = -1
+				for distance = 1, session.CellCount do
+					local cell = sourceCell + direction * distance
+					if session:IsValidCell(cell) then
+						local entity = session.BoardState:FindAtCell(cell, sourceUnit.UnitId)
+						if isvalid(entity) then
+							local target = entity:GetComponent("script.BattleUnitComponent")
+							if target ~= nil and (target.Team ~= sourceUnit.Team or sourceUnit.Team == "Enemy") and not target.IsDead and not target.IsAirborne then
+								farthestEnemy = cell
+							end
+						end
+					end
+				end
+				if farthestEnemy >= 0 then
+					destination = farthestEnemy + direction * math.max(1, math.floor(step.Value))
+					-- A blocked or off-board landing behind the enemy falls back to the cell in front of it.
+					if session:IsValidCell(destination) == false or session:IsCellOccupied(destination, sourceUnit.UnitId) then
+						local frontCell = farthestEnemy - direction
+						if frontCell ~= sourceCell and session:IsValidCell(frontCell) and session:IsCellOccupied(frontCell, sourceUnit.UnitId) == false then
+							destination = frontCell
+							landedInFront = true
+						end
+					end
+				end
+			else
+				return { Success = false, Reason = "UTILITY_MOVE_RULE_UNSUPPORTED" }
+			end
+			if session:IsValidCell(destination) == false or session:IsCellOccupied(destination, sourceUnit.UnitId) then
+				return { Success = false, Reason = "UTILITY_NO_EMPTY_DESTINATION" }
+			end
+			local relocation = session:RelocateUnitForMechanic(sourceUnit.UnitId, destination, definition.SkillId)
+			if relocation.Success == true and step.ParameterA == "BEHIND_FARTHEST_ENEMY_FORWARD" and landedInFront == false then
+				-- Landing is beyond the crossed enemy, so face back toward it within the same utility action.
+				-- A front landing never crossed it, so the caster already faces it.
+				session:TryFaceDirection(sourceUnit.UnitId, -direction)
+			end
+			return relocation
+		end
+		if (step.EffectType == "THROW_BEHIND" or step.EffectType == "THROW_FORWARD") and step.TargetSelector == "PRIMARY_TARGET" then
+			-- Grabs the targeted enemy and lands it Value cells behind the caster (THROW_BEHIND) or on the farthest
+			-- empty cell beyond it in the facing direction, passing over units (THROW_FORWARD). A missing target, a
+			-- HEAVY one or no legal landing rejects the utility, so the cooldown is not spent.
+			local targets = _SkillTargetResolverLogic:Resolve(session, sourceUnit.UnitId, definition)
+			if targets.Success == false then return targets end
+			local targetId = targets.PrimaryTargetUnitId
+			if targetId == "" then
+				return { Success = false, Reason = "UTILITY_NO_TARGET" }
+			end
+			local targetEntity = session:FindUnitEntity(targetId)
+			local targetUnit = isvalid(targetEntity) and targetEntity:GetComponent("script.BattleUnitComponent") or nil
+			if targetUnit == nil then
+				return { Success = false, Reason = "UTILITY_NO_TARGET" }
+			end
+			if _EnemyTraitRouterLogic:BlocksForcedDisplacement(targetUnit.EnemyTraitIds) then
+				return { Success = false, Reason = "UTILITY_TARGET_HEAVY" }
+			end
+			local destination = sourceCell - direction * math.max(1, math.floor(step.Value))
+			if step.EffectType == "THROW_FORWARD" then
+				destination = -1
+				for distance = 1, session.CellCount do
+					local cell = targetUnit.CellIndex + direction * distance
+					if session:IsValidCell(cell) and session:IsCellOccupied(cell, targetId) == false then
+						destination = cell
+					end
+				end
+			end
+			if session:IsValidCell(destination) == false or session:IsCellOccupied(destination, targetId) then
+				return { Success = false, Reason = "UTILITY_NO_EMPTY_DESTINATION" }
+			end
+			local thrown = session:RelocateUnitForMechanic(targetId, destination, definition.SkillId)
+			if thrown.Success == true then
+				local presentation = targetEntity:GetComponent("script.BattleUnitPresentationComponent")
+				if presentation ~= nil then
+					presentation:PlaySkillEffect(targetId, "HIT", definition.HitEffectRuid or "", definition.EffectScale or 1, sourceUnit.Facing == "Right", session:GetSkillSpeedMultiplier())
+					presentation:PlaySkillSound(targetId, "HIT", definition.HitSoundRuid or "", session:GetSkillSoundVolume())
+				end
+				log("[UtilitySkill] thrown skill=" .. definition.SkillId .. " target=" .. targetId .. " to=" .. destination)
+			end
+			return thrown
+		end
+		if step.EffectType ~= "PUSH_DISTANCE"
+			or (step.ParameterA ~= "STOP_BEFORE_BLOCKED" and step.ParameterA ~= "MAX")
+			or (step.TargetSelector ~= "PRIMARY_TARGET" and step.TargetSelector ~= "ALL_SKILL_TARGETS") then
+			return { Success = false, Reason = "UTILITY_EFFECT_UNSUPPORTED" }
+		end
+		-- ParameterB is a token set so one push row can both carry the caster and cancel what it hits.
+		local carryCaster = false
+		local cancelQueue = false
+		for token in string.gmatch(step.ParameterB or "", "([^|]+)") do
+			if token == "CARRY_CASTER" then carryCaster = true end
+			if token == "CANCEL_QUEUE" then cancelQueue = true end
+		end
+		local targets = _SkillTargetResolverLogic:Resolve(session, sourceUnit.UnitId, definition)
+		if targets.Success == false then return targets end
+		local targetIds = step.TargetSelector == "PRIMARY_TARGET" and { targets.PrimaryTargetUnitId } or targets.TargetUnitIds
+		if #targetIds == 0 or targetIds[1] == "" then
+			return { Success = false, Reason = "UTILITY_NO_TARGET" }
+		end
+		-- Move the farthest target first so nearer targets cannot block a multi-target wave.
+		table.sort(targetIds, function(left, right)
+			return math.abs(targets.TargetCellsByUnitId[left] - sourceCell) > math.abs(targets.TargetCellsByUnitId[right] - sourceCell)
+		end)
+		-- The shot is cosmetic: the push below resolves at once, so the aim cell is read before anything moves and
+		-- the authored hit clip/sound land on the pushed targets when the shot arrives.
+		local hitTargetIds = {}
+		for _, id in ipairs(targetIds) do table.insert(hitTargetIds, id) end
+		local hitDelay = 0
+		if session:HasSkillProjectile(definition) then
+			local launchDelay = session:GetProjectileLaunchDelay(definition)
+			hitDelay = launchDelay + session:LaunchSkillProjectile(sourceUnit.UnitId, definition, launchDelay)
+		end
+		if (definition.HitEffectRuid or "") ~= "" or (definition.HitSoundRuid or "") ~= "" then
+			local flipX = sourceUnit.Facing == "Right"
+			local playHit = function()
+				for _, id in ipairs(hitTargetIds) do
+					local hitEntity = session:FindUnitEntity(id)
+					local hitPresentation = isvalid(hitEntity) and hitEntity:GetComponent("script.BattleUnitPresentationComponent") or nil
+					if hitPresentation ~= nil then
+						hitPresentation:PlaySkillEffect(id, "HIT", definition.HitEffectRuid or "", definition.EffectScale or 1, flipX, session:GetSkillSpeedMultiplier())
+						hitPresentation:PlaySkillSound(id, "HIT", definition.HitSoundRuid or "", session:GetSkillSoundVolume())
+					end
+				end
+			end
+			if hitDelay > 0 then
+				_TimerService:SetTimerOnce(playHit, hitDelay)
+			else
+				playHit()
+			end
+		end
+		local maxSteps = step.ParameterA == "MAX" and session.CellCount or math.max(0, math.floor(step.Value))
+		local moved = 0
+		local cancelled = 0
+		for _, targetId in ipairs(targetIds) do
+			for distance = 1, maxSteps do
+				local pushed = session:ResolvePushImpactOnTarget(sourceUnit.UnitId, targetId)
+				if definition.SkillId == "fairy_turn" then session:ApplyFairyTurnCollisionStun(targetId, pushed) end
+				if pushed.Success == false or pushed.Reason ~= "PUSHED" then break end
+				moved = moved + 1
+			end
+			-- Being inside the skill's range is enough: a target that cannot be displaced still loses its queue.
+			if cancelQueue == true then
+				local cancelResult = session:CancelEnemyQueuedSkills(targetId, "UTILITY_" .. definition.SkillId)
+				if cancelResult.Success == true then
+					cancelled = cancelled + 1
+				end
+			end
+		end
+		if carryCaster == true and moved > 0 then
+			local destination = sourceCell
+			for distance = 1, session.CellCount do
+				local cell = sourceCell + direction * distance
+				if session:IsValidCell(cell) == false or session:IsCellOccupied(cell, sourceUnit.UnitId) then break end
+				destination = cell
+			end
+			if destination ~= sourceCell then
+				session:RelocateUnitForMechanic(sourceUnit.UnitId, destination, definition.SkillId)
+			end
+		end
+		log("[UtilitySkill] pushed skill=" .. definition.SkillId .. " cells=" .. tostring(moved) .. " cancelledQueues=" .. tostring(cancelled))
+		if moved == 0 and cancelled > 0 then
+			return { Success = true, Reason = "UTILITY_QUEUE_CANCELLED" }
+		end
+		return { Success = true, Reason = moved > 0 and "UTILITY_PUSHED" or "UTILITY_PUSH_BLOCKED" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method void ApplyFairyTurnCollisionStun(BattleSessionComponent session, string targetId, table pushed)
+		-- Only physical wall/enemy collisions stun; HEAVY resistance alone is not a collision.
+		if not pushed.Success then return end
+		local collision = pushed.Reason == "PUSH_BLOCKED_OUT_OF_BOUNDS"
+		if pushed.Reason == "PUSH_BLOCKED_OCCUPIED" then
+			local blocker = session.BoardState:FindAtCell(pushed.ToCell, targetId)
+			local unit = isvalid(blocker) and blocker:GetComponent("script.BattleUnitComponent") or nil
+			collision = unit ~= nil and unit.Team == "Enemy"
+		end
+		if not collision then return end
+		local entity = session:FindUnitEntity(targetId)
+		local unit = isvalid(entity) and entity:GetComponent("script.BattleUnitComponent") or nil
+		if unit == nil or unit.IsDead or unit.Team ~= "Enemy" then return end
+		unit.StopActionTurns = math.max(unit.StopActionTurns, 1)
+		unit.StopMarkerRuid = "602b777092204ca7a4b191d538b72de9"
+		log("[FairyTurn] collision stun target=" .. targetId .. " reason=" .. pushed.Reason)
+	end
+
+end

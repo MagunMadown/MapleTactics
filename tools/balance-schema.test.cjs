@@ -248,3 +248,56 @@ test("active union skins require native catalog references while retired aliases
   assert.deepEqual(S.validate(t),[]);
   assert.equal(studio(t.UnionShopProducts).filter(e=>e.level==="error").length,0);
 });
+
+
+for (const field of ["FlatDamageReduction", "AscensionHpBonus"]) {
+  for (const invalid of ["-1", "NaN", "Infinity", "-Infinity", "bad", "  ", ...(field === "AscensionHpBonus" ? ["1.5"] : [])]) {
+    test("enemy tuning rejects " + field + "=" + JSON.stringify(invalid), () => {
+      const t=copy(); t.EnemyDefinitions.rows[0][field]=invalid;
+      assert.ok(S.validate(t).some(e=>e.code==="INVALID_ENEMY_"+field));
+    });
+  }
+  for (const valid of ["", "0", "1", ...(field === "FlatDamageReduction" ? ["0.5"] : [])]) {
+    test("enemy tuning accepts " + field + "=" + JSON.stringify(valid), () => {
+      const t=copy(); t.EnemyDefinitions.rows[0][field]=valid;
+      assert.deepEqual(S.validate(t),[]);
+    });
+  }
+}
+function killMath() {
+  const html=fs.readFileSync(path.join(__dirname,"balance-studio.html"),"utf8");
+  const begin=html.indexOf("  function castDamage(");
+  const end=html.indexOf("  function renderKillView(",begin);
+  assert.ok(begin>=0&&end>begin);
+  const ctx=vm.createContext({});
+  vm.runInContext(html.slice(begin,end)+";globalThis.math={castDamage,hitsToKill};",ctx);
+  return ctx.math;
+}
+test("iron hog HP 4 needs four casts of base damage 2",()=>{
+  const {castDamage,hitsToKill}=killMath();
+  const step={effectType:"DAMAGE",condition:"",value:2,hits:1};
+  assert.equal(hitsToKill(4,castDamage([step],0,null,1)),4);
+  assert.equal(hitsToKill(4,castDamage([step],0,null,0)),2);
+});
+test("flat armor reduces every multi-hit; bonus applies only to first hit",()=>{
+  const {castDamage}=killMath();
+  const step={effectType:"DAMAGE",condition:"",value:2,hits:3};
+  assert.equal(castDamage([step],0,null,1),1); // 2+1+1 -> 1+0+0
+  assert.equal(castDamage([step],2,null,1),3); // 4+1+1 -> 3+0+0
+  assert.equal(castDamage([step],2,null,0),6);
+  assert.equal(castDamage([step],0,null,0.5),2.5);
+});
+test("zero damage is unkillable and conditional effects are excluded",()=>{
+  const {castDamage,hitsToKill}=killMath();
+  const step={effectType:"DAMAGE",condition:"",value:1,hits:3};
+  assert.equal(castDamage([step],0,null,1),0);
+  assert.equal(hitsToKill(4,0),null);
+  assert.equal(castDamage([{...step,condition:"IF_TARGET_POISONED"}],10,null,0),0);
+  assert.equal(castDamage([{...step,paramA:"SOURCE_BASIC_ATTACK"}],0,3,1),2);
+});
+test("CSV preserves iron hog armor and supplies valid ascension bonuses for all enemies",()=>{
+  for(const row of all.EnemyDefinitions.rows) {
+    assert.equal(Number(row.FlatDamageReduction),row.EnemyDefinitionId==="region_04_iron_hog"?1:0,row.EnemyDefinitionId);
+    assert.ok(Number.isInteger(Number(row.AscensionHpBonus))&&Number(row.AscensionHpBonus)>=0);
+  }
+});

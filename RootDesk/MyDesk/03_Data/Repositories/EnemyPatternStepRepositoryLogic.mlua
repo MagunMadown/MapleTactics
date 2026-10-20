@@ -6,40 +6,14 @@ script EnemyPatternStepRepositoryLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table GetPatternSteps(string patternId)
-		-- Loads immutable pattern rows. Runtime selection and mutable progression belong outside the repository.
-		local result = {
-			Success = false,
-			Reason = "PATTERN_NOT_FOUND",
-			PatternId = patternId or "",
-			Steps = {},
-			Source = "DATASET"
-		}
-		if patternId == nil or patternId == "" then
-			result.Reason = "INVALID_PATTERN_ID"
-			return result
-		end
-
-		local dataSet = _DataService:GetTable(self.PatternStepDataSetName)
-		if dataSet == nil then
-			result.Reason = "PATTERN_DATASET_MISSING"
-			log_error("[EnemyPatternData] dataset missing name=" .. self.PatternStepDataSetName)
-			return result
-		end
-
-		for rowIndex = 1, dataSet:GetRowCount() do
-			if dataSet:GetCell(rowIndex, "PatternId") == patternId
-				and self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")) == true then
-				table.insert(result.Steps, self:ConvertRow(dataSet, rowIndex))
-			end
-		end
-		if #result.Steps == 0 then
-			log_warning("[EnemyPatternData] pattern missing id=" .. patternId .. " dataset=" .. self.PatternStepDataSetName)
-			return result
-		end
-
-		table.sort(result.Steps, function(left, right)
-			return left.StepIndex < right.StepIndex
-		end)
+		-- Return independent rows while preserving validation-visible duplicates.
+		local result = { Success = false, Reason = "PATTERN_NOT_FOUND", PatternId = patternId or "", Steps = {}, Source = "DATASET" }
+		if patternId == nil or patternId == "" then result.Reason = "INVALID_PATTERN_ID"; return result end
+		local cache = self:GetPatternIndex()
+		if cache.Success == false then result.Reason = cache.Reason; return result end
+		local bundle = cache.Patterns[patternId]
+		if bundle == nil then return result end
+		for _, step in ipairs(bundle.Steps) do table.insert(result.Steps, self:CopyRow(step)) end
 		result.Success = true
 		result.Reason = "OK"
 		return result
@@ -47,16 +21,21 @@ script EnemyPatternStepRepositoryLogic extends Logic
 
 	@ExecSpace("ServerOnly")
 	method table GetPatternStep(string patternId, integer stepIndex)
-		local bundle = self:GetPatternSteps(patternId)
-		if bundle.Success == false then
-			return { Success = false, Reason = bundle.Reason, PatternId = patternId, StepIndex = stepIndex, StepCount = 0 }
-		end
-		for _, step in ipairs(bundle.Steps) do
-			if step.StepIndex == stepIndex then
-				return { Success = true, Reason = "OK", PatternId = patternId, StepIndex = stepIndex, StepCount = #bundle.Steps, Step = step, Source = bundle.Source }
-			end
-		end
-		return { Success = false, Reason = "PATTERN_STEP_NOT_FOUND", PatternId = patternId, StepIndex = stepIndex, StepCount = #bundle.Steps }
+		-- Indexed lookup does not copy or scan the whole pattern.
+		local result = { Success = false, Reason = "PATTERN_NOT_FOUND", PatternId = patternId, StepIndex = stepIndex, StepCount = 0 }
+		if patternId == nil or patternId == "" then result.Reason = "INVALID_PATTERN_ID"; return result end
+		local cache = self:GetPatternIndex()
+		if cache.Success == false then result.Reason = cache.Reason; return result end
+		local bundle = cache.Patterns[patternId]
+		if bundle == nil then return result end
+		result.StepCount = #bundle.Steps
+		local step = bundle.ByIndex[stepIndex]
+		if step == nil then result.Reason = "PATTERN_STEP_NOT_FOUND"; return result end
+		result.Success = true
+		result.Reason = "OK"
+		result.Source = "DATASET"
+		result.Step = self:CopyRow(step)
+		return result
 	end
 
 	@ExecSpace("ServerOnly")
@@ -85,6 +64,64 @@ script EnemyPatternStepRepositoryLogic extends Logic
 		end
 		local normalized = string.lower(tostring(cellValue or ""))
 		return normalized == "true" or normalized == "1" or normalized == "yes"
+	end
+
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Maker Play starts with a fresh view of all authored data.
+		self:InvalidateCache()
+	end
+
+	@ExecSpace("ServerOnly")
+	method void OnEndPlay()
+		-- Do not retain dataset objects between play sessions.
+		self:InvalidateCache()
+	end
+
+	method table CopyRow(table row)
+		-- Converted rows contain scalar values only; callers own their mutable copies.
+		local copy = {}
+		for key, value in pairs(row) do copy[key] = value end
+		return copy
+	end
+
+	@ExecSpace("ServerOnly")
+	method void InvalidateCache()
+		-- Call after any in-place dataset edit; normal CSV refresh requires a new Play.
+		self._T.PatternCache = nil
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetPatternIndex()
+		-- Scan and sort once per dataset instance; keep duplicate steps for validation.
+		local dataSet = _DataService:GetTable(self.PatternStepDataSetName)
+		if dataSet == nil then
+			self:InvalidateCache()
+			return { Success = false, Reason = "PATTERN_DATASET_MISSING" }
+		end
+		local cache = self._T.PatternCache
+		if cache ~= nil and cache.Name == self.PatternStepDataSetName and cache.DataSet == dataSet then return cache end
+		cache = { Success = true, Reason = "OK", Name = self.PatternStepDataSetName, DataSet = dataSet, Patterns = {} }
+		for rowIndex = 1, dataSet:GetRowCount() do
+			if self:ParseBooleanCell(dataSet:GetCell(rowIndex, "Enabled")) then
+				local step = self:ConvertRow(dataSet, rowIndex)
+				local bundle = cache.Patterns[step.PatternId]
+				if bundle == nil then
+					bundle = { Steps = {}, ByIndex = {} }
+					cache.Patterns[step.PatternId] = bundle
+				end
+				table.insert(bundle.Steps, step)
+			end
+		end
+		for _, bundle in pairs(cache.Patterns) do
+			table.sort(bundle.Steps, function(left, right) return left.StepIndex < right.StepIndex end)
+			for _, step in ipairs(bundle.Steps) do
+				if bundle.ByIndex[step.StepIndex] == nil then bundle.ByIndex[step.StepIndex] = step end
+			end
+		end
+		self._T.PatternCache = cache
+		return cache
 	end
 
 end

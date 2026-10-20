@@ -1,0 +1,537 @@
+@Logic
+script BattleMovementLogic extends Logic
+
+	method integer GetFacingDirection(string facing)
+		-- Preserves the existing fallback for every value other than Right.
+		if facing == "Right" then
+			return 1
+		end
+		return -1
+	end
+
+	@ExecSpace("ServerOnly")
+	method table RelocateUnitForMechanic(any session, string unitId, integer toCell, string mechanicId)
+		-- Provides a validated board-mutation boundary for job handlers without exposing BoardState internals.
+		local result = { Success = false, Reason = "UNKNOWN", UnitId = unitId or "", FromCell = -1, ToCell = toCell }
+		if session:IsValidCell(toCell) == false then
+			result.Reason = "OUT_OF_BOUNDS"
+			return result
+		end
+		local unitEntity = session:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil or unit.IsDead == true then
+			result.Reason = "UNIT_UNAVAILABLE"
+			return result
+		end
+		if session:IsCellOccupied(toCell, unitId) then
+			result.Reason = "CELL_OCCUPIED"
+			return result
+		end
+		result.FromCell = unit.CellIndex
+		local cellChange = unit:ApplyCellChange(toCell)
+		if cellChange.Success == false then
+			result.Reason = cellChange.Reason
+			return result
+		end
+		session:PlaceEntity(unitEntity, session:GetCellPosition(toCell))
+		session:CollectDropsForMovedUnit(unit, toCell)
+		local movedEvent = UnitMovedEvent()
+		movedEvent.UnitId = unit.UnitId
+		movedEvent.FromCell = result.FromCell
+		movedEvent.ToCell = toCell
+		session.Entity:SendEvent(movedEvent)
+		result.Success = true
+		result.Reason = "OK"
+		log("[JobMechanic] relocated mechanic=" .. mechanicId .. " unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. toCell)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryMoveInternal(any session, string unitId, integer direction, boolean smoothEnemyMove)
+		-- Moves one logical cell after checking phase, range, life, and occupancy.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			FromCell = -1,
+			ToCell = -1
+		}
+
+		if direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+
+		local unitEntity = session:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+
+		if session:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+
+		result.FromCell = unit.CellIndex
+		result.ToCell = unit.CellIndex + direction
+		if unit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+
+		if session:IsValidCell(result.ToCell) == false then
+			result.Reason = "OUT_OF_BOUNDS"
+			return result
+		end
+
+		local mechanicResult = nil
+		if session:IsCellOccupied(result.ToCell, unitId) then
+			local occupiedEntity = session.BoardState:FindAtCell(result.ToCell, unitId)
+			if unit.Team == "Player" and session.SelectedJobMechanicId ~= "" and session.SelectedJobMechanicId ~= "NONE" then
+				local mechanicContext = {
+					BattleSession = session,
+					SourceEntity = unitEntity,
+					SourceUnit = unit,
+					SourceCell = result.FromCell,
+					TargetCell = result.ToCell,
+					Direction = direction,
+					OccupantEntity = occupiedEntity
+				}
+				local availability = _JobMechanicRouterLogic:CanActivate(session.SelectedJobMechanicId, mechanicContext)
+				session.LastJobMechanicId = session.SelectedJobMechanicId
+				session.LastJobMechanicSuccess = availability.Success == true and availability.CanActivate == true
+				session.LastJobMechanicReason = availability.Reason or "JOB_MECHANIC_UNAVAILABLE"
+				session.JobMechanicRevision = session.JobMechanicRevision + 1
+				if availability.Success == true and availability.CanActivate == true then
+					mechanicResult = _JobMechanicRouterLogic:Execute(session.SelectedJobMechanicId, mechanicContext)
+					session.LastJobMechanicSuccess = mechanicResult.Success == true
+					session.LastJobMechanicReason = mechanicResult.Reason or "JOB_MECHANIC_FAILED"
+					if mechanicResult.Success == false or mechanicResult.AllowSourceMove ~= true then
+						result.Reason = mechanicResult.Reason
+						return result
+					end
+				else
+					result.DetailReason = availability.Reason
+				end
+			end
+			if session:IsCellOccupied(result.ToCell, unitId) then
+				result.Reason = "CELL_OCCUPIED"
+				return result
+			end
+		end
+
+		local cellChange = unit:ApplyCellChange(result.ToCell)
+		if cellChange.Success == false then
+			result.Reason = cellChange.Reason
+			return result
+		end
+		-- Voluntary enemy movement always faces its destination before starting the visual tween.
+		-- Player strafing and forced displacement keep their existing facing rules.
+		if unit.Team == "Enemy" then
+			local previousFacing = unit.Facing
+			local moveFacing = direction > 0 and "Right" or "Left"
+			unit:ApplyFacingState(moveFacing)
+			session:ApplyFacing(unitEntity, unit.Facing)
+			if previousFacing ~= unit.Facing then
+				local turnedEvent = UnitTurnedEvent()
+				turnedEvent.UnitId = unit.UnitId
+				turnedEvent.PreviousFacing = previousFacing
+				turnedEvent.CurrentFacing = unit.Facing
+				session.Entity:SendEvent(turnedEvent)
+			end
+		end
+		local position = session:GetCellPosition(result.ToCell)
+		if unit.Team == "Player" and unit.UnitId == "player_01" then
+			local started = session:StartPlayerGridMovePresentation(unitEntity, result.FromCell, result.ToCell)
+			result.PresentationStarted = started
+			if started == false then
+				session:PlaceEntity(unitEntity, position)
+			end
+		elseif unit.Team == "Enemy" and smoothEnemyMove then
+			result.PresentationStarted = session:StartEnemyGridMovePresentation(unitEntity, result.FromCell, result.ToCell)
+			if result.PresentationStarted == false then
+				session:PlaceEntity(unitEntity, position)
+			end
+		else
+			session:PlaceEntity(unitEntity, position)
+			session:PlayUnitMoveHop(unitEntity)
+		end
+		local pickupResult = session:CollectDropsForMovedUnit(unit, result.ToCell)
+		result.PickedUpDropCount = pickupResult.CollectedCount or 0
+
+		local movedEvent = UnitMovedEvent()
+		movedEvent.UnitId = unit.UnitId
+		movedEvent.FromCell = result.FromCell
+		movedEvent.ToCell = result.ToCell
+		session.Entity:SendEvent(movedEvent)
+
+		result.Success = true
+		result.Reason = mechanicResult ~= nil and mechanicResult.Reason or "OK"
+		if mechanicResult ~= nil then
+			result.MechanicId = mechanicResult.MechanicId
+			result.PushedUnitId = mechanicResult.PushedUnitId
+			result.PushedFromCell = mechanicResult.PushedFromCell
+			result.PushedToCell = mechanicResult.PushedToCell
+		end
+		log("[BattleMove] success unit=" .. unit.UnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " x=" .. position.x)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryMoveAwayInternal(any session, string unitId, integer direction, boolean smoothEnemyMove)
+		-- Atomically turns away and moves one cell; blocked destinations never change Facing.
+		local result = { Success = false, Reason = "UNKNOWN", FromCell = -1, ToCell = -1, PreviousFacing = "", CurrentFacing = "" }
+		if direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+		local unitEntity = session:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if session:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if unit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+
+		result.FromCell = unit.CellIndex
+		result.ToCell = unit.CellIndex + direction
+		result.PreviousFacing = unit.Facing
+		result.CurrentFacing = direction > 0 and "Right" or "Left"
+		if session:IsValidCell(result.ToCell) == false then
+			result.Reason = "OUT_OF_BOUNDS"
+			return result
+		end
+		if session:IsCellOccupied(result.ToCell, unitId) then
+			result.Reason = "CELL_OCCUPIED"
+			return result
+		end
+
+		local facingResult = unit:ApplyFacingState(result.CurrentFacing)
+		if facingResult.Success == false then
+			result.Reason = facingResult.Reason
+			return result
+		end
+		local moveResult = session:TryMoveInternal(unitId, direction, smoothEnemyMove)
+		if moveResult.Success == false then
+			unit:ApplyFacingState(result.PreviousFacing)
+			session:ApplyFacing(unitEntity, unit.Facing)
+			result.Reason = moveResult.Reason
+			return result
+		end
+
+		session:ApplyFacing(unitEntity, unit.Facing)
+		if result.PreviousFacing ~= result.CurrentFacing then
+			local turnedEvent = UnitTurnedEvent()
+			turnedEvent.UnitId = unit.UnitId
+			turnedEvent.PreviousFacing = result.PreviousFacing
+			turnedEvent.CurrentFacing = result.CurrentFacing
+			session.Entity:SendEvent(turnedEvent)
+		end
+		result.Success = true
+		result.Reason = "OK"
+		result.PresentationStarted = moveResult.PresentationStarted == true
+		log("[BattleMoveAway] success unit=" .. unit.UnitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " facing=" .. result.PreviousFacing .. "->" .. result.CurrentFacing)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryChargeForward(any session, string unitId, integer direction, string skillId, string committedCellSnapshot)
+		-- Traverses only the cells frozen with the visible plan and stops before the first occupied cell.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			FromCell = -1,
+			ToCell = -1,
+			TraversedCells = "",
+			MovedCellCount = 0,
+			Hit = false,
+			TargetUnitId = "",
+			DamageAmount = 0,
+			StopReason = ""
+		}
+		if session.BattleResult ~= "" then
+			result.Reason = "BATTLE_ENDED"
+			return result
+		end
+		if direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+		local unitEntity = session:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if unit.IsDead == true or unit.IsAirborne == true then
+			result.Reason = "UNIT_UNAVAILABLE"
+			return result
+		end
+		if session:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+		if definition.Success == false then
+			result.Reason = "CHARGE_SKILL_INVALID"
+			return result
+		end
+
+		result.FromCell = unit.CellIndex
+		result.ToCell = unit.CellIndex
+		local committedCells = {}
+		for token in string.gmatch(committedCellSnapshot or "", "([^|]+)") do
+			local cellIndex = math.floor(tonumber(token) or -1)
+			if session:IsValidCell(cellIndex) then
+				table.insert(committedCells, cellIndex)
+			end
+		end
+		if #committedCells == 0 then
+			result.Reason = "CHARGE_TARGET_SNAPSHOT_MISSING"
+			return result
+		end
+		local committedFacing = direction == 1 and "Right" or "Left"
+		local facingResult = unit:ApplyFacingState(committedFacing)
+		if facingResult.Success == false then
+			result.Reason = facingResult.Reason
+			return result
+		end
+		session:ApplyFacing(unitEntity, unit.Facing)
+		local traversed = {}
+		local targetCell = -1
+		for index, nextCell in ipairs(committedCells) do
+			if index > math.max(1, definition.Range) or nextCell ~= result.ToCell + direction then break end
+			local occupant = session.BoardState ~= nil and session.BoardState:FindAtCell(nextCell, unitId) or nil
+			if isvalid(occupant) then
+				local other = occupant:GetComponent("script.BattleUnitComponent")
+				if other ~= nil and not other.IsDead and (other.Team ~= unit.Team or unit.Team == "Enemy") then
+					result.TargetUnitId = other.UnitId
+					targetCell = nextCell
+				end
+				break
+			end
+			result.ToCell = nextCell
+			table.insert(traversed, tostring(nextCell))
+		end
+		local changed = unit:ApplyCellChange(result.ToCell)
+		if changed.Success == false then result.Reason = changed.Reason; return result end
+		result.MovedCellCount = #traversed
+		result.TraversedCells = table.concat(traversed, "|")
+		result.PresentationStarted = session:StartEnemyGridMovePresentation(unitEntity, result.FromCell, result.ToCell)
+		if result.PresentationStarted then
+			local movement = session._T.enemyGridMove
+			movement.IsCharge = true
+			movement.Height = 0
+			movement.Duration = math.max(0.22, tonumber(definition.ActionDuration) or 0.35)
+			if result.FromCell == result.ToCell and targetCell >= 0 then
+				movement.TargetPosition = Vector2(movement.StartPosition.x + direction * session.CellSpacing * 0.25, movement.StartPosition.y)
+			end
+			local chargeDamage = session:GetChargeDamage(unit, definition)
+			movement.Impact = function()
+				if result.TargetUnitId ~= "" and not unit.IsDead then
+					session:BeginSkillEffectPresentation(unitId, definition)
+					session:ResolveSkillDamageImpact(unitId, skillId, result.TargetUnitId, targetCell, chargeDamage)
+				end
+			end
+			local presentation = unitEntity:GetComponent("script.BattleUnitPresentationComponent")
+			if presentation ~= nil then
+				presentation:StopMoveHopVisual("CHARGE_STARTED")
+				session:SendMotionPresentation(unitEntity, "SPRITE", { UnitId = unitId, Ruid = definition.CasterMotionRuid, PlayRate = 3, Duration = movement.Duration, Facing = unit.Facing })
+			end
+		else
+			result.Reason = "CHARGE_PRESENTATION_UNAVAILABLE"
+			unit:ApplyCellChange(result.FromCell)
+			return result
+		end
+		if result.FromCell ~= result.ToCell then
+			local moved = UnitMovedEvent()
+			moved.UnitId = unitId
+			moved.FromCell = result.FromCell
+			moved.ToCell = result.ToCell
+			session.Entity:SendEvent(moved)
+		end
+		result.Success = true
+		result.Reason = "CHARGE_STARTED"
+		log("[EnemyCharge] started unit=" .. unitId .. " from=" .. result.FromCell .. " to=" .. result.ToCell .. " target=" .. result.TargetUnitId)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryTurn(any session, string unitId)
+		-- Reverses a living unit's logical and visual facing without moving cells.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			PreviousFacing = "",
+			CurrentFacing = ""
+		}
+
+		local unitEntity = session:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+
+		if session:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+
+		if unit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+
+		result.PreviousFacing = unit.Facing
+		local nextFacing = "Right"
+		if unit.Facing == "Right" then
+			nextFacing = "Left"
+		end
+		local facingResult = unit:ApplyFacingState(nextFacing)
+		if facingResult.Success == false then
+			result.Reason = facingResult.Reason
+			return result
+		end
+		result.CurrentFacing = facingResult.CurrentFacing
+		session:ApplyFacing(unitEntity, unit.Facing)
+
+		local turnedEvent = UnitTurnedEvent()
+		turnedEvent.UnitId = unit.UnitId
+		turnedEvent.PreviousFacing = result.PreviousFacing
+		turnedEvent.CurrentFacing = result.CurrentFacing
+		session.Entity:SendEvent(turnedEvent)
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[BattleTurn] success unit=" .. unit.UnitId .. " from=" .. result.PreviousFacing .. " to=" .. result.CurrentFacing .. " cell=" .. unit.CellIndex)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method number GetChargeDamage(any session, any unit, table definition)
+		-- A charge hits with its skill's first DAMAGE step; SOURCE_BASIC_ATTACK (the shared default) keeps the
+		-- charger's basic attack, a fixed Value lets one charge hit lighter than the monster's other attacks.
+		local steps = _SkillDefinitionRepositoryLogic:GetEffectSteps(definition.EffectSetId or "")
+		if steps.Success == true then
+			for _, step in ipairs(steps.Steps) do
+				if step.EffectType == "DAMAGE" then
+					if (step.ParameterA or "") ~= "SOURCE_BASIC_ATTACK" and step.Value > 0 then
+						return _DamageEffectExecutorLogic:ResolveDamageAmount(unit, step)
+					end
+					break
+				end
+			end
+		end
+		return unit.BasicAttackDamage
+	end
+
+	@ExecSpace("ServerOnly")
+	method table TryFaceDirection(any session, string unitId, integer direction)
+		-- Sets one living unit to an explicit prepared direction without deriving it again from the current target position.
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			PreviousFacing = "",
+			CurrentFacing = ""
+		}
+
+		if direction ~= -1 and direction ~= 1 then
+			result.Reason = "INVALID_DIRECTION"
+			return result
+		end
+
+		local unitEntity = session:FindUnitEntity(unitId)
+		if isvalid(unitEntity) == false then
+			result.Reason = "UNIT_NOT_FOUND"
+			return result
+		end
+
+		local unit = unitEntity:GetComponent("script.BattleUnitComponent")
+		if unit == nil then
+			result.Reason = "UNIT_COMPONENT_MISSING"
+			return result
+		end
+		if session:IsTeamTurn(unit.Team) == false then
+			result.Reason = "INVALID_PHASE"
+			return result
+		end
+		if unit.IsDead == true then
+			result.Reason = "UNIT_DEAD"
+			return result
+		end
+
+		result.PreviousFacing = unit.Facing
+		result.CurrentFacing = "Right"
+		if direction < 0 then
+			result.CurrentFacing = "Left"
+		end
+
+		if result.PreviousFacing == result.CurrentFacing then
+			result.Success = true
+			result.Reason = "ALREADY_FACING"
+			log("[BattleTurn] kept unit=" .. unit.UnitId .. " facing=" .. result.CurrentFacing .. " cell=" .. unit.CellIndex)
+			return result
+		end
+
+		local facingResult = unit:ApplyFacingState(result.CurrentFacing)
+		if facingResult.Success == false then
+			result.Reason = facingResult.Reason
+			return result
+		end
+		session:ApplyFacing(unitEntity, unit.Facing)
+
+		local turnedEvent = UnitTurnedEvent()
+		turnedEvent.UnitId = unit.UnitId
+		turnedEvent.PreviousFacing = result.PreviousFacing
+		turnedEvent.CurrentFacing = result.CurrentFacing
+		session.Entity:SendEvent(turnedEvent)
+
+		result.Success = true
+		result.Reason = "OK"
+		log("[BattleTurn] success unit=" .. unit.UnitId .. " from=" .. result.PreviousFacing .. " to=" .. result.CurrentFacing .. " cell=" .. unit.CellIndex .. " source=PREPARED_DIRECTION")
+		return result
+	end
+
+	method Vector2 GetCellPosition(any session, integer cellIndex)
+		-- Converts a zero-based logical cell index into the current map's world position.
+		local x = session.CellStartX + session.CellSpacing * cellIndex
+		return Vector2(x, session.UnitY)
+	end
+
+	method number GetBoardCenterX(any session)
+		-- Calculates the visual center of the current logical battle board.
+		return session.CellStartX + session.CellSpacing * (session.CellCount - 1) * 0.5
+	end
+
+end

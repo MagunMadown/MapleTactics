@@ -8,9 +8,6 @@ script LobbyGridMovementComponent extends Component
 	-- Every step lands on GridOriginX + n * CellSize (the lobby spawn column), so fixed props such as the
 	-- start portal can sit exactly on a reachable column even after the player touches a map edge.
 	property number GridOriginX = -27.3686
-	-- The owning client walks its own root through a step; this long after the step ends the server checks
-	-- where the root landed and corrects it only when the client never arrived.
-	property number LandingCheckDelay = 0.5
 
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
@@ -77,6 +74,7 @@ script LobbyGridMovementComponent extends Component
 	method void OnBeginPlay()
 		-- Tracks each lobby player independently; no movement state lives in the shared Logic.
 		self._T.gridMoves = {}
+		self._T.gridLandingChecks = {}
 		self._T.gridPlayers = {}
 		self._T.gridMoveContexts = {}
 		self._T.lastMoveRequestIds = {}
@@ -150,6 +148,8 @@ script LobbyGridMovementComponent extends Component
 				self._T.gridMoveContexts[userId] = (self._T.gridMoveContexts[userId] or 0) + 1
 				self._T.lastMoveRequestIds = self._T.lastMoveRequestIds or {}
 				self._T.lastMoveRequestIds[userId] = 0
+				if self._T.gridMoves ~= nil then self._T.gridMoves[userId] = nil end
+				if self._T.gridLandingChecks ~= nil then self._T.gridLandingChecks[userId] = nil end
 			end
 			self:ReceiveMoveContext(self._T.gridMoveContexts[userId], userId)
 		end
@@ -318,9 +318,10 @@ script LobbyGridMovementComponent extends Component
 				if step.Complete then
 					self._T.gridMoves[userId] = nil
 					self._T.gridLandingChecks = self._T.gridLandingChecks or {}
-					self._T.gridLandingChecks[userId] = { Entity = player, Position = step.Position, Remaining = math.max(0, self.LandingCheckDelay) }
+					self._T.gridLandingChecks[userId] = _PlayerGridMovementLogic:CreateLandingCheck(player, self.Entity,
+						Vector2(step.Position.x, movement.StartPosition.y), movement.RequestId, 0, movement.Context)
 					self:ReceiveMoveResult(movement.RequestId, movement.Context, true, true, step.Position.x, step.Position.y, "MOVE_COMPLETE", userId)
-					log("[LobbyGridMove] completed user=" .. userId .. " snappedX=" .. tostring(step.Position.x))
+					log("[LobbyGridMove] completed user=" .. userId .. " targetX=" .. tostring(step.Position.x))
 				end
 			end
 		end
@@ -328,20 +329,12 @@ script LobbyGridMovementComponent extends Component
 
 	@ExecSpace("ServerOnly")
 	method void UpdateLandingChecks(number delta)
-		-- Keeps the grid authoritative: a root that never reached its column is put there once the client had time.
+		-- Context checks stay map-owned; landing timing and X/Y correction are shared with battle.
 		if self._T.gridLandingChecks == nil then return end
 		for userId, check in pairs(self._T.gridLandingChecks) do
-			local player = check.Entity
-			check.Remaining = check.Remaining - delta
-			if isvalid(player) == false or player.CurrentMap ~= self.Entity or player.MovementComponent == nil then
+			if self._T.gridPlayers[userId] ~= check.Entity or self._T.gridMoveContexts[userId] ~= check.Context
+				or _PlayerGridMovementLogic:UpdateLandingCheck(check, delta) then
 				self._T.gridLandingChecks[userId] = nil
-			elseif check.Remaining <= 0 then
-				self._T.gridLandingChecks[userId] = nil
-				local landedX = player.TransformComponent.WorldPosition.x
-				if math.abs(landedX - check.Position.x) > 0.05 then
-					player.MovementComponent:SetWorldPosition(check.Position)
-					log_warning("[LobbyGridMove] corrected landing user=" .. userId .. " from=" .. tostring(landedX) .. " to=" .. tostring(check.Position.x))
-				end
 			end
 		end
 	end

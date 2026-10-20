@@ -1,0 +1,320 @@
+@Logic
+script BattleQuickbarLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table TryReorderBattleSkillSlot(any session, integer sourceIndex, integer targetIndex, integer expectedRevision)
+		if not _TutorialRulesLogic:CanEditSkillQueue(session) then return { Success = false, Reason = "TUTORIAL_FOLLOW_GUIDE" } end
+		local result = {
+			Success = false,
+			Reason = "UNKNOWN",
+			SourceIndex = sourceIndex,
+			TargetIndex = targetIndex,
+			SlotIds = session.SkillSlotIds,
+			PreviousSlotIds = session.SkillSlotIds,
+			Revision = session.SkillSlotRevision
+		}
+
+		if sourceIndex ~= math.floor(sourceIndex) or targetIndex ~= math.floor(targetIndex) then
+			result.Reason = "INVALID_SLOT_INDEX_TYPE"
+			return result
+		end
+		if sourceIndex < 1 or sourceIndex > session.SkillSlotCount or targetIndex < 1 or targetIndex > session.SkillSlotCount then
+			result.Reason = "SLOT_INDEX_OUT_OF_RANGE"
+			return result
+		end
+		if sourceIndex == targetIndex then
+			result.Reason = "SAME_SLOT"
+			return result
+		end
+		if expectedRevision ~= session.SkillSlotRevision then
+			result.Reason = "STALE_SLOT_REVISION"
+			return result
+		end
+		if session.ContentValidationState ~= "VALID" then
+			result.Reason = "CONTENT_NOT_READY"
+			return result
+		end
+		if session.BattleResult ~= "" then
+			result.Reason = "BATTLE_ALREADY_ENDED"
+			return result
+		end
+		if session.TurnState == nil or session.TurnState.BattlePhase ~= "PlayerTurn" then
+			result.Reason = "NOT_PLAYER_DECISION_STATE"
+			return result
+		end
+		if session.TurnState.IsActionProcessing == true then
+			result.Reason = "ACTION_PROCESSING"
+			return result
+		end
+
+		local slotIds = session:ParseSkillSlotPipe(session.SkillSlotIds)
+		local sourceSkillId = slotIds[sourceIndex] or ""
+		local targetSkillId = slotIds[targetIndex] or ""
+		if sourceSkillId == "" then
+			result.Reason = "SOURCE_SLOT_EMPTY"
+			return result
+		end
+		local sourceValidation = _ContentValidatorLogic:ValidateSkillById(sourceSkillId)
+		if sourceValidation.Success == false then
+			result.Reason = "SOURCE_SKILL_INVALID"
+			result.DetailReason = sourceValidation.Reason
+			return result
+		end
+		local sourceOwnership = _RunManagerLogic:CanUseRunSkill(session.PlayerEntity, sourceSkillId)
+		if sourceOwnership.Success == false then
+			result.Reason = "SOURCE_SKILL_NOT_OWNED"
+			return result
+		end
+		if targetSkillId ~= "" then
+			local targetValidation = _ContentValidatorLogic:ValidateSkillById(targetSkillId)
+			if targetValidation.Success == false then
+				result.Reason = "TARGET_SKILL_INVALID"
+				result.DetailReason = targetValidation.Reason
+				return result
+			end
+			local targetOwnership = _RunManagerLogic:CanUseRunSkill(session.PlayerEntity, targetSkillId)
+			if targetOwnership.Success == false then
+				result.Reason = "TARGET_SKILL_NOT_OWNED"
+				return result
+			end
+		end
+
+		local seenSkillIds = {}
+		for slotIndex = 1, session.SkillSlotCount do
+			local skillId = slotIds[slotIndex] or ""
+			if skillId ~= "" then
+				if seenSkillIds[skillId] == true then
+					result.Reason = "DUPLICATE_SKILL_SLOT"
+					return result
+				end
+				seenSkillIds[skillId] = true
+			end
+		end
+
+		-- Names and authored cooldowns are parallel presentation data for the same fixed six positions.
+		-- QueuedTileIds and ExecutingTileIds deliberately remain untouched because they already store SkillIds.
+		local slotNames = session:ParseSkillSlotPipe(session.SkillSlotNames)
+		local slotCooldownTurns = session:ParseSkillSlotPipe(session.SkillSlotCooldownTurns)
+		local operation = "SWAP"
+		if targetSkillId == "" then
+			operation = "MOVE"
+			slotIds[targetIndex] = slotIds[sourceIndex]
+			slotIds[sourceIndex] = ""
+			slotNames[targetIndex] = slotNames[sourceIndex]
+			slotNames[sourceIndex] = ""
+			slotCooldownTurns[targetIndex] = slotCooldownTurns[sourceIndex]
+			slotCooldownTurns[sourceIndex] = ""
+		else
+			slotIds[sourceIndex], slotIds[targetIndex] = slotIds[targetIndex], slotIds[sourceIndex]
+			slotNames[sourceIndex], slotNames[targetIndex] = slotNames[targetIndex], slotNames[sourceIndex]
+			slotCooldownTurns[sourceIndex], slotCooldownTurns[targetIndex] = slotCooldownTurns[targetIndex], slotCooldownTurns[sourceIndex]
+		end
+
+		local nextSlotIds = session:SerializeSkillSlotPipe(slotIds)
+		local nextSlotNames = session:SerializeSkillSlotPipe(slotNames)
+		local nextSlotCooldownTurns = session:SerializeSkillSlotPipe(slotCooldownTurns)
+		local runInventory = session.PlayerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if runInventory == nil then
+			result.Reason = "RUN_SKILL_BAR_OWNER_UNAVAILABLE"
+			return result
+		end
+		local runOrderResult = runInventory:CommitRunSkillBarOrder(session.SkillSlotIds, nextSlotIds, "BATTLE_REORDER")
+		if runOrderResult.Success ~= true then
+			result.Reason = runOrderResult.Reason or "RUN_SKILL_BAR_COMMIT_FAILED"
+			return result
+		end
+
+		session.SkillSlotIds = nextSlotIds
+		session.SkillSlotNames = nextSlotNames
+		session.SkillSlotCooldownTurns = nextSlotCooldownTurns
+		session.SkillSlotSourceSnapshot = runInventory.RunSkillSnapshot
+		session.SkillSlotSourceRunOrderRevision = runOrderResult.Revision or session.SkillSlotSourceRunOrderRevision
+		session.SkillSlotRevision = session.SkillSlotRevision + 1
+		result.Success = true
+		result.Reason = "OK"
+		result.SourceSkillId = sourceSkillId
+		result.TargetSkillId = targetSkillId
+		result.Operation = operation
+		result.SlotIds = session.SkillSlotIds
+		result.Revision = session.SkillSlotRevision
+		result.RunSkillBarRevision = session.SkillSlotSourceRunOrderRevision
+		log("[BattleSkillSlotReorder] success request=" .. tostring(session.LastProcessedSkillSlotReorderRequestId) .. " operation=" .. operation .. " source=" .. tostring(sourceIndex) .. " target=" .. tostring(targetIndex) .. " before=" .. result.PreviousSlotIds .. " after=" .. result.SlotIds .. " runOrderRevision=" .. tostring(session.SkillSlotSourceRunOrderRevision) .. " queued=" .. session.QueuedTileIds .. " executing=" .. session.ExecutingTileIds)
+		return result
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ParseSkillSlotPipe(any session, string snapshot)
+		local values = {}
+		local serialized = snapshot or ""
+		local startIndex = 1
+		for slotIndex = 1, session.SkillSlotCount do
+			local separatorIndex, _ = string.find(serialized, "|", startIndex, true)
+			if separatorIndex == nil then
+				values[slotIndex] = string.sub(serialized, startIndex)
+				startIndex = string.len(serialized) + 1
+			else
+				values[slotIndex] = string.sub(serialized, startIndex, separatorIndex - 1)
+				startIndex = separatorIndex + 1
+			end
+		end
+		return values
+	end
+
+	@ExecSpace("ServerOnly")
+	method string SerializeSkillSlotPipe(any session, table values)
+		local fixedValues = {}
+		for slotIndex = 1, session.SkillSlotCount do
+			fixedValues[slotIndex] = values[slotIndex] or ""
+		end
+		return table.concat(fixedValues, "|")
+	end
+
+	@ExecSpace("ServerOnly")
+	method void RefreshSkillSlots(any session, string reason, Entity playerEntity)
+		-- Reconciles the player-owned run order and copies it into this map-scoped BattleSession.
+		local ownedSnapshot = ""
+		local runSlotIds = ""
+		local runOrderRevision = 0
+		local runOrderAvailable = false
+		local inventory = nil
+		if isvalid(playerEntity) then
+			inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+			if inventory ~= nil then
+				ownedSnapshot = inventory.RunSkillSnapshot
+				local runOrderResult = inventory:GetOrInitializeRunSkillBarOrder()
+				if runOrderResult.Success == true then
+					runSlotIds = runOrderResult.SlotIds or ""
+					runOrderRevision = runOrderResult.Revision or 0
+					runOrderAvailable = runSlotIds ~= ""
+				else
+					log_error("[BattleSkillSlots] run order unavailable reason=" .. (runOrderResult.Reason or "UNKNOWN") .. " refresh=" .. (reason or ""))
+				end
+			end
+		end
+		if ownedSnapshot == "" then
+			ownedSnapshot = session.SelectedJobStartingSkillIds
+		end
+		if runOrderAvailable == true
+			and ownedSnapshot == session.SkillSlotSourceSnapshot
+			and runOrderRevision == session.SkillSlotSourceRunOrderRevision
+			and runSlotIds == session.SkillSlotIds then
+			return
+		end
+		session.SkillSlotSourceSnapshot = ownedSnapshot
+		session.SkillSlotSourceRunOrderRevision = runOrderRevision
+
+		local candidates = {}
+		local seen = {}
+		for token in string.gmatch(ownedSnapshot or "", "([^|]+)") do
+			-- Inventory snapshot entries carry an owned-amount suffix ("brandish~1"); only the id selects a slot.
+			local skillId = string.match(token, "^([^~]+)")
+			if skillId ~= nil and skillId ~= "" and seen[skillId] == nil then
+				seen[skillId] = true
+				table.insert(candidates, skillId)
+			end
+		end
+
+		-- Icons cover every candidate, not just the drawn slots, because the queue accepts any owned skill.
+		-- The same pass collects the clips those skills will play, so the client can warm them before the
+		-- first cast instead of loading one mid-flight.
+		local iconRecords = {}
+		local presentationRuids = {}
+		local presentationSeen = {}
+		for _, ruid in ipairs(_EnemyImpactPresentationLogic:GetResourceRuids()) do
+			session:CollectPresentationRuid(presentationRuids, presentationSeen, ruid)
+		end
+		for _, skillId in ipairs(candidates) do
+			local definition = _SkillDefinitionRepositoryLogic:GetSkillDefinition(skillId)
+			if definition.Success == true then
+				if definition.IconRuid ~= nil and definition.IconRuid ~= "" then
+					table.insert(iconRecords, skillId .. "~" .. definition.IconRuid)
+				end
+				session:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CastEffectRuid)
+				session:CollectPresentationRuid(presentationRuids, presentationSeen, definition.HitEffectRuid)
+				session:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CellEffectRuid)
+				session:CollectPresentationRuid(presentationRuids, presentationSeen, definition.ProjectileRuid)
+				-- Audio clips warm the same way: an unloaded cast sound lands after its own swing, which
+				-- reads as a mistimed hit rather than a slow load.
+				session:CollectPresentationRuid(presentationRuids, presentationSeen, definition.CastSoundRuid)
+				session:CollectPresentationRuid(presentationRuids, presentationSeen, definition.HitSoundRuid)
+			end
+		end
+
+		-- The utility skill comes from the job, not from the owned-skill snapshot, so it never appears among
+		-- the candidates above. Warm it in the same pass; otherwise its first cast is the one that loads it.
+		local utility = _SkillDefinitionRepositoryLogic:GetUtilitySkillBundle(session.SelectedJobId)
+		if utility.Success == true then
+			session:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastEffectRuid)
+			session:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitEffectRuid)
+			session:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CellEffectRuid)
+			session:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.ProjectileRuid)
+			session:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.CastSoundRuid)
+			session:CollectPresentationRuid(presentationRuids, presentationSeen, utility.Definition.HitSoundRuid)
+		else
+			-- A job with no authored utility row is a valid configuration, and warming is an optimisation
+			-- only, so this stays a log rather than a failure.
+			log("[BattleSkillSlots] utility warm skipped job=" .. session.SelectedJobId .. " reason=" .. (utility.Reason or "UNKNOWN"))
+		end
+
+		local slotIds = {}
+		local tutorialSlotIds = _TutorialRulesLogic:GetSessionSkillIds(session)
+		local slotNames = {}
+		local slotCooldownTurns = {}
+		if tutorialSlotIds ~= nil then
+			slotIds = tutorialSlotIds
+		elseif runOrderAvailable == true then
+			slotIds = session:ParseSkillSlotPipe(runSlotIds)
+		else
+			-- Compatibility fallback only; valid runs initialize and persist their random default in the run owner.
+			for index = #candidates, 2, -1 do
+				local swapIndex = _UtilLogic:RandomIntegerRange(1, index)
+				candidates[index], candidates[swapIndex] = candidates[swapIndex], candidates[index]
+			end
+			for index = 1, math.min(session.SkillSlotCount, #candidates) do
+				slotIds[index] = candidates[index]
+			end
+			log_warning("[BattleSkillSlots] using nonpersistent fallback reason=RUN_ORDER_UNAVAILABLE refresh=" .. (reason or ""))
+		end
+		for slotIndex = 1, session.SkillSlotCount do
+			local skillId = slotIds[slotIndex] or ""
+			slotNames[slotIndex] = ""
+			slotCooldownTurns[slotIndex] = ""
+			if skillId ~= "" then
+				local effective = session:GetEffectiveSkillValidation("player_01", skillId)
+				local definition = effective.Success and effective.Data.Definition or effective
+				if effective.Success == true then
+					slotNames[slotIndex] = definition.DisplayName .. ((definition.SkillAugmentName or "") ~= "" and " · " .. definition.SkillAugmentName or "")
+					slotCooldownTurns[slotIndex] = tostring(math.max(0, math.floor(definition.CooldownTurns or 0)))
+				else
+					log_error("[BattleSkillSlots] ordered skill definition unavailable skill=" .. skillId .. " reason=" .. (definition.Reason or "UNKNOWN"))
+				end
+			end
+		end
+
+		session.SkillSlotIds = session:SerializeSkillSlotPipe(slotIds)
+		session.SkillSlotNames = session:SerializeSkillSlotPipe(slotNames)
+		session.SkillSlotCooldownTurns = session:SerializeSkillSlotPipe(slotCooldownTurns)
+		session.SkillSlotRevision = session.SkillSlotRevision + 1
+		session.SkillIconSnapshot = table.concat(iconRecords, "|")
+		log("[BattleSkillSlots] assigned reason=" .. reason .. " owned=" .. ownedSnapshot .. " runOrder=" .. tostring(runOrderAvailable) .. " runOrderRevision=" .. tostring(session.SkillSlotSourceRunOrderRevision) .. " slots=" .. session.SkillSlotIds .. " names=" .. session.SkillSlotNames .. " cooldowns=" .. session.SkillSlotCooldownTurns .. " icons=" .. tostring(#iconRecords) .. " presentationRuids=" .. tostring(#presentationRuids))
+
+		-- Scope note: this method is only reached from job apply, so the warm covers the skills owned at
+		-- battle start. A skill granted mid-run is not re-warmed here -- it falls back to the renderer being
+		-- held off until its RUID lands, which costs a brief invisible projectile rather than a wrong one.
+		if #presentationRuids > 0 and isvalid(session.PlayerEntity) and session.PlayerEntity.PlayerComponent ~= nil then
+			session:PreloadSkillPresentation(table.concat(presentationRuids, "|"), session.PlayerEntity.PlayerComponent.UserId)
+		end
+	end
+
+	@ExecSpace("ServerOnly")
+	method void CollectPresentationRuid(any session, table collected, table seen, string ruid)
+		-- Appends one distinct non-empty clip RUID. Skills share cast and hit clips across tiers, so the
+		-- seen set keeps the preload list from asking for the same resource several times.
+		if ruid == nil or ruid == "" or seen[ruid] ~= nil then
+			return
+		end
+		seen[ruid] = true
+		table.insert(collected, ruid)
+	end
+
+end

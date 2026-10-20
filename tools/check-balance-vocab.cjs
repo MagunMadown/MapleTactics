@@ -3,8 +3,9 @@
 // tools/balance-studio.html) still covers every closed value the game code
 // accepts and the CSVs use: skill effect types, effect conditions / target
 // selectors / targeting types / cost types, MOVE_SELF modes, DAMAGE modes,
-// utility effect types, and enemy pattern actions / conditions / CELL_FREE
-// selectors.
+// utility effect types, enemy pattern actions / conditions / CELL_FREE
+// selectors, skill augment kinds, and relic special effects (the page's
+// RELIC_SPECIAL_EFFECTS list, checked against RelicDefinitionRepositoryLogic).
 //
 //   node tools/check-balance-vocab.cjs          # report, exit 1 if the catalog is missing something
 //
@@ -45,6 +46,8 @@ const buff = read(path.join(COMBAT, "Skills/EffectExecutors/BuffEffectExecutorLo
 const move = read(path.join(COMBAT, "Skills/EffectExecutors/MoveSelfEffectExecutorLogic.mlua"));
 const session = read(path.join(COMBAT, "Components/Shared/BattleSessionComponent.mlua"));
 const router = read(path.join(COMBAT, "Resolvers/EffectRouterLogic.mlua"));
+const augmentValidator = read(path.join(DATA, "Repositories/AugmentContentValidatorLogic.mlua"));
+const relicRepo = read(path.join(DATA, "Repositories/RelicDefinitionRepositoryLogic.mlua"));
 const skillBody = methodBody(cv, "ValidateSkillBundle");
 const lit = /"([A-Z0-9_]+)"/g;
 
@@ -67,6 +70,8 @@ const fromCode = {
   patternAction: literals(methodBody(pv, "IsSupportedAction"), lit),
   patternCondition: literals(methodBody(pv, "IsSupportedCondition"), lit),
   cellSelector: literals(methodBody(pv, "IsSupportedCellSelector"), lit),
+  augmentModifier: literals(methodBody(augmentValidator, "IsSkillModifierValid"), /kind\s*==\s*"([A-Z0-9_]+)"/g),
+  relicSpecial: literals(methodBody(relicRepo, "DescribeSpecialEffect"), /^\s*([A-Z0-9_]+)\s*=\s*"/gm),
 };
 
 function csvColumn(file, col) {
@@ -95,7 +100,11 @@ const fromData = {
   costType: [...skillTables, "UtilitySkillDefinitions.csv"].flatMap((f) => csvColumn(f, "CostType")),
   patternAction: csvColumn("EnemyPatternSteps.csv", "ActionType"),
   patternCondition: csvColumn("EnemyPatternSteps.csv", "ConditionType"),
+  relicSpecial: csvColumn("RelicDefinitions.csv", "SpecialEffectType"),
 };
+// Relic special effects live in a JS constant on the page, not in #vocabCatalog.
+const relicList = html.match(/const RELIC_SPECIAL_EFFECTS = \[([\s\S]*?)\];/);
+const relicCatalog = relicList ? literals(relicList[1], /\["([A-Z0-9_]+)",/g) : [];
 
 const S = VOCAB.skill, P = VOCAB.enemyPattern;
 const catalog = {
@@ -116,6 +125,7 @@ const catalog = {
   patternAction: Object.keys(P.actions),
   patternCondition: Object.keys(P.conditions),
   cellSelector: Object.keys(P.conditions.CELL_FREE.paramA.options),
+  relicSpecial: relicCatalog,
 };
 const TITLES = {
   augmentHidden: "AugmentEffects.ParamC", augmentTrigger: "AugmentEffects.TriggerType", augmentCondition: "AugmentEffects.ConditionType",
@@ -125,7 +135,7 @@ const TITLES = {
   targetingType: "*SkillDefinitions.TargetingType", targetSelector: "*EffectSteps.TargetSelector",
   damageMode: "DAMAGE ParameterA", moveMode: "MOVE_SELF ParameterA",
   patternAction: "EnemyPatternSteps.ActionType", patternCondition: "EnemyPatternSteps.ConditionType",
-  cellSelector: "CELL_FREE ParamA",
+  cellSelector: "CELL_FREE ParamA", relicSpecial: "RelicDefinitions.SpecialEffectType",
 };
 
 let missing = 0;
@@ -140,7 +150,8 @@ for (const kind of Object.keys(catalog)) {
   console.log(`${status.padEnd(7)} ${TITLES[kind].padEnd(38)} catalog ${known.size}, code ${code.size}, data ${data.size}`);
   gaps.forEach((v) => {
     missing++;
-    console.log(`        + ${v}  (${[code.has(v) && "game code", data.has(v) && "CSV"].filter(Boolean).join(" + ")}) — add to #vocabCatalog`);
+    const where = kind === "relicSpecial" ? "RELIC_SPECIAL_EFFECTS" : "#vocabCatalog";
+    console.log(`        + ${v}  (${[code.has(v) && "game code", data.has(v) && "CSV"].filter(Boolean).join(" + ")}) — add to ${where}`);
   });
   if (unseen.length && code.size) console.log(`        · in catalog but not found in code/data (removed?): ${unseen.join(", ")}`);
 }

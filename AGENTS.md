@@ -266,6 +266,15 @@ If none of the above resolves the issue, tell the user:
 
 # PROJECT RULES (MapleTactics — kept outside the mswai-managed block)
 
+## 전투 세션 책임 분리 (필수)
+
+`BattleSessionComponent`는 책임별 로직을 호출하여 전투 흐름을 연결하는 진입점으로 유지한다. 각 기능의 실제 구현은 책임별 `.mlua` 파일로 분리한다.
+
+- 계산·판정·실행·표시 데이터 생성 코드를 세션에 직접 추가하지 않는다. 기존 담당 로직을 우선 재사용하고, 별도 책임이면 해당 도메인 폴더에 로직 파일을 둔다.
+- 세션 메서드는 로직 호출과 필요한 인자·결과 전달, 세션 상태 동기화, RPC 요청 검증 및 생명주기 연결에 한정한다. RPC 인자와 서버의 소유권·셀·턴 검증은 유지한다.
+- 맵·플레이어·요청·타이머 등 실행 상태는 수명이 맞는 세션/컴포넌트가 소유한다. 공통 `@Logic`은 세션을 인자로 받아 처리하며, 전투별 상태를 전역 필드에 보관하지 않는다.
+- 기존 세션의 책임을 수정할 때는 관련 호출부까지 함께 분리하고, 중복 구현을 남기지 않는다. 분리 전후 동작과 회귀 테스트, Maker 실행 결과를 확인한다.
+
 ## Balance Studio vocabulary catalog (`tools/balance-studio.html`)
 
 Balance Studio builds its selects, per-type parameter inputs and checks for the balance CSVs from the
@@ -276,6 +285,11 @@ closed value that a CSV cell can hold, update that catalog **in the same change*
 - what `Value` / `ParameterA` / `ParameterB` mean for an effect (e.g. a new `MULTI_HIT`-style damage mode, a new `MOVE_SELF` mode)
 - `ConditionId`, `TargetSelector`, `TargetingType`, `CostType`
 - `EnemyPatternSteps.ActionType` / `ConditionType` / `CELL_FREE` selectors, and what `ParamA` means for them
+- skill augment kinds (`AugmentEffects.ParamA` → `augment.modifiers`), and the Balance Studio mirrors of
+  `IsSkillModifierValid` / `CanBindSkillAugment` / `ApplySkillModifier` (`skillAugmentProblems`, `canBindAugment`,
+  `applyAugmentToConcept`), plus `Docs/Guide/Skill-Augment-Reroll-Guide.md`
+- relic special effects (`RelicDefinitions.SpecialEffectType`) — these live in the page's `RELIC_SPECIAL_EFFECTS`
+  constant, transcribed from `RelicDefinitionRepositoryLogic.DescribeSpecialEffect`
 
 Transcribe labels and rules from the code (validator + executor), never guess. Then run:
 

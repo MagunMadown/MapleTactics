@@ -1,14 +1,14 @@
 # 페리온 몬스터 기술 — 원작 근거와 턴제 적용
 
-조사일: 2026-09-21. 대상은 페리온 1-1~보스와 소환 몬스터 9종이다. Hidden Street의 과거 GMS/EMS 기록과 StrategyWiki를 참고했다. 서비스·시기에 따라 레벨/HP/속성 수치가 달라 원작 수치를 그대로 복사하지 않았다. 아래 피해·거리·지속시간은 **이 프로젝트의 턴제 조정값**이다.
+원작 조사일: 2026-09-21. 프로젝트 적용 내용 갱신일: 2026-10-16. 대상은 페리온 1-1~보스와 소환 몬스터 9종이다. Hidden Street의 과거 GMS/EMS 기록과 StrategyWiki를 참고했다. 서비스·시기에 따라 레벨/HP/속성 수치가 달라 원작 수치를 그대로 복사하지 않았다. 아래 피해·거리·지속시간은 **이 프로젝트의 턴제 조정값**이다.
 
 | 몬스터 | 자료에서 확인한 특징 | 이번 적용 |
 |---|---|---|
 | 엑스텀프 | [별도 특수 공격/상태이상 없음](https://www.hidden-street.net/ems/node/24303) | 앞 1칸 근접 공격 유지. 접촉 공격을 보드 공격으로 표현 |
 | 와일드보어 | [물리 접촉 공격 중심](https://wayback.hidden-street.net/monsters/mons3.php) | 몸통박치기와 기존 보드 돌진. 자기 이동 모션으로 교체; 돌진은 턴제 각색 |
 | 주니어 부기 | [봉인·암흑·허약·저주 기록](https://wayback.hidden-street.net/monsters/mons4.php) | 대표 능력 **봉인**: 앞 2칸, 1턴 기술 등록/실행/유틸 금지. 기존 피해형 저주탄 대신 사용. 이동/방향 전환으로 한 턴을 보내거나 정화약으로 해제 |
-| 아이언호그 | [Power-Up Level 1, 높은 방어력](https://global.hidden-street.net/monster/iron-hog) | **파워 업**으로 공격력 +2. 강화→공격 3회 패턴; 지속은 적 행동 시계 기준 다음 3행동까지. 자기 skill1 모션 사용. 방어력은 원작 특징 기록만 하며 별도 방어 기술을 만들지 않음 |
-| 파이어보어 | [특수 공격 없음, 불 저항·얼음 약점](https://ems.hidden-street.net/monster/fire-boar) | 앞 1칸 몸통 공격. 원작에 근거 없는 화염탄/화상은 추가하지 않음 |
+| 아이언호그 | [Power-Up Level 1, 높은 방어력](https://global.hidden-street.net/monster/iron-hog) | **파워 업**으로 공격력 +2, 공격 적중 4회분. 라운드·이동·대기로 차감하지 않는다. 강화→방향 전환→돌진→대기→기본 공격→대기 패턴. 별도로 CSV의 고정 피해 감소 1을 매 타격·상태 피해에 적용한다 (최소 0) |
+| 파이어보어 | [특수 공격 없음, 불 저항·얼음 약점](https://ems.hidden-street.net/monster/fire-boar) | 턴제 각색인 앞 2칸 **화염방사**→앞 1칸 기본 공격→방향 전환→돌진→대기 패턴. 화염방사는 기본 공격 피해를 사용한다. CSV 효과와 별도로 피해 처리기가 일반 공격 적중 후 화상 피해 1·1턴을 부여한다 (고정 피해·막힌 타격·대상이 사망한 타격 제외) |
 | 스켈레톤 사병 | [특수 공격/상태이상 없음](https://ems.hidden-street.net/monster/skeleton-soldier) | 자기 공격 모션을 사용하는 앞 1칸 근접 공격 |
 | 스켈레톤 장교 | [특수 공격/상태이상 없음](https://global.hidden-street.net/monster/officer-skeleton) | 자기 공격 모션을 사용하는 앞 1칸 근접 공격. 지휘 버프/저주를 임의 추가하지 않음 |
 | 머미독 | [특수 공격/상태이상 없음](https://www.hidden-street.net/ems/monster/mummydog) | 자기 모션을 사용하는 앞 1칸 몸통 공격. 감염/저주 없음 |
@@ -28,9 +28,11 @@
 
 - `EnemySkillDefinitions.csv` / `SkillEffectSteps.csv` / `EnemyPatternSteps.csv`: 기술·효과·패턴.
 - `BattleUnitComponent`: 동기화된 봉인, 정화, 만료, 전투 시작 초기화.
-- `BattleSessionComponent`: 서버 명령 차단, 독안개 생명주기와 피해, 적 강화 만료, 특수 기술별 모션.
-- 기존 `EffectRouterLogic` / `ContentValidatorLogic` 확장. 신규 스크립트·모델·UI 에셋 없음.
+- `BossSummonComponent`: 파우스트와 지휘관의 공통 소환·확정된 배치·쿨다운·소환수 정리.
+- `BattleSessionComponent`는 진입점과 세션 상태를 유지한다. 피해는 `BattleDamageLogic`, 특수 상태·독안개는 `EnemySpecialEffectExecutorLogic`, 계획·실행은 `EnemyPlanningLogic` / `EnemyTurnExecutionLogic`이 담당한다.
+- `EnemyDefinitions.FlatDamageReduction`: 일반 피해·독·화상 등 상태 피해의 타격별 고정 감소. 방어 버프의 최소 피해 1과 별개이며, 아이언호그는 1, 다른 적은 0이다. 빈 값은 0, 음수·비유한 수치는 거부한다.
+- `EnemyDefinitions.AscensionHpBonus`: 승천 체력 기본 보너스. 빈 값은 1이며 기존 난이도 배율 및 일반 적 기본 HP 상한을 유지한다. 소환용 복사본의 낮춘 HP도 상한에 반영한다.
 - HUD: 봉인 안내, 위험 칸 표시, 클라이언트 버튼 상태. 최종 판정은 서버에서 다시 확인.
-- 추출한 실제 Lua 메서드의 모의 환경 테스트와 기존 페리온 회귀 검사 사용. **Maker refresh/play/logs 도구가 연결되지 않아 실제 빌드·게임플레이·모션 확인은 미실행**이다.
+- 2026-09-21 기록: 추출한 실제 Lua 메서드의 모의 환경 테스트와 기존 페리온 회귀 검사를 사용했으며 당시 Maker 검증은 미실행이었다. 2026-10-16 변경분의 실제 플레이 검증 결과는 별도 이슈 검증 기록에 남긴다.
 
 Maker에서 확인할 항목: 봉인 예고→적중→기술 비활성→이동/정화 후 해제, 호그 강화 모션 및 추가 피해, 독안개 생성·회피·2회 만료·지휘관 사망 즉시 제거, 보스 반피 전후 소환, 기존 피격/사망 연출.

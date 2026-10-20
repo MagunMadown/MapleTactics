@@ -32,6 +32,7 @@
     UnionSpecialZoneDefinitions:"현재 게임 진행에서 사용하지 않는 구형 특수 구역."
   };
   const columns = {
+    EnemyDefinitions:{FlatDamageReduction:{note:"유한한 0 이상 숫자. 빈 값 0. 각 타격/상태이상 틱마다 차감, 최소 피해 0."},AscensionHpBonus:{note:"0 이상 정수. 빈 값 1. 난이도 배율 및 일반 몬스터 HP 상한 적용 전 보너스."}},
     EnemyPatternSteps:{TileId:{label:"적 스킬 ID (TileId)",note:"타일이 아님. EnemySkillDefinitions.SkillId 참조.",ref:["EnemySkillDefinitions","SkillId"],optional:true}},
     UnionBoardCellDefinitions:{RegionId:{label:"보드 영역 (RegionId)",note:"GROWTH / COMBAT / CORE / EXPLORATION / TACTICS. RegionDefinitions와 관계없음.",ref:null}},
     RelicDefinitions:{IsOpen:{label:"유물 개방 (IsOpen)",note:"true: 획득 가능 / false: 상점·시작 추첨·지급 차단. 변경은 새 런부터 적용."},RequiredJobId:{ref:["JobDefinitions","JobId"],optional:true},EffectDescription:{label:"미사용 설명 (EffectDescription)",note:"런타임은 능력치와 특수 효과로 설명을 생성함.",readonly:true}},
@@ -192,6 +193,9 @@
       for(const h of m.key) if(!t.headers.includes(h))add(name,1,h,"REQUIRED_KEY_COLUMN");
       t.rows.forEach((r,i)=>{
         const row=i+2;
+        if(name==="EnemyDefinitions") for(const [field,integer] of [["FlatDamageReduction",false],["AscensionHpBonus",true]]) {
+          if(!numberOK(r[field],0,integer,true))add(name,row,field,"INVALID_ENEMY_"+field);
+        }
         if(name==="RelicDefinitions" && !["true","false"].includes(r.IsOpen))add(name,row,"IsOpen","INVALID_RELIC_OPEN_FLAG");
         if(name==="EnemyPatternSteps"&&["EXECUTE_TILE","TELEGRAPH_TILE","CHARGE_FORWARD","CAST_INTERRUPTIBLE","BOSS_JUMP_TELEGRAPH","BOSS_LAND_OPPOSITE"].includes(r.ActionType)&&!r.TileId)add(name,row,"TileId","PATTERN_TILE_ID_MISSING");
         if(m.key.length){
