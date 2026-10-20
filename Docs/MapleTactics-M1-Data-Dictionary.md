@@ -673,6 +673,8 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 | TraitIds | string | - | `|` 구분 Trait 목록. 비어 있는 일반 적은 공격 후 기본 1칸 후퇴 |
 | IsBoss | boolean | O | `true`이면 사망 시 `BOSS_KILL` 드롭 Trigger를 함께 발행 |
 | VisualOffsetY | number | - | 몬스터 리소스의 발 피벗을 셀 바닥에 맞추는 월드 Y 보정값. 논리 CellIndex와 판정 위치는 바꾸지 않으며 기본값은 `0` |
+| DeathSpawnEnemyDefinitionId | string | - | 처치 직후 같은 칸에 생성할 후속 적 정의. `DeathSpawnModelId`와 함께 지정하며 둘 다 비우면 기존 처치 동작 유지 |
+| DeathSpawnModelId | string | - | 후속 적의 모델 ID. `EnemySpawnPools`에 같은 적 정의·모델 조합이 등록돼 있어야 함 |
 
 허용 MovementPolicy M1: `TRACK_PLAYER`, `FIXED_FACING`.
 
@@ -694,6 +696,13 @@ brandish_ii         SkillTier=2  BaseSkillId=brandish
 Repository가 이 행을 검증·변환하고, Spawn 시 각 `BattleUnitComponent`에 HP·공격력·패턴·이동 정책을 복사한다.
 `VisualOffsetY`는 `BattleUnitPresentationComponent`에 복사되어 생성·이동·착지에 일관되게 적용된다.
 따라서 서로 다른 정의의 적이 같은 보드에 동시에 살아 있어도 세션 공용 값에 서로 덮어쓰지 않는다.
+
+처치 후 분리 계약은 `EnemyDefeatSuccessorLogic`이 담당한다. 기존 적을 즉시 사망 처리하고,
+웨이브/승리 판단 전에 새 UnitId의 후속 적을 같은 Cell에 등록한다. 큐·쿨타임은 승계하지 않으며
+기존 스폰 대기 규칙을 적용한다. 같은 처치를 중복 처리해도 후속 적은 한 번만 생성된다.
+각 실제 적의 처치·드롭은 각각 한 번 발생한다. 필드 한쪽 누락, 없는 참조, 모델 조합 미등록,
+순환 참조, 보스를 포함한 분리 체인은 검증에서 거부한다. 모델의 실제 Maker 등록 여부는
+Refresh 후 스폰 테스트로 추가 확인한다. 예시는 [엘나스 제작 가이드](Guide/El-Nath-Authoring-Guide.md)를 참고한다.
 
 ## 7. EnemyPatternSteps
 
