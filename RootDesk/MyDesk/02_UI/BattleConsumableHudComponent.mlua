@@ -18,10 +18,36 @@ script BattleConsumableHudComponent extends Component
 	property integer SkillPage = 1
 	property string SelectedConsumableId = ""
 	property table IconSizes = {}
+	property number DoubleTapSeconds = 0.35
+	property number DragThreshold = 16
+	property Entity DragGhost = "7c60f57b-9bba-456d-8f6c-7df36abef1fb"
+	property Entity DiscardConfirm = "bdb257e9-c062-4847-a33d-2d690e280e75"
+	property Entity DiscardIcon = "aaad0f1b-d493-4418-8944-355a92dc79ec"
+	property TextGUIRendererComponent DiscardMessage = "2d8837dc-f949-47ad-b11b-c6700420a168"
+	property Entity DiscardYesButton = "8da68cb4-5f66-4a32-82b6-273079b32840"
+	property Entity DiscardNoButton = "c8d185f4-2b8e-4b18-b243-c4aca08b9ae6"
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
 		-- Keeps the root controller alive and toggles only the two child panels.
+		self._T.Mobile = _ApplicationService:IsMobilePlatform()
+		self._T.Focused = true
+		self._T.SystemPopup = false
+		self._T.MenuOpen = false
+		self._T.ExitOpen = false
+		self.DragGhost.Enable = false
+		_UILayerLogic:MoveToCursorLayer(self.DragGhost)
+		self:CloseDiscard()
+		self:ConnectButton(self.DiscardYesButton, function() self:ConfirmDiscard() end)
+		self:ConnectButton(self.DiscardNoButton, function() self:CloseDiscard() end)
+		self:Listen(_ApplicationService, ApplicationFocusOutEvent, function() self._T.Focused = false self:ResetGesture("FOCUS_OUT") self:CloseDiscard() self:CloseSelection() end)
+		self:Listen(_ApplicationService, ApplicationFocusInEvent, function() self._T.Focused = true end)
+		self:Listen(_InputService, MenuPopupOpenedEvent, function() self._T.MenuOpen = true self._T.SystemPopup = true self:ResetGesture("SYSTEM_MENU") self:CloseDiscard() end)
+		self:Listen(_InputService, MenuPopupClosedEvent, function() self._T.MenuOpen = false self._T.SystemPopup = self._T.ExitOpen == true end)
+		self:Listen(_InputService, ExitPopupOpenedEvent, function() self._T.ExitOpen = true self._T.SystemPopup = true self:ResetGesture("EXIT_POPUP") self:CloseDiscard() end)
+		self:Listen(_InputService, ExitPopupClosedEvent, function() self._T.ExitOpen = false self._T.SystemPopup = self._T.MenuOpen == true end)
+		self:InitializeMobileLayout()
+		self:RefreshMobileViewport()
 		self.Panel.Enable = false
 		self.Selector.Enable = false
 		self.SlotTemplate.Enable = false
@@ -30,13 +56,74 @@ script BattleConsumableHudComponent extends Component
 		self:ConnectButton(self.CancelButton, function() self:CloseSelection() end)
 		self:ConnectButton(self.PreviousButton, function() self.SkillPage = math.max(1, self.SkillPage - 1); self:RenderSkills() end)
 		self:ConnectButton(self.NextButton, function() self.SkillPage = self.SkillPage + 1; self:RenderSkills() end)
-		log("[BattleConsumableHUD] ready")
+		log("[VRF] BattleConsumableHUD ready mobile=" .. tostring(self._T.Mobile))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void InitializeMobileLayout()
+		-- Leave the authored PC layout intact; enlarge mobile targets before cloning them.
+		if not self._T.Mobile then return end
+		local panel = self.Panel.UITransformComponent
+		panel.AlignmentOption = AlignmentType.Center
+		panel.Pivot = Vector2(0, 0)
+		self.SlotTemplate.UITransformComponent.RectSize = Vector2(88, 88)
+		self.SlotTemplate:GetChildByName("SlotSkin").UITransformComponent.RectSize = Vector2(88, 88)
+		local hotkey = self.SlotTemplate:GetChildByName("Hotkey")
+		hotkey.UITransformComponent.RectSize = Vector2(78, 30)
+		hotkey.TextGUIRendererComponent.FontSize = 26
+		hotkey.TextGUIRendererComponent.MinSize = 24
+		hotkey.TextGUIRendererComponent.MaxSize = 26
+		local selector = self.Selector.UITransformComponent
+		selector.AlignmentOption = AlignmentType.Center
+		selector.Pivot = Vector2(0.5, 0.5)
+		selector.anchoredPosition = Vector2(0, 0)
+		local title = self.Selector:GetChildByName("Title")
+		title.UITransformComponent.anchoredPosition = Vector2(16, -12)
+		title.UITransformComponent.RectSize = Vector2(488, 40)
+		title.TextGUIRendererComponent.FontSize = 28
+		title.TextGUIRendererComponent.MinSize = 24
+		title.TextGUIRendererComponent.MaxSize = 28
+		self.SkillTemplate.UITransformComponent.RectSize = Vector2(488, 88)
+		self.SkillTemplate.TextGUIRendererComponent.FontSize = 28
+		self.SkillTemplate.TextGUIRendererComponent.MinSize = 24
+		self.SkillTemplate.TextGUIRendererComponent.MaxSize = 28
+		self.PreviousButton.UITransformComponent.RectSize = Vector2(96, 88)
+		self.PreviousButton.UITransformComponent.anchoredPosition = Vector2(16, 16)
+		self.NextButton.UITransformComponent.RectSize = Vector2(96, 88)
+		self.NextButton.UITransformComponent.anchoredPosition = Vector2(128, 16)
+		self.CancelButton.UITransformComponent.RectSize = Vector2(144, 88)
+		self.CancelButton.UITransformComponent.anchoredPosition = Vector2(-16, 16)
+		for _, button in ipairs({self.PreviousButton, self.NextButton, self.CancelButton}) do
+			button.TextGUIRendererComponent.FontSize = 28
+			button.TextGUIRendererComponent.MinSize = 24
+			button.TextGUIRendererComponent.MaxSize = 28
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshMobileViewport()
+		-- Match mobile controls' height-fit viewport instead of the wider UI root on tablets.
+		if not self._T.Mobile then return end
+		local width, height = _UILogic.ScreenWidth, _UILogic.ScreenHeight
+		if width <= 0 or height <= 0 then return end
+		local visibleWidth = 1080 * width / height
+		if self._T.VisibleWidth ~= nil and math.abs(self._T.VisibleWidth - visibleWidth) < 0.5 then return end
+		self:ResetGesture("VIEWPORT_CHANGED")
+		self._T.VisibleWidth = visibleWidth
+		self.Panel.UITransformComponent.anchoredPosition = Vector2(-visibleWidth / 2 + 32, -540 + 192)
+		if (self._T.HoveredSlot or 0) > 0 then self:DescribeSlot(self._T.HoveredSlot) end
+		log("[VRF] consumable mobile viewport=" .. tostring(visibleWidth) .. "x1080 panel=" .. tostring(self.Panel.UITransformComponent.anchoredPosition))
 	end
 
 	@ExecSpace("ClientOnly")
 	@EventSender("Service", "InputService")
 	handler HandleConsumableHotkey(KeyDownEvent event)
 		-- Reuse click validation and server requests for the six slots; keys come from the control settings.
+		if event.key == KeyboardKey.Escape then
+			if _UILayerLogic:IsEscapeTarget(self.DiscardConfirm) or self._T.DiscardOpening ~= nil then self:CloseDiscard() end
+			self:ResetGesture("ESCAPE")
+			return
+		end
 		if not self.Panel.Enable or _GameSettingsLogic:IsInputBlocked() then return end
 		local index = 0
 		for slot = 1, 6 do
@@ -50,19 +137,22 @@ script BattleConsumableHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void ConnectButton(Entity button, any callback)
 		-- Stores every event subscription for cleanup; children do not intercept button raycasts.
-		local eventHandler = button:ConnectEvent(ButtonClickEvent, function()
+		self:Listen(button, ButtonClickEvent, function()
 			_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 0.5)
 			callback()
 		end)
-		table.insert(self.EventLinks, { Entity = button, EventType = ButtonClickEvent, EventHandler = eventHandler })
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
 		-- Requests metadata only when synchronized gameplay state changes, with retry for delayed initialization.
+		self:RefreshMobileViewport()
+		self:ValidateInteractions()
 		local session = _BattleHudPresenterLogic:GetBattleSession()
 		local player = _UserService.LocalPlayer
 		if session == nil or not isvalid(player) or session.BattleResult ~= "" or session.ContentValidationState ~= "VALID" then
+			self:ResetGesture("CONTEXT_UNAVAILABLE")
+			self:CloseDiscard()
 			_TutorialPresentationLogic:ResetHudHighlights(self)
 			self.Panel.Enable = false
 			self:HideTooltip()
@@ -74,6 +164,8 @@ script BattleConsumableHudComponent extends Component
 		local runtime = player:GetComponent("script.SkillRuntimeStateComponent")
 		local unit = player:GetComponent("script.BattleUnitComponent")
 		if inventory == nil or runtime == nil or unit == nil then
+			self:ResetGesture("CONTEXT_UNAVAILABLE")
+			self:CloseDiscard()
 			self.Panel.Enable = false
 			self:HideTooltip()
 			self:CloseSelection()
@@ -85,6 +177,8 @@ script BattleConsumableHudComponent extends Component
 			self._T.Signature = ""
 			self._T.ReceiptRevision = session._T.ConsumableReceiptRevision or 0
 			self._T.Data = nil
+			self:ResetGesture("CONTEXT_UNAVAILABLE")
+			self:CloseDiscard()
 			self.MessageText.Text = ""
 			self:HideTooltip()
 			self:CloseSelection()
@@ -107,6 +201,8 @@ script BattleConsumableHudComponent extends Component
 			session:RequestConsumableHudState(self.QueryId, session.EntryRequestId)
 		end
 		if data == nil or not data.Success or data.EntryId ~= session.EntryRequestId or data.RunSequence ~= inventory.ActiveRunSequence then
+			self:ResetGesture("CONTEXT_UNAVAILABLE")
+			self:CloseDiscard()
 			self.Panel.Enable = false
 			self:HideTooltip()
 			return
@@ -116,6 +212,7 @@ script BattleConsumableHudComponent extends Component
 			session._T.ConsumablePending = false
 		end
 		self._T.CanInteract = session.BattlePhase == "PlayerTurn" and not session.IsActionProcessing and not session._T.ConsumablePending and data.InventoryRevision == inventory.InventoryRevision and data.CooldownRevision == runtime.CooldownRevision and data.CurrentHp == unit.CurrentHp and data.MaxHp == unit.MaxHp and not unit.IsDead
+		if not self._T.CanInteract then self:ResetGesture("CANNOT_INTERACT") self:CloseDiscard() end
 		self.Panel.Enable = true
 		if self._T.RenderedData ~= data or self._T.RenderedInteract ~= self._T.CanInteract then
 			self:RenderSlots()
@@ -162,9 +259,14 @@ script BattleConsumableHudComponent extends Component
 			log("[BattleConsumableHUD] skin-import-v3 slot=" .. tostring(index) .. " source=65061d6a2e7642ab916b51bac9c6933b")
 			_UILogic:SetSiblingIndex(slot:GetChildByName("Hotkey").UITransformComponent, 100)
 			local capturedIndex = index
-			self:ConnectButton(slot, function() self:ClickSlot(capturedIndex) end)
-			self:ConnectButton(slot:GetChildByName("Discard"), function() self:DiscardSlot(capturedIndex) end)
-			local hover = slot:ConnectEvent(ButtonStateChangeEvent, function(event)
+			slot.ButtonComponent.KeyCode = KeyboardKey.None
+			slot.ButtonComponent.Selectable = false
+			self:Listen(slot, UITouchDownEvent, function(event) self:OnSlotPointerDown(capturedIndex, event) end)
+			self:Listen(slot, UITouchBeginDragEvent, function(event) self:OnSlotPointerMove(capturedIndex, event.TouchId, event.TouchPoint) end)
+			self:Listen(slot, UITouchDragEvent, function(event) self:OnSlotPointerMove(capturedIndex, event.TouchId, event.TouchPoint) end)
+			self:Listen(slot, UITouchUpEvent, function(event) self:OnSlotPointerRelease(capturedIndex, event.TouchId, event.TouchPoint) end)
+			self:Listen(slot, UITouchEndDragEvent, function(event) self:OnSlotPointerRelease(capturedIndex, event.TouchId, event.TouchPoint) end)
+			self:Listen(slot, ButtonStateChangeEvent, function(event)
 				if event.state == ButtonState.Hover then
 					self._T.HoveredSlot = capturedIndex
 					self:DescribeSlot(capturedIndex)
@@ -172,18 +274,20 @@ script BattleConsumableHudComponent extends Component
 					if self._T.HoveredSlot == capturedIndex then self:HideTooltip() end
 				end
 			end)
-			table.insert(self.EventLinks, { Entity = slot, EventType = ButtonStateChangeEvent, EventHandler = hover })
 			table.insert(self.Slots, slot)
 		end
-		self.Panel.UITransformComponent.RectSize = Vector2(count * 80 - 8, 72)
+		local stride, size = 80, 72
+		if self._T.Mobile then stride, size = 104, 88 end
+		self.Panel.UITransformComponent.RectSize = Vector2((count - 1) * stride + size, size)
+		if self._T.Mobile then
+			-- A single low row keeps every potion below actor names and HP bars on the raised mobile camera.
+			log("[VRF] consumable mobile grid columns=" .. tostring(count) .. " rows=1 size=" .. tostring(self.Panel.UITransformComponent.RectSize))
+		end
 		for index, slot in ipairs(self.Slots) do
 			slot.Enable = index <= count
 			if slot.Enable then
-				slot.UITransformComponent.anchoredPosition = Vector2((index - 1) * 80, 0)
+				slot.UITransformComponent.anchoredPosition = Vector2((index - 1) * stride, 0)
 				local item = self._T.SlotItems[index]
-				local discard = slot:GetChildByName("Discard")
-				discard.Enable = item ~= nil
-				discard.ButtonComponent.Enable = item ~= nil and self._T.CanInteract == true
 				local icon = slot:GetChildByName("Icon")
 				icon.Enable = item ~= nil
 				slot.TextGUIRendererComponent.Text = ""
@@ -206,14 +310,14 @@ script BattleConsumableHudComponent extends Component
 		for index, slot in ipairs(self.Slots) do
 			local hotkey = slot:GetChildByName("Hotkey")
 			local label = _GameSettingsLogic:GetActionKeyShortLabel("ITEM_" .. tostring(index))
-			hotkey.Enable = label ~= ""
+			hotkey.Enable = not self._T.Mobile and label ~= ""
 			hotkey.TextGUIRendererComponent.Text = label
 		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void ApplyItemIcon(Entity icon, string ruid)
-		-- Fit the resource aspect into the existing 52px box without preserving its source pivot.
+		-- Fit the resource aspect into the platform's icon box without preserving its source pivot.
 		icon.SpriteGUIRendererComponent.ImageRUID = DataRef(ruid)
 		local size = self.IconSizes[ruid]
 		if size == nil then
@@ -223,7 +327,8 @@ script BattleConsumableHudComponent extends Component
 				log_warning("[BattleConsumableHUD] icon resource metadata unavailable source=" .. ruid)
 				return
 			end
-			local scale = 52 / math.max(sprite.Width, sprite.Height)
+			local iconSize = self._T.Mobile and 72 or 52
+			local scale = iconSize / math.max(sprite.Width, sprite.Height)
 			size = Vector2(sprite.Width * scale, sprite.Height * scale)
 			self.IconSizes[ruid] = size
 		end
@@ -255,10 +360,20 @@ script BattleConsumableHudComponent extends Component
 		if not item.Usable then detail = self:ReasonText(item.Reason) end
 		if item.Usable and not self._T.CanInteract then detail = "현재 사용할 수 없습니다." end
 		self.MessageText.Text = item.DisplayName .. "\n" .. detail
-		local height = math.min(144, math.max(76, self.MessageText:GetPreferredHeight(self.MessageText.Text, 276) + 24))
+		if item.Usable then self.MessageText.Text = self.MessageText.Text .. "\n더블클릭·더블탭: 사용" end
+		self.MessageText.Text = self.MessageText.Text .. "\n바깥으로 드래그: 버리기"
+		local height = math.min(288, math.max(96, self.MessageText:GetPreferredHeight(self.MessageText.Text, self._T.Mobile and 376 or 276) + 24))
 		self.MessageText.Entity.UITransformComponent.RectSize = Vector2(300, height)
 		self.MessageText.Entity.UITransformComponent.anchoredPosition = Vector2((index - 1) * 80 + 84, 12)
+		if self._T.Mobile then
+			-- Keep the tooltip close to the compact grid and within the visible viewport.
+			local width = 400
+			local x = math.max(0, math.min(((index - 1) % 3) * 104, (self._T.VisibleWidth or 1440) - 64 - width))
+			self.MessageText.Entity.UITransformComponent.RectSize = Vector2(width, height)
+			self.MessageText.Entity.UITransformComponent.anchoredPosition = Vector2(x, 16)
+		end
 		self.MessageText.Entity.Enable = self._T.HoveredSlot == index and self.SelectedConsumableId == ""
+			and self._T.Pointer == nil and self._T.DiscardToken == nil
 	end
 
 	@ExecSpace("ClientOnly")
@@ -271,13 +386,17 @@ script BattleConsumableHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void ClickSlot(integer index)
 		-- Time sand opens a target list; all other items use the same authenticated request path.
+		if self._T.DiscardOpening ~= nil or self._T.Focused == false or self._T.SystemPopup or _GameSettingsLogic:IsInputBlocked() then return end
+		self:ResetGesture("USE_ITEM")
 		self:DescribeSlot(index)
 		if not self._T.CanInteract or self._T.Data == nil then return end
 		local item = (self._T.SlotItems or {})[index]
 		if item == nil then return end
 		if not item.Usable then return end
 		if item.EffectType == "COOLDOWN_REDUCTION" then
-			self.Selector.UITransformComponent.anchoredPosition = Vector2(116 + (index - 1) * 80, 268)
+			if not self._T.Mobile then
+				self.Selector.UITransformComponent.anchoredPosition = Vector2(116 + (index - 1) * 80, 268)
+			end
 			self.MessageText.Entity.Enable = false
 			self.SelectedConsumableId = item.ConsumableId
 			self.SkillPage = 1
@@ -287,18 +406,235 @@ script BattleConsumableHudComponent extends Component
 		self._T.Session:SubmitConsumableUse(item.ConsumableId, "")
 	end
 
+
 	@ExecSpace("ClientOnly")
-	method void DiscardSlot(integer index)
-		if not self._T.CanInteract or self._T.Data == nil then return end
+	method void Listen(any source, any eventType, any callback)
+		-- Own every UI/service subscription so reloads never duplicate gestures.
+		local subscription = source:ConnectEvent(eventType, callback)
+		table.insert(self.EventLinks, { Source = source, EventType = eventType, EventHandler = subscription })
+	end
+
+	@ExecSpace("ClientOnly")
+	method table CaptureSlotSnapshot(integer index)
+		-- Capture item identity before a tap or drag; a replacement slot must never inherit that input.
+		if self._T.DiscardOpening ~= nil or self._T.DiscardToken ~= nil
+			or not self._T.CanInteract or self._T.Data == nil or self.SelectedConsumableId ~= "" then return nil end
 		local item = (self._T.SlotItems or {})[index]
-		if item == nil then return end
-		-- A stale displayed slot must never discard a replacement item after an inventory update.
+		local session = self._T.Session
+		if item == nil or session == nil then return nil end
+		local token = { Index = index, Id = item.ConsumableId, IconKey = item.IconKey, DisplayName = item.DisplayName,
+			InventoryRevision = self._T.Data.InventoryRevision, MapId = session.Entity.Id,
+			EntryId = session.EntryRequestId, RunSequence = self._T.Data.RunSequence,
+			HudContextRevision = session.HudContextRevision, TurnNumber = session.TurnNumber }
+		return self:IsSnapshotCurrent(token, false) and token or nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsSnapshotCurrent(table token, boolean allowOwnModal)
+		-- Revalidate the captured item against live owner state, including while the confirmation owns input.
+		if token == nil or self._T.Focused == false or self._T.SystemPopup then return false end
+		if _GameUIPolishLogic:IsTransitioning() then return false end
+		if allowOwnModal then
+			if not isvalid(self.DiscardConfirm) or not self.DiscardConfirm.Enable
+				or _UILayerLogic:GetTopWindow("Input") ~= self.DiscardConfirm then return false end
+		elseif _GameSettingsLogic:IsInputBlocked() then return false end
 		local player = _UserService.LocalPlayer
-		local inventory = isvalid(player) and player:GetComponent("script.PlayerRunInventoryComponent") or nil
-		if inventory == nil or inventory.InventoryRevision ~= self._T.Data.InventoryRevision then return end
+		local session = _BattleHudPresenterLogic:GetBattleSession()
+		if not isvalid(player) or not isvalid(player.CurrentMap) or session == nil
+			or session.Entity.Id ~= token.MapId or player.CurrentMap.Id ~= token.MapId
+			or session.EntryRequestId ~= token.EntryId or session.HudContextRevision ~= token.HudContextRevision
+			or session.TurnNumber ~= token.TurnNumber or session.BattlePhase ~= "PlayerTurn"
+			or session.IsActionProcessing or session.BattleResult ~= "" or session.ContentValidationState ~= "VALID"
+			or session._T.ConsumablePending then return false end
+		local inventory = player:GetComponent("script.PlayerRunInventoryComponent")
+		local unit = player:GetComponent("script.BattleUnitComponent")
+		local data = self._T.Data
+		local item = (self._T.SlotItems or {})[token.Index]
+		return inventory ~= nil and unit ~= nil and not unit.IsDead and data ~= nil
+			and inventory.ActiveRunSequence == token.RunSequence and inventory.InventoryRevision == token.InventoryRevision
+			and data.InventoryRevision == token.InventoryRevision and data.EntryId == token.EntryId
+			and data.RunSequence == token.RunSequence and item ~= nil and item.ConsumableId == token.Id
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsPointInside(Vector2 screenPoint, UITransformComponent transform)
+		-- Use the real rendered rect for both the PC row and the mobile grid.
+		if transform == nil then return false end
+		local point = _UILogic:ScreenToLocalUIPosition(screenPoint, transform)
+		local size, pivot = transform.RectSize, transform.Pivot
+		return point.x >= -size.x * pivot.x and point.x <= size.x * (1 - pivot.x)
+			and point.y >= -size.y * pivot.y and point.y <= size.y * (1 - pivot.y)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetGesture(string reason)
+		-- Cancel pointer/tap ownership without ever interpreting cancellation as a completed tap.
+		if self._T.Pointer ~= nil then log("[VRF] potion gesture cancelled reason=" .. reason) end
+		self._T.Pointer = nil
+		self._T.LastTap = nil
+		if isvalid(self.DragGhost) then self.DragGhost.Enable = false end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ValidateInteractions()
+		-- Expire transient inputs and close stale confirmations before the next interaction can run.
+		local now = _UtilLogic.ElapsedSeconds
+		local pointer = self._T.Pointer
+		if pointer ~= nil and (now - pointer.StartedAt > 4 or not self:IsSnapshotCurrent(pointer.Token, false)) then
+			self:ResetGesture("STALE_POINTER")
+		end
+		local last = self._T.LastTap
+		if last ~= nil and (now - last.CompletedAt > self.DoubleTapSeconds or not self:IsSnapshotCurrent(last.Token, false)) then
+			self._T.LastTap = nil
+		end
+		if self._T.DiscardToken ~= nil and self._T.DiscardOpening == nil
+			and not self:IsSnapshotCurrent(self._T.DiscardToken, true) then
+			self:CloseDiscard()
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSlotPointerDown(integer index, UITouchDownEvent event)
+		-- A gesture belongs to one pointer; simultaneous fingers cannot become a double tap.
+		if event.TouchId < 0 and event.TouchId ~= -1 then return end
+		local pointer = self._T.Pointer
+		if pointer ~= nil then
+			if pointer.TouchId ~= event.TouchId then pointer.Cancelled = true end
+			self._T.LastTap = nil
+			return
+		end
+		local token = self:CaptureSlotSnapshot(index)
+		local slot = self.Slots[index]
+		if token == nil or not isvalid(slot) or not slot.EnabledInHierarchy then
+			self:ResetGesture("BLOCKED_DOWN")
+			return
+		end
+		local last = self._T.LastTap
+		if last ~= nil and (last.Token.Index ~= index or last.Token.Id ~= token.Id
+			or last.Token.InventoryRevision ~= token.InventoryRevision) then self._T.LastTap = nil end
+		self._T.Pointer = { TouchId = event.TouchId, Token = token, StartedAt = _UtilLogic.ElapsedSeconds,
+			StartLocal = _UILogic:ScreenToLocalUIPosition(event.TouchPoint, self.Panel.UITransformComponent), Dragging = false }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSlotPointerMove(integer index, integer touchId, Vector2 screenPoint)
+		-- Follow the captured finger, never the multi-touch cursor centroid.
+		local pointer = self._T.Pointer
+		if pointer == nil or pointer.TouchId ~= touchId or pointer.Token.Index ~= index or pointer.Cancelled then return end
+		if not self:IsSnapshotCurrent(pointer.Token, false) then self:ResetGesture("STALE_DRAG") return end
+		local current = _UILogic:ScreenToLocalUIPosition(screenPoint, self.Panel.UITransformComponent)
+		local dx, dy = current.x - pointer.StartLocal.x, current.y - pointer.StartLocal.y
+		if not pointer.Dragging and dx * dx + dy * dy >= self.DragThreshold * self.DragThreshold then
+			pointer.Dragging = true
+			self._T.LastTap = nil
+			self:HideTooltip()
+			self:ApplyItemIcon(self.DragGhost, pointer.Token.IconKey)
+			if self._T.Pointer ~= pointer then return end
+			if not self:IsSnapshotCurrent(pointer.Token, false) then self:ResetGesture("ICON_LOAD_INVALIDATED") return end
+			self.DragGhost.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 0.9)
+			_UILogic:SetSiblingIndex(self.DragGhost.UITransformComponent, 1000000)
+			log("[VRF] potion drag started item=" .. pointer.Token.Id)
+		end
+		if pointer.Dragging then
+			local point = _UILogic:ScreenToLocalUIPosition(screenPoint, self.DragGhost.Parent.UITransformComponent)
+			self.DragGhost.UITransformComponent.anchoredPosition = point + Vector2(18, self._T.Mobile and 48 or 18)
+			self.DragGhost.Enable = true
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnSlotPointerRelease(integer index, integer touchId, Vector2 screenPoint)
+		-- Up and EndDrag may arrive in either order; consume ownership before opening a dialog or using an item.
+		local pointer = self._T.Pointer
+		if pointer == nil or pointer.TouchId ~= touchId or pointer.Token.Index ~= index then return end
+		self:OnSlotPointerMove(index, touchId, screenPoint)
+		if self._T.Pointer ~= pointer then return end
+		self._T.Pointer = nil
+		self.DragGhost.Enable = false
+		if pointer.Cancelled or not self:IsSnapshotCurrent(pointer.Token, false) then self._T.LastTap = nil return end
+		if pointer.Dragging then
+			self._T.LastTap = nil
+			if not self:IsPointInside(screenPoint, self.Panel.UITransformComponent) then
+				self:OpenDiscard(pointer.Token)
+			else
+				log("[VRF] potion drag returned inside; discard cancelled")
+			end
+			return
+		end
+		local slot = self.Slots[index]
+		if _UtilLogic.ElapsedSeconds - pointer.StartedAt > 0.5 or not isvalid(slot)
+			or not self:IsPointInside(screenPoint, slot.UITransformComponent) then self._T.LastTap = nil return end
+		local last = self._T.LastTap
+		local now = _UtilLogic.ElapsedSeconds
+		if last ~= nil and now - last.CompletedAt <= self.DoubleTapSeconds
+			and last.Token.Index == index and last.Token.Id == pointer.Token.Id
+			and last.Token.InventoryRevision == pointer.Token.InventoryRevision
+			and self:IsSnapshotCurrent(last.Token, false) then
+			self._T.LastTap = nil
+			log("[VRF] potion double tap item=" .. pointer.Token.Id)
+			_GameSettingsLogic:PlayUISound(self.ClickSoundRUID, 0.5)
+			self:ClickSlot(index)
+		else
+			self._T.LastTap = { Token = pointer.Token, CompletedAt = now }
+			self._T.HoveredSlot = index
+			self:DescribeSlot(index)
+			log("[VRF] potion first tap item=" .. pointer.Token.Id)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OpenDiscard(table token)
+		-- Opening the modal never discards; keep the captured identity until an explicit Yes.
+		if self._T.DiscardOpening ~= nil or self._T.DiscardToken ~= nil then return end
+		if not self:IsSnapshotCurrent(token, false) then return end
+		self:ResetGesture("DISCARD_PROMPT")
 		self:CloseSelection()
 		self:HideTooltip()
-		self._T.Session:SubmitConsumableDiscard(item.ConsumableId)
+		self._T.DiscardOpening = token
+		self:ApplyItemIcon(self.DiscardIcon, token.IconKey)
+		if self._T.DiscardOpening ~= token then return end
+		if not self:IsSnapshotCurrent(token, false) then self:CloseDiscard() return end
+		self:ResetGesture("DISCARD_OPEN")
+		self._T.DiscardToken = token
+		self.DiscardMessage.Text = token.DisplayName .. " 1개"
+		self.DiscardConfirm.Enable = true
+		_UILayerLogic:PushWindow(self.DiscardConfirm)
+		if self._T.DiscardToken ~= token or self._T.DiscardOpening ~= token then
+			if self._T.DiscardToken == nil then
+				_UILayerLogic:PopWindow(self.DiscardConfirm)
+				self.DiscardConfirm.Enable = false
+			end
+			return
+		end
+		self._T.DiscardOpening = nil
+		if not self:IsSnapshotCurrent(token, true) then self:CloseDiscard() return end
+		log("[VRF] potion discard confirmation opened item=" .. token.Id .. " revision=" .. tostring(token.InventoryRevision))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConfirmDiscard()
+		-- Invalidate the prompt before submitting so repeated Yes events cannot discard twice.
+		if self._T.DiscardOpening ~= nil then return end
+		local token = self._T.DiscardToken
+		local current = token ~= nil and self:IsSnapshotCurrent(token, true)
+		self:CloseDiscard()
+		if not current or not self:IsSnapshotCurrent(token, false) then return end
+		log("[VRF] potion discard confirmed item=" .. token.Id)
+		self._T.Session:SubmitConsumableDiscard(token.Id)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CloseDiscard()
+		-- No, Esc, focus loss and invalidation all leave the inventory unchanged.
+		local hadPrompt = self._T.DiscardToken ~= nil
+		self._T.DiscardOpening = nil
+		self._T.DiscardToken = nil
+		if isvalid(self.DiscardConfirm) then
+			_UILayerLogic:PopWindow(self.DiscardConfirm)
+			self.DiscardConfirm.Enable = false
+		end
+		self._T.LastTap = nil
+		if hadPrompt then log("[VRF] potion discard confirmation closed") end
 	end
 
 	@ExecSpace("ClientOnly")
@@ -310,6 +646,7 @@ script BattleConsumableHudComponent extends Component
 		self.SkillPage = math.min(self.SkillPage, math.ceil(#data.Skills / pageSize))
 		local visibleRows = math.min(pageSize, #data.Skills - (self.SkillPage - 1) * pageSize)
 		self.Selector.UITransformComponent.RectSize = Vector2(304, 84 + visibleRows * 48)
+		if self._T.Mobile then self.Selector.UITransformComponent.RectSize = Vector2(520, 168 + visibleRows * 104) end
 		self.Selector.Enable = true
 		self.PreviousButton.ButtonComponent.Enable = self.SkillPage > 1
 		self.NextButton.ButtonComponent.Enable = self.SkillPage * pageSize < #data.Skills
@@ -324,6 +661,7 @@ script BattleConsumableHudComponent extends Component
 			row.Enable = index <= pageSize and skill ~= nil
 			if row.Enable then
 				row.UITransformComponent.anchoredPosition = Vector2(10, -36 - (index - 1) * 48)
+				if self._T.Mobile then row.UITransformComponent.anchoredPosition = Vector2(16, -64 - (index - 1) * 104) end
 				row.TextGUIRendererComponent.Text = skill.DisplayName .. "  CD " .. tostring(skill.Cooldown)
 				row.ButtonComponent.Enable = self._T.CanInteract == true
 			end
@@ -362,9 +700,11 @@ script BattleConsumableHudComponent extends Component
 	method void OnEndPlay()
 		-- Releases cloned controls and event subscriptions when the UI is unloaded.
 		_TutorialPresentationLogic:ResetHudHighlights(self)
+		self:ResetGesture("END_PLAY")
+		self:CloseDiscard()
 		self:HideTooltip()
 		for _, link in ipairs(self.EventLinks) do
-			if isvalid(link.Entity) then link.Entity:DisconnectEvent(link.EventType, link.EventHandler) end
+			link.Source:DisconnectEvent(link.EventType, link.EventHandler)
 		end
 		for _, slot in ipairs(self.Slots) do if isvalid(slot) then slot:Destroy() end end
 		for _, row in ipairs(self.SkillRows) do if isvalid(row) then row:Destroy() end end

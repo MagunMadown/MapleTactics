@@ -1,0 +1,304 @@
+@Component
+script MobileControlsComponent extends Component
+
+	property boolean Mobile = false
+	property Entity Controls = nil
+	property table Buttons = {}
+	property table EventLinks = {}
+	property table NativeControls = {}
+	property number RefreshInterval = 0.05
+	property number RefreshRemaining = 0
+	property number MaximumPressSeconds = 2
+
+	@ExecSpace("ClientOnly")
+	method void OnBeginPlay()
+		-- Use native UI buttons as a mobile adapter; keyboard bindings and movement profiles stay shared.
+		self.Mobile = _ApplicationService:IsMobilePlatform()
+		self.Controls = self.Entity:GetChildByName("Controls")
+		self._T.Focused = true
+		self._T.MenuOpen = false
+		self._T.ExitOpen = false
+		self._T.Press = nil
+		self._T.ContextKey = ""
+		self._T.Ready = false
+		if isvalid(self.Controls) then self.Controls.Enable = false end
+		-- Defer the first stock-pad capture until updates begin, including focus events during bootstrap.
+		self.RefreshRemaining = self.RefreshInterval
+		if self.Mobile then self:BindControls() end
+		log("[VRF] mobile controls boot mobile=" .. tostring(self.Mobile) .. " layout=LANDSCAPE style=ROUND_QUICKSLOT native=ButtonComponent utility=SKILL_SLOT")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void Listen(any source, any eventType, any callback)
+		-- Keep every subscription alive and release it when the UI controller is removed.
+		local subscription = source:ConnectEvent(eventType, callback)
+		table.insert(self.EventLinks, { Source = source, EventType = eventType, Subscription = subscription })
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindControls()
+		-- Bind one logical command per completed tap, without a second virtual-key input path.
+		if #self.EventLinks > 0 or isvalid(self.Controls) == false then return end
+		for _, action in ipairs({ "Left", "Right", "Turn", "Execute", "ClearQueue", "Interact" }) do
+			local button = self.Controls:GetChildByName(action)
+			if isvalid(button) and button.ButtonComponent ~= nil then
+				local capturedAction = action
+				button.ButtonComponent.KeyCode = KeyboardKey.None
+				button.ButtonComponent.Selectable = false
+				self.Buttons[action] = button
+				self:Listen(button, UITouchDownEvent, function(event) self:OnButtonDown(capturedAction, event) end)
+				self:Listen(button, UITouchUpEvent, function(event) self:OnButtonUp(capturedAction, event) end)
+				self:Listen(button, UITouchExitEvent, function(event) self:OnButtonExit(capturedAction, event) end)
+				self:Listen(button, ButtonClickEvent, function() self:OnButtonClicked(capturedAction) end)
+			end
+		end
+		self:Listen(_ApplicationService, ApplicationFocusOutEvent, function() self._T.Focused = false self:CancelPress("FOCUS_OUT") self:RefreshControls() end)
+		self:Listen(_ApplicationService, ApplicationFocusInEvent, function() self._T.Focused = true self:RefreshControls() end)
+		self:Listen(_InputService, MenuPopupOpenedEvent, function() self._T.MenuOpen = true self:CancelPress("SYSTEM_MENU") self:RefreshControls() end)
+		self:Listen(_InputService, MenuPopupClosedEvent, function() self._T.MenuOpen = false self:RefreshControls() end)
+		self:Listen(_InputService, ExitPopupOpenedEvent, function() self._T.ExitOpen = true self:CancelPress("EXIT_POPUP") self:RefreshControls() end)
+		self:Listen(_InputService, ExitPopupClosedEvent, function() self._T.ExitOpen = false self:RefreshControls() end)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetInputContext()
+		-- Resolve the current map afresh so a released touch cannot act on a departed battle or lobby.
+		local player = _UserService.LocalPlayer
+		local map = isvalid(player) and player.CurrentMap or nil
+		if isvalid(map) == false then return nil end
+		local session = map:GetComponent("script.BattleSessionComponent")
+		local grid = map:GetComponent("script.LobbyGridMovementComponent")
+		local kind = ""
+		local generation = ""
+		if session ~= nil and session.Enable then
+			kind = "BATTLE"
+			generation = tostring(session.EntryRequestId) .. ":" .. tostring(session.HudContextRevision)
+		elseif grid ~= nil and grid.Enable then
+			kind = "GRID"
+		else
+			return nil
+		end
+		return { Player = player, Map = map, Session = session, Grid = grid, Kind = kind,
+			Key = tostring(player.Id) .. ":" .. tostring(map.Id) .. ":" .. kind .. ":" .. generation }
+	end
+
+	@ExecSpace("ClientOnly")
+	method boolean IsInputBlocked()
+		-- Match the existing gameplay gates and also discard touches while the application loses focus.
+		return self.Mobile == false or self._T.Ready ~= true or self._T.Focused == false or self._T.MenuOpen == true or self._T.ExitOpen == true
+			or _GameUIPolishLogic:IsTransitioning() or _BattleHudPresenterLogic:IsLocalInputBlocked()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void SetNativeControlsSuppressed(boolean suppressed)
+		-- Replace only the stock pad in maps owned by this adapter; other maps retain their native controls.
+		if self.Mobile == false then return end
+		if suppressed == false then
+			for _, record in pairs(self.NativeControls) do
+				if isvalid(record.Entity) then record.Entity.Enable = record.Enabled end
+			end
+			self.NativeControls = {}
+			return
+		end
+		for _, name in ipairs({ "Button_Attack", "Button_Jump", "UIJoystick" }) do
+			local record = self.NativeControls[name]
+			local entity = record ~= nil and record.Entity or nil
+			if isvalid(entity) == false then
+				entity = _EntityService:GetEntityByPath("/ui/DefaultGroup/" .. name)
+				if isvalid(entity) then
+					record = { Entity = entity, Enabled = entity.Enable }
+					self.NativeControls[name] = record
+					log("[VRF] mobile native snapshot name=" .. name .. " enabled=" .. tostring(record.Enabled))
+				end
+			end
+			if isvalid(entity) and entity.Enable then
+				-- Preserve a later engine/UI activation request while keeping the replaced stock pad hidden.
+				if record.Enabled == false then
+					record.Enabled = true
+					log("[VRF] mobile native deferred activation name=" .. name)
+				end
+				entity.Enable = false
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshControls()
+		-- Keep touch controls beside the skill queue and switch their actions with the current map context.
+		if self.Mobile == false or self._T.Ready ~= true or isvalid(self.Controls) == false then return end
+		self:RefreshViewport()
+		local context = self:GetInputContext()
+		local contextKey = context ~= nil and context.Key or ""
+		if contextKey ~= self._T.ContextKey then
+			self:CancelPress("CONTEXT_CHANGED")
+			self._T.ContextKey = contextKey
+			log("[VRF] mobile context kind=" .. (context ~= nil and context.Kind or "NATIVE") .. " key=" .. contextKey)
+		end
+		self:SetNativeControlsSuppressed(context ~= nil)
+		local visible = context ~= nil and self:IsInputBlocked() == false
+		local battle = context ~= nil and context.Kind == "BATTLE"
+		if battle then
+			local state = _BattleHudPresenterLogic:GetCurrentState()
+			visible = visible and state.Success == true and state.ContextVisible == true and state.Session ~= nil
+				and state.Session.MapId == context.Map.Id and state.Session.EntryRequestId == context.Session.EntryRequestId
+				and state.Session.HudContextRevision == context.Session.HudContextRevision
+				and state.Session.BattleResult == ""
+		end
+		if visible == false then self:CancelPress("INPUT_BLOCKED") end
+		self.Controls.Enable = visible
+		for _, action in ipairs({ "Left", "Right", "Turn" }) do
+			if isvalid(self.Buttons[action]) then self.Buttons[action].Enable = context ~= nil end
+		end
+		for _, action in ipairs({ "Execute", "ClearQueue" }) do
+			if isvalid(self.Buttons[action]) then self.Buttons[action].Enable = battle end
+		end
+		local interact = self.Buttons.Interact
+		if isvalid(interact) then
+			interact.Enable = context ~= nil and context.Kind == "GRID" and context.Map.Name == "lobby"
+				and isvalid(_LobbyInteractionFocusLogic.FocusEntity)
+			local label = interact:GetChildByName("Label")
+			if isvalid(label) and label.TextGUIRendererComponent ~= nil then
+				label.TextGUIRendererComponent.Text = _LobbyInteractionFocusLogic.IsPortalFocus and "시작" or "대화"
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshViewport()
+		-- Use the authored 1080-pixel design height; the runtime root height expands on 4:3 previews.
+		local width, height = _UILogic.ScreenWidth, _UILogic.ScreenHeight
+		if width <= 0 or height <= 0 then return end
+		local referenceHeight = 1080
+		local size = Vector2(referenceHeight * width / height, referenceHeight)
+		local transform = self.Controls.UITransformComponent
+		if math.abs(transform.RectSize.x - size.x) < 0.5 and math.abs(transform.RectSize.y - size.y) < 0.5 then return end
+		self:CancelPress("VIEWPORT_CHANGED")
+		transform.RectSize = size
+		log("[VRF] mobile viewport controls=" .. tostring(size.x) .. "x" .. tostring(size.y))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void CancelPress(string reason)
+		-- A cancelled gesture never becomes a new command after a popup, map transfer or focus change.
+		if self._T.Press ~= nil then log("[VRF] mobile tap cancelled reason=" .. reason) end
+		self._T.Press = nil
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnButtonDown(string action, UITouchDownEvent event)
+		-- Capture both the pointer and map generation; a second finger cannot replace an active press.
+		if self:IsInputBlocked() then return end
+		local button = self.Buttons[action]
+		local context = self:GetInputContext()
+		if context == nil or isvalid(button) == false or button.EnabledInHierarchy == false then return end
+		local pending = self._T.Press
+		if pending ~= nil and pending.Released ~= true then return end
+		self._T.Press = { Action = action, TouchId = event.TouchId, ContextKey = context.Key,
+			PressedAt = _UtilLogic.ElapsedSeconds, Released = false, Clicked = false }
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnButtonUp(string action, UITouchUpEvent event)
+		-- Only the captured pointer can complete a tap, including when ButtonClickEvent arrives first.
+		local pending = self._T.Press
+		if pending == nil or pending.Action ~= action or pending.TouchId ~= event.TouchId then return end
+		local button = self.Buttons[action]
+		local transform = isvalid(button) and button.UITransformComponent or nil
+		if transform == nil then self:CancelPress("BUTTON_UNAVAILABLE") return end
+		local point = _UILogic:ScreenToLocalUIPosition(event.TouchPoint, transform)
+		local size, pivot = transform.RectSize, transform.Pivot
+		if point.x < -size.x * pivot.x or point.x > size.x * (1 - pivot.x)
+			or point.y < -size.y * pivot.y or point.y > size.y * (1 - pivot.y) then
+			self:CancelPress("RELEASE_OUTSIDE")
+			return
+		end
+		pending.Released = true
+		self:FinishPress(action)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnButtonClicked(string action)
+		-- Click events have no pointer id; they cannot consume a different finger's held capture.
+		local pending = self._T.Press
+		if pending == nil or pending.Action ~= action then return end
+		pending.Clicked = true
+		self:FinishPress(action)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnButtonExit(string action, UITouchExitEvent event)
+		-- Release cancelled drags immediately; post-release exit must not swallow a pending native click.
+		local pending = self._T.Press
+		if pending ~= nil and pending.Action == action and pending.TouchId == event.TouchId and pending.Released ~= true then
+			self:CancelPress("POINTER_EXIT")
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void FinishPress(string action)
+		-- Consume the press before dispatch, so duplicate clicks and old releases cannot repeat a turn.
+		local pending = self._T.Press
+		if pending == nil or pending.Action ~= action or pending.Released ~= true or pending.Clicked ~= true then return end
+		self._T.Press = nil
+		local age = _UtilLogic.ElapsedSeconds - pending.PressedAt
+		local context = self:GetInputContext()
+		if age < 0 or age > self.MaximumPressSeconds or self:IsInputBlocked() or context == nil or context.Key ~= pending.ContextKey then
+			log("[VRF] mobile tap rejected action=" .. action .. " reason=STALE_OR_BLOCKED")
+			return
+		end
+		local button = self.Buttons[action]
+		if isvalid(button) == false or button.EnabledInHierarchy == false then return end
+		_GameUIPolishLogic:PlayClick()
+		self:DispatchAction(action, context)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void DispatchAction(string action, table context)
+		-- Call the same client entry points as PC; the existing server still validates cells, turns and requests.
+		log("[VRF] mobile command action=" .. action .. " kind=" .. context.Kind .. " map=" .. context.Map.Name)
+		if context.Kind == "GRID" then
+			if action == "Left" or action == "Right" then
+				context.Grid:TryLobbyMove(context.Player, action == "Left" and -1 or 1)
+			elseif action == "Turn" then
+				context.Grid:TryLobbyTurn()
+			elseif action == "Interact" and context.Map.Name == "lobby" then
+				_LobbyInteractionFocusLogic:TryInteract()
+			end
+		elseif context.Kind == "BATTLE" then
+			if action == "Left" or action == "Right" then
+				_BattleHudPresenterLogic:SubmitLocalCommand("MOVE", "", action == "Left" and -1 or 1)
+			elseif action == "Turn" then
+				_BattleHudPresenterLogic:SubmitLocalCommand("TURN", "", 0)
+			elseif action == "Execute" then
+				_BattleHudPresenterLogic:RequestExecuteQueue()
+			elseif action == "ClearQueue" then
+				_BattleHudPresenterLogic:RequestClearQueue()
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnUpdate(number delta)
+		-- No held-input timer is added; each tap keeps the same one-step timing as the PC key-down path.
+		if self.Mobile == false then return end
+		local pending = self._T.Press
+		if pending ~= nil and _UtilLogic.ElapsedSeconds - pending.PressedAt > self.MaximumPressSeconds then self:CancelPress("EXPIRED") end
+		self.RefreshRemaining = self.RefreshRemaining - delta
+		if self.RefreshRemaining > 0 then return end
+		self.RefreshRemaining = self.RefreshInterval
+		self._T.Ready = true
+		self:RefreshControls()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnEndPlay()
+		-- Restore the stock pad and remove every local listener before reload or shutdown.
+		self:CancelPress("END_PLAY")
+		for _, link in ipairs(self.EventLinks) do link.Source:DisconnectEvent(link.EventType, link.Subscription) end
+		self.EventLinks = {}
+		self:SetNativeControlsSuppressed(false)
+		if isvalid(self.Controls) then self.Controls.Enable = false end
+		self.Buttons = {}
+	end
+
+end

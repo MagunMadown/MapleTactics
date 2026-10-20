@@ -222,6 +222,8 @@ script BattleQueueHudComponent extends Component
 
 	property number BuffIconSpacing = 86
 
+	property any UtilitySlotClickHandler = nil
+
 	property any ExecuteClickHandler = nil
 
 	property any ResetClickHandler = nil
@@ -233,11 +235,13 @@ script BattleQueueHudComponent extends Component
 		-- The view binds UI controls and consumes presentation state without reading battle components directly.
 		log("[BattleQueueHUD] ready")
 		self:ApplyHorizontalStateTextLayout()
+		self:ConfigureExecutePresentation()
 		self._T.SkillIconFeedbackTimers = {}
 		self._T.SkillSlotDragHandlers = {}
 		self._T.SkillSlotReorderSuccessSourceIndex = 0
 		self._T.SkillSlotReorderSuccessTargetIndex = 0
 		self:ResetSkillSlotDragState()
+		self:RefreshMobileQueueViewport()
 		-- The ghost is dropped on the overhead queue, which draws above this HUD, so it lives in the Cursor layer.
 		if self.SkillDragGhost ~= nil then _UILayerLogic:MoveToCursorLayer(self.SkillDragGhost.Entity) end
 		self:BuildSkillCooldownPipViews()
@@ -245,6 +249,12 @@ script BattleQueueHudComponent extends Component
 		self:SetHudContextVisible(false, "INITIALIZING")
 		self.PresenterStateChangedHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudStateChangedEvent, self.OnPresenterStateChanged)
 		self.PresenterCommandResultHandler = _BattleHudPresenterLogic:ConnectEvent(BattleHudCommandResultEvent, self.OnPresenterCommandResult)
+		if isvalid(self.UtilitySlot) and self.UtilitySlot.ButtonComponent ~= nil then
+			self.UtilitySlot.ButtonComponent.KeyCode = KeyboardKey.None
+			self.UtilitySlot.ButtonComponent.Selectable = false
+			self.UtilitySlotClickHandler = self.UtilitySlot:ConnectEvent(ButtonClickEvent, self.OnUtilitySlotClicked)
+			log("[VRF] battle utility input ready source=SKILL_SLOT")
+		end
 		self.SkillSlot1ClickHandler = self.SkillSlot1Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot1Clicked)
 		self.SkillSlot2ClickHandler = self.SkillSlot2Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot2Clicked)
 		self.SkillSlot3ClickHandler = self.SkillSlot3Button.Entity:ConnectEvent(ButtonClickEvent, self.OnSkillSlot3Clicked)
@@ -256,6 +266,94 @@ script BattleQueueHudComponent extends Component
 		self.ResetClickHandler = self.ResetButton.Entity:ConnectEvent(ButtonClickEvent, self.OnResetClicked)
 		self:BindOrbisEpilogue()
 		self:RefreshHud(true)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ConfigureExecutePresentation()
+		-- Keep one mobile Execute target and move tutorial guidance onto the sword button.
+		local mobile = _ApplicationService:IsMobilePlatform()
+		self.ExecuteButton.Entity.Enable = not mobile
+		if not mobile then
+			log("[VRF] execute controls mobile=false primary=PC_BUTTON")
+			return
+		end
+		if self.ExecuteTutorialHighlight ~= nil and isvalid(self.ExecuteTutorialHighlight.Entity) then
+			self.ExecuteTutorialHighlight.Entity.Enable = false
+		end
+		local sword = _EntityService:GetEntityByPath("/ui/MobileControlsHUD/Controls/Execute")
+		local highlight = isvalid(sword) and sword:GetChildByName("TutorialHighlight") or nil
+		if not isvalid(highlight) or highlight.SpriteGUIRendererComponent == nil then
+			log_error("[VRF] mobile sword tutorial highlight missing")
+			return
+		end
+		self.ExecuteTutorialHighlight = highlight.SpriteGUIRendererComponent
+		log("[VRF] execute controls mobile=true primary=SWORD legacy=false tutorial=SWORD")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshMobileQueueViewport()
+		-- Re-evaluate the actual app window after folding or resizing; PC keeps the authored positions.
+		if not _ApplicationService:IsMobilePlatform() then
+			if self._T.QueueViewportActive then self:RestoreQueueViewport() end
+			return
+		end
+		local width, height = _UILogic.ScreenWidth, _UILogic.ScreenHeight
+		if width <= 0 or height <= 0 then return end
+		self:ApplyMobileQueueViewport(1080 * width / height)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ApplyMobileQueueViewport(number visibleWidth)
+		-- Keep seven 88-pixel slots between movement and Execute on landscape windows at least 1.1:1.
+		if not _ApplicationService:IsMobilePlatform() or visibleWidth <= 0 then return end
+		if not isvalid(self.QueuePanelEntity) or self.QueuePanelEntity.UITransformComponent == nil
+			or self.TurnText == nil or not isvalid(self.TurnText.Entity) or self.TurnText.Entity.UITransformComponent == nil then return end
+		if self._T.QueueViewportWidth ~= nil and math.abs(self._T.QueueViewportWidth - visibleWidth) < 0.5 then return end
+		local panel = self.QueuePanelEntity.UITransformComponent
+		local turn = self.TurnText.Entity.UITransformComponent
+		local buffBar = self.QueuePanelEntity:GetChildByName("BuffBar", false)
+		if not isvalid(buffBar) or buffBar.UITransformComponent == nil then return end
+		local buff = buffBar.UITransformComponent
+		if self._T.QueueBuffBase == nil then
+			self._T.QueueBuffBase = Vector2(buff.anchoredPosition.x, buff.anchoredPosition.y)
+		end
+		if self._T.QueueViewportBase == nil then
+			self._T.QueueViewportBase = Vector2(panel.anchoredPosition.x, panel.anchoredPosition.y)
+			self._T.QueueTurnBase = Vector2(turn.anchoredPosition.x, turn.anchoredPosition.y)
+		end
+		if self._T.SkillSlotDragCandidate or self._T.SkillSlotDragActive then
+			self:CleanupSkillSlotDragVisuals(false)
+			self.SuppressSkillClickUntil = _UtilLogic.ElapsedSeconds + self.SkillSlotDragClickSuppressionSeconds
+			self.SuppressSkillDragUntil = self.SuppressSkillClickUntil
+		end
+		local base = self._T.QueueViewportBase
+		local shift = math.max(0, 706 - visibleWidth * 0.5)
+		panel.anchoredPosition = Vector2(base.x + shift, base.y)
+		-- Keep the turn count below the sword: text top 86, button bottom 102, on every mobile width.
+		turn.anchoredPosition = Vector2(visibleWidth * 0.5 - 120 - base.x - shift, 60 - base.y)
+		-- Place buffs below the stage header, away from the single potion row and right-side actions.
+		buff.anchoredPosition = Vector2(32 - visibleWidth * 0.5 - base.x - shift, 730 - base.y)
+		self._T.QueueViewportWidth = visibleWidth
+		self._T.QueueViewportActive = true
+		log("[VRF] battle queue viewport=" .. tostring(visibleWidth) .. "x1080 shift=" .. tostring(shift) .. " turn=" .. tostring(turn.anchoredPosition) .. " buff=" .. tostring(buff.anchoredPosition))
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RestoreQueueViewport()
+		-- Restore the captured authoring layout when leaving the mobile viewport path.
+		if self._T.QueueViewportBase == nil then return end
+		if isvalid(self.QueuePanelEntity) and self.QueuePanelEntity.UITransformComponent ~= nil then
+			self.QueuePanelEntity.UITransformComponent.anchoredPosition = self._T.QueueViewportBase
+			local buffBar = self.QueuePanelEntity:GetChildByName("BuffBar", false)
+			if isvalid(buffBar) and buffBar.UITransformComponent ~= nil and self._T.QueueBuffBase ~= nil then
+				buffBar.UITransformComponent.anchoredPosition = self._T.QueueBuffBase
+			end
+		end
+		if self.TurnText ~= nil and isvalid(self.TurnText.Entity) and self.TurnText.Entity.UITransformComponent ~= nil then
+			self.TurnText.Entity.UITransformComponent.anchoredPosition = self._T.QueueTurnBase
+		end
+		self._T.QueueViewportWidth = nil
+		self._T.QueueViewportActive = false
 	end
 
 	@ExecSpace("ClientOnly")
@@ -302,6 +400,10 @@ script BattleQueueHudComponent extends Component
 			_BattleHudPresenterLogic:DisconnectEvent(BattleHudCommandResultEvent, self.PresenterCommandResultHandler)
 			self.PresenterCommandResultHandler = nil
 		end
+		if self.UtilitySlotClickHandler ~= nil then
+			if isvalid(self.UtilitySlot) then self.UtilitySlot:DisconnectEvent(ButtonClickEvent, self.UtilitySlotClickHandler) end
+			self.UtilitySlotClickHandler = nil
+		end
 		if self.SkillSlot1ClickHandler ~= nil then
 			self.SkillSlot1Button.Entity:DisconnectEvent(ButtonClickEvent, self.SkillSlot1ClickHandler)
 			self.SkillSlot1ClickHandler = nil
@@ -340,6 +442,7 @@ script BattleQueueHudComponent extends Component
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
 		-- Keep buff and hover refresh under one client lifecycle callback.
+		self:RefreshMobileQueueViewport()
 		self:UpdateOrbisEpilogue(delta)
 		self:RefreshBuffBar()
 		self:UpdateTutorialHighlight(delta)
@@ -415,7 +518,8 @@ script BattleQueueHudComponent extends Component
 		self.UtilityCooldownText.Text = turns > 0 and tostring(turns) or ""
 		self.UtilityCooldownText.Entity.Enable = turns > 0
 		local presentation = _LobbyCharacterSelectionLogic:GetJobPassivePresentation(session.SelectedJobId)
-		self._T.UtilityDescription = presentation.Text .. "\n사용 키: S"
+		local inputHint = _ApplicationService:IsMobilePlatform() and "\n사용: 고유스킬 슬롯 터치" or "\n사용 키: S"
+		self._T.UtilityDescription = presentation.Text .. inputHint
 		if turns > 0 then self._T.UtilityDescription = self._T.UtilityDescription .. "\n남은 대기시간: " .. tostring(turns) .. "턴" end
 		self._T.UtilitySignature = signature
 		log("[BattleUtilityHUD] skill=" .. session.UtilitySkillId .. " cooldown=" .. tostring(turns))
@@ -540,7 +644,7 @@ script BattleQueueHudComponent extends Component
 		local uiState = presenterState.UiState
 		self:ConsumeSkillSlotReorderReceipt(session)
 		self._T.ShopSkillPreview = false
-		self.ExecuteButton.Entity.Enable = true
+		self.ExecuteButton.Entity.Enable = not _ApplicationService:IsMobilePlatform()
 		self:SetHudContextVisible(true, "BATTLE_CONTEXT_READY")
 		local queueState = uiState.PlayerQueue
 		local runFlowUi = presenterState.RunFlowUi
@@ -636,7 +740,7 @@ script BattleQueueHudComponent extends Component
 				self:PlayQueueIconPop(queuedSlotIndex, queuedSkillForPop)
 			end
 		end
-		self.ExecuteButton.Enable = canUseQueuedTile
+		self.ExecuteButton.Enable = canUseQueuedTile and not _ApplicationService:IsMobilePlatform()
 		self.CanClearQueue = uiState.Commands.CanClear
 		if visibleQueue == "" then
 			self.QueueSlotSprite.Color = Color(0.15, 0.20, 0.28, 1)
@@ -1877,7 +1981,9 @@ script BattleQueueHudComponent extends Component
 				if relics ~= nil then medalBonus = relics.BattleKillAttackBonus end
 			end
 		end
-		local signature = snapshot .. ":" .. self.IconSnapshot .. ":medal:" .. tostring(medalBonus)
+		local mobile = _ApplicationService:IsMobilePlatform()
+		local rowDirection = mobile and -1 or 1
+		local signature = snapshot .. ":" .. self.IconSnapshot .. ":medal:" .. tostring(medalBonus) .. ":mobile:" .. tostring(mobile)
 		if signature == self._T.BuffBarSignature then
 			return
 		end
@@ -1918,7 +2024,7 @@ script BattleQueueHudComponent extends Component
 			view.Enable = buff ~= nil
 			view.Visible = buff ~= nil
 			if buff ~= nil then
-				view.UITransformComponent.anchoredPosition = Vector2(((index - 1) % 6) * self.BuffIconSpacing, math.floor((index - 1) / 6) * 100)
+				view.UITransformComponent.anchoredPosition = Vector2(((index - 1) % 6) * self.BuffIconSpacing, rowDirection * math.floor((index - 1) / 6) * 100)
 				local icon = view:GetChildByName("Icon", false)
 				local turnText = view:GetChildByName("TurnText", false)
 				-- A clone may finish constructing its children on a later frame; do not cache an incomplete redraw.
@@ -1937,6 +2043,7 @@ script BattleQueueHudComponent extends Component
 		end
 		self._T.BuffBarSignature = signature
 		log("[BattleBuffHUD] refreshed count=" .. tostring(#buffs) .. " buffs=" .. snapshot)
+		log("[VRF] battle buff rows=" .. tostring(math.ceil(#buffs / 6)) .. " mobile=" .. tostring(mobile) .. " direction=" .. tostring(rowDirection))
 	end
 
 	@ExecSpace("ClientOnly")
@@ -2174,6 +2281,16 @@ script BattleQueueHudComponent extends Component
 	end
 
 	@ExecSpace("ClientOnly")
+	method void OnUtilitySlotClicked()
+		-- Use the shared utility command path so cooldown, turn buffering and server validation stay consistent.
+		if not self.IsHudContextVisible or self.IsMapTransferPending or self._T.ShopSkillPreview
+			or not isvalid(self.UtilitySlot) or not self.UtilitySlot.EnabledInHierarchy then return end
+		_GameUIPolishLogic:PlayClick()
+		log("[VRF] battle utility slot command=UTILITY")
+		_BattleHudPresenterLogic:SubmitLocalCommand("UTILITY", "", 0)
+	end
+
+	@ExecSpace("ClientOnly")
 	method void OnSkillSlot1Clicked()
 		self:RequestSlotSkill(1, false)
 	end
@@ -2205,6 +2322,8 @@ script BattleQueueHudComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnExecuteClicked()
+		-- The legacy button belongs to PC; mobile uses the captured sword-button tap path.
+		if _ApplicationService:IsMobilePlatform() then return end
 		log("[BattleQueueHUD] execute clicked")
 		_BattleHudPresenterLogic:RequestExecuteQueue()
 	end

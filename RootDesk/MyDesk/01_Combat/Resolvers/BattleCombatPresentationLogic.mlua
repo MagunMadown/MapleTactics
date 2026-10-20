@@ -391,6 +391,15 @@ script BattleCombatPresentationLogic extends Logic
 		boardCamera.CameraOffset = Vector2(boardCenterX - anchorX, playerCamera.CameraOffset.y)
 		boardCamera.ScreenOffset = playerCamera.ScreenOffset
 		boardCamera.ZoomRatio = playerCamera.ZoomRatio
+		-- Fit only this map's camera; the lobby and common movement retain the player's settings.
+		session._T.MobileBoardBaseZoom = playerCamera.ZoomRatio
+		session._T.MobileBoardFitSignature = nil
+		session._T.MobileBoardPendingSignature = nil
+		if _ApplicationService:IsMobilePlatform() then
+			-- Raise the mobile viewpoint enough to show more scenery and less underground terrain.
+			boardCamera.ScreenOffset = Vector2(playerCamera.ScreenOffset.x, math.min(playerCamera.ScreenOffset.y, 0.52))
+			log("[VRF] mobile battle framing map=" .. session.Entity.Name .. " screenY=" .. tostring(boardCamera.ScreenOffset.y))
+		end
 		boardCamera.ConfineCameraArea = false
 		boardCamera.Damping = Vector2(0, 0)
 		boardCamera.DeadZone = Vector2(0, 0)
@@ -399,6 +408,52 @@ script BattleCombatPresentationLogic extends Logic
 		_CameraService.TransitionBlendTime = 0
 		_CameraService:SwitchCameraTo(boardCamera)
 		log("[BattleCamera] fixed anchor active centerX=" .. boardCenterX .. " anchorX=" .. anchorX .. " offsetX=" .. boardCamera.CameraOffset.x)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshMobileBoardCamera(any session, number visualCellWidth, number delta)
+		-- Measure the live projection so every board fits on phones and tablets without changing cells.
+		if not _ApplicationService:IsMobilePlatform() then return end
+		local player = _UserService.LocalPlayer
+		if not isvalid(player) or player.CurrentMap ~= session.Entity then return end
+		local anchor = session.Entity:GetChildByName("BattleCameraAnchor", false)
+		if not isvalid(anchor) or anchor.CameraComponent == nil then return end
+		local camera = anchor.CameraComponent
+		if _CameraService:GetCurrentCameraComponent() ~= camera then return end
+		local baseZoom = session._T.MobileBoardBaseZoom
+		local width, height = _UILogic.ScreenWidth, _UILogic.ScreenHeight
+		if baseZoom == nil or baseZoom <= 0 or width <= 0 or height <= 0 or session.CellCount <= 0 then return end
+		local signature = tostring(width) .. ":" .. tostring(height) .. ":" .. tostring(session.EntryRequestId) .. ":" .. tostring(session.CellCount) .. ":" .. tostring(session.CellStartX) .. ":" .. tostring(session.CellSpacing) .. ":" .. tostring(visualCellWidth) .. ":" .. tostring(baseZoom)
+		if session._T.MobileBoardFitSignature == signature then
+			session._T.MobileBoardSettleRemaining = math.max(0, (session._T.MobileBoardSettleRemaining or 0) - math.max(0, delta))
+			return
+		end
+		-- Camera switches can leave the previous camera's projection alive for several frames.
+		if session._T.MobileBoardPendingSignature ~= signature then
+			session._T.MobileBoardPendingSignature = signature
+			session._T.MobileBoardFitRemaining = 0.15
+			session._T.MobileBoardFitFrames = 3
+			return
+		end
+		session._T.MobileBoardFitRemaining = (session._T.MobileBoardFitRemaining or 0) - math.max(0, delta)
+		session._T.MobileBoardFitFrames = math.max(0, (session._T.MobileBoardFitFrames or 0) - 1)
+		if session._T.MobileBoardFitRemaining > 0 or session._T.MobileBoardFitFrames > 0 then return end
+		-- Include the outside half-cells, sprite/shake slack, and 5% screen margins on each side.
+		local halfCell = math.max(math.abs(session.CellSpacing), visualCellWidth) * 0.5 + 0.2
+		local leftX = math.min(session.CellStartX, session.CellStartX + session.CellSpacing * (session.CellCount - 1)) - halfCell
+		local rightX = math.max(session.CellStartX, session.CellStartX + session.CellSpacing * (session.CellCount - 1)) + halfCell
+		local left = _UILogic:WorldToScreenPosition(Vector2(leftX, session.UnitY))
+		local right = _UILogic:WorldToScreenPosition(Vector2(rightX, session.UnitY))
+		local projectedWidth = math.abs(right.x - left.x)
+		-- CameraService.currentZoomRatio is the global zoom multiplier, separate from this camera's zoom.
+		local measuredZoom = camera.ZoomRatio
+		if projectedWidth <= 0 or measuredZoom <= 0 then return end
+		local targetZoom = math.min(baseZoom, measuredZoom * width * 0.9 / projectedWidth)
+		targetZoom = math.max(camera.ZoomRatioMin, math.min(camera.ZoomRatioMax, targetZoom))
+		camera.ZoomRatio = targetZoom
+		session._T.MobileBoardFitSignature = signature
+		session._T.MobileBoardSettleRemaining = 0.1
+		log("[VRF] mobile board fit map=" .. session.Entity.Name .. " cells=" .. tostring(session.CellCount) .. " viewport=" .. tostring(width) .. "x" .. tostring(height) .. " projected=" .. tostring(projectedWidth) .. " baseZoom=" .. tostring(baseZoom) .. " zoom=" .. tostring(targetZoom))
 	end
 
 	@ExecSpace("ClientOnly")
