@@ -54,19 +54,40 @@ script BattleTestHubLogic extends Logic
 
 	@ExecSpace("Server")
 	method void RequestStartStage(string stageId, string jobId, integer runSeed)
+		-- Preserves the existing default-start RPC contract.
 		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
 		local result = self:StartStage(playerEntity, stageId, jobId, runSeed)
 		self:NotifyStartResult(result.Success, result.Reason, stageId, senderUserId)
 	end
 
+	@ExecSpace("Server")
+	method void RequestStartStageWithLoadout(string stageId, string jobId, integer runSeed, string slotIds)
+		-- Resolves the actual caller; clients never choose another player's inventory.
+		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
+		local result = self:StartStageWithLoadout(playerEntity, stageId, jobId, runSeed, slotIds)
+		self:NotifyStartResult(result.Success, result.Reason, stageId, senderUserId)
+	end
+
 	@ExecSpace("ServerOnly")
 	method table StartStage(Entity playerEntity, string stageId, string jobId, integer runSeed)
+		-- Keeps all pre-existing callers on the unmodified normal starter selection.
+		return self:StartStageWithLoadout(playerEntity, stageId, jobId, runSeed, "")
+	end
+
+	@ExecSpace("ServerOnly")
+	method table StartStageWithLoadout(Entity playerEntity, string stageId, string jobId, integer runSeed, string slotIds)
+		-- Validates test-only overrides before preparing or starting a new run.
 		if isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then
 			return { Success = false, Reason = "INVALID_PLAYER" }
 		end
 		if isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= self.TestHubMapId then
 			log_warning("[BattleTestHub] start rejected player=" .. playerEntity.Name .. " reason=NOT_IN_TEST_HUB")
 			return { Success = false, Reason = "NOT_IN_TEST_HUB" }
+		end
+		if slotIds ~= "" then
+			if Environment:IsMakerPlay() == false then return {Success = false, Reason = "TEST_LOADOUT_MAKER_ONLY"} end
+			local validation = _BattleTestLoadoutLogic:ValidateLoadout(jobId, slotIds)
+			if validation.Success == false then return validation end
 		end
 
 		local stageValidation = _ContentValidatorLogic:ValidateStageById(stageId)
@@ -85,6 +106,10 @@ script BattleTestHubLogic extends Logic
 		if readiness.Success == false then
 			return { Success = false, Reason = readiness.Reason or "PROFILE_LOAD_IN_PROGRESS" }
 		end
+		local jobAccess = _UnionShopServiceLogic:CanSelectJob(playerEntity, jobId)
+		if jobAccess.Success == false and (Environment:IsMakerPlay() == false or jobAccess.Reason ~= "JOB_LOCKED") then
+			return jobAccess
+		end
 
 		local seed = math.max(1, math.min(9999999, math.floor(math.abs(runSeed))))
 		local prepare = _BattleGatewayLogic:PrepareBattleEntry(playerEntity, stageId, "", jobId, "", seed, "NEW_RUN")
@@ -99,6 +124,10 @@ script BattleTestHubLogic extends Logic
 		if markResult.Success == false then
 			return markResult
 		end
+		if slotIds ~= "" then
+			local loadout = entryState:SetPrototypeTestLoadout(prepare.RequestId, slotIds)
+			if loadout.Success == false then entryState:Cancel(loadout.Reason) return loadout end
+		end
 
 		local transfer = _BattleGatewayLogic:TransferPreparedLobbyBattleEntry(playerEntity, prepare.RequestId)
 		if transfer.Success == false then
@@ -107,6 +136,21 @@ script BattleTestHubLogic extends Logic
 		end
 		log("[BattleTestHub] start accepted player=" .. playerEntity.Name .. " stage=" .. stageId .. " map=" .. route.MapId .. " job=" .. jobId .. " seed=" .. tostring(seed))
 		return transfer
+	end
+
+	@ExecSpace("ServerOnly")
+	method boolean CanBypassJobLock(Entity playerEntity, string jobId)
+		-- Authorizes only the claimed Maker request granted while its owner was inside this test hub.
+		if Environment:IsMakerPlay() == false or isvalid(playerEntity) == false or playerEntity.PlayerComponent == nil then return false end
+		local entry = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		if entry == nil or entry.EntryState ~= "INITIALIZING" or entry.EntryMode ~= "NEW_RUN"
+			or entry.PrototypeTestEntry ~= true or entry.JobId ~= jobId or entry.RequestId <= 0
+			or entry.PrototypeTestJobAccessRequestId ~= entry.RequestId
+			or entry.LastTransferRequestId ~= entry.RequestId or isvalid(playerEntity.CurrentMap) == false then
+			return false
+		end
+		local route = _StageMapRouteRepositoryLogic:GetMapRoute(entry.StageId)
+		return route.Success == true and route.MapId == playerEntity.CurrentMap.Name
 	end
 
 	@ExecSpace("Client")

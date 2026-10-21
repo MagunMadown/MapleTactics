@@ -1,0 +1,91 @@
+@Logic
+script EnemyDefeatSuccessorLogic extends Logic
+
+	@ExecSpace("ServerOnly")
+	method table ValidateDefinition(any dataSet, string enemyDefinitionId)
+		-- Validate the optional defeat chain without recursively loading combat definitions.
+		local seen = {}
+		local currentId = enemyDefinitionId
+		local pools = _DataService:GetTable("EnemySpawnPools")
+		while currentId ~= "" do
+			if seen[currentId] then return { Success = false, Reason = "DEATH_SPAWN_CYCLE" } end
+			seen[currentId] = true
+			local row = dataSet:FindRow("EnemyDefinitionId", currentId)
+			if row == nil then return { Success = false, Reason = "DEATH_SPAWN_ENEMY_NOT_FOUND" } end
+			local nextId = row:GetItem("DeathSpawnEnemyDefinitionId") or ""
+			local modelId = row:GetItem("DeathSpawnModelId") or ""
+			if nextId == "" and modelId == "" then return { Success = true, Reason = "OK" } end
+			if nextId == "" or modelId == "" then return { Success = false, Reason = "DEATH_SPAWN_PAIR_REQUIRED" } end
+			if _StageWaveRepositoryLogic:ParseBooleanCell(row:GetItem("IsBoss")) then
+				return { Success = false, Reason = "DEATH_SPAWN_BOSS_NOT_SUPPORTED" }
+			end
+			local registered = false
+			if pools ~= nil then
+				for index = 1, pools:GetRowCount() do
+					if pools:GetCell(index, "EnemyDefinitionId") == nextId and pools:GetCell(index, "EnemyModelId") == modelId then
+						registered = true
+						break
+					end
+				end
+			end
+			if not registered then return { Success = false, Reason = "DEATH_SPAWN_MODEL_PAIR_NOT_REGISTERED" } end
+			local nextRow = dataSet:FindRow("EnemyDefinitionId", nextId)
+			if nextRow ~= nil and _StageWaveRepositoryLogic:ParseBooleanCell(nextRow:GetItem("IsBoss")) then
+				return { Success = false, Reason = "DEATH_SPAWN_BOSS_NOT_SUPPORTED" }
+			end
+			currentId = nextId
+		end
+		return { Success = true, Reason = "OK" }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table SpawnSuccessor(any session, Entity defeatedEntity)
+		-- Register a new empty-plan actor before death settlement can decide that the battlefield is clear.
+		local unit = isvalid(defeatedEntity) and defeatedEntity:GetComponent("script.BattleUnitComponent") or nil
+		if unit == nil or unit.Team ~= "Enemy" then return { Success = true, Reason = "NOT_ENEMY" } end
+		if unit._T.DefeatSuccessorState ~= nil then
+			return { Success = unit._T.DefeatSuccessorState == "SPAWNED", Reason = "ALREADY_ATTEMPTED" }
+		end
+		local entry = session.EntryRequestId
+		local dataSet = _DataService:GetTable(_StageWaveRepositoryLogic.EnemyDefinitionDataSetName)
+		local row = dataSet ~= nil and dataSet:FindRow("EnemyDefinitionId", unit.EnemyDefinitionId) or nil
+		local nextId = row ~= nil and (row:GetItem("DeathSpawnEnemyDefinitionId") or "") or ""
+		local modelId = row ~= nil and (row:GetItem("DeathSpawnModelId") or "") or ""
+		if nextId == "" and modelId == "" then return { Success = true, Reason = "NOT_CONFIGURED" } end
+		local validation = self:ValidateDefinition(dataSet, unit.EnemyDefinitionId)
+		if not validation.Success then return validation end
+		unit._T.DefeatSuccessorState = "SPAWNING"
+		local successor = _StageWaveRepositoryLogic:GetEnemyDefinition(nextId)
+		if not successor.Success then return successor end
+		if session.EntryRequestId ~= entry or session.BattleResult ~= "" then
+			return { Success = false, Reason = "STALE_DEATH_SPAWN" }
+		end
+		successor.EnemyModelId = modelId
+		successor.SelectionRoll = 0
+		successor.TotalWeight = 0
+		local spawnOrder = unit.SpawnOrder + 1
+		for _, actor in ipairs(session.BoardState:CollectRegisteredUnits()) do
+			local actorUnit = actor:GetComponent("script.BattleUnitComponent")
+			if actorUnit ~= nil then spawnOrder = math.max(spawnOrder, actorUnit.SpawnOrder + 1) end
+		end
+		local child = session:SpawnWaveEnemy("successor_" .. unit.UnitId, unit.CellIndex, unit.Facing, spawnOrder, successor)
+		if session.EntryRequestId ~= entry or session.BattleResult ~= "" or not isvalid(defeatedEntity) then
+			-- Resource loading may yield across a reset; an old death may not insert an actor into the new battle.
+			if isvalid(child) then
+				local childUnit = child:GetComponent("script.BattleUnitComponent")
+				if childUnit ~= nil and session:FindUnitEntity(childUnit.UnitId) == child then
+					session.BoardState:UnregisterUnit(childUnit.UnitId)
+				end
+				_EntityService:Destroy(child)
+			end
+			return { Success = false, Reason = "STALE_DEATH_SPAWN" }
+		end
+		if not isvalid(child) then
+			unit._T.DefeatSuccessorState = "FAILED"
+			return { Success = false, Reason = "DEATH_SPAWN_FAILED" }
+		end
+		unit._T.DefeatSuccessorState = "SPAWNED"
+		unit._T.DefeatSuccessorEntity = child
+		return { Success = true, Reason = "SUCCESSOR_SPAWNED", Entity = child }
+	end
+end
