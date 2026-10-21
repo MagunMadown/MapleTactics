@@ -1002,7 +1002,7 @@
 -->
 <script type="application/json" id="vocabCatalog">
 {
-  "catalogVersion": "2026-10-17 battle session split sync (develop 502994c)",
+  "catalogVersion": "2026-10-21 El Nath defeat successor sync (develop 0a1ab49)",
   "sources": [
     "RootDesk/MyDesk/03_Data/Repositories/ContentValidatorLogic.mlua",
     "RootDesk/MyDesk/03_Data/Repositories/EnemyPatternContentValidatorLogic.mlua",
@@ -6254,6 +6254,9 @@
     }
     buildEditableStat(stats, "고정 피해 감소", "EnemyDefinitions", c.rowIndex, "FlatDamageReduction");
     buildEditableStat(stats, "승천 HP 보너스", "EnemyDefinitions", c.rowIndex, "AscensionHpBonus");
+    if (buildEditableStat(stats, "처치 후 분리 적", "EnemyDefinitions", c.rowIndex, "DeathSpawnEnemyDefinitionId")) {
+      buildEditableStat(stats, "분리 적 모델", "EnemyDefinitions", c.rowIndex, "DeathSpawnModelId");
+    }
     const patK = document.createElement("div"); patK.className = "stat-k"; patK.textContent = "패턴 ID";
     const patV = document.createElement("div"); patV.className = "stat-v"; patV.style.fontSize = "var(--fs-2xs)"; patV.textContent = c.patternId || "—";
     stats.appendChild(patK); stats.appendChild(patV);
@@ -7082,6 +7085,41 @@
     const idx = new Map(def.header.map((h, i) => [h, i]));
     return def.rows.map((row, rowIndex) => ({ rowIndex, get: (c) => (idx.has(c) ? (row[idx.get(c)] || "").trim() : "") }));
   }
+
+  // EnemyDefeatSuccessorLogic.ValidateDefinition: walks the optional
+  // DeathSpawnEnemyDefinitionId / DeathSpawnModelId chain from one enemy, in
+  // the game's check order. Returns { ok, reason, chain } where chain lists the
+  // successor EnemyDefinitionIds in spawn order (empty when not configured).
+  function deathSpawnCheck(enemyId) {
+    const enemies = new Map(tableRowsOf("EnemyDefinitions").map((r) => [r.get("EnemyDefinitionId"), r]));
+    const pools = tableRowsOf("EnemySpawnPools");
+    const isBoss = (r) => !!r && r.get("IsBoss").toLowerCase() === "true";
+    const seen = new Set();
+    const chain = [];
+    let current = enemyId;
+    while (current) {
+      if (seen.has(current)) return { ok: false, reason: "DEATH_SPAWN_CYCLE", chain };
+      seen.add(current);
+      const row = enemies.get(current);
+      if (!row) return { ok: false, reason: "DEATH_SPAWN_ENEMY_NOT_FOUND", chain };
+      const next = row.get("DeathSpawnEnemyDefinitionId"), model = row.get("DeathSpawnModelId");
+      if (!next && !model) return { ok: true, reason: "OK", chain };
+      if (!next || !model) return { ok: false, reason: "DEATH_SPAWN_PAIR_REQUIRED", chain };
+      if (isBoss(row)) return { ok: false, reason: "DEATH_SPAWN_BOSS_NOT_SUPPORTED", chain };
+      if (!pools.some((p) => p.get("EnemyDefinitionId") === next && p.get("EnemyModelId") === model)) return { ok: false, reason: "DEATH_SPAWN_MODEL_PAIR_NOT_REGISTERED", chain };
+      if (isBoss(enemies.get(next))) return { ok: false, reason: "DEATH_SPAWN_BOSS_NOT_SUPPORTED", chain };
+      chain.push(next);
+      current = next;
+    }
+    return { ok: true, reason: "OK", chain };
+  }
+  const DEATH_SPAWN_REASON = {
+    DEATH_SPAWN_CYCLE: "처치 후 분리 체인이 순환합니다",
+    DEATH_SPAWN_ENEMY_NOT_FOUND: "처치 후 분리 대상 적 정의가 없습니다",
+    DEATH_SPAWN_PAIR_REQUIRED: "DeathSpawnEnemyDefinitionId와 DeathSpawnModelId는 둘 다 채우거나 둘 다 비워야 합니다",
+    DEATH_SPAWN_BOSS_NOT_SUPPORTED: "보스는 처치 후 분리 체인에 들어갈 수 없습니다",
+    DEATH_SPAWN_MODEL_PAIR_NOT_REGISTERED: "EnemySpawnPools에 이 적 정의·모델 조합이 없습니다",
+  };
 
   function buildRelicConcepts() {
     const shopByRelic = new Map();
@@ -8314,6 +8352,14 @@
     }
 
     rows.forEach((row, ri) => {
+      if (def.fileName === "EnemyDefinitions.csv" && header.includes("DeathSpawnEnemyDefinitionId")) {
+        // ContentIntegrityValidatorLogic.ValidateDefeatSuccessors checks every row's whole chain.
+        const check = deathSpawnCheck((row[header.indexOf("EnemyDefinitionId")] || "").trim());
+        if (!check.ok) {
+          const col = check.reason === "DEATH_SPAWN_MODEL_PAIR_NOT_REGISTERED" || check.reason === "DEATH_SPAWN_PAIR_REQUIRED" ? "DeathSpawnModelId" : "DeathSpawnEnemyDefinitionId";
+          issues.push({ row: ri, col, level: "error", msg: `${DEATH_SPAWN_REASON[check.reason] || check.reason} (게임 검증: ${check.reason}).` });
+        }
+      }
       if (def.fileName === "EnemyDefinitions.csv") {
         for (const field of ["FlatDamageReduction", "AscensionHpBonus"]) {
           const index = header.indexOf(field);
@@ -10863,10 +10909,13 @@
         enemies += count;
         cands.forEach((c) => {
           const share = count * c.weight / total;
-          const ev = dropEv.get(c.enemyId);
-          if (!ev) return;
-          dropGold += share * ev.gold;
-          ev.items.forEach((n, ref) => items.set(ref, (items.get(ref) || 0) + share * n));
+          // Each real enemy drops once, including defeat successors (EnemyDefeatSuccessorLogic).
+          [c.enemyId, ...deathSpawnCheck(c.enemyId).chain].forEach((id) => {
+            const ev = dropEv.get(id);
+            if (!ev) return;
+            dropGold += share * ev.gold;
+            ev.items.forEach((n, ref) => items.set(ref, (items.get(ref) || 0) + share * n));
+          });
         });
       });
     }
@@ -11331,6 +11380,13 @@
             chip.className = "stage-cand" + (e && e.boss ? " boss" : "");
             chip.title = `${c.enemyId} · 가중치 ${c.weight}/${total} · HP ${e ? e.hp : "?"} — 가중치는 EnemySpawnPools에서 편집`;
             chip.textContent = `${e ? e.name : c.enemyId} ${Math.round(c.weight / total * 100)}%`;
+            // EnemyDefeatSuccessorLogic: the successor occupies the same cell and must also be defeated.
+            const succ = deathSpawnCheck(c.enemyId).chain;
+            if (succ.length) {
+              const names = succ.map((id) => (enemies.get(id) || {}).name || id);
+              chip.textContent += ` → ${names.join(" → ")}`;
+              chip.title += ` · 처치하면 같은 칸에 ${names.join(" → ")} 등장 (각각 처치·드롭 1회, 승리 조건에 포함)`;
+            }
             const wWidget = buildEditableCell("EnemySpawnPools", c.rowIndex, "Weight");
             if (wWidget) { wWidget.classList.add("stage-weight"); wWidget.title = "가중치"; chip.appendChild(wWidget); }
             td.appendChild(chip);
