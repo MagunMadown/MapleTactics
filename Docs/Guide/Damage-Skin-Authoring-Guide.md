@@ -53,7 +53,7 @@ local result2 = presentation:SetDamageSkin("maple_taken", true) -- 내가 받는
 
 ## 검증 현황 및 수동 테스트
 
-Maker MCP 연결 후 Refresh/Play를 확인했다. 빌드 오류 0건, `[DamageSkinData] loaded count=2`, 기본 스킨 2개의 `preloaded` 로그가 확인됐다. 전투 로그에서 몬스터와 플레이어의 데미지스킨 호출도 각각 확인됐다. **실제 숫자 위치와 사망 직전 표시의 화면 검증은 아직 남았다.** 정적 검증 명령은 `node Artifacts/tests/damage-skin-contract-test.cjs`다.
+Maker MCP 연결 후 Refresh/Play를 확인했다. 빌드 오류 0건, `[DamageSkinData] loaded count=2`, 기본 스킨 2개의 `preloaded` 로그가 확인됐다. 전투 로그에서 몬스터와 플레이어의 데미지스킨 호출도 각각 확인됐다. **실제 숫자 위치와 사망 직전 표시의 화면 검증은 아직 남았다.** 현재 저장소의 공통 정적 검증은 `node --test tools/*.test.cjs`로 실행하며, 과거 전용 `Artifacts/tests/damage-skin-contract-test.cjs`는 현재 트리에 없다.
 
 2026-09-28 해적 `magnum_shot` 런타임 재검증: 머쉬맘 대상 4회 HP 감소(18→14), `[DamageSkin] ... hits=4 interval=0.08` 1회가 확인됐다. HP 2에서 마무리한 경우에도 `hits=2`가 사망 처리 전에 전달됐다. 다단히트 피격 효과는 1회, 0.5초 피격 모션 시작은 0회였고 빌드 오류는 없었다. 숫자 애니메이션의 체감 간격과 위치는 실제 화면에서 최종 확인이 필요하다.
 

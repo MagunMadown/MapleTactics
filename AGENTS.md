@@ -313,4 +313,46 @@ the validator code and CSVs on load, but without description, per-type inputs or
 
 검증 기준: Maker에서 로비와 전투맵 각각 좌/우 단발 이동, 연속 입력, 빠른 방향 전환, 막힌 셀·경계, 착지 직후 다음 이동, 맵 전환을 실제 입력으로 비교한다. 동일한 한 칸 이동의 시간·궤적·착지 스냅·카메라 및 이름표 떨림을 확인하고, 서버 목적 셀과 최종 위치가 일치하는지 로그로 검증한다. 전투에서는 턴 진행과 스킬/강제 이동 후 일반 이동 복귀도 확인한다. 코드 확인과 실제 플레이 검증 결과는 구분해서 보고하며, 프레임 간격 측정을 GPU FPS 측정으로 표현하지 않는다.
 
-현재 남은 차이 (2026-10-07, develop 7a0eb99 기준): 일반 이동은 클라이언트 루트 이동으로 맞춰졌지만, 전투는 완료 시 서버가 한 번 위치를 맞추고 로비는 유예 후 오차가 있을 때만 보정한다. 이 차이는 통일 완료로 간주하지 않으며, 다음 이동 변경에서 공통 착지·보정 정책으로 정리하고 양쪽을 검증한다. 이 지침 추가 자체는 런타임 수정이나 검증 완료를 의미하지 않는다.
+현재 코드 상태 (2026-10-22, develop 8703433 기준): 로비와 전투의 일반 이동은 모두 `PlayerGridMovementLogic.CreateLandingCheck` / `UpdateLandingCheck`의 공통 착지·보정 정책을 사용한다. 이는 코드 경로 통일을 뜻할 뿐 Maker 실제 입력 비교가 완료됐다는 뜻은 아니다. 다음 이동 변경에서는 위 검증 기준에 따라 로비와 전투를 함께 플레이 검증한다.
+
+<!-- trail:start -->
+## Trail — repo context graph
+
+This repo is indexed in `.trail/cache/`: small linked markdown nodes that explain each
+system and carry exact file:line spans, kept in sync with the code through git.
+
+For ANY task here — understanding how something works, finding where code lives,
+or scoping a change — get context from the graph before grepping or opening
+source files. Re-ask freely (it's cheap) and reuse literal identifiers you
+already have (symbol, error string, file name) as the query. New to this repo?
+Run `trail map` first — a token-budgeted orientation (dir clusters, hubs,
+hotspots), no LLM, no key.
+
+- Run `trail ask "<your question>" --source` → ranked nodes with the relevant
+  code spans inlined (each hit's ≤8-line crux by default; `--full` for whole
+  definitions when the crux isn't enough). Match the tool to the task shape:
+  for understanding or editing, the top node IS the answer — cite its
+  `covers:` file:line spans and edit straight from `--source`. For
+  exhaustive tasks ("every occurrence / every caller of this pattern"), ranked
+  results are top-N, not complete — run `trail grep "<literal>"` instead
+  (exhaustive over indexed files, grouped by enclosing symbol), falling back
+  to raw `grep -rn` only for unindexed files.
+- `trail skeleton <file>` → every definition's signature + span, ~10× cheaper
+  than reading the file; use it to skim an API surface.
+- `trail callers <symbol>` gives precomputed, exact edges — who calls this.
+  Add `--direction out` for what it calls, or `--depth N` to walk
+  transitively for the full blast radius. For structural questions, skip
+  ranking and use this directly.
+- Or browse: `.trail/cache/INDEX.md` lists every node; follow the links.
+- Monorepos and folders of multiple repos rank fairly across sub-projects —
+  hits carry `[scope/]` labels naming which one they're from. Narrow with
+  `trail ask "<task>" --in <scope>/` once you know where you're working.
+
+If a returned span is truncated ("+N more lines"), open the file at that exact
+range before finalizing. Only open source files when a node genuinely lacks a
+needed detail, and then at the exact file:line the node points to — never
+re-read whole files.
+
+After big code changes, refresh the graph with `trail build` (deterministic,
+no API key, $0).
+<!-- trail:end -->
