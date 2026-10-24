@@ -1,0 +1,200 @@
+@Logic
+script ContentRelicTriggerLogic extends Logic
+
+	method void Reset(any owner)
+		-- Encounter state belongs to the player's relic component, never this singleton.
+		owner.ContentRelicState = { Moon = false, Stationary = 0, Moved = false, Stone = false,
+			FeatherUsed = false, FeatherActive = false, Waves = {}, QueueActive = false, SunUsed = false, FinisherUsed = false }
+		_RunRelicFeedbackLogic:Reset(owner)
+	end
+
+	method boolean IsActive(any owner)
+		-- Old entries and lobby actors cannot charge or spend encounter effects.
+		return owner ~= nil and owner:IsCurrentRun() and owner.ActiveBattleKey ~= ""
+	end
+
+	method void QueueStarted(any owner)
+		-- Repeats retain this same queue receipt and cannot replenish either effect.
+		if not self:IsActive(owner) then return end
+		local state = owner.ContentRelicState
+		state.Moved = false
+		state.QueueActive = true
+		state.SunUsed = false
+		state.FinisherUsed = false
+		self:PublishDisplay(owner)
+	end
+
+	method void QueueEnded(any owner)
+		-- Failed or interrupted queues discard unused bonuses.
+		owner.ContentRelicState.QueueActive = false
+		self:PublishDisplay(owner)
+	end
+
+	method void Turned(any owner)
+		-- Only an accepted ordinary player TURN command calls this hook.
+		if self:IsActive(owner) and owner:GetSpecialEffectValue("TURN_HIT_COOLDOWN") > 0 then
+			local wasCharged = owner.ContentRelicState.Moon
+			owner.ContentRelicState.Moon = true
+			if not wasCharged then self:Notify(owner, "TURN_HIT_COOLDOWN", "충전") end
+			log("[ContentRelic] moon charged key=" .. owner.ActiveBattleKey)
+		end
+	end
+
+	method void SkillStarted(any owner, table context, boolean isAttack)
+		-- Capture queue position once; repeats are casts, not additional registered slots.
+		if not self:IsActive(owner) then return end
+		local session = context.BattleSession
+		context.ContentBattleKey = owner.ActiveBattleKey
+		context.ContentHitTargets = {}
+		context.ContentHitCount = 0
+		context.ContentAttack = isAttack
+		context.ContentFinisher = isAttack and session.TurnState ~= nil
+			and session.TurnState:GetTileIdCount(session.TurnState.ExecutingTileIds) >= 2
+			and session.TurnState.ExecutingTileIndex == session.TurnState:GetTileIdCount(session.TurnState.ExecutingTileIds)
+		if isAttack then
+			context.ContentMoon = owner.ContentRelicState.Moon
+			owner.ContentRelicState.Moon = false
+			self:PublishDisplay(owner)
+		end
+	end
+
+	method number FinisherBonus(any owner, table context)
+		-- One actual direct impact in the last slot gets the bonus, even for area/multi-hit casts.
+		if not self:IsActive(owner) or context == nil or context.ContentBattleKey ~= owner.ActiveBattleKey
+			or not context.ContentFinisher or not owner.ContentRelicState.QueueActive or owner.ContentRelicState.FinisherUsed then return 0 end
+		local amount = owner:GetSpecialEffectValue("QUEUE_FINISHER_BONUS")
+		if amount > 0 then
+			owner.ContentRelicState.FinisherUsed = true
+			self:Notify(owner, "QUEUE_FINISHER_BONUS", "피해 +" .. tostring(math.floor(amount)))
+			log("[ContentRelic] finisher skill=" .. context.SkillId .. " bonus=" .. amount)
+		end
+		return amount
+	end
+
+	method void DirectHit(any owner, table context, string targetId, number amount)
+		-- Observe positive direct damage before a lethal hit settles the battle and clears its state.
+		if not self:IsActive(owner) or context == nil or context.ContentBattleKey ~= owner.ActiveBattleKey
+			or not context.ContentAttack or amount <= 0 then return end
+		if context.ContentMoon then
+			context.ContentMoon = false
+			local runtime = owner.Entity:GetComponent("script.SkillRuntimeStateComponent")
+			local refund = runtime ~= nil and runtime:ReduceCooldown(context.SkillId, owner:GetSpecialEffectValue("TURN_HIT_COOLDOWN")) or nil
+			if refund ~= nil and (refund.AppliedAmount or 0) > 0 then
+				self:Notify(owner, "TURN_HIT_COOLDOWN", "쿨 -" .. tostring(math.floor(refund.AppliedAmount)))
+			end
+			log("[ContentRelic] moon refund skill=" .. context.SkillId)
+		end
+		local targets = context.ContentHitTargets
+		if targets[targetId] then return end
+		targets[targetId] = true
+		context.ContentHitCount = context.ContentHitCount + 1
+		local state = owner.ContentRelicState
+		if context.ContentHitCount >= 2 and state.QueueActive and not state.SunUsed
+			and owner:GetSpecialEffectValue("MULTI_TARGET_HEAL") > 0 then
+			state.SunUsed = true
+			self:Heal(owner, "MULTI_TARGET_HEAL")
+			self:PublishDisplay(owner)
+		end
+	end
+
+
+	method void Moved(any owner)
+		-- Every logical cell change resets progress, including skill movement and knockback.
+		if not self:IsActive(owner) then return end
+		owner.ContentRelicState.Stationary = 0
+		owner.ContentRelicState.Moved = true
+		self:PublishDisplay(owner)
+	end
+
+	method void PlayerActionCompleted(any owner)
+		-- The shared consumed-action boundary runs once for a whole queue, and never for free inputs.
+		if not self:IsActive(owner) then return end
+		local state = owner.ContentRelicState
+		state.FeatherActive = false
+		if state.Moved then
+			state.Stationary = 0
+		elseif not state.Stone and owner:GetSpecialEffectValue("STATIONARY_GUARD") > 0 then
+			state.Stationary = state.Stationary + 1
+			if state.Stationary >= 2 then
+				state.Stone = true
+				state.Stationary = 0
+				self:Notify(owner, "STATIONARY_GUARD", "방어 준비")
+				log("[ContentRelic] stone ready key=" .. owner.ActiveBattleKey)
+			end
+		end
+		state.Moved = false
+		self:PublishDisplay(owner)
+	end
+
+	method number IncomingDirectDamage(any owner, number amount)
+		-- Complete guards run first; reduction runs before lethal survival and may reduce damage to zero.
+		if not self:IsActive(owner) or not owner.ContentRelicState.Stone then return amount end
+		local reduction = owner:GetSpecialEffectValue("STATIONARY_GUARD")
+		if reduction <= 0 or amount <= 0 then return amount end
+		owner.ContentRelicState.Stone = false
+		local applied = math.min(amount, reduction)
+		local text = applied % 1 == 0 and tostring(math.floor(applied)) or tostring(applied)
+		self:Notify(owner, "STATIONARY_GUARD", "피해 -" .. text)
+		log("[ContentRelic] stone consumed reduction=" .. reduction)
+		return math.max(0, amount - reduction)
+	end
+
+	method boolean BlockNegativeStatus(any owner)
+		-- Valid hostile applications share one immunity window through the next consumed player action.
+		if not self:IsActive(owner) or owner:GetSpecialEffectValue("FIRST_DEBUFF_WINDOW") <= 0 then return false end
+		local state = owner.ContentRelicState
+		if state.FeatherActive then
+			self:Notify(owner, "FIRST_DEBUFF_WINDOW", "상태 차단")
+			return true
+		end
+		if state.FeatherUsed then return false end
+		state.FeatherUsed = true
+		state.FeatherActive = true
+		self:Notify(owner, "FIRST_DEBUFF_WINDOW", "상태 차단")
+		log("[ContentRelic] feather window opened key=" .. owner.ActiveBattleKey)
+		return true
+	end
+
+	method void WaveStarted(any owner, integer wave, boolean clearedPrevious)
+		-- Only successful clear transitions heal; the first wave and overlapping reinforcements do not.
+		if not self:IsActive(owner) or wave <= 1 or not clearedPrevious or owner.ContentRelicState.Waves[wave] then return end
+		owner.ContentRelicState.Waves[wave] = true
+		self:Heal(owner, "WAVE_TRANSITION_HEAL")
+	end
+
+	method void Heal(any owner, string effectType)
+		-- Shared healing synchronizes run HP, clamps at maximum, and never revives a dead unit.
+		local amount = owner:GetSpecialEffectValue(effectType)
+		local unit = owner.Entity:GetComponent("script.BattleUnitComponent")
+		if amount <= 0 or unit == nil or unit.IsDead or unit.CurrentHp <= 0 then return end
+		local result = unit:ApplyHealing(amount)
+		local applied = result.AppliedAmount or 0
+		if applied > 0 then
+			local text = applied % 1 == 0 and tostring(math.floor(applied)) or tostring(applied)
+			self:Notify(owner, effectType, "회복 +" .. text)
+		end
+		log("[ContentRelic] heal effect=" .. effectType .. " amount=" .. tostring(result.AppliedAmount or 0))
+	end
+
+	method void PlayerActionStarted(any owner)
+		-- Movement between actions reset progress already; the next stationary action counts normally.
+		if self:IsActive(owner) then owner.ContentRelicState.Moved = false end
+	end
+
+
+	method void Notify(any owner, string effectType, string text)
+		-- Preserve the existing content-hook API while sharing all display receipts.
+		_RunRelicFeedbackLogic:Notify(owner, effectType, text)
+	end
+
+	method table GetDisplayState(string effectType, table state, boolean active)
+		-- Preserve the existing content projection API.
+		return _RunRelicFeedbackLogic:GetContentState(effectType, state, active)
+	end
+
+	method void PublishDisplay(any owner)
+		-- All stateful relics use the same owner-synced display bundle.
+		_RunRelicFeedbackLogic:Publish(owner)
+	end
+
+end

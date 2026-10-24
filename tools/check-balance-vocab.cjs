@@ -101,6 +101,7 @@ const fromData = {
   patternAction: csvColumn("EnemyPatternSteps.csv", "ActionType"),
   patternCondition: csvColumn("EnemyPatternSteps.csv", "ConditionType"),
   relicSpecial: csvColumn("RelicDefinitions.csv", "SpecialEffectType"),
+  relicAcquisition: csvColumn("RelicDefinitions.csv", "AcquisitionType"),
 };
 // Relic special effects live in a JS constant on the page, not in #vocabCatalog.
 const relicList = html.match(/const RELIC_SPECIAL_EFFECTS = \[([\s\S]*?)\];/);
@@ -126,6 +127,7 @@ const catalog = {
   patternCondition: Object.keys(P.conditions),
   cellSelector: Object.keys(P.conditions.CELL_FREE.paramA.options),
   relicSpecial: relicCatalog,
+  relicAcquisition: Object.keys(VOCAB.relic.acquisitionTypes),
 };
 const TITLES = {
   augmentHidden: "AugmentEffects.ParamC", augmentTrigger: "AugmentEffects.TriggerType", augmentCondition: "AugmentEffects.ConditionType",
@@ -135,7 +137,7 @@ const TITLES = {
   targetingType: "*SkillDefinitions.TargetingType", targetSelector: "*EffectSteps.TargetSelector",
   damageMode: "DAMAGE ParameterA", moveMode: "MOVE_SELF ParameterA",
   patternAction: "EnemyPatternSteps.ActionType", patternCondition: "EnemyPatternSteps.ConditionType",
-  cellSelector: "CELL_FREE ParamA", relicSpecial: "RelicDefinitions.SpecialEffectType",
+  cellSelector: "CELL_FREE ParamA", relicAcquisition: "RelicDefinitions.AcquisitionType", relicSpecial: "RelicDefinitions.SpecialEffectType",
 };
 
 let missing = 0;

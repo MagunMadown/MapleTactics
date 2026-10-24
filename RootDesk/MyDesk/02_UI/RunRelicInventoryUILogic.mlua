@@ -19,6 +19,13 @@ script RunRelicInventoryUILogic extends Logic
 	property integer SlotRunSequence = -1
 	property integer Page = 1
 	property integer PageCount = 1
+	property Entity ContentHud = nil
+	property table ContentSlots = {}
+	property string LastContentSnapshot = ""
+	property string ContentBattleKey = ""
+	property table ContentItems = {}
+	property table ContentPulses = {}
+	property table ContentFlashes = {}
 
 	@ExecSpace("ClientOnly")
 	method void OnUpdate(number delta)
@@ -31,6 +38,7 @@ script RunRelicInventoryUILogic extends Logic
 		local session = isvalid(player) and isvalid(player.CurrentMap) and player.CurrentMap:GetComponent("script.BattleSessionComponent") or nil
 		local available = run ~= nil and effects ~= nil and run.RunState == "Active" and effects.ActiveRunSequence == run.RunSequence
 			and (session == nil or not session.SkillTestMode) and not _UILayerLogic:IsEpilogueActive()
+		self:UpdateContentHud(delta, run, effects, session)
 		self.OpenButton.Enable = available
 		if not available then
 			self:SetOpen(false)
@@ -82,6 +90,13 @@ script RunRelicInventoryUILogic extends Logic
 		if not isvalid(self.Root) then return false end
 		self.Modal = self.Root:GetChildByName("Modal")
 		self.OpenButton = self.Root:GetChildByName("Open")
+		self.ContentHud = self.Root:GetChildByName("ContentHud")
+		if not isvalid(self.ContentHud) then return false end
+		self.ContentSlots = {}
+		for index = 1, 24 do
+			local slot = self.ContentHud:GetChildByName("Slot" .. tostring(index))
+			table.insert(self.ContentSlots, { Root = slot, Icon = slot:GetChildByName("Icon"), Label = slot:GetChildByName("State"), Signature = "" })
+		end
 		local window = self.Modal:GetChildByName("Window")
 		self.Grid = window:GetChildByName("List").GridViewComponent
 		self.Grid.OnRefresh = function(index, row) self:RefreshRow(index, row) end
@@ -377,6 +392,82 @@ script RunRelicInventoryUILogic extends Logic
 		end
 		self.Bindings = {}
 		self.RowBindings = {}
+		self:ResetContentHud()
+	end
+
+
+	@ExecSpace("ClientOnly")
+	method void ResetContentHud()
+		-- Clear cached receipts on map/run changes, preventing old highlights from replaying.
+		if isvalid(self.ContentHud) then self.ContentHud.Enable = false end
+		self.LastContentSnapshot = ""
+		self.ContentBattleKey = ""
+		self.ContentItems = {}
+		self.ContentPulses = {}
+		self.ContentFlashes = {}
+		for _, slot in ipairs(self.ContentSlots) do slot.Signature = "" end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void UpdateContentHud(number delta, any run, any effects, any session)
+		-- The client reads server text/readiness and animates receipts; it never predicts a relic effect.
+		if run == nil or effects == nil or session == nil or session.SkillTestMode
+			or _UILayerLogic:IsEpilogueActive()
+			or effects.ActiveRunSequence ~= run.RunSequence then self:ResetContentHud(); return end
+		local key = tostring(run.RunSequence) .. ":" .. session.StageId .. ":" .. tostring(session.EntryRequestId)
+		local snapshot = effects.ContentRelicDisplaySnapshot or ""
+		if snapshot == "" then self:ResetContentHud(); return end
+		if snapshot ~= self.LastContentSnapshot or self.ContentBattleKey ~= key then
+			local data = _HttpService:JSONDecode(snapshot)
+			if data == nil or data.RunSequence ~= run.RunSequence or data.BattleKey ~= key then self:ResetContentHud(); return end
+			local sameBattle = self.ContentBattleKey == key
+			if not sameBattle then self.ContentFlashes = {} end
+			local pulses = {}
+			if sameBattle then for id, pulse in pairs(self.ContentPulses) do pulses[id] = pulse end end
+			self.ContentItems = data.Items or {}
+			for _, item in ipairs(self.ContentItems) do
+				local pulseKey = item.PulseKey or item.RelicId
+				local previous = self.ContentPulses[pulseKey] or 0
+				if sameBattle and item.Pulse > previous then
+					self.ContentFlashes[item.RelicId] = 1.2
+					log("[ContentRelicHUD] pulse relic=" .. item.RelicId .. " text=" .. item.PulseText)
+				end
+				pulses[pulseKey] = item.Pulse
+			end
+			self.ContentPulses = pulses
+			self.ContentBattleKey = key
+			self.LastContentSnapshot = snapshot
+		end
+		local visible = 0
+		for index, slot in ipairs(self.ContentSlots) do
+			local item = self.ContentItems[index]
+			slot.Root.Enable = item ~= nil
+			if item ~= nil then
+				local before = self.ContentFlashes[item.RelicId] or 0
+				local remaining = math.max(0, before - math.max(0, delta))
+				self.ContentFlashes[item.RelicId] = remaining > 0 and remaining or nil
+				slot.Root.Enable = not item.Transient or remaining > 0
+				if slot.Root.Enable then visible = visible + 1 end
+				if before > 0 and remaining == 0 then log("[ContentRelicHUD] pulse ended relic=" .. item.RelicId) end
+				local signature = item.RelicId .. ":" .. item.StateText .. ":" .. tostring(item.Ready) .. ":" .. tostring(remaining) .. ":" .. item.PulseText
+				if slot.Signature ~= signature then self:PaintContentSlot(slot, item, remaining); slot.Signature = signature end
+			end
+		end
+		self.ContentHud.Enable = visible > 0 and not self.IsOpen
+	end
+
+	@ExecSpace("ClientOnly")
+	method void PaintContentSlot(table slot, table item, number remaining)
+		-- Pair a readable state label with blue readiness and a brief warm trigger highlight.
+		local flash = math.min(1, remaining / 1.2)
+		local base = item.Ready and Color(0.16, 0.38, 0.52, 0.96) or Color(0.10, 0.14, 0.21, 0.90)
+		slot.Root.SpriteGUIRendererComponent.Color = Color(base.r + (0.64 - base.r) * flash,
+			base.g + (0.43 - base.g) * flash, base.b + (0.13 - base.b) * flash, base.a)
+		slot.Icon.SpriteGUIRendererComponent.ImageRUID = DataRef(item.IconImageRUID)
+		slot.Icon.SpriteGUIRendererComponent.Color = Color(1, 1, 1, 1)
+		slot.Label.TextGUIRendererComponent.Text = remaining > 0 and item.PulseText or item.StateText
+		slot.Label.TextGUIRendererComponent.FontColor = remaining > 0 and Color(1, 0.91, 0.61, 1)
+			or (item.Ready and Color(0.72, 0.94, 1, 1) or Color(0.85, 0.89, 0.96, 1))
 	end
 
 end

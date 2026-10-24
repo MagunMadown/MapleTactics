@@ -9,7 +9,7 @@
     JobDefinitions:["JobId"], JobStartingSkillEntries:["StartingSkillSetId","SlotIndex"],
     WeaponDefinitions:["WeaponType"], AugmentDefinitions:["AugmentId"], AugmentEffects:["AugmentId","Seq"],
     EnemyDefinitions:["EnemyDefinitionId"], EnemyPatternSteps:["PatternId","StepIndex"],
-    EnemySpawnPools:["PoolId","EnemyDefinitionId","EnemyModelId"], EnemyDropDefinitions:["DropEntryId"],
+    EnemySpawnPools:["PoolId","EnemyDefinitionId","EnemyModelId","SpawnIndex"], EnemyDropDefinitions:["DropEntryId"],
     EnemyImpactPresentations:["EntryId"], BossPhaseDefinitions:["EnemyDefinitionId","PhaseIndex"],
     RegionDefinitions:["RegionId"], NodeDefinitions:["NodeGraphId","NodeId"], StageDefinitions:["StageId"],
     StageMapRoutes:["StageId"], StageEnemyWaves:["WaveTableId","WaveIndex"], StageRewardDefinitions:["StageRewardEntryId"],
@@ -32,10 +32,11 @@
     UnionSpecialZoneDefinitions:"현재 게임 진행에서 사용하지 않는 구형 특수 구역."
   };
   const columns = {
+    EnemySpawnPools:{SpawnIndex:{note:"선택 사항. 빈 값/0: 모든 스폰 슬롯에서 가중 추첨. 양의 정수: 해당 순번 슬롯에서만 추첨."}},
     EnemyDefinitions:{FlatDamageReduction:{note:"유한한 0 이상 숫자. 빈 값 0. 각 타격/상태이상 틱마다 차감, 최소 피해 0."},AscensionHpBonus:{note:"0 이상 정수. 빈 값 1. 난이도 배율 및 일반 몬스터 HP 상한 적용 전 보너스."}},
     EnemyPatternSteps:{TileId:{label:"적 스킬 ID (TileId)",note:"타일이 아님. EnemySkillDefinitions.SkillId 참조.",ref:["EnemySkillDefinitions","SkillId"],optional:true}},
     UnionBoardCellDefinitions:{RegionId:{label:"보드 영역 (RegionId)",note:"GROWTH / COMBAT / CORE / EXPLORATION / TACTICS. RegionDefinitions와 관계없음.",ref:null}},
-    RelicDefinitions:{IsOpen:{label:"유물 개방 (IsOpen)",note:"true: 획득 가능 / false: 상점·시작 추첨·지급 차단. 변경은 새 런부터 적용."},RequiredJobId:{ref:["JobDefinitions","JobId"],optional:true},EffectDescription:{label:"미사용 설명 (EffectDescription)",note:"런타임은 능력치와 특수 효과로 설명을 생성함.",readonly:true}},
+    RelicDefinitions:{AcquisitionType:{optional:true,note:"GENERAL(빈 값 포함) / REGION_SHOP / BOSS_CLEAR"},AcquisitionSourceId:{optional:true,note:"GENERAL: 빈 값 / REGION_SHOP: RegionId / BOSS_CLEAR: 보스 StageId"},IsOpen:{label:"유물 개방 (IsOpen)",note:"true: 획득 가능 / false: 상점·시작 추첨·지급 차단. 변경은 새 런부터 적용."},RequiredJobId:{ref:["JobDefinitions","JobId"],optional:true},EffectDescription:{label:"미사용 설명 (EffectDescription)",note:"런타임은 능력치와 특수 효과로 설명을 생성함.",readonly:true}},
     TopHudThemeDefinitions:{
       RegionId:{ref:["RegionDefinitions","RegionId"],allow:["default"]},
       BackdropColor:{label:"화면 미반영 (BackdropColor)",note:"테마 검증에서는 읽지만 배경 렌더링에는 적용하지 않음.",readonly:true},
@@ -188,20 +189,31 @@
     const issues=[];
     const add=(table,row,column,code)=>issues.push({table,row,column,code});
     for(const [name,t] of Object.entries(tables)){
-      const m=meta(name),seen=new Set();
+      const m=meta(name),seen=new Set(),bossSources=new Set();
       if(name==="UnionShopProducts") for(const issue of unionShopProductIssues(t.rows,tables.DamageSkinDefinitions?.rows)) add(name,issue.row+2,issue.column,issue.code);
-      for(const h of m.key) if(!t.headers.includes(h))add(name,1,h,"REQUIRED_KEY_COLUMN");
+      for(const h of m.key) if(!t.headers.includes(h)&&!(name==="EnemySpawnPools"&&h==="SpawnIndex"))add(name,1,h,"REQUIRED_KEY_COLUMN");
       t.rows.forEach((r,i)=>{
         const row=i+2;
+        if(name==="EnemySpawnPools"&&!numberOK(r.SpawnIndex,0,true,true))add(name,row,"SpawnIndex","INVALID_POOL_SPAWN_INDEX");
         if(name==="EnemyDefinitions") for(const [field,integer] of [["FlatDamageReduction",false],["AscensionHpBonus",true]]) {
           if(!numberOK(r[field],0,integer,true))add(name,row,field,"INVALID_ENEMY_"+field);
+        }
+        if(name==="RelicDefinitions") {
+          const kind=r.AcquisitionType||"GENERAL", source=r.AcquisitionSourceId||"";
+          if(!["GENERAL","REGION_SHOP","BOSS_CLEAR"].includes(kind)||(kind==="GENERAL" ? source!=="" : source===""))add(name,row,"AcquisitionType","INVALID_RELIC_ACQUISITION");
+          if(kind==="REGION_SHOP" && !tables.RegionDefinitions?.rows.some(x=>x.RegionId===source&&x.Enabled==="true"))add(name,row,"AcquisitionSourceId","INVALID_RELIC_ACQUISITION");
+          if(kind==="BOSS_CLEAR") {
+            if(!tables.StageDefinitions?.rows.some(x=>x.StageId===source&&x.StageType==="BOSS"))add(name,row,"AcquisitionSourceId","INVALID_RELIC_ACQUISITION");
+            if(bossSources.has(source))add(name,row,"AcquisitionSourceId","DUPLICATE_BOSS_RELIC_SOURCE");
+            bossSources.add(source);
+          }
         }
         if(name==="RelicDefinitions" && !["true","false"].includes(r.IsOpen))add(name,row,"IsOpen","INVALID_RELIC_OPEN_FLAG");
         if(name==="EnemyPatternSteps"&&["EXECUTE_TILE","TELEGRAPH_TILE","CHARGE_FORWARD","CAST_INTERRUPTIBLE","BOSS_JUMP_TELEGRAPH","BOSS_LAND_OPPOSITE"].includes(r.ActionType)&&!r.TileId)add(name,row,"TileId","PATTERN_TILE_ID_MISSING");
         if(m.key.length){
           // Level is numeric in runtime; "01" and "1" must collide.
-          const key=JSON.stringify(m.key.map(k=>k==="Level"?Number(r[k]):r[k]));
-          if(m.key.some(k=>r[k]==null||r[k]===""))add(name,row,m.key.join("+"),"EMPTY_PRIMARY_KEY");
+          const key=JSON.stringify(m.key.map(k=>k==="Level"?Number(r[k]):name==="EnemySpawnPools"&&k==="SpawnIndex"?Number(r[k]||0):r[k]));
+          if(m.key.some(k=>!(name==="EnemySpawnPools"&&k==="SpawnIndex")&&(r[k]==null||r[k]==="")))add(name,row,m.key.join("+"),"EMPTY_PRIMARY_KEY");
           else if(seen.has(key))add(name,row,m.key.join("+"),"DUPLICATE_PRIMARY_KEY");
           seen.add(key);
         }

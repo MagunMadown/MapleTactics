@@ -1,0 +1,115 @@
+@Logic
+script RunRelicFeedbackLogic extends Logic
+
+	method void Reset(any owner)
+		-- Display receipts share the encounter lifetime but never own gameplay counters.
+		owner.RelicFeedbackState = { Pulses = {}, Retired = {}, Turn = 0 }
+	end
+
+	method string Amount(number value)
+		-- Keep exact positive application amounts without an unnecessary decimal suffix.
+		return value % 1 == 0 and tostring(math.floor(value)) or tostring(value)
+	end
+
+	method void Notify(any owner, string effectType, string text)
+		-- Preserve the latest receipt through sync coalescing and result settlement.
+		if not _ContentRelicTriggerLogic:IsActive(owner) then return end
+		local pulses = owner.RelicFeedbackState.Pulses
+		local previous = pulses[effectType]
+		pulses[effectType] = { Sequence = (previous ~= nil and previous.Sequence or 0) + 1, Text = text }
+		self:Publish(owner)
+		log("[ContentRelicFeedback] effect=" .. effectType .. " text=" .. text .. " key=" .. owner.ActiveBattleKey)
+	end
+
+	method table GetContentState(string effectType, table state, boolean active)
+		-- This is a read-only projection of authoritative state, never a second combat calculation.
+		local labels = { QUEUE_FINISHER_BONUS = "큐당 1회", TURN_HIT_COOLDOWN = "전환 대기",
+			MULTI_TARGET_HEAL = "광역 회복", STATIONARY_GUARD = "0/2", WAVE_TRANSITION_HEAL = "전멸 회복", FIRST_DEBUFF_WINDOW = "차단 준비" }
+		if labels[effectType] == nil then return nil end
+		if not active then return { Text = "전투 종료", Ready = false } end
+		local text, ready = labels[effectType], false
+		if effectType == "TURN_HIT_COOLDOWN" then
+			ready = state.Moon; if ready then text = "충전 완료" end
+		elseif effectType == "STATIONARY_GUARD" then
+			ready = state.Stone; text = ready and "방어 준비" or tostring(state.Stationary) .. "/2"
+		elseif effectType == "FIRST_DEBUFF_WINDOW" then
+			ready = state.FeatherActive or not state.FeatherUsed
+			text = state.FeatherActive and "면역 중" or (state.FeatherUsed and "사용 완료" or "차단 준비")
+		elseif effectType == "QUEUE_FINISHER_BONUS" and state.QueueActive and state.FinisherUsed then text = "큐 완료"
+		elseif effectType == "MULTI_TARGET_HEAL" and state.QueueActive and state.SunUsed then text = "큐 완료" end
+		return { Text = text, Ready = ready }
+	end
+
+	method table GetDisplayState(any owner, string id, table definition, boolean active)
+		-- Project the same flags, charges and ready-turn deadlines used by the effect owner.
+		local kind = definition.SpecialEffectType or ""
+		local content = self:GetContentState(kind, owner.ContentRelicState, active)
+		if content ~= nil then return content end
+		if kind == "FINITE_GUARD" then
+			local remaining = owner.RemainingUses[id]
+			if remaining == nil then remaining = definition.SpecialEffectValue end
+			return { Text = remaining > 0 and "방어 " .. tostring(remaining) .. "회" or "소멸", Ready = active and remaining > 0 }
+		end
+		local once = { FIRST_HIT_GUARD = owner.FirstHitGuardUsed, LETHAL_SURVIVAL = owner.LethalSurvivalUsed,
+			FIRST_SKILL_COOLDOWN = owner.FirstSkillUsed, FIRST_KILL_COOLDOWN = owner.FirstKillUsed, FIRST_KILL_HEAL_PERCENT = owner.FirstKillUsed }
+		local text, ready = nil, false
+		if once[kind] ~= nil then
+			ready = not once[kind]; text = ready and "준비 완료" or "사용 완료"
+		elseif kind == "THREE_KILL_HEAL" then text = tostring(owner.KillHealProgress) .. "/3"
+		elseif kind == "KILL_ATTACK_BATTLE" then
+			text = "공격 +" .. self:Amount(owner.BattleKillAttackBonus); ready = owner.BattleKillAttackBonus > 0
+		elseif kind == "KILL_SKILL_RESET_INTERVAL" or kind == "FREE_LOAD_INTERVAL"
+			or kind == "LOAD_COOLDOWN_INTERVAL" or kind == "REPEAT_SKILL_INTERVAL" then
+			local remaining = math.max(0, (owner.EffectReadyTurns[kind] or 0) - self:GetTurn(owner))
+			ready = remaining == 0; text = ready and "준비 완료" or "대기 " .. tostring(remaining) .. "턴"
+			if kind == "LOAD_COOLDOWN_INTERVAL" and next(owner.LoadedCooldownReductions) ~= nil then text = "장전 예약"; ready = true end
+		end
+		if text == nil then return nil end
+		return { Text = active and text or "전투 종료", Ready = active and ready }
+	end
+
+	method integer GetTurn(any owner)
+		-- Read the authoritative session clock, never a client timer or an independent cooldown.
+		local map = owner.Entity.CurrentMap
+		local session = isvalid(map) and map:GetComponent("script.BattleSessionComponent") or nil
+		return session ~= nil and session.TurnNumber or owner.RelicFeedbackState.Turn
+	end
+
+	method void UpdateClock(any owner)
+		-- The existing owner update watches turn changes; unchanged turns publish nothing.
+		if not _ContentRelicTriggerLogic:IsActive(owner) then return end
+		local effects = owner.SpecialEffects
+		if effects.KILL_SKILL_RESET_INTERVAL == nil and effects.FREE_LOAD_INTERVAL == nil
+			and effects.LOAD_COOLDOWN_INTERVAL == nil and effects.REPEAT_SKILL_INTERVAL == nil then return end
+		local turn = self:GetTurn(owner)
+		if owner.RelicFeedbackState.Turn == turn then return end
+		owner.RelicFeedbackState.Turn = turn
+		self:Publish(owner)
+	end
+
+	method void Publish(any owner)
+		-- Publish owned eligible stateful relics, retaining a final depleted-guard receipt only for its flash.
+		if not owner:IsCurrentRun() or owner.ContentRelicBattleKey == "" then owner.ContentRelicDisplaySnapshot = ""; return end
+		local state = owner.RelicFeedbackState
+		state.Turn = self:GetTurn(owner)
+		local inventory = owner.Entity:GetComponent("script.PlayerRunInventoryComponent")
+		local ids, items = {}, {}
+		for id, definition in pairs(owner.Definitions) do
+			local owned = not owner.ExhaustedRelics[id] and inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) > 0
+			if (owned or state.Retired[id]) and owner:IsJobAllowed(id)
+				and self:GetDisplayState(owner, id, definition, owner.ActiveBattleKey ~= "") ~= nil then table.insert(ids, id) end
+		end
+		table.sort(ids)
+		for _, id in ipairs(ids) do
+			local definition = owner.Definitions[id]
+			local display = self:GetDisplayState(owner, id, definition, owner.ActiveBattleKey ~= "")
+			local pulse = state.Pulses[definition.SpecialEffectType]
+			table.insert(items, { RelicId = id, DisplayName = definition.DisplayName, IconImageRUID = definition.IconImageRUID,
+				StateText = display.Text, Ready = display.Ready, PulseKey = definition.SpecialEffectType, Pulse = pulse ~= nil and pulse.Sequence or 0,
+				PulseText = pulse ~= nil and pulse.Text or "", Transient = state.Retired[id] == true })
+		end
+		owner.ContentRelicDisplaySnapshot = _HttpService:JSONEncode({ RunSequence = owner.ActiveRunSequence,
+			BattleKey = owner.ContentRelicBattleKey, Items = items })
+	end
+
+end
