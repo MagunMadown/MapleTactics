@@ -24,6 +24,8 @@ new=load(COMBAT+'Components/Shared/BattleWaveComponent.mlua','newWave',methods)
 rows=list(csv.DictReader(io.StringIO((ROOT/'RootDesk/MyDesk/03_Data/EnemyDefinitions.csv').read_text(encoding='utf-8-sig'))))
 checks=0
 for row in rows:
+    # El Nath was added after this legacy baseline and defines its own ascension bonuses.
+    if row["EnemyDefinitionId"].startswith("el_nath_"): continue
     d=dict(row)
     for k in ['MaxHp','BasicAttackDamage','AscensionHpBonus']: d[k]=float(d[k] or 1)
     d['IsBoss']=d['IsBoss'].lower()=='true'

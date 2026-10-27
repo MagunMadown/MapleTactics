@@ -7,6 +7,10 @@
 
 ## 현재 적용 범위
 
+엘나스의 독립 테스트 스테이지 6개와 처치 후 분리형 적 규격은
+[El-Nath-Authoring-Guide.md](El-Nath-Authoring-Guide.md)에 정리했다.
+현재 다른 Region의 Node/REST/상점에는 연결하지 않는다.
+
 Stage 진입은 다음 순서를 사용한다.
 
 ```text

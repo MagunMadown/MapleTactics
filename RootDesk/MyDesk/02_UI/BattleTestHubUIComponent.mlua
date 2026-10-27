@@ -6,6 +6,12 @@ script BattleTestHubUIComponent extends Component
 	property integer SelectedJobIndex = 1
 	property integer SelectedSeed = 6001
 	property integer LastCatalogRevision = -1
+	property integer LastSkillCatalogRevision = -1
+	property boolean UseCustomLoadout = false
+	property table SkillFamilies = nil
+	property table SkillChoices = nil
+	property table SkillRows = nil
+	property TextGUIRendererComponent ModeText = nil
 	property boolean WasVisible = false
 	property boolean IsRequesting = false
 	property table Stages = nil
@@ -21,8 +27,12 @@ script BattleTestHubUIComponent extends Component
 
 	@ExecSpace("ClientOnly")
 	method void OnBeginPlay()
+		-- Binds the existing stage selector and the test-only six-slot skill editor.
 		self.Stages = {}
 		self.Jobs = {}
+		self.SkillFamilies = {}
+		self.SkillChoices = {}
+		self.SkillRows = {}
 		self.EventHandlers = {}
 		self:ResolveBindings()
 		self:BindButton("/ui/BattleTestHubUI/Panel/StagePrev", self.OnStagePrev)
@@ -32,6 +42,7 @@ script BattleTestHubUIComponent extends Component
 		self:BindButton("/ui/BattleTestHubUI/Panel/SeedMinus", self.OnSeedMinus)
 		self:BindButton("/ui/BattleTestHubUI/Panel/SeedPlus", self.OnSeedPlus)
 		self:BindButton("/ui/BattleTestHubUI/Panel/StartButton", self.OnStartClicked)
+		self:BindLoadoutControls()
 		self:RefreshVisibility(true)
 		self:RefreshCatalog(true)
 		log("[BattleTestHubUI] initialized")
@@ -78,17 +89,22 @@ script BattleTestHubUIComponent extends Component
 			self.IsRequesting = false
 			self:SetStatus("Stage를 선택하고 전투 시작을 누르세요.")
 			self:SetStartEnabled(true)
+			self:RefreshLoadout()
 		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void RefreshCatalog(boolean forceRefresh)
-		if forceRefresh == false and self.LastCatalogRevision == _BattleTestHubLogic.CatalogRevision then return end
+		-- Refreshes only when synchronized authored data changes, never every frame.
+		if forceRefresh == false and self.LastCatalogRevision == _BattleTestHubLogic.CatalogRevision
+			and self.LastSkillCatalogRevision == _BattleTestLoadoutLogic.CatalogRevision then return end
 		self.LastCatalogRevision = _BattleTestHubLogic.CatalogRevision
+		self.LastSkillCatalogRevision = _BattleTestLoadoutLogic.CatalogRevision
 		self.Stages = _BattleTestHubLogic:GetStages()
 		self.Jobs = _BattleTestHubLogic:GetJobs()
 		self.SelectedStageIndex = self:ClampIndex(self.SelectedStageIndex, #self.Stages)
 		self.SelectedJobIndex = self:ClampIndex(self.SelectedJobIndex, #self.Jobs)
+		self:RefreshJobSkills()
 		self:RefreshSelection()
 	end
 
@@ -105,46 +121,62 @@ script BattleTestHubUIComponent extends Component
 		local job = self.Jobs[self.SelectedJobIndex]
 		self.JobText.Text = job ~= nil and (job.DisplayName .. "  (" .. job.JobId .. ")") or "직업 데이터 없음"
 		self.SeedText.Text = tostring(self.SelectedSeed)
+		self:RefreshLoadout()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnStagePrev()
+		-- Selects the previous stage while no transfer is in flight.
+		if self.IsRequesting then return end
 		self.SelectedStageIndex = self:WrapIndex(self.SelectedStageIndex - 1, #self.Stages)
 		self:RefreshSelection()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnStageNext()
+		-- Selects the next stage while no transfer is in flight.
+		if self.IsRequesting then return end
 		self.SelectedStageIndex = self:WrapIndex(self.SelectedStageIndex + 1, #self.Stages)
 		self:RefreshSelection()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnJobPrev()
+		-- Rebuilds choices for the newly selected job, preventing cross-job carryover.
+		if self.IsRequesting then return end
 		self.SelectedJobIndex = self:WrapIndex(self.SelectedJobIndex - 1, #self.Jobs)
+		self:RefreshJobSkills()
 		self:RefreshSelection()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnJobNext()
+		-- Rebuilds choices for the newly selected job, preventing cross-job carryover.
+		if self.IsRequesting then return end
 		self.SelectedJobIndex = self:WrapIndex(self.SelectedJobIndex + 1, #self.Jobs)
+		self:RefreshJobSkills()
 		self:RefreshSelection()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnSeedMinus()
+		-- Adjusts the deterministic seed before requesting a new run.
+		if self.IsRequesting then return end
 		self.SelectedSeed = math.max(1, self.SelectedSeed - 100)
 		self:RefreshSelection()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnSeedPlus()
+		-- Adjusts the deterministic seed before requesting a new run.
+		if self.IsRequesting then return end
 		self.SelectedSeed = math.min(9999999, self.SelectedSeed + 100)
 		self:RefreshSelection()
 	end
 
 	@ExecSpace("ClientOnly")
 	method void OnStartClicked()
+		-- Sends either the unchanged default entry or a fixed-position authored skill loadout.
 		if self.IsRequesting then return end
 		local stage = self.Stages[self.SelectedStageIndex]
 		local job = self.Jobs[self.SelectedJobIndex]
@@ -152,23 +184,164 @@ script BattleTestHubUIComponent extends Component
 			self:SetStatus("Stage 또는 직업 데이터가 없습니다.")
 			return
 		end
+		local slotIds = self:GetLoadoutSlotIds()
+		if self.UseCustomLoadout and string.gsub(slotIds, "|", "") == "" then
+			self:SetStatus("커스텀 시작에는 스킬을 1개 이상 선택하세요.")
+			return
+		end
 		self.IsRequesting = true
 		self:SetStartEnabled(false)
 		self:SetStatus("이동 준비 중: " .. stage.DisplayName)
 		log("[BattleTestHubUI] start requested stage=" .. stage.StageId .. " job=" .. job.JobId .. " seed=" .. tostring(self.SelectedSeed))
-		_BattleTestHubLogic:RequestStartStage(stage.StageId, job.JobId, self.SelectedSeed)
+		self:RefreshLoadout()
+		if self.UseCustomLoadout then
+			_BattleTestHubLogic:RequestStartStageWithLoadout(stage.StageId, job.JobId, self.SelectedSeed, slotIds)
+		else
+			_BattleTestHubLogic:RequestStartStage(stage.StageId, job.JobId, self.SelectedSeed)
+		end
 	end
 
 	@ExecSpace("ClientOnly")
 	method void HandleStartResult(boolean success, string reason, string stageId)
+		-- Restores editor interaction after a rejected request.
 		if success then
 			self:SetStatus("전투 맵으로 이동합니다: " .. stageId)
 			return
 		end
 		self.IsRequesting = false
 		self:SetStartEnabled(true)
+		self:RefreshLoadout()
 		self:SetStatus("시작 실패: " .. reason)
 		log_warning("[BattleTestHubUI] start rejected stage=" .. stageId .. " reason=" .. reason)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void BindLoadoutControls()
+		-- Captures each row index once and stores all handlers in the existing cleanup list.
+		local prefix = "/ui/BattleTestHubUI/Panel/Loadout/"
+		self.ModeText = self:GetText(prefix .. "ModeToggle")
+		self:BindButton(prefix .. "ModeToggle", self.OnToggleLoadout)
+		self:BindButton(prefix .. "ResetButton", self.OnResetLoadout)
+		for slot = 1, 6 do
+			local slotIndex = slot
+			local rowPath = prefix .. "Slot" .. tostring(slot) .. "/"
+			self.SkillRows[slot] = {NameText = self:GetText(rowPath .. "Name"), TierText = self:GetText(rowPath .. "Tier"), Controls = {}}
+			for _, control in ipairs({"SkillPrev", "SkillNext", "TierMinus", "TierPlus"}) do
+				local entity = _EntityService:GetEntityByPath(rowPath .. control)
+				self.SkillRows[slot].Controls[control] = isvalid(entity) and entity.ButtonComponent or nil
+			end
+			self:BindButton(rowPath .. "SkillPrev", function() self:ChangeSlotSkill(slotIndex, -1) end)
+			self:BindButton(rowPath .. "SkillNext", function() self:ChangeSlotSkill(slotIndex, 1) end)
+			self:BindButton(rowPath .. "TierMinus", function() self:ChangeSlotTier(slotIndex, -1) end)
+			self:BindButton(rowPath .. "TierPlus", function() self:ChangeSlotTier(slotIndex, 1) end)
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshJobSkills()
+		-- Loads only the selected job's families and resets authored starter choices.
+		local job = self.Jobs[self.SelectedJobIndex]
+		self.SkillFamilies = job ~= nil and _BattleTestLoadoutLogic:GetSkillFamilies(job.JobId) or {}
+		self:ResetSkillChoices()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ResetSkillChoices()
+		-- Prefills the first three authored starter positions without invoking random account bonuses.
+		self.SkillChoices = {}
+		for slot = 1, 6 do self.SkillChoices[slot] = {FamilyIndex = 0, TierIndex = 1} end
+		for index, family in ipairs(self.SkillFamilies or {}) do
+			if family.StartingSlot >= 1 and family.StartingSlot <= 3 then
+				self.SkillChoices[family.StartingSlot] = {FamilyIndex = index, TierIndex = 1}
+			end
+		end
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnToggleLoadout()
+		-- Custom skills are available only in Maker, leaving ordinary starter behavior intact.
+		if self.IsRequesting then return end
+		if Environment:IsMakerPlay() == false then self:SetStatus("커스텀 스킬은 Maker 테스트에서만 사용할 수 있습니다.") return end
+		self.UseCustomLoadout = not self.UseCustomLoadout
+		self:RefreshLoadout()
+		self:SetStatus(self.UseCustomLoadout and "스킬 좌우 선택 · 단계 +/- 변경 · 빈 슬롯 허용" or "기본 시작: 기존 직업 시작 스킬 규칙을 사용합니다.")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void OnResetLoadout()
+		-- Restores a predictable three-skill base setup for the selected job.
+		if self.IsRequesting or self.UseCustomLoadout == false then return end
+		self:ResetSkillChoices()
+		self:RefreshLoadout()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ChangeSlotSkill(integer slotIndex, integer direction)
+		-- Cycles families plus an empty slot, skipping families already equipped elsewhere.
+		if self.IsRequesting or self.UseCustomLoadout == false then return end
+		local choice = self.SkillChoices[slotIndex]
+		if choice == nil then return end
+		local candidate = choice.FamilyIndex
+		for attempt = 1, #self.SkillFamilies + 1 do
+			candidate = (candidate + direction) % (#self.SkillFamilies + 1)
+			local used = false
+			for otherSlot, other in ipairs(self.SkillChoices) do
+				if otherSlot ~= slotIndex and candidate > 0 and other.FamilyIndex == candidate then used = true end
+			end
+			if used == false then
+				choice.FamilyIndex = candidate
+				choice.TierIndex = 1
+				break
+			end
+		end
+		self:RefreshLoadout()
+	end
+
+	@ExecSpace("ClientOnly")
+	method void ChangeSlotTier(integer slotIndex, integer direction)
+		-- Clamps to actual authored upgrades instead of fabricating levels or stat multipliers.
+		if self.IsRequesting or self.UseCustomLoadout == false then return end
+		local choice = self.SkillChoices[slotIndex]
+		local family = choice ~= nil and self.SkillFamilies[choice.FamilyIndex] or nil
+		if family == nil then return end
+		choice.TierIndex = math.max(1, math.min(#family.Tiers, choice.TierIndex + direction))
+		self:RefreshLoadout()
+	end
+
+	@ExecSpace("ClientOnly")
+	method string GetLoadoutSlotIds()
+		-- Serializes all six positions, including gaps, for authoritative server validation.
+		local slots = {}
+		for slot = 1, 6 do
+			local choice = self.SkillChoices[slot]
+			local family = choice ~= nil and self.SkillFamilies[choice.FamilyIndex] or nil
+			local tier = family ~= nil and family.Tiers[choice.TierIndex] or nil
+			slots[slot] = tier ~= nil and tier.SkillId or ""
+		end
+		return table.concat(slots, "|")
+	end
+
+	@ExecSpace("ClientOnly")
+	method void RefreshLoadout()
+		-- Renders only on state changes; normal mode clearly disables the custom rows.
+		if self.ModeText ~= nil then self.ModeText.Text = self.UseCustomLoadout and "커스텀 시작: 켜짐" or "기본 시작 (클릭해 변경)" end
+		local editable = self.UseCustomLoadout and self.IsRequesting == false
+		for slot, row in ipairs(self.SkillRows or {}) do
+			local choice = self.SkillChoices[slot]
+			local family = choice ~= nil and self.SkillFamilies[choice.FamilyIndex] or nil
+			local tier = family ~= nil and family.Tiers[choice.TierIndex] or nil
+			if row.NameText ~= nil then
+				row.NameText.Text = tier ~= nil and tier.DisplayName or "빈 슬롯"
+				row.NameText.FontColor = editable and Color(0.92, 0.96, 1, 1) or Color(0.5, 0.57, 0.65, 1)
+			end
+			if row.TierText ~= nil then row.TierText.Text = tier ~= nil and tostring(tier.SkillTier) or "-" end
+			for control, button in pairs(row.Controls) do
+				local enabled = editable
+				if control == "TierMinus" then enabled = editable and family ~= nil and choice.TierIndex > 1 end
+				if control == "TierPlus" then enabled = editable and family ~= nil and choice.TierIndex < #family.Tiers end
+				button.Enable = enabled
+			end
+		end
 	end
 
 	@ExecSpace("ClientOnly")

@@ -54,7 +54,9 @@ function Color(r,g,b,a) return {r=r,g=g,b=b,a=a} end
 function dataset(rows)
   return {rows=rows,GetRowCount=function(self) return #self.rows end,
     GetCell=function(self,i,k) return self.rows[i][k] end,
-    FindRow=function(self,k,v) for _,r in ipairs(self.rows) do if r[k]==v then return r end end end}
+    FindRow=function(self,k,v) for _,r in ipairs(self.rows) do if r[k]==v then
+      return setmetatable({GetItem=function(_,column) return r[column] end},{__index=r})
+    end end end}
 end
 _DataService={Tables={}, GetTable=function(self,n) return self.Tables[n] end}
 function entity(components)
@@ -69,7 +71,7 @@ for p in (ROOT / "RootDesk/MyDesk/03_Data").glob("*.csv"):
 for name in ["SkillDefinitionRepositoryLogic", "ContentValidatorLogic", "BuffEffectExecutorLogic", "MoveSelfEffectExecutorLogic",
              "StageDefinitionRepositoryLogic", "RegionDefinitionRepositoryLogic", "RegionContentValidatorLogic", "StageMapRouteRepositoryLogic",
              "EnemyPatternStepRepositoryLogic", "EnemyPatternContentValidatorLogic", "BossPhaseDefinitionRepositoryLogic",
-             "BossPhaseContentValidatorLogic", "EnemyTraitRouterLogic", "StageWaveRepositoryLogic", "EnemyIntentResolverLogic"]:
+             "BossPhaseContentValidatorLogic", "EnemyTraitRouterLogic", "EnemyDefeatSuccessorLogic", "StageWaveRepositoryLogic", "EnemyIntentResolverLogic"]:
     load(name)
 
 checks = []

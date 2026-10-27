@@ -44,7 +44,8 @@ const cv = read(path.join(DATA, "Repositories/ContentValidatorLogic.mlua"));
 const pv = read(path.join(DATA, "Repositories/EnemyPatternContentValidatorLogic.mlua"));
 const buff = read(path.join(COMBAT, "Skills/EffectExecutors/BuffEffectExecutorLogic.mlua"));
 const move = read(path.join(COMBAT, "Skills/EffectExecutors/MoveSelfEffectExecutorLogic.mlua"));
-const session = read(path.join(COMBAT, "Components/Shared/BattleSessionComponent.mlua"));
+// IsCombatModifierEffect moved out of BattleSessionComponent (now a thin delegate).
+const combatModifier = read(path.join(COMBAT, "Skills/EffectExecutors/CombatModifierEffectExecutorLogic.mlua"));
 const router = read(path.join(COMBAT, "Resolvers/EffectRouterLogic.mlua"));
 const augmentValidator = read(path.join(DATA, "Repositories/AugmentContentValidatorLogic.mlua"));
 const relicRepo = read(path.join(DATA, "Repositories/RelicDefinitionRepositoryLogic.mlua"));
@@ -57,7 +58,7 @@ const fromCode = {
     ...literals(methodBody(buff, "IsBuffEffectType"), lit),
     ...literals(methodBody(buff, "GetBuffStat"), /effectType\s*==\s*"([A-Z0-9_]+)"/g),
     ...literals(methodBody(move, "IsMoveEffectType"), lit),
-    ...literals(methodBody(session, "IsCombatModifierEffect"), lit),
+    ...literals(methodBody(combatModifier, "IsCombatModifierEffect"), lit),
     ...literals(router, /EffectType\s*==\s*"([A-Z0-9_]+)"/g),
   ],
   utilityEffectType: literals(methodBody(cv, "ValidateUtilityEffect"), /EffectType\s*[~=]=\s*"([A-Z0-9_]+)"/g),

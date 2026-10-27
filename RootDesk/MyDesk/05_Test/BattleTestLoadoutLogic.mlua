@@ -1,0 +1,139 @@
+@Logic
+script BattleTestLoadoutLogic extends Logic
+
+	@Sync property string SkillCatalogSnapshot = ""
+	@Sync property integer CatalogRevision = 0
+	property table JobCatalogs = nil
+	property integer SlotCount = 6
+
+	@ExecSpace("ServerOnly")
+	method void OnBeginPlay()
+		-- Publishes immutable authored skill paths once; selections remain player-owned.
+		self.JobCatalogs = {}
+		local records = {}
+		local jobs = _DataService:GetTable("JobDefinitions")
+		if jobs == nil then return end
+		for row = 1, jobs:GetRowCount() do
+			if _BattleTestHubLogic:ParseBooleanCell(jobs:GetCell(row, "Enabled")) then
+				local jobId = jobs:GetCell(row, "JobId") or ""
+				local catalog = self:GetJobCatalog(jobId)
+				for _, entry in ipairs(catalog.Entries or {}) do
+					table.insert(records, table.concat({jobId, entry.RootSkillId, entry.SkillId,
+						string.gsub(entry.DisplayName, "[|~]", " "), tostring(entry.SkillTier), tostring(entry.StartingSlot)}, "~"))
+				end
+			end
+		end
+		self.SkillCatalogSnapshot = table.concat(records, "|")
+		self.CatalogRevision = self.CatalogRevision + 1
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GetJobCatalog(string jobId)
+		-- Reuses the production upgrade resolver, including non-upgradable heal rules.
+		if self.JobCatalogs == nil then self.JobCatalogs = {} end
+		if self.JobCatalogs[jobId] ~= nil then return self.JobCatalogs[jobId] end
+		local job = _JobDefinitionRepositoryLogic:GetJobDefinition(jobId)
+		local skills = _SkillDefinitionRepositoryLogic:GetJobSkillDefinitions(jobId)
+		if job.Success == false or skills.Success == false then
+			return {Success = false, Reason = "TEST_LOADOUT_JOB_UNAVAILABLE", Entries = {}, ById = {}}
+		end
+		local starting = {}
+		local starters = _JobDefinitionRepositoryLogic:GetStartingSkillEntries(job.StartingSkillSetId)
+		for _, skill in ipairs(starters.Entries or {}) do
+			if skill.Count > 0 then starting[skill.SkillId] = skill.SlotIndex end
+		end
+		local catalog = {Success = true, Reason = "OK", Entries = {}, ById = {}}
+		for _, definition in ipairs(skills.Skills) do
+			if (definition.BaseSkillId or "") == "" then
+				local current = definition
+				local visited = {}
+				while current ~= nil and visited[current.SkillId] ~= true do
+					visited[current.SkillId] = true
+					local entry = {RootSkillId = definition.SkillId, SkillId = current.SkillId,
+						DisplayName = current.DisplayName, SkillTier = current.SkillTier,
+						StartingSlot = starting[definition.SkillId] or 0}
+					table.insert(catalog.Entries, entry)
+					catalog.ById[current.SkillId] = entry
+					local nextTier = _SkillDefinitionRepositoryLogic:GetNextSkillUpgrade(jobId, current.SkillId)
+					current = nextTier.Success and nextTier.UpgradeDefinition or nil
+				end
+			end
+		end
+		self.JobCatalogs[jobId] = catalog
+		return catalog
+	end
+
+	method table ParseSlots(string snapshot)
+		-- Preserves empty/trailing slots and rejects extra positions instead of truncating them.
+		if snapshot == nil or #snapshot > 1024 then return {Success = false, Reason = "TEST_LOADOUT_INVALID_SLOTS"} end
+		local slots = {}
+		for value in string.gmatch(snapshot .. "|", "(.-)|") do table.insert(slots, value) end
+		if #slots ~= self.SlotCount then return {Success = false, Reason = "TEST_LOADOUT_INVALID_SLOTS"} end
+		return {Success = true, Reason = "OK", Slots = slots}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ValidateLoadout(string jobId, string snapshot)
+		-- Accepts only reachable same-job skill tiers and at most one variant per family.
+		local parsed = self:ParseSlots(snapshot)
+		if parsed.Success == false then return parsed end
+		local catalog = self:GetJobCatalog(jobId)
+		if catalog.Success == false then return catalog end
+		local selected = {}
+		local count = 0
+		for _, skillId in ipairs(parsed.Slots) do
+			if skillId ~= "" then
+				local entry = catalog.ById[skillId]
+				if entry == nil then return {Success = false, Reason = "TEST_LOADOUT_SKILL_NOT_ALLOWED"} end
+				if selected[entry.RootSkillId] then return {Success = false, Reason = "TEST_LOADOUT_DUPLICATE_FAMILY"} end
+				selected[entry.RootSkillId] = true
+				count = count + 1
+			end
+		end
+		if count == 0 then return {Success = false, Reason = "TEST_LOADOUT_EMPTY"} end
+		return {Success = true, Reason = "OK", Slots = parsed.Slots, SlotIds = table.concat(parsed.Slots, "|"), Count = count}
+	end
+
+	@ExecSpace("ServerOnly")
+	method table ApplyPreparedLoadout(Entity playerEntity, string jobId, integer requestId, string entryMode)
+		-- Consumes only the Maker test request before the session builds its skill slots.
+		local entry = playerEntity:GetComponent("script.BattleEntryStateComponent")
+		if entry == nil or entry.PrototypeTestSkillSlotIds == "" then return {Success = true, Reason = "NO_OVERRIDE"} end
+		if Environment:IsMakerPlay() == false or entryMode ~= "NEW_RUN" or entry.PrototypeTestEntry ~= true
+			or entry.EntryState ~= "INITIALIZING" or entry.RequestId ~= requestId or entry.JobId ~= jobId then
+			return {Success = false, Reason = "TEST_LOADOUT_ENTRY_MISMATCH"}
+		end
+		local validation = self:ValidateLoadout(jobId, entry.PrototypeTestSkillSlotIds)
+		if validation.Success == false then return validation end
+		local inventory = playerEntity:GetComponent("script.PlayerRunInventoryComponent")
+		if inventory == nil then return {Success = false, Reason = "RUN_INVENTORY_MISSING"} end
+		return inventory:InitializePrototypeTestSkills(validation.Slots)
+	end
+
+	@ExecSpace("ClientOnly")
+	method table GetSkillFamilies(string jobId)
+		-- Projects the synchronized catalog into ordered families without reading server-only datasets.
+		local families = {}
+		local byRoot = {}
+		for record in string.gmatch(self.SkillCatalogSnapshot or "", "[^|]+") do
+			local fields = _BattleTestHubLogic:Split(record, "~")
+			if #fields == 6 and fields[1] == jobId then
+				local family = byRoot[fields[2]]
+				if family == nil then
+					family = {RootSkillId = fields[2], StartingSlot = tonumber(fields[6]) or 0, Tiers = {}}
+					byRoot[fields[2]] = family
+					table.insert(families, family)
+				end
+				table.insert(family.Tiers, {SkillId = fields[3], DisplayName = fields[4], SkillTier = tonumber(fields[5]) or 1})
+			end
+		end
+		table.sort(families, function(a, b)
+			local orderA = a.StartingSlot > 0 and a.StartingSlot or 999
+			local orderB = b.StartingSlot > 0 and b.StartingSlot or 999
+			if orderA ~= orderB then return orderA < orderB end
+			return a.RootSkillId < b.RootSkillId
+		end)
+		return families
+	end
+
+end

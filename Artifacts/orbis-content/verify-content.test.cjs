@@ -16,8 +16,19 @@ const rows = n => tables[n].rows;
 const find = (n, key, value) => rows(n).find(r => r[key] === value);
 const orbis = n => rows(n).filter(r => Object.values(r).some(v => /^orbis_|^skill_orbis_/.test(v)));
 
+function authoringBaselineBytes(file) {
+  const bytes = fs.readFileSync(path.join(root, file));
+  if (!file.endsWith(".csv")) return bytes;
+  // Historical Orbis snapshots predate El Nath; its rows and successor columns have separate coverage.
+  const table = schema.parseCSV(bytes.toString("utf8"));
+  table.headers = table.headers.filter(h => !["DeathSpawnEnemyDefinitionId", "DeathSpawnModelId"].includes(h));
+  table.rows = table.rows.filter(r => !Object.values(r).some(v => /^el_nath(?:_|$)/.test(v)));
+  table.dirty = true;
+  return Buffer.from(schema.serializeCSV(table));
+}
+
 function legacyEconomyBytes(file) {
-  const bytes=fs.readFileSync(path.join(root,file));
+  const bytes=authoringBaselineBytes(file);
   if(!/\/(ShopEntries|RelicDefinitions)\.csv$/.test(file)) return bytes;
   const lines=bytes.toString("utf8").trimEnd().split(/\r?\n/);
   const header=lines[0].split(","), originalColumns=file.endsWith("RelicDefinitions.csv") ? header.indexOf("AcquisitionType") : header.length;
@@ -187,7 +198,7 @@ test("incremental tower authoring preserves old CSVs/arenas and models except Ma
   const crypto = require("node:crypto");
   const baseline = require("./tower-authoring-baseline.json");
   for (const [relative, before] of Object.entries(baseline.files)) {
-    const after = fs.readFileSync(path.join(root, relative));
+    const after = authoringBaselineBytes(relative);
     let preserved = relative.endsWith(".csv") ? after.subarray(0, before.bytes) : after;
     if (relative.endsWith(".model")) {
       // Maker upgrades the old template wrapper to the approved project core; values/children must be identical.
@@ -343,4 +354,33 @@ test("relic content hooks use shared damage, action and wave owners without expa
   const html=fs.readFileSync(path.join(root,"tools/balance-studio.html"),"utf8");
   const vocab=JSON.parse(html.match(/<script[^>]*id="vocabCatalog"[^>]*>([\s\S]*?)<\/script>/)[1]);
   assert.deepEqual(Object.keys(vocab.relic.acquisitionTypes),["GENERAL","REGION_SHOP","BOSS_CLEAR"]);
+});
+
+
+test("Balance Studio combines fixed spawn slots with defeat-successor drops", () => {
+  const html = fs.readFileSync(path.join(root, "tools/balance-studio.html"), "utf8");
+  const functionSource = name => { const start = html.indexOf("  function " + name + "("); return html.slice(start, html.indexOf("\n  function ", start + 10)); };
+  const parent = find("EnemyDefinitions", "EnemyDefinitionId", "el_nath_yeti_pepe");
+  const child = parent.DeathSpawnEnemyDefinitionId;
+  const pools = [
+    { PoolId: "verify", EnemyDefinitionId: parent.EnemyDefinitionId, EnemyModelId: "parent", Weight: "1", SpawnIndex: "1" },
+    { PoolId: "verify", EnemyDefinitionId: "orbis_star_pixie", EnemyModelId: "orbisstarpixie", Weight: "1", SpawnIndex: "2" },
+    { PoolId: "registration", EnemyDefinitionId: child, EnemyModelId: parent.DeathSpawnModelId, Weight: "1" }
+  ];
+  const wrap = records => records.map(r => ({ get: key => r[key] ?? "" }));
+  const context = vm.createContext({
+    GOLD_ID: "gold",
+    tableRowsOf: name => wrap(name === "EnemyDefinitions" ? rows(name) : name === "EnemySpawnPools" ? pools : []),
+    stageWaves: () => wrap([{ SpawnCount: "2", EnemyPoolId: "verify", WaveIndex: "1" }])
+  });
+  vm.runInContext(functionSource("poolCandidates") + functionSource("deathSpawnCheck") + functionSource("stageEconomy") + ";globalThis.estimate=stageEconomy;", context);
+  const drops = new Map([
+    [parent.EnemyDefinitionId, { gold: 10, items: new Map([["token", 1]]) }],
+    [child, { gold: 3, items: new Map([["token", 2]]) }],
+    ["orbis_star_pixie", { gold: 2, items: new Map() }]
+  ]);
+  const result = context.estimate("verify", new Map([["verify", { waveTableId: "verify" }]]), drops, {});
+  assert.equal(result.enemies, 2);
+  assert.equal(result.dropGold, 15);
+  assert.equal(result.items.get("token"), 3);
 });
