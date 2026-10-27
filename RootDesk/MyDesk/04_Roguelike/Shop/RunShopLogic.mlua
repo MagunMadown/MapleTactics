@@ -54,32 +54,46 @@ script RunShopLogic extends Logic
 		local nextVisit = shopState.ActiveRunSequence == runState.RunSequence and shopState.VisitSequence + 1 or 1
 		local potions = self:BuildPotionOffers(shopId, runState.RunSequence, nextVisit)
 		if not potions.Success then return potions end
-		local candidates = {}
+		local candidates, souvenirs = {}, {}
+		local sourceRegion = (runState.SelectedNodeId == "orbis_shop_after_stage03" or runState.SelectedNodeId == "orbis_shop_after_stage10") and "orbis" or ""
 		for _, entry in ipairs(bundle.Entries) do
+			local definition = relics.Definitions[entry.RewardRefId]
 			if relics:CanAcquireRelic(entry.RewardRefId) and not shopState:IsOfferPurchased(entry.ShopEntryId) then
-				table.insert(candidates, entry)
+				local kind = definition.AcquisitionType or "GENERAL"
+				if kind == "GENERAL" then table.insert(candidates, entry)
+				elseif kind == "REGION_SHOP" and sourceRegion ~= "" and definition.AcquisitionSourceId == sourceRegion then table.insert(souvenirs, entry) end
 			end
 		end
-		table.sort(candidates, function(left, right) return left.ShopEntryId < right.ShopEntryId end)
-		local relicIds = {}
-		for _, entry in ipairs(candidates) do table.insert(relicIds, entry.RewardRefId) end
-		local snapshot = ""
-		local offeredEntries = {}
-		local firstOffered = nil
-		for slot = 1, math.min(3, #candidates) do
-			local index = relics:SelectRelicIndex(relicIds)
-			if index <= 0 then return { Success = false, Reason = "INVALID_RELIC_OFFER_POOL" } end
-			local offered = candidates[index]
-			if firstOffered == nil then firstOffered = offered end
-			offeredEntries[offered.ShopEntryId] = offered
-			local definition = relics.Definitions[offered.RewardRefId]
-			local row = table.concat({ offered.ShopEntryId, definition.DisplayName, offered.RewardType, offered.RewardRefId,
-				tostring(offered.RewardAmount), offered.PriceCurrencyId, tostring(offered.PriceAmount), tostring(offered.DisplayOrder),
-				offered.IconImageRUID, offered.ItemCategory, tostring(definition.AttackBonus), tostring(definition.MaxHpBonus),
-				tostring(definition.DefenseBonus), definition.EffectDescription }, "~")
-			snapshot = snapshot == "" and row or snapshot .. "|" .. row
-			table.remove(candidates, index)
-			table.remove(relicIds, index)
+		local sortEntries = function(a, b) return a.ShopEntryId < b.ShopEntryId end
+		table.sort(candidates, sortEntries)
+		table.sort(souvenirs, sortEntries)
+		local snapshot, offeredEntries, firstOffered = "", {}, nil
+		for slot = 1, 3 do
+			local pool = slot == 3 and #souvenirs > 0 and souvenirs or candidates
+			if #pool > 0 then
+				local offerIds, offerIndices = {}, {}
+				local lowestPrice = math.huge
+				if slot == 1 and runState.SelectedNodeId == "orbis_shop_after_stage03" then
+					for _, entry in ipairs(pool) do if entry.PriceCurrencyId == "gold" then lowestPrice = math.min(lowestPrice, entry.PriceAmount) end end
+				end
+				for index, entry in ipairs(pool) do
+					if lowestPrice == math.huge or (entry.PriceCurrencyId == "gold" and entry.PriceAmount == lowestPrice) then
+						table.insert(offerIds, entry.RewardRefId); table.insert(offerIndices, index)
+					end
+				end
+				local index = offerIndices[relics:SelectRelicIndex(offerIds)] or 0
+				if index <= 0 then return { Success = false, Reason = "INVALID_RELIC_OFFER_POOL" } end
+				local offered = pool[index]
+				if firstOffered == nil then firstOffered = offered end
+				offeredEntries[offered.ShopEntryId] = offered
+				local definition = relics.Definitions[offered.RewardRefId]
+				local row = table.concat({ offered.ShopEntryId, definition.DisplayName, offered.RewardType, offered.RewardRefId,
+					tostring(offered.RewardAmount), offered.PriceCurrencyId, tostring(offered.PriceAmount), tostring(offered.DisplayOrder),
+					offered.IconImageRUID, offered.ItemCategory, tostring(definition.AttackBonus), tostring(definition.MaxHpBonus),
+					tostring(definition.DefenseBonus), definition.EffectDescription }, "~")
+				snapshot = snapshot == "" and row or snapshot .. "|" .. row
+				table.remove(pool, index)
+			end
 		end
 		for _, entry in ipairs(potions.Entries) do
 			offeredEntries[entry.ShopEntryId] = entry
@@ -133,7 +147,7 @@ script RunShopLogic extends Logic
 			table.sort(entries, function(a, b) return a.DisplayOrder < b.DisplayOrder end)
 			for _, entry in ipairs(entries) do
 				local definition = relics.Definitions[entry.RewardRefId]
-				if definition ~= nil and entry.RewardType == "ITEM" and entry.PriceCurrencyId == "gold" then
+				if definition ~= nil and definition.AcquisitionType ~= "BOSS_CLEAR" and entry.RewardType == "ITEM" and entry.PriceCurrencyId == "gold" then
 					local price = math.max(1, math.floor(entry.PriceAmount * 70 / 100 / math.max(1, entry.RewardAmount)))
 					shopState.SellCatalog[entry.RewardRefId] = price
 					shopState.SellItemTypes[entry.RewardRefId] = "ITEM"
@@ -353,34 +367,50 @@ script RunShopLogic extends Logic
 
 	@ExecSpace("Server")
 	method void RequestCloseShop(integer requestId)
-		-- Lets the owning client finish or skip the active shop through the same completion path.
+		-- Completes the owning player's visit and resumes approved in-region battle edges.
 		local playerEntity = _UserService:GetUserEntityByUserId(senderUserId)
 		local visit = self:GetOrCreateShopState(playerEntity)
 		local run = _RunManagerLogic:GetOrCreateRunState(playerEntity)
-		local bossShop = visit ~= nil and run ~= nil and visit.ActiveRunSequence == run.RunSequence
-			and visit.ActiveNodeId == "shop_sleepywood_balrog"
-		if bossShop and (isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= "sleepywood_shop") then
-			self:NotifyCloseShopResult(false, "SHOP_MAP_REQUIRED", senderUserId)
+		local directShop = visit ~= nil and run ~= nil and visit.ActiveRunSequence == run.RunSequence
+			and _ShopNodeBindingRepositoryLogic:UsesDirectBattleDeparture(visit.ActiveNodeId)
+		if directShop and visit.ShopState == "CLOSED"
+			and run.LastContentCompletionKey == tostring(run.RunSequence) .. ":" .. tostring(requestId) then
+			self:NotifyCloseShopResult(true, "DUPLICATE_CONTENT_COMPLETION_IGNORED", senderUserId)
 			return
 		end
+		if directShop then
+			local bundle = _ShopDefinitionRepositoryLogic:GetShopBundle(visit.ActiveShopId)
+			local expectedMap = bundle.Success and _ShopDefinitionRepositoryLogic:GetMapIdForNode(bundle.Definition, visit.ActiveNodeId) or ""
+			if expectedMap == "" or isvalid(playerEntity.CurrentMap) == false or playerEntity.CurrentMap.Name ~= expectedMap then
+				self:NotifyCloseShopResult(false, "SHOP_MAP_REQUIRED", senderUserId)
+				return
+			end
+		end
 		local result = nil
-		if bossShop and visit.ShopState == "CLOSED" then
-			result = { Success = true, Reason = "RETRY_BOSS_DEPARTURE" }
+		if directShop and visit.ShopState == "CLOSED" then
+			result = { Success = true, Reason = "RETRY_BATTLE_DEPARTURE" }
 		else
 			result = self:CloseShop(playerEntity, requestId)
 		end
-		if result.Success and bossShop then
-			if run.AvailableNodeIds == "sleepywood_stage08_boss" then
-				result = _RunManagerLogic:SelectNextContent(playerEntity, "sleepywood_stage08_boss", 9000000 + run.RunFlowRevision)
-			end
-			if result.Success then
-				if run.SelectedNodeId ~= "sleepywood_stage08_boss" then
-					result = { Success = false, Reason = "BOSS_ROUTE_NOT_READY" }
-				else
-					result = _RunContentMapTransitionAdapterLogic:ConsumeSelectedBattle(playerEntity)
+		if result.Success and directShop then
+			local node = _NodeDefinitionRepositoryLogic:GetNodeDefinition(run.CurrentNodeGraphId, visit.ActiveNodeId)
+			local nextId = node.Success and node.NextNodeIds or ""
+			local nextNode = nextId ~= "" and _NodeDefinitionRepositoryLogic:GetNodeDefinition(run.CurrentNodeGraphId, nextId) or nil
+			if nextNode == nil or not nextNode.Success or (nextNode.NodeType ~= "BATTLE" and nextNode.NodeType ~= "BOSS") then
+				result = { Success = false, Reason = "SHOP_BATTLE_ROUTE_NOT_READY" }
+			else
+				if run.AvailableNodeIds == nextId then
+					result = _RunManagerLogic:SelectNextContent(playerEntity, nextId, 9000000 + run.RunFlowRevision)
+				end
+				if result.Success then
+					if run.SelectedNodeId ~= nextId then
+						result = { Success = false, Reason = "SHOP_BATTLE_ROUTE_NOT_READY" }
+					else
+						result = _RunContentMapTransitionAdapterLogic:ConsumeSelectedBattle(playerEntity)
+					end
 				end
 			end
-			if result.Success then self:NotifyCloseShopResult(true, "BOSS_DEPARTED", senderUserId) end
+			if result.Success then self:NotifyCloseShopResult(true, "SHOP_BATTLE_DEPARTED", senderUserId) end
 		end
 		if result.Success == false then
 			log_warning("[RunShop] close rejected user=" .. senderUserId .. " request=" .. requestId .. " reason=" .. result.Reason)
@@ -452,7 +482,7 @@ script RunShopLogic extends Logic
 				CanClose = shopState.ShopState == "OPEN",
 				-- Closing the route map must not strand a completed visit in the shop map.
 				CanResumeDeparture = shopState.ShopState == "CLOSED"
-					and shopState.ActiveNodeId ~= "shop_sleepywood_balrog"
+					and not _ShopNodeBindingRepositoryLogic:UsesDirectBattleDeparture(shopState.ActiveNodeId)
 					and shopState.ActiveRunSequence == runState.RunSequence
 					and runState.RunFlowState == "AWAITING_NODE_SELECTION"
 					and runState.LastCompletedContentType == "SHOP"

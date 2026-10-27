@@ -10,6 +10,10 @@ script PlayerRunRelicEffectComponent extends Component
 	property table Definitions = {}
 	property table ShopBundle = {}
 	property table SpecialEffects = {}
+	property table ContentRelicState = {}
+	property table RelicFeedbackState = {}
+	property string ContentRelicBattleKey = ""
+	property boolean IncomingDirectDamage = false
 	property string ActiveBattleKey = ""
 	property string LastVictoryKey = ""
 	property boolean FirstHitGuardUsed = false
@@ -25,6 +29,7 @@ script PlayerRunRelicEffectComponent extends Component
 	property table ExhaustedRelics = {}
 	property table BossRelicRolls = {}
 	@TargetUserSync property string InventoryDisplaySnapshot = ""
+	@TargetUserSync property string ContentRelicDisplaySnapshot = ""
 
 	@ExecSpace("ServerOnly")
 	method table CaptureForRun(integer runSequence)
@@ -56,6 +61,10 @@ script PlayerRunRelicEffectComponent extends Component
 		self.RemainingUses = {}
 		self.ExhaustedRelics = {}
 		self.BossRelicRolls = {}
+		self.IncomingDirectDamage = false
+		self.ContentRelicBattleKey = ""
+		self.ContentRelicDisplaySnapshot = ""
+		_ContentRelicTriggerLogic:Reset(self)
 		self.InventoryDisplaySnapshot = ""
 		if runSequence <= 0 then return { Success = true, Reason = "RELIC_RESET" } end
 		local catalog = _RelicDefinitionRepositoryLogic:GetAllDefinitions()
@@ -79,7 +88,7 @@ script PlayerRunRelicEffectComponent extends Component
 		end
 		local candidates = {}
 		for id, _ in pairs(self.Definitions) do
-			if self:CanAcquireRelic(id) then table.insert(candidates, id) end
+			if self:CanAcquireRelic(id) and self:IsAcquisitionAllowed(id, "GENERAL", "") then table.insert(candidates, id) end
 		end
 		table.sort(candidates)
 		local pending = {}
@@ -193,7 +202,11 @@ script PlayerRunRelicEffectComponent extends Component
 			end
 			log("[RunRelic] hp delta=" .. delta .. " hp=" .. runState.RunCurrentHp .. "/" .. runState.RunMaxHp)
 		end
+		if (specialEffects["TURN_HIT_COOLDOWN"] or 0) == 0 then self.ContentRelicState.Moon = false end
+		if (specialEffects["STATIONARY_GUARD"] or 0) == 0 then self.ContentRelicState.Stone = false; self.ContentRelicState.Stationary = 0 end
+		if (specialEffects["FIRST_DEBUFF_WINDOW"] or 0) == 0 then self.ContentRelicState.FeatherActive = false end
 		self:PublishInventoryDisplay()
+		_ContentRelicTriggerLogic:PublishDisplay(self)
 		return { Success = true, Reason = "RELIC_EFFECTS_APPLIED", AttackBonus = attack, MaxHpBonus = hp, DefenseBonus = defense }
 	end
 
@@ -228,6 +241,10 @@ script PlayerRunRelicEffectComponent extends Component
 		local recalculation = self:Recalculate()
 		if recalculation.Success == false then return end
 		self.ActiveBattleKey = key
+		if self.ContentRelicBattleKey ~= key then
+			_ContentRelicTriggerLogic:Reset(self)
+			self.ContentRelicBattleKey = key
+		end
 		self.BattleKillAttackBonus = 0
 		self.EffectReadyTurns = {}
 		self.LoadedCooldownReductions = {}
@@ -237,6 +254,7 @@ script PlayerRunRelicEffectComponent extends Component
 		self.FirstKillUsed = false
 		self.DefeatedUnitIds = {}
 		self:ApplyRelicHealing("BATTLE_START_HEAL")
+		_ContentRelicTriggerLogic:PublishDisplay(self)
 		log("[RunRelic] battle armed key=" .. key)
 	end
 
@@ -246,12 +264,15 @@ script PlayerRunRelicEffectComponent extends Component
 		if not self:IsCurrentRun() or amount <= 0 or currentHp <= 0 or self.ActiveBattleKey == "" then return amount end
 		if not self.FirstHitGuardUsed and self:GetSpecialEffectValue("FIRST_HIT_GUARD") > 0 then
 			self.FirstHitGuardUsed = true
+			_RunRelicFeedbackLogic:Notify(self, "FIRST_HIT_GUARD", "피해 무효")
 			log("[RunRelic] triggered effect=FIRST_HIT_GUARD key=" .. self.ActiveBattleKey .. " blocked=" .. amount)
 			return 0
 		end
 		if self:ConsumeGuardUse() then return 0 end
+		if self.IncomingDirectDamage then amount = _ContentRelicTriggerLogic:IncomingDirectDamage(self, amount) end
 		if amount >= currentHp and not self.LethalSurvivalUsed and self:GetSpecialEffectValue("LETHAL_SURVIVAL") > 0 then
 			self.LethalSurvivalUsed = true
+			_RunRelicFeedbackLogic:Notify(self, "LETHAL_SURVIVAL", "체력 1")
 			log("[RunRelic] triggered effect=LETHAL_SURVIVAL key=" .. self.ActiveBattleKey .. " hp=1")
 			return math.max(0, currentHp - 1)
 		end
@@ -265,6 +286,9 @@ script PlayerRunRelicEffectComponent extends Component
 		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
 		if amount <= 0 or unit == nil or unit.Team ~= "Player" then return end
 		local healing = unit:ApplyHealing(amount)
+		if effectType == "THREE_KILL_HEAL" and (healing.AppliedAmount or 0) > 0 then
+			_RunRelicFeedbackLogic:Notify(self, effectType, "회복 +" .. _RunRelicFeedbackLogic:Amount(healing.AppliedAmount))
+		end
 		log("[RunRelic] triggered effect=" .. effectType .. " key=" .. self.ActiveBattleKey
 			.. " applied=" .. tostring(healing.AppliedAmount or 0) .. " reason=" .. healing.Reason)
 	end
@@ -276,7 +300,11 @@ script PlayerRunRelicEffectComponent extends Component
 		self.DefeatedUnitIds[unitId] = true
 		local gain = self:GetSpecialEffectValue("KILL_ATTACK_BATTLE")
 		if gain > 0 then
-			self.BattleKillAttackBonus = math.min(3, self.BattleKillAttackBonus + gain)
+			local before = self.BattleKillAttackBonus
+			self.BattleKillAttackBonus = math.min(3, before + gain)
+			if self.BattleKillAttackBonus > before then
+				_RunRelicFeedbackLogic:Notify(self, "KILL_ATTACK_BATTLE", "공격 +" .. _RunRelicFeedbackLogic:Amount(self.BattleKillAttackBonus))
+			end
 			self:PublishInventoryDisplay()
 			log("[RunRelic] kill attack bonus=" .. self.BattleKillAttackBonus .. " unit=" .. unitId)
 		end
@@ -288,19 +316,26 @@ script PlayerRunRelicEffectComponent extends Component
 				self:ApplyRelicHealing("THREE_KILL_HEAL")
 			end
 		end
-		if self.FirstKillUsed then return end
+		if self.FirstKillUsed then _RunRelicFeedbackLogic:Publish(self); return end
 		self.FirstKillUsed = true
 		local percent = self:GetSpecialEffectValue("FIRST_KILL_HEAL_PERCENT")
 		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
 		if percent > 0 and unit ~= nil then
-			unit:ApplyHealing(math.max(1, math.floor(unit.MaxHp * percent / 100)))
+			local healing = unit:ApplyHealing(math.max(1, math.floor(unit.MaxHp * percent / 100)))
+			if (healing.AppliedAmount or 0) > 0 then
+				_RunRelicFeedbackLogic:Notify(self, "FIRST_KILL_HEAL_PERCENT", "회복 +" .. _RunRelicFeedbackLogic:Amount(healing.AppliedAmount))
+			end
 		end
 		local reduction = self:GetSpecialEffectValue("FIRST_KILL_COOLDOWN")
 		local runtime = self.Entity:GetComponent("script.SkillRuntimeStateComponent")
 		if reduction > 0 and runtime ~= nil then
+			local hasCooldown = false
+			for _, turns in pairs(runtime.RemainingCooldowns or {}) do if turns > 0 then hasCooldown = true; break end end
 			runtime:AdvanceCooldowns(reduction, "RELIC_FIRST_KILL")
+			if hasCooldown then _RunRelicFeedbackLogic:Notify(self, "FIRST_KILL_COOLDOWN", "쿨 감소") end
 			log("[RunRelic] triggered effect=FIRST_KILL_COOLDOWN key=" .. self.ActiveBattleKey .. " reduction=" .. reduction)
 		end
+		_RunRelicFeedbackLogic:Publish(self)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -337,11 +372,13 @@ script PlayerRunRelicEffectComponent extends Component
 			if remaining > 0 then
 				self.RemainingUses[id] = remaining - 1
 				if remaining == 1 then
+					self.RelicFeedbackState.Retired[id] = true
 					self.ExhaustedRelics[id] = true
 					inventory.RunItemSnapshot = inventory:SetSnapshotAmount(inventory.RunItemSnapshot, id, 0)
 				end
 				inventory.InventoryRevision = inventory.InventoryRevision + 1
 				self:Recalculate()
+				_RunRelicFeedbackLogic:Notify(self, "FINITE_GUARD", remaining == 1 and "방어 소진" or "피해 무효")
 				log("[RunRelic] finite guard id=" .. id .. " remaining=" .. tostring(remaining - 1))
 				return true
 			end
@@ -393,9 +430,13 @@ script PlayerRunRelicEffectComponent extends Component
 		local amount = self:GetSpecialEffectValue("FIRST_SKILL_COOLDOWN")
 		local runtime = self.Entity:GetComponent("script.SkillRuntimeStateComponent")
 		if amount > 0 and runtime ~= nil then
-			runtime:ReduceCooldown(skillId, amount)
+			local refund = runtime:ReduceCooldown(skillId, amount)
+			if refund ~= nil and (refund.AppliedAmount or 0) > 0 then
+				_RunRelicFeedbackLogic:Notify(self, "FIRST_SKILL_COOLDOWN", "쿨 -" .. _RunRelicFeedbackLogic:Amount(refund.AppliedAmount))
+			end
 			log("[RunRelic] first skill cooldown skill=" .. skillId .. " amount=" .. tostring(amount))
 		end
+		_RunRelicFeedbackLogic:Publish(self)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -443,6 +484,10 @@ script PlayerRunRelicEffectComponent extends Component
 		local cooldown = self:GetSpecialEffectValue(effectType)
 		if cooldown <= 0 or self.ActiveBattleKey == "" or turnNumber < (self.EffectReadyTurns[effectType] or 0) then return false end
 		self.EffectReadyTurns[effectType] = turnNumber + cooldown
+		self.RelicFeedbackState.Turn = turnNumber
+		local labels = { FREE_LOAD_INTERVAL = "무료 장전", LOAD_COOLDOWN_INTERVAL = "장전 예약", REPEAT_SKILL_INTERVAL = "추가 시전" }
+		if labels[effectType] ~= nil then _RunRelicFeedbackLogic:Notify(self, effectType, labels[effectType])
+		else _RunRelicFeedbackLogic:Publish(self) end
 		log("[RunRelic] triggered effect=" .. effectType .. " turn=" .. turnNumber .. " ready=" .. self.EffectReadyTurns[effectType])
 		return true
 	end
@@ -455,7 +500,10 @@ script PlayerRunRelicEffectComponent extends Component
 		if runtime == nil then return end
 		local remaining = runtime:GetRemainingCooldown(skillId)
 		if remaining <= 0 or not self:ConsumeReadyEffect("KILL_SKILL_RESET_INTERVAL", turnNumber) then return end
-		runtime:ReduceCooldown(skillId, remaining)
+		local refund = runtime:ReduceCooldown(skillId, remaining)
+		if refund ~= nil and (refund.AppliedAmount or 0) > 0 then
+			_RunRelicFeedbackLogic:Notify(self, "KILL_SKILL_RESET_INTERVAL", "쿨 초기화")
+		end
 		log("[RunRelic] kill skill reset skill=" .. skillId .. " turn=" .. turnNumber)
 	end
 
@@ -467,6 +515,7 @@ script PlayerRunRelicEffectComponent extends Component
 		if self:ConsumeReadyEffect("LOAD_COOLDOWN_INTERVAL", turnNumber) then
 			self.LoadedCooldownReductions[skillId] = 3
 		end
+		_RunRelicFeedbackLogic:Publish(self)
 		return freeLoad
 	end
 
@@ -476,6 +525,7 @@ script PlayerRunRelicEffectComponent extends Component
 		local amount = self.LoadedCooldownReductions[skillId] or 0
 		self.LoadedCooldownReductions[skillId] = nil
 		if self:GetSpecialEffectValue("LOAD_COOLDOWN_INTERVAL") <= 0 then return 0 end
+		if amount > 0 then _RunRelicFeedbackLogic:Notify(self, "LOAD_COOLDOWN_INTERVAL", "예약 사용") end
 		return amount
 	end
 
@@ -483,6 +533,7 @@ script PlayerRunRelicEffectComponent extends Component
 	method void CancelLoadedSkill(string skillId)
 		-- Removing a loaded card drops its benefit without refunding the relic's internal cooldown.
 		self.LoadedCooldownReductions[skillId] = nil
+		_RunRelicFeedbackLogic:Publish(self)
 	end
 
 	@ExecSpace("ServerOnly")
@@ -492,6 +543,8 @@ script PlayerRunRelicEffectComponent extends Component
 		self.EffectReadyTurns = {}
 		self.LoadedCooldownReductions = {}
 		self.ActiveBattleKey = ""
+		self.ContentRelicState.QueueActive = false
+		_ContentRelicTriggerLogic:PublishDisplay(self)
 		self:PublishInventoryDisplay()
 	end
 
@@ -531,6 +584,7 @@ script PlayerRunRelicEffectComponent extends Component
 		if self._T.MagnetPetElapsed < 0.05 then return end
 		local elapsed = math.min(0.15, self._T.MagnetPetElapsed)
 		self._T.MagnetPetElapsed = 0
+		_RunRelicFeedbackLogic:UpdateClock(self)
 		local map = self.Entity.CurrentMap
 		local run = self.Entity:GetComponent("script.PlayerRunStateComponent")
 		if not isvalid(map) or run == nil or run.RunState ~= "Active"
@@ -616,6 +670,32 @@ script PlayerRunRelicEffectComponent extends Component
 	method void OnEndPlay()
 		-- Player removal must not leave a replicated pet in a shared map.
 		self:ClearMagnetPetFollower()
+	end
+
+	method boolean IsAcquisitionAllowed(string relicId, string kind, string source)
+		-- Source filtering is separate from ownership, job and open-state eligibility.
+		local definition = self.Definitions[relicId]
+		return definition ~= nil and (definition.AcquisitionType or "GENERAL") == kind
+			and (definition.AcquisitionSourceId or "") == source
+	end
+
+	@ExecSpace("ServerOnly")
+	method table GrantBossContentRelic(string stageId, string completionKey)
+		-- Captured content rewards replace the class roll only for their declared boss stage.
+		if not self:IsCurrentRun() then return { Success = false, Reason = "RUN_RELIC_SEQUENCE_MISMATCH" } end
+		local inventory = self.Entity:GetComponent("script.PlayerRunInventoryComponent")
+		for id, _ in pairs(self.Definitions) do
+			if self:IsAcquisitionAllowed(id, "BOSS_CLEAR", stageId) then
+				local key = "boss_content_relic:" .. self.ActiveRunSequence .. ":" .. stageId
+				if inventory:GetSnapshotAmount(inventory.RunItemSnapshot, id) > 0 then
+					return { Success = true, Reason = "CONTENT_RELIC_ALREADY_OWNED" }
+				end
+				local result = inventory:GrantRelicFrom(id, key, "BOSS_CLEAR", stageId)
+				result.AcquisitionType = "BOSS_CLEAR"
+				return result
+			end
+		end
+		return self:GrantBossClassRelic(completionKey)
 	end
 
 end

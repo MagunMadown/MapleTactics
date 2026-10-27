@@ -24,6 +24,8 @@ new=load(COMBAT+'Components/Shared/BattleWaveComponent.mlua','newWave',methods)
 rows=list(csv.DictReader(io.StringIO((ROOT/'RootDesk/MyDesk/03_Data/EnemyDefinitions.csv').read_text(encoding='utf-8-sig'))))
 checks=0
 for row in rows:
+    # El Nath was added after this legacy baseline and defines its own ascension bonuses.
+    if row["EnemyDefinitionId"].startswith("el_nath_"): continue
     d=dict(row)
     for k in ['MaxHp','BasicAttackDamage','AscensionHpBonus']: d[k]=float(d[k] or 1)
     d['IsBoss']=d['IsBoss'].lower()=='true'
@@ -41,6 +43,7 @@ _AugmentRuntimeLogic={GetConditionalDamageBonus=function() return 0 end}
 _TutorialRulesLogic={GetDamageAmount=function(_,s,u,a) return a end}
 local function unit(team)
  return {Team=team, CurrentHp=100,MaxHp=100,IsDead=false,PoisonDamage=0,NextAttackBonus=0,ComboAttackBonus=0,DefenseBuffAmount=0,AttackDamageCap=0,FlatDamageReduction=0,BurnDamage=0,BurnTurns=0,
+ ShouldBlockHostileStatus=function() return false end,
  ConsumeAttackBuffHit=function() return 0 end, ConsumeVenomBuffHit=function() return 0 end,
  ApplyDamage=function(self,a) local before=self.CurrentHp; self.CurrentHp=math.max(0,before-a); return {Success=true,AppliedAmount=before-self.CurrentHp,HpBefore=before,HpAfter=self.CurrentHp,ReachedZero=self.CurrentHp==0} end}
 end

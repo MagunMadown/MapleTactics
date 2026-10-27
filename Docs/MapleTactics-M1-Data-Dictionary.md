@@ -1261,6 +1261,12 @@ HUD는 같은 종류도 한 개씩 분리한다. 초과분은 기존 재화 정�
 | AttackBonus | integer | O | 0 이상, 실제 양수 타격에 합산 |
 | MaxHpBonus | integer | O | 0 이상, 최대 체력 및 현재 체력 차이 적용 |
 | DefenseBonus | integer | O | 0 이상, 받는 타격에서 차감; 최소 1, 완전 방어는 0 |
+| SpecialEffectType | enum | - | Repository가 지원하는 특수 효과; 빈 값은 능력치 유물 |
+| SpecialEffectValue | integer | - | 효과가 있으면 양의 정수, 없으면 0/빈 값 |
+| RequiredJobId | string | - | 빈 값은 전 직업, 그 외 JobDefinitions 참조 |
+| IsOpen | boolean | O | 새 런의 획득 가능 여부 |
+| AcquisitionType | enum | - | GENERAL(열 없음/빈 값 기본), REGION_SHOP, BOSS_CLEAR |
+| AcquisitionSourceId | string | - | GENERAL은 빈 값, REGION_SHOP은 활성 RegionId, BOSS_CLEAR는 BOSS StageId |
 
 한 행에 세 효과를 함께 설정할 수 있다. 안경·펜던트·귀고리는 (1,0,0), 모자·신발은 (0,1,0), 견장·벨트·옷은 (0,0,1)로 시작한다. 음수·소수·빈 수치·중복 ID를 거절한다.
 PlayerRunRelicEffectComponent는 새 런에서 정의를 고정하고 보유 유물별 합계를 구매 및 전투 진입에 계산한다. HP 5/10에서 체력 +1 구매는 6/11이며 재계산·재진입은 추가 회복하지 않는다. 새 런은 합계를 0으로 초기화한다. 계정 영구 저장은 없다.
@@ -1410,3 +1416,8 @@ Validator가 반환하는 코드가 아니다.
 - 연동: 일반 피해와 상태이상 피해의 실제 HP 감소량을 표시한다. 스킨 설정은 피해량·큐·턴·사망 판정을 변경하지 않는다.
 
 필드 허용값, 선택 API, 저장 범위, 테스트 절차는 [데미지스킨 제작 가이드](Guide/Damage-Skin-Authoring-Guide.md)를 따른다. 정적 검증과 Maker 빌드·기본 리소스 로드·양쪽 피격 호출을 확인했다. 실제 화면 위치 검증은 남아 있다.
+
+
+### 2026-10-24 오르비스 유물 규격 보충
+
+현재 RelicDefinitions는 공용 50·지역 상점 4·보스 확정 2의 56행이며 ShopEntries 유물은 54행이다. 위의 초기 33종·동일 가중 단일 상품 설명은 과거 이력이다. 현재 공용 유물은 일반:특수 개별 가중치 3:1로 최대 3종 진열하고, 오르비스 두 상점은 공용 2/기념 1을 구성한다. 가격·획득 종류·출처는 새 런에서 캡처한다. 보스 출처 중복은 거절한다. 상세 정책과 발동 경계는 [유물 가이드](Guide/Run-Relic-Trigger-Guide.md)를 따른다.

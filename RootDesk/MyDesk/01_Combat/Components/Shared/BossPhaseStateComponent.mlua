@@ -10,6 +10,8 @@ script BossPhaseStateComponent extends Component
 	property table Definitions = nil
 	property integer NextReinforcementTurn = 0
 	property integer ReinforcementSequence = 0
+	property string PendingPatternId = ""
+	property string PendingWarningSkillId = ""
 
 	@ExecSpace("ServerOnly")
 	method table InitializePhases(string enemyDefinitionId, number currentHp, number maxHp)
@@ -43,10 +45,33 @@ script BossPhaseStateComponent extends Component
 		end
 		local runner = self.Entity:GetComponent("script.EnemyPatternRunnerComponent")
 		if runner == nil then return { Success = false, Reason = "PATTERN_RUNNER_MISSING", Changed = false } end
-		local patternResult = runner:InitializePattern(selected.PatternId, 1)
-		if patternResult.Success == false then return patternResult end
+		-- A warning and its follow-up are one committed attack, even across a phase threshold.
+		local plan = self.Entity:GetComponent("script.EnemyActionPlanComponent")
+		local action = plan ~= nil and plan:GetCurrentAction() or { Success = false }
+		local warningSkillId = ""
+		if action.Success == true and (action.ActionType == "TELEGRAPH_TILE" or plan.TelegraphLocked == true) then
+			warningSkillId = action.TileId or ""
+		elseif runner.LastCompletionSuccess and runner.LastCompletedStepIndex > 0 then
+			-- The previous warning can have completed before the next player turn builds its follow-up.
+			local previous = _EnemyPatternStepRepositoryLogic:GetPatternStep(runner.PatternId, runner.LastCompletedStepIndex)
+			local following = _EnemyPatternStepRepositoryLogic:GetPatternStep(runner.PatternId, runner.CurrentStepIndex)
+			if previous.Success and following.Success and previous.Step.ActionType == "TELEGRAPH_TILE"
+				and (following.Step.ActionType == "TELEGRAPH_TILE" or following.Step.ActionType == "EXECUTE_TILE")
+				and previous.Step.TileId == following.Step.TileId then warningSkillId = previous.Step.TileId end
+		end
+		local preserveWarning = self.PhaseIndex > 0 and warningSkillId ~= ""
 		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
-		if unit ~= nil then unit.EnemyPatternId = selected.PatternId end
+		if preserveWarning then
+			self.PendingPatternId = selected.PatternId
+			self.PendingWarningSkillId = warningSkillId
+			log("[BossPhase] warning retained enemy=" .. self.EnemyDefinitionId .. " skill=" .. warningSkillId .. " pendingPattern=" .. selected.PatternId)
+		else
+			local patternResult = runner:InitializePattern(selected.PatternId, 1)
+			if patternResult.Success == false then return patternResult end
+			if unit ~= nil then unit.EnemyPatternId = selected.PatternId end
+			self.PendingPatternId = ""
+			self.PendingWarningSkillId = ""
+		end
 		local previousPhaseId = self.PhaseId
 		self.PhaseIndex = selected.PhaseIndex
 		self.PhaseId = selected.PhaseId
@@ -68,6 +93,26 @@ script BossPhaseStateComponent extends Component
 			end
 		end
 		return { Success = true, Reason = "BOSS_PHASE_CHANGED", Changed = true, PhaseIndex = self.PhaseIndex, PhaseId = self.PhaseId, PatternId = self.PatternId, Revision = self.PhaseRevision }
+	end
+
+	@ExecSpace("ServerOnly")
+	method table CompletePendingPattern(string skillId, string actionType, boolean cancelled)
+		-- Completion/cancellation releases the old warned attack without changing its skill or cells.
+		if self.PendingPatternId == "" then return { Success = true, Reason = "NO_PENDING_PHASE_PATTERN" } end
+		if not cancelled and (actionType ~= "EXECUTE_TILE" or skillId ~= self.PendingWarningSkillId) then
+			return { Success = true, Reason = "PHASE_WARNING_PENDING" }
+		end
+		local runner = self.Entity:GetComponent("script.EnemyPatternRunnerComponent")
+		if runner == nil then return { Success = false, Reason = "PATTERN_RUNNER_MISSING" } end
+		local patternId = self.PendingPatternId
+		local result = runner:InitializePattern(patternId, 1)
+		if result.Success == false then return result end
+		local unit = self.Entity:GetComponent("script.BattleUnitComponent")
+		if unit ~= nil then unit.EnemyPatternId = patternId end
+		self.PendingPatternId = ""
+		self.PendingWarningSkillId = ""
+		log("[BossPhase] pending pattern applied enemy=" .. self.EnemyDefinitionId .. " pattern=" .. patternId .. " cancelled=" .. tostring(cancelled))
+		return { Success = true, Reason = "PENDING_PHASE_PATTERN_APPLIED", PatternId = patternId }
 	end
 
 	@ExecSpace("ServerOnly")

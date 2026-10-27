@@ -4,6 +4,30 @@ const S=require("./balance-schema.js");
 const dataDir=path.join(__dirname,"../RootDesk/MyDesk/03_Data");
 const all=Object.fromEntries(fs.readdirSync(dataDir).filter(n=>n.endsWith(".csv")).map(n=>[n.slice(0,-4),S.parseCSV(fs.readFileSync(path.join(dataDir,n),"utf8"))]));
 const copy=()=>structuredClone(all);
+test("spawn slot is optional or a finite nonnegative integer",()=>{
+  for(const value of [undefined,"","0","1","2"]){
+    const t=copy();t.EnemySpawnPools.rows[0].SpawnIndex=value;
+    assert.ok(!S.validate(t).some(e=>e.code==="INVALID_POOL_SPAWN_INDEX"));
+  }
+  for(const value of ["-1","1.5","oops","Infinity"," "]){
+    const t=copy();t.EnemySpawnPools.rows[0].SpawnIndex=value;
+    assert.ok(S.validate(t).some(e=>e.table==="EnemySpawnPools"&&e.column==="SpawnIndex"&&e.code==="INVALID_POOL_SPAWN_INDEX"));
+  }
+});
+test("spawn pool keys distinguish fixed slots while legacy blank/zero slots still collide",()=>{
+  const t=copy(), pool=t.EnemySpawnPools;
+  const row={...pool.rows.find(r=>r.PoolId==="orbis_stage_15_wave_3"&&r.EnemyDefinitionId==="orbis_stoneball")};
+  assert.deepEqual(S.validate(t),[]); // The same stoneball is intentionally fixed to slots 2 and 3.
+  pool.rows.push({...row,SpawnIndex:"02"});
+  assert.ok(S.validate(t).some(e=>e.table==="EnemySpawnPools"&&e.code==="DUPLICATE_PRIMARY_KEY"));
+  const legacy=copy();
+  legacy.EnemySpawnPools.rows.push({...legacy.EnemySpawnPools.rows[0],SpawnIndex:"0"});
+  assert.ok(S.validate(legacy).some(e=>e.table==="EnemySpawnPools"&&e.code==="DUPLICATE_PRIMARY_KEY"));
+  const noSlot=copy();
+  noSlot.EnemySpawnPools.headers=noSlot.EnemySpawnPools.headers.filter(h=>h!=="SpawnIndex");
+  noSlot.EnemySpawnPools.rows=noSlot.EnemySpawnPools.rows.filter(r=>!r.PoolId.startsWith("orbis_")).map(r=>{delete r.SpawnIndex;return r;});
+  assert.ok(!S.validate(noSlot).some(e=>e.table==="EnemySpawnPools"&&["REQUIRED_KEY_COLUMN","EMPTY_PRIMARY_KEY"].includes(e.code)));
+});
 const unionProduct=(table,productId)=>{
   const row=table.rows.find(r=>r.ProductId===productId);
   assert.ok(row,"missing union product: "+productId);
@@ -300,4 +324,42 @@ test("CSV preserves iron hog armor and supplies valid ascension bonuses for all 
     assert.equal(Number(row.FlatDamageReduction),row.EnemyDefinitionId==="region_04_iron_hog"?1:0,row.EnemyDefinitionId);
     assert.ok(Number.isInteger(Number(row.AscensionHpBonus))&&Number(row.AscensionHpBonus)>=0);
   }
+});
+
+
+test("relic acquisition validates source kinds and preserves legacy default columns",()=>{
+  const t=copy(),legacy=t.RelicDefinitions.rows[0];
+  delete legacy.AcquisitionType;delete legacy.AcquisitionSourceId;
+  assert.deepEqual(S.validate(t),[]);
+  for(const [kind,source] of [["OTHER",""],["GENERAL","orbis"],["REGION_SHOP","missing"],["BOSS_CLEAR","orbis_stage_01"]]){
+    const bad=copy();Object.assign(bad.RelicDefinitions.rows[0],{AcquisitionType:kind,AcquisitionSourceId:source});
+    assert.ok(S.validate(bad).some(e=>e.code==="INVALID_RELIC_ACQUISITION"),kind+"/"+source);
+  }
+});
+test("two boss relics cannot claim the same guaranteed stage reward",()=>{
+  const t=copy(),boss=t.RelicDefinitions.rows.filter(r=>r.AcquisitionType==="BOSS_CLEAR");
+  assert.equal(boss.length,2);boss[1].AcquisitionSourceId=boss[0].AcquisitionSourceId;
+  assert.ok(S.validate(t).some(e=>e.code==="DUPLICATE_BOSS_RELIC_SOURCE"));
+});
+
+
+test("Balance Studio mirrors relic acquisition references and boss-source uniqueness",()=>{
+  const html=fs.readFileSync(path.join(__dirname,"balance-studio.html"),"utf8");
+  const start=html.indexOf("  function validateTable(def)"),end=html.indexOf("  // ---------- Navigation UI",start);
+  const vocab=JSON.parse(html.match(/<script[^>]*id="vocabCatalog"[^>]*>([\s\S]*?)<\/script>/)[1]);
+  const ctx=vm.createContext({VOCAB:vocab,validateVocabRow:()=>{},normalizeRuid:()=>true,
+    RELIC_SPECIAL_MAP:new Map(all.RelicDefinitions.rows.map(r=>[r.SpecialEffectType,true])),
+    RELIC_SPECIAL_FIXED_ONE:new Set(["FIRST_HIT_GUARD","LETHAL_SURVIVAL","FIRST_DEBUFF_WINDOW"]),
+    tableRowsOf:n=>(all[n]?.rows||[]).map(r=>({get:k=>r[k]||""}))});
+  vm.runInContext(html.slice(start,end)+";globalThis.check=validateTable;",ctx);
+  const check=t=>ctx.check({fileName:"RelicDefinitions.csv",header:t.headers,keys:["RelicId"],
+    columns:t.headers.map((name,idx)=>({name,idx,type:"text"})),rows:t.rows.map(r=>t.headers.map(h=>r[h]||""))});
+  assert.equal(check(all.RelicDefinitions).filter(e=>e.level==="error").length,0);
+  for(const [kind,source] of [["OTHER",""],["GENERAL","orbis"],["REGION_SHOP","missing"],["BOSS_CLEAR","orbis_stage_01"]]){
+    const t=structuredClone(all.RelicDefinitions);Object.assign(t.rows[0],{AcquisitionType:kind,AcquisitionSourceId:source});
+    assert.ok(check(t).some(e=>e.msg.includes("INVALID_RELIC_ACQUISITION")));
+  }
+  const t=structuredClone(all.RelicDefinitions),boss=t.rows.filter(r=>r.AcquisitionType==="BOSS_CLEAR");
+  boss[1].AcquisitionSourceId=boss[0].AcquisitionSourceId;
+  assert.ok(check(t).some(e=>e.msg.includes("DUPLICATE_BOSS_RELIC_SOURCE")));
 });
