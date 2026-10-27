@@ -155,11 +155,26 @@ MapleTactics/
 ├── ui/                       # UI 그룹 정의 (.ui)
 ├── Global/                   # 엔진 기본값 및 월드 설정 (직접 수정 금지)
 ├── Docs/                     # GDD, 구현 계획, 데이터 사전, 시스템 가이드(Docs/Guide)
-├── tools/                    # Balance Studio / Workbench 및 검증 스크립트
-└── Artifacts/tests/          # 회귀 테스트 스크립트와 픽스처
+├── tools/                    # Balance Studio / Workbench 및 Node/Python 회귀 테스트
+└── requirements-dev.txt      # Python 회귀 테스트 의존성
 ```
 
 > 스크립트는 189개의 `.mlua` 파일로 구성되며, 각 `.mlua`는 Maker가 생성하는 `.codeblock`과 짝을 이룹니다.
+
+### 로컬 검증
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+node --test tools/*.test.cjs
+python3 tools/combat-issue-test.py
+python3 tools/hud-cache-test.py
+python3 tools/movement-issue-test.py
+python3 tools/repository-cache-test.py
+node tools/check-balance-vocab.cjs
+node tools/check-ui-path-contract.cjs
+```
+
+로컬 테스트는 소스 계약과 순수 로직 회귀를 확인한다. MSW 실행 동작은 Maker에서 Refresh 후 Build/Play 로그와 실제 입력으로 별도 검증한다.
 
 ### 아키텍처 원칙
 

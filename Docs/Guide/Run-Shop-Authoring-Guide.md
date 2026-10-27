@@ -169,7 +169,7 @@ UI는 표를 직접 읽거나 잔액을 차감하지 않는다. Snapshot은 `|`,
 - 기존 저장 데이터 형식과 유물 ID는 유지한다. 새 모델·맵·UI 파일이나 코드블록 수동 변경은 없다.
 - 검증 대상: 8종 단독/동시 보유, 만피/치명상/HP 1, 기존 가드, 중복 처치/승리/진입, 웨이브 유지, 런 초기화, 잘못된 정의 거부, 기존 능력치 유물 회귀.
 - Maker Build/Play 검증은 연결된 Maker MCP가 없어 미실행. 로컬 메서드 테스트는 엔진·동기화 검증을 대체하지 않는다.
-- 로컬 검증: `node Artifacts/tests/relic-special-effects-test.cjs`에서 실제 mLua 메서드 146개 assertion 통과. `node --test tools/balance-schema.test.cjs` 23개 테스트 통과. 기존 25종은 변경 전 데이터와 모든 기존 열이 동일함을 비교한다.
+- 당시 로컬 검증에서는 별도 유물 테스트 146개 assertion과 Balance Schema 23개 테스트가 통과했다. 현재 저장소에서는 `node --test tools/*.test.cjs`와 `node tools/check-balance-vocab.cjs`를 실행한다. 과거 `Artifacts/tests/relic-special-effects-test.cjs`는 현재 트리에 없다.
 - Maker 후속 확인: 편집 모드 Refresh → Build/Normal 로그 확인 → 새 런 시작 → 각 유물 보유 상태에서 위 효과 및 전투 간 초기화 확인 → `[RunRelic] triggered` 로그와 실제 HP/쿨다운/메소 대조 → Stop.
 
 

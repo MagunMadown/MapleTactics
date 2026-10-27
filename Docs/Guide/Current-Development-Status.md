@@ -1,7 +1,9 @@
 # MapleTactics 현재 개발 현황
 
-기준일: 2026-08-30
-기준 브랜치: `feat/jjr/temp-develop-nautilus-integration`
+기준일: 2026-10-22
+기준 브랜치: `develop` (`8703433` 기준으로 갱신)
+
+이 문서의 콘텐츠 개수와 지역별 Maker 결과는 각 항목에 적힌 과거 검증일의 스냅샷이다. 현재 검증 명령과 실행 구분은 README의 `로컬 검증` 절을 따른다.
 
 ## 1. 현재 도달한 수직 슬라이스
 
@@ -45,14 +47,14 @@
 | Region 6 슬리피우드 전반전 | 6-1~6-3 공용 일반맵, 6-4 포장마차 보스맵·적 패턴·Node 연결 구현 | 밸런스 검증 가능 |
 | Run Shop | 데이터 상품, 서버 구매, 종료/건너뛰기 구현 | 가능 |
 | 콘텐츠 전체 Validator | 시작 Gate와 행 단위 오류 계약 구현 | 가능 |
-| 최종 전투/상점/지도 UI | DTO만 제공 | UI 팀 작업 필요 |
+| 전투/상점/지도 UI | 기능 UI와 Presenter/DTO 연결 구현, 최종 아트·전체 화면 검증 진행 중 | 교체·확장 가능 |
 | EVENT·REST 소비기 | Handler만 존재 | 미구현 |
 | StageId→MapId Adapter | `StageMapRoutes` Repository와 Gateway/Transition 연결 구현 | 확장 가능 |
 | 공통 전투 테스트 진입 | 전용 `battle_test_hub`의 Stage·직업·Seed 선택, MapId 기본 Stage 자동 선택, 공용 맵 Override, Prototype 전용 F8 | 사용 가능 |
 | Instance Map 정책 | 미확정 | 합의 필요 |
 | 보스 Phase | HP 임계 전환·Pattern 교체·UI DTO 최소 규격 완료 | 확장 가능 |
 | 스킬 증강·업그레이드 3택·리롤 | 스킬 증강 14종(일반 9·히든 5), 스킬당 6단계 누적, 3택·슬롯 리롤 구현 (2026-09-28 기준, [`Skill-Augment-Reroll-Guide.md`](./Skill-Augment-Reroll-Guide.md)) | Maker 화면 검증 필요 |
-| 저장·재접속 | 미구현 | 후속 작업 |
+| 저장·재접속 | 게임 설정·런 상태 등 도메인별 저장 구현, 전체 재접속 시나리오 회귀는 계속 필요 | 조건부 가능 |
 
 ## 3. 현재 실제 콘텐츠 수
 

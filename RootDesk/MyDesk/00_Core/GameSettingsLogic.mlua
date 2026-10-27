@@ -422,11 +422,25 @@ script GameSettingsLogic extends Logic
 		-- Bumps the revision the UI and BGM watch, and debounces one save for a burst of slider or key edits.
 		self.Revision = self.Revision + 1
 		self._T.ChangedBeforeLoad = self.IsLoaded == false
+		self._T.SaveDirty = true
 		if self.SaveTimerId ~= 0 then _TimerService:ClearTimer(self.SaveTimerId) end
 		self.SaveTimerId = _TimerService:SetTimerOnce(function()
-			self.SaveTimerId = 0
-			self:SaveSettings(self:Encode())
+			self:FlushPendingSave("DEBOUNCE")
 		end, self.SaveDelay)
+	end
+
+	@ExecSpace("ClientOnly")
+	method void FlushPendingSave(string reason)
+		-- Window close bypasses the debounce so the newest local settings reach the server before navigation.
+		if self.SaveTimerId ~= 0 then
+			_TimerService:ClearTimer(self.SaveTimerId)
+			self.SaveTimerId = 0
+		end
+		if self._T.SaveDirty ~= true then return end
+		self._T.SaveDirty = false
+		local raw = self:Encode()
+		log("[VRF][GameSettings] flush reason=" .. (reason or "UNSPECIFIED") .. " bytes=" .. tostring(string.len(raw)))
+		self:SaveSettings(raw)
 	end
 
 	@ExecSpace("Client")
@@ -476,19 +490,44 @@ script GameSettingsLogic extends Logic
 
 	@ExecSpace("Server")
 	method void SaveSettings(string raw)
-		-- Last write wins; the payload is re-validated so a client can only store a well-formed settings blob.
+		-- Re-validates the payload, then keeps only the newest queued value per user while one write is in flight.
 		local player = _UserService:GetUserEntityByUserId(senderUserId)
 		if isvalid(player) == false or player.PlayerComponent == nil then return end
 		if raw == nil or string.len(raw) > self.MaxPayloadLength or self:Decode(raw) == nil then
 			log_warning("[GameSettings] save rejected length=" .. tostring(raw and string.len(raw) or 0))
 			return
 		end
-		local storage = _DataStorageService:GetUserDataStorage(self:GetStorageUserKey(player))
-		storage:SetAsync(self.StorageKey, raw, function(code)
+		local userKey = self:GetStorageUserKey(player)
+		self._T.SaveQueues = self._T.SaveQueues or {}
+		local queue = self._T.SaveQueues[userKey]
+		if queue == nil then
+			queue = { Storage = _DataStorageService:GetUserDataStorage(userKey), InFlight = false, PendingRaw = nil }
+			self._T.SaveQueues[userKey] = queue
+		end
+		queue.PendingRaw = raw
+		log("[VRF][GameSettings] save queued user=" .. userKey .. " bytes=" .. tostring(string.len(raw)))
+		self:DrainSaveQueue(userKey)
+	end
+
+	@ExecSpace("ServerOnly")
+	method void DrainSaveQueue(string userKey)
+		local queues = self._T.SaveQueues
+		local queue = queues ~= nil and queues[userKey] or nil
+		if queue == nil or queue.InFlight or queue.PendingRaw == nil then return end
+		local raw = queue.PendingRaw
+		queue.PendingRaw = nil
+		queue.InFlight = true
+		queue.Storage:SetAsync(self.StorageKey, raw, function(code)
+			queue.InFlight = false
 			if code ~= 0 then
 				log_warning("[GameSettings] save failed code=" .. tostring(code))
 			else
-				log("[GameSettings] saved bytes=" .. tostring(string.len(raw)))
+				log("[VRF][GameSettings] saved user=" .. userKey .. " bytes=" .. tostring(string.len(raw)))
+			end
+			if queue.PendingRaw ~= nil then
+				self:DrainSaveQueue(userKey)
+			else
+				queues[userKey] = nil
 			end
 		end)
 	end
